@@ -150,7 +150,11 @@ impl Player {
             return;
         }
 
-        let walk_speed = if input.sprint { 7.2 } else { 4.6 };
+        let walk_speed = if input.sprint || input.crouch_or_down {
+            7.2
+        } else {
+            4.6
+        };
         self.velocity.x = move_dir.x * walk_speed;
         self.velocity.z = move_dir.z * walk_speed;
 
@@ -161,8 +165,8 @@ impl Player {
 
         self.velocity.y = (self.velocity.y - 28.0 * dt).max(-45.0);
 
-        // Sub-step physics if moving fast
-        let steps = 4;
+        // Sub-step physics dynamically so no single step exceeds 0.25 blocks
+        let steps = ((self.velocity.length() * dt) / 0.25).ceil().max(4.0) as usize;
         let sub_dt = dt / steps as f32;
         for _ in 0..steps {
             // 1. Resolve Y
@@ -236,5 +240,57 @@ mod tests {
         }
         assert!(player.on_ground);
         assert!((player.position.y - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_fast_fall_does_not_embed_in_floor() {
+        let mut player = Player::new(Vec3::new(0.5, 5.05, 0.5));
+        player.fly_mode = false;
+        player.velocity.y = -45.0;
+        let input = InputState::default();
+        player.update(0.1, &input, |_, y, _| {
+            if y < 5 {
+                BlockId::Stone
+            } else {
+                BlockId::Air
+            }
+        });
+        assert!(player.on_ground);
+        assert!((player.position.y - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_left_shift_sprints_in_walk_mode() {
+        let mut p_walk = Player::new(Vec3::new(0.5, 5.0, 0.5));
+        p_walk.fly_mode = false;
+        p_walk.yaw = 0.0;
+        let mut p_sprint = p_walk.clone();
+
+        let walk_input = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        let shift_sprint_input = InputState {
+            forward: true,
+            crouch_or_down: true, // Left Shift sets crouch_or_down
+            ..Default::default()
+        };
+
+        p_walk.update(0.05, &walk_input, |_, y, _| {
+            if y < 5 {
+                BlockId::Stone
+            } else {
+                BlockId::Air
+            }
+        });
+        p_sprint.update(0.05, &shift_sprint_input, |_, y, _| {
+            if y < 5 {
+                BlockId::Stone
+            } else {
+                BlockId::Air
+            }
+        });
+
+        assert!(p_sprint.position.x > p_walk.position.x + 0.05);
     }
 }

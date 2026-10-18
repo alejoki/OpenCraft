@@ -277,6 +277,7 @@ impl WorldManager {
 
         let mut out = Vec::with_capacity(dirty.len());
         for dpos in dirty {
+            self.pending_mesh.remove(&dpos);
             if let Some(padded) = self.build_padded_chunk(dpos) {
                 let mesh = mesh_chunk(&padded);
                 self.meshed_chunks.insert(dpos);
@@ -330,8 +331,7 @@ impl WorldManager {
             let Ok((pos, mesh)) = self.mesh_rx.try_recv() else {
                 break;
             };
-            self.pending_mesh.remove(&pos);
-            if self.chunks.contains_key(&pos) {
+            if self.pending_mesh.remove(&pos) && self.chunks.contains_key(&pos) {
                 self.meshed_chunks.insert(pos);
                 completed_meshes.push((pos, mesh));
             }
@@ -457,5 +457,36 @@ mod tests {
         let positions: Vec<ChunkPos> = remeshed.iter().map(|(p, _)| *p).collect();
         assert!(positions.contains(&ChunkPos::new(0, 0, 0)));
         assert!(positions.contains(&ChunkPos::new(-1, 0, 0)));
+    }
+
+    #[test]
+    fn test_set_block_immediate_cancels_inflight_pending_mesh() {
+        let mut mgr = WorldManager::new(4);
+        let cpos = ChunkPos::new(0, 0, 0);
+        mgr.insert_chunk_for_test(cpos, Chunk::new_uniform(BlockId::Stone));
+        for dir in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            mgr.insert_chunk_for_test(dir, Chunk::new_uniform(BlockId::Air));
+        }
+
+        // Simulate an older in-flight background mesh that completes after a synchronous block edit
+        mgr.pending_mesh.insert(cpos);
+        let _ = mgr.mesh_tx.send((cpos, ChunkMesh::new()));
+
+        let remeshed = mgr.set_block_immediate(5, 5, 5, BlockId::Air);
+        assert_eq!(remeshed.len(), 1);
+
+        // Subsequent streaming update must discard the stale in-flight mesh result
+        let (completed, _) = mgr.update_streaming(cpos);
+        assert!(
+            !completed.iter().any(|(p, _)| *p == cpos),
+            "stale in-flight mesh must be ignored after set_block_immediate"
+        );
     }
 }
