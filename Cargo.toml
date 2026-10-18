@@ -1,0 +1,20 @@
+[package]
+name = "minecraft-clone"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.14", features = ["derive"] }
+crossbeam-channel = "0.5"
+glam = "0.27"
+pollster = "0.3"
+rayon = "1.10"
+rustc-hash = "1.1"
+wgpu = "0.19"
+winit = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
