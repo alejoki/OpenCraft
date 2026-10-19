@@ -37,13 +37,13 @@ use minecraft_clone::ui::{
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use minecraft_clone::world::block::BlockId;
-use minecraft_clone::world::catalog::{CatalogRow, PendingDelete};
+use minecraft_clone::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use minecraft_clone::world::catalog_fs::WorldCatalogFs;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
-use minecraft_clone::WorldSession;
+use minecraft_clone::{random_seed, WorldSession};
 use minecraft_clone::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, SavedPlayerState, WorldSaveData,
-    DEFAULT_SAVE_PATH,
+    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
+    WorldSaveData, DEFAULT_SAVE_PATH,
 };
 use minecraft_clone::world::terrain::DEFAULT_WORLD_SEED;
 
@@ -57,12 +57,6 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// often keeps the T01 pure tick counter time-sane without giving the menu
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
-
-/// Transient screen message shown at the S03 seam (see
-/// [`handle_world_start`]): a valid Create or a loadable-row Play does not
-/// start a world session in this slice — it only displays this and stays on
-/// the calling screen.
-const WORLD_START_SEAM_MESSAGE: &str = "world sessions start in the next milestone";
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -97,11 +91,13 @@ fn apply_vsync(ctx: &mut RenderContext, vsync: bool) {
 /// unload, pause Save-and-Quit, Exit Game, CloseRequested, OutOfMemory —
 /// funnels through this one session-tied function, so no site can drift
 /// back to writing cli.save_path). `save_world_to_path` creates parent
-/// directories atomically. Returns whether the write succeeded; on failure
-/// the session's world keeps its unsaved-changes flag for the next save
-/// opportunity (no log by convention; callers surface failures where a
-/// message slot exists).
-fn save_current_world(session: &mut WorldSession) -> bool {
+/// directories atomically. Returns `Ok` only after the write succeeded
+/// (only then is the world's unsaved-changes flag cleared); on failure the
+/// `PersistenceError` is returned as data — the session's world keeps
+/// its unsaved-changes flag for the next save opportunity, and the caller
+/// surfaces the error where a message slot exists (no log by convention;
+/// D006/MEM009).
+fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError> {
     let data = WorldSaveData {
         seed: session.world.seed(),
         player: SavedPlayerState {
@@ -114,12 +110,11 @@ fn save_current_world(session: &mut WorldSession) -> bool {
         },
         chunk_edits: session.world.chunk_edits().clone(),
     };
-    if save_world_to_path(&session.save_path, &data).is_ok() {
+    let result = save_world_to_path(&session.save_path, &data);
+    if result.is_ok() {
         session.world.mark_saved();
-        true
-    } else {
-        false
     }
+    result
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -204,40 +199,6 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     WorldSession::new_session(seed, cli.save_path.clone())
 }
 
-/// S03 seam: the single place a valid Create (new-game form) or a
-/// loadable-row Play routes to. World-session replacement is deliberately
-/// deferred to S03 — in this slice the seam only yields the transient
-/// message the calling screen displays, and no lifecycle or world state is
-/// mutated, so no session swap can be fabricated (the caller stays on its
-/// screen). S03 replaces this body with the real session-start logic
-/// behind the same call sites.
-fn handle_world_start(_name: &str, _seed: Option<&str>) -> &'static str {
-    WORLD_START_SEAM_MESSAGE
-}
-
-/// Compose the load screen's Play message for one catalog row through the
-/// live catalog (S02-T03 wiring): the row is probed via
-/// `catalog.load_row`, so a file that vanished between the listing and
-/// the Play click surfaces `CatalogLoadError::Load` inline instead of
-/// being swallowed, and a corrupt row surfaces its
-/// `CatalogLoadError::Corrupt` display (degraded, not excluded). A
-/// genuinely loadable row routes to the S03 seam `handle_world_start` —
-/// the probed `WorldSaveData` is dropped there: world-session
-/// replacement is S03's job, the probe exists so errors surface and the
-/// row is proven loadable (warnings-as-data, D006/MEM009 — the crate
-/// stays log-free). Free helper over (catalog, row) so every failure
-/// mode is unit-testable with a tempdir catalog.
-fn play_row_message(catalog: &WorldCatalogFs, row: &CatalogRow) -> MenuMessage {
-    let text = match catalog.load_row(row) {
-        Ok(_save) => handle_world_start(&row.name, None).to_string(),
-        Err(err) => err.to_string(),
-    };
-    MenuMessage {
-        text,
-        ticks_left: menu::MESSAGE_TICKS,
-    }
-}
-
 /// Apply a S01-confirmed pending delete through the live catalog and
 /// compose the post-delete load-screen state (S02-T03 wiring): rows
 /// refresh from disk on success AND failure alike — the screen must stay
@@ -264,11 +225,13 @@ fn apply_confirmed_delete(
     (rows, message)
 }
 
-/// Decrement a transient [`MenuMessage`] tick counter (the same pattern as
-/// `SettingsMenu::tick` and `NewGameScreen::tick`). The T01 `LoadScreen`
-/// owns no message slot of its own, so GameApp owns the load screen's
-/// transient message directly and ticks it here.
-fn tick_load_message(message: &mut Option<MenuMessage>) -> bool {
+/// Decrement a GameApp-owned transient [`MenuMessage`] tick counter (the
+/// same pattern as `SettingsMenu::tick` and `NewGameScreen::tick`). The
+/// T01 pure screens own no message slots of their own, so GameApp owns
+/// the load screen's and the main menu's transient messages directly and
+/// ticks them here (S03-T03: the main-menu slot carries the Save-and-Quit
+/// save-failure message).
+fn tick_transient_message(message: &mut Option<MenuMessage>) -> bool {
     match message {
         None => false,
         Some(msg) => {
@@ -287,7 +250,7 @@ fn tick_load_message(message: &mut Option<MenuMessage>) -> bool {
 /// game, load game, pause): one line per row/target in T01 geometry order
 /// top-to-bottom, then transient state lines (the delete prompt while a
 /// delete is pending), then the message line last. Pure function of
-/// (screen, form, load, message) so it is unit-testable without GPU or
+/// (screen, form, load, messages) so it is unit-testable without GPU or
 /// events — same pattern as `compose_menu_text` (called per frame;
 /// `StatsOverlay::update` skips the expensive re-shape unless the composed
 /// string changed). The settings screen composes via `compose_menu_text`
@@ -297,18 +260,28 @@ fn tick_load_message(message: &mut Option<MenuMessage>) -> bool {
 /// align with their rows: catalog rows, then Back, then — only while a
 /// delete is pending — the Confirm row (which doubles as the prompt naming
 /// the row it would delete) and Cancel. An empty catalog (fresh install,
-/// missing saves dir — not an error) displays as `(no saved worlds)`.
+/// missing saves dir — not an error) displays as `(no saved worlds)`. The
+/// main menu appends its transient message (the S03-T03 Save-and-Quit
+/// save-failure note) as its last line when present; with no message it
+/// lists exactly its four rows.
 fn compose_screen_text(
     screen: LifecycleScreen,
     new_game: &NewGameScreen,
     load: &LoadScreen,
     load_message: Option<&MenuMessage>,
+    main_menu_message: Option<&MenuMessage>,
 ) -> String {
     let lines: Vec<String> = match screen {
-        LifecycleScreen::MainMenu => MAIN_MENU_ROWS
-            .iter()
-            .map(|row| row.label().to_string())
-            .collect(),
+        LifecycleScreen::MainMenu => {
+            let mut lines = MAIN_MENU_ROWS
+                .iter()
+                .map(|row| row.label().to_string())
+                .collect::<Vec<_>>();
+            if let Some(message) = main_menu_message {
+                lines.push(message.text.clone());
+            }
+            lines
+        }
         LifecycleScreen::Pause => PAUSE_ROWS
             .iter()
             .map(|row| row.label().to_string())
@@ -571,11 +544,17 @@ struct GameApp {
     /// catalog on every entry into the screen and after every delete
     /// (S02-T03 wiring — `refresh_load_rows` / `confirm_pending_delete`).
     load: LoadScreen,
-    /// The load screen's transient message (inline errors, the S03 seam
-    /// message; the T01 LoadScreen owns no message slot of its own — same
-    /// tick-counter pattern as the settings menu, ticked by
-    /// `tick_load_message`).
+    /// The load screen's transient message (inline errors; the T01
+    /// LoadScreen owns no message slot of its own — same tick-counter
+    /// pattern as the settings menu, ticked by
+    /// `tick_transient_message`).
     load_message: Option<MenuMessage>,
+    /// The main menu's transient message (S03-T03): a Save-and-Quit save
+    /// failure surfaces here as a user-readable "could not save world:
+    /// ..." line while the session's unsaved-changes flag stays set for
+    /// retry; same tick-counter pattern, ticked alongside the other
+    /// message slots by `tick_transient_message`.
+    main_menu_message: Option<MenuMessage>,
     /// Timestamp of the last message-expiry tick (bounded at ~60 Hz; see
     /// `MENU_TICK_INTERVAL`).
     message_tick_timer: Instant,
@@ -626,6 +605,7 @@ impl GameApp {
             new_game: NewGameScreen::new(),
             load: LoadScreen::new(),
             load_message: None,
+            main_menu_message: None,
             message_tick_timer: Instant::now(),
         }
     }
@@ -724,6 +704,14 @@ impl GameApp {
             self.enter_playing();
             return;
         }
+        // Leaving the main menu retires its transient message (the
+        // S03-T03 Save-and-Quit failure note described the main-menu
+        // state the player navigated away from); navigating to any other
+        // screen starts that screen's state clean, and the load screen's
+        // row refresh clears its own message the same way.
+        if screen != LifecycleScreen::MainMenu {
+            self.main_menu_message = None;
+        }
         self.input.reset();
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
@@ -766,15 +754,17 @@ impl GameApp {
     }
 
     /// Swap in a new world session atomically — the ONE boundary a world
-    /// start flows through (S03-T02; Create/Play wire into it in T03). The
-    /// swap drops the outgoing session's CPU state wholesale, clears every
-    /// GPU chunk mesh via `ChunkRenderStore::clear` (a freshly started
-    /// world must never render the outgoing world's meshes — the streaming
-    /// pass re-uploads the new world's chunks as they load), and resets
-    /// held inputs (a swap can only be initiated from a menu screen, but
-    /// resetting here makes the boundary self-contained). The camera
-    /// arrives pre-synced to the new player by the WorldSession
-    /// constructors (`new_session`/`session_from_save` both sync it).
+    /// start flows through (S03-T02, wired by Create/Play in S03-T03).
+    /// The swap drops the outgoing session's CPU state wholesale, clears
+    /// every GPU chunk mesh via `ChunkRenderStore::clear` (a freshly
+    /// started world must never render the outgoing world's meshes — the
+    /// streaming pass re-uploads the new world's chunks as they load),
+    /// and resets held inputs (a swap can only be initiated from a menu
+    /// screen, but resetting here makes the boundary self-contained). The
+    /// loaded Settings' FOV applies to the new session's camera here (the
+    /// same source-of-truth rule as `GameApp::new`), and the camera arrives
+    /// pre-synced to the new player by the WorldSession constructors
+    /// (`new_session`/`session_from_save` both sync it).
     ///
     /// No outgoing-session autosave happens here, by design: only Playing
     /// can accumulate unsaved chunk edits, and every path out of Playing
@@ -783,18 +773,58 @@ impl GameApp {
     /// can only be reached from a screen, never from Playing, so a session
     /// swapped here was already saved (or never edited). If a future path
     /// ever swaps directly out of Playing, that path owns its save.
-    ///
-    /// Uncalled from Create/Play in this task (the S02 seam still shows
-    /// the transient message); it is directly unit-tested here instead —
-    /// hence the targeted allow, which only silences the non-test build
-    /// (the test build exercises the method and keeps the lint honest).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn start_world_session(&mut self, session: WorldSession) {
+    fn start_world_session(&mut self, mut session: WorldSession) {
+        // The loaded Settings stay the single source of truth for video
+        // parameters across a session swap too (GameApp::new does the
+        // same at startup; defaults are 75 degrees either way).
+        session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
         self.session = session;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
         }
         self.input.reset();
+    }
+
+    /// Apply a lifecycle decision from the S01 state machine (navigation,
+    /// cursor/input resets, settings-menu sync, save-and-quit, exit save).
+    /// Returns whether the caller should exit the event loop: the ExitGame
+    /// arm performs its world+settings save here but defers
+    /// `event_loop.exit()` to the caller, so the create, play, and
+    /// save-and-quit paths need no `&ActiveEventLoop` and are unit-testable
+    /// without a live loop. `StartNewGame`/`LoadWorld` are no-ops here by
+    /// design: the create and play paths dispatch directly and consume the
+    /// decision alongside the `WorldSession` they prepared (the decision
+    /// carries no session data).
+    fn apply_lifecycle_decision(&mut self, decision: LifecycleDecision) -> bool {
+        match decision {
+            LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
+            LifecycleDecision::ResumeGame => self.enter_playing(),
+            LifecycleDecision::StartNewGame | LifecycleDecision::LoadWorld => {}
+            LifecycleDecision::SaveAndQuit => {
+                // Save the session's world to the session's own save path
+                // (S03-T02: every save site is session-tied), then return
+                // to the main menu. On failure: surface a transient
+                // main-menu message (warnings-as-data, D006/MEM009 — the
+                // crate stays log-free) and KEEP the unsaved-changes flag
+                // set for the next save opportunity (retry, or a later
+                // save/exit path saves it again).
+                if let Err(err) = save_current_world(&mut self.session) {
+                    self.main_menu_message = Some(MenuMessage {
+                        text: format!("could not save world: {err}"),
+                        ticks_left: menu::MESSAGE_TICKS,
+                    });
+                }
+                self.enter_screen(LifecycleScreen::MainMenu);
+            }
+            LifecycleDecision::ExitGame => {
+                // Mirror the CloseRequested path: save the current world
+                // and settings; the caller owns exiting the loop.
+                let _ = save_current_world(&mut self.session);
+                let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
+                return true;
+            }
+        }
+        false
     }
 
     /// Dispatch a lifecycle intent through the S01 state machine and apply
@@ -806,42 +836,18 @@ impl GameApp {
     /// could surface, but every call site here builds its intent from the
     /// same screen it dispatches to, so rejection is unreachable).
     ///
-    /// `StartNewGame` and `LoadWorld` are unreachable in this slice: a
-    /// valid create and a loadable-row Play route to the S03 seam
-    /// (`handle_world_start`) instead of dispatching — the seam shows a
-    /// transient message and stays on the calling screen, so no session
-    /// swap can be fabricated.
+    /// `StartNewGame` and `LoadWorld` are never produced by these call
+    /// sites: a valid Create and a loadable-row Play dispatch directly
+    /// (owning their session start at the `start_world_session`
+    /// boundary) instead of going through this loop-taking wrapper.
     fn dispatch_screen_intent(
         &mut self,
         event_loop: &ActiveEventLoop,
         intent: LifecycleIntent,
     ) -> Option<LifecycleDecision> {
         let decision = self.lifecycle.dispatch(intent).ok()?;
-        match decision {
-            LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
-            LifecycleDecision::ResumeGame => self.enter_playing(),
-            LifecycleDecision::SaveAndQuit => {
-                // Save the session's world to the session's own save path
-                // (S03-T02: every save site is session-tied), then return
-                // to the main menu. A save failure is dropped by the same
-                // convention as the CloseRequested path: the world keeps
-                // its unsaved-changes flag and is saved again on the next
-                // save/exit opportunity (no log by convention; the
-                // transient main-menu failure message is S03-T03's to own
-                // at the seam).
-                let _ = save_current_world(&mut self.session);
-                self.enter_screen(LifecycleScreen::MainMenu);
-            }
-            LifecycleDecision::ExitGame => {
-                // Mirror the CloseRequested path: save the current world
-                // and settings, then exit the loop.
-                let _ = save_current_world(&mut self.session);
-                let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
-                event_loop.exit();
-            }
-            // Unreachable in this slice (see the doc comment): create
-            // and play route to the S03 seam without dispatching.
-            LifecycleDecision::StartNewGame | LifecycleDecision::LoadWorld => {}
+        if self.apply_lifecycle_decision(decision) {
+            event_loop.exit();
         }
         Some(decision)
     }
@@ -960,21 +966,52 @@ impl GameApp {
     /// opened must still collide; the load screen refreshes its own rows
     /// on every entry, so this list is validation-only and not stored),
     /// show any failure inline as the form's transient message
-    /// (warnings-as-data, D006/MEM009), and route a valid create to the S03
-    /// seam — which only shows a transient message and stays on the screen
-    /// in this slice. No `ensure_dir()`/`save_world` happens here: creation
-    /// itself is the S03 seam, so no save is written in this slice and
-    /// there is no create-path filesystem use to ensure a directory for.
+    /// (warnings-as-data, D006/MEM009), and start the real world session:
+    /// the seed resolves through `catalog::resolve_seed_or` (a blank seed
+    /// means a fresh time-derived `session::random_seed`; any other text
+    /// hashes deterministically), the save path is the catalog adapter's
+    /// validated `<saves_dir>/<Name>.mcvx` (no save is written here — the
+    /// session persists through the normal save sites once edits exist),
+    /// the `WorldSession` is built via `session::new_session`, and the S01
+    /// decision `StartNewGame` (from dispatching `NewGameIntent::Create`)
+    /// drives the swap through the one `start_world_session` boundary and
+    /// enters Playing semantics (cursor grab via `enter_playing`; the
+    /// lifecycle state is already Playing, set by the dispatch). Needs no
+    /// `&ActiveEventLoop`, so the whole create path is unit-testable
+    /// without a live loop.
     fn attempt_create(&mut self) {
         let name = self.new_game.name().value().to_string();
         let rows = self.catalog.list_rows();
-        match validate_create(&name, &rows) {
-            Err(err) => self.new_game.set_message(err.to_string()),
-            Ok(()) => {
-                let seed = self.new_game.seed().value().to_string();
-                let message = handle_world_start(&name, Some(&seed));
-                self.new_game.set_message(message);
+        if let Err(err) = validate_create(&name, &rows) {
+            self.new_game.set_message(err.to_string());
+            return;
+        }
+        // Blank seed = fresh random seed; any other text = stable hash.
+        let seed_form = self.new_game.seed().value().to_string();
+        let seed = resolve_seed_or(&seed_form, random_seed());
+        // The catalog adapter re-validates (and canonicalizes the trim of)
+        // the already-valid name into <saves_dir>/<Name>.mcvx. The error
+        // arm is unreachable (validate_create enforced the same rule) but
+        // stays a warnings-as-data no-panic path.
+        let save_path = match self.catalog.world_path(&name) {
+            Ok(path) => path,
+            Err(err) => {
+                self.new_game.set_message(err.to_string());
+                return;
             }
+        };
+        let session = WorldSession::new_session(seed, save_path);
+        match self
+            .lifecycle
+            .dispatch(LifecycleIntent::NewGame(NewGameIntent::Create))
+        {
+            Ok(LifecycleDecision::StartNewGame) => {
+                self.start_world_session(session);
+                self.enter_playing();
+            }
+            // Unreachable: attempt_create only runs while the new-game
+            // screen is open, and that screen accepts Create.
+            _ => {}
         }
     }
 
@@ -996,20 +1033,51 @@ impl GameApp {
         self.load_message = message;
     }
 
-    /// Play on catalog row `index` (load screen): the row is probed through
-    /// the live catalog (S02-T03 wiring) via the pure `play_row_message`
-    /// helper — a loadable row routes to the S03 seam (transient message,
-    /// stays on screen), a corrupt row and a vanished file both surface
-    /// their `CatalogLoadError` display inline as the load screen's
-    /// transient message (warnings-as-data, D006/MEM009: degraded or
-    /// vanished rows are displayed, never swallowed — the crate stays
-    /// log-free). An out-of-range index is ignored (rows only shrink via a
-    /// confirmed delete, which cancels any pending identity first).
+    /// Play on catalog row `index` (load screen): probe the row through the
+    /// live catalog (S02-T03 wiring) — a corrupt row and a file that
+    /// vanished between the listing and the Play click both surface their
+    /// `CatalogLoadError` display inline as the load screen's transient
+    /// message and the screen stays put (warnings-as-data, D006/MEM009:
+    /// degraded or vanished rows are displayed, never swallowed — the
+    /// crate stays log-free). A loadable row starts the real world session:
+    /// the persisted `WorldSaveData` (seed, player state, chunk edits)
+    /// rebuilds the session via `session::session_from_save` at the row's
+    /// own file path (`<saves_dir>/<file_name>`), and the S01 decision
+    /// `LoadWorld` (from dispatching `LoadGameIntent::Load`) drives the
+    /// swap through the one `start_world_session` boundary and enters
+    /// Playing semantics (cursor grab via `enter_playing`; the lifecycle
+    /// state is already Playing, set by the dispatch). An out-of-range
+    /// index is ignored (rows only shrink via a confirmed delete, which
+    /// cancels any pending identity first). Needs no `&ActiveEventLoop`,
+    /// so every failure mode is unit-testable with a tempdir catalog.
     fn play_row(&mut self, index: usize) {
         let Some(row) = self.load.rows().get(index).cloned() else {
             return;
         };
-        self.load_message = Some(play_row_message(&self.catalog, &row));
+        let save = match self.catalog.load_row(&row) {
+            Ok(save) => save,
+            Err(err) => {
+                self.load_message = Some(MenuMessage {
+                    text: err.to_string(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                return;
+            }
+        };
+        let session =
+            WorldSession::session_from_save(save, self.catalog.saves_dir().join(&row.file_name));
+        match self
+            .lifecycle
+            .dispatch(LifecycleIntent::LoadGame(LoadGameIntent::Load))
+        {
+            Ok(LifecycleDecision::LoadWorld) => {
+                self.start_world_session(session);
+                self.enter_playing();
+            }
+            // Unreachable: play_row only runs while the load screen is
+            // open, and that screen accepts Load.
+            _ => {}
+        }
     }
 
     /// Route one mouse click while a lifecycle screen (not Settings, not
@@ -1315,7 +1383,7 @@ impl ApplicationHandler for GameApp {
                             self.session.player.velocity = Vec3::ZERO;
                         }
                         KeyCode::F5 if pressed && !event.repeat => {
-                            if save_current_world(&mut self.session) {
+                            if save_current_world(&mut self.session).is_ok() {
                                 self.last_saved_badge = Some(Instant::now());
                             }
                         }
@@ -1507,10 +1575,12 @@ impl ApplicationHandler for GameApp {
                     if self.menu.message.is_some()
                         || self.new_game.message().is_some()
                         || self.load_message.is_some()
+                        || self.main_menu_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
-                        tick_load_message(&mut self.load_message);
+                        tick_transient_message(&mut self.load_message);
+                        tick_transient_message(&mut self.main_menu_message);
                     }
                 }
 
@@ -1535,7 +1605,7 @@ impl ApplicationHandler for GameApp {
                     let (new_meshes, unloaded) = self.session.world.update_streaming(player_chunk);
                     if !unloaded.is_empty()
                         && self.session.world.has_unsaved_changes()
-                        && save_current_world(&mut self.session)
+                        && save_current_world(&mut self.session).is_ok()
                     {
                         self.last_saved_badge = Some(Instant::now());
                     }
@@ -1639,6 +1709,7 @@ impl ApplicationHandler for GameApp {
                             &self.new_game,
                             &self.load,
                             self.load_message.as_ref(),
+                            self.main_menu_message.as_ref(),
                         )
                     };
                     gpu.menu_text.update(
@@ -1825,6 +1896,9 @@ mod tests {
     use super::*;
     use minecraft_clone::ui::SettingsCaller;
     use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
+    use minecraft_clone::world::chunk::ChunkPos;
+    use minecraft_clone::world::terrain::generate_chunk_seeded;
+    use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
     use minecraft_clone::player::camera::Camera;
@@ -2117,17 +2191,276 @@ mod tests {
         ])));
     }
 
-    #[test]
-    fn handle_world_start_is_the_s03_seam_message_only() {
-        // The seam returns only the transient message: the caller stays on
-        // its screen — no lifecycle or world mutation can happen through it
-        // (world-session replacement is deferred to S03).
-        assert_eq!(
-            handle_world_start("New World", Some("42")),
-            WORLD_START_SEAM_MESSAGE
+    /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,
+    /// and the given screen entered through the real `enter_screen` path
+    /// (LoadGame entry refreshes rows from the tempdir catalog).
+    fn app_at_screen(saves_dir: &Path, screen: LifecycleScreen) -> GameApp {
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
         );
-        assert_eq!(handle_world_start("alpha", None), WORLD_START_SEAM_MESSAGE);
-        assert!(!WORLD_START_SEAM_MESSAGE.is_empty());
+        app.catalog = WorldCatalogFs::new(saves_dir);
+        app.enter_screen(screen);
+        app
+    }
+
+    #[test]
+    fn valid_create_starts_a_world_session_and_enters_playing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
+        app.new_game.cycle_focus();
+        app.new_game.apply(TextInputAction::InsertText("42".into()));
+        app.attempt_create();
+
+        // A valid create dispatches StartNewGame and enters Playing.
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        // The form's seed text resolves through catalog::resolve_seed_or.
+        let expected_seed = resolve_seed_or("42", 0);
+        assert_eq!(app.session.world.seed(), expected_seed);
+        // The session owns the catalog-validated saves/<Name>.mcvx path.
+        assert_eq!(app.session.save_path, dir.path().join("Deep Dark.mcvx"));
+        // The player spawns on the resolved seed's terrain (the session
+        // was built via session::new_session, not the old one).
+        let expected_y = (terrain_height_at_seeded(0, 0, expected_seed) + 4) as f32;
+        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        // Playing semantics: cursor grabbed, no form message.
+        assert!(app.cursor_grabbed);
+        assert!(app.new_game.message().is_none());
+        // No save is written at create time — persistence rides the
+        // normal save sites once the world accumulates state.
+        assert!(!dir.path().join("Deep Dark.mcvx").exists());
+    }
+
+    #[test]
+    fn blank_seed_create_uses_a_fresh_seed_and_still_enters_playing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game.apply(TextInputAction::InsertText("Blank Seed".into()));
+        // Seed field left blank: the create resolves a fresh time-derived
+        // seed (session::random_seed). The value itself is not predictable,
+        // so assert the session is internally consistent with its own seed
+        // (built via new_session: the player spawns on that seed's terrain)
+        // plus the catalog-validated save path.
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_path, dir.path().join("Blank Seed.mcvx"));
+        let seed = app.session.world.seed();
+        let expected_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
+        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+    }
+
+    #[test]
+    fn duplicate_and_invalid_name_creates_stay_on_new_game_with_inline_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Duplicate: attempt_create fetches FRESH rows, so a row saved
+        // after the screen opened still collides (case-insensitively).
+        let catalog = WorldCatalogFs::new(dir.path());
+        catalog.save_world("Alpha", &sample_save(9)).expect("save alpha");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game.apply(TextInputAction::InsertText("alpha".into()));
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::NewGame);
+        let message = app.new_game.message().expect("duplicate surfaces inline");
+        assert!(
+            message.text.contains("already exists"),
+            "unexpected duplicate text: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+        assert_eq!(app.session.world.seed(), 1, "session not swapped");
+
+        // Invalid name: the typed WorldNameError displays inline too.
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game.apply(TextInputAction::InsertText("bad/name".into()));
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::NewGame);
+        let message = app
+            .new_game
+            .message()
+            .expect("invalid name surfaces inline");
+        assert!(
+            message.text.contains("not allowed in a world name"),
+            "unexpected invalid-name text: {}",
+            message.text
+        );
+    }
+
+    #[test]
+    fn loadable_play_rebuilds_the_session_from_the_row_and_enters_playing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+
+        // A save with one persisted chunk edit, so Play must restore edits.
+        let mut inner: FxHashMap<u16, BlockId> = FxHashMap::default();
+        inner.insert(5, BlockId::Stone);
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos { x: 1, y: 0, z: -2 }, inner);
+        let mut data = sample_save(31337);
+        data.chunk_edits = edits.clone();
+        app.catalog.save_world("ghost", &data).expect("save ghost");
+        app.refresh_load_rows();
+        let index = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "ghost")
+            .expect("ghost row listed");
+
+        app.play_row(index);
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.world.seed(), 31337);
+        assert_eq!(
+            app.session.player.position,
+            Vec3::from_array(data.player.position)
+        );
+        assert_eq!(app.session.player.yaw, 0.5);
+        assert_eq!(app.session.player.pitch, -0.25);
+        assert!(app.session.player.fly_mode);
+        assert_eq!(app.session.player.selected_slot, 2);
+        assert_eq!(app.session.world.chunk_edits(), &edits);
+        assert_eq!(
+            app.session.save_path,
+            dir.path().join("ghost.mcvx"),
+            "session owns the row's own file path"
+        );
+        assert!(app.cursor_grabbed, "Playing semantics grab the cursor");
+        assert!(app.load_message.is_none());
+    }
+
+    #[test]
+    fn corrupt_and_vanished_plays_stay_on_load_game_with_inline_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+        app.catalog.save_world("ghost", &sample_save(5)).expect("save ghost");
+        std::fs::write(dir.path().join("broken.mcvx"), b"NOPE!1234").expect("write broken");
+        app.refresh_load_rows();
+        let ghost = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "ghost")
+            .expect("ghost row listed");
+        let broken = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "broken")
+            .expect("broken row listed");
+
+        // A corrupt row surfaces its inline non-loadable display and the
+        // screen stays.
+        app.play_row(broken);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::LoadGame);
+        let message = app.load_message.as_ref().expect("corrupt surfaces inline");
+        assert!(
+            message.text.contains("cannot be loaded"),
+            "unexpected corrupt-row text: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+        assert_eq!(app.session.world.seed(), 1, "session not swapped");
+
+        // Vanished between the listing and the Play click:
+        // CatalogLoadError::Load surfaces inline, never swallowed.
+        std::fs::remove_file(dir.path().join("ghost.mcvx")).expect("remove ghost");
+        app.play_row(ghost);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::LoadGame);
+        let message = app.load_message.as_ref().expect("vanished surfaces inline");
+        assert!(
+            message.text.contains("Could not load world \"ghost\""),
+            "unexpected vanished-row text: {}",
+            message.text
+        );
+    }
+
+    #[test]
+    fn save_and_quit_failure_composes_a_main_menu_message_and_keeps_the_retry_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Force a save failure: the save path's parent is a FILE, so the
+        // atomic save's create_dir_all cannot succeed.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, blocker.join("deep.mcvx")),
+        );
+        // An unsaved chunk edit: the flag the failure must preserve.
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(app.session.world.has_unsaved_changes());
+
+        // Pause -> SaveAndQuit through the extracted, loop-free decision
+        // apply (no &ActiveEventLoop, no exit requested).
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
+        assert!(!exit_requested);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+
+        // The failure surfaces as the main menu's transient message and
+        // composes as the main menu's last line.
+        let message = app
+            .main_menu_message
+            .as_ref()
+            .expect("save failure surfaces on the main menu");
+        assert!(
+            message.text.contains("could not save world"),
+            "unexpected failure text: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+        let text = compose_screen_text(
+            LifecycleScreen::MainMenu,
+            &app.new_game,
+            &app.load,
+            None,
+            app.main_menu_message.as_ref(),
+        );
+        assert_eq!(text.lines().count(), 4 + 1, "four rows plus the message");
+        assert!(text.ends_with(message.text.as_str()));
+
+        // The unsaved-changes flag stays set for the next save opportunity
+        // (retry), and nothing was written.
+        assert!(app.session.world.has_unsaved_changes());
+        assert!(!app.session.save_path.exists());
+    }
+
+    #[test]
+    fn save_and_quit_success_returns_to_the_main_menu_with_no_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("kept.mcvx");
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
+        assert!(!exit_requested);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none(), "no failure, no message");
+        assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
+        assert!(save_path.is_file(), "the session's own path was written");
+        // The main menu still lists exactly its four rows with no message.
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::MainMenu,
+                &app.new_game,
+                &app.load,
+                None,
+                None
+            ),
+            "New Game\nLoad Game\nSettings\nExit Game"
+        );
     }
 
     #[test]
@@ -2272,19 +2605,19 @@ mod tests {
     }
 
     #[test]
-    fn tick_load_message_expires_by_tick_counter_purely() {
+    fn tick_transient_message_expires_by_tick_counter_purely() {
         let mut message = Some(MenuMessage {
-            text: "seam".to_string(),
+            text: "note".to_string(),
             ticks_left: 2,
         });
-        assert!(tick_load_message(&mut message));
+        assert!(tick_transient_message(&mut message));
         assert_eq!(message.as_ref().unwrap().ticks_left, 1);
         assert!(
-            !tick_load_message(&mut message),
+            !tick_transient_message(&mut message),
             "the expiring tick is false"
         );
         assert!(message.is_none(), "expires at zero");
-        assert!(!tick_load_message(&mut message), "no message stays false");
+        assert!(!tick_transient_message(&mut message), "no message stays false");
     }
 
     #[test]
@@ -2292,12 +2625,29 @@ mod tests {
         let new_game = NewGameScreen::new();
         let load = LoadScreen::new();
         assert_eq!(
-            compose_screen_text(LifecycleScreen::MainMenu, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::MainMenu, &new_game, &load, None, None),
             "New Game\nLoad Game\nSettings\nExit Game"
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None, None),
             "Resume\nSettings\nSave and Quit"
+        );
+        // With no message the main menu lists exactly its four rows; a
+        // transient main-menu message (the S03-T03 Save-and-Quit save
+        // failure note) appends as the main menu's last line when present.
+        let message = MenuMessage {
+            text: "could not save world: blocked".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::MainMenu,
+                &new_game,
+                &load,
+                None,
+                Some(&message)
+            ),
+            "New Game\nLoad Game\nSettings\nExit Game\ncould not save world: blocked"
         );
     }
 
@@ -2308,7 +2658,7 @@ mod tests {
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
-        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None);
+        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);
         assert!(text.contains("World Name: Deep Dark"));
         assert!(text.contains("Seed: 42"));
         assert!(text.contains("Randomize Seed"));
@@ -2316,7 +2666,7 @@ mod tests {
         assert!(text.contains("Back"));
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
-        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None);
+        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);
         assert!(text.ends_with("World name cannot be empty."));
     }
 
@@ -2327,7 +2677,7 @@ mod tests {
         // Empty catalog (fresh install / missing saves dir): not an error —
         // displayed as such, then Back.
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
             "(no saved worlds)\nBack"
         );
 
@@ -2343,24 +2693,30 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack"
         );
 
         // A pending delete appends the prompt-naming confirm row and cancel.
         assert!(load.request_delete(1));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack\nDelete 'broken'?\nCancel"
         );
 
-        // A transient load-screen message (seam, inline errors) appends last.
+        // A transient load-screen message (inline Play errors) appends last.
         let message = MenuMessage {
-            text: "world sessions start in the next milestone".to_string(),
+            text: "Could not load world \"alpha\"".to_string(),
             ticks_left: 1,
         };
-        let text = compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, Some(&message));
-        assert!(text.ends_with("world sessions start in the next milestone"));
+        let text = compose_screen_text(
+            LifecycleScreen::LoadGame,
+            &new_game,
+            &load,
+            Some(&message),
+            None,
+        );
+        assert!(text.ends_with("Could not load world \"alpha\""));
 
         // Settings composes through compose_menu_text instead; Playing
         // renders no screen text at all.
@@ -2369,12 +2725,13 @@ mod tests {
                 LifecycleScreen::Settings(SettingsCaller::MainMenu),
                 &new_game,
                 &load,
+                None,
                 None
             ),
             String::new()
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None),
+            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None, None),
             String::new()
         );
     }
@@ -2543,50 +2900,6 @@ mod tests {
         );
         assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
         assert!(!dir.path().parent().unwrap().join("escape.mcvx").exists());
-    }
-
-    #[test]
-    fn play_row_message_probes_the_catalog_and_surfaces_inline_errors() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let catalog = WorldCatalogFs::new(dir.path());
-        catalog.save_world("ghost", &sample_save(5)).expect("save ghost");
-        std::fs::write(dir.path().join("broken.mcvx"), b"NOPE!1234").expect("write broken");
-
-        let rows = catalog.list_rows();
-        let ghost = rows
-            .iter()
-            .find(|r| r.name == "ghost")
-            .expect("ghost row listed")
-            .clone();
-        let broken = rows
-            .iter()
-            .find(|r| r.name == "broken")
-            .expect("broken row listed")
-            .clone();
-
-        // A loadable row routes to the S03 seam (transient message; the
-        // probed save data is S03's to consume — none is written here).
-        let message = play_row_message(&catalog, &ghost);
-        assert_eq!(message.text, WORLD_START_SEAM_MESSAGE);
-        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
-
-        // A corrupt row surfaces its inline non-loadable display.
-        let message = play_row_message(&catalog, &broken);
-        assert!(
-            message.text.contains("cannot be loaded"),
-            "unexpected corrupt-row text: {}",
-            message.text
-        );
-
-        // Vanished between the listing and the Play click:
-        // CatalogLoadError::Load surfaces inline, never swallowed.
-        std::fs::remove_file(dir.path().join("ghost.mcvx")).expect("remove ghost");
-        let message = play_row_message(&catalog, &ghost);
-        assert!(
-            message.text.contains("Could not load world \"ghost\""),
-            "unexpected vanished-row text: {}",
-            message.text
-        );
     }
 
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
