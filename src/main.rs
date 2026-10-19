@@ -12,8 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use minecraft_clone::player::camera::Camera;
-use minecraft_clone::player::physics::{InputState, Player};
+use minecraft_clone::player::physics::InputState;
 use minecraft_clone::player::raycast::raycast_voxels;
 use minecraft_clone::render::buffer::ChunkRenderStore;
 use minecraft_clone::render::context::RenderContext;
@@ -41,12 +40,12 @@ use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::catalog::{CatalogRow, PendingDelete};
 use minecraft_clone::world::catalog_fs::WorldCatalogFs;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
-use minecraft_clone::world::manager::WorldManager;
+use minecraft_clone::WorldSession;
 use minecraft_clone::world::persistence::{
-    load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, SavedPlayerState,
-    WorldSaveData, DEFAULT_SAVE_PATH,
+    load_world_from_path, save_world_to_path, CliConfig, SavedPlayerState, WorldSaveData,
+    DEFAULT_SAVE_PATH,
 };
-use minecraft_clone::world::terrain::{terrain_height_at_seeded, DEFAULT_WORLD_SEED};
+use minecraft_clone::world::terrain::DEFAULT_WORLD_SEED;
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
@@ -93,21 +92,30 @@ fn apply_vsync(ctx: &mut RenderContext, vsync: bool) {
     ctx.surface.configure(&ctx.device, &ctx.config);
 }
 
-fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Player) -> bool {
+/// Save the active session's world to the session's own save path
+/// (S03-T02: every save site — F5 quick-save, streaming autosave on
+/// unload, pause Save-and-Quit, Exit Game, CloseRequested, OutOfMemory —
+/// funnels through this one session-tied function, so no site can drift
+/// back to writing cli.save_path). `save_world_to_path` creates parent
+/// directories atomically. Returns whether the write succeeded; on failure
+/// the session's world keeps its unsaved-changes flag for the next save
+/// opportunity (no log by convention; callers surface failures where a
+/// message slot exists).
+fn save_current_world(session: &mut WorldSession) -> bool {
     let data = WorldSaveData {
-        seed: world.seed(),
+        seed: session.world.seed(),
         player: SavedPlayerState {
-            position: player.position.to_array(),
-            yaw: player.yaw,
-            pitch: player.pitch,
-            fly_mode: player.fly_mode,
-            selected_slot: player.selected_slot as u8,
-            render_distance: world.render_distance() as u16,
+            position: session.player.position.to_array(),
+            yaw: session.player.yaw,
+            pitch: session.player.pitch,
+            fly_mode: session.player.fly_mode,
+            selected_slot: session.player.selected_slot as u8,
+            render_distance: session.world.render_distance() as u16,
         },
-        chunk_edits: world.chunk_edits().clone(),
+        chunk_edits: session.world.chunk_edits().clone(),
     };
-    if save_world_to_path(save_path, &data).is_ok() {
-        world.mark_saved();
+    if save_world_to_path(&session.save_path, &data).is_ok() {
+        session.world.mark_saved();
         true
     } else {
         false
@@ -174,6 +182,26 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
     cli.force_new_world
         || cli.seed_override.is_some()
         || cli.save_path != Path::new(DEFAULT_SAVE_PATH)
+}
+
+/// The startup world session, mirroring main()'s pre-S03 load-or-fresh
+/// block EXACTLY (byte-identical legacy behavior — including the
+/// default.mcvx launch and every CLI-flag direct launch — now testable
+/// without an event loop): when the cli save path exists and the launch
+/// did not force a new world, load it and rebuild the session via
+/// `WorldSession::session_from_save` (player state, seed, render
+/// distance, chunk edits) with `save_path = cli.save_path`; otherwise a
+/// fresh `WorldSession::new_session` at
+/// `cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED)` with the same save
+/// path.
+fn startup_session(cli: &CliConfig) -> WorldSession {
+    if !cli.force_new_world && cli.save_path.exists() {
+        if let Ok(save) = load_world_from_path(&cli.save_path) {
+            return WorldSession::session_from_save(save, cli.save_path.clone());
+        }
+    }
+    let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+    WorldSession::new_session(seed, cli.save_path.clone())
 }
 
 /// S03 seam: the single place a valid Create (new-game form) or a
@@ -497,10 +525,10 @@ struct Ready {
 struct GameApp {
     window: Option<Arc<Window>>,
     gpu: Option<Ready>,
-    cli: CliConfig,
-    world: WorldManager,
-    player: Player,
-    camera: Camera,
+    /// The active world session (S03-T02): world + player + camera + the
+    /// save path every save site writes to. One always-present session,
+    /// swapped atomically at `start_world_session`.
+    session: WorldSession,
     input: InputState,
     cursor_grabbed: bool,
     last_frame: Instant,
@@ -554,10 +582,7 @@ struct GameApp {
 }
 
 impl GameApp {
-    fn new(cli: CliConfig, world: WorldManager, player: Player) -> Self {
-        let mut camera = Camera::new(player.eye_position());
-        camera.yaw = player.yaw;
-        camera.pitch = player.pitch;
+    fn new(cli: CliConfig, mut session: WorldSession) -> Self {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
@@ -575,16 +600,15 @@ impl GameApp {
             LifecycleScreen::MainMenu
         };
         // The loaded Settings are the single source of truth for video
-        // parameters: FOV applies to the camera at construction (defaults
-        // are 75 degrees either way, so this is behavior-neutral).
-        camera.fov_y_radians = settings.fov_degrees.to_radians();
+        // parameters: FOV applies to the session's camera at startup
+        // (defaults are 75 degrees either way, so this is
+        // behavior-neutral). The session's camera arrives already synced
+        // to its player by the WorldSession constructors.
+        session.camera.fov_y_radians = settings.fov_degrees.to_radians();
         Self {
             window: None,
             gpu: None,
-            cli,
-            world,
-            player,
-            camera,
+            session,
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             last_frame: Instant::now(),
@@ -649,7 +673,7 @@ impl GameApp {
                     // Live apply: Camera reads `fov_y_radians` every frame
                     // in view_proj, so updating the pub field updates the
                     // projection with no reconstruction.
-                    self.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+                    self.session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
                     save_settings_or_warn(&mut self.menu, &self.settings);
                 }
             }
@@ -741,6 +765,38 @@ impl GameApp {
         self.lifecycle = LifecycleState::from_screen(LifecycleScreen::Playing);
     }
 
+    /// Swap in a new world session atomically — the ONE boundary a world
+    /// start flows through (S03-T02; Create/Play wire into it in T03). The
+    /// swap drops the outgoing session's CPU state wholesale, clears every
+    /// GPU chunk mesh via `ChunkRenderStore::clear` (a freshly started
+    /// world must never render the outgoing world's meshes — the streaming
+    /// pass re-uploads the new world's chunks as they load), and resets
+    /// held inputs (a swap can only be initiated from a menu screen, but
+    /// resetting here makes the boundary self-contained). The camera
+    /// arrives pre-synced to the new player by the WorldSession
+    /// constructors (`new_session`/`session_from_save` both sync it).
+    ///
+    /// No outgoing-session autosave happens here, by design: only Playing
+    /// can accumulate unsaved chunk edits, and every path out of Playing
+    /// (Pause → Save and Quit; Pause → Exit Game; CloseRequested) saves
+    /// the session first through `save_current_world`. Menu Create/Play
+    /// can only be reached from a screen, never from Playing, so a session
+    /// swapped here was already saved (or never edited). If a future path
+    /// ever swaps directly out of Playing, that path owns its save.
+    ///
+    /// Uncalled from Create/Play in this task (the S02 seam still shows
+    /// the transient message); it is directly unit-tested here instead —
+    /// hence the targeted allow, which only silences the non-test build
+    /// (the test build exercises the method and keeps the lint honest).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn start_world_session(&mut self, session: WorldSession) {
+        self.session = session;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.render_store.clear();
+        }
+        self.input.reset();
+    }
+
     /// Dispatch a lifecycle intent through the S01 state machine and apply
     /// the resulting decision (navigation, cursor/input resets,
     /// settings-menu sync, save-and-quit, exit). Returns the decision, or
@@ -765,20 +821,21 @@ impl GameApp {
             LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
             LifecycleDecision::ResumeGame => self.enter_playing(),
             LifecycleDecision::SaveAndQuit => {
-                // Save the current world to cli.save_path (the existing
-                // save path), then return to the main menu. A save failure
-                // is dropped by the same convention as the CloseRequested
-                // path: the world keeps its unsaved-changes flag and is
-                // saved again on the next save/exit opportunity (no log by
-                // convention; there is no menu message slot to surface it
-                // in until S03 owns the seam).
-                let _ = save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                // Save the session's world to the session's own save path
+                // (S03-T02: every save site is session-tied), then return
+                // to the main menu. A save failure is dropped by the same
+                // convention as the CloseRequested path: the world keeps
+                // its unsaved-changes flag and is saved again on the next
+                // save/exit opportunity (no log by convention; the
+                // transient main-menu failure message is S03-T03's to own
+                // at the seam).
+                let _ = save_current_world(&mut self.session);
                 self.enter_screen(LifecycleScreen::MainMenu);
             }
             LifecycleDecision::ExitGame => {
                 // Mirror the CloseRequested path: save the current world
                 // and settings, then exit the loop.
-                let _ = save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                let _ = save_current_world(&mut self.session);
                 let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
                 event_loop.exit();
             }
@@ -1135,7 +1192,7 @@ impl ApplicationHandler for GameApp {
 
         match event {
             WindowEvent::CloseRequested => {
-                let _ = save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                let _ = save_current_world(&mut self.session);
                 // Crash-safety settings save on quit: every accepted change
                 // already saved immediately, so this only catches anything
                 // not yet persisted (e.g. a hand-edited in-memory state).
@@ -1254,15 +1311,11 @@ impl ApplicationHandler for GameApp {
 
                     match code {
                         KeyCode::KeyF if pressed && !event.repeat => {
-                            self.player.fly_mode = !self.player.fly_mode;
-                            self.player.velocity = Vec3::ZERO;
+                            self.session.player.fly_mode = !self.session.player.fly_mode;
+                            self.session.player.velocity = Vec3::ZERO;
                         }
                         KeyCode::F5 if pressed && !event.repeat => {
-                            if save_current_world(
-                                &self.cli.save_path,
-                                &mut self.world,
-                                &self.player,
-                            ) {
+                            if save_current_world(&mut self.session) {
                                 self.last_saved_badge = Some(Instant::now());
                             }
                         }
@@ -1277,22 +1330,22 @@ impl ApplicationHandler for GameApp {
                             self.enter_screen(LifecycleScreen::Pause);
                         }
                         KeyCode::BracketLeft if pressed && !event.repeat => {
-                            let rd = (self.world.render_distance() - 2).max(4);
-                            self.world.set_render_distance(rd);
+                            let rd = (self.session.world.render_distance() - 2).max(4);
+                            self.session.world.set_render_distance(rd);
                         }
                         KeyCode::BracketRight if pressed && !event.repeat => {
-                            let rd = (self.world.render_distance() + 2).min(36);
-                            self.world.set_render_distance(rd);
+                            let rd = (self.session.world.render_distance() + 2).min(36);
+                            self.session.world.set_render_distance(rd);
                         }
-                        KeyCode::Digit1 if pressed => self.player.selected_slot = 0,
-                        KeyCode::Digit2 if pressed => self.player.selected_slot = 1,
-                        KeyCode::Digit3 if pressed => self.player.selected_slot = 2,
-                        KeyCode::Digit4 if pressed => self.player.selected_slot = 3,
-                        KeyCode::Digit5 if pressed => self.player.selected_slot = 4,
-                        KeyCode::Digit6 if pressed => self.player.selected_slot = 5,
-                        KeyCode::Digit7 if pressed => self.player.selected_slot = 6,
-                        KeyCode::Digit8 if pressed => self.player.selected_slot = 7,
-                        KeyCode::Digit9 if pressed => self.player.selected_slot = 8,
+                        KeyCode::Digit1 if pressed => self.session.player.selected_slot = 0,
+                        KeyCode::Digit2 if pressed => self.session.player.selected_slot = 1,
+                        KeyCode::Digit3 if pressed => self.session.player.selected_slot = 2,
+                        KeyCode::Digit4 if pressed => self.session.player.selected_slot = 3,
+                        KeyCode::Digit5 if pressed => self.session.player.selected_slot = 4,
+                        KeyCode::Digit6 if pressed => self.session.player.selected_slot = 5,
+                        KeyCode::Digit7 if pressed => self.session.player.selected_slot = 6,
+                        KeyCode::Digit8 if pressed => self.session.player.selected_slot = 7,
+                        KeyCode::Digit9 if pressed => self.session.player.selected_slot = 8,
                         // Rebindable gameplay keys (S04-T03): press sets the
                         // InputState flag, release clears it — both
                         // transitions route through the loaded keybind map
@@ -1342,8 +1395,8 @@ impl ApplicationHandler for GameApp {
                     }
                 };
                 if step != 0 {
-                    self.player.selected_slot =
-                        (self.player.selected_slot as isize + step).rem_euclid(9) as usize;
+                    self.session.player.selected_slot =
+                        (self.session.player.selected_slot as isize + step).rem_euclid(9) as usize;
                 }
             }
             WindowEvent::MouseInput {
@@ -1395,17 +1448,17 @@ impl ApplicationHandler for GameApp {
                 }
 
                 if let Some(hit) = raycast_voxels(
-                    self.camera.position,
-                    self.camera.forward(),
+                    self.session.camera.position,
+                    self.session.camera.forward(),
                     8.0,
-                    |x, y, z| self.world.get_block(x, y, z),
+                    |x, y, z| self.session.world.get_block(x, y, z),
                 ) {
                     match button {
                         MouseButton::Left => {
                             let bp = hit.block_pos;
-                            if self.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
+                            if self.session.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
                                 let remeshed =
-                                    self.world
+                                    self.session.world
                                         .set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
@@ -1419,10 +1472,10 @@ impl ApplicationHandler for GameApp {
                         }
                         MouseButton::Right => {
                             let ap = hit.adjacent_pos;
-                            if !self.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
-                                let place_block = BlockId::HOTBAR[self.player.selected_slot];
+                            if !self.session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
+                                let place_block = BlockId::HOTBAR[self.session.player.selected_slot];
                                 let remeshed =
-                                    self.world
+                                    self.session.world
                                         .set_block_immediate(ap.x, ap.y, ap.z, place_block);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
@@ -1468,21 +1521,21 @@ impl ApplicationHandler for GameApp {
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
                 if playing {
-                    self.player
-                        .update(dt, &self.input, |x, y, z| self.world.get_block(x, y, z));
-                    self.camera.position = self.player.eye_position();
-                    self.camera.yaw = self.player.yaw;
-                    self.camera.pitch = self.player.pitch;
+                    self.session.player
+                        .update(dt, &self.input, |x, y, z| self.session.world.get_block(x, y, z));
+                    self.session.camera.position = self.session.player.eye_position();
+                    self.session.camera.yaw = self.session.player.yaw;
+                    self.session.camera.pitch = self.session.player.pitch;
 
                     let (player_chunk, _) = world_to_chunk_and_local(
-                        self.player.position.x.floor() as i32,
-                        self.player.position.y.floor() as i32,
-                        self.player.position.z.floor() as i32,
+                        self.session.player.position.x.floor() as i32,
+                        self.session.player.position.y.floor() as i32,
+                        self.session.player.position.z.floor() as i32,
                     );
-                    let (new_meshes, unloaded) = self.world.update_streaming(player_chunk);
+                    let (new_meshes, unloaded) = self.session.world.update_streaming(player_chunk);
                     if !unloaded.is_empty()
-                        && self.world.has_unsaved_changes()
-                        && save_current_world(&self.cli.save_path, &mut self.world, &self.player)
+                        && self.session.world.has_unsaved_changes()
+                        && save_current_world(&mut self.session)
                     {
                         self.last_saved_badge = Some(Instant::now());
                     }
@@ -1500,10 +1553,10 @@ impl ApplicationHandler for GameApp {
                 }
 
                 let target_block = raycast_voxels(
-                    self.camera.position,
-                    self.camera.forward(),
+                    self.session.camera.position,
+                    self.session.camera.forward(),
                     8.0,
-                    |x, y, z| self.world.get_block(x, y, z),
+                    |x, y, z| self.session.world.get_block(x, y, z),
                 )
                 .map(|h| h.block_pos);
 
@@ -1637,10 +1690,10 @@ impl ApplicationHandler for GameApp {
                 match gpu.renderer.render_frame(
                     &gpu.ctx,
                     &gpu.render_store,
-                    &self.camera,
-                    self.world.render_distance(),
+                    &self.session.camera,
+                    self.session.world.render_distance(),
                     target_block,
-                    self.player.selected_slot,
+                    self.session.player.selected_slot,
                     ui_pass,
                 ) {
                     Ok(visible_chunks) => {
@@ -1650,8 +1703,8 @@ impl ApplicationHandler for GameApp {
                             let fps = (self.frame_count as f32 / elapsed).round() as u32;
                             let ms = (elapsed * 1000.0) / self.frame_count.max(1) as f32;
                             let vram_kb = gpu.render_store.total_vram_bytes / 1024;
-                            let mode = if self.player.fly_mode { "Fly" } else { "Walk" };
-                            let block_name = BlockId::HOTBAR[self.player.selected_slot].name();
+                            let mode = if self.session.player.fly_mode { "Fly" } else { "Walk" };
+                            let block_name = BlockId::HOTBAR[self.session.player.selected_slot].name();
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -1667,17 +1720,17 @@ impl ApplicationHandler for GameApp {
                                 fps,
                                 ms,
                                 visible_chunks,
-                                self.world.loaded_chunk_count(),
+                                self.session.world.loaded_chunk_count(),
                                 gpu.render_store.total_quads,
                                 vram_kb,
-                                self.player.position.x,
-                                self.player.position.y,
-                                self.player.position.z,
+                                self.session.player.position.x,
+                                self.session.player.position.y,
+                                self.session.player.position.z,
                                 mode,
-                                self.player.selected_slot + 1,
+                                self.session.player.selected_slot + 1,
                                 block_name,
-                                self.world.render_distance(),
-                                self.world.seed(),
+                                self.session.world.render_distance(),
+                                self.session.world.seed(),
                                 save_tag,
                             ));
                             self.title_timer = Instant::now();
@@ -1690,12 +1743,12 @@ impl ApplicationHandler for GameApp {
                                 "FPS {} | {:.1} ms | Pos ({:.0}, {:.0}, {:.0}) [{}] | Chunks {}/{}",
                                 fps,
                                 ms,
-                                self.player.position.x,
-                                self.player.position.y,
-                                self.player.position.z,
+                                self.session.player.position.x,
+                                self.session.player.position.y,
+                                self.session.player.position.z,
                                 mode,
                                 visible_chunks,
-                                self.world.loaded_chunk_count(),
+                                self.session.world.loaded_chunk_count(),
                             );
                             gpu.stats.update(
                                 &mut gpu.ui.font_system,
@@ -1710,7 +1763,7 @@ impl ApplicationHandler for GameApp {
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
                         let _ =
-                            save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                            save_current_world(&mut self.session);
                         event_loop.exit();
                     }
                     Err(wgpu::SurfaceError::Timeout) => {}
@@ -1741,9 +1794,9 @@ impl ApplicationHandler for GameApp {
                 // already clamped at load; menu adjustments clamp via the
                 // T01 helpers before every save.
                 let sensitivity = self.settings.mouse_sensitivity;
-                self.player.yaw += delta.0 as f32 * sensitivity;
-                self.player.pitch =
-                    (self.player.pitch - delta.1 as f32 * sensitivity).clamp(-1.54, 1.54);
+                self.session.player.yaw += delta.0 as f32 * sensitivity;
+                self.session.player.pitch =
+                    (self.session.player.pitch - delta.1 as f32 * sensitivity).clamp(-1.54, 1.54);
             }
         }
     }
@@ -1758,43 +1811,12 @@ impl ApplicationHandler for GameApp {
 fn main() {
     let cli = CliConfig::from_iter(std::env::args().skip(1));
 
-    let (world, player) = if !cli.force_new_world && cli.save_path.exists() {
-        match load_world_from_path(&cli.save_path) {
-            Ok(save) => {
-                let mut p = Player::new(Vec3::from_array(save.player.position));
-                p.yaw = save.player.yaw;
-                p.pitch = save.player.pitch;
-                p.fly_mode = save.player.fly_mode;
-                p.selected_slot = (save.player.selected_slot as usize).min(8);
-                let w = WorldManager::with_seed_and_edits(
-                    save.player.render_distance as i32,
-                    save.seed,
-                    save.chunk_edits,
-                );
-                (w, p)
-            }
-            Err(_) => {
-                let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
-                let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-                (
-                    WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-                    Player::new(Vec3::new(0.5, spawn_y, 0.5)),
-                )
-            }
-        }
-    } else {
-        let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
-        let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-        (
-            WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-            Player::new(Vec3::new(0.5, spawn_y, 0.5)),
-        )
-    };
+    let session = startup_session(&cli);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = GameApp::new(cli, world, player);
+    let mut app = GameApp::new(cli, session);
     event_loop.run_app(&mut app).expect("Event loop error");
 }
 
@@ -1803,6 +1825,11 @@ mod tests {
     use super::*;
     use minecraft_clone::ui::SettingsCaller;
     use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
+    use std::path::PathBuf;
+
+    use minecraft_clone::player::camera::Camera;
+    use minecraft_clone::world::persistence::ChunkEditMap;
+    use minecraft_clone::world::terrain::terrain_height_at_seeded;
 
     #[test]
     fn menu_text_lists_every_row_with_its_live_value() {
@@ -2101,6 +2128,147 @@ mod tests {
         );
         assert_eq!(handle_world_start("alpha", None), WORLD_START_SEAM_MESSAGE);
         assert!(!WORLD_START_SEAM_MESSAGE.is_empty());
+    }
+
+    #[test]
+    fn start_world_session_swaps_the_session_and_resets_input() {
+        // GameApp::new with a bare CliConfig and a directly-built session:
+        // no window/GPU needed (start_world_session tolerates gpu: None,
+        // which is exactly the headless case; the GPU-clear leg rides on
+        // the launch smoke script and S04's human UAT — see the honest
+        // limitation documented on `ChunkRenderStore::clear`).
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+        );
+        assert_eq!(app.session.world.seed(), 1);
+        assert_eq!(
+            app.session.save_path,
+            PathBuf::from("/nonexistent/initial.mcvx")
+        );
+
+        // Held inputs as if mid-gameplay; the boundary must reset them.
+        app.input.forward = true;
+        app.input.jump_or_up = true;
+        app.input.sprint = true;
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+        ));
+
+        assert_eq!(app.session.world.seed(), 42, "seed swapped");
+        assert_eq!(
+            app.session.save_path,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+            "save path swapped"
+        );
+        let expected_y = (terrain_height_at_seeded(0, 0, 42) + 4) as f32;
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(0.5, expected_y, 0.5),
+            "player swapped to the new world's spawn"
+        );
+        assert_eq!(
+            app.session.camera.position,
+            app.session.player.eye_position(),
+            "camera synced to the new player by the constructor"
+        );
+        assert_eq!(app.session.camera.yaw, app.session.player.yaw);
+        assert_eq!(app.session.camera.pitch, app.session.player.pitch);
+        assert!(
+            !app.input.forward && !app.input.jump_or_up && !app.input.sprint,
+            "input flags reset at the boundary"
+        );
+    }
+
+    #[test]
+    fn startup_session_loads_an_existing_save_file_at_the_cli_save_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("keep.mcvx");
+        let save_path_str = save_path.to_str().expect("utf-8 tempdir path").to_string();
+        let data = sample_save(31337);
+        save_world_to_path(&save_path, &data).expect("write save file");
+
+        let cli = CliConfig::from_iter(["--save", save_path_str.as_str()]);
+        let session = startup_session(&cli);
+        assert_eq!(session.world.seed(), 31337);
+        assert_eq!(
+            session.player.position,
+            Vec3::from_array(data.player.position)
+        );
+        assert_eq!(session.player.yaw, 0.5);
+        assert_eq!(session.player.pitch, -0.25);
+        assert!(session.player.fly_mode);
+        assert_eq!(session.player.selected_slot, 2);
+        assert_eq!(session.world.render_distance(), 16);
+        assert_eq!(session.save_path, save_path, "session owns the cli save path");
+        assert_eq!(
+            session.camera.position,
+            session.player.eye_position(),
+            "camera synced from the loaded player"
+        );
+    }
+
+    #[test]
+    fn startup_session_yields_a_fresh_session_when_the_save_is_missing_or_new_forced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Missing file + seed override: fresh session at the override seed.
+        let missing = dir.path().join("missing.mcvx");
+        let cli = CliConfig::from_iter([
+            "--save",
+            missing.to_str().unwrap(),
+            "--seed",
+            "777",
+        ]);
+        let session = startup_session(&cli);
+        assert_eq!(session.world.seed(), 777);
+        assert_eq!(session.save_path, missing);
+        let expected_y = (terrain_height_at_seeded(0, 0, 777) + 4) as f32;
+        assert_eq!(
+            session.player.position,
+            Vec3::new(0.5, expected_y, 0.5),
+            "spawn mirrors main()'s fresh branch"
+        );
+
+        // Missing file, no override: the default seed.
+        let missing2 = dir.path().join("other.mcvx");
+        let cli = CliConfig::from_iter(["--save", missing2.to_str().unwrap()]);
+        let session = startup_session(&cli);
+        assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
+        assert_eq!(session.save_path, missing2);
+
+        // Corrupt save file: falls back to a fresh session (legacy
+        // behavior — main() matched Err(_) the same way).
+        let corrupt = dir.path().join("corrupt.mcvx");
+        std::fs::write(&corrupt, b"NOPE!1234").expect("write corrupt save");
+        let cli = CliConfig::from_iter(["--save", corrupt.to_str().unwrap()]);
+        let session = startup_session(&cli);
+        assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
+        assert_eq!(
+            session.player.position.y,
+            (terrain_height_at_seeded(0, 0, DEFAULT_WORLD_SEED) + 4) as f32,
+            "corrupt save falls back to the default-seed spawn"
+        );
+
+        // --new forces a fresh session even when a save file exists
+        // (legacy direct-launch behavior, byte-identical).
+        let existing = dir.path().join("ignored.mcvx");
+        save_world_to_path(&existing, &sample_save(999)).expect("write existing save");
+        let cli = CliConfig::from_iter([
+            "--save",
+            existing.to_str().unwrap(),
+            "--new",
+            "--seed",
+            "5",
+        ]);
+        let session = startup_session(&cli);
+        assert_eq!(session.world.seed(), 5, "force_new ignores the existing save");
+        let expected_y = (terrain_height_at_seeded(0, 0, 5) + 4) as f32;
+        assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        assert_eq!(session.save_path, existing);
     }
 
     #[test]
