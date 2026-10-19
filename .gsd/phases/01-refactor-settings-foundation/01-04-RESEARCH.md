@@ -67,3 +67,4 @@ One glyphon `Buffer` per menu instance holding all lines (set_text with `\n`-joi
 
 - `npx skills find` is blocked by this unit's tools policy (planning-dispatch, read-only bash); no external skill discovery performed. All technologies (winit 0.30, wgpu 0.19, glyphon 0.5, serde/toml) are already established locally with prior-slice patterns and memory notes — no new core technology requires a skill.
 - The loaded `observability` skill is not directly applicable (this is a player-facing interactive UI, not an unattended process); its one relevant echo is S02's design: warnings/conflicts already surface as structured data for the menu to display, and save failures return `io::Error` to the caller rather than being swallowed — keep that explicit-failure style in the menu wiring (e.g. surface a save error in the menu instead of ignoring it).
+<!-- gsd:state-version=131:1 -->

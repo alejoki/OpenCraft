@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "bash",
+    "toolCallId": "chatcmpl-tool-87d16b9e4ad940d1",
+    "command": "ls src/ui/ src/settings/ && grep -rn \"menu\" src/ --include=\"*.rs\" | head -5; grep -c \"#\\[test\\]\" src/settings/mod.rs src/settings/keybind.rs src/ui/quad.rs 2>/dev/null; echo ---; grep -rn \"#\\[test\\]\" src/ --include=\"*.rs\" | wc -l",
+    "exitCode": 0,
+    "outputSnippet": "src/settings/:\nkeybind.rs\nmod.rs\n\nsrc/ui/:\nmod.rs\nquad.rs\ntext.rs\nsrc/settings/mod.rs:23\nsrc/settings/keybind.rs:8\nsrc/ui/quad.rs:5\n---\n59\n",
+    "timestamp": 1792402219355
+  },
+  {
+    "kind": "edit",
+    "toolCallId": "chatcmpl-tool-8a1e9193dea40a9a",
+    "path": "src/settings/mod.rs",
+    "timestamp": 1792402242795
+  },
+  {
+    "kind": "edit",
+    "toolCallId": "chatcmpl-tool-8ed3ce052a510812",
+    "path": "src/ui/mod.rs",
+    "timestamp": 1792402242813
+  }
+]

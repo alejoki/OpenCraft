@@ -9,10 +9,18 @@ use winit::keyboard::KeyCode;
 /// Default settings file path, for S04's wiring to use.
 pub const DEFAULT_SETTINGS_PATH: &str = "settings.toml";
 
-const SENSITIVITY_MIN: f64 = 0.0001;
-const SENSITIVITY_MAX: f64 = 0.01;
-const FOV_MIN: f64 = 30.0;
-const FOV_MAX: f64 = 120.0;
+/// Inclusive lower bound for `mouse.sensitivity` (f64): values below this
+/// clamp up on load and on menu adjustment. Public so the S04 settings menu
+/// clamps its live adjustments through the same single source of truth.
+pub const SENSITIVITY_MIN: f64 = 0.0001;
+/// Inclusive upper bound for `mouse.sensitivity` (f64); see `SENSITIVITY_MIN`.
+pub const SENSITIVITY_MAX: f64 = 0.01;
+/// Inclusive lower bound for `video.fov` in degrees (f64): values below this
+/// clamp up on load and on menu adjustment. Public so the S04 settings menu
+/// clamps its live FOV adjustments through the same single source of truth.
+pub const FOV_MIN: f64 = 30.0;
+/// Inclusive upper bound for `video.fov` in degrees (f64); see `FOV_MIN`.
+pub const FOV_MAX: f64 = 120.0;
 
 /// Player keybind preferences, mirroring `InputState` in
 /// `src/player/physics.rs`: exactly one physical key per action.

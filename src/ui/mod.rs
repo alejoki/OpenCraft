@@ -1,3 +1,4 @@
+pub mod menu;
 pub mod quad;
 pub mod text;
 
