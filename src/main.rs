@@ -10,7 +10,7 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use minecraft_clone::player::camera::Camera;
 use minecraft_clone::player::physics::{InputState, Player};
@@ -54,6 +54,22 @@ fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
     }
+}
+
+/// Apply the vsync setting to the surface's present mode and reconfigure
+/// (the same set-present_mode-then-configure mechanism the resize path
+/// uses; `ctx.config` is pub). `Fifo` (blocking, always supported) when
+/// vsync is on; uncapped `Immediate` when off. NOTE: on Wayland the
+/// compositor may not honor `Immediate` — presenting then degrades to the
+/// compositor's schedule (an accepted visual no-op per plan; do not fight
+/// the compositor).
+fn apply_vsync(ctx: &mut RenderContext, vsync: bool) {
+    ctx.config.present_mode = if vsync {
+        wgpu::PresentMode::Fifo
+    } else {
+        wgpu::PresentMode::Immediate
+    };
+    ctx.surface.configure(&ctx.device, &ctx.config);
 }
 
 fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Player) -> bool {
@@ -128,6 +144,18 @@ fn adjust_direction(button: MouseButton) -> Option<AdjustDirection> {
         MouseButton::Left => Some(AdjustDirection::Up),
         MouseButton::Right => Some(AdjustDirection::Down),
         _ => None,
+    }
+}
+
+/// Save settings atomically (tmp-sibling + rename) and surface an
+/// io::Error as an in-menu message instead of swallowing it (D006: the
+/// crate stays log-free; failure data is displayed, never dropped).
+/// Free function with disjoint args (not a `&mut self` method) so both
+/// the whole-`self` `menu_click` call site and the keyboard rebind path
+/// can call it while the `gpu`/`window` field borrows are live (P005).
+fn save_settings_or_warn(menu: &mut menu::SettingsMenu, settings: &Settings) {
+    if let Err(err) = settings.save(Path::new(DEFAULT_SETTINGS_PATH)) {
+        menu.set_message(format!("could not save settings: {err}"));
     }
 }
 
@@ -223,6 +251,10 @@ impl GameApp {
         // as menu text on the first open.
         let (settings, startup_warnings) =
             load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        // The loaded Settings are the single source of truth for video
+        // parameters: FOV applies to the camera at construction (defaults
+        // are 75 degrees either way, so this is behavior-neutral).
+        camera.fov_y_radians = settings.fov_degrees.to_radians();
         Self {
             window: None,
             gpu: None,
@@ -249,7 +281,13 @@ impl GameApp {
     /// Route one mouse click while the menu is open: hit-test the row under
     /// the cursor and apply that row's action. Clicks outside the panel are
     /// ignored (no accidental gameplay); a `None` cursor position (cursor
-    /// left the window) is ignored too.
+    /// left the window) is ignored too. Every accepted change saves
+    /// immediately (crash-safe, never deferred). Sensitivity, FOV (live to
+    /// the camera's pub `fov_y_radians`), and fullscreen (live via the
+    /// `window` param) apply HERE; the vsync row only toggles + saves here
+    /// — its surface reconfigure needs the RenderContext, whose borrow
+    /// cannot coexist with this whole-`self` method, so the caller applies
+    /// it right after (P005).
     fn menu_click(
         &mut self,
         window: &Window,
@@ -270,39 +308,45 @@ impl GameApp {
                     // (only load clamps), so the T01 helper is mandatory here.
                     self.settings.mouse_sensitivity =
                         menu::adjust_sensitivity(self.settings.mouse_sensitivity, direction);
-                    self.save_settings_or_warn();
+                    save_settings_or_warn(&mut self.menu, &self.settings);
                 }
             }
             MenuRow::Fov => {
                 if let Some(direction) = adjust_direction(button) {
                     self.settings.fov_degrees =
                         menu::adjust_fov(self.settings.fov_degrees, direction);
-                    self.save_settings_or_warn();
+                    // Live apply: Camera reads `fov_y_radians` every frame
+                    // in view_proj, so updating the pub field updates the
+                    // projection with no reconstruction.
+                    self.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+                    save_settings_or_warn(&mut self.menu, &self.settings);
                 }
             }
             MenuRow::Fullscreen => {
                 self.settings.fullscreen = !self.settings.fullscreen;
-                self.save_settings_or_warn();
+                // Live apply: borderless fullscreen on, windowed off. The
+                // resulting Resized flows through the existing ctx.resize
+                // + overlay re-shape path; the menu layout derives per
+                // frame from ctx.config.width/height so it reflows
+                // automatically — no cached rects survive a Resized.
+                if self.settings.fullscreen {
+                    window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                } else {
+                    window.set_fullscreen(None);
+                }
+                save_settings_or_warn(&mut self.menu, &self.settings);
             }
             MenuRow::Vsync => {
                 self.settings.vsync = !self.settings.vsync;
-                self.save_settings_or_warn();
+                // The live present-mode swap happens in the caller (needs
+                // the RenderContext; see the doc comment above).
+                save_settings_or_warn(&mut self.menu, &self.settings);
             }
             MenuRow::Close => {
                 self.menu.close();
                 self.cursor_grabbed = true;
                 set_cursor_grab(window, true);
             }
-        }
-    }
-
-    /// Save settings atomically and surface an io::Error as an in-menu
-    /// message instead of swallowing it (D006: the crate stays log-free;
-    /// failure data is displayed, never dropped).
-    fn save_settings_or_warn(&mut self) {
-        if let Err(err) = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH)) {
-            self.menu
-                .set_message(format!("could not save settings: {err}"));
         }
     }
 }
@@ -325,12 +369,24 @@ impl ApplicationHandler for GameApp {
                 .expect("Failed to create window"),
         );
 
-        let ctx = RenderContext::new(window.clone());
+        let mut ctx = RenderContext::new(window.clone());
         let renderer = VoxelRenderer::new(&ctx);
         let render_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
+
+        // Loaded video settings apply at startup too (the loaded Settings
+        // are the single source of truth for video parameters): borderless
+        // fullscreen when enabled, and the Fifo present mode when vsync is
+        // on (RenderContext::new prefers uncapped Immediate, which matches
+        // the vsync=false default — only vsync=true needs the override).
+        if self.settings.fullscreen {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+        if self.settings.vsync {
+            apply_vsync(&mut ctx, true);
+        }
 
         self.cursor_grabbed = true;
         set_cursor_grab(&window, true);
@@ -361,6 +417,12 @@ impl ApplicationHandler for GameApp {
         match event {
             WindowEvent::CloseRequested => {
                 let _ = save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                // Crash-safety settings save on quit: every accepted change
+                // already saved immediately, so this only catches anything
+                // not yet persisted (e.g. a hand-edited in-memory state).
+                // Save errors are ignored here — the process is exiting and
+                // there is no menu left to display them in.
+                let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
                 event_loop.exit();
             }
             WindowEvent::Focused(false) => {
@@ -416,7 +478,7 @@ impl ApplicationHandler for GameApp {
                                         // as in-menu text instead of being
                                         // swallowed.
                                         action.set_key(&mut self.settings.keybinds, key);
-                                        self.save_settings_or_warn();
+                                        save_settings_or_warn(&mut self.menu, &self.settings);
                                         self.menu.finish_capture();
                                         // The menu text composes per frame
                                         // from the live settings, so the new
@@ -552,9 +614,24 @@ impl ApplicationHandler for GameApp {
                 if self.menu.is_open() {
                     let (surface_w, surface_h) =
                         (gpu.ctx.config.width, gpu.ctx.config.height);
+                    // Hit-test the clicked row BEFORE the whole-`self`
+                    // menu_click call (which must not overlap the live
+                    // gpu/window field borrows): only the Vsync row needs a
+                    // post-call surface reconfigure, and that needs gpu.
+                    let clicked = self
+                        .cursor_pos
+                        .and_then(|pos| menu::hovered_row(pos, surface_w, surface_h));
                     let window = window.clone();
                     let cursor = self.cursor_pos;
                     self.menu_click(&window, button, cursor, surface_w, surface_h);
+                    if clicked == Some(MenuRow::Vsync) {
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            // Live apply: Fifo/Immediate present mode +
+                            // surface reconfigure (the resize path's
+                            // mechanism; see `apply_vsync`).
+                            apply_vsync(&mut gpu.ctx, self.settings.vsync);
+                        }
+                    }
                     return;
                 }
 
@@ -868,7 +945,10 @@ impl ApplicationHandler for GameApp {
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.cursor_grabbed {
-                let sensitivity = 0.0022;
+                // Settings-driven sensitivity (S04-T04): the loaded value,
+                // already clamped at load; menu adjustments clamp via the
+                // T01 helpers before every save.
+                let sensitivity = self.settings.mouse_sensitivity;
                 self.player.yaw += delta.0 as f32 * sensitivity;
                 self.player.pitch = (self.player.pitch - delta.1 as f32 * sensitivity)
                     .clamp(-1.54, 1.54);
@@ -1014,6 +1094,19 @@ mod tests {
         assert_eq!(adjust_direction(MouseButton::Right), Some(AdjustDirection::Down));
         assert_eq!(adjust_direction(MouseButton::Middle), None);
         assert_eq!(adjust_direction(MouseButton::Back), None);
+    }
+
+    #[test]
+    fn default_settings_fov_matches_camera_default_fov() {
+        // Wiring guard for the settings-driven FOV (S04-T04): GameApp::new
+        // now copies fov_degrees.to_radians() onto the camera at startup,
+        // so the default settings FOV must equal Camera::new's hardcoded
+        // 75-degree default — the source-of-truth swap stays neutral.
+        let camera = Camera::new(Vec3::ZERO);
+        assert_eq!(
+            camera.fov_y_radians,
+            Settings::default().fov_degrees.to_radians()
+        );
     }
 
     #[test]
