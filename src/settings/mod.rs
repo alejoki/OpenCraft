@@ -1,5 +1,7 @@
 pub mod keybind;
 
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use winit::keyboard::KeyCode;
@@ -78,6 +80,156 @@ impl Default for Settings {
 pub struct SettingsWarning {
     pub field: String,
     pub reason: String,
+}
+
+/// One duplicate-keybind conflict: the colliding action names and the
+/// shared `KeyCode`. Returned as data (not logged) so the loader can warn
+/// without blocking launch and S04's rebind flow can reject duplicate
+/// assignments from the same one function.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeybindConflict {
+    pub actions: Vec<&'static str>,
+    pub key: KeyCode,
+}
+
+impl Settings {
+    /// Scan the 7 keybind actions and report one conflict per duplicated
+    /// `KeyCode`, listing the actions sharing it. Empty for the defaults.
+    pub fn validate_keybinds(&self) -> Vec<KeybindConflict> {
+        let Keybinds {
+            forward,
+            backward,
+            left,
+            right,
+            jump_or_up,
+            crouch_or_down,
+            sprint,
+        } = self.keybinds;
+        let actions: [(&'static str, KeyCode); 7] = [
+            ("forward", forward),
+            ("backward", backward),
+            ("left", left),
+            ("right", right),
+            ("jump_or_up", jump_or_up),
+            ("crouch_or_down", crouch_or_down),
+            ("sprint", sprint),
+        ];
+
+        // Group action names by shared KeyCode, preserving declaration
+        // order; any group larger than one is a conflict.
+        let mut groups: Vec<(KeyCode, Vec<&'static str>)> = Vec::new();
+        for (name, code) in actions {
+            match groups.iter_mut().find(|(key, _)| *key == code) {
+                Some((_, names)) => names.push(name),
+                None => groups.push((code, vec![name])),
+            }
+        }
+
+        groups
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(key, names)| KeybindConflict {
+                actions: names,
+                key,
+            })
+            .collect()
+    }
+
+    /// Atomically save settings to `path` as TOML in the documented format.
+    ///
+    /// Serialized through a private Serialize-only mirror (never
+    /// Deserialize: loading goes through the two-phase per-field-fallback
+    /// parser so a bad field can never abort its siblings). Writes to a
+    /// `.toml.tmp` sibling, syncs, then renames over the target (the
+    /// pattern from `src/world/persistence.rs save_world_to_path`), so a
+    /// crash mid-save cannot corrupt the previous file. IO failures bubble
+    /// as `std::io::Result`.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let mirror = SettingsToml {
+            keybinds: KeybindsToml {
+                forward: keybind_string(self.keybinds.forward, "forward"),
+                backward: keybind_string(self.keybinds.backward, "backward"),
+                left: keybind_string(self.keybinds.left, "left"),
+                right: keybind_string(self.keybinds.right, "right"),
+                jump_or_up: keybind_string(self.keybinds.jump_or_up, "jump_or_up"),
+                crouch_or_down: keybind_string(
+                    self.keybinds.crouch_or_down,
+                    "crouch_or_down",
+                ),
+                sprint: keybind_string(self.keybinds.sprint, "sprint"),
+            },
+            mouse: MouseToml {
+                sensitivity: f64::from(self.mouse_sensitivity),
+            },
+            video: VideoToml {
+                fov: f64::from(self.fov_degrees),
+                fullscreen: self.fullscreen,
+                vsync: self.vsync,
+            },
+        };
+
+        let contents = toml::to_string(&mirror)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let tmp_path = path.with_extension("toml.tmp");
+        {
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(contents.as_bytes())?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+}
+
+/// Map a keybind to its stable settings string. A key outside the table is
+/// a bug at save time (every default is mapped, and the round-trip and
+/// format tests guard the mapping), so panic with a precise message.
+fn keybind_string(code: KeyCode, action: &'static str) -> String {
+    keybind::key_to_string(code)
+        .unwrap_or_else(|| panic!("no settings string mapping for {action}'s key {code:?}"))
+        .to_owned()
+}
+
+/// Serialize-only mirror of `Settings` matching the documented TOML format
+/// exactly. Never derive Deserialize here: loading uses the two-phase
+/// per-field-fallback parser, not serde (see pattern P001 in KNOWLEDGE.md).
+#[derive(serde::Serialize)]
+struct SettingsToml {
+    keybinds: KeybindsToml,
+    mouse: MouseToml,
+    video: VideoToml,
+}
+
+#[derive(serde::Serialize)]
+struct KeybindsToml {
+    forward: String,
+    backward: String,
+    left: String,
+    right: String,
+    jump_or_up: String,
+    crouch_or_down: String,
+    sprint: String,
+}
+
+#[derive(serde::Serialize)]
+struct MouseToml {
+    sensitivity: f64,
+}
+
+#[derive(serde::Serialize)]
+struct VideoToml {
+    fov: f64,
+    fullscreen: bool,
+    vsync: bool,
 }
 
 /// Load settings from `path`, discarding warnings. Thin wrapper over
@@ -161,6 +313,20 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
                 ),
             }),
         }
+    }
+
+    // Duplicate keybinds surface as data: one warning per conflict (never
+    // blocking launch), with both values kept for S04's rebind flow to
+    // resolve.
+    for conflict in settings.validate_keybinds() {
+        warnings.push(SettingsWarning {
+            field: "keybinds".to_string(),
+            reason: format!(
+                "duplicate keybind: {:?} is bound to multiple actions: {}",
+                conflict.key,
+                conflict.actions.join(", ")
+            ),
+        });
     }
 
     if let Some(mouse_value) = root.get("mouse") {
@@ -557,5 +723,133 @@ vsync = false
 
         let bad = write_settings_file(&dir, "]]garbage[[");
         assert_eq!(load(&bad), Settings::default());
+    }
+
+    // --- T03: save, duplicate-keybind validation, round-trip ---
+
+    #[test]
+    fn round_trip_preserves_non_default_settings_with_zero_warnings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let original = Settings {
+            keybinds: Keybinds {
+                jump_or_up: KeyCode::ArrowUp,
+                ..Keybinds::default()
+            },
+            mouse_sensitivity: 0.005,
+            fov_degrees: 90.0,
+            fullscreen: true,
+            vsync: true,
+        };
+        original.save(&path).unwrap();
+        let (loaded, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn defaults_round_trip_exactly_with_zero_warnings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        Settings::default().save(&path).unwrap();
+        let (loaded, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(loaded, Settings::default());
+    }
+
+    #[test]
+    fn saved_file_matches_the_documented_format() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        Settings::default().save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[keybinds]"));
+        assert!(text.contains("forward = \"KeyW\""));
+        assert!(text.contains("jump_or_up = \"Space\""));
+        assert!(text.contains("crouch_or_down = \"ShiftLeft\""));
+        assert!(text.contains("[mouse]"));
+        assert!(text.contains("[video]"));
+        assert!(text.contains("fullscreen = false"));
+        assert!(text.contains("vsync = false"));
+    }
+
+    #[test]
+    fn duplicate_keybinds_load_with_conflict_warning_and_both_values_kept() {
+        let dir = tempdir().unwrap();
+        let contents = r#"
+[keybinds]
+forward = "KeyW"
+jump_or_up = "KeyW"
+"#;
+        let path = write_settings_file(&dir, contents);
+        let (settings, warnings) = load_with_warnings(&path);
+        // never blocks launch: both values load and are kept
+        assert_eq!(settings.keybinds.forward, KeyCode::KeyW);
+        assert_eq!(settings.keybinds.jump_or_up, KeyCode::KeyW);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field, "keybinds");
+        assert!(warnings[0].reason.contains("forward"));
+        assert!(warnings[0].reason.contains("jump_or_up"));
+        assert!(warnings[0].reason.contains("KeyW"));
+        // the same validate function reports the conflict for S04's rebind flow
+        let conflicts = settings.validate_keybinds();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, KeyCode::KeyW);
+        assert!(conflicts[0].actions.contains(&"forward"));
+        assert!(conflicts[0].actions.contains(&"jump_or_up"));
+    }
+
+    #[test]
+    fn validate_keybinds_on_defaults_reports_no_conflicts() {
+        assert!(Settings::default().validate_keybinds().is_empty());
+    }
+
+    #[test]
+    fn triple_duplicate_reports_one_conflict_listing_all_actions() {
+        let keybinds = Keybinds {
+            left: KeyCode::KeyW,
+            jump_or_up: KeyCode::KeyW,
+            ..Keybinds::default()
+        };
+        let settings = Settings {
+            keybinds,
+            ..Settings::default()
+        };
+        let conflicts = settings.validate_keybinds();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, KeyCode::KeyW);
+        assert_eq!(conflicts[0].actions, vec!["forward", "left", "jump_or_up"]);
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories_and_overwrites_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("nested")
+            .join("deeper")
+            .join("settings.toml");
+        Settings::default().save(&path).unwrap();
+        assert!(path.is_file());
+        assert_eq!(load(&path), Settings::default());
+
+        let changed = Settings {
+            mouse_sensitivity: 0.005,
+            fov_degrees: 90.0,
+            vsync: true,
+            ..Settings::default()
+        };
+        changed.save(&path).unwrap();
+        assert_eq!(load(&path), changed);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file_behind_on_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        Settings::default().save(&path).unwrap();
+        assert!(path.is_file());
+        assert!(!path.with_extension("toml.tmp").exists());
+        assert!(dir.path().read_dir().unwrap().count() == 1);
     }
 }
