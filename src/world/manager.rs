@@ -4,8 +4,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::mesh::greedy::{mesh_chunk, PaddedChunk};
 use crate::mesh::quad::ChunkMesh;
 use crate::world::block::BlockId;
-use crate::world::chunk::{world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE};
-use crate::world::terrain::generate_chunk;
+use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::persistence::ChunkEditMap;
+use crate::world::terrain::{generate_chunk_seeded, DEFAULT_WORLD_SEED};
 
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
@@ -23,6 +24,9 @@ pub struct WorldManager {
     render_distance: i32,
     last_center: Option<ChunkPos>,
     spiral_offsets: Vec<(i32, i32)>,
+    world_seed: u32,
+    chunk_edits: ChunkEditMap,
+    unsaved_changes: bool,
 }
 
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
@@ -42,6 +46,18 @@ fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
 
 impl WorldManager {
     pub fn new(render_distance: i32) -> Self {
+        Self::with_seed_and_edits(
+            render_distance,
+            DEFAULT_WORLD_SEED,
+            ChunkEditMap::default(),
+        )
+    }
+
+    pub fn with_seed_and_edits(
+        render_distance: i32,
+        seed: u32,
+        chunk_edits: ChunkEditMap,
+    ) -> Self {
         let rd = render_distance.clamp(4, 36);
         let (gen_tx, gen_rx) = unbounded();
         let (mesh_tx, mesh_rx) = unbounded();
@@ -58,11 +74,47 @@ impl WorldManager {
             render_distance: rd,
             last_center: None,
             spiral_offsets: build_spiral_offsets(rd),
+            world_seed: seed,
+            chunk_edits,
+            unsaved_changes: false,
         }
     }
 
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
         self.chunks.insert(pos, chunk);
+    }
+
+    #[inline]
+    pub fn seed(&self) -> u32 {
+        self.world_seed
+    }
+
+    #[inline]
+    pub fn chunk_edits(&self) -> &ChunkEditMap {
+        &self.chunk_edits
+    }
+
+    #[inline]
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.unsaved_changes
+    }
+
+    #[inline]
+    pub fn mark_saved(&mut self) {
+        self.unsaved_changes = false;
+    }
+
+    pub fn dirty_mesh_queue_len(&self) -> usize {
+        self.dirty_mesh_queue.len()
+    }
+
+    pub fn queue_all_loaded_for_test(&mut self) {
+        let keys: Vec<ChunkPos> = self.chunks.keys().copied().collect();
+        for pos in keys {
+            if self.has_all_face_neighbors(pos) {
+                self.dirty_mesh_queue.insert(pos);
+            }
+        }
     }
 
     #[inline]
@@ -257,6 +309,12 @@ impl WorldManager {
         chunk.set(lx, ly, lz, block);
         chunk.try_compress();
 
+        self.chunk_edits
+            .entry(cpos)
+            .or_default()
+            .insert(linear_index(lx, ly, lz) as u16, block);
+        self.unsaved_changes = true;
+
         let mut dirty = vec![cpos];
         let last = CHUNK_SIZE - 1;
         if lx == 0 {
@@ -297,10 +355,16 @@ impl WorldManager {
 
         // 1. Drain up to 48 generated chunks per frame
         for _ in 0..48 {
-            let Ok((pos, chunk)) = self.gen_rx.try_recv() else {
+            let Ok((pos, mut chunk)) = self.gen_rx.try_recv() else {
                 break;
             };
             self.pending_gen.remove(&pos);
+            if let Some(edits) = self.chunk_edits.get(&pos) {
+                for (&idx, &block) in edits {
+                    chunk.set_by_index(idx, block);
+                }
+                chunk.try_compress();
+            }
             self.chunks.insert(pos, chunk);
 
             // Check if this chunk and its 6 neighbors can now be queued for meshing
@@ -359,6 +423,7 @@ impl WorldManager {
 
         // 4. Dispatch new terrain generation tasks in spiral order around center_chunk
         let mut dispatched_gen = 0;
+        let seed = self.world_seed;
         'spiral: for &(dx, dz) in &self.spiral_offsets {
             if self.pending_gen.len() >= 96 || dispatched_gen >= 32 {
                 break;
@@ -371,7 +436,7 @@ impl WorldManager {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
                     rayon::spawn(move || {
-                        let chunk = generate_chunk(pos);
+                        let chunk = generate_chunk_seeded(pos, seed);
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -382,7 +447,19 @@ impl WorldManager {
             }
         }
 
-        // 5. Dispatch meshing tasks for chunks inside render_distance whose 6 neighbors are ready
+        // 5. Fast-clear any Uniform(Air) chunks from dirty_mesh_queue before counting the 24-chunk frame budget
+        let mut empty_air_chunks = Vec::new();
+        for &pos in &self.dirty_mesh_queue {
+            if self.chunks.get(&pos).and_then(|c| c.is_uniform()) == Some(BlockId::Air) {
+                empty_air_chunks.push(pos);
+            }
+        }
+        for pos in empty_air_chunks {
+            self.dirty_mesh_queue.remove(&pos);
+            self.meshed_chunks.insert(pos);
+        }
+
+        // Dispatch meshing tasks for chunks inside render_distance whose 6 neighbors are ready
         let rd2 = self.render_distance * self.render_distance;
         let mut ready_to_mesh: Vec<ChunkPos> = self
             .dirty_mesh_queue
@@ -488,5 +565,64 @@ mod tests {
             !completed.iter().any(|(p, _)| *p == cpos),
             "stale in-flight mesh must be ignored after set_block_immediate"
         );
+    }
+
+    #[test]
+    fn test_chunk_edits_persist_across_unload_and_regeneration() {
+        let mut mgr = WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
+        let c0 = ChunkPos::new(0, 1, 0);
+        let c_neg_x = ChunkPos::new(-1, 1, 0);
+        for dx in -2..=1 {
+            for dy in 0..=2 {
+                for dz in -1..=1 {
+                    let p = ChunkPos::new(dx, dy, dz);
+                    mgr.insert_chunk_for_test(p, generate_chunk_seeded(p, 1337));
+                }
+            }
+        }
+
+        // Place a Brick block at wx = 0, wy = 40, wz = 5 (local x = 0 of chunk (0, 1, 0))
+        mgr.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(mgr.has_unsaved_changes());
+        assert_eq!(mgr.get_block(0, 40, 5), BlockId::Brick);
+
+        // Move player far away (chunk 100, 1, 100) to force unloading chunk (0, 1, 0)
+        let (_, unloaded) = mgr.update_streaming(ChunkPos::new(100, 1, 100));
+        assert!(unloaded.contains(&c0));
+        assert_eq!(mgr.get_block(0, 40, 5), BlockId::Air);
+
+        // Move back to (0, 1, 0) and pump streaming until (0, 1, 0) regenerates
+        for _ in 0..40 {
+            mgr.update_streaming(c0);
+            if mgr.get_block(0, 40, 5) == BlockId::Brick {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(mgr.get_block(0, 40, 5), BlockId::Brick);
+        let _ = c_neg_x;
+    }
+
+    #[test]
+    fn test_uniform_air_chunks_do_not_consume_mesh_budget() {
+        let mut mgr = WorldManager::new(4);
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    let block = if cy == 0 && dx == 0 && dz == 0 {
+                        BlockId::Stone
+                    } else {
+                        BlockId::Air
+                    };
+                    mgr.insert_chunk_for_test(pos, Chunk::new_uniform(block));
+                }
+            }
+        }
+        mgr.queue_all_loaded_for_test();
+        assert!(mgr.dirty_mesh_queue_len() > 25);
+
+        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        assert_eq!(mgr.dirty_mesh_queue_len(), 0);
     }
 }
