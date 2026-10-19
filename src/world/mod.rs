@@ -4,4 +4,5 @@ pub mod catalog_fs;
 pub mod chunk;
 pub mod manager;
 pub mod persistence;
+pub mod session;
 pub mod terrain;
