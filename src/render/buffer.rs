@@ -1,5 +1,5 @@
-use std::ops::Range;
 use rustc_hash::FxHashMap;
+use std::ops::Range;
 use wgpu::util::DeviceExt;
 
 use crate::mesh::quad::{ChunkMesh, PackedQuad};
@@ -31,6 +31,20 @@ impl ChunkRenderStore {
             self.total_vram_bytes = self.total_vram_bytes.saturating_sub(old.byte_size);
             self.total_quads = self.total_quads.saturating_sub(old.quad_count);
         }
+    }
+
+    /// Remove every chunk (dropping its wgpu buffers) and zero both
+    /// totals. The session-swap boundary (`GameApp::start_world_session`,
+    /// S03-T02) calls this so a freshly loaded world can never render
+    /// stale GPU meshes from the outgoing world. The populated-clear
+    /// proof rides on the launch smoke script and S04's human UAT:
+    /// constructing a real `GpuChunk` needs a wgpu `Device`, which
+    /// headless lib tests do not provide (honest limitation — the tests
+    /// below cover the empty-store and missing-pos contracts).
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.total_vram_bytes = 0;
+        self.total_quads = 0;
     }
 
     pub fn upload_mesh(
@@ -98,5 +112,34 @@ impl ChunkRenderStore {
                 byte_size,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_on_an_empty_store_is_a_no_op_keeping_both_totals_zero() {
+        // Headless contract: clear() must leave an empty store empty with
+        // both totals zero. The populated-clear proof (a store with real
+        // GpuChunks dropping to zero totals) rides on the launch smoke
+        // script and S04's human UAT — constructing a real GpuChunk needs a
+        // wgpu Device, which headless lib tests do not provide (honest
+        // limitation, documented on `clear`).
+        let mut store = ChunkRenderStore::new();
+        store.clear();
+        assert!(store.chunks.is_empty());
+        assert_eq!(store.total_vram_bytes, 0);
+        assert_eq!(store.total_quads, 0);
+    }
+
+    #[test]
+    fn remove_chunk_of_a_missing_pos_stays_a_no_op() {
+        let mut store = ChunkRenderStore::new();
+        store.remove_chunk(ChunkPos { x: 3, y: -1, z: 7 });
+        assert!(store.chunks.is_empty());
+        assert_eq!(store.total_vram_bytes, 0);
+        assert_eq!(store.total_quads, 0);
     }
 }

@@ -46,18 +46,10 @@ fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
 
 impl WorldManager {
     pub fn new(render_distance: i32) -> Self {
-        Self::with_seed_and_edits(
-            render_distance,
-            DEFAULT_WORLD_SEED,
-            ChunkEditMap::default(),
-        )
+        Self::with_seed_and_edits(render_distance, DEFAULT_WORLD_SEED, ChunkEditMap::default())
     }
 
-    pub fn with_seed_and_edits(
-        render_distance: i32,
-        seed: u32,
-        chunk_edits: ChunkEditMap,
-    ) -> Self {
+    pub fn with_seed_and_edits(render_distance: i32, seed: u32, chunk_edits: ChunkEditMap) -> Self {
         let rd = render_distance.clamp(4, 36);
         let (gen_tx, gen_rx) = unbounded();
         let (mesh_tx, mesh_rx) = unbounded();

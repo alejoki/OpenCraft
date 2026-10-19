@@ -32,7 +32,8 @@ impl Camera {
     #[inline]
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_to_rh(self.position, self.forward(), Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y_radians, aspect.max(0.1), self.z_near, self.z_far);
+        let proj =
+            Mat4::perspective_rh(self.fov_y_radians, aspect.max(0.1), self.z_near, self.z_far);
         proj * view
     }
 }

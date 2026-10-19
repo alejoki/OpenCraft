@@ -85,11 +85,7 @@ pub fn quad_to_vertices(
 
 /// Convert a slice of pixel-space quads into one interleaved vertex list
 /// (6 vertices per quad, in input order). An empty slice yields no vertices.
-pub fn quads_to_vertices(
-    quads: &[Quad],
-    surface_w: u32,
-    surface_h: u32,
-) -> Vec<OverlayVertex> {
+pub fn quads_to_vertices(quads: &[Quad], surface_w: u32, surface_h: u32) -> Vec<OverlayVertex> {
     let mut verts = Vec::with_capacity(quads.len() * 6);
     for q in quads {
         verts.extend(quad_to_vertices(
@@ -140,8 +136,7 @@ impl QuadRenderer {
                     module: &shader,
                     entry_point: "vs_main",
                     buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<OverlayVertex>()
-                            as wgpu::BufferAddress,
+                        array_stride: std::mem::size_of::<OverlayVertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
                             wgpu::VertexAttribute {
@@ -197,11 +192,13 @@ impl QuadRenderer {
         self.vertex_buffer = if verts.is_empty() {
             None
         } else {
-            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("ui_quad_vbuf"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
+            Some(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui_quad_vbuf"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            )
         };
     }
 
@@ -286,9 +283,9 @@ mod tests {
     fn degenerate_surface_dims_do_not_divide_by_zero() {
         let verts = quad_to_vertices(0.0, 0.0, 10.0, 10.0, [1.0; 4], 0, 0);
         assert_eq!(verts.len(), 6);
-        assert!(verts
-            .iter()
-            .all(|v| v.clip_pos[3] == 1.0 && v.clip_pos[0].is_finite() && v.clip_pos[1].is_finite()));
+        assert!(verts.iter().all(|v| v.clip_pos[3] == 1.0
+            && v.clip_pos[0].is_finite()
+            && v.clip_pos[1].is_finite()));
     }
 
     #[test]

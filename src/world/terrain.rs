@@ -52,7 +52,8 @@ pub fn terrain_height_at_seeded(wx: i32, wz: i32, seed: u32) -> i32 {
     let ridge = (value_noise_2d(x * 0.008, z * 0.008, 404 ^ s) * 2.0 - 1.0).abs();
 
     let mountain_factor = (continental - 0.55).max(0.0) * 2.2;
-    let base = 18.0 + continental * 26.0 + hills * 14.0 + detail * 4.0 + mountain_factor * ridge * 48.0;
+    let base =
+        18.0 + continental * 26.0 + hills * 14.0 + detail * 4.0 + mountain_factor * ridge * 48.0;
     base.round() as i32
 }
 

@@ -38,36 +38,20 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
     vec![
         // 0: Grass Top
         make_layer(1, |_, _, j| {
-            [
-                clamp_u8(88 + j),
-                clamp_u8(168 + j * 2),
-                clamp_u8(54 + j),
-            ]
+            [clamp_u8(88 + j), clamp_u8(168 + j * 2), clamp_u8(54 + j)]
         }),
         // 1: Grass Side
         make_layer(2, |x, y, j| {
             let fringe = 2 + (hash_pixel(x, 0, 99) % 3);
             if y < fringe {
-                [
-                    clamp_u8(88 + j),
-                    clamp_u8(168 + j * 2),
-                    clamp_u8(54 + j),
-                ]
+                [clamp_u8(88 + j), clamp_u8(168 + j * 2), clamp_u8(54 + j)]
             } else {
-                [
-                    clamp_u8(134 + j * 2),
-                    clamp_u8(96 + j),
-                    clamp_u8(67 + j),
-                ]
+                [clamp_u8(134 + j * 2), clamp_u8(96 + j), clamp_u8(67 + j)]
             }
         }),
         // 2: Dirt
         make_layer(3, |_, _, j| {
-            [
-                clamp_u8(134 + j * 2),
-                clamp_u8(96 + j),
-                clamp_u8(67 + j),
-            ]
+            [clamp_u8(134 + j * 2), clamp_u8(96 + j), clamp_u8(67 + j)]
         }),
         // 3: Stone
         make_layer(4, |x, y, j| {
@@ -166,11 +150,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                     clamp_u8(255 + j / 2),
                 ]
             } else {
-                [
-                    clamp_u8(134 + j * 2),
-                    clamp_u8(96 + j),
-                    clamp_u8(67 + j),
-                ]
+                [clamp_u8(134 + j * 2), clamp_u8(96 + j), clamp_u8(67 + j)]
             }
         }),
     ]

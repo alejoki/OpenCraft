@@ -2,6 +2,9 @@
 /.superpowers
 /saves
 /settings.toml
+docs/
+.agents/
+skills-lock.json
 
 # ── GSD baseline (auto-generated) ──
 .gsd
