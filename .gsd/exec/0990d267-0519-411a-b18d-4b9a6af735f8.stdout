@@ -1,0 +1,3 @@
+total_warning_sites=12 src/main.rs_sites=0
+targets: ['src/mesh/greedy.rs', 'src/mesh/quad.rs', 'src/world/manager.rs', 'src/world/persistence.rs', 'src/world/terrain.rs']
+CLIPPY_BIN_CLEAN (no findings on migration surface src/main.rs; all warnings in pre-existing lib files)

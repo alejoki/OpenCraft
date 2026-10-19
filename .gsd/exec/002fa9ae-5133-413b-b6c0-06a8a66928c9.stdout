@@ -1,0 +1,15 @@
+      1   --> src/world/terrain.rs:98:19
+      1   --> src/world/terrain.rs:97:15
+      1   --> src/world/terrain.rs:79:19
+      1   --> src/world/terrain.rs:78:15
+      1   --> src/world/persistence.rs:22:5
+      1    --> src/world/manager.rs:164:16
+      1   --> src/mesh/quad.rs:20:5
+      1    --> src/mesh/greedy.rs:216:35
+      1    --> src/mesh/greedy.rs:207:39
+      1    --> src/mesh/greedy.rs:129:26
+      1    --> src/mesh/greedy.rs:106:23
+      1    --> src/mesh/greedy.rs:105:19
+---
+0
+NO_MAIN_RS_WARNINGS

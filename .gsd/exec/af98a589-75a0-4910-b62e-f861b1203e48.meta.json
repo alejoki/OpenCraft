@@ -1,0 +1,20 @@
+{
+  "id": "af98a589-75a0-4910-b62e-f861b1203e48",
+  "runtime": "bash",
+  "purpose": "GREEN phase: full test suite with the filled KEY_TABLE — expect all keybind conversion tests plus the existing 23 tests green",
+  "script_chars": 10,
+  "started_at": "2026-10-19T07:52:20.280Z",
+  "finished_at": "2026-10-19T07:52:21.237Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 957,
+  "stdout_bytes": 2810,
+  "stderr_bytes": 364,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/af98a589-75a0-4910-b62e-f861b1203e48.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/af98a589-75a0-4910-b62e-f861b1203e48.stderr"
+}

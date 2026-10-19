@@ -96,4 +96,4 @@ pub fn parse_key(s: &str) -> Option<KeyCode>;
 - Cargo.toml, src/main.rs, src/player/physics.rs, src/player/camera.rs, src/render/context.rs, src/world/persistence.rs (read in full or in relevant sections)
 - toml crate docs (docs.rs, Value/from_str API) + `cargo search toml` (current 1.1.8 line)
 - MEM003 (keybind string representation decision), MEM001–MEM004 (M001 architecture decisions)
-<!-- gsd:state-version=43:1 -->
+<!-- gsd:state-version=61:1 -->

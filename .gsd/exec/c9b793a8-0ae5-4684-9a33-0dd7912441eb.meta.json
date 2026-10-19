@@ -1,0 +1,20 @@
+{
+  "id": "c9b793a8-0ae5-4684-9a33-0dd7912441eb",
+  "runtime": "bash",
+  "purpose": "Confirm bin target (src/main.rs, the migration surface) is clippy-clean",
+  "script_chars": 198,
+  "started_at": "2026-10-19T07:41:39.320Z",
+  "finished_at": "2026-10-19T07:41:39.481Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 161,
+  "stdout_bytes": 225,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c9b793a8-0ae5-4684-9a33-0dd7912441eb.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c9b793a8-0ae5-4684-9a33-0dd7912441eb.stderr"
+}

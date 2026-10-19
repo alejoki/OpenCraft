@@ -1,0 +1,28 @@
+{
+  "id": "0990d267-0519-411a-b18d-4b9a6af735f8",
+  "runtime": "python",
+  "purpose": "UAT M001/S01/s01-clippy-bin-clean (uat-log-inspection)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S01",
+    "checkId": "s01-clippy-bin-clean",
+    "intent": "uat-log-inspection",
+    "expected": "no clippy findings on src/main.rs (migration surface)"
+  },
+  "script_chars": 603,
+  "started_at": "2026-10-19T07:44:07.756Z",
+  "finished_at": "2026-10-19T07:44:07.789Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 33,
+  "stdout_bytes": 275,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0990d267-0519-411a-b18d-4b9a6af735f8.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0990d267-0519-411a-b18d-4b9a6af735f8.stderr"
+}

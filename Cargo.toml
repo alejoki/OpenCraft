@@ -12,6 +12,11 @@ rayon = "1.10"
 rustc-hash = "1.1"
 wgpu = "0.19"
 winit = "0.30"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,20 @@
+{
+  "id": "99ba1ef3-d5c2-44f5-b886-9440b30926c4",
+  "runtime": "bash",
+  "purpose": "Slice verification: warning-free cargo build against winit 0.30.13",
+  "script_chars": 156,
+  "started_at": "2026-10-19T07:40:42.125Z",
+  "finished_at": "2026-10-19T07:40:42.249Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 124,
+  "stdout_bytes": 84,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/99ba1ef3-d5c2-44f5-b886-9440b30926c4.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/99ba1ef3-d5c2-44f5-b886-9440b30926c4.stderr"
+}

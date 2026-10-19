@@ -1,0 +1,75 @@
+
+running 32 tests
+test player::camera::tests::test_frustum_and_visible_face_mask ... ok
+test player::physics::tests::test_cannot_place_block_overlapping_player_aabb ... ok
+test player::physics::tests::test_fast_fall_does_not_embed_in_floor ... ok
+test player::physics::tests::test_focus_loss_resets_input_state ... ok
+test player::physics::tests::test_left_shift_sprints_in_walk_mode ... ok
+test player::physics::tests::test_player_lands_on_ground_without_falling_through ... ok
+test player::raycast::tests::test_raycast_axis_aligned_zero_components ... ok
+test settings::keybind::tests::every_mapped_string_is_the_keycode_debug_spelling ... ok
+test render::pipeline::tests::test_overlay_vertices_include_wireframe_crosshair_and_hotbar ... ok
+test settings::keybind::tests::every_supported_key_round_trips ... ok
+test settings::keybind::tests::keys_outside_the_supported_subset_return_none_from_key_to_string ... ok
+test settings::keybind::tests::parses_modifier_variants_independently ... FAILED
+test settings::keybind::tests::parses_digit_keys ... FAILED
+test settings::keybind::tests::parses_letter_keys ... FAILED
+test settings::keybind::tests::unsupported_strings_return_none ... ok
+test settings::tests::keybinds_defaults_match_todays_hardcoded_bindings ... ok
+test settings::keybind::tests::parses_whitespace_and_function_and_arrow_keys ... FAILED
+test world::block::tests::test_block_solidity_and_texture_layers ... ok
+test world::chunk::tests::test_negative_world_coordinates ... ok
+test world::chunk::tests::test_chunk_uniform_promotion_and_compression ... ok
+test render::texture::tests::test_procedural_texture_layers_non_empty ... ok
+test world::persistence::tests::test_corrupted_save_rejected ... ok
+test world::persistence::tests::test_cli_args_parsing ... ok
+test world::persistence::tests::test_save_and_load_roundtrip ... ok
+test world::manager::tests::test_uniform_air_chunks_do_not_consume_mesh_budget ... ok
+test world::terrain::tests::test_terrain_generation_deterministic_and_layered ... ok
+test mesh::greedy::tests::test_single_voxel_produces_six_unit_quads ... ok
+test mesh::greedy::tests::test_halo_culls_chunk_boundary_face ... ok
+test world::manager::tests::test_set_block_immediate_cancels_inflight_pending_mesh ... ok
+test mesh::greedy::tests::test_full_solid_chunk_greedy_merges_to_six_quads ... ok
+test world::manager::tests::test_boundary_block_edit_marks_neighbor_dirty ... ok
+test world::manager::tests::test_chunk_edits_persist_across_unload_and_regeneration ... ok
+
+failures:
+
+---- settings::keybind::tests::parses_modifier_variants_independently stdout ----
+
+thread 'settings::keybind::tests::parses_modifier_variants_independently' (37518) panicked at src/settings/keybind.rs:77:9:
+assertion `left == right` failed
+  left: None
+ right: Some(ShiftLeft)
+
+---- settings::keybind::tests::parses_digit_keys stdout ----
+
+thread 'settings::keybind::tests::parses_digit_keys' (37516) panicked at src/settings/keybind.rs:53:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Digit0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- settings::keybind::tests::parses_letter_keys stdout ----
+
+thread 'settings::keybind::tests::parses_letter_keys' (37517) panicked at src/settings/keybind.rs:45:9:
+assertion `left == right` failed
+  left: None
+ right: Some(KeyA)
+
+---- settings::keybind::tests::parses_whitespace_and_function_and_arrow_keys stdout ----
+
+thread 'settings::keybind::tests::parses_whitespace_and_function_and_arrow_keys' (37519) panicked at src/settings/keybind.rs:60:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Space)
+
+
+failures:
+    settings::keybind::tests::parses_digit_keys
+    settings::keybind::tests::parses_letter_keys
+    settings::keybind::tests::parses_modifier_variants_independently
+    settings::keybind::tests::parses_whitespace_and_function_and_arrow_keys
+
+test result: FAILED. 28 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

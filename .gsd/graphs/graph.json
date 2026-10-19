@@ -1,0 +1,106 @@
+{
+  "nodes": [
+    {
+      "id": "milestone:M001",
+      "label": "M001: Refactor + Settings Foundation",
+      "type": "milestone",
+      "description": "Active milestone: M001",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "concept:phase:planning",
+      "label": "Phase: planning",
+      "type": "concept",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "lesson:L001",
+      "label": "L001",
+      "type": "lesson",
+      "description": "winit 0.30.13's ApplicationHandler trait methods take `&ActiveEventLoop` (not `&dyn ActiveEventLoop`); `EventLoop::set_control_flow(ControlFlow::Poll)` is called once before `run_app`, window creation moves into `resumed()` via `event_loop.create_window(Window::default_attributes()...)`, and the migrated `GameApp`/`Ready` struct pattern lives in src/main.rs of the M001 worktree (S03/S04 build on this loop; window+GPU stack is behind `Option`, guarded idempotently in resumed()).",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "lesson:L002",
+      "label": "L002",
+      "type": "lesson",
+      "description": "The workspace has ~12 pre-existing clippy lib warnings (needless_range_loop etc. in src/mesh/greedy.rs, src/mesh/quad.rs, src/world/manager.rs, src/world/terrain.rs) that predate M001-S01; the bin target (src/main.rs) is clippy-clean. Downstream slice verification should not treat these lib lints as a regression — scope clippy checks to the files the slice touched, or record the inherited findings as known limitations.",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "slice:M001:S01",
+      "label": "S01: winit 0.30 ApplicationHandler migration",
+      "type": "slice",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S01:S01-T01",
+      "label": "S01-T01: Migrate src/main.rs to winit 0.30 ApplicationHandler and bump winit to 0.30",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S01:S01-T02",
+      "label": "S01-T02: Bounded launch smoke: game runs 10s on the migrated loop without panic",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "slice:M001:S02",
+      "label": "S02: Settings core with TOML persistence and tests",
+      "type": "slice",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "slice:M001:S03",
+      "label": "S03: UI foundation: glyphon text overlay + quad rendering",
+      "type": "slice",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "slice:M001:S04",
+      "label": "S04: In-game settings menu: rebind, adjust, persist",
+      "type": "slice",
+      "confidence": "EXTRACTED"
+    }
+  ],
+  "edges": [
+    {
+      "from": "milestone:M001",
+      "to": "slice:M001:S01",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "slice:M001:S01",
+      "to": "task:M001:S01:S01-T01",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "slice:M001:S01",
+      "to": "task:M001:S01:S01-T02",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "milestone:M001",
+      "to": "slice:M001:S02",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "milestone:M001",
+      "to": "slice:M001:S03",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "milestone:M001",
+      "to": "slice:M001:S04",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    }
+  ],
+  "builtAt": "2026-10-19T07:43:05.449Z"
+}

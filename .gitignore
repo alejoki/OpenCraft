@@ -1,6 +1,7 @@
 /target
 /.superpowers
 /saves
+/settings.toml
 
 # ── GSD baseline (auto-generated) ──
 .gsd

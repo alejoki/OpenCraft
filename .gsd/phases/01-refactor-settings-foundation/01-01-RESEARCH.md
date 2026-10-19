@@ -84,4 +84,4 @@ Rejected alternative: initializing GPU state in `main()` via `EventLoop::create_
 ## Skills Discovered
 
 None installed — winit 0.30 API knowledge was fully covered by docs.rs (`/websites/rs_winit_winit` via Context7) plus empirical compile probes; no winit-specific skill is needed for this slice.
-<!-- gsd:state-version=43:1 -->
+<!-- gsd:state-version=61:1 -->

@@ -1,0 +1,28 @@
+{
+  "id": "2a68fba3-13a5-45bd-b94e-d1883a4c51fa",
+  "runtime": "bash",
+  "purpose": "UAT M001/S01/s01-clippy-bin-clean (uat-runtime-check)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S01",
+    "checkId": "s01-clippy-bin-clean",
+    "intent": "uat-runtime-check",
+    "expected": "exit 0, zero clippy findings on the migration surface src/main.rs"
+  },
+  "script_chars": 211,
+  "started_at": "2026-10-19T07:44:00.673Z",
+  "finished_at": "2026-10-19T07:44:00.906Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 233,
+  "stdout_bytes": 313,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2a68fba3-13a5-45bd-b94e-d1883a4c51fa.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2a68fba3-13a5-45bd-b94e-d1883a4c51fa.stderr"
+}

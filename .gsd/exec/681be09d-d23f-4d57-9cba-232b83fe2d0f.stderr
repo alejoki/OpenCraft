@@ -1,0 +1,4 @@
+  File "<string>", line 1
+    grep -n 'winit' Cargo.toml Cargo.lock | head -20 && if grep -q 'winit = "0.30"' Cargo.toml && grep -q 'name = "winit"' Cargo.lock; then if Cargo.lock grep -A1 'name = "winit"' | grep -q 'version = "0.30.13"' && ! grep -q 'winit = "0.29"' Cargo.toml; then echo MANIFEST_OK; fi; fi
+            ^^^^^^^
+SyntaxError: invalid syntax

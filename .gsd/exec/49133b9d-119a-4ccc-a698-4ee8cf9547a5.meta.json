@@ -1,0 +1,28 @@
+{
+  "id": "49133b9d-119a-4ccc-a698-4ee8cf9547a5",
+  "runtime": "python",
+  "purpose": "UAT M001/S01/s01-manifest-probe (uat-artifact-check)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S01",
+    "checkId": "s01-manifest-probe",
+    "intent": "uat-artifact-check",
+    "expected": "MANIFEST_OK"
+  },
+  "script_chars": 523,
+  "started_at": "2026-10-19T07:43:53.470Z",
+  "finished_at": "2026-10-19T07:43:53.502Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 32,
+  "stdout_bytes": 65,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/49133b9d-119a-4ccc-a698-4ee8cf9547a5.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/49133b9d-119a-4ccc-a698-4ee8cf9547a5.stderr"
+}
