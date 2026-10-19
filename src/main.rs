@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -441,8 +441,12 @@ fn adjust_direction(button: MouseButton) -> Option<AdjustDirection> {
 /// Free function with disjoint args (not a `&mut self` method) so both
 /// the whole-`self` `menu_click` call site and the keyboard rebind path
 /// can call it while the `gpu`/`window` field borrows are live (P005).
-fn save_settings_or_warn(menu: &mut menu::SettingsMenu, settings: &Settings) {
-    if let Err(err) = settings.save(Path::new(DEFAULT_SETTINGS_PATH)) {
+/// The path is the caller-injected `GameApp::settings_path` (S04-T02:
+/// runtime behavior is identical — `DEFAULT_SETTINGS_PATH` — but a
+/// headless test can point it at a tempdir so the crate root is never
+/// written).
+fn save_settings_or_warn(menu: &mut menu::SettingsMenu, settings: &Settings, path: &Path) {
+    if let Err(err) = settings.save(path) {
         menu.set_message(format!("could not save settings: {err}"));
     }
 }
@@ -558,6 +562,14 @@ struct GameApp {
     /// Timestamp of the last message-expiry tick (bounded at ~60 Hz; see
     /// `MENU_TICK_INTERVAL`).
     message_tick_timer: Instant,
+    /// The path every settings SAVE writes to (S04-T02): the injected
+    /// twin of `session.save_path` for settings — the same extraction
+    /// pattern as `startup_session`/`cli_has_world_intent`. Runtime
+    /// behavior is identical (`DEFAULT_SETTINGS_PATH`, i.e. the process
+    /// cwd); tests point it at a tempdir so the ExitGame/CloseRequested
+    /// settings saves are provable headless without writing the crate
+    /// root. Loading still reads the same path at startup.
+    settings_path: PathBuf,
 }
 
 impl GameApp {
@@ -565,7 +577,8 @@ impl GameApp {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
-        let (settings, startup_warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let settings_path = Path::new(DEFAULT_SETTINGS_PATH).to_path_buf();
+        let (settings, startup_warnings) = load_with_warnings(&settings_path);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -607,6 +620,7 @@ impl GameApp {
             load_message: None,
             main_menu_message: None,
             message_tick_timer: Instant::now(),
+            settings_path,
         }
     }
 
@@ -643,7 +657,7 @@ impl GameApp {
                     // (only load clamps), so the T01 helper is mandatory here.
                     self.settings.mouse_sensitivity =
                         menu::adjust_sensitivity(self.settings.mouse_sensitivity, direction);
-                    save_settings_or_warn(&mut self.menu, &self.settings);
+                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
                 }
             }
             MenuRow::Fov => {
@@ -654,7 +668,7 @@ impl GameApp {
                     // in view_proj, so updating the pub field updates the
                     // projection with no reconstruction.
                     self.session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
-                    save_settings_or_warn(&mut self.menu, &self.settings);
+                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
                 }
             }
             MenuRow::Fullscreen => {
@@ -669,13 +683,13 @@ impl GameApp {
                 } else {
                     window.set_fullscreen(None);
                 }
-                save_settings_or_warn(&mut self.menu, &self.settings);
+                save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
             }
             MenuRow::Vsync => {
                 self.settings.vsync = !self.settings.vsync;
                 // The live present-mode swap happens in the caller (needs
                 // the RenderContext; see the doc comment above).
-                save_settings_or_warn(&mut self.menu, &self.settings);
+                save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
             }
             MenuRow::Close => {
                 // Close now dispatches Back through the lifecycle state
@@ -820,7 +834,7 @@ impl GameApp {
                 // Mirror the CloseRequested path: save the current world
                 // and settings; the caller owns exiting the loop.
                 let _ = save_current_world(&mut self.session);
-                let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
+                let _ = self.settings.save(&self.settings_path);
                 return true;
             }
         }
@@ -1266,7 +1280,7 @@ impl ApplicationHandler for GameApp {
                 // not yet persisted (e.g. a hand-edited in-memory state).
                 // Save errors are ignored here — the process is exiting and
                 // there is no menu left to display them in.
-                let _ = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH));
+                let _ = self.settings.save(&self.settings_path);
                 event_loop.exit();
             }
             WindowEvent::Focused(false) => {
@@ -1337,7 +1351,11 @@ impl ApplicationHandler for GameApp {
                                             // as in-menu text instead of being
                                             // swallowed.
                                             action.set_key(&mut self.settings.keybinds, key);
-                                            save_settings_or_warn(&mut self.menu, &self.settings);
+                                            save_settings_or_warn(
+                                                &mut self.menu,
+                                                &self.settings,
+                                                &self.settings_path,
+                                            );
                                             self.menu.finish_capture();
                                             // The menu text composes per frame
                                             // from the live settings, so the new
@@ -2461,6 +2479,57 @@ mod tests {
             ),
             "New Game\nLoad Game\nSettings\nExit Game"
         );
+    }
+
+    #[test]
+    fn exit_game_saves_world_and_settings_and_requests_exit() {
+        // S04-T02: the ExitGame decision arm (save the session's world,
+        // save settings, return exit-requested — the caller owns
+        // `event_loop.exit()`) made headless by the injected
+        // `settings_path`: both save targets live inside a tempdir, so
+        // the crate root is never written. No event loop, window, or GPU.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("exit-game.mcvx");
+        let settings_path = dir.path().join("settings.toml");
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        // Bare CliConfig: GameApp::new starts at the main menu over the
+        // loaded default session (the same S03 test pattern as the
+        // SaveAndQuit tests).
+        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        // Inject the settings save path AFTER construction (runtime keeps
+        // DEFAULT_SETTINGS_PATH; the test points it at the tempdir).
+        app.settings_path = settings_path.clone();
+        // An unsaved chunk edit: proof the world save actually wrote the
+        // session's edited world, not just an empty file.
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(app.session.world.has_unsaved_changes());
+
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::ExitGame);
+
+        // The decision arm returns true: exit-requested, and the caller
+        // owns `event_loop.exit()` (mirroring CloseRequested).
+        assert!(
+            exit_requested,
+            "ExitGame requests exit; the caller owns event_loop.exit()"
+        );
+        // The session's world was saved at its own tempdir save path and
+        // the unsaved-changes flag cleared.
+        assert!(save_path.is_file(), "world saved at the session's save path");
+        assert!(!app.session.world.has_unsaved_changes());
+        // Settings were durably written at the injected tempdir path.
+        assert!(
+            settings_path.is_file(),
+            "settings saved at the injected settings path"
+        );
+        // The written settings parse back as Settings (durable, loadable).
+        let (reloaded, warnings) = load_with_warnings(&settings_path);
+        assert!(warnings.is_empty(), "reloaded settings parse cleanly");
+        assert_eq!(reloaded.fov_degrees, app.settings.fov_degrees);
     }
 
     #[test]
