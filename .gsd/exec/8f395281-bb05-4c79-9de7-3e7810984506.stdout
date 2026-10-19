@@ -1,0 +1,7 @@
+54060fc6-7bcc-4bc2-9a8d-db2d15f03147|2026-10-19T10:51:55.192Z|2026-10-19T10:51:55.872Z|0|S04 slice gate: cargo build + cargo test + clippy slice-surface scan
+e122c732-fa7d-4e0d-958c-d188bd418332|2026-10-19T10:52:23.181Z|2026-10-19T10:52:33.234Z|0|S04 slice gate: settings smoke (seeded settings.toml with jump_or_up=ShiftLeft s
+88c1f1b5-1276-4dc1-aa3a-4fc3269275ca|2026-10-19T10:54:35.789Z|2026-10-19T10:54:45.841Z|0|UAT M001/S04/s04-settings-smoke (uat-runtime-check)
+04f1262a-1e54-455e-ae05-f9d9107ff535|2026-10-19T10:54:21.792Z|2026-10-19T10:54:31.836Z|0|UAT M001/S04/s04-launch-smoke (uat-runtime-check)
+63dfb1d3-cc00-4c44-b674-922b70a6fa9d|2026-10-19T07:43:23.155Z|2026-10-19T07:43:33.199Z|0|UAT M001/S01/s01-smoke-launch (uat-runtime-check)
+67a4819d-97f2-42a2-bad8-9270d14814f3|2026-10-19T08:43:59.630Z|2026-10-19T08:44:09.675Z|0|UAT M001/S03/s03-check-4-launch-smoke (uat-runtime-check)
+60eec96f-bfb0-4efb-8212-327ab2349cc3|2026-10-19T10:52:09.309Z|2026-10-19T10:52:19.355Z|0|S04 slice gate: launch smoke (bounded 10s run, no panic, no regression from menu

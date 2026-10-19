@@ -1,0 +1,22 @@
+23:    load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
+253:            load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+429:                self.input.reset();
+526:                                self.input.reset();
+172:fn apply_gameplay_key(
+569:                            apply_gameplay_key(
+1127:                apply_gameplay_key(&mut input, &binds, code, true),
+466:                                let decision = menu::evaluate_rebind_candidate(
+66:fn apply_vsync(ctx: &mut RenderContext, vsync: bool) {
+388:            apply_vsync(&mut ctx, true);
+631:                            // mechanism; see `apply_vsync`).
+333:                    window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+335:                    window.set_fullscreen(None);
+385:            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+156:fn save_settings_or_warn(menu: &mut menu::SettingsMenu, settings: &Settings) {
+311:                    save_settings_or_warn(&mut self.menu, &self.settings);
+322:                    save_settings_or_warn(&mut self.menu, &self.settings);
+337:                save_settings_or_warn(&mut self.menu, &self.settings);
+343:                save_settings_or_warn(&mut self.menu, &self.settings);
+481:                                        save_settings_or_warn(&mut self.menu, &self.settings);
+418:            WindowEvent::CloseRequested => {
+WIRING-INSPECTION-DONE

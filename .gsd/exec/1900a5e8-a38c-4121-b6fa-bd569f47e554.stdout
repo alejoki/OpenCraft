@@ -1,0 +1,59 @@
+now=2026-10-19T10:59:08Z
+--- files under src/ and scripts/ modified after 2026-10-19 10:55 ---
+src/lib.rs
+src/main.rs
+src/mesh/greedy.rs
+src/mesh/mod.rs
+src/mesh/quad.rs
+src/player/camera.rs
+src/player/mod.rs
+src/player/physics.rs
+src/player/raycast.rs
+src/render/buffer.rs
+src/render/context.rs
+src/render/mod.rs
+src/render/pipeline.rs
+src/render/texture.rs
+src/settings/keybind.rs
+src/settings/mod.rs
+src/ui/menu.rs
+src/ui/mod.rs
+src/ui/quad.rs
+src/ui/text.rs
+src/world/block.rs
+src/world/chunk.rs
+src/world/manager.rs
+src/world/mod.rs
+src/world/persistence.rs
+src/world/terrain.rs
+scripts/launch_smoke.sh
+scripts/settings_smoke.sh
+--- newest 5 files under src/ and scripts/ ---
+2026-10-19T10:49:11Z scripts/settings_smoke.sh
+2026-10-19T10:45:44Z src/main.rs
+2026-10-19T10:18:09Z src/world/terrain.rs
+2026-10-19T10:18:09Z src/world/persistence.rs
+2026-10-19T10:18:09Z src/world/mod.rs
+--- git status (porcelain) ---
+ M .gsd/graphs/graph.json
+ M .gsd/hook-state.json
+ M .gsd/phases/01-refactor-settings-foundation/01-04-PLAN.md
+ M .gsd/phases/01-refactor-settings-foundation/01-ROADMAP.md
+ M .gsd/phases/01-refactor-settings-foundation/S04-T05-SUMMARY.md
+?? .gsd/exec/03185386-d346-4780-bfe8-ff09d97a9730.meta.json
+?? .gsd/exec/03185386-d346-4780-bfe8-ff09d97a9730.stderr
+?? .gsd/exec/03185386-d346-4780-bfe8-ff09d97a9730.stdout
+?? .gsd/exec/04f1262a-1e54-455e-ae05-f9d9107ff535.meta.json
+?? .gsd/exec/04f1262a-1e54-455e-ae05-f9d9107ff535.stderr
+?? .gsd/exec/04f1262a-1e54-455e-ae05-f9d9107ff535.stdout
+?? .gsd/exec/1e4bc9b1-9639-42cd-9183-b5285ce9de94.meta.json
+?? .gsd/exec/1e4bc9b1-9639-42cd-9183-b5285ce9de94.stderr
+?? .gsd/exec/1e4bc9b1-9639-42cd-9183-b5285ce9de94.stdout
+?? .gsd/exec/3d795802-be19-4440-815d-fe5c3ab587d3.meta.json
+?? .gsd/exec/3d795802-be19-4440-815d-fe5c3ab587d3.stderr
+?? .gsd/exec/3d795802-be19-4440-815d-fe5c3ab587d3.stdout
+?? .gsd/exec/430fa96e-4576-4b72-b0d4-d35b63853327.meta.json
+?? .gsd/exec/430fa96e-4576-4b72-b0d4-d35b63853327.stderr
+?? .gsd/exec/430fa96e-4576-4b72-b0d4-d35b63853327.stdout
+--- git HEAD ---
+b0bf602

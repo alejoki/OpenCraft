@@ -1,0 +1,20 @@
+{
+  "id": "f8b01e58-3f48-44c2-a919-3d20aa299c39",
+  "runtime": "bash",
+  "purpose": "Read the full-suite test evidence and wiring inspection evidence stdout and metadata for validation evidence entries",
+  "script_chars": 679,
+  "started_at": "2026-10-19T10:58:58.108Z",
+  "finished_at": "2026-10-19T10:58:58.125Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 17,
+  "stdout_bytes": 2748,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/f8b01e58-3f48-44c2-a919-3d20aa299c39.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/f8b01e58-3f48-44c2-a919-3d20aa299c39.stderr"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "49ff331b-9a2a-4960-98aa-3508aa3c0d58",
+  "runtime": "bash",
+  "purpose": "Read full grep output and find Bracket key handling in main.rs",
+  "script_chars": 107,
+  "started_at": "2026-10-19T11:27:16.548Z",
+  "finished_at": "2026-10-19T11:27:16.569Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 21,
+  "stdout_bytes": 2060,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/49ff331b-9a2a-4960-98aa-3508aa3c0d58.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/49ff331b-9a2a-4960-98aa-3508aa3c0d58.stderr"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "60eec96f-bfb0-4efb-8212-327ab2349cc3",
+  "runtime": "bash",
+  "purpose": "S04 slice gate: launch smoke (bounded 10s run, no panic, no regression from menu wiring)",
+  "script_chars": 43,
+  "started_at": "2026-10-19T10:52:09.309Z",
+  "finished_at": "2026-10-19T10:52:19.355Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10046,
+  "stdout_bytes": 61,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/60eec96f-bfb0-4efb-8212-327ab2349cc3.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/60eec96f-bfb0-4efb-8212-327ab2349cc3.stderr"
+}

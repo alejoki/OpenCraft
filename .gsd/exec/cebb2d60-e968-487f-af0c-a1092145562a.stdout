@@ -1,0 +1,14 @@
+SEEDED-CORRUPT:
+[keybinds]
+forward = "KeyW"
+jump_or_up = "NotAKey"
+
+[mouse]
+sensitivity = "banana"
+
+[video]
+fov = "ninety"
+fullscreen = true
+EXIT: 124
+panic-lines: 0
+DURABLE-LOG: /tmp/mc-corrupt-a0Pl/output.log

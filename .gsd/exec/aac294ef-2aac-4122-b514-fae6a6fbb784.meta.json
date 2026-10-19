@@ -1,0 +1,20 @@
+{
+  "id": "aac294ef-2aac-4122-b514-fae6a6fbb784",
+  "runtime": "bash",
+  "purpose": "Check for user's interactive-session settings.toml as durable rebind evidence",
+  "script_chars": 121,
+  "started_at": "2026-10-19T11:31:13.059Z",
+  "finished_at": "2026-10-19T11:31:13.086Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 27,
+  "stdout_bytes": 311,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/aac294ef-2aac-4122-b514-fae6a6fbb784.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/aac294ef-2aac-4122-b514-fae6a6fbb784.stderr"
+}

@@ -1,0 +1,7 @@
+total passed: 11 failed: 0
+---clippy slice-surface---
+slice-surface-warning-lines: 0
+---build---
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s

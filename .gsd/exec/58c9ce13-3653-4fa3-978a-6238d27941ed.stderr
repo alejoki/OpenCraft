@@ -1,0 +1,2 @@
+/bin/bash: -c: line 1: syntax error near unexpected token `('
+/bin/bash: -c: line 1: `for sym in load_with_warnings input.reset() apply_gameplay_key evaluate_rebind_candidate apply_vsync set_fullscreen save_settings_or_warn CloseRequested; do n=$(grep -c "$sym" src/main.rs); echo "$sym: $n"; done; grep -c "startup_warnings\|load_with_warnings" src/main.rs'

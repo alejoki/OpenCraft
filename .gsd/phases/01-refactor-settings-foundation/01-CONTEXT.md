@@ -178,4 +178,4 @@ Automated (`cargo test`, pure logic — no GPU required): settings round-trip (l
 
 - Text rendering library: glyphon vs cosmic-text (vs raw) — current thinking: decide at roadmap/slice planning time when the `src/ui/` slice is sized
 - Exact winit target version (latest stable 0.30.x line) — resolved when the migration slice is planned
-<!-- gsd:state-version=43:1 -->
+<!-- gsd:state-version=192:1 -->

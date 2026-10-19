@@ -1,0 +1,27 @@
+src/main.rs:84:            render_distance: world.render_distance() as u16,
+src/main.rs:541:                        KeyCode::BracketLeft if pressed && !event.repeat => {
+src/main.rs:542:                            let rd = (self.world.render_distance() - 2).max(4);
+src/main.rs:543:                            self.world.set_render_distance(rd);
+src/main.rs:545:                        KeyCode::BracketRight if pressed && !event.repeat => {
+src/main.rs:546:                            let rd = (self.world.render_distance() + 2).min(36);
+src/main.rs:547:                            self.world.set_render_distance(rd);
+src/main.rs:564:                        // brackets/digits keep their hardcoded behavior even
+src/main.rs:850:                    self.world.render_distance(),
+src/main.rs:887:                                self.world.render_distance(),
+src/main.rs:978:                    save.player.render_distance as i32,
+src/world/manager.rs:24:    render_distance: i32,
+src/world/manager.rs:33:    // Load 1 extra ring of chunks beyond render_distance so chunks at the edge have neighbors for meshing
+src/world/manager.rs:48:    pub fn new(render_distance: i32) -> Self {
+src/world/manager.rs:50:            render_distance,
+src/world/manager.rs:57:        render_distance: i32,
+src/world/manager.rs:61:        let rd = render_distance.clamp(4, 36);
+src/world/manager.rs:74:            render_distance: rd,
+src/world/manager.rs:126:    pub fn render_distance(&self) -> i32 {
+src/world/manager.rs:127:        self.render_distance
+src/world/manager.rs:130:    pub fn set_render_distance(&mut self, rd: i32) {
+src/world/manager.rs:132:        if clamped != self.render_distance {
+src/world/manager.rs:133:            self.render_distance = clamped;
+src/world/manager.rs:404:        // 3. Unload chunks far outside render_distance + 2 when player moves to a new chunk
+src/world/manager.rs:408:            let unload_r = self.render_distance + 2;
+src/world/manager.rs:462:        // Dispatch meshing tasks for chunks inside render_distance whose 6 neighbors are ready
+src/world/manager.rs:463:        let rd2 = self.render_distance * self.render_distance;

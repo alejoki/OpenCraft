@@ -1,0 +1,51 @@
+12:use winit::keyboard::{KeyCode, PhysicalKey};
+84:            render_distance: world.render_distance() as u16,
+175:    code: KeyCode,
+449:                    // where ANY pressed KeyCode is a capture candidate.
+452:                            if code == KeyCode::Escape {
+505:                        KeyCode::KeyF if pressed && !event.repeat => {
+509:                        KeyCode::F5 if pressed && !event.repeat => {
+515:                        KeyCode::Escape if pressed && !event.repeat => {
+541:                        KeyCode::BracketLeft if pressed && !event.repeat => {
+542:                            let rd = (self.world.render_distance() - 2).max(4);
+543:                            self.world.set_render_distance(rd);
+545:                        KeyCode::BracketRight if pressed && !event.repeat => {
+546:                            let rd = (self.world.render_distance() + 2).min(36);
+547:                            self.world.set_render_distance(rd);
+549:                        KeyCode::Digit1 if pressed => self.player.selected_slot = 0,
+550:                        KeyCode::Digit2 if pressed => self.player.selected_slot = 1,
+551:                        KeyCode::Digit3 if pressed => self.player.selected_slot = 2,
+552:                        KeyCode::Digit4 if pressed => self.player.selected_slot = 3,
+553:                        KeyCode::Digit5 if pressed => self.player.selected_slot = 4,
+554:                        KeyCode::Digit6 if pressed => self.player.selected_slot = 5,
+555:                        KeyCode::Digit7 if pressed => self.player.selected_slot = 6,
+556:                        KeyCode::Digit8 if pressed => self.player.selected_slot = 7,
+557:                        KeyCode::Digit9 if pressed => self.player.selected_slot = 8,
+850:                    self.world.render_distance(),
+887:                                self.world.render_distance(),
+978:                    save.player.render_distance as i32,
+1117:            (KeyCode::KeyW, "forward"),
+1118:            (KeyCode::KeyS, "backward"),
+1119:            (KeyCode::KeyA, "left"),
+1120:            (KeyCode::KeyD, "right"),
+1121:            (KeyCode::Space, "jump_or_up"),
+1122:            (KeyCode::ShiftLeft, "crouch_or_down"),
+1123:            (KeyCode::ControlLeft, "sprint"),
+1150:        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, true));
+1153:        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, true));
+1158:        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, false));
+1161:        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, false));
+1172:        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ShiftRight, true));
+1173:        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ControlRight, true));
+1185:        for code in [KeyCode::KeyQ, KeyCode::KeyZ, KeyCode::KeyF, KeyCode::F5, KeyCode::Escape] {
+---
+24:    render_distance: i32,
+33:    // Load 1 extra ring of chunks beyond render_distance so chunks at the edge have neighbors for meshing
+48:    pub fn new(render_distance: i32) -> Self {
+50:            render_distance,
+57:        render_distance: i32,
+61:        let rd = render_distance.clamp(4, 36);
+74:            render_distance: rd,
+126:    pub fn render_distance(&self) -> i32 {
+127:        self.render_distance
+130:    pub fn set_render_distance(&mut self, rd: i32) {

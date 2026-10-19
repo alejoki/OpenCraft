@@ -1,0 +1,58 @@
+== 03185386 stdout ==
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+---CLIPPY---
+NO_FINDINGS_ON_SLICE_SURFACE
+== 03185386 meta ==
+{
+  "id": "03185386-d346-4780-bfe8-ff09d97a9730",
+  "runtime": "bash",
+  "purpose": "S04 slice gate: full test counts + clippy findings located on slice surface files",
+  "script_chars": 188,
+  "started_at": "2026-10-19T10:52:03.600Z",
+  "finished_at": "2026-10-19T10:52:04.153Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 553,
+  "stdout_bytes": 326,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/03185386-d346-4780-bfe8-ff09d97a9730.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/03185386-d346-4780-bfe8-ff09d97a9730.stderr"
+}
+== 430fa96e meta ==
+{
+  "id": "430fa96e-4576-4b72-b0d4-d35b63853327",
+  "runtime": "bash",
+  "purpose": "S04 wiring evidence: confirm the key integration seams exist in src/main.rs (startup load, InputState reset on menu open, keybind routing, rebind capture, live apply, save sites)",
+  "script_chars": 181,
+  "started_at": "2026-10-19T10:53:01.002Z",
+  "finished_at": "2026-10-19T10:53:01.020Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 18,
+  "stdout_bytes": 1733,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/430fa96e-4576-4b72-b0d4-d35b63853327.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/430fa96e-4576-4b72-b0d4-d35b63853327.stderr"
+}
+== mtimes ==
+03185386-d346-4780-bfe8-ff09d97a9730 2026-10-19T10:52:04Z
+430fa96e-4576-4b72-b0d4-d35b63853327 2026-10-19T10:53:01Z
+== grep 'passed' counts in 9f625f75 and 03185386 ==
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

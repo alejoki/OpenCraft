@@ -1,0 +1,18 @@
+-rw-r--r--. 1 aleksi aleksi 238 Oct 19 14:30 settings.toml
+===CONTENT===
+[keybinds]
+forward = "KeyW"
+backward = "KeyS"
+left = "KeyA"
+right = "KeyD"
+jump_or_up = "Space"
+crouch_or_down = "Tab"
+sprint = "ControlLeft"
+
+[mouse]
+sensitivity = 0.002199999988079071
+
+[video]
+fov = 75.0
+fullscreen = false
+vsync = true

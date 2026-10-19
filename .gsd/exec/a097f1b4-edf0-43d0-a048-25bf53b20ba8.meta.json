@@ -1,0 +1,20 @@
+{
+  "id": "a097f1b4-edf0-43d0-a048-25bf53b20ba8",
+  "runtime": "bash",
+  "purpose": "Fresh Integration evidence: 10s live launch smoke on the migrated loop",
+  "script_chars": 43,
+  "started_at": "2026-10-19T11:31:29.138Z",
+  "finished_at": "2026-10-19T11:31:39.177Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10039,
+  "stdout_bytes": 61,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/a097f1b4-edf0-43d0-a048-25bf53b20ba8.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/a097f1b4-edf0-43d0-a048-25bf53b20ba8.stderr"
+}

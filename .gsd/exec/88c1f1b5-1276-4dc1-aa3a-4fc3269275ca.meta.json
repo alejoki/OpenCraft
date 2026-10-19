@@ -1,0 +1,27 @@
+{
+  "id": "88c1f1b5-1276-4dc1-aa3a-4fc3269275ca",
+  "runtime": "bash",
+  "purpose": "UAT M001/S04/s04-settings-smoke (uat-runtime-check)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S04",
+    "checkId": "s04-settings-smoke",
+    "intent": "uat-runtime-check"
+  },
+  "script_chars": 39,
+  "started_at": "2026-10-19T10:54:35.789Z",
+  "finished_at": "2026-10-19T10:54:45.841Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10052,
+  "stdout_bytes": 106,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/88c1f1b5-1276-4dc1-aa3a-4fc3269275ca.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/88c1f1b5-1276-4dc1-aa3a-4fc3269275ca.stderr"
+}
