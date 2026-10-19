@@ -1,0 +1,11 @@
+total 0
+drwxrwxrwt.  2 root   root    60 Oct 19 08:07 .
+drwxrwxrwt. 24 root   root   660 Oct 19 10:36 ..
+srwxr-xr-x.  1 aleksi aleksi   0 Oct 19 08:07 X0
+/run/user/1000/wayland-0
+/run/user/1000/wayland-0.lock
+kwin_wayland
+kwin_wayland_wr
+Xwayland
+xwaylandvideobr
+NO_DISPLAY_ENV

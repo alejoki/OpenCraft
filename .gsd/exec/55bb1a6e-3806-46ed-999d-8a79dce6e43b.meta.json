@@ -1,0 +1,20 @@
+{
+  "id": "55bb1a6e-3806-46ed-999d-8a79dce6e43b",
+  "runtime": "bash",
+  "purpose": "Probe Wayland backend for 3s launch survival",
+  "script_chars": 298,
+  "started_at": "2026-10-19T07:38:28.255Z",
+  "finished_at": "2026-10-19T07:38:31.287Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 3032,
+  "stdout_bytes": 13,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/55bb1a6e-3806-46ed-999d-8a79dce6e43b.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/55bb1a6e-3806-46ed-999d-8a79dce6e43b.stderr"
+}

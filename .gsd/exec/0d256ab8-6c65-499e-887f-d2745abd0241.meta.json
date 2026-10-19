@@ -1,0 +1,20 @@
+{
+  "id": "0d256ab8-6c65-499e-887f-d2745abd0241",
+  "runtime": "bash",
+  "purpose": "Check GPU devices and runtime dir",
+  "script_chars": 132,
+  "started_at": "2026-10-19T07:37:00.941Z",
+  "finished_at": "2026-10-19T07:37:00.953Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 12,
+  "stdout_bytes": 310,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0d256ab8-6c65-499e-887f-d2745abd0241.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0d256ab8-6c65-499e-887f-d2745abd0241.stderr"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "42b7a459-022a-44d5-b1f3-79a616683ffc",
+  "runtime": "bash",
+  "purpose": "Check smoke script and debug binary presence",
+  "script_chars": 153,
+  "started_at": "2026-10-19T07:35:52.397Z",
+  "finished_at": "2026-10-19T07:35:52.409Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 12,
+  "stdout_bytes": 161,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/42b7a459-022a-44d5-b1f3-79a616683ffc.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/42b7a459-022a-44d5-b1f3-79a616683ffc.stderr"
+}

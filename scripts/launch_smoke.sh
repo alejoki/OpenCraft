@@ -13,6 +13,20 @@
 
 set -u
 
+# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
+# when a desktop session is live. Attach to the running session so winit can
+# create its window. Prefer the Wayland socket: Xwayland's :0 needs an xauth
+# cookie the launching shell may not have, and winit picks the X11 backend
+# whenever DISPLAY is set (it does not fall back cleanly to Wayland).
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
+        export WAYLAND_DISPLAY="wayland-0"
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
+        export DISPLAY=":0"
+    fi
+fi
+
 BIN="./target/debug/minecraft-clone"
 SMOKE_DIR="/tmp/minecraft-clone-smoke"
 OUT="$SMOKE_DIR/output.log"

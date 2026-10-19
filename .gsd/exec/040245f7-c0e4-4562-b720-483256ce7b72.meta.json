@@ -1,0 +1,20 @@
+{
+  "id": "040245f7-c0e4-4562-b720-483256ce7b72",
+  "runtime": "bash",
+  "purpose": "Diagnose display server availability",
+  "script_chars": 323,
+  "started_at": "2026-10-19T07:36:26.784Z",
+  "finished_at": "2026-10-19T07:36:26.826Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 42,
+  "stdout_bytes": 278,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/040245f7-c0e4-4562-b720-483256ce7b72.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/040245f7-c0e4-4562-b720-483256ce7b72.stderr"
+}

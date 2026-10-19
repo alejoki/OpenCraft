@@ -1,0 +1,20 @@
+{
+  "id": "fe2a346b-5003-4298-bcfa-8edbcef6c0a6",
+  "runtime": "bash",
+  "purpose": "Verify smoke tmp dir cleanup",
+  "script_chars": 55,
+  "started_at": "2026-10-19T07:39:23.776Z",
+  "finished_at": "2026-10-19T07:39:23.787Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 11,
+  "stdout_bytes": 11,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/fe2a346b-5003-4298-bcfa-8edbcef6c0a6.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/fe2a346b-5003-4298-bcfa-8edbcef6c0a6.stderr"
+}
