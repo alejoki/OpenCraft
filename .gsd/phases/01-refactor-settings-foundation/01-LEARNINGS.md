@@ -72,10 +72,9 @@ missing_artifacts: []
 - **Bounded smoke harnesses:** timeout-killed GUI runs asserting exit 124 + no-panic text in captured output (launch) plus byte-identical seeded-file survival (settings) — reusable, cheap, CI-friendly proof the game actually runs.
   - Source: 01-01-SUMMARY.md/What Happened + 01-04-SUMMARY.md/What Happened
 
-### Capture Status Note (for closeout retry)
+### Capture Status Note (final)
 
-- Persisted to the memory store this milestone: MEM021 (P007 change-gated text shaping), MEM022 (P008 pure immediate-mode menu module), MEM023 (P009 change-gated atomic persistence), MEM024 (P010 bounded GUI smoke harness), MEM025 (L007 rebind validation order), MEM026 (human-in-the-loop UAT halves convention). Already present from slice work: MEM001–MEM020 (D001–D004, D007/MEM013, D005/D006 + P001/P002 from S02, MEM012/MEM015 quad API, MEM019/MEM020, MEM005/MEM006/MEM007/MEM014/MEM016/MEM017/MEM018).
-- **NOT yet persisted — blocked by the tool-call loop guard mid-batch:** the two Decisions "Loaded Settings is the single source of truth for video parameters" and "Save-on-every-accepted-change plus save-on-quit" (category: architecture, scope: M001, structuredFields per Step 6 of the learnings procedure). A retry turn must persist exactly these two via capture_thought and skip everything already captured above, then call gsd_complete_milestone. Project .gsd/PREFERENCES.md now exempts capture_thought from the per-tool cap for future turns.
+- All durable Decisions, Lessons, and Patterns from this milestone are persisted to the memory store: MEM001–MEM028 (D001–D007 as MEM001–MEM004/MEM008/MEM009/MEM013, P001–P010, L002/L007 and related gotchas, MEM019–MEM020 routing/borrow patterns, MEM026 human-in-the-loop UAT convention, MEM027 loaded-Settings-as-video-source-of-truth decision, MEM028 save-on-accept + save-on-quit decision). The two decisions previously blocked by the tool-call loop guard were persisted in the closeout retry turn (MEM027, MEM028). Surprises remain only in this file, not in the memory store.
 
 ### Surprises
 

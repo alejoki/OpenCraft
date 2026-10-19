@@ -12,6 +12,7 @@ A Minecraft-style voxel sandbox game in Rust: chunked terrain, greedy-meshed ren
 - In-game settings menu (`src/ui/menu.rs`): Escape toggles with cursor release + InputState reset, menu-first input routing, press-to-rebind for the 7 gameplay keybinds with duplicate/unsupported rejection, live sensitivity/FOV/fullscreen/vsync apply, atomic save on every accepted change plus save-on-quit. Loaded Settings is the single source of truth for video parameters (applied at startup too).
 - Test suite: 94/94 green (31 settings, 24 menu, 5 quad, plus pre-existing). Slice surface build-warning-free and clippy-clean.
 - Smoke harnesses: `scripts/launch_smoke.sh` (bounded 10 s launch, exit-124/no-panic assertions) and `scripts/settings_smoke.sh` (seeded settings.toml survives a run byte-identical).
+- Validation: milestone validation passed (remediation round 2) — all four verification classes (Contract/Integration/Operational/UAT) PASS with current evidence, including human-confirmed interactive UAT on 2026-10-19 (durable artifact: game-written settings.toml with non-default `crouch_or_down = "Tab"`).
 
 ## Architecture
 
@@ -30,6 +31,8 @@ A Minecraft-style voxel sandbox game in Rust: chunked terrain, greedy-meshed ren
 - D005: two-phase per-field-fallback TOML load; never serde-derive load.
 - D006: warnings/conflicts returned as structured data, no logging dependency.
 - D007: UI drawn via an optional render pass hook on `render_frame` (least-churn seam).
+- (D008/MEM027): loaded Settings is the single source of truth for video parameters, applied at startup.
+- (D009/MEM028): atomic save on every accepted change plus save-on-quit.
 
 ## Known Limitations
 
