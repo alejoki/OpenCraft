@@ -12,6 +12,7 @@ Agents read this before every unit. Add entries when you discover something wort
 
 | # | Pattern | Where | Notes |
 |---|---------|-------|-------|
+| P001 | Per-field TOML fallback in src/settings/mod.rs requires a two-phase parse: first `toml::from_str::<toml::Value>` into a generic tree, then independent per-field extraction with type/range checks. Plain `#[serde(default)]` derive cannot be used for loading — serde aborts the whole struct on any field type error, losing valid siblings. Add new settings fields by extending the phase-2 lookups (see load_keybind_action / load_clamped_f32 / load_bool helpers). | — | — |
 
 ## Lessons Learned
 

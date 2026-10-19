@@ -1,0 +1,20 @@
+{
+  "id": "47fc2464-25b9-47cd-abcb-1e8182252803",
+  "runtime": "bash",
+  "purpose": "T02 TDD red phase: confirm new load tests fail against the stub before implementing",
+  "script_chars": 10,
+  "started_at": "2026-10-19T07:57:00.095Z",
+  "finished_at": "2026-10-19T07:57:02.758Z",
+  "exit_code": 101,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 2663,
+  "stdout_bytes": 8520,
+  "stderr_bytes": 289,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/47fc2464-25b9-47cd-abcb-1e8182252803.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/47fc2464-25b9-47cd-abcb-1e8182252803.stderr"
+}
