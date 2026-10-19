@@ -1,0 +1,20 @@
+{
+  "id": "8099b0b1-6990-42b9-9e2d-4b7b434ac620",
+  "runtime": "bash",
+  "purpose": "M001 source commit evidence verification retry",
+  "script_chars": 1658,
+  "started_at": "2026-10-19T13:10:36.560Z",
+  "finished_at": "2026-10-19T13:10:36.622Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 62,
+  "stdout_bytes": 377,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/8099b0b1-6990-42b9-9e2d-4b7b434ac620.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/8099b0b1-6990-42b9-9e2d-4b7b434ac620.stderr"
+}

@@ -1,3 +1,3 @@
 # Queue
 
-- ⬜ **M001: Refactor + Settings Foundation**
+- 🔄 **M001: Refactor + Settings Foundation**

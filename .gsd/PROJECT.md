@@ -4,47 +4,47 @@ A Minecraft-style voxel sandbox game in Rust: chunked terrain, greedy-meshed ren
 
 ## Current State
 
-**Last completed milestone: M001 — Refactor + Settings Foundation (2026-10-19)**
+**M001 closeout submitted for validation: Refactor + Settings Foundation (2026-10-19)**
 
-- Event loop migrated from winit 0.29's deprecated closure `run()` to winit 0.30.13's `ApplicationHandler` (GameApp/Ready structs, window + GPU init in `resumed()` via `ActiveEventLoop::create_window`, `Arc<Window>` surface for wgpu 0.19). Gameplay parity human-confirmed.
-- `src/settings` pure-logic module: TOML load with two-phase per-field fallback (a bad settings.toml never blocks launch), atomic save (tmp sibling + rename), hand-mapped KeyCode↔stable-string keybind conversion, duplicate-keybind validation. Defaults equal the pre-existing hardcoded values.
-- `src/ui` module: glyphon 0.5.0 text stack, pixel-space quad drawing API, color-only second render pass over the world pass, cursor position plumbing — powering both a live always-on stats overlay (FPS/frame ms/position/chunks) and the settings menu.
-- In-game settings menu (`src/ui/menu.rs`): Escape toggles with cursor release + InputState reset, menu-first input routing, press-to-rebind for the 7 gameplay keybinds with duplicate/unsupported rejection, live sensitivity/FOV/fullscreen/vsync apply, atomic save on every accepted change plus save-on-quit. Loaded Settings is the single source of truth for video parameters (applied at startup too).
-- Test suite: 94/94 green (31 settings, 24 menu, 5 quad, plus pre-existing). Slice surface build-warning-free and clippy-clean.
-- Smoke harnesses: `scripts/launch_smoke.sh` (bounded 10 s launch, exit-124/no-panic assertions) and `scripts/settings_smoke.sh` (seeded settings.toml survives a run byte-identical).
-- Validation: milestone validation passed (remediation round 2) — all four verification classes (Contract/Integration/Operational/UAT) PASS with current evidence, including human-confirmed interactive UAT on 2026-10-19 (durable artifact: game-written settings.toml with non-default `crouch_or_down = "Tab"`).
+- Event loop migrated from winit 0.29's deprecated closure `run()` to winit 0.30.13's `ApplicationHandler` (GameApp/Ready structs, window + GPU init in `resumed()` via `ActiveEventLoop::create_window`, `Arc<Window>` surface for wgpu 0.19). Gameplay parity was human-confirmed.
+- `src/settings` is a pure-logic module with TOML load using two-phase per-field fallback, atomic save (tmp sibling + rename), hand-mapped KeyCode to stable-string conversion, duplicate-keybind validation, and defaults matching the pre-existing hardcoded values.
+- `src/ui` provides the glyphon 0.5.0 text stack, pixel-space quad drawing, a color-only second render pass, cursor position plumbing, a live stats overlay, and the settings menu.
+- The settings menu opens with cursor release and InputState reset; supports press-to-rebind for seven gameplay keybinds with duplicate/unsupported rejection; applies sensitivity, FOV, fullscreen, and vsync live; and persists accepted changes and quit state atomically.
+- Test suite: 94/94 green (31 settings, 24 menu, 5 quad, plus pre-existing). Slice-surface build-warning-free and clippy-clean; full-tree cargo build reports 0 warnings.
+- Smoke harnesses: `scripts/launch_smoke.sh` (bounded 10 s launch, exit-124/no-panic assertions) and `scripts/settings_smoke.sh` (seeded settings.toml survives a run byte-identically).
+- Validation receipt: milestone validation passed in remediation round 3, with Contract, Integration, Operational, and UAT classes all passing. Interactive UAT on 2026-10-19 confirmed gameplay parity, menu behavior, live settings application, and relaunch persistence; durable evidence includes a game-written `crouch_or_down = "Tab"` binding.
 
 ## Architecture
 
-- **Event loop / app:** `src/main.rs` — winit 0.30.13 `ApplicationHandler`; `GameApp` (state) + nested `Option<Ready>` (window-dependent GPU stack) initialized in `resumed()`.
-- **Rendering:** `src/render/` — wgpu 0.19.4 context and pipeline; world pass plus optional color-only UI pass (second `begin_render_pass`, LoadOp::Load, same encoder) for overlay and menu.
-- **UI:** `src/ui/` — `UiRenderer` (glyphon 0.5.0), `StatsOverlay`, pure px→NDC quad API, `menu.rs` pure immediate-mode menu state machine + layout + hit-test (unit-tested before wiring).
-- **Settings:** `src/settings/` — `Settings`, `load_with_warnings`, atomic `save`, `validate_keybinds`, `SettingsWarning`/`KeybindConflict` returned as data (crate is log-free by decision D006).
-- **World/mesh:** `src/world/`, `src/mesh/` — chunked terrain, greedy meshing (pre-existing; not touched by M001).
+- **Event loop / app:** `src/main.rs` — winit 0.30.13 `ApplicationHandler`; `GameApp` plus nested `Option<Ready>` for window-dependent GPU initialization in `resumed()`.
+- **Rendering:** `src/render/` — wgpu 0.19.4 context and pipeline; world pass plus optional color-only UI pass (second `begin_render_pass`, LoadOp::Load, same encoder/view) for overlay and menu, driven through the lifetime-typed `UiPass` trait.
+- **UI:** `src/ui/` — `UiRenderer` (glyphon 0.5.0), `StatsOverlay`, pure px-to-NDC quad API, and `menu.rs` pure immediate-mode menu state machine with unit tests.
+- **Settings:** `src/settings/` — `Settings`, `load_with_warnings`, atomic `save`, `validate_keybinds`, `SettingsWarning` and `KeybindConflict` returned as data; no logging dependency.
+- **World/mesh:** `src/world/`, `src/mesh/` — chunked terrain and greedy meshing, pre-existing and not changed by M001.
 
 ## Key Decisions (M001)
 
-- D001: winit pinned to 0.30.13 (not 0.31.0-beta).
-- D002: glyphon pinned `=0.5.0` (its wgpu ^0.19 pin; 0.6+ requires the out-of-scope wgpu upgrade).
-- D003: keybinds stored as hand-mapped stable strings, decoupled from winit's serde.
-- D004: slice order S01→S02→S03→S04 (risk-first, S04 as end-to-end integration).
-- D005: two-phase per-field-fallback TOML load; never serde-derive load.
-- D006: warnings/conflicts returned as structured data, no logging dependency.
-- D007: UI drawn via an optional render pass hook on `render_frame` (least-churn seam).
-- (D008/MEM027): loaded Settings is the single source of truth for video parameters, applied at startup.
-- (D009/MEM028): atomic save on every accepted change plus save-on-quit.
+- D001: pin winit to 0.30.13 rather than 0.31.0-beta.
+- D002: pin glyphon to `=0.5.0` for compatibility with wgpu 0.19.
+- D003: store keybinds as hand-mapped stable strings, independent of winit serde.
+- D004: execute foundations in risk order S01/S02, then UI S03, then end-to-end menu S04.
+- D005: use two-phase per-field-fallback TOML loading rather than serde-derived loading.
+- D006: return warnings and conflicts as structured data without adding a logging dependency.
+- D007: draw UI through a second color-only render pass on the existing encoder/view, implemented by the lifetime-typed `UiPass` trait.
+- D008: use loaded Settings as the single source of truth for video parameters at startup and during live changes.
+- D009: atomically save on every accepted menu change and on quit.
 
 ## Known Limitations
 
-- 13 pre-existing clippy lib warnings in `src/mesh/*`, `src/world/*`, `src/render/texture.rs` predate M001 and are out of its scope (MEM007/MEM017) — candidates for a future cleanup milestone.
-- Wayland with vsync=false may fall back (PresentMode::Immediate unavailable) — accepted visual no-op, documented in `apply_vsync`.
-- ShiftRight/ControlRight no longer crouch/sprint — intentional keybind narrowing documented in S02's rationale.
-- Duplicate bindings in a hand-edited settings.toml load with a warning (never block launch) and resolve first-match in declaration order.
+- 13 pre-existing clippy lib warnings in `src/mesh/*`, `src/world/*`, and `src/render/texture.rs` predate M001 and remain out of scope; they are candidates for a future cleanup milestone.
+- Wayland with vsync=false may fall back when PresentMode::Immediate is unavailable; this is an accepted visual no-op documented in `apply_vsync`.
+- ShiftRight and ControlRight no longer crouch/sprint; this intentional keybind narrowing is documented in S02.
+- Duplicate bindings in a hand-edited settings.toml load with a warning, never block launch, and resolve first-match in declaration order.
 
 ## Next
 
-No further milestones planned yet. Natural candidates: mesh/world lint cleanup, audio, more world generation, inventory/crafting.
+No further milestones are planned yet. Natural candidates are mesh/world lint cleanup, audio, more world generation, and inventory/crafting.
 
 ## Milestone Sequence
 
-- [ ] M001: Refactor + Settings Foundation — The event loop migrates from winit 0.29's deprecated closure API to winit 0.30.13's ApplicationHandler trait (wgpu stays pinned at 0.19), and the game gains its first persisted player preferences: a serde/TOML settings layer covering keybinds, mouse sensitivity, FOV, and fullscreen/vsync, with per-field fallback so a bad settings.toml never blocks launch.
+- [ ] M001: Refactor + Settings Foundation — winit 0.30.13 ApplicationHandler migration, resilient TOML settings persistence, UI overlay foundation, and interactive settings menu with live application and relaunch persistence.

@@ -1,0 +1,20 @@
+{
+  "id": "20c69cf8-bca2-4264-9246-4fd41a7511e0",
+  "runtime": "bash",
+  "purpose": "Re-run M001 code-change verification with pre-merge baseline and milestone-scoped commit evidence",
+  "script_chars": 1150,
+  "started_at": "2026-10-19T13:06:25.518Z",
+  "finished_at": "2026-10-19T13:06:25.629Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 111,
+  "stdout_bytes": 14445,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/20c69cf8-bca2-4264-9246-4fd41a7511e0.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/20c69cf8-bca2-4264-9246-4fd41a7511e0.stderr"
+}

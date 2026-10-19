@@ -88,4 +88,4 @@ Proceed as the brief scopes it, with **glyphon 0.5** as the text rendering libra
 - winit current stable = 0.30.13; 0.31.0-beta.3 pre-release; `serde` feature exists on the winit crate (source: [crates.io API — winit](https://crates.io/api/v1/crates/winit))
 - glyphon 0.5.0 depends on wgpu `^0.19`, cosmic-text `^0.10`; winit only a dev-dependency; glyphon 0.6+ requires wgpu `^22`+ (source: [crates.io API — glyphon 0.5.0 deps](https://crates.io/api/v1/crates/glyphon/0.5.0/dependencies), [glyphon 0.6.0 deps](https://crates.io/api/v1/crates/glyphon/0.6.0/dependencies), [docs.rs glyphon 0.5.0](https://docs.rs/glyphon/0.5.0/glyphon/struct.TextRenderer.html))
 - Candidate requirements surfaced (no REQUIREMENTS.md exists yet): (1) core-capability — settings persistence with per-field fallback and always-launch guarantee; (2) constraint/launchability — event loop on supported winit ApplicationHandler API. Duplicate-keybind warning and restart persistence are acceptance details of (1), advisory vs. separate requirements — left to the requirements-recording step, not silently expanded here.
-<!-- gsd:state-version=17:1 -->
+<!-- gsd:state-version=9:1 -->

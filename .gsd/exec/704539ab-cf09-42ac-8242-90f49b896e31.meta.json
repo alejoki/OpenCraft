@@ -1,0 +1,20 @@
+{
+  "id": "704539ab-cf09-42ac-8242-90f49b896e31",
+  "runtime": "bash",
+  "purpose": "Verify M001 source diff and milestone artifacts",
+  "script_chars": 853,
+  "started_at": "2026-10-19T13:00:05.526Z",
+  "finished_at": "2026-10-19T13:00:05.542Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 16,
+  "stdout_bytes": 1592,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/704539ab-cf09-42ac-8242-90f49b896e31.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/704539ab-cf09-42ac-8242-90f49b896e31.stderr"
+}
