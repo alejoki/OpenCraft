@@ -2604,6 +2604,180 @@ mod tests {
         assert_eq!(session.save_path, existing);
     }
 
+    /// S03-T04 integrated loop proof — the slice's demo, driven entirely
+    /// through the real flows with no window/GPU/event-loop: create a
+    /// named seeded world from the form, edit it and move the player,
+    /// Escape-to-pause semantics + Save and Quit back to the main menu
+    /// (writing the session's own save path), then reload the same row
+    /// and prove seed, edited-time player state, and chunk edits intact.
+    #[test]
+    fn integrated_loop_create_edit_save_quit_and_reload_keeps_everything_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+
+        // The create flow: name "alpha", seed text "42".
+        app.new_game.apply(TextInputAction::InsertText("alpha".into()));
+        app.new_game.cycle_focus();
+        app.new_game.apply(TextInputAction::InsertText("42".into()));
+        app.attempt_create();
+
+        let expected_seed = resolve_seed_or("42", 0);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.world.seed(), expected_seed);
+        assert_eq!(app.session.save_path, dir.path().join("alpha.mcvx"));
+
+        // Edit the world: load the spawn chunk and place a block (marking
+        // unsaved changes), and move the player / pick a hotbar slot so
+        // the edited-time player state must survive the round trip.
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, expected_seed));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert_eq!(app.session.world.get_block(0, 40, 5), BlockId::Brick);
+        assert!(app.session.world.has_unsaved_changes());
+        let edits_before = app.session.world.chunk_edits().clone();
+        app.session.player.position = Vec3::new(12.5, 70.0, -3.5);
+        app.session.player.yaw = 1.25;
+        app.session.player.pitch = -0.5;
+        app.session.player.fly_mode = true;
+        app.session.player.selected_slot = 5;
+
+        // Escape to pause, then Save and Quit through the real, loop-free
+        // decision apply: back to the main menu with the session saved to
+        // its own save path.
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
+        assert!(!exit_requested);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none(), "save succeeded, no message");
+        assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
+
+        // The save file exists with exactly the session's own data.
+        let save_path = dir.path().join("alpha.mcvx");
+        let data = load_world_from_path(&save_path).expect("alpha.mcvx written and loadable");
+        assert_eq!(data.seed, expected_seed);
+        assert_eq!(data.player.position, [12.5, 70.0, -3.5]);
+        assert_eq!(data.player.yaw, 1.25);
+        assert_eq!(data.player.pitch, -0.5);
+        assert!(data.player.fly_mode);
+        assert_eq!(data.player.selected_slot, 5);
+        assert_eq!(data.chunk_edits, edits_before);
+
+        // Load the same row: enter the load screen (refreshes rows from
+        // the tempdir catalog), Play, and prove the round trip.
+        app.enter_screen(LifecycleScreen::LoadGame);
+        let index = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "alpha")
+            .expect("alpha row listed");
+        app.play_row(index);
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.world.seed(), expected_seed, "seed round-trips");
+        assert_eq!(
+            app.session.save_path, save_path,
+            "session owns the row's own file path"
+        );
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(12.5, 70.0, -3.5),
+            "edited-time player position round-trips"
+        );
+        assert_eq!(app.session.player.yaw, 1.25);
+        assert_eq!(app.session.player.pitch, -0.5);
+        assert!(app.session.player.fly_mode);
+        assert_eq!(app.session.player.selected_slot, 5);
+        assert_eq!(
+            app.session.world.chunk_edits(),
+            &edits_before,
+            "chunk edits round-trip"
+        );
+        assert!(app.cursor_grabbed, "Playing semantics grab the cursor");
+
+        // The persisted edit re-applies when the chunk regenerates (the
+        // same bounded streaming pump the WorldManager
+        // unload/regeneration test uses — headless, rayon-driven).
+        for _ in 0..40 {
+            app.session.world.update_streaming(cpos);
+            if app.session.world.get_block(0, 40, 5) == BlockId::Brick {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.session.world.get_block(0, 40, 5),
+            BlockId::Brick,
+            "the edited block is restored after the reload"
+        );
+    }
+
+    /// S03-T04 startup regression: a world-intent CLI (the three-flag
+    /// disjunction both smoke scripts' launches rely on) starts a session
+    /// that owns `cli.save_path` and GameApp::new enters Playing directly
+    /// (the direct-launch bypass); a bare launch targets the default save
+    /// path and loads `saves/default.mcvx` when it exists (legacy
+    /// byte-identical behavior — read-only, the test never writes there).
+    #[test]
+    fn startup_regression_direct_launch_owns_cli_path_and_bare_launch_targets_the_default_save() {
+        // Direct launch: --save + --seed is a world intent; the startup
+        // session owns the CLI save path at the override seed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("smoke.mcvx");
+        let cli = CliConfig::from_iter([
+            "--save",
+            save_path.to_str().unwrap(),
+            "--seed",
+            "7",
+        ]);
+        assert!(cli_has_world_intent(&cli));
+        let session = startup_session(&cli);
+        assert_eq!(session.save_path, cli.save_path);
+        assert_eq!(session.world.seed(), 7);
+
+        // GameApp::new with a world-intent CLI enters gameplay directly,
+        // bypassing every menu screen (both smoke scripts' launches).
+        let app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(app.cursor_grabbed, "direct launch grabs the cursor");
+        assert_eq!(app.session.save_path, save_path);
+
+        // Bare launch: no world intent, the session targets the default
+        // save path, and startup_session loads `saves/default.mcvx` when
+        // it is present and loadable (asserting against the file's own
+        // content, so the test tracks the fixture instead of pinning it);
+        // a missing/corrupt default save falls back to the fresh default
+        // seed. Read-only either way.
+        let bare = CliConfig::from_iter(Vec::<String>::new());
+        assert!(!cli_has_world_intent(&bare));
+        assert_eq!(bare.save_path, Path::new(DEFAULT_SAVE_PATH));
+        let session = startup_session(&bare);
+        assert_eq!(
+            session.save_path,
+            Path::new(DEFAULT_SAVE_PATH),
+            "bare launch targets the default save path"
+        );
+        match load_world_from_path(Path::new(DEFAULT_SAVE_PATH)) {
+            Ok(data) => {
+                assert_eq!(session.world.seed(), data.seed, "default save loaded");
+                assert_eq!(session.world.chunk_edits(), &data.chunk_edits);
+                assert_eq!(
+                    session.player.position,
+                    Vec3::from_array(data.player.position)
+                );
+            }
+            Err(_) => {
+                assert_eq!(
+                    session.world.seed(),
+                    DEFAULT_WORLD_SEED,
+                    "no default save: fresh session at the default seed"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tick_transient_message_expires_by_tick_counter_purely() {
         let mut message = Some(MenuMessage {
