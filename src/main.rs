@@ -88,6 +88,10 @@ struct GameApp {
     last_saved_badge: Option<Instant>,
     frame_count: u32,
     last_overlay_text: String,
+    /// Last reported cursor position in physical pixels (None when the
+    /// cursor left the window). Same px space as ctx.config, cosmic-text
+    /// buffers, and the quad renderer's API — S04 hit-testing consumes it.
+    cursor_pos: Option<(f32, f32)>,
 }
 
 impl GameApp {
@@ -109,6 +113,7 @@ impl GameApp {
             last_saved_badge: None,
             frame_count: 0,
             last_overlay_text: String::new(),
+            cursor_pos: None,
         }
     }
 }
@@ -485,6 +490,15 @@ impl ApplicationHandler for GameApp {
                     }
                     Err(wgpu::SurfaceError::Timeout) => {}
                 }
+            }
+            // Cursor plumbing (no gameplay behavior): stores the latest
+            // physical-pixel cursor position, or None once it leaves the
+            // window. winit 0.30 delivers PhysicalPosition<f64>.
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some((position.x as f32, position.y as f32));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
             }
             _ => {}
         }

@@ -561,6 +561,11 @@ impl VoxelRenderer {
         }
     }
 
+    // 8 args: the existing world-pass parameters plus the T01 `ui_pass`
+    // hook. Kept flat rather than grouped into a struct to avoid churn at
+    // the single call site in src/main.rs; this is the frame-draw entry
+    // point, not a general-purpose API.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
         ctx: &RenderContext,
