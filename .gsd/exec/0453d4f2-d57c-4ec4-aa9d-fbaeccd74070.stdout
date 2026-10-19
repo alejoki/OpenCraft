@@ -1,6 +1,0 @@
-MISSING: every_supported_key_round_trips
-MISSING: every_mapped_string_is_the_keycode_debug_spelling
-MISSING: unsupported_strings_return_none
-MISSING: keys_outside_the_supported_subset_return_none_from_key_to_string
-TOTAL_OK=31
-DONE

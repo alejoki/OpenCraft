@@ -1,3 +1,0 @@
-ls: cannot access 'target/debug/minecraft-clone': No such file or directory
--rwxr-xr-x. 1 aleksi aleksi 1417 Oct 19 10:33 scripts/launch_smoke.sh
-BINARY_MISSING

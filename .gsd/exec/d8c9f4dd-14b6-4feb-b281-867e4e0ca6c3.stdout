@@ -1,9 +1,0 @@
-   Compiling minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
-error[E0425]: cannot find value `ui` in this scope
-   --> src/render/pipeline.rs:698:13
-    |
-698 |             ui.draw_ui(&mut ui_rpass);
-    |             ^^ not found in this scope
-
-For more information about this error, try `rustc --explain E0425`.
-error: could not compile `minecraft-clone` (lib) due to 1 previous error

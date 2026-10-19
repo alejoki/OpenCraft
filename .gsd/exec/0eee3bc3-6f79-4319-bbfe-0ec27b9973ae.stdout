@@ -1,3 +1,0 @@
-DISPLAY=unset WAYLAND_DISPLAY=unset XDG_SESSION_TYPE=unset
-which: no Xvfb in (/home/aleksi/.gsd/agent/bin:/home/aleksi/.nvm/versions/node/v26.9.0/bin:/home/aleksi/.local/bin:/home/aleksi/.opencode/bin:/usr/local/bin:/usr/bin:/bin)
-which: no xvfb-run in (/home/aleksi/.gsd/agent/bin:/home/aleksi/.nvm/versions/node/v26.9.0/bin:/home/aleksi/.local/bin:/home/aleksi/.opencode/bin:/usr/local/bin:/usr/bin:/bin)

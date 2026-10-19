@@ -1,4 +1,0 @@
-   Compiling minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.57s
-     Running unittests src/lib.rs (target/debug/deps/minecraft_clone-dddd1dbe32bfc6bf)
-error: test failed, to rerun pass `--lib`

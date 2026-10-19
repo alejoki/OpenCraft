@@ -1,8 +1,0 @@
-total 0
-drwxr-xr-x.  3 root root        100 Oct 19  2026 .
-drwxr-xr-x. 20 root root       4880 Oct 19 08:13 ..
-drwxr-xr-x.  2 root root         80 Oct 19 08:07 by-path
-crw-rw----+  1 root video  226,   1 Oct 19 08:07 card1
-crw-rw-rw-.  1 root render 226, 128 Oct 19 08:07 renderD128
-XDG_RUNTIME_DIR=unset
-1000

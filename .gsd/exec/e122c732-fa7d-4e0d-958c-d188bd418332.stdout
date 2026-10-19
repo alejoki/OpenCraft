@@ -1,2 +1,0 @@
-SMOKE PASS: ran 10s on a seeded settings.toml (jump = ShiftLeft), exit 124, no panic, file byte-identical
-NO_STRAY_SETTINGS_IN_CWD

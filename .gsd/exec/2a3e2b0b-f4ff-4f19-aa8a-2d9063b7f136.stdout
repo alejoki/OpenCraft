@@ -1,3 +1,0 @@
-warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
-    Checking minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s

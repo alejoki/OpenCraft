@@ -1,5 +1,0 @@
-   Compiling minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
-     Running unittests src/lib.rs (target/debug/deps/minecraft_clone-2bd436777ed8b1eb)
-     Running unittests src/main.rs (target/debug/deps/minecraft_clone-5f261a69e0f83d3a)
-   Doc-tests minecraft_clone

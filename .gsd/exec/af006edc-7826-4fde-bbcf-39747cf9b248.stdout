@@ -1,6 +1,0 @@
-warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
-warning: `minecraft-clone` (lib test) generated 13 warnings (12 duplicates) (run `cargo clippy --fix --lib -p minecraft-clone --tests -- ` to apply 1 suggestion)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
-EXIT=0
---- warning locations ---
-TOTAL_WARN=15

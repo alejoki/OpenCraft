@@ -1,4 +1,0 @@
-
-warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.86s
-CLIPPY_FINDINGS_PRESENT
