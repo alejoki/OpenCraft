@@ -1,0 +1,20 @@
+{
+  "id": "b2a76932-e717-47f5-baed-a3a186d225f3",
+  "runtime": "bash",
+  "purpose": "List GSD artifact files to locate PROJECT and requirements artifacts",
+  "script_chars": 84,
+  "started_at": "2026-10-19T11:35:10.532Z",
+  "finished_at": "2026-10-19T11:35:10.544Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 12,
+  "stdout_bytes": 635,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/b2a76932-e717-47f5-baed-a3a186d225f3.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/b2a76932-e717-47f5-baed-a3a186d225f3.stderr"
+}
