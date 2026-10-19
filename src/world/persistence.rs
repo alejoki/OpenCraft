@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -92,6 +93,25 @@ impl From<std::io::Error> for PersistenceError {
         Self::Io(e)
     }
 }
+
+impl fmt::Display for PersistenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PersistenceError::Io(e) => write!(f, "could not read or write the save file: {e}"),
+            PersistenceError::InvalidMagic => write!(f, "not a valid save file (bad magic)"),
+            PersistenceError::UnsupportedVersion(v) => {
+                write!(f, "unsupported save version {v} (this build reads version {SAVE_VERSION})")
+            }
+            PersistenceError::InvalidBlockId(b) => write!(f, "unknown block id {b} in save"),
+            PersistenceError::InvalidLocalIndex(i) => {
+                write!(f, "invalid block index {i} in save")
+            }
+            PersistenceError::InvalidPlayerState => write!(f, "invalid player state in save"),
+        }
+    }
+}
+
+impl std::error::Error for PersistenceError {}
 
 pub fn save_world_to_bytes(
     out: &mut Vec<u8>,
