@@ -28,8 +28,8 @@ use minecraft_clone::ui::screens::{
     load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect, load_row_rect,
     main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect, new_game_row_lines,
     new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action, validate_create,
-    LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction,
-    MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
+    FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
+    ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
 use minecraft_clone::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
@@ -1147,11 +1147,11 @@ impl GameApp {
                     return;
                 };
                 match target {
-                    // Field rows are not click-to-focus targets in this
-                    // slice (the plan's target list is randomize/create/
-                    // back): focus cycles via Tab. Field clicks are
-                    // consumed and ignored.
-                    NewGameTarget::NameField | NewGameTarget::SeedField => {}
+                    // Click-to-focus: the click sets the same single focus
+                    // field Tab cycles, so one field, one writer per
+                    // event (MEM028 stays closed).
+                    NewGameTarget::NameField => self.new_game.set_focus(FocusField::Name),
+                    NewGameTarget::SeedField => self.new_game.set_focus(FocusField::Seed),
                     NewGameTarget::Randomize => self.new_game.randomize(),
                     NewGameTarget::Create => self.attempt_create(),
                     NewGameTarget::Back => {
@@ -2898,15 +2898,20 @@ mod tests {
     fn compose_screen_text_shows_new_game_fields_and_appends_messages() {
         let mut new_game = NewGameScreen::new();
         let load = LoadScreen::new();
+        // default focus Name: marker prefix, caret after the typed name,
+        // unfocused blank seed renders the random hint
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
+        assert_eq!(
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
+            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nCreate World\nBack"
+        );
+        // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
-        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);
-        assert!(text.contains("World Name: Deep Dark"));
-        assert!(text.contains("Seed: 42"));
-        assert!(text.contains("Randomize Seed"));
-        assert!(text.contains("Create World"));
-        assert!(text.contains("Back"));
+        assert_eq!(
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
+            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nCreate World\nBack"
+        );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
         let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);

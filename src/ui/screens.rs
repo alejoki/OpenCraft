@@ -484,6 +484,13 @@ impl NewGameScreen {
         self.focus
     }
 
+    /// Set the focused field directly (click-to-focus on a field row).
+    /// Setting the already-focused field is a harmless no-op; focus stays
+    /// a single field either way (one writer per event).
+    pub fn set_focus(&mut self, field: FocusField) {
+        self.focus = field;
+    }
+
     /// Randomize the seed: clears the seed field, because a blank seed
     /// means "pick a random seed at creation"
     /// (`catalog::SeedSource::Random`). The name field is untouched.
@@ -557,20 +564,51 @@ impl NewGameScreen {
     }
 }
 
+/// Insert a `|` caret at `cursor`'s character index within `value`
+/// (the focused field renders its insertion cursor).
+fn insert_caret(value: &str, cursor: usize) -> String {
+    let mut out = String::with_capacity(value.len() + 1);
+    for (index, character) in value.chars().enumerate() {
+        if index == cursor {
+            out.push('|');
+        }
+        out.push(character);
+    }
+    if cursor >= value.chars().count() {
+        out.push('|');
+    }
+    out
+}
+
 /// Compose the new-game screen's display lines, top-to-bottom: the two
-/// field rows with their current values (a blank seed renders as
-/// "(random)", matching `catalog::SeedSource::Random`), then the three
-/// action rows.
+/// field rows with their current values, then the three action rows. The
+/// focused field's line is prefixed `> ` (every other line `  `) and
+/// shows a `|` caret at its value's cursor index; an unfocused blank
+/// (or whitespace-only) seed renders as "(random)", matching
+/// `catalog::SeedSource::Random`.
 pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
     let name = screen.name().value();
     let seed = screen.seed().value();
-    let seed_line = if seed.trim().is_empty() {
-        "Seed: (random)".to_string()
+    let name_line = if screen.focus() == FocusField::Name {
+        format!(
+            "> World Name: {}",
+            insert_caret(name, screen.name().cursor())
+        )
     } else {
-        format!("Seed: {seed}")
+        format!("  World Name: {name}")
+    };
+    let seed_line = if screen.focus() == FocusField::Seed {
+        format!(
+            "> Seed: {}",
+            insert_caret(seed, screen.seed().cursor())
+        )
+    } else if seed.trim().is_empty() {
+        "  Seed: (random)".to_string()
+    } else {
+        format!("  Seed: {seed}")
     };
     vec![
-        format!("World Name: {name}"),
+        name_line,
         seed_line,
         NewGameTarget::Randomize.label().to_string(),
         NewGameTarget::Create.label().to_string(),
@@ -1153,6 +1191,24 @@ mod tests {
         assert_eq!(screen.focus(), FocusField::Name);
         assert_eq!(FocusField::Name.cycle(), FocusField::Seed);
         assert_eq!(FocusField::Seed.cycle(), FocusField::Name);
+
+        // set_focus drives the same single field (click-to-focus), and
+        // set + cycle interleave consistently with cycle-only routing
+        screen.set_focus(FocusField::Seed);
+        assert_eq!(screen.focus(), FocusField::Seed);
+        assert_eq!(screen.cycle_focus(), FocusField::Name);
+        screen.set_focus(FocusField::Name);
+        assert_eq!(screen.focus(), FocusField::Name);
+        assert_eq!(screen.cycle_focus(), FocusField::Seed);
+        screen.set_focus(FocusField::Seed);
+        assert_eq!(screen.focus(), FocusField::Seed);
+        // setting the already-focused field is a harmless no-op
+        screen.set_focus(FocusField::Seed);
+        assert_eq!(screen.focus(), FocusField::Seed);
+        // text still routes to whichever field set_focus chose
+        screen.apply(TextInputAction::InsertText("via click".into()));
+        assert_eq!(screen.seed().value(), "via click");
+        assert_eq!(screen.name().value(), "");
     }
 
     #[test]
@@ -1421,27 +1477,29 @@ mod tests {
     #[test]
     fn new_game_row_lines_compose_fields_and_actions_in_order() {
         let mut screen = NewGameScreen::new();
-        // empty form: blank seed renders as the random hint
+        // empty form, default focus Name: marker on the name, caret at the
+        // blank value's start, unfocused blank seed renders the random hint
         assert_eq!(
             new_game_row_lines(&screen),
             vec![
-                "World Name: ".to_string(),
-                "Seed: (random)".to_string(),
+                "> World Name: |".to_string(),
+                "  Seed: (random)".to_string(),
                 "Randomize Seed".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
         );
 
-        // filled form: current values shown, whitespace-only seed still random
+        // filled form: the focused name shows the caret after the text;
+        // a whitespace-only unfocused seed still renders the random hint
         screen.apply(TextInputAction::InsertText("Deep Dark".into()));
         screen.cycle_focus();
         screen.apply(TextInputAction::InsertText("  ".into()));
         assert_eq!(
             new_game_row_lines(&screen),
             vec![
-                "World Name: Deep Dark".to_string(),
-                "Seed: (random)".to_string(),
+                "  World Name: Deep Dark".to_string(),
+                "> Seed:   |".to_string(),
                 "Randomize Seed".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
@@ -1449,7 +1507,42 @@ mod tests {
         );
 
         screen.apply(TextInputAction::InsertText("42".into()));
-        assert_eq!(new_game_row_lines(&screen)[1], "Seed:   42");
+        assert_eq!(new_game_row_lines(&screen)[1], "> Seed:   42|");
+    }
+
+    #[test]
+    fn focus_marker_and_caret_follow_focus_and_edits() {
+        let mut screen = NewGameScreen::new();
+        // focused marker on the name; caret at index 0 of the blank value
+        assert_eq!(new_game_row_lines(&screen)[0], "> World Name: |");
+        assert_eq!(new_game_row_lines(&screen)[1], "  Seed: (random)");
+
+        // a single-char insert advances the caret
+        screen.apply(TextInputAction::Insert('D'));
+        assert_eq!(new_game_row_lines(&screen)[0], "> World Name: D|");
+        // InsertText appends and the caret lands after the text
+        screen.apply(TextInputAction::InsertText("eep Dark".into()));
+        assert_eq!(new_game_row_lines(&screen)[0], "> World Name: Deep Dark|");
+        // Backspace removes the char before the caret and moves it back
+        screen.apply(TextInputAction::Backspace);
+        assert_eq!(new_game_row_lines(&screen)[0], "> World Name: Deep Dar|");
+        // the unfocused seed keeps the random hint throughout
+        assert_eq!(new_game_row_lines(&screen)[1], "  Seed: (random)");
+
+        // Tab moves the marker to the seed; its blank value shows the
+        // caret (not the random hint — the hint is unfocused-only)
+        screen.cycle_focus();
+        assert_eq!(new_game_row_lines(&screen)[0], "  World Name: Deep Dar");
+        assert_eq!(new_game_row_lines(&screen)[1], "> Seed: |");
+        // typing in the seed moves its caret and leaves the name untouched
+        screen.apply(TextInputAction::InsertText("42".into()));
+        assert_eq!(new_game_row_lines(&screen)[1], "> Seed: 42|");
+        assert_eq!(new_game_row_lines(&screen)[0], "  World Name: Deep Dar");
+
+        // set_focus (click-to-focus) moves the marker without Tab
+        screen.set_focus(FocusField::Name);
+        assert_eq!(new_game_row_lines(&screen)[0], "> World Name: Deep Dar|");
+        assert_eq!(new_game_row_lines(&screen)[1], "  Seed: 42");
     }
 
     #[test]
