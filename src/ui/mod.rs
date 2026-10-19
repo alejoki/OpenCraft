@@ -1,6 +1,15 @@
+pub mod lifecycle;
 pub mod menu;
 pub mod quad;
 pub mod text;
+pub mod text_input;
+
+pub use lifecycle::{
+    decide as decide_lifecycle, LifecycleDecision, LifecycleError, LifecycleIntent,
+    LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
+    NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
+};
+pub use text_input::{TextInput, TextInputAction, TextInputOutcome};
 
 use crate::render::context::RenderContext;
 use crate::render::pipeline::UiPass;
