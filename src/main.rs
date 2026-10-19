@@ -20,7 +20,7 @@ use minecraft_clone::render::context::RenderContext;
 use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
 use minecraft_clone::settings::keybind::key_to_string;
 use minecraft_clone::settings::{
-    load_with_warnings, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
+    load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
 };
 use minecraft_clone::ui::menu::{self, AdjustDirection, MenuRow};
 use minecraft_clone::ui::{Quad, StatsOverlay, UiRenderer, FONT_SIZE, LINE_HEIGHT};
@@ -129,6 +129,42 @@ fn adjust_direction(button: MouseButton) -> Option<AdjustDirection> {
         MouseButton::Right => Some(AdjustDirection::Down),
         _ => None,
     }
+}
+
+/// Route one gameplay key event through the loaded keybind map (S04-T03).
+/// Returns whether `code` is a bound gameplay key. Press sets the
+/// `InputState` flag, release clears it — both transitions route through
+/// the same map, preserving the pre-rebind press/release semantics exactly.
+/// NOTE: only the single bound `crouch_or_down` / `sprint` key triggers —
+/// the old ShiftLeft|ShiftRight / ControlLeft|ControlRight pairs were
+/// narrowed on purpose when keybinds became user-rebindable (see the
+/// `Keybinds` doc comment in src/settings for the rationale). Duplicate
+/// bindings in a hand-edited settings file resolve by first-match priority
+/// in `Keybinds` declaration order, keeping routing deterministic.
+fn apply_gameplay_key(
+    input: &mut InputState,
+    keybinds: &Keybinds,
+    code: KeyCode,
+    pressed: bool,
+) -> bool {
+    if code == keybinds.forward {
+        input.forward = pressed;
+    } else if code == keybinds.backward {
+        input.backward = pressed;
+    } else if code == keybinds.left {
+        input.left = pressed;
+    } else if code == keybinds.right {
+        input.right = pressed;
+    } else if code == keybinds.jump_or_up {
+        input.jump_or_up = pressed;
+    } else if code == keybinds.crouch_or_down {
+        input.crouch_or_down = pressed;
+    } else if code == keybinds.sprint {
+        input.sprint = pressed;
+    } else {
+        return false;
+    }
+    true
 }
 
 /// Window-dependent GPU stack, initialized together in `resumed()`.
@@ -344,18 +380,66 @@ impl ApplicationHandler for GameApp {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // While the menu is open it owns the keyboard: every key
+                    // routes to the menu FIRST and the gameplay match below
+                    // never runs. Gameplay keys must not set InputState
+                    // while the menu is open — especially in AwaitingKey,
+                    // where ANY pressed KeyCode is a capture candidate.
+                    if self.menu.is_open() {
+                        if pressed && !event.repeat {
+                            if code == KeyCode::Escape {
+                                // In capture mode, Escape cancels the pending
+                                // capture first (the menu stays open and the
+                                // cursor stays released); otherwise it closes
+                                // the menu and re-grabs the cursor.
+                                if !self.menu.cancel_capture() {
+                                    self.menu.close();
+                                    self.cursor_grabbed = true;
+                                    set_cursor_grab(window, true);
+                                }
+                            } else if let Some(action) = self.menu.awaiting_action() {
+                                // Press-to-rebind: T01's pure decision — the
+                                // unsupported-key filter runs first, then the
+                                // duplicate check.
+                                let decision = menu::evaluate_rebind_candidate(
+                                    &self.settings.keybinds,
+                                    action,
+                                    code,
+                                );
+                                match decision {
+                                    menu::RebindDecision::Accept(key) => {
+                                        // Apply, then save on every accepted
+                                        // rebind — never deferred, so a later
+                                        // panic cannot lose the player's
+                                        // rebind. The atomic tmp+rename write
+                                        // is crash-safe; an io::Error surfaces
+                                        // as in-menu text instead of being
+                                        // swallowed.
+                                        action.set_key(&mut self.settings.keybinds, key);
+                                        self.save_settings_or_warn();
+                                        self.menu.finish_capture();
+                                        // The menu text composes per frame
+                                        // from the live settings, so the new
+                                        // binding is shown immediately.
+                                    }
+                                    menu::RebindDecision::RejectUnsupported { .. }
+                                    | menu::RebindDecision::RejectDuplicate { .. } => {
+                                        if let Some(text) =
+                                            menu::rebind_rejection_message(&decision)
+                                        {
+                                            self.menu.set_message(text);
+                                        }
+                                    }
+                                }
+                            }
+                            // Any other key while the menu is open is
+                            // consumed and ignored — the gameplay layer
+                            // never sees it.
+                        }
+                        return;
+                    }
+
                     match code {
-                        KeyCode::KeyW => self.input.forward = pressed,
-                        KeyCode::KeyS => self.input.backward = pressed,
-                        KeyCode::KeyA => self.input.left = pressed,
-                        KeyCode::KeyD => self.input.right = pressed,
-                        KeyCode::Space => self.input.jump_or_up = pressed,
-                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                            self.input.crouch_or_down = pressed;
-                        }
-                        KeyCode::ControlLeft | KeyCode::ControlRight => {
-                            self.input.sprint = pressed;
-                        }
                         KeyCode::KeyF if pressed && !event.repeat => {
                             self.player.fly_mode = !self.player.fly_mode;
                             self.player.velocity = Vec3::ZERO;
@@ -367,20 +451,11 @@ impl ApplicationHandler for GameApp {
                             }
                         }
                         KeyCode::Escape if pressed && !event.repeat => {
-                            // Escape toggles the settings menu (replacing the
-                            // old raw cursor-grab toggle: an open menu always
-                            // implies a released cursor).
-                            if self.menu.is_open() {
-                                // In capture mode, Escape cancels the pending
-                                // capture first (the menu stays open and the
-                                // cursor stays released); otherwise it closes
-                                // the menu and re-grabs the cursor.
-                                if !self.menu.cancel_capture() {
-                                    self.menu.close();
-                                    self.cursor_grabbed = true;
-                                    set_cursor_grab(window, true);
-                                }
-                            } else if self.menu.open() {
+                            // The menu is closed here — an open menu returned
+                            // above. Escape opens the settings menu
+                            // (replacing the old raw cursor-grab toggle: an
+                            // open menu always implies a released cursor).
+                            if self.menu.open() {
                                 self.cursor_grabbed = false;
                                 set_cursor_grab(window, false);
                                 // Roadmap requirement: opening the menu resets
@@ -418,7 +493,24 @@ impl ApplicationHandler for GameApp {
                         KeyCode::Digit7 if pressed => self.player.selected_slot = 6,
                         KeyCode::Digit8 if pressed => self.player.selected_slot = 7,
                         KeyCode::Digit9 if pressed => self.player.selected_slot = 8,
-                        _ => {}
+                        // Rebindable gameplay keys (S04-T03): press sets the
+                        // InputState flag, release clears it — both
+                        // transitions route through the loaded keybind map
+                        // via the pure helper. The 7 rebindable routes sit
+                        // AFTER the non-rebindable utility keys on purpose:
+                        // Escape must always toggle the menu and F/F5/
+                        // brackets/digits keep their hardcoded behavior even
+                        // if a gameplay action is rebound onto one of them
+                        // (Escape is a rebindable target, so the menu must
+                        // stay reachable no matter what is bound).
+                        _ => {
+                            apply_gameplay_key(
+                                &mut self.input,
+                                &self.settings.keybinds,
+                                code,
+                                pressed,
+                            );
+                        }
                     }
                 }
             }
@@ -922,6 +1014,104 @@ mod tests {
         assert_eq!(adjust_direction(MouseButton::Right), Some(AdjustDirection::Down));
         assert_eq!(adjust_direction(MouseButton::Middle), None);
         assert_eq!(adjust_direction(MouseButton::Back), None);
+    }
+
+    #[test]
+    fn gameplay_keys_route_through_the_loaded_keybind_map_press_and_release() {
+        let mut input = InputState::default();
+        let binds = Keybinds::default();
+        let presses = [
+            (KeyCode::KeyW, "forward"),
+            (KeyCode::KeyS, "backward"),
+            (KeyCode::KeyA, "left"),
+            (KeyCode::KeyD, "right"),
+            (KeyCode::Space, "jump_or_up"),
+            (KeyCode::ShiftLeft, "crouch_or_down"),
+            (KeyCode::ControlLeft, "sprint"),
+        ];
+        for (code, name) in presses {
+            assert!(
+                apply_gameplay_key(&mut input, &binds, code, true),
+                "{name} press routes through the map"
+            );
+        }
+        assert!(input.forward && input.backward && input.left && input.right
+            && input.jump_or_up && input.crouch_or_down && input.sprint);
+        // releases clear the same flags through the same map — both
+        // transitions route identically (pre-rebind semantics preserved).
+        for (code, name) in presses {
+            assert!(
+                apply_gameplay_key(&mut input, &binds, code, false),
+                "{name} release routes through the map"
+            );
+        }
+        assert!(!input.forward && !input.backward && !input.left && !input.right
+            && !input.jump_or_up && !input.crouch_or_down && !input.sprint);
+    }
+
+    #[test]
+    fn rebound_keys_take_effect_and_the_replaced_key_goes_dead() {
+        // same rebind as the compose test: jump_or_up from Space to ArrowUp
+        let binds = minecraft_clone_keybinds_jump_arrow_up();
+        let mut input = InputState::default();
+        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, true));
+        assert!(input.jump_or_up, "the new key jumps");
+        // the replaced key is unbound now — Space no longer jumps
+        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, true));
+        // an unbound press must not disturb the flag either way: the
+        // ArrowUp press keeps it set, and no stick/clear happens from Space
+        assert!(input.jump_or_up, "an unbound key press must not clear the flag");
+        // release through the new key clears the flag
+        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, false));
+        assert!(!input.jump_or_up);
+        // the old key's release is unbound too and must not resurrect it
+        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, false));
+        assert!(!input.jump_or_up);
+    }
+
+    #[test]
+    fn only_the_bound_crouch_and_sprint_keys_trigger() {
+        // intentional narrowing (documented on Keybinds in src/settings):
+        // rebindable bindings are single keys, so ShiftRight/ControlRight no
+        // longer crouch/sprint the way the old hardcoded pairs did.
+        let binds = Keybinds::default();
+        let mut input = InputState::default();
+        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ShiftRight, true));
+        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ControlRight, true));
+        assert_eq!(
+            format!("{:?}", input),
+            format!("{:?}", InputState::default()),
+            "unbound siblings must not touch InputState"
+        );
+    }
+
+    #[test]
+    fn non_gameplay_keys_report_not_bound_and_leave_input_untouched() {
+        let binds = Keybinds::default();
+        let mut input = InputState::default();
+        for code in [KeyCode::KeyQ, KeyCode::KeyZ, KeyCode::KeyF, KeyCode::F5, KeyCode::Escape] {
+            assert!(
+                !apply_gameplay_key(&mut input, &binds, code, true),
+                "{code:?} is not a gameplay bind"
+            );
+        }
+        assert_eq!(
+            format!("{:?}", input),
+            format!("{:?}", InputState::default())
+        );
+    }
+
+    #[test]
+    fn duplicate_bindings_in_a_hand_edited_file_resolve_first_match() {
+        // load does not deduplicate; first-match priority in Keybinds
+        // declaration order keeps routing deterministic instead of
+        // last-write-wins per flag.
+        let mut binds = Keybinds::default();
+        binds.backward = KeyCode::KeyW; // collides with forward
+        let mut input = InputState::default();
+        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::KeyW, true));
+        assert!(input.forward, "forward is declared first and wins");
+        assert!(!input.backward, "the duplicate loser stays clear");
     }
 
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
