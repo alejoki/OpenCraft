@@ -34,6 +34,15 @@ pub const fn linear_index(x: usize, y: usize, z: usize) -> usize {
     x + (z << 5) + (y << 10)
 }
 
+#[inline]
+pub const fn local_coords_from_index(idx: u16) -> (usize, usize, usize) {
+    let i = idx as usize;
+    let x = i & 31;
+    let z = (i >> 5) & 31;
+    let y = (i >> 10) & 31;
+    (x, y, z)
+}
+
 impl Chunk {
     #[inline]
     pub fn new_uniform(block: BlockId) -> Self {
@@ -60,7 +69,13 @@ impl Chunk {
 
     #[inline]
     pub fn set(&mut self, x: usize, y: usize, z: usize, block: BlockId) {
-        let idx = linear_index(x, y, z);
+        self.set_by_index(linear_index(x, y, z) as u16, block);
+    }
+
+    #[inline]
+    pub fn set_by_index(&mut self, idx: u16, block: BlockId) {
+        let idx = idx as usize;
+        debug_assert!(idx < CHUNK_VOLUME);
         match &mut self.storage {
             ChunkStorage::Uniform(u) => {
                 if *u == block {

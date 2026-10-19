@@ -33,6 +33,25 @@ impl BlockId {
         !matches!(self, BlockId::Air)
     }
 
+    #[inline]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(BlockId::Air),
+            1 => Some(BlockId::Grass),
+            2 => Some(BlockId::Dirt),
+            3 => Some(BlockId::Stone),
+            4 => Some(BlockId::Cobblestone),
+            5 => Some(BlockId::Sand),
+            6 => Some(BlockId::OakLog),
+            7 => Some(BlockId::OakLeaves),
+            8 => Some(BlockId::OakPlanks),
+            9 => Some(BlockId::Brick),
+            10 => Some(BlockId::Snow),
+            11 => Some(BlockId::Bedrock),
+            _ => None,
+        }
+    }
+
     /// Returns texture array layer index (0..14) for a face direction:
     /// 0 = +X, 1 = -X, 2 = +Y (top), 3 = -Y (bottom), 4 = +Z, 5 = -Z
     #[inline]

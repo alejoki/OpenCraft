@@ -34,14 +34,22 @@ fn value_noise_2d(x: f32, z: f32, seed: u32) -> f32 {
     nx0 + v * (nx1 - nx0)
 }
 
+pub const DEFAULT_WORLD_SEED: u32 = 1337;
+
 #[inline]
 pub fn terrain_height_at(wx: i32, wz: i32) -> i32 {
+    terrain_height_at_seeded(wx, wz, DEFAULT_WORLD_SEED)
+}
+
+#[inline]
+pub fn terrain_height_at_seeded(wx: i32, wz: i32, seed: u32) -> i32 {
     let x = wx as f32;
     let z = wz as f32;
-    let continental = value_noise_2d(x * 0.004, z * 0.004, 101);
-    let hills = value_noise_2d(x * 0.015, z * 0.015, 202);
-    let detail = value_noise_2d(x * 0.05, z * 0.05, 303);
-    let ridge = (value_noise_2d(x * 0.008, z * 0.008, 404) * 2.0 - 1.0).abs();
+    let s = seed.wrapping_mul(0x9E37_79B9);
+    let continental = value_noise_2d(x * 0.004, z * 0.004, 101 ^ s);
+    let hills = value_noise_2d(x * 0.015, z * 0.015, 202 ^ s);
+    let detail = value_noise_2d(x * 0.05, z * 0.05, 303 ^ s);
+    let ridge = (value_noise_2d(x * 0.008, z * 0.008, 404 ^ s) * 2.0 - 1.0).abs();
 
     let mountain_factor = (continental - 0.55).max(0.0) * 2.2;
     let base = 18.0 + continental * 26.0 + hills * 14.0 + detail * 4.0 + mountain_factor * ridge * 48.0;
@@ -49,6 +57,10 @@ pub fn terrain_height_at(wx: i32, wz: i32) -> i32 {
 }
 
 pub fn generate_chunk(pos: ChunkPos) -> Chunk {
+    generate_chunk_seeded(pos, DEFAULT_WORLD_SEED)
+}
+
+pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
@@ -65,7 +77,7 @@ pub fn generate_chunk(pos: ChunkPos) -> Chunk {
     let mut max_h = i32::MIN;
     for lz in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
-            let h = terrain_height_at(base_wx + lx as i32, base_wz + lz as i32);
+            let h = terrain_height_at_seeded(base_wx + lx as i32, base_wz + lz as i32, seed);
             heights[lz][lx] = h;
             min_h = min_h.min(h);
             max_h = max_h.max(h);
@@ -121,7 +133,7 @@ pub fn generate_chunk(pos: ChunkPos) -> Chunk {
 
             // Place deterministic oak trees inside safe interior (lx, lz in 3..29) on grass
             if (3..29).contains(&lx) && (3..29).contains(&lz) && (24..54).contains(&h) {
-                let tree_hash = hash2d(wx, wz, 777);
+                let tree_hash = hash2d(wx, wz, 777 ^ seed);
                 if (tree_hash & 0xFF) == 0 {
                     let trunk_h = 4 + ((tree_hash >> 8) & 1) as i32;
                     for ty in (h + 1)..=(h + trunk_h) {
