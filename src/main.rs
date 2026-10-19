@@ -340,6 +340,25 @@ fn compose_screen_text(
     lines.join("\n")
 }
 
+/// Compose one load-screen action-label column: `count` copies of `label`,
+/// one line per catalog row, newline-joined (S05-T02). The load screen's
+/// "Play"/"Delete" columns render as two positioned buffers at their
+/// hit-test rects — `load_play_rect(surface_w, 0)` / `load_delete_rect
+/// (surface_w, 0)` supply the left/top, and glyphon's LINE_HEIGHT equals
+/// the `row_y` step, so buffer line i lands on row i's rect top. In-string
+/// padding is deliberately NOT used (the monospace pixel advance is
+/// unknowable in pure code — the label/rect drift MEM056 warns about), so
+/// `format_row_line` stays byte-identical. Pure function of (label, count)
+/// so it is unit-testable without GPU; called per frame while the load
+/// screen is open, where `StatsOverlay::update` skips the expensive
+/// re-shape unless the composed string changed (it only changes when the
+/// row count changes). An empty catalog composes the empty string — a
+/// convention pinned by tests and moot in the render path, which skips
+/// both label areas when `row_count == 0`.
+fn repeated_lines(label: &str, count: usize) -> String {
+    (0..count).map(|_| label).collect::<Vec<_>>().join("\n")
+}
+
 /// The active lifecycle screen's backing panel rect (T01 geometry, derived
 /// per frame from the surface size so a `Resized` reflows every screen).
 /// The settings screen's panel comes from `menu::panel_rect` in its own
@@ -497,6 +516,15 @@ struct Ready {
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
     /// drawn in the same UI pass, after the stats text area.
     menu_text: StatsOverlay,
+    /// Load-screen "Play" label column (S05-T02): one "Play" line per
+    /// catalog row, drawn in the same UI pass after `menu_text`, at
+    /// `load_play_rect`'s left/top so buffer line i lands on row i's
+    /// hit-test rect. Same change-gated pattern as `menu_text` — the
+    /// text only re-shapes when the row count changes.
+    load_play_text: StatsOverlay,
+    /// Load-screen "Delete" label column (S05-T02): same as
+    /// `load_play_text`, positioned at `load_delete_rect`'s left/top.
+    load_delete_text: StatsOverlay,
 }
 
 struct GameApp {
@@ -1229,6 +1257,8 @@ impl ApplicationHandler for GameApp {
         let mut ui = UiRenderer::new(&ctx);
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
+        let load_play_text = StatsOverlay::new(&mut ui.font_system);
+        let load_delete_text = StatsOverlay::new(&mut ui.font_system);
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -1257,6 +1287,8 @@ impl ApplicationHandler for GameApp {
             ui,
             stats,
             menu_text,
+            load_play_text,
+            load_delete_text,
         });
     }
 
@@ -1675,6 +1707,8 @@ impl ApplicationHandler for GameApp {
                 // no cached rects; the text only re-shapes when the composed
                 // string changed (StatsOverlay guards that).
                 let mut menu_text_area = None;
+                let mut load_play_text_area = None;
+                let mut load_delete_text_area = None;
                 let active_screen = self.lifecycle.screen();
                 if active_screen != LifecycleScreen::Playing {
                     let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
@@ -1740,6 +1774,39 @@ impl ApplicationHandler for GameApp {
                         gpu.menu_text
                             .text_area(panel_x + menu::MENU_PAD, panel_y + menu::MENU_PAD),
                     );
+
+                    // S05-T02: the load screen's per-row "Play"/"Delete"
+                    // label columns render as two positioned buffers at
+                    // their hit-test rects — row 0's `load_play_rect`/
+                    // `load_delete_rect` supplies the left/top, and
+                    // glyphon's LINE_HEIGHT equals the `row_y` step, so
+                    // buffer line i lands on row i's rect top. Skipped
+                    // entirely when the catalog is empty ("(no saved
+                    // worlds)" stays a single line) and on every other
+                    // screen; the buffers only re-shape when the row
+                    // count changes (the StatsOverlay change gate —
+                    // `format_row_line` stays byte-identical, no
+                    // in-string padding per MEM056).
+                    if active_screen == LifecycleScreen::LoadGame && self.load.row_count() > 0 {
+                        let row_count = self.load.row_count();
+                        let (play_x, play_y, _, _) = load_play_rect(surface_w, 0);
+                        let (delete_x, _, _, _) = load_delete_rect(surface_w, 0);
+                        gpu.load_play_text.update(
+                            &mut gpu.ui.font_system,
+                            surface_w as f32,
+                            surface_h as f32,
+                            &repeated_lines("Play", row_count),
+                        );
+                        gpu.load_delete_text.update(
+                            &mut gpu.ui.font_system,
+                            surface_w as f32,
+                            surface_h as f32,
+                            &repeated_lines("Delete", row_count),
+                        );
+                        load_play_text_area = Some(gpu.load_play_text.text_area(play_x, play_y));
+                        load_delete_text_area =
+                            Some(gpu.load_delete_text.text_area(delete_x, play_y));
+                    }
                 }
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
@@ -1757,6 +1824,14 @@ impl ApplicationHandler for GameApp {
                 let mut areas = vec![stats_text_area];
                 if let Some(menu_text_area) = menu_text_area {
                     areas.push(menu_text_area);
+                }
+                // S05-T02 label columns ride the same UI pass, after the
+                // screen text area (no pipeline change).
+                if let Some(load_play_text_area) = load_play_text_area {
+                    areas.push(load_play_text_area);
+                }
+                if let Some(load_delete_text_area) = load_delete_text_area {
+                    areas.push(load_delete_text_area);
                 }
                 let prepare_ok = gpu
                     .ui
@@ -2916,6 +2991,26 @@ mod tests {
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
         let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);
         assert!(text.ends_with("World name cannot be empty."));
+    }
+
+    #[test]
+    fn repeated_lines_composes_one_label_line_per_catalog_row() {
+        // Empty catalog: the empty string (the render path skips the label
+        // areas entirely when row_count == 0, so this is a pinned
+        // convention, not a rendered state).
+        assert_eq!(repeated_lines("Play", 0), "");
+        assert_eq!(repeated_lines("Delete", 0), "");
+        // One line per catalog row, every line exactly the label, nothing
+        // beyond the single newline between lines (a trailing newline
+        // would render an empty line on the row below the catalog).
+        for &(label, count) in &[("Play", 1), ("Delete", 1), ("Play", 3), ("Delete", 3)] {
+            let text = repeated_lines(label, count);
+            let lines: Vec<&str> = text.split('\n').collect();
+            assert_eq!(lines.len(), count);
+            assert!(lines.iter().all(|line| *line == label));
+        }
+        assert_eq!(repeated_lines("Play", 3), "Play\nPlay\nPlay");
+        assert_eq!(repeated_lines("Delete", 2), "Delete\nDelete");
     }
 
     #[test]
