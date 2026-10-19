@@ -22,4 +22,4 @@
 - S02 → S04: provides the Settings module API — Settings struct (keybinds, mouse_sensitivity, fov, fullscreen, vsync), load with per-field fallback + logged warnings, save, defaults, KeyCode↔stable-string conversion, duplicate-keybind validation; consumes nothing upstream (pure logic, no GPU, no event loop dependency).
 - S03 → S04: provides the src/ui module — glyphon 0.5 wrappers (FontSystem, SwashCache, TextAtlas, TextRenderer, Viewport), a minimal quad renderer for panels/buttons, color-only UI render pass after the world pass, and cursor hover/click plumbing; consumes S01's loop and cursor events.
 - S04: consumes S01's input routing (menu-open key releases cursor grab and calls InputState::reset, gameplay keys route through the S02 keybind map), S02's Settings API, and S03's UI; provides the milestone's user-facing settings capability and its end-to-end restart-persistence proof.
-<!-- gsd:state-version=118:1 -->
+<!-- gsd:state-version=122:1 -->

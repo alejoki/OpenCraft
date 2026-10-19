@@ -101,3 +101,4 @@ One or more checks are marked `NEEDS-HUMAN` and require a person to validate:
 - Validate the work here: /home/aleksi/minecraft-clone/.gsd-worktrees/M001
 - This milestone runs in a git worktree, so the code lives under the GSD worktrees directory. Open it with: cd "/home/aleksi/minecraft-clone/.gsd-worktrees/M001"
 - Follow the UAT checklist at: .gsd/phases/01-refactor-settings-foundation/01-03-UAT.md
+<!-- gsd:state-version=122:1 -->

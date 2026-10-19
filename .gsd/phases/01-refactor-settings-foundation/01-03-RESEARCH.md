@@ -89,4 +89,4 @@ Text visible on screen over the world, in a separate pass, surviving the 10 s sm
 ## Skills Discovered
 
 None — no glyphon/cosmic-text skills available via `npx skills find`; API verified directly from pinned docs.rs pages instead.
-<!-- gsd:state-version=90:1 -->
+<!-- gsd:state-version=122:1 -->

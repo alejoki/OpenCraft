@@ -70,4 +70,4 @@ None.
 - `src/ui/text.rs`
 - `src/render/pipeline.rs`
 - `src/main.rs`
-<!-- gsd:state-version=102:1 -->
+<!-- gsd:state-version=122:1 -->
