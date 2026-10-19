@@ -17,7 +17,8 @@ use minecraft_clone::player::physics::{InputState, Player};
 use minecraft_clone::player::raycast::raycast_voxels;
 use minecraft_clone::render::buffer::ChunkRenderStore;
 use minecraft_clone::render::context::RenderContext;
-use minecraft_clone::render::pipeline::VoxelRenderer;
+use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
+use minecraft_clone::ui::{StatsOverlay, UiRenderer};
 use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
 use minecraft_clone::world::manager::WorldManager;
@@ -26,6 +27,10 @@ use minecraft_clone::world::persistence::{
     WorldSaveData,
 };
 use minecraft_clone::world::terrain::{terrain_height_at_seeded, DEFAULT_WORLD_SEED};
+
+/// Top-left corner of the stats overlay text, in physical pixels.
+const OVERLAY_TEXT_LEFT: f32 = 8.0;
+const OVERLAY_TEXT_TOP: f32 = 8.0;
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -65,6 +70,8 @@ struct Ready {
     ctx: RenderContext,
     renderer: VoxelRenderer,
     render_store: ChunkRenderStore,
+    ui: UiRenderer,
+    stats: StatsOverlay,
 }
 
 struct GameApp {
@@ -80,6 +87,7 @@ struct GameApp {
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
     frame_count: u32,
+    last_overlay_text: String,
 }
 
 impl GameApp {
@@ -100,6 +108,7 @@ impl GameApp {
             title_timer: Instant::now(),
             last_saved_badge: None,
             frame_count: 0,
+            last_overlay_text: String::new(),
         }
     }
 }
@@ -125,6 +134,8 @@ impl ApplicationHandler for GameApp {
         let ctx = RenderContext::new(window.clone());
         let renderer = VoxelRenderer::new(&ctx);
         let render_store = ChunkRenderStore::new();
+        let mut ui = UiRenderer::new(&ctx);
+        let stats = StatsOverlay::new(&mut ui.font_system);
 
         self.cursor_grabbed = true;
         set_cursor_grab(&window, true);
@@ -134,6 +145,8 @@ impl ApplicationHandler for GameApp {
             ctx,
             renderer,
             render_store,
+            ui,
+            stats,
         });
     }
 
@@ -159,6 +172,14 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
+                // Re-shape the stats overlay at the new size so text does not
+                // keep the old layout (wrapping) after a resize.
+                gpu.stats.update(
+                    &mut gpu.ui.font_system,
+                    new_size.width as f32,
+                    new_size.height as f32,
+                    &self.last_overlay_text,
+                );
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
@@ -336,6 +357,32 @@ impl ApplicationHandler for GameApp {
                 )
                 .map(|h| h.block_pos);
 
+                // UI overlay: prepare glyphs each frame; on prepare error
+                // (glyph atlas full) the UI pass is skipped for that frame
+                // (the crate is log-free by convention).
+                let text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
+                let prepare_ok = gpu
+                    .ui
+                    .text_renderer
+                    .prepare(
+                        &gpu.ctx.device,
+                        &gpu.ctx.queue,
+                        &mut gpu.ui.font_system,
+                        &mut gpu.ui.atlas,
+                        glyphon::Resolution {
+                            width: gpu.ctx.config.width,
+                            height: gpu.ctx.config.height,
+                        },
+                        [text_area],
+                        &mut gpu.ui.swash_cache,
+                    )
+                    .is_ok();
+                let ui_pass: Option<&dyn UiPass> = if prepare_ok {
+                    Some(&gpu.ui)
+                } else {
+                    None
+                };
+
                 match gpu.renderer.render_frame(
                     &gpu.ctx,
                     &gpu.render_store,
@@ -343,6 +390,7 @@ impl ApplicationHandler for GameApp {
                     self.world.render_distance(),
                     target_block,
                     self.player.selected_slot,
+                    ui_pass,
                 ) {
                     Ok(visible_chunks) => {
                         self.frame_count += 1;
@@ -382,6 +430,27 @@ impl ApplicationHandler for GameApp {
                             ));
                             self.title_timer = Instant::now();
                             self.frame_count = 0;
+
+                            // Same stats data drives the on-screen overlay,
+                            // refreshed at this 0.25 s cadence (not per frame;
+                            // `set_text`/re-shape only runs when it changed).
+                            self.last_overlay_text = format!(
+                                "FPS {} | {:.1} ms | Pos ({:.0}, {:.0}, {:.0}) [{}] | Chunks {}/{}",
+                                fps,
+                                ms,
+                                self.player.position.x,
+                                self.player.position.y,
+                                self.player.position.z,
+                                mode,
+                                visible_chunks,
+                                self.world.loaded_chunk_count(),
+                            );
+                            gpu.stats.update(
+                                &mut gpu.ui.font_system,
+                                gpu.ctx.config.width as f32,
+                                gpu.ctx.config.height as f32,
+                                &self.last_overlay_text,
+                            );
                         }
                     }
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {

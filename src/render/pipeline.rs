@@ -322,6 +322,17 @@ pub fn build_overlay_line_vertices(
     verts
 }
 
+/// Hook for drawing UI content in the color-only pass that `render_frame`
+/// opens after the world pass.
+///
+/// The `&'pass self` receiver matches glyphon's `render<'pass>(&'pass self,
+/// atlas: &'pass TextAtlas, pass: &mut RenderPass<'pass>)` tie: with wgpu
+/// 0.19's lifetime-carrying `RenderPass`, a higher-ranked closure hook would
+/// force the captured atlas/renderer borrows to be `'static`.
+pub trait UiPass {
+    fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>);
+}
+
 pub struct VoxelRenderer {
     pub voxel_pipeline: wgpu::RenderPipeline,
     pub overlay_pipeline: wgpu::RenderPipeline,
@@ -558,6 +569,7 @@ impl VoxelRenderer {
         render_distance: i32,
         target_block: Option<IVec3>,
         selected_slot: usize,
+        ui_pass: Option<&dyn UiPass>,
     ) -> Result<usize, wgpu::SurfaceError> {
         let output = ctx.surface.get_current_texture()?;
         let view = output
@@ -663,6 +675,27 @@ impl VoxelRenderer {
                 rpass.set_vertex_buffer(0, overlay_buf.slice(..));
                 rpass.draw(0..overlay_verts.len() as u32, 0..1);
             }
+        }
+
+        // UI pass: second color-only render pass on the same encoder and view,
+        // drawn after the world pass and before submit/present. It loads (not
+        // clears) the color attachment so the world pass output stays visible.
+        if let Some(ui) = ui_pass {
+            let mut ui_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            ui.draw_ui(&mut ui_rpass);
         }
 
         ctx.queue.submit(std::iter::once(encoder.finish()));
