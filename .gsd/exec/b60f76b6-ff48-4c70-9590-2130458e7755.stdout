@@ -1,0 +1,20 @@
+thread 'ui::menu::tests::messages_expire_by_tick_counter_purely' (66745) panicked at src/ui/menu.rs:778:9:
+assertion failed: menu.tick()
+
+---- ui::menu::tests::rebind_to_a_free_supported_key_is_accepted stdout ----
+
+thread 'ui::menu::tests::rebind_to_a_free_supported_key_is_accepted' (66749) panicked at src/ui/menu.rs:627:9:
+assertion `left == right` failed
+  left: RejectDuplicate { conflicting_action: CrouchOrDown }
+ right: Accept(ShiftLeft)
+
+
+failures:
+    ui::menu::tests::accepted_rebinds_survive_the_settings_validate_keybinds_scan
+    ui::menu::tests::menu_opens_and_closes_and_reports_openness
+    ui::menu::tests::messages_expire_by_tick_counter_purely
+    ui::menu::tests::rebind_to_a_free_supported_key_is_accepted
+
+test result: FAILED. 79 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--lib`

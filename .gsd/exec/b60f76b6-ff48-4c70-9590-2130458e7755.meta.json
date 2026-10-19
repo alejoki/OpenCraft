@@ -1,0 +1,20 @@
+{
+  "id": "b60f76b6-ff48-4c70-9590-2130458e7755",
+  "runtime": "bash",
+  "purpose": "S04-T01: run full test suite including new menu module tests",
+  "script_chars": 81,
+  "started_at": "2026-10-19T10:14:03.473Z",
+  "finished_at": "2026-10-19T10:14:05.456Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1983,
+  "stdout_bytes": 872,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/b60f76b6-ff48-4c70-9590-2130458e7755.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/b60f76b6-ff48-4c70-9590-2130458e7755.stderr"
+}
