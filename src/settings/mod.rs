@@ -160,10 +160,7 @@ impl Settings {
                 left: keybind_string(self.keybinds.left, "left"),
                 right: keybind_string(self.keybinds.right, "right"),
                 jump_or_up: keybind_string(self.keybinds.jump_or_up, "jump_or_up"),
-                crouch_or_down: keybind_string(
-                    self.keybinds.crouch_or_down,
-                    "crouch_or_down",
-                ),
+                crouch_or_down: keybind_string(self.keybinds.crouch_or_down, "crouch_or_down"),
                 sprint: keybind_string(self.keybinds.sprint, "sprint"),
             },
             mouse: MouseToml {
@@ -315,10 +312,7 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
             }
             None => warnings.push(SettingsWarning {
                 field: "keybinds".to_string(),
-                reason: format!(
-                    "expected a table, found {}",
-                    keybinds_value.type_str()
-                ),
+                reason: format!("expected a table, found {}", keybinds_value.type_str()),
             }),
         }
     }
@@ -369,8 +363,13 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
                     "video.fov",
                     &mut warnings,
                 );
-                settings.fullscreen =
-                    load_bool(table, "fullscreen", settings.fullscreen, "video.fullscreen", &mut warnings);
+                settings.fullscreen = load_bool(
+                    table,
+                    "fullscreen",
+                    settings.fullscreen,
+                    "video.fullscreen",
+                    &mut warnings,
+                );
                 settings.vsync =
                     load_bool(table, "vsync", settings.vsync, "video.vsync", &mut warnings);
             }

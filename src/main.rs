@@ -94,7 +94,11 @@ fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Playe
 }
 
 fn on_off(value: bool) -> &'static str {
-    if value { "On" } else { "Off" }
+    if value {
+        "On"
+    } else {
+        "Off"
+    }
 }
 
 /// Compose the menu's display text: one "label: value" line per row, a
@@ -111,8 +115,8 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
                 if menu.awaiting_action() == Some(action) {
                     format!("{}: <press a key>", row.label())
                 } else {
-                    let key = key_to_string(action.key_of(&settings.keybinds))
-                        .unwrap_or("<unsupported>");
+                    let key =
+                        key_to_string(action.key_of(&settings.keybinds)).unwrap_or("<unsupported>");
                     format!("{}: {}", row.label(), key)
                 }
             }
@@ -129,7 +133,10 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
         lines.push(line);
     }
     if let Some(action) = menu.awaiting_action() {
-        lines.push(format!("press a key for '{}' (Escape cancels)", action.name()));
+        lines.push(format!(
+            "press a key for '{}' (Escape cancels)",
+            action.name()
+        ));
     }
     if let Some(message) = &menu.message {
         lines.push(message.text.clone());
@@ -249,8 +256,7 @@ impl GameApp {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
-        let (settings, startup_warnings) =
-            load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (settings, startup_warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
         // The loaded Settings are the single source of truth for video
         // parameters: FOV applies to the camera at construction (defaults
         // are 75 degrees either way, so this is behavior-neutral).
@@ -507,8 +513,11 @@ impl ApplicationHandler for GameApp {
                             self.player.velocity = Vec3::ZERO;
                         }
                         KeyCode::F5 if pressed && !event.repeat => {
-                            if save_current_world(&self.cli.save_path, &mut self.world, &self.player)
-                            {
+                            if save_current_world(
+                                &self.cli.save_path,
+                                &mut self.world,
+                                &self.player,
+                            ) {
                                 self.last_saved_badge = Some(Instant::now());
                             }
                         }
@@ -530,9 +539,8 @@ impl ApplicationHandler for GameApp {
                                 if !self.startup_warnings_shown {
                                     self.startup_warnings_shown = true;
                                     if !self.startup_warnings.is_empty() {
-                                        let lines =
-                                            menu::format_warnings(&self.startup_warnings)
-                                                .join(" | ");
+                                        let lines = menu::format_warnings(&self.startup_warnings)
+                                            .join(" | ");
                                         self.menu.set_message(lines);
                                     }
                                 }
@@ -612,8 +620,7 @@ impl ApplicationHandler for GameApp {
                 // cursor. The click-to-re-grab path below and the gameplay
                 // raycast must not steal menu clicks.
                 if self.menu.is_open() {
-                    let (surface_w, surface_h) =
-                        (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                     // Hit-test the clicked row BEFORE the whole-`self`
                     // menu_click call (which must not overlap the live
                     // gpu/window field borrows): only the Vsync row needs a
@@ -652,7 +659,8 @@ impl ApplicationHandler for GameApp {
                             let bp = hit.block_pos;
                             if self.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
                                 let remeshed =
-                                    self.world.set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
+                                    self.world
+                                        .set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
                                         &gpu.ctx.device,
@@ -665,14 +673,11 @@ impl ApplicationHandler for GameApp {
                         }
                         MouseButton::Right => {
                             let ap = hit.adjacent_pos;
-                            if !self
-                                .player
-                                .aabb()
-                                .intersects_block(ap.x, ap.y, ap.z)
-                            {
+                            if !self.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
                                 let place_block = BlockId::HOTBAR[self.player.selected_slot];
                                 let remeshed =
-                                    self.world.set_block_immediate(ap.x, ap.y, ap.z, place_block);
+                                    self.world
+                                        .set_block_immediate(ap.x, ap.y, ap.z, place_block);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
                                         &gpu.ctx.device,
@@ -801,8 +806,10 @@ impl ApplicationHandler for GameApp {
                         surface_h as f32,
                         &text,
                     );
-                    menu_text_area =
-                        Some(gpu.menu_text.text_area(mx + menu::MENU_PAD, my + menu::MENU_PAD));
+                    menu_text_area = Some(
+                        gpu.menu_text
+                            .text_area(mx + menu::MENU_PAD, my + menu::MENU_PAD),
+                    );
                 }
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
@@ -837,11 +844,7 @@ impl ApplicationHandler for GameApp {
                         &mut gpu.ui.swash_cache,
                     )
                     .is_ok();
-                let ui_pass: Option<&dyn UiPass> = if prepare_ok {
-                    Some(&gpu.ui)
-                } else {
-                    None
-                };
+                let ui_pass: Option<&dyn UiPass> = if prepare_ok { Some(&gpu.ui) } else { None };
 
                 match gpu.renderer.render_frame(
                     &gpu.ctx,
@@ -950,8 +953,8 @@ impl ApplicationHandler for GameApp {
                 // T01 helpers before every save.
                 let sensitivity = self.settings.mouse_sensitivity;
                 self.player.yaw += delta.0 as f32 * sensitivity;
-                self.player.pitch = (self.player.pitch - delta.1 as f32 * sensitivity)
-                    .clamp(-1.54, 1.54);
+                self.player.pitch =
+                    (self.player.pitch - delta.1 as f32 * sensitivity).clamp(-1.54, 1.54);
             }
         }
     }
@@ -1003,9 +1006,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = GameApp::new(cli, world, player);
-    event_loop
-        .run_app(&mut app)
-        .expect("Event loop error");
+    event_loop.run_app(&mut app).expect("Event loop error");
 }
 
 #[cfg(test)]
@@ -1031,7 +1032,10 @@ mod tests {
         assert!(text.contains("VSync: Off"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
-        assert!(!text.contains("press a key for"), "no capture hint while just open");
+        assert!(
+            !text.contains("press a key for"),
+            "no capture hint while just open"
+        );
     }
 
     #[test]
@@ -1090,8 +1094,14 @@ mod tests {
 
     #[test]
     fn adjust_direction_maps_left_up_right_down_and_nothing_else() {
-        assert_eq!(adjust_direction(MouseButton::Left), Some(AdjustDirection::Up));
-        assert_eq!(adjust_direction(MouseButton::Right), Some(AdjustDirection::Down));
+        assert_eq!(
+            adjust_direction(MouseButton::Left),
+            Some(AdjustDirection::Up)
+        );
+        assert_eq!(
+            adjust_direction(MouseButton::Right),
+            Some(AdjustDirection::Down)
+        );
         assert_eq!(adjust_direction(MouseButton::Middle), None);
         assert_eq!(adjust_direction(MouseButton::Back), None);
     }
@@ -1128,8 +1138,15 @@ mod tests {
                 "{name} press routes through the map"
             );
         }
-        assert!(input.forward && input.backward && input.left && input.right
-            && input.jump_or_up && input.crouch_or_down && input.sprint);
+        assert!(
+            input.forward
+                && input.backward
+                && input.left
+                && input.right
+                && input.jump_or_up
+                && input.crouch_or_down
+                && input.sprint
+        );
         // releases clear the same flags through the same map — both
         // transitions route identically (pre-rebind semantics preserved).
         for (code, name) in presses {
@@ -1138,8 +1155,15 @@ mod tests {
                 "{name} release routes through the map"
             );
         }
-        assert!(!input.forward && !input.backward && !input.left && !input.right
-            && !input.jump_or_up && !input.crouch_or_down && !input.sprint);
+        assert!(
+            !input.forward
+                && !input.backward
+                && !input.left
+                && !input.right
+                && !input.jump_or_up
+                && !input.crouch_or_down
+                && !input.sprint
+        );
     }
 
     #[test]
@@ -1147,18 +1171,41 @@ mod tests {
         // same rebind as the compose test: jump_or_up from Space to ArrowUp
         let binds = minecraft_clone_keybinds_jump_arrow_up();
         let mut input = InputState::default();
-        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, true));
+        assert!(apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::ArrowUp,
+            true
+        ));
         assert!(input.jump_or_up, "the new key jumps");
         // the replaced key is unbound now — Space no longer jumps
-        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, true));
+        assert!(!apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::Space,
+            true
+        ));
         // an unbound press must not disturb the flag either way: the
         // ArrowUp press keeps it set, and no stick/clear happens from Space
-        assert!(input.jump_or_up, "an unbound key press must not clear the flag");
+        assert!(
+            input.jump_or_up,
+            "an unbound key press must not clear the flag"
+        );
         // release through the new key clears the flag
-        assert!(apply_gameplay_key(&mut input, &binds, KeyCode::ArrowUp, false));
+        assert!(apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::ArrowUp,
+            false
+        ));
         assert!(!input.jump_or_up);
         // the old key's release is unbound too and must not resurrect it
-        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::Space, false));
+        assert!(!apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::Space,
+            false
+        ));
         assert!(!input.jump_or_up);
     }
 
@@ -1169,8 +1216,18 @@ mod tests {
         // longer crouch/sprint the way the old hardcoded pairs did.
         let binds = Keybinds::default();
         let mut input = InputState::default();
-        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ShiftRight, true));
-        assert!(!apply_gameplay_key(&mut input, &binds, KeyCode::ControlRight, true));
+        assert!(!apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::ShiftRight,
+            true
+        ));
+        assert!(!apply_gameplay_key(
+            &mut input,
+            &binds,
+            KeyCode::ControlRight,
+            true
+        ));
         assert_eq!(
             format!("{:?}", input),
             format!("{:?}", InputState::default()),
@@ -1182,7 +1239,13 @@ mod tests {
     fn non_gameplay_keys_report_not_bound_and_leave_input_untouched() {
         let binds = Keybinds::default();
         let mut input = InputState::default();
-        for code in [KeyCode::KeyQ, KeyCode::KeyZ, KeyCode::KeyF, KeyCode::F5, KeyCode::Escape] {
+        for code in [
+            KeyCode::KeyQ,
+            KeyCode::KeyZ,
+            KeyCode::KeyF,
+            KeyCode::F5,
+            KeyCode::Escape,
+        ] {
             assert!(
                 !apply_gameplay_key(&mut input, &binds, code, true),
                 "{code:?} is not a gameplay bind"

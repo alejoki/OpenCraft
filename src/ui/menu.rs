@@ -171,9 +171,7 @@ pub fn row(index: usize) -> Option<MenuRow> {
 pub enum MenuState {
     Closed,
     Open,
-    AwaitingKey {
-        action: BindAction,
-    },
+    AwaitingKey { action: BindAction },
 }
 
 /// A transient in-menu message (duplicate-key warning, unsupported-key
@@ -395,15 +393,11 @@ pub enum RebindDecision {
     Accept(KeyCode),
     /// The key has no `key_to_string` mapping. `Settings::save` PANICS on
     /// unmapped keys, so this rejection is mandatory, not cosmetic.
-    RejectUnsupported {
-        key: KeyCode,
-    },
+    RejectUnsupported { key: KeyCode },
     /// Another action already holds this key; rebinding would create a
     /// duplicate. `conflicting_action` matches `KeybindConflict.actions`
     /// naming.
-    RejectDuplicate {
-        conflicting_action: BindAction,
-    },
+    RejectDuplicate { conflicting_action: BindAction },
 }
 
 /// Decide what a key press during capture means for `action`.
@@ -517,8 +511,14 @@ mod tests {
         let (px, py, pw, ph) = panel_rect(SW, SH);
         for index in 0..ROW_COUNT {
             let (x, y, w, h) = row_rect(SW, SH, index).unwrap();
-            assert!(px <= x && x + w <= px + pw, "row {index} inside panel horizontally");
-            assert!(py <= y && y + h <= py + ph, "row {index} inside panel vertically");
+            assert!(
+                px <= x && x + w <= px + pw,
+                "row {index} inside panel horizontally"
+            );
+            assert!(
+                py <= y && y + h <= py + ph,
+                "row {index} inside panel vertically"
+            );
         }
         // padding is symmetric and exactly MENU_PAD on each side
         let (x0, y0, ..) = row_rect(SW, SH, 0).unwrap();
@@ -569,8 +569,14 @@ mod tests {
     #[test]
     fn sensitivity_steps_move_by_the_step_and_clamp_both_directions() {
         let base = 0.0022;
-        assert_eq!(adjust_sensitivity(base, AdjustDirection::Up), base + SENSITIVITY_STEP);
-        assert_eq!(adjust_sensitivity(base, AdjustDirection::Down), base - SENSITIVITY_STEP);
+        assert_eq!(
+            adjust_sensitivity(base, AdjustDirection::Up),
+            base + SENSITIVITY_STEP
+        );
+        assert_eq!(
+            adjust_sensitivity(base, AdjustDirection::Down),
+            base - SENSITIVITY_STEP
+        );
 
         // near the top: 0.0099 + 0.0005 would be 0.0104 -> clamps to MAX
         assert_eq!(
@@ -598,15 +604,29 @@ mod tests {
         assert_eq!(adjust_fov(75.0, AdjustDirection::Up), 80.0);
         assert_eq!(adjust_fov(75.0, AdjustDirection::Down), 70.0);
         assert_eq!(adjust_fov(118.0, AdjustDirection::Up), 120.0);
-        assert_eq!(adjust_fov(120.0, AdjustDirection::Up), 120.0, "pinned at MAX");
+        assert_eq!(
+            adjust_fov(120.0, AdjustDirection::Up),
+            120.0,
+            "pinned at MAX"
+        );
         assert_eq!(adjust_fov(33.0, AdjustDirection::Down), 30.0);
-        assert_eq!(adjust_fov(30.0, AdjustDirection::Down), 30.0, "pinned at MIN");
+        assert_eq!(
+            adjust_fov(30.0, AdjustDirection::Down),
+            30.0,
+            "pinned at MIN"
+        );
     }
 
     #[test]
     fn clamping_bounds_are_inclusive_and_match_the_load_path_constants() {
-        assert_eq!(clamp_sensitivity(SENSITIVITY_MIN as f32), SENSITIVITY_MIN as f32);
-        assert_eq!(clamp_sensitivity(SENSITIVITY_MAX as f32), SENSITIVITY_MAX as f32);
+        assert_eq!(
+            clamp_sensitivity(SENSITIVITY_MIN as f32),
+            SENSITIVITY_MIN as f32
+        );
+        assert_eq!(
+            clamp_sensitivity(SENSITIVITY_MAX as f32),
+            SENSITIVITY_MAX as f32
+        );
         assert_eq!(clamp_fov(FOV_MIN as f32), FOV_MIN as f32);
         assert_eq!(clamp_fov(FOV_MAX as f32), FOV_MAX as f32);
         // boundary values are accepted unchanged, not clamped away
@@ -623,8 +643,7 @@ mod tests {
     fn rebind_to_a_free_supported_key_is_accepted() {
         let binds = Keybinds::default();
         // a free supported key: jump_or_up -> ArrowUp
-        let decision =
-            evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ArrowUp);
+        let decision = evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ArrowUp);
         assert_eq!(decision, RebindDecision::Accept(KeyCode::ArrowUp));
         // sprint -> KeyQ is also free
         let decision = evaluate_rebind_candidate(&binds, BindAction::Sprint, KeyCode::KeyQ);
@@ -642,8 +661,7 @@ mod tests {
     fn rebind_to_another_actions_key_is_rejected_as_duplicate() {
         let binds = Keybinds::default();
         // jump_or_up -> KeyW collides with forward
-        let decision =
-            evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::KeyW);
+        let decision = evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::KeyW);
         assert_eq!(
             decision,
             RebindDecision::RejectDuplicate {
@@ -660,8 +678,7 @@ mod tests {
         );
         // the slice demo's press-to-rebind case: jump_or_up -> ShiftLeft
         // collides with the default crouch binding
-        let decision =
-            evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ShiftLeft);
+        let decision = evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ShiftLeft);
         assert_eq!(
             decision,
             RebindDecision::RejectDuplicate {
@@ -681,7 +698,9 @@ mod tests {
         );
         assert_eq!(
             evaluate_rebind_candidate(&binds, BindAction::Forward, KeyCode::Minus),
-            RebindDecision::RejectUnsupported { key: KeyCode::Minus }
+            RebindDecision::RejectUnsupported {
+                key: KeyCode::Minus
+            }
         );
     }
 
@@ -690,8 +709,7 @@ mod tests {
         // The direct duplicate scan must agree with the authoritative
         // validator: apply each Accept and expect zero conflicts.
         let mut binds = Keybinds::default();
-        let decision =
-            evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ArrowUp);
+        let decision = evaluate_rebind_candidate(&binds, BindAction::JumpOrUp, KeyCode::ArrowUp);
         match decision {
             RebindDecision::Accept(code) => {
                 BindAction::JumpOrUp.set_key(&mut binds, code);
@@ -715,8 +733,7 @@ mod tests {
         let text = rebind_rejection_message(&dup).unwrap();
         assert!(text.contains("forward"), "message names the action: {text}");
 
-        let unsup =
-            evaluate_rebind_candidate(&binds, BindAction::Forward, KeyCode::Backslash);
+        let unsup = evaluate_rebind_candidate(&binds, BindAction::Forward, KeyCode::Backslash);
         let text = rebind_rejection_message(&unsup).unwrap();
         assert!(text.contains("Backslash"), "message names the key: {text}");
         assert!(text.contains("supported"), "message says why: {text}");
@@ -756,9 +773,12 @@ mod tests {
 
         menu.open();
         menu.begin_rebind(BindAction::JumpOrUp);
-        assert_eq!(menu.state, MenuState::AwaitingKey {
-            action: BindAction::JumpOrUp
-        });
+        assert_eq!(
+            menu.state,
+            MenuState::AwaitingKey {
+                action: BindAction::JumpOrUp
+            }
+        );
         assert_eq!(menu.awaiting_action(), Some(BindAction::JumpOrUp));
         assert!(menu.is_open(), "capture mode is still an open menu");
 
@@ -779,7 +799,9 @@ mod tests {
         let mut menu = SettingsMenu::new();
         menu.set_message_for_ticks("dup", 2);
         assert_eq!(
-            menu.message.as_ref().map(|m| (m.text.as_str(), m.ticks_left)),
+            menu.message
+                .as_ref()
+                .map(|m| (m.text.as_str(), m.ticks_left)),
             Some(("dup", 2))
         );
         assert!(menu.tick());

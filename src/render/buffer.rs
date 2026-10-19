@@ -1,5 +1,5 @@
-use std::ops::Range;
 use rustc_hash::FxHashMap;
+use std::ops::Range;
 use wgpu::util::DeviceExt;
 
 use crate::mesh::quad::{ChunkMesh, PackedQuad};

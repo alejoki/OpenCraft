@@ -95,10 +95,7 @@ const KEY_TABLE: &[(KeyCode, &str)] = &[
 /// Debug spelling, e.g. "KeyW"). Returns `None` for keys outside the
 /// supported subset.
 pub fn key_to_string(code: KeyCode) -> Option<&'static str> {
-    KEY_TABLE
-        .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, s)| *s)
+    KEY_TABLE.iter().find(|(c, _)| *c == code).map(|(_, s)| *s)
 }
 
 /// Parse a settings-file string back into a `KeyCode`. Case-sensitive;
@@ -176,15 +173,30 @@ mod tests {
     #[test]
     fn every_supported_key_round_trips() {
         for (code, name) in KEY_TABLE {
-            assert_eq!(key_to_string(*code), Some(*name), "missing key_to_string entry for {:?}", code);
-            assert_eq!(parse_key(name), Some(*code), "missing parse_key entry for {}", name);
+            assert_eq!(
+                key_to_string(*code),
+                Some(*name),
+                "missing key_to_string entry for {:?}",
+                code
+            );
+            assert_eq!(
+                parse_key(name),
+                Some(*code),
+                "missing parse_key entry for {}",
+                name
+            );
         }
     }
 
     #[test]
     fn every_mapped_string_is_the_keycode_debug_spelling() {
         for (code, name) in KEY_TABLE {
-            assert_eq!(&format!("{:?}", code), name, "string for {:?} is not the Debug spelling", code);
+            assert_eq!(
+                &format!("{:?}", code),
+                name,
+                "string for {:?} is not the Debug spelling",
+                code
+            );
         }
     }
 }
