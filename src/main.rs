@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,7 +20,11 @@ use minecraft_clone::render::pipeline::VoxelRenderer;
 use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
 use minecraft_clone::world::manager::WorldManager;
-use minecraft_clone::world::terrain::terrain_height_at;
+use minecraft_clone::world::persistence::{
+    load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, SavedPlayerState,
+    WorldSaveData,
+};
+use minecraft_clone::world::terrain::{terrain_height_at_seeded, DEFAULT_WORLD_SEED};
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -33,7 +38,63 @@ fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     }
 }
 
+fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Player) -> bool {
+    let data = WorldSaveData {
+        seed: world.seed(),
+        player: SavedPlayerState {
+            position: player.position.to_array(),
+            yaw: player.yaw,
+            pitch: player.pitch,
+            fly_mode: player.fly_mode,
+            selected_slot: player.selected_slot as u8,
+            render_distance: world.render_distance() as u16,
+        },
+        chunk_edits: world.chunk_edits().clone(),
+    };
+    if save_world_to_path(save_path, &data).is_ok() {
+        world.mark_saved();
+        true
+    } else {
+        false
+    }
+}
+
 fn main() {
+    let cli = CliConfig::from_iter(std::env::args().skip(1));
+
+    let (mut world, mut player) = if !cli.force_new_world && cli.save_path.exists() {
+        match load_world_from_path(&cli.save_path) {
+            Ok(save) => {
+                let mut p = Player::new(Vec3::from_array(save.player.position));
+                p.yaw = save.player.yaw;
+                p.pitch = save.player.pitch;
+                p.fly_mode = save.player.fly_mode;
+                p.selected_slot = (save.player.selected_slot as usize).min(8);
+                let w = WorldManager::with_seed_and_edits(
+                    save.player.render_distance as i32,
+                    save.seed,
+                    save.chunk_edits,
+                );
+                (w, p)
+            }
+            Err(_) => {
+                let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+                let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
+                (
+                    WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
+                    Player::new(Vec3::new(0.5, spawn_y, 0.5)),
+                )
+            }
+        }
+    } else {
+        let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+        let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
+        (
+            WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
+            Player::new(Vec3::new(0.5, spawn_y, 0.5)),
+        )
+    };
+
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let window = Arc::new(
         WindowBuilder::new()
@@ -46,17 +107,17 @@ fn main() {
     let mut ctx = RenderContext::new(window.clone());
     let renderer = VoxelRenderer::new(&ctx);
     let mut render_store = ChunkRenderStore::new();
-    let mut world = WorldManager::new(16);
 
-    let spawn_y = (terrain_height_at(0, 0) + 4) as f32;
-    let mut player = Player::new(Vec3::new(0.5, spawn_y, 0.5));
     let mut camera = Camera::new(player.eye_position());
+    camera.yaw = player.yaw;
+    camera.pitch = player.pitch;
     let mut input = InputState::default();
     let mut cursor_grabbed = true;
     set_cursor_grab(&window, true);
 
     let mut last_frame = Instant::now();
     let mut title_timer = Instant::now();
+    let mut last_saved_badge: Option<Instant> = None;
     let mut frame_count = 0u32;
 
     event_loop
@@ -65,7 +126,13 @@ fn main() {
 
             match event {
                 Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => elwt.exit(),
+                    WindowEvent::CloseRequested => {
+                        let _ = save_current_world(&cli.save_path, &mut world, &player);
+                        elwt.exit();
+                    }
+                    WindowEvent::Focused(false) => {
+                        input.reset();
+                    }
                     WindowEvent::Resized(new_size) => {
                         ctx.resize(new_size);
                     }
@@ -87,6 +154,11 @@ fn main() {
                                 KeyCode::KeyF if pressed && !event.repeat => {
                                     player.fly_mode = !player.fly_mode;
                                     player.velocity = Vec3::ZERO;
+                                }
+                                KeyCode::F5 if pressed && !event.repeat => {
+                                    if save_current_world(&cli.save_path, &mut world, &player) {
+                                        last_saved_badge = Some(Instant::now());
+                                    }
                                 }
                                 KeyCode::Escape if pressed && !event.repeat => {
                                     cursor_grabbed = !cursor_grabbed;
@@ -216,6 +288,11 @@ fn main() {
                             player.position.z.floor() as i32,
                         );
                         let (new_meshes, unloaded) = world.update_streaming(player_chunk);
+                        if !unloaded.is_empty() && world.has_unsaved_changes() {
+                            if save_current_world(&cli.save_path, &mut world, &player) {
+                                last_saved_badge = Some(Instant::now());
+                            }
+                        }
                         for upos in unloaded {
                             render_store.remove_chunk(upos);
                         }
@@ -253,8 +330,16 @@ fn main() {
                                     let vram_kb = render_store.total_vram_bytes / 1024;
                                     let mode = if player.fly_mode { "Fly" } else { "Walk" };
                                     let block_name = BlockId::HOTBAR[player.selected_slot].name();
+                                    let save_tag = if last_saved_badge
+                                        .map(|t| t.elapsed().as_secs_f32() < 2.0)
+                                        .unwrap_or(false)
+                                    {
+                                        " [Saved]"
+                                    } else {
+                                        ""
+                                    };
                                     window.set_title(&format!(
-                                        "Minecraft Clone | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {}",
+                                        "Minecraft Clone | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
                                         fps,
                                         ms,
                                         visible_chunks,
@@ -268,6 +353,8 @@ fn main() {
                                         player.selected_slot + 1,
                                         block_name,
                                         world.render_distance(),
+                                        world.seed(),
+                                        save_tag,
                                     ));
                                     title_timer = Instant::now();
                                     frame_count = 0;
@@ -279,6 +366,7 @@ fn main() {
                                 ctx.resize(ctx.size);
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => {
+                                let _ = save_current_world(&cli.save_path, &mut world, &player);
                                 elwt.exit();
                             }
                             Err(wgpu::SurfaceError::Timeout) => {}

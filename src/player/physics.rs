@@ -52,6 +52,13 @@ pub struct InputState {
     pub sprint: bool,
 }
 
+impl InputState {
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Player {
     pub position: Vec3,
@@ -292,5 +299,21 @@ mod tests {
         });
 
         assert!(p_sprint.position.x > p_walk.position.x + 0.05);
+    }
+
+    #[test]
+    fn test_focus_loss_resets_input_state() {
+        let mut input = InputState {
+            forward: true,
+            backward: true,
+            left: true,
+            right: true,
+            jump_or_up: true,
+            crouch_or_down: true,
+            sprint: true,
+        };
+        input.reset();
+        assert!(!input.forward && !input.backward && !input.left && !input.right);
+        assert!(!input.jump_or_up && !input.crouch_or_down && !input.sprint);
     }
 }
