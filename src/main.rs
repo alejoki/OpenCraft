@@ -38,8 +38,8 @@ use minecraft_clone::ui::{
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use minecraft_clone::world::block::BlockId;
-use minecraft_clone::world::catalog::{CatalogRow, RowStatus};
-use minecraft_clone::world::catalog_fs::CatalogLoadError;
+use minecraft_clone::world::catalog::{CatalogRow, PendingDelete};
+use minecraft_clone::world::catalog_fs::WorldCatalogFs;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
 use minecraft_clone::world::manager::WorldManager;
 use minecraft_clone::world::persistence::{
@@ -185,6 +185,55 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
 /// behind the same call sites.
 fn handle_world_start(_name: &str, _seed: Option<&str>) -> &'static str {
     WORLD_START_SEAM_MESSAGE
+}
+
+/// Compose the load screen's Play message for one catalog row through the
+/// live catalog (S02-T03 wiring): the row is probed via
+/// `catalog.load_row`, so a file that vanished between the listing and
+/// the Play click surfaces `CatalogLoadError::Load` inline instead of
+/// being swallowed, and a corrupt row surfaces its
+/// `CatalogLoadError::Corrupt` display (degraded, not excluded). A
+/// genuinely loadable row routes to the S03 seam `handle_world_start` —
+/// the probed `WorldSaveData` is dropped there: world-session
+/// replacement is S03's job, the probe exists so errors surface and the
+/// row is proven loadable (warnings-as-data, D006/MEM009 — the crate
+/// stays log-free). Free helper over (catalog, row) so every failure
+/// mode is unit-testable with a tempdir catalog.
+fn play_row_message(catalog: &WorldCatalogFs, row: &CatalogRow) -> MenuMessage {
+    let text = match catalog.load_row(row) {
+        Ok(_save) => handle_world_start(&row.name, None).to_string(),
+        Err(err) => err.to_string(),
+    };
+    MenuMessage {
+        text,
+        ticks_left: menu::MESSAGE_TICKS,
+    }
+}
+
+/// Apply a S01-confirmed pending delete through the live catalog and
+/// compose the post-delete load-screen state (S02-T03 wiring): rows
+/// refresh from disk on success AND failure alike — the screen must stay
+/// truthful about what is actually on disk (a failed delete leaves the
+/// row present) — and a `CatalogDeleteError` surfaces inline as the
+/// screen's transient message (warnings-as-data, D006/MEM009) instead of
+/// being swallowed. Free helper over (catalog, pending) so the failure
+/// modes are unit-testable with a tempdir catalog; deleting an already
+/// vanished file is a success (S01 idempotency — the observable outcome,
+/// the save being gone, is already true).
+fn apply_confirmed_delete(
+    catalog: &WorldCatalogFs,
+    pending: &PendingDelete,
+) -> (Vec<CatalogRow>, Option<MenuMessage>) {
+    let outcome = catalog.delete_confirmed(pending);
+    let rows = catalog.list_rows();
+    let message = match outcome {
+        Ok(()) => None,
+        Err(err) => Some(MenuMessage {
+            text: err.to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        }),
+    };
+    (rows, message)
 }
 
 /// Decrement a transient [`MenuMessage`] tick counter (the same pattern as
@@ -480,12 +529,19 @@ struct GameApp {
     /// App-state routing: which screen owns input and rendering (the S01
     /// pure lifecycle contracts, applied by S02-T02).
     lifecycle: LifecycleState,
+    /// Filesystem world catalog over the default saves directory (S02-T03
+    /// catalog wiring): the load screen's rows and the new-game duplicate
+    /// check read through it. Construction is path-only (no I/O), so the
+    /// CLI-bypass launch path never touches the disk before gameplay.
+    catalog: WorldCatalogFs,
     /// New-game screen state (T01 pure model). The duplicate check on
-    /// Create runs against the rows the load screen holds (the real
-    /// catalog is wired in S02-T03; until then the rows stay empty).
+    /// Create fetches FRESH rows from the catalog at Create time (the
+    /// S02-T03 decision — documented on `attempt_create`), so it is
+    /// truthful against the real saves/*.mcvx.
     new_game: NewGameScreen,
-    /// Load-game screen state (T01 pure model; rows stay empty until the
-    /// catalog is wired in S02-T03).
+    /// Load-game screen state (T01 pure model); rows refresh from the
+    /// catalog on every entry into the screen and after every delete
+    /// (S02-T03 wiring — `refresh_load_rows` / `confirm_pending_delete`).
     load: LoadScreen,
     /// The load screen's transient message (inline errors, the S03 seam
     /// message; the T01 LoadScreen owns no message slot of its own — same
@@ -542,6 +598,7 @@ impl GameApp {
             startup_warnings_shown: false,
             menu: menu::SettingsMenu::new(),
             lifecycle: LifecycleState::from_screen(startup_screen),
+            catalog: WorldCatalogFs::for_default_saves_dir(),
             new_game: NewGameScreen::new(),
             load: LoadScreen::new(),
             load_message: None,
@@ -659,6 +716,14 @@ impl GameApp {
             }
         } else if self.menu.is_open() {
             self.menu.close();
+        }
+        // Entering the load screen refreshes its rows from the real saves
+        // directory (S02-T03 catalog wiring): the screen must be truthful
+        // about what is on disk, and the row replacement cancels any stale
+        // pending delete (a delete must never fire from stale row
+        // identity — `set_rows` cancels it).
+        if screen == LifecycleScreen::LoadGame {
+            self.refresh_load_rows();
         }
         self.lifecycle = LifecycleState::from_screen(screen);
     }
@@ -804,6 +869,18 @@ impl GameApp {
         }
     }
 
+    /// Refresh the load screen's rows from the real saves directory
+    /// (S02-T03 catalog wiring): newest-first via `catalog.list_rows()`;
+    /// a missing saves dir lists empty (fresh install — not an error). The
+    /// transient message is cleared so stale errors never survive a
+    /// refresh, and the row replacement cancels any pending delete
+    /// (`set_rows` does that — a delete must never fire from stale row
+    /// identity).
+    fn refresh_load_rows(&mut self) {
+        self.load.set_rows(self.catalog.list_rows());
+        self.load_message = None;
+    }
+
     /// Escape on a backing-out screen: navigate back through the lifecycle
     /// state (new-game/load-game → main menu; pause → Resume, the
     /// non-destructive default T01 documents). The main menu is the root
@@ -820,16 +897,20 @@ impl GameApp {
     }
 
     /// Enter/Create on the new-game screen: validate via T01's pure
-    /// `validate_create` against the rows the load screen holds (the
-    /// real catalog is wired in S02-T03, which also decides fresh-vs-
-    /// reused rows for the duplicate check; until then the rows stay
-    /// empty and only name validation can fail), show any failure inline
-    /// as the form's transient message (warnings-as-data, D006/MEM009),
-    /// and route a valid create to the S03 seam — which only shows a
-    /// transient message and stays on the screen in this slice.
+    /// `validate_create` against FRESH catalog rows fetched at Create time
+    /// (the S02-T03 decision: fresh rows over reusing the rows loaded when
+    /// some earlier screen opened — a save written after the load screen
+    /// opened must still collide; the load screen refreshes its own rows
+    /// on every entry, so this list is validation-only and not stored),
+    /// show any failure inline as the form's transient message
+    /// (warnings-as-data, D006/MEM009), and route a valid create to the S03
+    /// seam — which only shows a transient message and stays on the screen
+    /// in this slice. No `ensure_dir()`/`save_world` happens here: creation
+    /// itself is the S03 seam, so no save is written in this slice and
+    /// there is no create-path filesystem use to ensure a directory for.
     fn attempt_create(&mut self) {
         let name = self.new_game.name().value().to_string();
-        let rows: Vec<CatalogRow> = self.load.rows().to_vec();
+        let rows = self.catalog.list_rows();
         match validate_create(&name, &rows) {
             Err(err) => self.new_game.set_message(err.to_string()),
             Ok(()) => {
@@ -841,38 +922,37 @@ impl GameApp {
     }
 
     /// Confirm a pending delete (Enter or the confirm target on the load
-    /// screen): consume the pending row identity through the T01 machine.
-    /// The actual filesystem delete (`catalog.delete_confirmed`) and the
-    /// row refresh are S02-T03; in T02 the load screen holds no rows, so
-    /// no delete can ever be pending (`request_delete` requires a row)
-    /// and this path is dormant until T03 supplies rows.
+    /// screen): consume the pending row identity through the T01 machine
+    /// and hand the S01-confirmed [`PendingDelete`] to the live catalog
+    /// (S02-T03 catalog wiring) via the pure `apply_confirmed_delete`
+    /// helper: the file is deleted, rows refresh from disk either way (a
+    /// failed delete keeps the still-present row listed), and a
+    /// `CatalogDeleteError` surfaces inline as the load screen's transient
+    /// message (warnings-as-data, D006/MEM009). Nothing pending: a no-op
+    /// (a delete can never fire without a prior request).
     fn confirm_pending_delete(&mut self) {
-        let _pending = self.load.confirm_delete();
-    }
-
-    /// Play on catalog row `index` (load screen): a loadable row routes to
-    /// the S03 seam (transient message, stays on screen); a corrupt row
-    /// shows its inline non-loadable message — the same
-    /// `CatalogLoadError::Corrupt` display T03's real load path surfaces
-    /// (warnings-as-data, D006/MEM009: the row is degraded, not
-    /// excluded). An out-of-range index is ignored (rows only shrink via a
-    /// confirmed delete, which cancels any pending identity first).
-    fn play_row(&mut self, index: usize) {
-        let Some(row) = self.load.rows().get(index) else {
+        let Some(pending) = self.load.confirm_delete() else {
             return;
         };
-        let message = match row.status {
-            RowStatus::Loadable => handle_world_start(&row.name, None).to_string(),
-            RowStatus::Corrupt(problem) => CatalogLoadError::Corrupt {
-                name: row.name.clone(),
-                problem,
-            }
-            .to_string(),
+        let (rows, message) = apply_confirmed_delete(&self.catalog, &pending);
+        self.load.set_rows(rows);
+        self.load_message = message;
+    }
+
+    /// Play on catalog row `index` (load screen): the row is probed through
+    /// the live catalog (S02-T03 wiring) via the pure `play_row_message`
+    /// helper — a loadable row routes to the S03 seam (transient message,
+    /// stays on screen), a corrupt row and a vanished file both surface
+    /// their `CatalogLoadError` display inline as the load screen's
+    /// transient message (warnings-as-data, D006/MEM009: degraded or
+    /// vanished rows are displayed, never swallowed — the crate stays
+    /// log-free). An out-of-range index is ignored (rows only shrink via a
+    /// confirmed delete, which cancels any pending identity first).
+    fn play_row(&mut self, index: usize) {
+        let Some(row) = self.load.rows().get(index).cloned() else {
+            return;
         };
-        self.load_message = Some(MenuMessage {
-            text: message,
-            ticks_left: menu::MESSAGE_TICKS,
-        });
+        self.load_message = Some(play_row_message(&self.catalog, &row));
     }
 
     /// Route one mouse click while a lifecycle screen (not Settings, not
@@ -1722,7 +1802,7 @@ fn main() {
 mod tests {
     use super::*;
     use minecraft_clone::ui::SettingsCaller;
-    use minecraft_clone::world::catalog::RowProblem;
+    use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
 
     #[test]
     fn menu_text_lists_every_row_with_its_live_value() {
@@ -2221,6 +2301,123 @@ mod tests {
         assert_eq!(
             screen_title_tag(LifecycleScreen::Settings(SettingsCaller::Pause)),
             " | Settings"
+        );
+    }
+
+    /// A valid sample world save for catalog-wiring tests (same shape
+    /// the catalog_fs tests use).
+    fn sample_save(seed: u32) -> WorldSaveData {
+        WorldSaveData {
+            seed,
+            player: SavedPlayerState {
+                position: [1.0, 64.0, -2.0],
+                yaw: 0.5,
+                pitch: -0.25,
+                fly_mode: true,
+                selected_slot: 2,
+                render_distance: 16,
+            },
+            chunk_edits: ChunkEditMap::default(),
+        }
+    }
+
+    #[test]
+    fn apply_confirmed_delete_refreshes_rows_and_surfaces_delete_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = WorldCatalogFs::new(dir.path());
+        catalog.save_world("doomed", &sample_save(1)).expect("save doomed");
+        catalog.save_world("spared", &sample_save(2)).expect("save spared");
+
+        // Confirmed request deletes exactly the named file and the
+        // refreshed rows drop it; success shows no message.
+        let mut confirm = DeleteConfirmation::new();
+        let doomed = catalog
+            .list_rows()
+            .into_iter()
+            .find(|r| r.name == "doomed")
+            .expect("doomed row listed");
+        confirm.request(&doomed);
+        let ConfirmOutcome::Confirmed(pending) = confirm.confirm() else {
+            panic!("expected a confirmed delete");
+        };
+        let (rows, message) = apply_confirmed_delete(&catalog, &pending);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["spared"]);
+        assert!(!dir.path().join("doomed.mcvx").exists());
+        assert!(dir.path().join("spared.mcvx").is_file());
+        assert!(message.is_none(), "a successful delete shows no message");
+
+        // S01 idempotency: deleting the already-vanished file again is a
+        // success — rows stay truthful, no error surfaced.
+        let (rows, message) = apply_confirmed_delete(&catalog, &pending);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["spared"]);
+        assert!(message.is_none(), "vanished-entry redelete is a success");
+
+        // A delete failure surfaces inline as the screen message and the
+        // still-present row stays listed. The real wiring only ever passes
+        // machine-confirmed pendings (whose file names come from listed
+        // *.mcvx rows), so the error arm is staged with an unsafe pending
+        // directly — the adapter refuses it before touching the disk.
+        let unsafe_pending = PendingDelete {
+            name: "escape".to_string(),
+            file_name: "../escape.mcvx".to_string(),
+        };
+        let (rows, message) = apply_confirmed_delete(&catalog, &unsafe_pending);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["spared"], "nothing was deleted");
+        assert!(dir.path().join("spared.mcvx").is_file());
+        let message = message.expect("delete failure surfaces inline");
+        assert!(
+            message.text.contains("Refusing to delete"),
+            "unexpected delete-failure text: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+        assert!(!dir.path().parent().unwrap().join("escape.mcvx").exists());
+    }
+
+    #[test]
+    fn play_row_message_probes_the_catalog_and_surfaces_inline_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = WorldCatalogFs::new(dir.path());
+        catalog.save_world("ghost", &sample_save(5)).expect("save ghost");
+        std::fs::write(dir.path().join("broken.mcvx"), b"NOPE!1234").expect("write broken");
+
+        let rows = catalog.list_rows();
+        let ghost = rows
+            .iter()
+            .find(|r| r.name == "ghost")
+            .expect("ghost row listed")
+            .clone();
+        let broken = rows
+            .iter()
+            .find(|r| r.name == "broken")
+            .expect("broken row listed")
+            .clone();
+
+        // A loadable row routes to the S03 seam (transient message; the
+        // probed save data is S03's to consume — none is written here).
+        let message = play_row_message(&catalog, &ghost);
+        assert_eq!(message.text, WORLD_START_SEAM_MESSAGE);
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+
+        // A corrupt row surfaces its inline non-loadable display.
+        let message = play_row_message(&catalog, &broken);
+        assert!(
+            message.text.contains("cannot be loaded"),
+            "unexpected corrupt-row text: {}",
+            message.text
+        );
+
+        // Vanished between the listing and the Play click:
+        // CatalogLoadError::Load surfaces inline, never swallowed.
+        std::fs::remove_file(dir.path().join("ghost.mcvx")).expect("remove ghost");
+        let message = play_row_message(&catalog, &ghost);
+        assert!(
+            message.text.contains("Could not load world \"ghost\""),
+            "unexpected vanished-row text: {}",
+            message.text
         );
     }
 
