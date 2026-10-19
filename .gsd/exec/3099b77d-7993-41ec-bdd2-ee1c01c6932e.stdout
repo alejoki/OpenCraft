@@ -1,0 +1,10 @@
+      2 warning: the loop variable `lz` is used to index `heights`
+      2 warning: the loop variable `lx` is used to index `heights`
+      1 warning: this function has too many arguments (8/7)
+      1 warning: the loop variable `u` is used to index `slice_keys`
+      1 warning: the loop variable `pv` is used to index `solid_masks`
+      1 warning: the loop variable `pu` is used to index `solid_masks`
+      1 warning: the loop variable `kv` is only used to index `row_masks`
+      1 warning: the loop variable `ku` is only used to index `slice_keys`
+      1 warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
+      1 warning: method `from_iter` can be confused for the standard trait method `std::iter::FromIterator::from_iter`

@@ -1,0 +1,20 @@
+    |
+622 |                         menu::hovered_row(self.cursor_pos, surface_w, surface_h);
+    |                         ----------------- ^^^^^^^^^^^^^^^ expected `(f32, f32)`, found `Option<(f32, f32)>`
+    |                         |
+    |                         arguments to this function are incorrect
+    |
+    = note: expected tuple `(f32, f32)`
+                found enum `Option<(f32, f32)>`
+note: function defined here
+   --> src/ui/menu.rs:342:8
+    |
+342 | pub fn hovered_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> Option<MenuRow> {
+    |        ^^^^^^^^^^^
+help: consider using `Option::expect` to unwrap the `Option<(f32, f32)>` value, panicking if the value is an `Option::None`
+    |
+622 |                         menu::hovered_row(self.cursor_pos.expect("REASON"), surface_w, surface_h);
+    |                                                          +++++++++++++++++
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `minecraft-clone` (bin "minecraft-clone") due to 1 previous error

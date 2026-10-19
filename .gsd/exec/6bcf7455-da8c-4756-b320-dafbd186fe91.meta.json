@@ -1,0 +1,20 @@
+{
+  "id": "6bcf7455-da8c-4756-b320-dafbd186fe91",
+  "runtime": "bash",
+  "purpose": "Clean evidence run: cargo build",
+  "script_chars": 11,
+  "started_at": "2026-10-19T10:50:31.632Z",
+  "finished_at": "2026-10-19T10:50:31.830Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 198,
+  "stdout_bytes": 0,
+  "stderr_bytes": 72,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/6bcf7455-da8c-4756-b320-dafbd186fe91.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/6bcf7455-da8c-4756-b320-dafbd186fe91.stderr"
+}

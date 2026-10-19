@@ -1,0 +1,20 @@
+{
+  "id": "9c72daee-99ae-43a6-ae05-a9f9e2395e94",
+  "runtime": "bash",
+  "purpose": "Rebuild after Option-cursor fix in hovered_row call",
+  "script_chars": 11,
+  "started_at": "2026-10-19T10:45:56.921Z",
+  "finished_at": "2026-10-19T10:45:58.378Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1457,
+  "stdout_bytes": 0,
+  "stderr_bytes": 159,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/9c72daee-99ae-43a6-ae05-a9f9e2395e94.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/9c72daee-99ae-43a6-ae05-a9f9e2395e94.stderr"
+}

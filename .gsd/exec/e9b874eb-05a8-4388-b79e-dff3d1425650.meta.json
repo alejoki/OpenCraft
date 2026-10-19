@@ -1,0 +1,20 @@
+{
+  "id": "e9b874eb-05a8-4388-b79e-dff3d1425650",
+  "runtime": "bash",
+  "purpose": "S04-T03: build with keybind routing wired through Settings",
+  "script_chars": 11,
+  "started_at": "2026-10-19T10:37:00.144Z",
+  "finished_at": "2026-10-19T10:37:01.458Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1314,
+  "stdout_bytes": 0,
+  "stderr_bytes": 159,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/e9b874eb-05a8-4388-b79e-dff3d1425650.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/e9b874eb-05a8-4388-b79e-dff3d1425650.stderr"
+}

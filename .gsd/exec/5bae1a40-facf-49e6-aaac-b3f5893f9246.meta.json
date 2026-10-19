@@ -1,0 +1,20 @@
+{
+  "id": "5bae1a40-facf-49e6-aaac-b3f5893f9246",
+  "runtime": "bash",
+  "purpose": "Settings smoke gate — seeded settings.toml, bounded run, byte-identical assert",
+  "script_chars": 30,
+  "started_at": "2026-10-19T10:49:45.758Z",
+  "finished_at": "2026-10-19T10:49:55.812Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10054,
+  "stdout_bytes": 106,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/5bae1a40-facf-49e6-aaac-b3f5893f9246.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/5bae1a40-facf-49e6-aaac-b3f5893f9246.stderr"
+}

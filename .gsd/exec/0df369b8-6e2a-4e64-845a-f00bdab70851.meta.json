@@ -1,0 +1,20 @@
+{
+  "id": "0df369b8-6e2a-4e64-845a-f00bdab70851",
+  "runtime": "bash",
+  "purpose": "Clean evidence run: cargo clippy",
+  "script_chars": 12,
+  "started_at": "2026-10-19T10:50:36.507Z",
+  "finished_at": "2026-10-19T10:50:36.728Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 221,
+  "stdout_bytes": 0,
+  "stderr_bytes": 6330,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0df369b8-6e2a-4e64-845a-f00bdab70851.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0df369b8-6e2a-4e64-845a-f00bdab70851.stderr"
+}

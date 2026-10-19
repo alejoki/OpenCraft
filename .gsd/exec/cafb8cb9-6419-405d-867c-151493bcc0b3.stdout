@@ -1,0 +1,108 @@
+
+running 83 tests
+test player::camera::tests::test_frustum_and_visible_face_mask ... ok
+test player::physics::tests::test_cannot_place_block_overlapping_player_aabb ... ok
+test player::physics::tests::test_fast_fall_does_not_embed_in_floor ... ok
+test player::physics::tests::test_left_shift_sprints_in_walk_mode ... ok
+test player::physics::tests::test_focus_loss_resets_input_state ... ok
+test player::physics::tests::test_player_lands_on_ground_without_falling_through ... ok
+test player::raycast::tests::test_raycast_axis_aligned_zero_components ... ok
+test render::pipeline::tests::test_overlay_vertices_include_wireframe_crosshair_and_hotbar ... ok
+test settings::keybind::tests::every_mapped_string_is_the_keycode_debug_spelling ... ok
+test settings::keybind::tests::keys_outside_the_supported_subset_return_none_from_key_to_string ... ok
+test settings::keybind::tests::parses_digit_keys ... ok
+test settings::keybind::tests::every_supported_key_round_trips ... ok
+test settings::keybind::tests::parses_letter_keys ... ok
+test settings::keybind::tests::parses_modifier_variants_independently ... ok
+test settings::keybind::tests::parses_whitespace_and_function_and_arrow_keys ... ok
+test settings::keybind::tests::unsupported_strings_return_none ... ok
+test render::texture::tests::test_procedural_texture_layers_non_empty ... ok
+test settings::tests::keybinds_defaults_match_todays_hardcoded_bindings ... ok
+test settings::tests::missing_file_yields_defaults_with_exactly_one_warning ... ok
+test settings::tests::load_discards_warnings_and_never_panics ... ok
+test settings::tests::boundary_values_are_accepted_without_warnings ... ok
+test settings::tests::bad_fov_type_falls_back_while_valid_fields_survive ... ok
+test settings::tests::duplicate_keybinds_load_with_conflict_warning_and_both_values_kept ... ok
+test settings::tests::settings_defaults_match_todays_hardcoded_values ... ok
+test settings::tests::save_leaves_no_tmp_file_behind_on_success ... ok
+test settings::tests::saved_file_matches_the_documented_format ... ok
+test settings::tests::out_of_range_values_above_maximum_are_clamped_with_warnings ... ok
+test settings::tests::defaults_round_trip_exactly_with_zero_warnings ... ok
+test settings::tests::triple_duplicate_reports_one_conflict_listing_all_actions ... ok
+test settings::tests::missing_keybind_actions_keep_defaults_without_warnings ... ok
+test settings::tests::validate_keybinds_on_defaults_reports_no_conflicts ... ok
+test settings::tests::unparsable_keybind_string_falls_back_with_warning ... ok
+test settings::tests::save_creates_missing_parent_directories_and_overwrites_existing_file ... ok
+test settings::tests::unknown_keys_sections_and_actions_are_silently_ignored ... ok
+test settings::tests::syntactically_invalid_toml_yields_all_defaults_with_one_warning ... ok
+test settings::tests::round_trip_preserves_non_default_settings_with_zero_warnings ... ok
+test settings::tests::wrong_type_keybind_falls_back_with_warning ... ok
+test ui::menu::tests::bind_action_get_set_round_trips_every_action ... ok
+test ui::menu::tests::clamping_bounds_are_inclusive_and_match_the_load_path_constants ... ok
+test settings::tests::valid_minimal_file_parses_with_zero_warnings ... ok
+test settings::tests::wrong_type_mouse_and_video_fields_fall_back_with_warnings ... ok
+test settings::tests::out_of_range_values_below_minimum_are_clamped_with_warnings ... ok
+test ui::menu::tests::fov_steps_move_by_five_degrees_and_clamp_both_directions ... ok
+test ui::menu::tests::bind_action_names_match_validate_keybinds_strings ... ok
+test ui::menu::tests::hit_test_inside_is_true_and_outside_is_false ... ok
+test ui::menu::tests::hovered_row_finds_the_row_under_the_cursor_and_none_elsewhere ... ok
+test ui::menu::tests::accepted_rebinds_survive_the_settings_validate_keybinds_scan ... ok
+test ui::menu::tests::capture_mode_transitions_accept_and_cancel ... ok
+test ui::menu::tests::layout_is_deterministic_for_the_same_surface ... ok
+test ui::menu::tests::hit_test_boundaries_are_half_open_like_the_pixel_grid ... ok
+test ui::menu::tests::menu_opens_and_closes_and_reports_openness ... ok
+test ui::menu::tests::messages_expire_by_tick_counter_purely ... ok
+test ui::menu::tests::panel_rect_covers_every_row_plus_padding ... ok
+test ui::menu::tests::pressing_the_key_already_bound_to_the_same_action_is_an_idempotent_accept ... ok
+test ui::menu::tests::rebind_rejection_messages_name_the_culprit ... ok
+test ui::menu::tests::rebind_to_a_free_supported_key_is_accepted ... ok
+test ui::menu::tests::rebind_to_another_actions_key_is_rejected_as_duplicate ... ok
+test ui::menu::tests::row_index_out_of_range_returns_none ... ok
+test ui::menu::tests::row_rect_reflows_with_surface_width_and_clamps_at_narrow_surfaces ... ok
+test ui::menu::tests::rows_are_centered_line_height_tall_and_stacked ... ok
+test ui::menu::tests::rows_cover_all_seven_binds_plus_settings_and_close_in_order ... ok
+test ui::menu::tests::sensitivity_steps_move_by_the_step_and_clamp_both_directions ... ok
+test ui::menu::tests::settings_warnings_format_as_field_reason_lines ... ok
+test ui::menu::tests::unsupported_keys_are_rejected_before_any_duplicate_check ... ok
+test ui::quad::tests::degenerate_surface_dims_do_not_divide_by_zero ... ok
+test ui::quad::tests::empty_quad_list_yields_no_vertices ... ok
+test ui::quad::tests::full_surface_quad_maps_to_unit_corners_with_y_flip ... ok
+test ui::quad::tests::partial_quad_maps_to_offset_corners ... ok
+test ui::quad::tests::quads_to_vertices_concatenates_in_input_order ... ok
+test world::block::tests::test_block_solidity_and_texture_layers ... ok
+test world::chunk::tests::test_negative_world_coordinates ... ok
+test world::persistence::tests::test_cli_args_parsing ... ok
+test world::chunk::tests::test_chunk_uniform_promotion_and_compression ... ok
+test world::persistence::tests::test_corrupted_save_rejected ... ok
+test world::persistence::tests::test_save_and_load_roundtrip ... ok
+test mesh::greedy::tests::test_single_voxel_produces_six_unit_quads ... ok
+test mesh::greedy::tests::test_halo_culls_chunk_boundary_face ... ok
+test world::terrain::tests::test_terrain_generation_deterministic_and_layered ... ok
+test world::manager::tests::test_uniform_air_chunks_do_not_consume_mesh_budget ... ok
+test mesh::greedy::tests::test_full_solid_chunk_greedy_merges_to_six_quads ... ok
+test world::manager::tests::test_set_block_immediate_cancels_inflight_pending_mesh ... ok
+test world::manager::tests::test_boundary_block_edit_marks_neighbor_dirty ... ok
+test world::manager::tests::test_chunk_edits_persist_across_unload_and_regeneration ... ok
+
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 10 tests
+test tests::adjust_direction_maps_left_up_right_down_and_nothing_else ... ok
+test tests::gameplay_keys_route_through_the_loaded_keybind_map_press_and_release ... ok
+test tests::awaiting_key_row_shows_capture_hint_and_message_line_appends ... ok
+test tests::duplicate_bindings_in_a_hand_edited_file_resolve_first_match ... ok
+test tests::non_gameplay_keys_report_not_bound_and_leave_input_untouched ... ok
+test tests::menu_text_lists_every_row_with_its_live_value ... ok
+test tests::menu_text_reflects_changed_settings_values ... ok
+test tests::rebound_keys_take_effect_and_the_replaced_key_goes_dead ... ok
+test tests::startup_warnings_format_into_a_single_message_line ... ok
+test tests::only_the_bound_crouch_and_sprint_keys_trigger ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

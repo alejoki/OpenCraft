@@ -1,0 +1,20 @@
+{
+  "id": "2b514dfd-7ecd-4b55-9424-d57997176899",
+  "runtime": "bash",
+  "purpose": "Run full cargo test suite for slice gate",
+  "script_chars": 26,
+  "started_at": "2026-10-19T10:49:26.212Z",
+  "finished_at": "2026-10-19T10:49:26.507Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 295,
+  "stdout_bytes": 449,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2b514dfd-7ecd-4b55-9424-d57997176899.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2b514dfd-7ecd-4b55-9424-d57997176899.stderr"
+}

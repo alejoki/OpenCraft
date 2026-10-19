@@ -1,0 +1,160 @@
+    Checking minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
+warning: the loop variable `pv` is used to index `solid_masks`
+   --> src/mesh/greedy.rs:105:19
+    |
+105 |         for pv in 0..PADDED_SIZE {
+    |                   ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+105 -         for pv in 0..PADDED_SIZE {
+105 +         for (pv, <item>) in solid_masks.iter_mut().enumerate().take(PADDED_SIZE) {
+    |
+
+warning: the loop variable `pu` is used to index `solid_masks`
+   --> src/mesh/greedy.rs:106:23
+    |
+106 |             for pu in 0..PADDED_SIZE {
+    |                       ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+106 -             for pu in 0..PADDED_SIZE {
+106 +             for (pu, <item>) in solid_masks.iter_mut().enumerate().take(PADDED_SIZE) {
+    |
+
+warning: the loop variable `u` is used to index `slice_keys`
+   --> src/mesh/greedy.rs:129:26
+    |
+129 |                 for u in 0..CHUNK_SIZE {
+    |                          ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+129 -                 for u in 0..CHUNK_SIZE {
+129 +                 for (u, <item>) in slice_keys.iter_mut().enumerate().take(CHUNK_SIZE) {
+    |
+
+warning: the loop variable `ku` is only used to index `slice_keys`
+   --> src/mesh/greedy.rs:207:39
+    |
+207 | ...                   for ku in u..(u + w) {
+    |                                 ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+207 -                             for ku in u..(u + w) {
+207 +                             for <item> in slice_keys.iter().skip(u).take(w) {
+    |
+
+warning: the loop variable `kv` is only used to index `row_masks`
+   --> src/mesh/greedy.rs:216:35
+    |
+216 |                         for kv in v..(v + h) {
+    |                                   ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+216 -                         for kv in v..(v + h) {
+216 +                         for <item> in row_masks.iter_mut().skip(v).take(h) {
+    |
+
+warning: this function has too many arguments (8/7)
+  --> src/mesh/quad.rs:20:5
+   |
+20 | /     pub const fn new(
+21 | |         x: u32,
+22 | |         y: u32,
+23 | |         z: u32,
+...  |
+28 | |         ao_packed: u8,
+29 | |     ) -> Self {
+   | |_____________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+   = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: manual `!RangeInclusive::contains` implementation
+   --> src/world/manager.rs:164:16
+    |
+164 |             if ny < MIN_CHUNK_Y || ny > MAX_CHUNK_Y {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `!(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_contains
+    = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: method `from_iter` can be confused for the standard trait method `std::iter::FromIterator::from_iter`
+  --> src/world/persistence.rs:22:5
+   |
+22 | /     pub fn from_iter<I, S>(args: I) -> Self
+23 | |     where
+24 | |         I: IntoIterator<Item = S>,
+25 | |         S: AsRef<str>,
+...  |
+58 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::iter::FromIterator` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#should_implement_trait
+   = note: `#[warn(clippy::should_implement_trait)]` on by default
+
+warning: the loop variable `lz` is used to index `heights`
+  --> src/world/terrain.rs:78:15
+   |
+78 |     for lz in 0..CHUNK_SIZE {
+   |               ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+78 -     for lz in 0..CHUNK_SIZE {
+78 +     for (lz, <item>) in heights.iter_mut().enumerate().take(CHUNK_SIZE) {
+   |
+
+warning: the loop variable `lx` is used to index `heights`
+  --> src/world/terrain.rs:79:19
+   |
+79 |         for lx in 0..CHUNK_SIZE {
+   |                   ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+79 -         for lx in 0..CHUNK_SIZE {
+79 +         for (lx, <item>) in heights.iter_mut().enumerate().take(CHUNK_SIZE) {
+   |
+
+warning: the loop variable `lz` is used to index `heights`
+  --> src/world/terrain.rs:97:15
+   |
+97 |     for lz in 0..CHUNK_SIZE {
+   |               ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+97 -     for lz in 0..CHUNK_SIZE {
+97 +     for (lz, <item>) in heights.iter().enumerate().take(CHUNK_SIZE) {
+   |
+
+warning: the loop variable `lx` is used to index `heights`
+  --> src/world/terrain.rs:98:19
+   |
+98 |         for lx in 0..CHUNK_SIZE {
+   |                   ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+98 -         for lx in 0..CHUNK_SIZE {
+98 +         for (lx, <item>) in heights.iter().enumerate().take(CHUNK_SIZE) {
+   |
+
+warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.57s
