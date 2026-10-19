@@ -1,3 +1,3 @@
 # Queue
 
-- 🔄 **M001: Refactor + Settings Foundation**
+- No queued milestones.
