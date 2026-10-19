@@ -1,0 +1,20 @@
+{
+  "id": "bea52dd7-7d3c-494e-82c9-909ac36b293a",
+  "runtime": "bash",
+  "purpose": "Slice gate: cargo test (overlay-vertex + quad-vertex unit tests)",
+  "script_chars": 81,
+  "started_at": "2026-10-19T08:40:49.254Z",
+  "finished_at": "2026-10-19T08:40:50.237Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 983,
+  "stdout_bytes": 1242,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/bea52dd7-7d3c-494e-82c9-909ac36b293a.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/bea52dd7-7d3c-494e-82c9-909ac36b293a.stderr"
+}

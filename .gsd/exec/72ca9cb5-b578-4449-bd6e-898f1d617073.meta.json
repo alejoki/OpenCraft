@@ -1,0 +1,27 @@
+{
+  "id": "72ca9cb5-b578-4449-bd6e-898f1d617073",
+  "runtime": "bash",
+  "purpose": "UAT M001/S03/s03-check-3b-clippy-slice-surface-zero (uat-log-inspection)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S03",
+    "checkId": "s03-check-3b-clippy-slice-surface-zero",
+    "intent": "uat-log-inspection"
+  },
+  "script_chars": 234,
+  "started_at": "2026-10-19T08:43:53.975Z",
+  "finished_at": "2026-10-19T08:43:53.987Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 12,
+  "stdout_bytes": 49,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/72ca9cb5-b578-4449-bd6e-898f1d617073.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/72ca9cb5-b578-4449-bd6e-898f1d617073.stderr"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "a9540a4c-a597-4dd5-a158-750e99a2e3ef",
+  "runtime": "bash",
+  "purpose": "Final gate: cargo clippy, findings scoped to slice-touched files (src/ui/*, src/render/pipeline.rs, src/main.rs) per MEM007",
+  "script_chars": 254,
+  "started_at": "2026-10-19T08:35:48.787Z",
+  "finished_at": "2026-10-19T08:35:59.001Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10214,
+  "stdout_bytes": 1265,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/a9540a4c-a597-4dd5-a158-750e99a2e3ef.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/a9540a4c-a597-4dd5-a158-750e99a2e3ef.stderr"
+}

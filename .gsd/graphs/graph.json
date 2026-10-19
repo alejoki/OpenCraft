@@ -28,6 +28,20 @@
       "confidence": "EXTRACTED"
     },
     {
+      "id": "pattern:P003",
+      "label": "P003",
+      "type": "pattern",
+      "description": "src/ui quad rendering (M001-S03) reuses the existing OverlayVertex { clip_pos: [f32;4], color: [f32;4] } + pass-through WGSL pattern with a TriangleList pipeline, depth_stencil None, alpha blend: quads are specified in physical pixels (top-left origin, y down) and converted to NDC on the CPU (x_ndc = 2x/w − 1, y flipped: y_ndc = 1 − 2y/h), emitting 6 vertices per quad (0,1,2, 2,3,0 expanded — no shared index buffer). Same pixel space as ctx.config, cosmic-text buffers, and the cursor_pos plumbing, so S04 hover hit-testing works in px with no scale-factor math at scale 1.",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "pattern:P004",
+      "label": "P004",
+      "type": "pattern",
+      "description": "S04's settings menu consumes the pixel-space quad API from src/ui/quad.rs: build a `Quad { x, y, w, h, color }` list in physical pixels (top-left origin, y down), call `UiRenderer::set_quads(&device, &quads, surface_w, surface_h)` once per frame before render_frame, and quads draw first in the UI pass (before glyphon text) via UiPass. NDC conversion (with y-flip: y_ndc = 1 − 2y/h) is CPU-side in quads_to_vertices; pipelines in the UI pass must use depth_stencil None (color-only pass, LoadOp::Load).",
+      "confidence": "EXTRACTED"
+    },
+    {
       "id": "lesson:L001",
       "label": "L001",
       "type": "lesson",
@@ -39,6 +53,27 @@
       "label": "L002",
       "type": "lesson",
       "description": "The workspace has ~12 pre-existing clippy lib warnings (needless_range_loop etc. in src/mesh/greedy.rs, src/mesh/quad.rs, src/world/manager.rs, src/world/terrain.rs) that predate M001-S01; the bin target (src/main.rs) is clippy-clean. Downstream slice verification should not treat these lib lints as a regression — scope clippy checks to the files the slice touched, or record the inherited findings as known limitations.",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "lesson:L003",
+      "label": "L003",
+      "type": "lesson",
+      "description": "In this wgpu 0.19 project, glyphon 0.5.0's `render<'pass>(&'pass self, atlas: &'pass TextAtlas, pass: &mut RenderPass<'pass>)` cannot be driven through a `dyn FnMut(&mut wgpu::RenderPass)` closure hook: wgpu 0.19's RenderPass carries a lifetime and the higher-ranked closure forces the captured atlas/renderer borrows to be 'static (E0521/E0502). The working pattern is a trait with a lifetime-typed method: `trait UiPass { fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>); }` implemented on the owner of the glyphon stack, passed as `Option<&dyn UiPass>` to render_frame. Also: glyphon 0.5.0's ColorMode has only `Accurate`/`Web` variants (no `Color`), and cosmic-text 0.10's Buffer methods (set_size/set_text/shape_until_scroll) all take `&mut FontSystem` first.",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "lesson:L004",
+      "label": "L004",
+      "type": "lesson",
+      "description": "winit 0.30 WindowEvent::CursorLeft (and the other cursor variants like CursorEntered) carry a device_id field — matching them bare (`WindowEvent::CursorLeft => ...`) fails E0533; match with `..` (e.g. `WindowEvent::CursorLeft { .. }`). CursorMoved delivers PhysicalPosition<f64>, cast to f32 for the px-space UI (ctx.config / cosmic-text / quad renderer all share physical px at scale 1). Relevant when S04 adds menu hover/click routing.",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "lesson:L005",
+      "label": "L005",
+      "type": "lesson",
+      "description": "As of M001-S03 closeout, the inherited clippy lib-warning inventory is 13 unique warnings: 6 in src/mesh/* (greedy.rs 5, quad.rs 1), 6 in src/world/* (terrain.rs 4, manager.rs 1, persistence.rs 1), and 1 in src/render/texture.rs — the texture.rs warning is NOT listed in MEM007's mesh/world scope, so slice-touched scoping must not treat any src/render pre-existing warning as a regression unless the slice touched that same file. Slice-touched files (src/ui/*, src/render/pipeline.rs, src/main.rs) are clippy-clean after S03.",
       "confidence": "EXTRACTED"
     },
     {
@@ -87,6 +122,24 @@
       "id": "slice:M001:S03",
       "label": "S03: UI foundation: glyphon text overlay + quad rendering",
       "type": "slice",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S03:S03-T01",
+      "label": "S03-T01: glyphon 0.5.0 dependency, src/ui text wrapper, render_frame UI-pass restructure, live stats overlay",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S03:S03-T02",
+      "label": "S03-T02: Quad renderer (px-space filled quads, TriangleList, alpha blend) + panel behind stats text",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S03:S03-T03",
+      "label": "S03-T03: Cursor Moved/Left event capture into GameApp state + final slice gates (build, test, clippy, smoke)",
+      "type": "task",
       "confidence": "EXTRACTED"
     },
     {
@@ -146,11 +199,29 @@
       "confidence": "EXTRACTED"
     },
     {
+      "from": "slice:M001:S03",
+      "to": "task:M001:S03:S03-T01",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "slice:M001:S03",
+      "to": "task:M001:S03:S03-T02",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "slice:M001:S03",
+      "to": "task:M001:S03:S03-T03",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
       "from": "milestone:M001",
       "to": "slice:M001:S04",
       "type": "contains",
       "confidence": "EXTRACTED"
     }
   ],
-  "builtAt": "2026-10-19T08:05:16.674Z"
+  "builtAt": "2026-10-19T08:42:48.427Z"
 }

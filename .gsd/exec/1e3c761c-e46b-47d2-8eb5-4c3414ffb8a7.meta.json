@@ -1,0 +1,20 @@
+{
+  "id": "1e3c761c-e46b-47d2-8eb5-4c3414ffb8a7",
+  "runtime": "bash",
+  "purpose": "Evidence: UI pass hook, cursor plumbing wired into main loop",
+  "script_chars": 140,
+  "started_at": "2026-10-19T08:41:34.887Z",
+  "finished_at": "2026-10-19T08:41:34.901Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 14,
+  "stdout_bytes": 1312,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/1e3c761c-e46b-47d2-8eb5-4c3414ffb8a7.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/1e3c761c-e46b-47d2-8eb5-4c3414ffb8a7.stderr"
+}

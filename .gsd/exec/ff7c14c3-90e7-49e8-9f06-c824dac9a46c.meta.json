@@ -1,0 +1,20 @@
+{
+  "id": "ff7c14c3-90e7-49e8-9f06-c824dac9a46c",
+  "runtime": "bash",
+  "purpose": "Final gate: cargo test (all tests pass)",
+  "script_chars": 26,
+  "started_at": "2026-10-19T08:35:35.756Z",
+  "finished_at": "2026-10-19T08:35:36.504Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 748,
+  "stdout_bytes": 1245,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ff7c14c3-90e7-49e8-9f06-c824dac9a46c.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ff7c14c3-90e7-49e8-9f06-c824dac9a46c.stderr"
+}

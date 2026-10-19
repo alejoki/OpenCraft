@@ -1,0 +1,20 @@
+{
+  "id": "2c81b378-3d53-4da0-8d74-c75d724a51af",
+  "runtime": "bash",
+  "purpose": "Final gate: warning-free cargo build (retry after CursorLeft field fix)",
+  "script_chars": 27,
+  "started_at": "2026-10-19T08:35:29.548Z",
+  "finished_at": "2026-10-19T08:35:31.217Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1669,
+  "stdout_bytes": 159,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2c81b378-3d53-4da0-8d74-c75d724a51af.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/2c81b378-3d53-4da0-8d74-c75d724a51af.stderr"
+}
