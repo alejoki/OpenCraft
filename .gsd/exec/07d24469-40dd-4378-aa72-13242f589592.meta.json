@@ -1,0 +1,28 @@
+{
+  "id": "07d24469-40dd-4378-aa72-13242f589592",
+  "runtime": "bash",
+  "purpose": "UAT M001/S02/check-named-tests-list (uat-log-inspection)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S02",
+    "checkId": "check-named-tests-list",
+    "intent": "uat-log-inspection",
+    "expected": "list of all 31 settings test names"
+  },
+  "script_chars": 58,
+  "started_at": "2026-10-19T08:06:23.097Z",
+  "finished_at": "2026-10-19T08:06:23.239Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 142,
+  "stdout_bytes": 2583,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/07d24469-40dd-4378-aa72-13242f589592.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/07d24469-40dd-4378-aa72-13242f589592.stderr"
+}

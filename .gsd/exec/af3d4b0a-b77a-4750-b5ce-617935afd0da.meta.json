@@ -1,0 +1,20 @@
+{
+  "id": "af3d4b0a-b77a-4750-b5ce-617935afd0da",
+  "runtime": "bash",
+  "purpose": "Test gate for S03-T02: new quad vertex unit tests plus existing overlay-vertex test",
+  "script_chars": 10,
+  "started_at": "2026-10-19T08:33:27.184Z",
+  "finished_at": "2026-10-19T08:33:28.777Z",
+  "exit_code": 101,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1593,
+  "stdout_bytes": 5153,
+  "stderr_bytes": 289,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/af3d4b0a-b77a-4750-b5ce-617935afd0da.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/af3d4b0a-b77a-4750-b5ce-617935afd0da.stderr"
+}

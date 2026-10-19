@@ -1,0 +1,20 @@
+{
+  "id": "baea6112-b2b9-45f5-a1ac-e649aa187847",
+  "runtime": "bash",
+  "purpose": "Rebuild with UiPass trait hook",
+  "script_chars": 27,
+  "started_at": "2026-10-19T08:26:12.169Z",
+  "finished_at": "2026-10-19T08:26:12.882Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 713,
+  "stdout_bytes": 808,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/baea6112-b2b9-45f5-a1ac-e649aa187847.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/baea6112-b2b9-45f5-a1ac-e649aa187847.stderr"
+}

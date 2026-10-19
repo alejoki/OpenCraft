@@ -12,9 +12,10 @@ pub struct StatsOverlay {
     last_height: f32,
 }
 
-// Text metrics for a compact one-line stats readout.
-const FONT_SIZE: f32 = 18.0;
-const LINE_HEIGHT: f32 = 22.0;
+// Text metrics for a compact one-line stats readout. Public so the frame
+// loop can size the backing panel quad from the same metrics.
+pub const FONT_SIZE: f32 = 18.0;
+pub const LINE_HEIGHT: f32 = 22.0;
 
 impl StatsOverlay {
     pub fn new(font_system: &mut glyphon::FontSystem) -> Self {

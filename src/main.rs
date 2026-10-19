@@ -18,7 +18,7 @@ use minecraft_clone::player::raycast::raycast_voxels;
 use minecraft_clone::render::buffer::ChunkRenderStore;
 use minecraft_clone::render::context::RenderContext;
 use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
-use minecraft_clone::ui::{StatsOverlay, UiRenderer};
+use minecraft_clone::ui::{Quad, StatsOverlay, UiRenderer, FONT_SIZE, LINE_HEIGHT};
 use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
 use minecraft_clone::world::manager::WorldManager;
@@ -356,6 +356,28 @@ impl ApplicationHandler for GameApp {
                     |x, y, z| self.world.get_block(x, y, z),
                 )
                 .map(|h| h.block_pos);
+
+                // Translucent dark panel behind the stats text: the visible
+                // proof that pixel-space quads render in the UI pass. Width is
+                // estimated from the stats string (monospace advance ~0.6 em);
+                // the panel only has to be generous, not exact. Built each
+                // frame from pure CPU vertex math (cheap).
+                let panel_w = OVERLAY_TEXT_LEFT * 2.0
+                    + self.last_overlay_text.chars().count().max(1) as f32 * FONT_SIZE * 0.6
+                    + 4.0;
+                let panel = Quad {
+                    x: OVERLAY_TEXT_LEFT - 6.0,
+                    y: OVERLAY_TEXT_TOP - 4.0,
+                    w: panel_w,
+                    h: LINE_HEIGHT + 8.0,
+                    color: [0.0, 0.0, 0.0, 0.4],
+                };
+                gpu.ui.set_quads(
+                    &gpu.ctx.device,
+                    std::slice::from_ref(&panel),
+                    gpu.ctx.config.width,
+                    gpu.ctx.config.height,
+                );
 
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame

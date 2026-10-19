@@ -1,0 +1,20 @@
+{
+  "id": "832d49f4-6248-4564-8ee9-2002c2013cf4",
+  "runtime": "bash",
+  "purpose": "Confirm glyphon 0.5.0 constructor and method signatures",
+  "script_chars": 224,
+  "started_at": "2026-10-19T08:15:31.313Z",
+  "finished_at": "2026-10-19T08:15:31.325Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 12,
+  "stdout_bytes": 0,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/832d49f4-6248-4564-8ee9-2002c2013cf4.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/832d49f4-6248-4564-8ee9-2002c2013cf4.stderr"
+}

@@ -7,7 +7,7 @@
 - [x] **S01: winit 0.30 ApplicationHandler migration** `risk:high` `depends:[]`
   > After this: After this: cargo run launches the game on winit 0.30's ApplicationHandler loop with movement, block break/place, and raycast behaving identically to pre-migration (manual smoke check), and cargo build + cargo clippy are clean with winit = 0.30.
 
-- [ ] **S02: Settings core with TOML persistence and tests** `risk:medium` `depends:[]`
+- [x] **S02: Settings core with TOML persistence and tests** `risk:medium` `depends:[]`
   > After this: After this: cargo test passes for settings round-trip (load → save → load equality), missing file → defaults, corrupt file → per-field fallback with valid fields kept, unknown keys ignored, and duplicate-keybind rejection — pure logic, no GPU required.
 
 - [ ] **S03: UI foundation: glyphon text overlay + quad rendering** `risk:high` `depends:[S01]`
@@ -22,4 +22,4 @@
 - S02 → S04: provides the Settings module API — Settings struct (keybinds, mouse_sensitivity, fov, fullscreen, vsync), load with per-field fallback + logged warnings, save, defaults, KeyCode↔stable-string conversion, duplicate-keybind validation; consumes nothing upstream (pure logic, no GPU, no event loop dependency).
 - S03 → S04: provides the src/ui module — glyphon 0.5 wrappers (FontSystem, SwashCache, TextAtlas, TextRenderer, Viewport), a minimal quad renderer for panels/buttons, color-only UI render pass after the world pass, and cursor hover/click plumbing; consumes S01's loop and cursor events.
 - S04: consumes S01's input routing (menu-open key releases cursor grab and calls InputState::reset, gameplay keys route through the S02 keybind map), S02's Settings API, and S03's UI; provides the milestone's user-facing settings capability and its end-to-end restart-persistence proof.
-<!-- gsd:state-version=64:1 -->
+<!-- gsd:state-version=93:1 -->

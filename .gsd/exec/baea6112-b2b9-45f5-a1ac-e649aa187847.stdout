@@ -1,0 +1,20 @@
+error[E0425]: cannot find value `ui` in this scope
+   --> src/render/pipeline.rs:698:13
+    |
+698 |             ui.draw_ui(&mut ui_rpass);
+    |             ^^ not found in this scope
+
+error[E0046]: not all trait items implemented, missing: `draw_ui`
+   --> src/ui/mod.rs:52:1
+    |
+ 52 | impl UiPass for UiRenderer {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `draw_ui` in implementation
+    |
+   ::: src/render/pipeline.rs:333:5
+    |
+333 |     fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>);
+    |     ------------------------------------------------------------------- `draw_ui` from trait
+
+Some errors have detailed explanations: E0046, E0425.
+For more information about an error, try `rustc --explain E0046`.
+error: could not compile `minecraft-clone` (lib) due to 2 previous errors

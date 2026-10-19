@@ -1,0 +1,5 @@
+tempdir() call sites: 19
+tests writing to non-temp paths: 0
+src/settings/mod.rs:10:pub const DEFAULT_SETTINGS_PATH: &str = "settings.toml";
+src/settings/mod.rs:10:pub const DEFAULT_SETTINGS_PATH: &str = "settings.toml";
+DONE

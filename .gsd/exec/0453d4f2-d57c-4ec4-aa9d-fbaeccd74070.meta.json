@@ -1,0 +1,28 @@
+{
+  "id": "0453d4f2-d57c-4ec4-aa9d-fbaeccd74070",
+  "runtime": "bash",
+  "purpose": "UAT M001/S02/check-named-tests (uat-runtime-check)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S02",
+    "checkId": "check-named-tests",
+    "intent": "uat-runtime-check",
+    "expected": "all named behavior-matrix and edge-case tests present and ok"
+  },
+  "script_chars": 1644,
+  "started_at": "2026-10-19T08:06:17.870Z",
+  "finished_at": "2026-10-19T08:06:18.090Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 220,
+  "stdout_bytes": 232,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0453d4f2-d57c-4ec4-aa9d-fbaeccd74070.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/0453d4f2-d57c-4ec4-aa9d-fbaeccd74070.stderr"
+}

@@ -1,0 +1,30 @@
+   Compiling hashbrown v0.15.5
+   Compiling unicode-bidi v0.3.18
+   Compiling rangemap v1.8.0
+   Compiling font-types v0.7.3
+   Compiling tiny-skia-path v0.11.4
+   Compiling self_cell v1.3.0
+   Compiling sys-locale v0.3.2
+   Compiling unicode-linebreak v0.1.5
+   Compiling read-fonts v0.22.7
+   Compiling fontconfig-parser v0.5.8
+   Compiling etagere v0.2.15
+   Compiling tiny-skia v0.11.4
+   Compiling lru v0.12.5
+   Compiling rustybuzz v0.11.0
+   Compiling fontdb v0.15.0
+   Compiling sctk-adwaita v0.10.1
+   Compiling winit v0.30.13
+   Compiling skrifa v0.22.3
+   Compiling swash v0.1.19
+   Compiling cosmic-text v0.10.0
+   Compiling glyphon v0.5.0
+   Compiling minecraft-clone v0.1.0 (/home/aleksi/minecraft-clone/.gsd-worktrees/M001)
+error[E0599]: no variant, associated function, or constant named `Color` found for enum `ColorMode` in the current scope
+  --> src/ui/mod.rs:24:33
+   |
+24 |             glyphon::ColorMode::Color,
+   |                                 ^^^^^ variant, associated function, or constant not found in `ColorMode`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `minecraft-clone` (lib) due to 1 previous error

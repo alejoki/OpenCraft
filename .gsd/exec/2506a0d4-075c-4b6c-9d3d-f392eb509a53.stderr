@@ -1,0 +1,4 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/minecraft_clone-dddd1dbe32bfc6bf)
+     Running unittests src/main.rs (target/debug/deps/minecraft_clone-1dd49e324002525a)
+   Doc-tests minecraft_clone

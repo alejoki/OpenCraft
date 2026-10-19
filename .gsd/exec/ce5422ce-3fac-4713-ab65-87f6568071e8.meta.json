@@ -1,0 +1,20 @@
+{
+  "id": "ce5422ce-3fac-4713-ab65-87f6568071e8",
+  "runtime": "bash",
+  "purpose": "Inspect glyphon 0.5.0 API signatures",
+  "script_chars": 243,
+  "started_at": "2026-10-19T08:15:22.389Z",
+  "finished_at": "2026-10-19T08:15:22.413Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 24,
+  "stdout_bytes": 412,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ce5422ce-3fac-4713-ab65-87f6568071e8.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ce5422ce-3fac-4713-ab65-87f6568071e8.stderr"
+}

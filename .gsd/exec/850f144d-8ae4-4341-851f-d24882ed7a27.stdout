@@ -1,0 +1,30 @@
+error[E0521]: borrowed data escapes outside of method
+   --> src/main.rs:384:29
+    |
+154 |         &mut self,
+    |         ---------
+    |         |
+    |         `self` is a reference that is only valid in the method body
+    |         let's call the lifetime of this reference `'1`
+...
+384 |                     let _ = ui.text_renderer.render(&ui.atlas, pass);
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                             |
+    |                             `self` escapes the method body here
+    |                             argument requires that `'1` must outlive `'static`
+
+error[E0502]: cannot borrow `gpu.ui.font_system` as mutable because it is also borrowed as immutable
+   --> src/main.rs:454:33
+    |
+380 |                 let ui = &gpu.ui;
+    |                          ------- immutable borrow occurs here
+...
+384 |                     let _ = ui.text_renderer.render(&ui.atlas, pass);
+    |                             ---------------------------------------- argument requires that `gpu.ui` is borrowed for `'static`
+...
+454 |                                 &mut gpu.ui.font_system,
+    |                                 ^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+
+Some errors have detailed explanations: E0502, E0521.
+For more information about an error, try `rustc --explain E0502`.
+error: could not compile `minecraft-clone` (bin "minecraft-clone") due to 2 previous errors

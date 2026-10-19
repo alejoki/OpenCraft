@@ -1,0 +1,28 @@
+{
+  "id": "c63eec9f-1028-41b9-9368-38f77ae8a93c",
+  "runtime": "bash",
+  "purpose": "UAT M001/S02/check-clippy-settings-clean (uat-runtime-check)",
+  "metadata": {
+    "kind": "uat_exec",
+    "milestoneId": "M001",
+    "sliceId": "S02",
+    "checkId": "check-clippy-settings-clean",
+    "intent": "uat-runtime-check",
+    "expected": "0 warnings referencing src/settings"
+  },
+  "script_chars": 50,
+  "started_at": "2026-10-19T08:06:02.989Z",
+  "finished_at": "2026-10-19T08:06:03.154Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 165,
+  "stdout_bytes": 2,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c63eec9f-1028-41b9-9368-38f77ae8a93c.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c63eec9f-1028-41b9-9368-38f77ae8a93c.stderr"
+}

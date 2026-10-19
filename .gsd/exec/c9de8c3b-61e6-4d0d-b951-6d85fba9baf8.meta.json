@@ -1,0 +1,20 @@
+{
+  "id": "c9de8c3b-61e6-4d0d-b951-6d85fba9baf8",
+  "runtime": "bash",
+  "purpose": "10s bounded live-run smoke test with UI pass active",
+  "script_chars": 28,
+  "started_at": "2026-10-19T08:27:39.329Z",
+  "finished_at": "2026-10-19T08:27:49.372Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10043,
+  "stdout_bytes": 61,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c9de8c3b-61e6-4d0d-b951-6d85fba9baf8.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c9de8c3b-61e6-4d0d-b951-6d85fba9baf8.stderr"
+}

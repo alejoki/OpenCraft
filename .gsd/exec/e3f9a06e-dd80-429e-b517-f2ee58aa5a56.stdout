@@ -1,0 +1,10 @@
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+98 -         for lx in 0..CHUNK_SIZE {
+98 +         for (lx, <item>) in heights.iter().enumerate().take(CHUNK_SIZE) {
+   |
+
+warning: `minecraft-clone` (lib) generated 12 warnings (run `cargo clippy --fix --lib -p minecraft-clone -- ` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
