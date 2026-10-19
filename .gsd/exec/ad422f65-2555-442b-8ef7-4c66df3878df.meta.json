@@ -1,0 +1,20 @@
+{
+  "id": "ad422f65-2555-442b-8ef7-4c66df3878df",
+  "runtime": "bash",
+  "purpose": "Confirm no winit 0.29 pin remains in Cargo.toml",
+  "script_chars": 37,
+  "started_at": "2026-10-19T07:14:52.227Z",
+  "finished_at": "2026-10-19T07:14:52.248Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 21,
+  "stdout_bytes": 0,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ad422f65-2555-442b-8ef7-4c66df3878df.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ad422f65-2555-442b-8ef7-4c66df3878df.stderr"
+}

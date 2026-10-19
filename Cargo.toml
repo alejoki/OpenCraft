@@ -11,7 +11,7 @@ pollster = "0.3"
 rayon = "1.10"
 rustc-hash = "1.1"
 wgpu = "0.19"
-winit = "0.29"
+winit = "0.30"
 
 [profile.release]
 opt-level = 3

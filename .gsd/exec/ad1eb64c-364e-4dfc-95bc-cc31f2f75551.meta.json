@@ -1,0 +1,20 @@
+{
+  "id": "ad1eb64c-364e-4dfc-95bc-cc31f2f75551",
+  "runtime": "bash",
+  "purpose": "noop placeholder",
+  "script_chars": 9,
+  "started_at": "2026-10-19T07:15:20.903Z",
+  "finished_at": "2026-10-19T07:15:20.919Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 16,
+  "stdout_bytes": 5,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ad1eb64c-364e-4dfc-95bc-cc31f2f75551.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ad1eb64c-364e-4dfc-95bc-cc31f2f75551.stderr"
+}

@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::Vec3;
+use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
-    DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent,
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
 };
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, WindowBuilder};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use minecraft_clone::player::camera::Camera;
 use minecraft_clone::player::physics::{InputState, Player};
@@ -59,10 +60,372 @@ fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Playe
     }
 }
 
+/// Window-dependent GPU stack, initialized together in `resumed()`.
+struct Ready {
+    ctx: RenderContext,
+    renderer: VoxelRenderer,
+    render_store: ChunkRenderStore,
+}
+
+struct GameApp {
+    window: Option<Arc<Window>>,
+    gpu: Option<Ready>,
+    cli: CliConfig,
+    world: WorldManager,
+    player: Player,
+    camera: Camera,
+    input: InputState,
+    cursor_grabbed: bool,
+    last_frame: Instant,
+    title_timer: Instant,
+    last_saved_badge: Option<Instant>,
+    frame_count: u32,
+}
+
+impl GameApp {
+    fn new(cli: CliConfig, world: WorldManager, player: Player) -> Self {
+        let mut camera = Camera::new(player.eye_position());
+        camera.yaw = player.yaw;
+        camera.pitch = player.pitch;
+        Self {
+            window: None,
+            gpu: None,
+            cli,
+            world,
+            player,
+            camera,
+            input: InputState::default(),
+            cursor_grabbed: true,
+            last_frame: Instant::now(),
+            title_timer: Instant::now(),
+            last_saved_badge: None,
+            frame_count: 0,
+        }
+    }
+}
+
+impl ApplicationHandler for GameApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Idempotent guard: `resumed` can be delivered multiple times on
+        // some platforms.
+        if self.window.is_some() {
+            return;
+        }
+
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Rust Voxel Engine — Initializing...")
+                        .with_inner_size(PhysicalSize::new(1280, 720)),
+                )
+                .expect("Failed to create window"),
+        );
+
+        let ctx = RenderContext::new(window.clone());
+        let renderer = VoxelRenderer::new(&ctx);
+        let render_store = ChunkRenderStore::new();
+
+        self.cursor_grabbed = true;
+        set_cursor_grab(&window, true);
+
+        self.window = Some(window);
+        self.gpu = Some(Ready {
+            ctx,
+            renderer,
+            render_store,
+        });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        // Single-window application; nothing to do before `resumed()` builds
+        // the window and GPU stack.
+        let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) else {
+            return;
+        };
+
+        match event {
+            WindowEvent::CloseRequested => {
+                let _ = save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.input.reset();
+            }
+            WindowEvent::Resized(new_size) => {
+                gpu.ctx.resize(new_size);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    match code {
+                        KeyCode::KeyW => self.input.forward = pressed,
+                        KeyCode::KeyS => self.input.backward = pressed,
+                        KeyCode::KeyA => self.input.left = pressed,
+                        KeyCode::KeyD => self.input.right = pressed,
+                        KeyCode::Space => self.input.jump_or_up = pressed,
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.input.crouch_or_down = pressed;
+                        }
+                        KeyCode::ControlLeft | KeyCode::ControlRight => {
+                            self.input.sprint = pressed;
+                        }
+                        KeyCode::KeyF if pressed && !event.repeat => {
+                            self.player.fly_mode = !self.player.fly_mode;
+                            self.player.velocity = Vec3::ZERO;
+                        }
+                        KeyCode::F5 if pressed && !event.repeat => {
+                            if save_current_world(&self.cli.save_path, &mut self.world, &self.player)
+                            {
+                                self.last_saved_badge = Some(Instant::now());
+                            }
+                        }
+                        KeyCode::Escape if pressed && !event.repeat => {
+                            self.cursor_grabbed = !self.cursor_grabbed;
+                            set_cursor_grab(window, self.cursor_grabbed);
+                        }
+                        KeyCode::BracketLeft if pressed && !event.repeat => {
+                            let rd = (self.world.render_distance() - 2).max(4);
+                            self.world.set_render_distance(rd);
+                        }
+                        KeyCode::BracketRight if pressed && !event.repeat => {
+                            let rd = (self.world.render_distance() + 2).min(36);
+                            self.world.set_render_distance(rd);
+                        }
+                        KeyCode::Digit1 if pressed => self.player.selected_slot = 0,
+                        KeyCode::Digit2 if pressed => self.player.selected_slot = 1,
+                        KeyCode::Digit3 if pressed => self.player.selected_slot = 2,
+                        KeyCode::Digit4 if pressed => self.player.selected_slot = 3,
+                        KeyCode::Digit5 if pressed => self.player.selected_slot = 4,
+                        KeyCode::Digit6 if pressed => self.player.selected_slot = 5,
+                        KeyCode::Digit7 if pressed => self.player.selected_slot = 6,
+                        KeyCode::Digit8 if pressed => self.player.selected_slot = 7,
+                        KeyCode::Digit9 if pressed => self.player.selected_slot = 8,
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let step: isize = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        if y > 0.0 {
+                            -1
+                        } else if y < 0.0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        if p.y > 0.0 {
+                            -1
+                        } else if p.y < 0.0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                };
+                if step != 0 {
+                    self.player.selected_slot =
+                        (self.player.selected_slot as isize + step).rem_euclid(9) as usize;
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                if !self.cursor_grabbed {
+                    self.cursor_grabbed = true;
+                    set_cursor_grab(window, true);
+                    return;
+                }
+
+                if let Some(hit) = raycast_voxels(
+                    self.camera.position,
+                    self.camera.forward(),
+                    8.0,
+                    |x, y, z| self.world.get_block(x, y, z),
+                ) {
+                    match button {
+                        MouseButton::Left => {
+                            let bp = hit.block_pos;
+                            if self.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
+                                let remeshed =
+                                    self.world.set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
+                                for (cpos, mesh) in remeshed {
+                                    gpu.render_store.upload_mesh(
+                                        &gpu.ctx.device,
+                                        &gpu.renderer.chunk_bind_group_layout,
+                                        cpos,
+                                        &mesh,
+                                    );
+                                }
+                            }
+                        }
+                        MouseButton::Right => {
+                            let ap = hit.adjacent_pos;
+                            if !self
+                                .player
+                                .aabb()
+                                .intersects_block(ap.x, ap.y, ap.z)
+                            {
+                                let place_block = BlockId::HOTBAR[self.player.selected_slot];
+                                let remeshed =
+                                    self.world.set_block_immediate(ap.x, ap.y, ap.z, place_block);
+                                for (cpos, mesh) in remeshed {
+                                    gpu.render_store.upload_mesh(
+                                        &gpu.ctx.device,
+                                        &gpu.renderer.chunk_bind_group_layout,
+                                        cpos,
+                                        &mesh,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let dt = (now - self.last_frame).as_secs_f32();
+                self.last_frame = now;
+
+                self.player
+                    .update(dt, &self.input, |x, y, z| self.world.get_block(x, y, z));
+                self.camera.position = self.player.eye_position();
+                self.camera.yaw = self.player.yaw;
+                self.camera.pitch = self.player.pitch;
+
+                let (player_chunk, _) = world_to_chunk_and_local(
+                    self.player.position.x.floor() as i32,
+                    self.player.position.y.floor() as i32,
+                    self.player.position.z.floor() as i32,
+                );
+                let (new_meshes, unloaded) = self.world.update_streaming(player_chunk);
+                if !unloaded.is_empty()
+                    && self.world.has_unsaved_changes()
+                    && save_current_world(&self.cli.save_path, &mut self.world, &self.player)
+                {
+                    self.last_saved_badge = Some(Instant::now());
+                }
+                for upos in unloaded {
+                    gpu.render_store.remove_chunk(upos);
+                }
+                for (cpos, mesh) in new_meshes {
+                    gpu.render_store.upload_mesh(
+                        &gpu.ctx.device,
+                        &gpu.renderer.chunk_bind_group_layout,
+                        cpos,
+                        &mesh,
+                    );
+                }
+
+                let target_block = raycast_voxels(
+                    self.camera.position,
+                    self.camera.forward(),
+                    8.0,
+                    |x, y, z| self.world.get_block(x, y, z),
+                )
+                .map(|h| h.block_pos);
+
+                match gpu.renderer.render_frame(
+                    &gpu.ctx,
+                    &gpu.render_store,
+                    &self.camera,
+                    self.world.render_distance(),
+                    target_block,
+                    self.player.selected_slot,
+                ) {
+                    Ok(visible_chunks) => {
+                        self.frame_count += 1;
+                        let elapsed = self.title_timer.elapsed().as_secs_f32();
+                        if elapsed >= 0.25 {
+                            let fps = (self.frame_count as f32 / elapsed).round() as u32;
+                            let ms = (elapsed * 1000.0) / self.frame_count.max(1) as f32;
+                            let vram_kb = gpu.render_store.total_vram_bytes / 1024;
+                            let mode = if self.player.fly_mode { "Fly" } else { "Walk" };
+                            let block_name = BlockId::HOTBAR[self.player.selected_slot].name();
+                            let save_tag = if self
+                                .last_saved_badge
+                                .map(|t| t.elapsed().as_secs_f32() < 2.0)
+                                .unwrap_or(false)
+                            {
+                                " [Saved]"
+                            } else {
+                                ""
+                            };
+                            window.set_title(&format!(
+                                "Minecraft Clone | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
+                                fps,
+                                ms,
+                                visible_chunks,
+                                self.world.loaded_chunk_count(),
+                                gpu.render_store.total_quads,
+                                vram_kb,
+                                self.player.position.x,
+                                self.player.position.y,
+                                self.player.position.z,
+                                mode,
+                                self.player.selected_slot + 1,
+                                block_name,
+                                self.world.render_distance(),
+                                self.world.seed(),
+                                save_tag,
+                            ));
+                            self.title_timer = Instant::now();
+                            self.frame_count = 0;
+                        }
+                    }
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        gpu.ctx.resize(gpu.ctx.size);
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        let _ =
+                            save_current_world(&self.cli.save_path, &mut self.world, &self.player);
+                        event_loop.exit();
+                    }
+                    Err(wgpu::SurfaceError::Timeout) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.cursor_grabbed {
+                let sensitivity = 0.0022;
+                self.player.yaw += delta.0 as f32 * sensitivity;
+                self.player.pitch = (self.player.pitch - delta.1 as f32 * sensitivity)
+                    .clamp(-1.54, 1.54);
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
 fn main() {
     let cli = CliConfig::from_iter(std::env::args().skip(1));
 
-    let (mut world, mut player) = if !cli.force_new_world && cli.save_path.exists() {
+    let (world, player) = if !cli.force_new_world && cli.save_path.exists() {
         match load_world_from_path(&cli.save_path) {
             Ok(save) => {
                 let mut p = Player::new(Vec3::from_array(save.player.position));
@@ -96,300 +459,10 @@ fn main() {
     };
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Rust Voxel Engine — Initializing...")
-            .with_inner_size(PhysicalSize::new(1280, 720))
-            .build(&event_loop)
-            .expect("Failed to create window"),
-    );
+    event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut ctx = RenderContext::new(window.clone());
-    let renderer = VoxelRenderer::new(&ctx);
-    let mut render_store = ChunkRenderStore::new();
-
-    let mut camera = Camera::new(player.eye_position());
-    camera.yaw = player.yaw;
-    camera.pitch = player.pitch;
-    let mut input = InputState::default();
-    let mut cursor_grabbed = true;
-    set_cursor_grab(&window, true);
-
-    let mut last_frame = Instant::now();
-    let mut title_timer = Instant::now();
-    let mut last_saved_badge: Option<Instant> = None;
-    let mut frame_count = 0u32;
-
+    let mut app = GameApp::new(cli, world, player);
     event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Poll);
-
-            match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => {
-                        let _ = save_current_world(&cli.save_path, &mut world, &player);
-                        elwt.exit();
-                    }
-                    WindowEvent::Focused(false) => {
-                        input.reset();
-                    }
-                    WindowEvent::Resized(new_size) => {
-                        ctx.resize(new_size);
-                    }
-                    WindowEvent::KeyboardInput { event, .. } => {
-                        let pressed = event.state == ElementState::Pressed;
-                        if let PhysicalKey::Code(code) = event.physical_key {
-                            match code {
-                                KeyCode::KeyW => input.forward = pressed,
-                                KeyCode::KeyS => input.backward = pressed,
-                                KeyCode::KeyA => input.left = pressed,
-                                KeyCode::KeyD => input.right = pressed,
-                                KeyCode::Space => input.jump_or_up = pressed,
-                                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                                    input.crouch_or_down = pressed;
-                                }
-                                KeyCode::ControlLeft | KeyCode::ControlRight => {
-                                    input.sprint = pressed;
-                                }
-                                KeyCode::KeyF if pressed && !event.repeat => {
-                                    player.fly_mode = !player.fly_mode;
-                                    player.velocity = Vec3::ZERO;
-                                }
-                                KeyCode::F5 if pressed && !event.repeat => {
-                                    if save_current_world(&cli.save_path, &mut world, &player) {
-                                        last_saved_badge = Some(Instant::now());
-                                    }
-                                }
-                                KeyCode::Escape if pressed && !event.repeat => {
-                                    cursor_grabbed = !cursor_grabbed;
-                                    set_cursor_grab(&window, cursor_grabbed);
-                                }
-                                KeyCode::BracketLeft if pressed && !event.repeat => {
-                                    let rd = (world.render_distance() - 2).max(4);
-                                    world.set_render_distance(rd);
-                                }
-                                KeyCode::BracketRight if pressed && !event.repeat => {
-                                    let rd = (world.render_distance() + 2).min(36);
-                                    world.set_render_distance(rd);
-                                }
-                                KeyCode::Digit1 if pressed => player.selected_slot = 0,
-                                KeyCode::Digit2 if pressed => player.selected_slot = 1,
-                                KeyCode::Digit3 if pressed => player.selected_slot = 2,
-                                KeyCode::Digit4 if pressed => player.selected_slot = 3,
-                                KeyCode::Digit5 if pressed => player.selected_slot = 4,
-                                KeyCode::Digit6 if pressed => player.selected_slot = 5,
-                                KeyCode::Digit7 if pressed => player.selected_slot = 6,
-                                KeyCode::Digit8 if pressed => player.selected_slot = 7,
-                                KeyCode::Digit9 if pressed => player.selected_slot = 8,
-                                _ => {}
-                            }
-                        }
-                    }
-                    WindowEvent::MouseWheel { delta, .. } => {
-                        let step: isize = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => {
-                                if y > 0.0 {
-                                    -1
-                                } else if y < 0.0 {
-                                    1
-                                } else {
-                                    0
-                                }
-                            }
-                            MouseScrollDelta::PixelDelta(p) => {
-                                if p.y > 0.0 {
-                                    -1
-                                } else if p.y < 0.0 {
-                                    1
-                                } else {
-                                    0
-                                }
-                            }
-                        };
-                        if step != 0 {
-                            player.selected_slot =
-                                (player.selected_slot as isize + step).rem_euclid(9) as usize;
-                        }
-                    }
-                    WindowEvent::MouseInput {
-                        state: ElementState::Pressed,
-                        button,
-                        ..
-                    } => {
-                        if !cursor_grabbed {
-                            cursor_grabbed = true;
-                            set_cursor_grab(&window, true);
-                            return;
-                        }
-
-                        if let Some(hit) = raycast_voxels(
-                            camera.position,
-                            camera.forward(),
-                            8.0,
-                            |x, y, z| world.get_block(x, y, z),
-                        ) {
-                            match button {
-                                MouseButton::Left => {
-                                    let bp = hit.block_pos;
-                                    if world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
-                                        let remeshed = world.set_block_immediate(
-                                            bp.x,
-                                            bp.y,
-                                            bp.z,
-                                            BlockId::Air,
-                                        );
-                                        for (cpos, mesh) in remeshed {
-                                            render_store.upload_mesh(
-                                                &ctx.device,
-                                                &renderer.chunk_bind_group_layout,
-                                                cpos,
-                                                &mesh,
-                                            );
-                                        }
-                                    }
-                                }
-                                MouseButton::Right => {
-                                    let ap = hit.adjacent_pos;
-                                    if !player.aabb().intersects_block(ap.x, ap.y, ap.z) {
-                                        let place_block = BlockId::HOTBAR[player.selected_slot];
-                                        let remeshed = world.set_block_immediate(
-                                            ap.x,
-                                            ap.y,
-                                            ap.z,
-                                            place_block,
-                                        );
-                                        for (cpos, mesh) in remeshed {
-                                            render_store.upload_mesh(
-                                                &ctx.device,
-                                                &renderer.chunk_bind_group_layout,
-                                                cpos,
-                                                &mesh,
-                                            );
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    WindowEvent::RedrawRequested => {
-                        let now = Instant::now();
-                        let dt = (now - last_frame).as_secs_f32();
-                        last_frame = now;
-
-                        player.update(dt, &input, |x, y, z| world.get_block(x, y, z));
-                        camera.position = player.eye_position();
-                        camera.yaw = player.yaw;
-                        camera.pitch = player.pitch;
-
-                        let (player_chunk, _) = world_to_chunk_and_local(
-                            player.position.x.floor() as i32,
-                            player.position.y.floor() as i32,
-                            player.position.z.floor() as i32,
-                        );
-                        let (new_meshes, unloaded) = world.update_streaming(player_chunk);
-                        if !unloaded.is_empty() && world.has_unsaved_changes() {
-                            if save_current_world(&cli.save_path, &mut world, &player) {
-                                last_saved_badge = Some(Instant::now());
-                            }
-                        }
-                        for upos in unloaded {
-                            render_store.remove_chunk(upos);
-                        }
-                        for (cpos, mesh) in new_meshes {
-                            render_store.upload_mesh(
-                                &ctx.device,
-                                &renderer.chunk_bind_group_layout,
-                                cpos,
-                                &mesh,
-                            );
-                        }
-
-                        let target_block = raycast_voxels(
-                            camera.position,
-                            camera.forward(),
-                            8.0,
-                            |x, y, z| world.get_block(x, y, z),
-                        )
-                        .map(|h| h.block_pos);
-
-                        match renderer.render_frame(
-                            &ctx,
-                            &render_store,
-                            &camera,
-                            world.render_distance(),
-                            target_block,
-                            player.selected_slot,
-                        ) {
-                            Ok(visible_chunks) => {
-                                frame_count += 1;
-                                let elapsed = title_timer.elapsed().as_secs_f32();
-                                if elapsed >= 0.25 {
-                                    let fps = (frame_count as f32 / elapsed).round() as u32;
-                                    let ms = (elapsed * 1000.0) / frame_count.max(1) as f32;
-                                    let vram_kb = render_store.total_vram_bytes / 1024;
-                                    let mode = if player.fly_mode { "Fly" } else { "Walk" };
-                                    let block_name = BlockId::HOTBAR[player.selected_slot].name();
-                                    let save_tag = if last_saved_badge
-                                        .map(|t| t.elapsed().as_secs_f32() < 2.0)
-                                        .unwrap_or(false)
-                                    {
-                                        " [Saved]"
-                                    } else {
-                                        ""
-                                    };
-                                    window.set_title(&format!(
-                                        "Minecraft Clone | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
-                                        fps,
-                                        ms,
-                                        visible_chunks,
-                                        world.loaded_chunk_count(),
-                                        render_store.total_quads,
-                                        vram_kb,
-                                        player.position.x,
-                                        player.position.y,
-                                        player.position.z,
-                                        mode,
-                                        player.selected_slot + 1,
-                                        block_name,
-                                        world.render_distance(),
-                                        world.seed(),
-                                        save_tag,
-                                    ));
-                                    title_timer = Instant::now();
-                                    frame_count = 0;
-                                }
-                            }
-                            Err(
-                                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
-                            ) => {
-                                ctx.resize(ctx.size);
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => {
-                                let _ = save_current_world(&cli.save_path, &mut world, &player);
-                                elwt.exit();
-                            }
-                            Err(wgpu::SurfaceError::Timeout) => {}
-                        }
-                    }
-                    _ => {}
-                },
-                Event::DeviceEvent {
-                    event: DeviceEvent::MouseMotion { delta },
-                    ..
-                } => {
-                    if cursor_grabbed {
-                        let sensitivity = 0.0022;
-                        player.yaw += delta.0 as f32 * sensitivity;
-                        player.pitch = (player.pitch - delta.1 as f32 * sensitivity)
-                            .clamp(-1.54, 1.54);
-                    }
-                }
-                Event::AboutToWait => {
-                    window.request_redraw();
-                }
-                _ => {}
-            }
-        })
+        .run_app(&mut app)
         .expect("Event loop error");
 }
