@@ -155,9 +155,9 @@ pub fn decide(screen: LifecycleScreen, intent: LifecycleIntent) -> LifecycleResu
         (LifecycleScreen::MainMenu, LifecycleIntent::MainMenu(intent)) => match intent {
             MainMenuIntent::NewGame => LifecycleDecision::Navigate(LifecycleScreen::NewGame),
             MainMenuIntent::LoadGame => LifecycleDecision::Navigate(LifecycleScreen::LoadGame),
-            MainMenuIntent::Settings => LifecycleDecision::Navigate(LifecycleScreen::Settings(
-                SettingsCaller::MainMenu,
-            )),
+            MainMenuIntent::Settings => {
+                LifecycleDecision::Navigate(LifecycleScreen::Settings(SettingsCaller::MainMenu))
+            }
             MainMenuIntent::Exit | MainMenuIntent::ExitGame => LifecycleDecision::ExitGame,
         },
         (LifecycleScreen::NewGame, LifecycleIntent::NewGame(intent)) => match intent {

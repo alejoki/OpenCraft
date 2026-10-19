@@ -220,11 +220,17 @@ mod tests {
     #[test]
     fn insertion_is_bounded_and_cursor_stays_at_accepted_end() {
         let mut input = TextInput::new(3);
-        assert_eq!(input.apply(TextInputAction::InsertText("ab😀!".into())), TextInputOutcome::Changed);
+        assert_eq!(
+            input.apply(TextInputAction::InsertText("ab😀!".into())),
+            TextInputOutcome::Changed
+        );
         assert_eq!(input.value(), "ab😀");
         assert_eq!(input.len(), 3);
         assert_eq!(input.cursor(), 3);
-        assert_eq!(input.apply(TextInputAction::Insert('x')), TextInputOutcome::Unchanged);
+        assert_eq!(
+            input.apply(TextInputAction::Insert('x')),
+            TextInputOutcome::Unchanged
+        );
     }
 
     #[test]
@@ -256,18 +262,36 @@ mod tests {
     #[test]
     fn clear_and_submit_have_explicit_outcomes() {
         let mut input = TextInput::from_text("seed", 10);
-        assert_eq!(input.apply(TextInputAction::Submit), TextInputOutcome::Submitted("seed".into()));
-        assert_eq!(input.apply(TextInputAction::Clear), TextInputOutcome::Changed);
+        assert_eq!(
+            input.apply(TextInputAction::Submit),
+            TextInputOutcome::Submitted("seed".into())
+        );
+        assert_eq!(
+            input.apply(TextInputAction::Clear),
+            TextInputOutcome::Changed
+        );
         assert_eq!(input.value(), "");
-        assert_eq!(input.apply(TextInputAction::Clear), TextInputOutcome::Unchanged);
-        assert_eq!(input.apply(TextInputAction::Submit), TextInputOutcome::Submitted(String::new()));
+        assert_eq!(
+            input.apply(TextInputAction::Clear),
+            TextInputOutcome::Unchanged
+        );
+        assert_eq!(
+            input.apply(TextInputAction::Submit),
+            TextInputOutcome::Submitted(String::new())
+        );
     }
 
     #[test]
     fn control_characters_are_rejected_without_corrupting_the_value() {
         let mut input = TextInput::new(8);
-        assert_eq!(input.apply(TextInputAction::Insert('\n')), TextInputOutcome::Unchanged);
-        assert_eq!(input.apply(TextInputAction::InsertText("ok\r\n".into())), TextInputOutcome::Changed);
+        assert_eq!(
+            input.apply(TextInputAction::Insert('\n')),
+            TextInputOutcome::Unchanged
+        );
+        assert_eq!(
+            input.apply(TextInputAction::InsertText("ok\r\n".into())),
+            TextInputOutcome::Changed
+        );
         assert_eq!(input.value(), "ok");
     }
 }
