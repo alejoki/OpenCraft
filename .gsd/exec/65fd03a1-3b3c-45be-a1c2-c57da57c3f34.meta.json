@@ -1,0 +1,20 @@
+{
+  "id": "65fd03a1-3b3c-45be-a1c2-c57da57c3f34",
+  "runtime": "bash",
+  "purpose": "Verify clippy is clean on the src/main.rs integration surface",
+  "script_chars": 28,
+  "started_at": "2026-10-19T10:28:00.672Z",
+  "finished_at": "2026-10-19T10:28:25.116Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 24444,
+  "stdout_bytes": 686,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/65fd03a1-3b3c-45be-a1c2-c57da57c3f34.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/65fd03a1-3b3c-45be-a1c2-c57da57c3f34.stderr"
+}

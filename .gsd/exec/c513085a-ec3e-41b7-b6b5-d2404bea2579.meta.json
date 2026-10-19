@@ -1,0 +1,20 @@
+{
+  "id": "c513085a-ec3e-41b7-b6b5-d2404bea2579",
+  "runtime": "bash",
+  "purpose": "Clean-signal clippy verification for the evidence table (un-piped exit code)",
+  "script_chars": 12,
+  "started_at": "2026-10-19T10:29:21.164Z",
+  "finished_at": "2026-10-19T10:29:21.392Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 228,
+  "stdout_bytes": 0,
+  "stderr_bytes": 6330,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c513085a-ec3e-41b7-b6b5-d2404bea2579.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/c513085a-ec3e-41b7-b6b5-d2404bea2579.stderr"
+}

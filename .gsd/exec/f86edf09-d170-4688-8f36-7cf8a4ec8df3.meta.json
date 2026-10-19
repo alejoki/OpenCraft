@@ -1,0 +1,20 @@
+{
+  "id": "f86edf09-d170-4688-8f36-7cf8a4ec8df3",
+  "runtime": "bash",
+  "purpose": "Run the full test suite including the new compose_menu_text unit tests",
+  "script_chars": 26,
+  "started_at": "2026-10-19T10:27:30.737Z",
+  "finished_at": "2026-10-19T10:27:31.155Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 418,
+  "stdout_bytes": 1174,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/f86edf09-d170-4688-8f36-7cf8a4ec8df3.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/f86edf09-d170-4688-8f36-7cf8a4ec8df3.stderr"
+}

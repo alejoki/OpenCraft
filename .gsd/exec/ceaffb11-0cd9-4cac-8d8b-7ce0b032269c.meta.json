@@ -1,0 +1,20 @@
+{
+  "id": "ceaffb11-0cd9-4cac-8d8b-7ce0b032269c",
+  "runtime": "bash",
+  "purpose": "Compile the crate with the new menu integration in src/main.rs",
+  "script_chars": 27,
+  "started_at": "2026-10-19T10:27:24.724Z",
+  "finished_at": "2026-10-19T10:27:26.565Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 1841,
+  "stdout_bytes": 159,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ceaffb11-0cd9-4cac-8d8b-7ce0b032269c.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/ceaffb11-0cd9-4cac-8d8b-7ce0b032269c.stderr"
+}

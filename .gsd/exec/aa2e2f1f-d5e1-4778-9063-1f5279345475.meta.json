@@ -1,0 +1,20 @@
+{
+  "id": "aa2e2f1f-d5e1-4778-9063-1f5279345475",
+  "runtime": "bash",
+  "purpose": "Bounded 10s launch smoke proving the game boots with settings loading and menu code paths compiled in",
+  "script_chars": 43,
+  "started_at": "2026-10-19T10:28:38.955Z",
+  "finished_at": "2026-10-19T10:28:49.022Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 10067,
+  "stdout_bytes": 61,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/aa2e2f1f-d5e1-4778-9063-1f5279345475.stdout",
+  "stderr_path": "/home/aleksi/minecraft-clone/.gsd-worktrees/M001/.gsd/exec/aa2e2f1f-d5e1-4778-9063-1f5279345475.stderr"
+}

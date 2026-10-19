@@ -18,6 +18,11 @@ use minecraft_clone::player::raycast::raycast_voxels;
 use minecraft_clone::render::buffer::ChunkRenderStore;
 use minecraft_clone::render::context::RenderContext;
 use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
+use minecraft_clone::settings::keybind::key_to_string;
+use minecraft_clone::settings::{
+    load_with_warnings, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
+};
+use minecraft_clone::ui::menu::{self, AdjustDirection, MenuRow};
 use minecraft_clone::ui::{Quad, StatsOverlay, UiRenderer, FONT_SIZE, LINE_HEIGHT};
 use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::chunk::world_to_chunk_and_local;
@@ -31,6 +36,13 @@ use minecraft_clone::world::terrain::{terrain_height_at_seeded, DEFAULT_WORLD_SE
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
 const OVERLAY_TEXT_TOP: f32 = 8.0;
+
+/// Message-expiry tick interval: the loop runs in `ControlFlow::Poll`,
+/// potentially far above 60 fps, while `menu::MESSAGE_TICKS` is calibrated
+/// as ~10 seconds at ~60 ticks/s. Ticking the menu message at most this
+/// often keeps the T01 pure tick counter time-sane without giving the menu
+/// module a clock.
+const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -65,6 +77,60 @@ fn save_current_world(save_path: &Path, world: &mut WorldManager, player: &Playe
     }
 }
 
+fn on_off(value: bool) -> &'static str {
+    if value { "On" } else { "Off" }
+}
+
+/// Compose the menu's display text: one "label: value" line per row, a
+/// capture hint line while a rebind is pending, and the transient message
+/// line. Pure function of (settings, menu) so it is unit-testable without
+/// GPU or events; called per frame while the menu is open, where
+/// `StatsOverlay::update` skips the expensive re-shape unless the
+/// composed string actually changed.
+fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
+    let mut lines = Vec::with_capacity(menu::ROW_COUNT + 2);
+    for row in menu::ROWS {
+        let line = match row {
+            MenuRow::Bind(action) => {
+                if menu.awaiting_action() == Some(action) {
+                    format!("{}: <press a key>", row.label())
+                } else {
+                    let key = key_to_string(action.key_of(&settings.keybinds))
+                        .unwrap_or("<unsupported>");
+                    format!("{}: {}", row.label(), key)
+                }
+            }
+            MenuRow::MouseSensitivity => {
+                format!("{}: {:.4}", row.label(), settings.mouse_sensitivity)
+            }
+            MenuRow::Fov => format!("{}: {:.0}", row.label(), settings.fov_degrees),
+            MenuRow::Fullscreen => {
+                format!("{}: {}", row.label(), on_off(settings.fullscreen))
+            }
+            MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
+            MenuRow::Close => row.label().to_string(),
+        };
+        lines.push(line);
+    }
+    if let Some(action) = menu.awaiting_action() {
+        lines.push(format!("press a key for '{}' (Escape cancels)", action.name()));
+    }
+    if let Some(message) = &menu.message {
+        lines.push(message.text.clone());
+    }
+    lines.join("\n")
+}
+
+/// Click-to-direction mapping for the stepped value rows: left click steps
+/// the value up, right click steps it down; other buttons don't adjust.
+fn adjust_direction(button: MouseButton) -> Option<AdjustDirection> {
+    match button {
+        MouseButton::Left => Some(AdjustDirection::Up),
+        MouseButton::Right => Some(AdjustDirection::Down),
+        _ => None,
+    }
+}
+
 /// Window-dependent GPU stack, initialized together in `resumed()`.
 struct Ready {
     ctx: RenderContext,
@@ -72,6 +138,9 @@ struct Ready {
     render_store: ChunkRenderStore,
     ui: UiRenderer,
     stats: StatsOverlay,
+    /// Settings-menu text buffer (same change-gated pattern as `stats`):
+    /// drawn in the same UI pass, after the stats text area.
+    menu_text: StatsOverlay,
 }
 
 struct GameApp {
@@ -92,6 +161,20 @@ struct GameApp {
     /// cursor left the window). Same px space as ctx.config, cosmic-text
     /// buffers, and the quad renderer's API — S04 hit-testing consumes it.
     cursor_pos: Option<(f32, f32)>,
+    /// Loaded player settings (settings.toml, or defaults on any load
+    /// failure): the single in-memory source of truth the menu edits.
+    settings: Settings,
+    /// Startup load warnings, surfaced as the menu's initial message on the
+    /// first open (MEM009/D006: warnings are data displayed in-menu, never
+    /// logged — the crate stays log-free).
+    startup_warnings: Vec<SettingsWarning>,
+    /// Whether the startup warnings have already been shown once.
+    startup_warnings_shown: bool,
+    /// The settings menu state machine (pure logic from `ui::menu`).
+    menu: menu::SettingsMenu,
+    /// Timestamp of the last message-expiry tick (bounded at ~60 Hz; see
+    /// `MENU_TICK_INTERVAL`).
+    message_tick_timer: Instant,
 }
 
 impl GameApp {
@@ -99,6 +182,11 @@ impl GameApp {
         let mut camera = Camera::new(player.eye_position());
         camera.yaw = player.yaw;
         camera.pitch = player.pitch;
+        // Startup settings load: never blocks launch — a missing or corrupt
+        // settings.toml yields defaults plus structured warnings, surfaced
+        // as menu text on the first open.
+        let (settings, startup_warnings) =
+            load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
         Self {
             window: None,
             gpu: None,
@@ -114,6 +202,71 @@ impl GameApp {
             frame_count: 0,
             last_overlay_text: String::new(),
             cursor_pos: None,
+            settings,
+            startup_warnings,
+            startup_warnings_shown: false,
+            menu: menu::SettingsMenu::new(),
+            message_tick_timer: Instant::now(),
+        }
+    }
+
+    /// Route one mouse click while the menu is open: hit-test the row under
+    /// the cursor and apply that row's action. Clicks outside the panel are
+    /// ignored (no accidental gameplay); a `None` cursor position (cursor
+    /// left the window) is ignored too.
+    fn menu_click(
+        &mut self,
+        window: &Window,
+        button: MouseButton,
+        cursor: Option<(f32, f32)>,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        let Some(cursor) = cursor else { return };
+        let Some(row) = menu::hovered_row(cursor, surface_w, surface_h) else {
+            return;
+        };
+        match row {
+            MenuRow::Bind(action) => self.menu.begin_rebind(action),
+            MenuRow::MouseSensitivity => {
+                if let Some(direction) = adjust_direction(button) {
+                    // Clamp BEFORE storing: in-memory Settings are unclamped
+                    // (only load clamps), so the T01 helper is mandatory here.
+                    self.settings.mouse_sensitivity =
+                        menu::adjust_sensitivity(self.settings.mouse_sensitivity, direction);
+                    self.save_settings_or_warn();
+                }
+            }
+            MenuRow::Fov => {
+                if let Some(direction) = adjust_direction(button) {
+                    self.settings.fov_degrees =
+                        menu::adjust_fov(self.settings.fov_degrees, direction);
+                    self.save_settings_or_warn();
+                }
+            }
+            MenuRow::Fullscreen => {
+                self.settings.fullscreen = !self.settings.fullscreen;
+                self.save_settings_or_warn();
+            }
+            MenuRow::Vsync => {
+                self.settings.vsync = !self.settings.vsync;
+                self.save_settings_or_warn();
+            }
+            MenuRow::Close => {
+                self.menu.close();
+                self.cursor_grabbed = true;
+                set_cursor_grab(window, true);
+            }
+        }
+    }
+
+    /// Save settings atomically and surface an io::Error as an in-menu
+    /// message instead of swallowing it (D006: the crate stays log-free;
+    /// failure data is displayed, never dropped).
+    fn save_settings_or_warn(&mut self) {
+        if let Err(err) = self.settings.save(Path::new(DEFAULT_SETTINGS_PATH)) {
+            self.menu
+                .set_message(format!("could not save settings: {err}"));
         }
     }
 }
@@ -141,6 +294,7 @@ impl ApplicationHandler for GameApp {
         let render_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
         let stats = StatsOverlay::new(&mut ui.font_system);
+        let menu_text = StatsOverlay::new(&mut ui.font_system);
 
         self.cursor_grabbed = true;
         set_cursor_grab(&window, true);
@@ -152,6 +306,7 @@ impl ApplicationHandler for GameApp {
             render_store,
             ui,
             stats,
+            menu_text,
         });
     }
 
@@ -212,8 +367,39 @@ impl ApplicationHandler for GameApp {
                             }
                         }
                         KeyCode::Escape if pressed && !event.repeat => {
-                            self.cursor_grabbed = !self.cursor_grabbed;
-                            set_cursor_grab(window, self.cursor_grabbed);
+                            // Escape toggles the settings menu (replacing the
+                            // old raw cursor-grab toggle: an open menu always
+                            // implies a released cursor).
+                            if self.menu.is_open() {
+                                // In capture mode, Escape cancels the pending
+                                // capture first (the menu stays open and the
+                                // cursor stays released); otherwise it closes
+                                // the menu and re-grabs the cursor.
+                                if !self.menu.cancel_capture() {
+                                    self.menu.close();
+                                    self.cursor_grabbed = true;
+                                    set_cursor_grab(window, true);
+                                }
+                            } else if self.menu.open() {
+                                self.cursor_grabbed = false;
+                                set_cursor_grab(window, false);
+                                // Roadmap requirement: opening the menu resets
+                                // held inputs so no gameplay key sticks while
+                                // the menu owns the input.
+                                self.input.reset();
+                                // Startup load warnings surface as the menu's
+                                // initial message, once (MEM009/D006: data
+                                // displayed in-menu, never logged).
+                                if !self.startup_warnings_shown {
+                                    self.startup_warnings_shown = true;
+                                    if !self.startup_warnings.is_empty() {
+                                        let lines =
+                                            menu::format_warnings(&self.startup_warnings)
+                                                .join(" | ");
+                                        self.menu.set_message(lines);
+                                    }
+                                }
+                            }
                         }
                         KeyCode::BracketLeft if pressed && !event.repeat => {
                             let rd = (self.world.render_distance() - 2).max(4);
@@ -267,6 +453,19 @@ impl ApplicationHandler for GameApp {
                 button,
                 ..
             } => {
+                // While the menu is open the cursor is released and every
+                // click belongs to the menu: hit-test the row under the
+                // cursor. The click-to-re-grab path below and the gameplay
+                // raycast must not steal menu clicks.
+                if self.menu.is_open() {
+                    let (surface_w, surface_h) =
+                        (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let window = window.clone();
+                    let cursor = self.cursor_pos;
+                    self.menu_click(&window, button, cursor, surface_w, surface_h);
+                    return;
+                }
+
                 if !self.cursor_grabbed {
                     self.cursor_grabbed = true;
                     set_cursor_grab(window, true);
@@ -324,6 +523,17 @@ impl ApplicationHandler for GameApp {
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
+                // Message expiry at a bounded ~60 ticks/s (see
+                // `MENU_TICK_INTERVAL`): the pure T01 tick counter decrements
+                // only here, so warnings never stick forever and never flash
+                // by at uncapped frame rates.
+                if self.menu.message.is_some()
+                    && self.message_tick_timer.elapsed().as_secs_f32() >= MENU_TICK_INTERVAL
+                {
+                    self.message_tick_timer = Instant::now();
+                    self.menu.tick();
+                }
+
                 self.player
                     .update(dt, &self.input, |x, y, z| self.world.get_block(x, y, z));
                 self.camera.position = self.player.eye_position();
@@ -370,24 +580,78 @@ impl ApplicationHandler for GameApp {
                 let panel_w = OVERLAY_TEXT_LEFT * 2.0
                     + self.last_overlay_text.chars().count().max(1) as f32 * FONT_SIZE * 0.6
                     + 4.0;
-                let panel = Quad {
+                let mut quads = vec![Quad {
                     x: OVERLAY_TEXT_LEFT - 6.0,
                     y: OVERLAY_TEXT_TOP - 4.0,
                     w: panel_w,
                     h: LINE_HEIGHT + 8.0,
                     color: [0.0, 0.0, 0.0, 0.4],
-                };
+                }];
+
+                // While the menu is open: draw its dark panel plus a
+                // translucent highlight over the hovered row, and shape the
+                // menu text (labels + live values + transient message). All
+                // geometry derives per frame from the current surface size,
+                // so a fullscreen Resized reflows the menu automatically with
+                // no cached rects; the text only re-shapes when the composed
+                // string changed (StatsOverlay guards that).
+                let mut menu_text_area = None;
+                if self.menu.is_open() {
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let (mx, my, mw, mh) = menu::panel_rect(surface_w, surface_h);
+                    quads.push(Quad {
+                        x: mx,
+                        y: my,
+                        w: mw,
+                        h: mh,
+                        color: [0.0, 0.0, 0.0, 0.7],
+                    });
+                    if let Some(cursor) = self.cursor_pos {
+                        if let Some(hover) = menu::hovered_row(cursor, surface_w, surface_h) {
+                            let index = menu::ROWS
+                                .iter()
+                                .position(|&r| r == hover)
+                                .expect("hovered row is one of ROWS");
+                            if let Some((hx, hy, hw, hh)) =
+                                menu::row_rect(surface_w, surface_h, index)
+                            {
+                                quads.push(Quad {
+                                    x: hx,
+                                    y: hy,
+                                    w: hw,
+                                    h: hh,
+                                    color: [0.35, 0.55, 0.9, 0.3],
+                                });
+                            }
+                        }
+                    }
+                    let text = compose_menu_text(&self.settings, &self.menu);
+                    gpu.menu_text.update(
+                        &mut gpu.ui.font_system,
+                        surface_w as f32,
+                        surface_h as f32,
+                        &text,
+                    );
+                    menu_text_area =
+                        Some(gpu.menu_text.text_area(mx + menu::MENU_PAD, my + menu::MENU_PAD));
+                }
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
-                    std::slice::from_ref(&panel),
+                    &quads,
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
 
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
-                // (the crate is log-free by convention).
-                let text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
+                // (the crate is log-free by convention). The menu's text
+                // area rides the same UI pass, AFTER the stats area, with
+                // no pipeline change (MEM014).
+                let stats_text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
+                let mut areas = vec![stats_text_area];
+                if let Some(menu_text_area) = menu_text_area {
+                    areas.push(menu_text_area);
+                }
                 let prepare_ok = gpu
                     .ui
                     .text_renderer
@@ -400,7 +664,7 @@ impl ApplicationHandler for GameApp {
                             width: gpu.ctx.config.width,
                             height: gpu.ctx.config.height,
                         },
-                        [text_area],
+                        areas,
                         &mut gpu.ui.swash_cache,
                     )
                     .is_ok();
@@ -570,4 +834,101 @@ fn main() {
     event_loop
         .run_app(&mut app)
         .expect("Event loop error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_text_lists_every_row_with_its_live_value() {
+        let settings = Settings::default();
+        let mut menu = menu::SettingsMenu::new();
+        menu.open();
+        let text = compose_menu_text(&settings, &menu);
+        assert!(text.contains("Move Forward: KeyW"));
+        assert!(text.contains("Move Backward: KeyS"));
+        assert!(text.contains("Move Left: KeyA"));
+        assert!(text.contains("Move Right: KeyD"));
+        assert!(text.contains("Jump / Up: Space"));
+        assert!(text.contains("Crouch / Down: ShiftLeft"));
+        assert!(text.contains("Sprint: ControlLeft"));
+        assert!(text.contains("Mouse Sensitivity: 0.0022"));
+        assert!(text.contains("Field of View: 75"));
+        assert!(text.contains("Fullscreen: Off"));
+        assert!(text.contains("VSync: Off"));
+        assert!(text.contains("Close Menu"));
+        assert_eq!(text.lines().count(), menu::ROW_COUNT);
+        assert!(!text.contains("press a key for"), "no capture hint while just open");
+    }
+
+    #[test]
+    fn menu_text_reflects_changed_settings_values() {
+        let settings = Settings {
+            keybinds: minecraft_clone_keybinds_jump_arrow_up(),
+            mouse_sensitivity: 0.005,
+            fov_degrees: 90.0,
+            fullscreen: true,
+            vsync: true,
+        };
+        let menu = menu::SettingsMenu::new();
+        let text = compose_menu_text(&settings, &menu);
+        assert!(text.contains("Jump / Up: ArrowUp"));
+        assert!(text.contains("Mouse Sensitivity: 0.0050"));
+        assert!(text.contains("Field of View: 90"));
+        assert!(text.contains("Fullscreen: On"));
+        assert!(text.contains("VSync: On"));
+    }
+
+    #[test]
+    fn awaiting_key_row_shows_capture_hint_and_message_line_appends() {
+        let settings = Settings::default();
+        let mut menu = menu::SettingsMenu::new();
+        menu.open();
+        menu.begin_rebind(menu::BindAction::JumpOrUp);
+        let text = compose_menu_text(&settings, &menu);
+        assert!(text.contains("Jump / Up: <press a key>"));
+        assert!(text.contains("press a key for 'jump_or_up' (Escape cancels)"));
+
+        // Transient messages append as the final line.
+        menu.set_message_for_ticks("key already bound to 'forward'", 1);
+        let text = compose_menu_text(&settings, &menu);
+        assert!(text.ends_with("key already bound to 'forward'"));
+    }
+
+    #[test]
+    fn startup_warnings_format_into_a_single_message_line() {
+        let warnings = vec![
+            SettingsWarning {
+                field: "video.fov".to_string(),
+                reason: "expected a float, found string".to_string(),
+            },
+            SettingsWarning {
+                field: "settings".to_string(),
+                reason: "could not read settings file".to_string(),
+            },
+        ];
+        // Same composition the Escape open path uses (join(" | ")).
+        let joined = menu::format_warnings(&warnings).join(" | ");
+        assert_eq!(
+            joined,
+            "video.fov: expected a float, found string | settings: could not read settings file"
+        );
+    }
+
+    #[test]
+    fn adjust_direction_maps_left_up_right_down_and_nothing_else() {
+        assert_eq!(adjust_direction(MouseButton::Left), Some(AdjustDirection::Up));
+        assert_eq!(adjust_direction(MouseButton::Right), Some(AdjustDirection::Down));
+        assert_eq!(adjust_direction(MouseButton::Middle), None);
+        assert_eq!(adjust_direction(MouseButton::Back), None);
+    }
+
+    /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
+    /// rebinding nothing else) — a valid, conflict-free state.
+    fn minecraft_clone_keybinds_jump_arrow_up() -> minecraft_clone::settings::Keybinds {
+        let mut binds = minecraft_clone::settings::Keybinds::default();
+        binds.jump_or_up = KeyCode::ArrowUp;
+        binds
+    }
 }
