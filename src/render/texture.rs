@@ -188,7 +188,10 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
     ]
 }
 
-fn downsample_rgba_2x(src: &[u8], src_dim: u32) -> Vec<u8> {
+/// Halve a square RGBA image with a 2x box average (edge-clamped).
+/// Shared by the texture-array mip chain and the pack resample path so both
+/// use one averaging rule.
+pub fn downsample_rgba_2x(src: &[u8], src_dim: u32) -> Vec<u8> {
     let dst_dim = (src_dim / 2).max(1);
     let mut dst = vec![0u8; (dst_dim * dst_dim * 4) as usize];
     for y in 0..dst_dim {
