@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::HOTBAR_SLOTS;
 use opencraft::player::mining::{MiningState, MiningTick};
 use opencraft::player::physics::InputState;
@@ -20,10 +21,12 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::pipeline::{UiPass, VoxelRenderer};
+use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
 };
+use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
     delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
@@ -47,10 +50,12 @@ use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
+use opencraft::world::manager::WorldManager;
+use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
-    WorldSaveData, DEFAULT_SAVE_PATH,
+    load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
+    SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH,
 };
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 
@@ -64,6 +69,23 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// often keeps the T01 pure tick counter time-sane without giving the menu
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
+
+/// Load the persisted texture pack at startup, returning it together with its
+/// per-file fallback warnings so the caller can merge them into
+/// `startup_warnings` (the S03 routing contract: warnings are data shown in the
+/// menu, never logs). `None` selection is the built-in Default pack: no data,
+/// no warnings.
+fn load_startup_pack(
+    packs_root: &Path,
+    selected: Option<&str>,
+) -> (Option<LoadedPack>, Vec<SettingsWarning>) {
+    let Some(name) = selected else {
+        return (None, Vec::new());
+    };
+    let loaded = pack::load_pack_by_name(packs_root, name);
+    let warnings = loaded.warnings.clone();
+    (Some(loaded), warnings)
+}
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -188,11 +210,13 @@ fn on_off(value: bool) -> &'static str {
 
 /// Compose the menu's display text: one "label: value" line per row, a
 /// capture hint line while a rebind is pending, and the transient message
-/// line. Pure function of (settings, menu) so it is unit-testable without
-/// GPU or events; called per frame while the menu is open, where
-/// `StatsOverlay::update` skips the expensive re-shape unless the
-/// composed string actually changed.
-fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
+/// line. `pack_label` is the active texture pack's display name ("Default"
+/// for the built-in procedural pack), kept as a parameter so this stays a
+/// pure function of its inputs — unit-testable without GPU or events.
+/// Called per frame while the menu is open, where `StatsOverlay::update`
+/// skips the expensive re-shape unless the composed string actually
+/// changed.
+fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label: &str) -> String {
     let mut lines = Vec::with_capacity(menu::ROW_COUNT + 2);
     for row in menu::ROWS {
         let line = match row {
@@ -216,6 +240,7 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
                 format!("{}: {}", row.label(), on_off(settings.fullscreen))
             }
             MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
+            MenuRow::TexturePack => format!("{}: {pack_label}", row.label()),
             MenuRow::Close => row.label().to_string(),
         };
         lines.push(line);
@@ -575,11 +600,20 @@ struct Ready {
     ctx: RenderContext,
     renderer: VoxelRenderer,
     render_store: ChunkRenderStore,
+    /// GPU meshes for the menu vista world (M004/S02). Deliberately separate
+    /// from `render_store`: the vista and the player session are distinct
+    /// worlds, and a session swap must never clear the menu's GPU state.
+    vista_store: ChunkRenderStore,
     ui: UiRenderer,
     stats: StatsOverlay,
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
     /// drawn in the same UI pass, after the stats text area.
     menu_text: StatsOverlay,
+    /// Vista text title (M004/S04): the large "OpenCraft" label shown on the
+    /// main-menu cluster when the active pack has no logo. Sized with
+    /// `logo::TITLE_FONT_SIZE`/`TITLE_LINE_HEIGHT`; change-gated like
+    /// `menu_text`.
+    title_text: StatsOverlay,
     /// Load-screen "Play" label column (S05-T02): one "Play" line per
     /// catalog row, drawn in the same UI pass after `menu_text`, at
     /// `load_play_rect`'s left/top so buffer line i lands on row i's
@@ -601,6 +635,15 @@ struct GameApp {
     /// save path every save site writes to. One always-present session,
     /// swapped atomically at `start_world_session`.
     session: WorldSession,
+    /// The menu vista's own demo world (M004/S02): built directly with the
+    /// fixed `vista::VISTA_SEED`, never a `WorldSession`, never saved and
+    /// never swapped through `start_world_session`. Streamed only while
+    /// `vista::vista_visible` reports a main-menu-cluster screen.
+    vista_world: WorldManager,
+    /// Construction epoch for the vista's procedural yaw drift: drift is
+    /// `elapsed()` from this single Instant, so it survives menu<->game
+    /// transitions with no per-frame accumulation or reset bookkeeping.
+    vista_epoch: Instant,
     input: InputState,
     cursor_grabbed: bool,
     /// The hold-to-mine accumulator (S02): pure state machine driven once per
@@ -673,6 +716,19 @@ struct GameApp {
     /// settings saves are provable headless without writing the crate
     /// root. Loading still reads the same path at startup.
     settings_path: PathBuf,
+    /// Root directory pack folders are discovered under (M004/S03):
+    /// `packs/` relative to the process cwd, the same convention as
+    /// `saves/` and `settings.toml`. Injected by tests like
+    /// `settings_path`.
+    packs_root: PathBuf,
+    /// Sorted pack names discovered under `packs_root` at startup. Cycling
+    /// walks this list; a pack authored while the game is running appears
+    /// on the next launch (no filesystem polling in the menu).
+    available_packs: Vec<String>,
+    /// The active pack's loaded layers and presentation data; `None` is
+    /// the built-in procedural Default pack (MEM113). Never holds a
+    /// half-loaded pack: `load_pack_by_name` always returns usable layers.
+    current_pack: Option<LoadedPack>,
 }
 
 impl GameApp {
@@ -681,7 +737,17 @@ impl GameApp {
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
         let settings_path = Path::new(DEFAULT_SETTINGS_PATH).to_path_buf();
-        let (settings, startup_warnings) = load_with_warnings(&settings_path);
+        let (settings, mut startup_warnings) = load_with_warnings(&settings_path);
+        // Pack discovery and startup apply (M004/S03): the persisted choice
+        // is re-applied on every launch. A missing/deleted pack folder still
+        // yields a fully usable procedural pack plus one warning naming it,
+        // surfaced through the existing first-Settings-open message path
+        // (D031/MEM121, MEM009: warnings are data, never logs).
+        let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
+        let available_packs = pack::available_pack_names(&packs_root);
+        let (current_pack, pack_warnings) =
+            load_startup_pack(&packs_root, settings.texture_pack.as_deref());
+        startup_warnings.extend(pack_warnings);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -705,10 +771,22 @@ impl GameApp {
         session
             .world
             .set_render_distance(settings.render_distance);
+        // The vista is a second, independent world with the same
+        // settings-driven render distance (the session's is a source of
+        // truth; the vista is never a WorldSession). `ChunkEditMap::default()`
+        // matches `WorldManager::new`; the fixed seed is the demo contract.
+        let mut vista_world = WorldManager::with_seed_and_edits(
+            settings.render_distance,
+            vista::VISTA_SEED,
+            ChunkEditMap::default(),
+        );
+        vista_world.set_render_distance(settings.render_distance);
         Self {
             window: None,
             gpu: None,
             session,
+            vista_world,
+            vista_epoch: Instant::now(),
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
@@ -731,6 +809,9 @@ impl GameApp {
             main_menu_message: None,
             message_tick_timer: Instant::now(),
             settings_path,
+            packs_root,
+            available_packs,
+            current_pack,
         }
     }
 
@@ -783,16 +864,7 @@ impl GameApp {
             }
             MenuRow::RenderDistance => {
                 if let Some(direction) = adjust_direction(button) {
-                    self.settings.render_distance =
-                        menu::adjust_render_distance(self.settings.render_distance, direction);
-                    // Live apply: the streaming loop reads
-                    // `world.render_distance()` every frame, so updating the
-                    // manager immediately changes both the load radius and
-                    // the fog distance the renderer receives.
-                    self.session
-                        .world
-                        .set_render_distance(self.settings.render_distance);
-                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+                    self.apply_render_distance_adjust(direction);
                 }
             }
             MenuRow::Fullscreen => {
@@ -815,6 +887,12 @@ impl GameApp {
                 // the RenderContext; see the doc comment above).
                 save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
             }
+            MenuRow::TexturePack => {
+                // Cycling is not an adjust row: any button advances one step.
+                // The GPU re-upload needs the RenderContext, so it happens in
+                // the caller right after this call (same P005 split as vsync).
+                self.apply_texture_pack_cycle();
+            }
             MenuRow::Close => {
                 // Close now dispatches Back through the lifecycle state
                 // (S02-T02): return to the caller screen — MainMenu or
@@ -827,6 +905,49 @@ impl GameApp {
                 );
             }
         }
+    }
+
+    /// Apply one Render Distance row adjustment: clamp/store the setting,
+    /// live-apply it to BOTH worlds (player session and menu vista), and
+    /// save. The session and vista loops both read `render_distance()`
+    /// every frame, so updating the managers immediately changes load
+    /// radius and fog distance. Extracted from `menu_click` so the
+    /// headless tests can drive the exact click semantics without a live
+    /// `ActiveEventLoop`/`Window` (menu_click's other arms need those
+    /// only for Close/Fullscreen).
+    fn apply_render_distance_adjust(&mut self, direction: AdjustDirection) {
+        self.settings.render_distance =
+            menu::adjust_render_distance(self.settings.render_distance, direction);
+        self.session
+            .world
+            .set_render_distance(self.settings.render_distance);
+        self.vista_world
+            .set_render_distance(self.settings.render_distance);
+        save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+    }
+
+    /// Apply one Texture Pack row click: advance through the discovered
+    /// packs (Default -> first -> ... -> Default), load the new pack, surface
+    /// any load warnings in the menu message slot (MEM009), and persist the
+    /// choice. Extracted from `menu_click` so the headless tests can drive
+    /// the exact click semantics without a live event loop; the live GPU
+    /// re-upload stays in the caller (P005 borrow split).
+    fn apply_texture_pack_cycle(&mut self) {
+        let next =
+            menu::cycle_texture_pack(self.settings.texture_pack.as_deref(), &self.available_packs);
+        self.settings.texture_pack = next.clone();
+        match next {
+            None => self.current_pack = None,
+            Some(name) => {
+                let loaded = pack::load_pack_by_name(&self.packs_root, &name);
+                if !loaded.warnings.is_empty() {
+                    let lines = menu::format_warnings(&loaded.warnings).join(" | ");
+                    self.menu.set_message(lines);
+                }
+                self.current_pack = Some(loaded);
+            }
+        }
+        save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
     /// Enter a lifecycle screen — the one transition entry point every
@@ -962,6 +1083,15 @@ impl GameApp {
                         text: format!("could not save world: {err}"),
                         ticks_left: menu::MESSAGE_TICKS,
                     });
+                }
+                // Drop every session GPU chunk mesh at menu return (the
+                // same boundary rule as `start_world_session`): the menu
+                // renders the vista from its own store, and leaving the
+                // outgoing world's meshes resident both drew the old world
+                // behind the menu and doubled VRAM (MEM115). Clear ONLY the
+                // session store — the vista store belongs to the menu.
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.render_store.clear();
                 }
                 self.enter_screen(LifecycleScreen::MainMenu);
             }
@@ -1354,10 +1484,31 @@ impl ApplicationHandler for GameApp {
 
         let mut ctx = RenderContext::new(window.clone());
         let renderer = VoxelRenderer::new(&ctx);
+        // Re-apply the persisted texture pack to the freshly created GPU
+        // texture (M004/S03): the renderer is still a local here, so the
+        // initial upload reuses the same live-apply path as cycling. A
+        // missing pack still carries usable procedural layers.
+        if let Some(pack) = &self.current_pack {
+            renderer.write_block_layers(&ctx.queue, &pack.layers);
+        }
         let render_store = ChunkRenderStore::new();
+        let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
+        // Startup logo upload (M004/S04): the texture is created exactly once
+        // per pack selection, never on the render hot path. Default (`None`)
+        // leaves the logo renderer empty so the text title shows instead.
+        ui.set_logo(
+            &ctx.device,
+            &ctx.queue,
+            self.current_pack.as_ref().and_then(|pack| pack.logo.as_ref()),
+        );
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
+        let title_text = StatsOverlay::with_metrics(
+            &mut ui.font_system,
+            logo::TITLE_FONT_SIZE,
+            logo::TITLE_LINE_HEIGHT,
+        );
         let load_play_text = StatsOverlay::new(&mut ui.font_system);
         let load_delete_text = StatsOverlay::new(&mut ui.font_system);
         let hotbar_counts = std::array::from_fn(|_| {
@@ -1392,9 +1543,11 @@ impl ApplicationHandler for GameApp {
             ctx,
             renderer,
             render_store,
+            vista_store,
             ui,
             stats,
             menu_text,
+            title_text,
             load_play_text,
             load_delete_text,
             hotbar_counts,
@@ -1664,6 +1817,32 @@ impl ApplicationHandler for GameApp {
                                 apply_vsync(&mut gpu.ctx, self.settings.vsync);
                             }
                         }
+                        if clicked == Some(MenuRow::TexturePack) {
+                            // Live apply (MEM111): rewrite the EXISTING block
+                            // texture array's contents — same texture, view,
+                            // and bind group, so nothing needs recreation.
+                            // Clone/copy the layer bytes BEFORE the `as_mut`
+                            // borrow split (P005); Default re-uploads the
+                            // procedural layers so wrapping back restores
+                            // the built-in textures.
+                            let layers = match &self.current_pack {
+                                Some(pack) => pack.layers.clone(),
+                                None => generate_all_texture_layers_rgba(),
+                            };
+                            // The logo is cloned too, for the same reason:
+                            // both reads of `self.current_pack` happen before
+                            // the `self.gpu.as_mut()` borrow (P005). Cycling
+                            // back to Default passes None and clears the logo
+                            // so the text title returns.
+                            let logo = match &self.current_pack {
+                                Some(pack) => pack.logo.clone(),
+                                None => None,
+                            };
+                            if let Some(gpu) = self.gpu.as_mut() {
+                                gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
+                                gpu.ui.set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                            }
+                        }
                     } else {
                         // Other lifecycle screens own the click (T01 hit
                         // tests); gpu is not touched after this call on
@@ -1735,6 +1914,11 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Vista discriminator (M004/S02): the single `vista_visible`
+                // truth source — true only for the main-menu cluster. Pause,
+                // Settings-from-pause, and Playing keep rendering the session
+                // world (frozen for Pause), so neither stream runs there.
+                let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
                     self.session.player
                         .update(dt, &self.input, |x, y, z| self.session.world.get_block(x, y, z));
@@ -1765,14 +1949,46 @@ impl ApplicationHandler for GameApp {
                             &mesh,
                         );
                     }
+                } else if vista {
+                    // Menu vista streaming (M004/S02): mirror the session
+                    // block against the vista world. The vista never saves
+                    // and never touches `session`/save paths; paused screens
+                    // fail `vista` above, so the frozen paused world stays
+                    // frozen with no chunk loads/unloads.
+                    let anchor = vista::vista_anchor();
+                    let (vista_chunk, _) = world_to_chunk_and_local(
+                        anchor.x.floor() as i32,
+                        anchor.y.floor() as i32,
+                        anchor.z.floor() as i32,
+                    );
+                    let (new_meshes, unloaded) = self.vista_world.update_streaming(vista_chunk);
+                    for upos in unloaded {
+                        gpu.vista_store.remove_chunk(upos);
+                    }
+                    for (cpos, mesh) in new_meshes {
+                        gpu.vista_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
                 }
 
-                let hit = raycast_voxels(
-                    self.session.camera.position,
-                    self.session.camera.forward(),
-                    8.0,
-                    |x, y, z| self.session.world.get_block(x, y, z),
-                );
+                // Gameplay raycast feeds both the targeted-block wireframe
+                // and hold-to-mine. Menus suppress it entirely: no wireframe
+                // can float behind a panel, and mining.tick(None, ..) resets
+                // stale progress exactly as before.
+                let hit = if playing {
+                    raycast_voxels(
+                        self.session.camera.position,
+                        self.session.camera.forward(),
+                        8.0,
+                        |x, y, z| self.session.world.get_block(x, y, z),
+                    )
+                } else {
+                    None
+                };
                 // Hold-to-mine candidate: only a held Left button on the
                 // grabbed gameplay surface feeds the accumulator. Every
                 // other frame passes None, which resets stale progress
@@ -1823,6 +2039,56 @@ impl ApplicationHandler for GameApp {
                     h: LINE_HEIGHT + 8.0,
                     color: [0.0, 0.0, 0.0, 0.4],
                 }];
+
+                // Vista branding (M004/S04), gated to the main-menu cluster:
+                // the pack's overlay tint darkens the panorama at the head of
+                // the quad list (all panels/text draw above it), the logo
+                // frame is rebuilt every frame, and with no logo the large
+                // text title is centered in the title strip. Non-vista
+                // screens pass `None` explicitly so no stale logo or tint
+                // follows the player into Pause/Playing.
+                let (brand_w, brand_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                if vista {
+                    if let Some(tint) = self
+                        .current_pack
+                        .as_ref()
+                        .and_then(|pack| pack.overlay_tint)
+                    {
+                        quads.insert(0, logo::tint_quad(brand_w, brand_h, tint));
+                    }
+                }
+                let logo_rect = if vista {
+                    self.current_pack.as_ref().and_then(|pack| {
+                        pack.logo.as_ref().map(|pack_logo| {
+                            logo::logo_rect(
+                                brand_w,
+                                pack_logo.width,
+                                pack_logo.height,
+                                logo::TITLE_STRIP_HEIGHT,
+                            )
+                        })
+                    })
+                } else {
+                    None
+                };
+                gpu.ui
+                    .set_logo_frame(&gpu.ctx.device, logo_rect, brand_w, brand_h);
+
+                // Default title: a large engine-styled "OpenCraft" line,
+                // centered manually (cosmic-text 0.10 has no alignment API).
+                let mut title_text_area = None;
+                if vista && logo_rect.is_none() {
+                    gpu.title_text.update(
+                        &mut gpu.ui.font_system,
+                        brand_w as f32,
+                        brand_h as f32,
+                        logo::TITLE_TEXT,
+                    );
+                    let measured_w = gpu.title_text.measured_width();
+                    let left = logo::centered_title_left(brand_w as f32, measured_w);
+                    title_text_area =
+                        Some(gpu.title_text.text_area(left, logo::TITLE_STRIP_TOP));
+                }
 
                 // While any non-Playing screen is open (S02-T02): draw its
                 // dark panel plus a translucent highlight over the hovered
@@ -1882,7 +2148,11 @@ impl ApplicationHandler for GameApp {
                         });
                     }
                     let text = if settings_open {
-                        compose_menu_text(&self.settings, &self.menu)
+                        let pack_label = self
+                            .current_pack
+                            .as_ref()
+                            .map_or("Default", |pack| pack.display_name.as_str());
+                        compose_menu_text(&self.settings, &self.menu, pack_label)
                     } else {
                         compose_screen_text(
                             active_screen,
@@ -1975,6 +2245,11 @@ impl ApplicationHandler for GameApp {
                 // no pipeline change (MEM014).
                 let stats_text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
                 let mut areas = vec![stats_text_area];
+                // The vista title draws before (under) the screen text, so a
+                // panel containing the title still wins visually.
+                if let Some(title_text_area) = title_text_area {
+                    areas.push(title_text_area);
+                }
                 if let Some(menu_text_area) = menu_text_area {
                     areas.push(menu_text_area);
                 }
@@ -2014,15 +2289,45 @@ impl ApplicationHandler for GameApp {
                     .is_ok();
                 let ui_pass: Option<&dyn UiPass> = if prepare_ok { Some(&gpu.ui) } else { None };
 
-                match gpu.renderer.render_frame(
-                    &gpu.ctx,
-                    &gpu.render_store,
-                    &self.session.camera,
-                    self.session.world.render_distance(),
-                    target_block,
-                    self.session.player.selected_slot,
-                    ui_pass,
-                ) {
+                // Single render_frame call site (M004/S02): menu-cluster
+                // screens render the drifting vista from its own store and
+                // world render distance; every other screen renders the
+                // session exactly as before. The vista camera is built per
+                // frame from the epoch + settings FOV (pure math, cheap),
+                // so live FOV changes reach the panorama. target_block is
+                // always None on vista frames (overlays are off anyway).
+                let vista_camera = if vista {
+                    Some(vista::vista_camera(
+                        self.vista_epoch.elapsed().as_secs_f32(),
+                        self.settings.fov_degrees.to_radians(),
+                    ))
+                } else {
+                    None
+                };
+                let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
+                    gpu.renderer.render_frame(
+                        &gpu.ctx,
+                        &gpu.vista_store,
+                        vista_camera,
+                        self.vista_world.render_distance(),
+                        None,
+                        self.session.player.selected_slot,
+                        false,
+                        ui_pass,
+                    )
+                } else {
+                    gpu.renderer.render_frame(
+                        &gpu.ctx,
+                        &gpu.render_store,
+                        &self.session.camera,
+                        self.session.world.render_distance(),
+                        target_block,
+                        self.session.player.selected_slot,
+                        playing,
+                        ui_pass,
+                    )
+                };
+                match frame_result {
                     Ok(visible_chunks) => {
                         self.frame_count += 1;
                         let elapsed = self.title_timer.elapsed().as_secs_f32();
@@ -2177,7 +2482,7 @@ mod tests {
         let settings = Settings::default();
         let mut menu = menu::SettingsMenu::new();
         menu.open();
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Move Forward: KeyW"));
         assert!(text.contains("Move Backward: KeyS"));
         assert!(text.contains("Move Left: KeyA"));
@@ -2190,6 +2495,7 @@ mod tests {
         assert!(text.contains("Render Distance: 16"));
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
+        assert!(text.contains("Texture Pack: Default"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
         assert!(
@@ -2207,15 +2513,17 @@ mod tests {
             render_distance: 24,
             fullscreen: true,
             vsync: true,
+            texture_pack: None,
         };
         let menu = menu::SettingsMenu::new();
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Jump / Up: ArrowUp"));
         assert!(text.contains("Mouse Sensitivity: 0.0050"));
         assert!(text.contains("Field of View: 90"));
         assert!(text.contains("Render Distance: 24"));
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
+        assert!(text.contains("Texture Pack: Default"));
     }
 
     #[test]
@@ -2224,13 +2532,13 @@ mod tests {
         let mut menu = menu::SettingsMenu::new();
         menu.open();
         menu.begin_rebind(menu::BindAction::JumpOrUp);
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Jump / Up: <press a key>"));
         assert!(text.contains("press a key for 'jump_or_up' (Escape cancels)"));
 
         // Transient messages append as the final line.
         menu.set_message_for_ticks("key already bound to 'forward'", 1);
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.ends_with("key already bound to 'forward'"));
     }
 
@@ -2475,6 +2783,258 @@ mod tests {
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
         app
+    }
+
+    #[test]
+    fn fresh_game_app_has_a_fixed_seed_vista_at_the_settings_render_distance() {
+        let app = app_at_screen(Path::new("/nonexistent/saves"), LifecycleScreen::MainMenu);
+        assert_eq!(app.vista_world.seed(), vista::VISTA_SEED);
+        assert_eq!(
+            app.vista_world.render_distance(),
+            app.settings.render_distance,
+            "the vista follows the settings-driven render distance"
+        );
+        // The vista is its own world, not a hidden alias of the session.
+        assert_ne!(
+            app.vista_world.seed(),
+            app.session.world.seed(),
+            "vista and session are distinct, independently seeded worlds"
+        );
+    }
+
+    #[test]
+    fn render_distance_adjust_updates_the_session_and_vista_worlds_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Settings(
+            SettingsCaller::MainMenu,
+        ));
+        // Keep the click's settings save inside the tempdir, never the crate
+        // root (S04-T02's injection precedent).
+        app.settings_path = dir.path().join("settings.toml");
+        app.settings.render_distance = 16;
+        app.session.world.set_render_distance(16);
+        app.vista_world.set_render_distance(16);
+
+        // The exact helper the MenuRow::RenderDistance click arm calls
+        // (menu_click itself requires a live ActiveEventLoop/Window; the
+        // RenderDistance arm's whole behavior lives in this helper).
+        app.apply_render_distance_adjust(AdjustDirection::Up);
+
+        assert_eq!(app.settings.render_distance, 18);
+        assert_eq!(app.session.world.render_distance(), 18);
+        assert_eq!(app.vista_world.render_distance(), 18);
+        assert!(
+            dir.path().join("settings.toml").exists(),
+            "the click saves the settings exactly as before"
+        );
+
+        // Boundary: at the max the click clamps and both worlds stay
+        // pinned to the same clamped value (negative-path guard).
+        app.settings.render_distance = 36;
+        app.session.world.set_render_distance(36);
+        app.vista_world.set_render_distance(36);
+        app.apply_render_distance_adjust(AdjustDirection::Up);
+        assert_eq!(app.settings.render_distance, 36);
+        assert_eq!(app.session.world.render_distance(), 36);
+        assert_eq!(app.vista_world.render_distance(), 36);
+    }
+
+    // --- texture pack wiring (M004/S03) ---
+
+    /// A headless GameApp whose pack root and settings save path live inside
+    /// `dir` (the same injection pattern as `settings_path`). Defaults to no
+    /// pack selected so each test drives the cycle from a known state.
+    fn app_with_packs(dir: &Path) -> GameApp {
+        let mut app = app_at_screen(
+            dir,
+            LifecycleScreen::Settings(SettingsCaller::MainMenu),
+        );
+        app.settings_path = dir.join("settings.toml");
+        app.packs_root = dir.join("packs");
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+        app.settings.texture_pack = None;
+        app.current_pack = None;
+        app
+    }
+
+    fn write_pack_fixture(dir: &Path, manifest_name: &str) {
+        std::fs::create_dir_all(dir).expect("create pack dir");
+        std::fs::write(dir.join("pack.toml"), format!("name = \"{manifest_name}\"\n"))
+            .expect("write pack.toml");
+    }
+
+    fn write_solid_png(path: &Path, rgba: [u8; 4]) {
+        let file = std::fs::File::create(path).expect("create fixture png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write png header");
+        let mut data = Vec::with_capacity(16 * 16 * 4);
+        for _ in 0..16 * 16 {
+            data.extend_from_slice(&rgba);
+        }
+        writer.write_image_data(&data).expect("write png data");
+    }
+
+    #[test]
+    fn menu_text_shows_the_active_texture_pack_label() {
+        let settings = Settings::default();
+        let menu = menu::SettingsMenu::new();
+        let text = compose_menu_text(&settings, &menu, "Alpha Pack");
+        assert!(text.contains("Texture Pack: Alpha Pack"));
+        assert_eq!(text.lines().count(), menu::ROW_COUNT);
+    }
+
+    #[test]
+    fn texture_pack_cycle_advances_to_the_first_pack_and_persists_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
+        // A real override layer proves the loaded pack's layers reach
+        // GameApp (not just its manifest).
+        write_solid_png(&packs_root.join("alpha").join("grass_top.png"), [200, 10, 20, 255]);
+        app.available_packs = pack::available_pack_names(&packs_root);
+        assert_eq!(app.available_packs, vec!["alpha", "beta"]);
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
+        let loaded = app.current_pack.as_ref().expect("pack loaded");
+        assert_eq!(loaded.display_name, "Alpha Pack");
+        assert_eq!(loaded.layers.len(), 16);
+        assert_ne!(
+            loaded.layers[0],
+            generate_all_texture_layers_rgba()[0],
+            "the pack's authored layer replaces the procedural one"
+        );
+        assert!(loaded.warnings.is_empty(), "clean pack has no warnings");
+
+        // The choice is durable at the injected path.
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.texture_pack.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn texture_pack_cycle_wraps_the_last_pack_back_to_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.texture_pack = Some("alpha".to_string());
+        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
+        assert!(app.current_pack.is_none(), "Default holds no pack data");
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.texture_pack, None);
+    }
+
+    #[test]
+    fn texture_pack_cycle_from_a_deleted_pack_lands_on_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        // The persisted choice names a pack that is no longer on disk.
+        app.settings.texture_pack = Some("deleted".to_string());
+        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "deleted"));
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack, None);
+        assert!(app.current_pack.is_none());
+    }
+
+    #[test]
+    fn texture_pack_cycle_surfaces_load_warnings_in_the_menu_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        let broken = packs_root.join("broken");
+        write_pack_fixture(&broken, "Broken Pack");
+        std::fs::write(broken.join("grass_top.png"), b"not a png").expect("corrupt layer");
+        app.available_packs = pack::available_pack_names(&packs_root);
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
+        let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
+        assert_eq!(loaded.layers.len(), 16, "fallback still fully usable");
+        let message = app.menu.message.as_ref().expect("warning in the menu");
+        assert!(
+            message.text.contains("grass_top.png"),
+            "warning names the failing layer: {}",
+            message.text
+        );
+    }
+
+    #[test]
+    fn load_startup_pack_corrupt_logo_falls_back_to_none_with_file_named_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+        let broken = packs_root.join("broken");
+        write_pack_fixture(&broken, "Broken Pack");
+        std::fs::write(
+            broken.join("pack.toml"),
+            "name = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
+        )
+        .expect("write pack.toml");
+        std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
+
+        let (pack, warnings) = load_startup_pack(&packs_root, Some("broken"));
+
+        let pack = pack.expect("a usable pack is still returned");
+        assert!(pack.logo.is_none(), "corrupt logo falls back to the text title");
+        assert_eq!(pack.layers.len(), 16, "layers stay fully usable");
+        assert!(
+            warnings.iter().any(|w| w.field == "title.png"),
+            "warning names the bare logo file: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_startup_pack_valid_logo_keeps_native_dimensions_without_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+        let branded = packs_root.join("branded");
+        write_pack_fixture(&branded, "Branded Pack");
+        std::fs::write(
+            branded.join("pack.toml"),
+            "name = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
+        )
+        .expect("write pack.toml");
+        write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
+
+        let (pack, warnings) = load_startup_pack(&packs_root, Some("branded"));
+
+        let pack = pack.expect("pack loads");
+        let pack_logo = pack.logo.expect("valid logo decodes");
+        assert_eq!((pack_logo.width, pack_logo.height), (16, 16));
+        assert_eq!(pack_logo.rgba.len(), 16 * 16 * 4);
+        assert_eq!(pack.overlay_tint, Some([0, 0, 0, 120]));
+        assert!(
+            !warnings.iter().any(|w| w.field == "logo.png"),
+            "a valid logo emits no warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_startup_pack_default_selection_is_none_without_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+
+        let (pack, warnings) = load_startup_pack(&packs_root, None);
+
+        assert!(pack.is_none(), "Default is the built-in procedural pack");
+        assert!(warnings.is_empty(), "Default emits no warnings");
     }
 
     /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`
@@ -2905,6 +3465,42 @@ mod tests {
             ),
             "New Game\nLoad Game\nSettings\nExit Game"
         );
+    }
+
+    #[test]
+    fn save_and_quit_from_pause_returns_to_a_vista_menu_with_the_save_flag_cleared() {
+        // S02-T04: the menu-return interaction point where the vista takes
+        // over the frame. The session GPU store clear is intentionally not
+        // asserted here (headless GameApp has `gpu: None`); this locks the
+        // lifecycle/flag side of the handoff so the vista is guaranteed to
+        // be the screen that renders next.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("menu-return.mcvx");
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path));
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(app.session.world.has_unsaved_changes());
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(
+            !vista::vista_visible(app.lifecycle.screen()),
+            "pause keeps rendering the frozen player world"
+        );
+
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
+
+        assert!(!exit_requested);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(
+            vista::vista_visible(app.lifecycle.screen()),
+            "the main menu renders the vista, not the saved world"
+        );
+        assert!(app.main_menu_message.is_none(), "successful save, no message");
+        assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
     }
 
     #[test]

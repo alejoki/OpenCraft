@@ -1,5 +1,6 @@
 pub mod hud;
 pub mod lifecycle;
+pub mod logo;
 pub mod menu;
 pub mod quad;
 pub mod screens;
@@ -23,6 +24,7 @@ pub use screens::{
     PAUSE_ROWS, ScreenKeyAction, SCREEN_WIDTH, SEED_MAX_CHARS,
 };
 
+use crate::pack::PackLogo;
 use crate::render::context::RenderContext;
 use crate::render::pipeline::UiPass;
 
@@ -30,7 +32,8 @@ pub use quad::{Quad, QuadRenderer};
 pub use text::{StatsOverlay, FONT_SIZE, LINE_HEIGHT};
 
 /// Owns the UI rendering stack for the color-only pass: filled quads
-/// (panels/buttons) plus the glyphon text renderer.
+/// (tint/panels/buttons), the optional pack logo, plus the glyphon text
+/// renderer.
 ///
 /// Created once at startup: `FontSystem::new()` scans system fonts, which is
 /// too expensive to do per frame.
@@ -40,6 +43,7 @@ pub struct UiRenderer {
     pub atlas: glyphon::TextAtlas,
     pub text_renderer: glyphon::TextRenderer,
     quad_renderer: QuadRenderer,
+    logo_renderer: logo::LogoRenderer,
 }
 
 impl UiRenderer {
@@ -66,6 +70,7 @@ impl UiRenderer {
             atlas,
             text_renderer,
             quad_renderer: QuadRenderer::new(ctx),
+            logo_renderer: logo::LogoRenderer::new(ctx),
         }
     }
 
@@ -82,12 +87,38 @@ impl UiRenderer {
         self.quad_renderer
             .set_quads(device, quads, surface_w, surface_h);
     }
+
+    /// Replace the pack logo texture. Call on pack load/switch only, never
+    /// per frame: the upload is the expensive part of the logo pipeline.
+    pub fn set_logo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        logo: Option<&PackLogo>,
+    ) {
+        self.logo_renderer.set_logo(device, queue, logo);
+    }
+
+    /// Rebuild the per-frame logo quad. `None` clears it, which also keeps a
+    /// logo from drawing on non-vista screens.
+    pub fn set_logo_frame(
+        &mut self,
+        device: &wgpu::Device,
+        rect: Option<(f32, f32, f32, f32)>,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        self.logo_renderer
+            .set_logo_frame(device, rect, surface_w, surface_h);
+    }
 }
 
 impl UiPass for UiRenderer {
     fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        // Quads first (panels), then text on top.
+        // Quads first (panorama tint/panels), then the pack logo, then text
+        // on top.
         self.quad_renderer.draw(pass);
+        self.logo_renderer.draw(pass);
         let _ = self.text_renderer.render(&self.atlas, pass);
     }
 }

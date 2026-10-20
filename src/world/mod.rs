@@ -6,3 +6,4 @@ pub mod manager;
 pub mod persistence;
 pub mod session;
 pub mod terrain;
+pub mod vista;

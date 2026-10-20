@@ -2,7 +2,7 @@
 /.superpowers
 /saves
 /settings.toml
-docs/
+docs/superpowers/
 .agents/
 skills-lock.json
 
@@ -76,3 +76,4 @@ tmp/
 .gsd/quarantine/
 .gsd/milestones/**/*-CONTINUE.md
 .gsd/milestones/**/continue.md
+REQUIREMENTS-REGISTRY.md

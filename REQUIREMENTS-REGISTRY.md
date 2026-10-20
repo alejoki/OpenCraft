@@ -135,25 +135,75 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: None
 - Validation: cargo clippy --all-targets --all-features -- -D warnings; cargo test --locked
 
-### R014 — Three bounded smoke harnesses pass against target/debug/opencraft with byte-preservation assertions
+### R014 — Four bounded smoke harnesses pass against target/debug/opencraft with byte-preservation assertions
 - Class: operability
 - Status: active
-- Description: Three bounded smoke harnesses pass against target/debug/opencraft with byte-preservation assertions.
+- Description: Four bounded smoke harnesses pass against target/debug/opencraft with byte-preservation assertions.
 - Why it matters: Launch, menu, and settings must keep working end to end.
 - Source: M003 / D022 item 14
 - Primary owning slice: M003/S04
 - Supporting slices: None
-- Validation: bash scripts/launch_smoke.sh; bash scripts/menu_smoke.sh; bash scripts/settings_smoke.sh
+- Validation: bash scripts/launch_smoke.sh; bash scripts/menu_smoke.sh; bash scripts/settings_smoke.sh; bash scripts/pack_smoke.sh
 
 ### R015 — The formal requirements registry carries stable RXXX IDs and supports M003 validation tracing
 - Class: admin/support
 - Status: active
-- Description: The formal requirements registry carries stable RXXX IDs and supports M003 validation tracing.
+- Description: The formal requirements registry carries stable RXXX IDs and supports M003 and M004 validation tracing.
 - Why it matters: Milestone validation must trace criteria to stable IDs.
 - Source: M003 / D022 item 15
 - Primary owning slice: M003/S04
-- Supporting slices: M003/S05
+- Supporting slices: M003/S05, M004/S05
 - Validation: bash scripts/requirements_check.sh
+
+### R016 — Texture packs load from packs/<name>/ folders with pack.toml and square PNG layer overrides (16-256 px resampled to 16x16) with per-file fallback and structured warnings that never block launch
+- Class: differentiator
+- Status: active
+- Description: Texture packs load from packs/<name>/ folders with pack.toml and square PNG layer overrides (16-256 px resampled to 16x16) with per-file fallback and structured warnings that never block launch.
+- Why it matters: A fork must re-skin the entire game without writing engine code.
+- Source: M004 / S01 pack loading core
+- Primary owning slice: M004/S01
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- pack::
+
+### R017 — The main-menu cluster floats over a slowly rotating fixed-seed vista panorama at the configured render distance while Pause shows the paused world and gameplay overlays are suppressed off-Playing
+- Class: quality-attribute
+- Status: active
+- Description: The main-menu cluster floats over a slowly rotating fixed-seed vista panorama at the configured render distance while Pause shows the paused world and gameplay overlays are suppressed off-Playing.
+- Why it matters: The front door must present a live 3D world, not a static menu.
+- Source: M004 / S02 vista panorama
+- Primary owning slice: M004/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::vista; cargo test --locked --bin opencraft
+
+### R018 — The Texture Pack settings row cycles discovered packs with live apply and restart persistence via the [packs] section, and a missing pack falls back to Default with an in-menu warning naming the pack
+- Class: primary-user-loop
+- Status: active
+- Description: The Texture Pack settings row cycles discovered packs with live apply and restart persistence via the [packs] section, and a missing pack falls back to Default with an in-menu warning naming the pack.
+- Why it matters: Pack choice must be a first-class, persistent user setting that never blocks launch.
+- Source: M004 / S03 texture pack setting
+- Primary owning slice: M004/S03
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- settings::; cargo test --locked --bin opencraft; bash scripts/pack_smoke.sh
+
+### R019 — Title branding: a large default text title over the vista, an aspect-preserved pack logo at native size up to 1024 px per side, and a panorama tint quad, with corrupt-logo fallback to the text title and a warning
+- Class: differentiator
+- Status: active
+- Description: Title branding: a large default text title over the vista, an aspect-preserved pack logo at native size up to 1024 px per side, and a panorama tint quad, with corrupt-logo fallback to the text title and a warning.
+- Why it matters: A pack must be able to brand the game's front door.
+- Source: M004 / S04 title branding
+- Primary owning slice: M004/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::logo; cargo test --locked --bin opencraft load_startup_pack
+
+### R020 — Pack authoring documentation and the M004 closure surface: registry rows, criterion trace, and the fourth smoke harness
+- Class: admin/support
+- Status: active
+- Description: Pack authoring documentation and the M004 closure surface: registry rows, criterion trace, and the fourth smoke harness.
+- Why it matters: A fresh reader must author a working pack without reading Rust, and the closure gates must stay green.
+- Source: M004 / S05 closure
+- Primary owning slice: M004/S05
+- Supporting slices: None
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; bash scripts/pack_smoke.sh
 
 ## M003 Criterion Trace
 
@@ -164,3 +214,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 3 | R008, R009, R010 | S03 | cargo test --locked --lib -- player::inventory && cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- ui::hud |
 | 4 | R011, R012, R013, R014 | S04 | cargo build --locked && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked && bash scripts/launch_smoke.sh && bash scripts/menu_smoke.sh && bash scripts/settings_smoke.sh |
 | 5 | R015 | S04, S05 | bash scripts/requirements_check.sh |
+
+## M004 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R016, R018 | S01, S03 | cargo test --locked --lib -- pack:: && cargo test --locked --bin opencraft && bash scripts/pack_smoke.sh |
+| 2 | R016 | S01 | cargo test --locked --lib -- pack:: |
+| 3 | R018 | S03 | cargo test --locked --lib -- settings:: && bash scripts/pack_smoke.sh |
+| 4 | R017 | S02 | cargo test --locked --lib -- world::vista && cargo test --locked --bin opencraft |
+| 5 | R016, R017, R018, R019 | S01, S02, S03, S04 | cargo test --locked |
+| 6 | R014, R020 | S05 | bash scripts/launch_smoke.sh && bash scripts/menu_smoke.sh && bash scripts/settings_smoke.sh && bash scripts/pack_smoke.sh && bash scripts/requirements_check.sh |
+| 7 | R020 | S05 | docs/TEXTURE-PACKS.md quickstart reader-test in bash scripts/pack_smoke.sh |
