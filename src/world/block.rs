@@ -107,6 +107,29 @@ impl BlockId {
             BlockId::IronOre => "Iron Ore",
         }
     }
+
+    /// Seconds of held left-click needed to break this block.
+    ///
+    /// `None` marks structurally unbreakable blocks (Air has nothing to break,
+    /// Bedrock is the world floor). The mining loop treats `None` as "no target".
+    pub const fn break_duration_secs(self) -> Option<f32> {
+        match self {
+            BlockId::Air => None,
+            BlockId::Grass => Some(0.5),
+            BlockId::Dirt => Some(0.45),
+            BlockId::Stone => Some(1.2),
+            BlockId::Cobblestone => Some(1.5),
+            BlockId::Sand => Some(0.45),
+            BlockId::OakLog => Some(0.9),
+            BlockId::OakLeaves => Some(0.2),
+            BlockId::OakPlanks => Some(0.8),
+            BlockId::Brick => Some(1.8),
+            BlockId::Snow => Some(0.3),
+            BlockId::Bedrock => None,
+            BlockId::CoalOre => Some(1.6),
+            BlockId::IronOre => Some(2.2),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +166,44 @@ mod tests {
             assert_eq!(BlockId::CoalOre.face_tex_layer(face_dir), 14);
             assert_eq!(BlockId::IronOre.face_tex_layer(face_dir), 15);
         }
+    }
+
+    #[test]
+    fn test_break_durations_cover_every_breakable_block() {
+        for id in 0u8..=13 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            match block {
+                BlockId::Air | BlockId::Bedrock => {
+                    assert_eq!(
+                        block.break_duration_secs(),
+                        None,
+                        "{block:?} must be unbreakable"
+                    );
+                }
+                _ => {
+                    let duration = block
+                        .break_duration_secs()
+                        .unwrap_or_else(|| panic!("{block:?} must be breakable"));
+                    assert!(duration > 0.0, "{block:?} duration must be positive");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_break_durations_are_ordered_by_hardness() {
+        let leaves = BlockId::OakLeaves.break_duration_secs().unwrap();
+        let dirt = BlockId::Dirt.break_duration_secs().unwrap();
+        let stone = BlockId::Stone.break_duration_secs().unwrap();
+        let coal = BlockId::CoalOre.break_duration_secs().unwrap();
+        let iron = BlockId::IronOre.break_duration_secs().unwrap();
+        assert!(leaves < dirt, "leaves must be faster than dirt");
+        assert!(dirt < stone, "dirt must be faster than stone");
+        assert!(stone < coal, "stone must be faster than coal ore");
+        assert!(coal < iron, "coal ore must be faster than iron ore");
+
+        let cobblestone = BlockId::Cobblestone.break_duration_secs().unwrap();
+        let brick = BlockId::Brick.break_duration_secs().unwrap();
+        assert!(brick > cobblestone, "brick must be slower than cobblestone");
     }
 }
