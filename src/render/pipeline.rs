@@ -7,7 +7,9 @@ use crate::player::camera::{visible_face_mask, Camera, Frustum};
 use crate::player::inventory::HOTBAR_SLOTS;
 use crate::render::buffer::ChunkRenderStore;
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
-use crate::render::texture::create_block_texture_array;
+use crate::render::texture::{
+    block_layers_match_shape, create_block_texture_array, upload_block_layers,
+};
 use crate::world::chunk::CHUNK_SIZE;
 
 #[repr(C)]
@@ -359,6 +361,10 @@ pub trait UiPass {
 }
 
 pub struct VoxelRenderer {
+    /// The 16-layer block texture array retained so live pack changes can
+    /// re-upload layer data into the existing texture (MEM111). The view and
+    /// bind group above stay valid because only the contents change.
+    pub block_texture: wgpu::Texture,
     pub voxel_pipeline: wgpu::RenderPipeline,
     pub overlay_pipeline: wgpu::RenderPipeline,
     pub camera_buffer: wgpu::Buffer,
@@ -368,7 +374,8 @@ pub struct VoxelRenderer {
 
 impl VoxelRenderer {
     pub fn new(ctx: &RenderContext) -> Self {
-        let (tex_view, sampler) = create_block_texture_array(&ctx.device, &ctx.queue);
+        let (block_texture, tex_view, sampler) =
+            create_block_texture_array(&ctx.device, &ctx.queue);
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -577,12 +584,24 @@ impl VoxelRenderer {
             });
 
         Self {
+            block_texture,
             voxel_pipeline,
             overlay_pipeline,
             camera_buffer,
             camera_bind_group,
             chunk_bind_group_layout,
         }
+    }
+
+    /// Re-upload all 16 block texture layers (base mip plus mip chain) into
+    /// the existing texture array. Never recreates the texture, its view, or
+    /// the camera bind group (MEM111).
+    pub fn write_block_layers(&self, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
+        debug_assert!(
+            block_layers_match_shape(layers),
+            "block texture layers must be 16 layers of 16x16 RGBA bytes"
+        );
+        upload_block_layers(&self.block_texture, queue, layers);
     }
 
     // 9 args: the existing world-pass parameters plus the T01 `ui_pass`

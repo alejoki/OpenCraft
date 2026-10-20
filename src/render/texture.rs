@@ -216,35 +216,30 @@ pub fn downsample_rgba_2x(src: &[u8], src_dim: u32) -> Vec<u8> {
     dst
 }
 
-pub fn create_block_texture_array(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> (wgpu::TextureView, wgpu::Sampler) {
-    let layers = generate_all_texture_layers_rgba();
-    let size = wgpu::Extent3d {
-        width: TEX_SIZE,
-        height: TEX_SIZE,
-        depth_or_array_layers: NUM_TEX_LAYERS,
-    };
+/// True when `layers` matches the fixed block texture array contract:
+/// exactly [`NUM_TEX_LAYERS`] layers, each [`TEX_SIZE`] × [`TEX_SIZE`] × 4
+/// RGBA bytes. Used to guard live re-uploads (MEM111) in debug builds.
+pub fn block_layers_match_shape(layers: &[Vec<u8>]) -> bool {
+    layers.len() == NUM_TEX_LAYERS as usize
+        && layers
+            .iter()
+            .all(|layer| layer.len() == (TEX_SIZE * TEX_SIZE * 4) as usize)
+}
 
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("block_texture_array"),
-        size,
-        mip_level_count: MIP_LEVELS,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    for (layer_idx, base_rgba) in layers.into_iter().enumerate() {
-        let mut current = base_rgba;
+/// Upload every layer's base mip and its box-filtered mip chain into an
+/// existing texture array.
+///
+/// Shared by the initial creation path and live pack re-uploads so both use
+/// exactly one upload rule (MEM111: the texture object itself is never
+/// recreated; only its contents change).
+pub fn upload_block_layers(texture: &wgpu::Texture, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
+    for (layer_idx, base_rgba) in layers.iter().enumerate() {
+        let mut current = base_rgba.clone();
         let mut dim = TEX_SIZE;
         for mip in 0..MIP_LEVELS {
             queue.write_texture(
                 wgpu::ImageCopyTexture {
-                    texture: &texture,
+                    texture,
                     mip_level: mip,
                     origin: wgpu::Origin3d {
                         x: 0,
@@ -271,6 +266,31 @@ pub fn create_block_texture_array(
             }
         }
     }
+}
+
+pub fn create_block_texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    let layers = generate_all_texture_layers_rgba();
+    let size = wgpu::Extent3d {
+        width: TEX_SIZE,
+        height: TEX_SIZE,
+        depth_or_array_layers: NUM_TEX_LAYERS,
+    };
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("block_texture_array"),
+        size,
+        mip_level_count: MIP_LEVELS,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    upload_block_layers(&texture, queue, &layers);
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("block_texture_array_view"),
@@ -290,7 +310,7 @@ pub fn create_block_texture_array(
         ..Default::default()
     });
 
-    (view, sampler)
+    (texture, view, sampler)
 }
 
 #[cfg(test)]
@@ -308,6 +328,35 @@ mod tests {
             assert!(remainder.is_empty());
             assert!(pixels.iter().all(|px| px[3] == 255));
         }
+    }
+
+    #[test]
+    fn test_block_layer_shape_accepts_canonical_layers() {
+        assert!(block_layers_match_shape(&generate_all_texture_layers_rgba()));
+    }
+
+    #[test]
+    fn test_block_layer_shape_rejects_wrong_layer_count() {
+        let mut too_few = generate_all_texture_layers_rgba();
+        too_few.pop();
+        assert!(!block_layers_match_shape(&too_few));
+
+        let mut too_many = generate_all_texture_layers_rgba();
+        too_many.push(vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize]);
+        assert!(!block_layers_match_shape(&too_many));
+
+        assert!(!block_layers_match_shape(&[]));
+    }
+
+    #[test]
+    fn test_block_layer_shape_rejects_wrong_layer_size() {
+        let mut short = generate_all_texture_layers_rgba();
+        short[0].pop();
+        assert!(!block_layers_match_shape(&short));
+
+        let mut long = generate_all_texture_layers_rgba();
+        long[0].push(0);
+        assert!(!block_layers_match_shape(&long));
     }
 
     #[test]

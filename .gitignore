@@ -76,3 +76,4 @@ tmp/
 .gsd/quarantine/
 .gsd/milestones/**/*-CONTINUE.md
 .gsd/milestones/**/continue.md
+REQUIREMENTS-REGISTRY.md
