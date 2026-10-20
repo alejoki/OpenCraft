@@ -1000,6 +1000,15 @@ impl GameApp {
                         ticks_left: menu::MESSAGE_TICKS,
                     });
                 }
+                // Drop every session GPU chunk mesh at menu return (the
+                // same boundary rule as `start_world_session`): the menu
+                // renders the vista from its own store, and leaving the
+                // outgoing world's meshes resident both drew the old world
+                // behind the menu and doubled VRAM (MEM115). Clear ONLY the
+                // session store — the vista store belongs to the menu.
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.render_store.clear();
+                }
                 self.enter_screen(LifecycleScreen::MainMenu);
             }
             LifecycleDecision::ExitGame => {
@@ -3065,6 +3074,42 @@ mod tests {
             ),
             "New Game\nLoad Game\nSettings\nExit Game"
         );
+    }
+
+    #[test]
+    fn save_and_quit_from_pause_returns_to_a_vista_menu_with_the_save_flag_cleared() {
+        // S02-T04: the menu-return interaction point where the vista takes
+        // over the frame. The session GPU store clear is intentionally not
+        // asserted here (headless GameApp has `gpu: None`); this locks the
+        // lifecycle/flag side of the handoff so the vista is guaranteed to
+        // be the screen that renders next.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("menu-return.mcvx");
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path));
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        app.session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(app.session.world.has_unsaved_changes());
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(
+            !vista::vista_visible(app.lifecycle.screen()),
+            "pause keeps rendering the frozen player world"
+        );
+
+        let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
+
+        assert!(!exit_requested);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(
+            vista::vista_visible(app.lifecycle.screen()),
+            "the main menu renders the vista, not the saved world"
+        );
+        assert!(app.main_menu_message.is_none(), "successful save, no message");
+        assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
     }
 
     #[test]
