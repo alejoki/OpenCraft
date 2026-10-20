@@ -1,5 +1,5 @@
 use crate::world::block::BlockId;
-use crate::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
 
 #[inline]
 fn hash2d(x: i32, z: i32, seed: u32) -> u32 {
@@ -174,12 +174,180 @@ impl CaveField {
     }
 }
 
+/// A block is strictly inside the stone band when it is above the bedrock
+/// floor and at least four blocks below the column surface. The top three
+/// surface blocks stay solid so caves and ores never punch holes in Stone
+/// mountain surfaces.
+#[inline]
+fn is_inside_stone_band(wy: i32, surface: i32) -> bool {
+    wy > -32 && wy < surface - 3
+}
+
 /// A cave may only carve Stone that is strictly inside the stone band.
-/// `surface` is the column's terrain height: keeping the top three blocks
-/// solid stops caves from punching holes in Stone mountain surfaces.
 #[inline]
 fn is_cave_carvable(block: BlockId, wy: i32, surface: i32) -> bool {
-    block == BlockId::Stone && wy > -32 && wy < surface - 3
+    block == BlockId::Stone && is_inside_stone_band(wy, surface)
+}
+
+/// Deterministic per-chunk xorshift32 stream. No wall-clock or global state,
+/// so the same chunk position and seed always produce the same ore layout.
+struct Xorshift32(u32);
+
+impl Xorshift32 {
+    #[inline]
+    fn new(seed: u32) -> Self {
+        // xorshift32 locks up at zero, so force a non-zero state.
+        Self(seed | 1)
+    }
+
+    #[inline]
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+}
+
+const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+const COAL_DEPTH_BAND: (i32, i32) = (4, 36);
+const IRON_DEPTH_BAND: (i32, i32) = (12, 90);
+
+#[inline]
+fn ore_depth_band(ore: BlockId) -> Option<(i32, i32)> {
+    match ore {
+        BlockId::CoalOre => Some(COAL_DEPTH_BAND),
+        BlockId::IronOre => Some(IRON_DEPTH_BAND),
+        _ => None,
+    }
+}
+
+/// Every ore replacement must satisfy all of these guards: the target is
+/// still Stone, it is strictly inside the stone band, and its depth from the
+/// column surface is inside the ore's band. Re-checking per growth cell keeps
+/// veins from climbing into the surface skin or drifting out of their band.
+#[inline]
+fn can_place_ore(block: BlockId, wy: i32, surface: i32, ore: BlockId) -> bool {
+    if block != BlockId::Stone || !is_inside_stone_band(wy, surface) {
+        return false;
+    }
+    match ore_depth_band(ore) {
+        Some((min_depth, max_depth)) => {
+            let depth = surface - wy;
+            (min_depth..=max_depth).contains(&depth)
+        }
+        None => false,
+    }
+}
+
+/// Stone cells with at least one in-chunk Air neighbor that is itself below
+/// the neighbor column's surface skin. These are cave walls and underground
+/// cliffs, not open sky; veins started from this list are visible when a
+/// player digs into a cave.
+fn exposed_stone_cells(
+    chunk: &Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+) -> Vec<u16> {
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+    let max_local = CHUNK_SIZE as i32 - 1;
+    let mut exposed = Vec::new();
+
+    for lz in 0..CHUNK_SIZE {
+        for ly in 0..CHUNK_SIZE {
+            let wy = base_wy + ly as i32;
+            for lx in 0..CHUNK_SIZE {
+                if chunk.get(lx, ly, lz) != BlockId::Stone
+                    || !is_inside_stone_band(wy, heights[lz][lx])
+                {
+                    continue;
+                }
+                let touches_cave_air = NEIGHBOR_OFFSETS.iter().any(|&(dx, dy, dz)| {
+                    let nlx = lx as i32 + dx;
+                    let nly = ly as i32 + dy;
+                    let nlz = lz as i32 + dz;
+                    if !(0..=max_local).contains(&nlx)
+                        || !(0..=max_local).contains(&nly)
+                        || !(0..=max_local).contains(&nlz)
+                    {
+                        return false;
+                    }
+                    let (nlx, nly, nlz) = (nlx as usize, nly as usize, nlz as usize);
+                    if chunk.get(nlx, nly, nlz) != BlockId::Air {
+                        return false;
+                    }
+                    let nwy = base_wy + nly as i32;
+                    nwy < heights[nlz][nlx] - 3
+                });
+                if touches_cave_air {
+                    exposed.push(linear_index(lx, ly, lz) as u16);
+                }
+            }
+        }
+    }
+
+    exposed
+}
+
+/// Place deterministic coal and iron veins, biased onto cave walls so the
+/// ores are visible from opened caves rather than only after blind mining.
+/// The pass is linear in chunk volume: one exposed-cell scan plus a bounded
+/// number of attempts, with no per-voxel noise calls.
+fn place_ore_veins(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+    seed: u32,
+) {
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+    let mut rng = Xorshift32::new(hash3d(pos.x, pos.y, pos.z, seed ^ 0x000F_E51D));
+    let exposed = exposed_stone_cells(chunk, heights, pos);
+    let max_local = CHUNK_SIZE as i32 - 1;
+
+    for (ore, attempts) in [(BlockId::CoalOre, 14u32), (BlockId::IronOre, 10u32)] {
+        for _ in 0..attempts {
+            let (mut lx, mut ly, mut lz) = if (rng.next() & 1) == 0 && !exposed.is_empty() {
+                let idx = exposed[(rng.next() as usize) % exposed.len()];
+                local_coords_from_index(idx)
+            } else {
+                (
+                    (rng.next() as usize) & 31,
+                    (rng.next() as usize) & 31,
+                    (rng.next() as usize) & 31,
+                )
+            };
+
+            let start_wy = base_wy + ly as i32;
+            if !can_place_ore(chunk.get(lx, ly, lz), start_wy, heights[lz][lx], ore) {
+                continue;
+            }
+
+            let steps = 3 + (rng.next() % 6) as usize;
+            for step in 0..steps {
+                let wy = base_wy + ly as i32;
+                if can_place_ore(chunk.get(lx, ly, lz), wy, heights[lz][lx], ore) {
+                    chunk.set(lx, ly, lz, ore);
+                }
+                if step + 1 == steps {
+                    break;
+                }
+                let (dx, dy, dz) = NEIGHBOR_OFFSETS[(rng.next() % 6) as usize];
+                lx = (lx as i32 + dx).clamp(0, max_local) as usize;
+                ly = (ly as i32 + dy).clamp(0, max_local) as usize;
+                lz = (lz as i32 + dz).clamp(0, max_local) as usize;
+            }
+        }
+    }
 }
 
 #[inline]
@@ -321,6 +489,7 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
         }
     }
 
+    place_ore_veins(&mut chunk, &heights, pos, seed);
     chunk.try_compress();
     chunk
 }
@@ -501,5 +670,278 @@ mod tests {
 
         let sky = generate_chunk(ChunkPos::new(0, 4, 0));
         assert_eq!(sky.is_uniform(), Some(BlockId::Air));
+    }
+
+    fn has_subsurface_air_neighbor(
+        chunk: &Chunk,
+        pos: ChunkPos,
+        lx: usize,
+        ly: usize,
+        lz: usize,
+        seed: u32,
+    ) -> bool {
+        let base_wx = pos.x * CHUNK_SIZE as i32;
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+        let base_wz = pos.z * CHUNK_SIZE as i32;
+        let max_local = CHUNK_SIZE as i32 - 1;
+        NEIGHBOR_OFFSETS.iter().any(|&(dx, dy, dz)| {
+            let nlx = lx as i32 + dx;
+            let nly = ly as i32 + dy;
+            let nlz = lz as i32 + dz;
+            if !(0..=max_local).contains(&nlx)
+                || !(0..=max_local).contains(&nly)
+                || !(0..=max_local).contains(&nlz)
+            {
+                return false;
+            }
+            let (nlx, nly, nlz) = (nlx as usize, nly as usize, nlz as usize);
+            if chunk.get(nlx, nly, nlz) != BlockId::Air {
+                return false;
+            }
+            let nwx = base_wx + nlx as i32;
+            let nwy = base_wy + nly as i32;
+            let nwz = base_wz + nlz as i32;
+            nwy < terrain_height_at_seeded(nwx, nwz, seed) - 3
+        })
+    }
+
+    #[test]
+    fn test_ore_generation_deterministic_full_chunks() {
+        let mut ore_count = 0usize;
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            for cy in -1..=1 {
+                for cz in -1..=1 {
+                    for cx in -1..=1 {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        let first = generate_chunk_seeded(pos, seed);
+                        let second = generate_chunk_seeded(pos, seed);
+                        for lz in 0..CHUNK_SIZE {
+                            for ly in 0..CHUNK_SIZE {
+                                for lx in 0..CHUNK_SIZE {
+                                    let a = first.get(lx, ly, lz);
+                                    assert_eq!(
+                                        a,
+                                        second.get(lx, ly, lz),
+                                        "seed {seed} chunk {pos:?} differs at ({lx}, {ly}, {lz})"
+                                    );
+                                    if matches!(a, BlockId::CoalOre | BlockId::IronOre) {
+                                        ore_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            ore_count > 0,
+            "expected non-vacuous ore placement across sampled chunks"
+        );
+    }
+
+    #[test]
+    fn test_both_ore_types_present_at_default_seed() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut coal = 0usize;
+        let mut iron = 0usize;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -1..=1 {
+                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                match chunk.get(lx, ly, lz) {
+                                    BlockId::CoalOre => coal += 1,
+                                    BlockId::IronOre => iron += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(coal > 0, "seed {seed} generated no coal ore");
+        assert!(iron > 0, "seed {seed} generated no iron ore");
+    }
+
+    #[test]
+    fn test_ore_blocks_respect_surface_and_depth_bands() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut checked = 0usize;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -1..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let h = terrain_height_at_seeded(
+                                base_wx + lx as i32,
+                                base_wz + lz as i32,
+                                seed,
+                            );
+                            for ly in 0..CHUNK_SIZE {
+                                let block = chunk.get(lx, ly, lz);
+                                let Some((min_depth, max_depth)) = ore_depth_band(block) else {
+                                    continue;
+                                };
+                                let wy = base_wy + ly as i32;
+                                let depth = h - wy;
+                                assert!(
+                                    wy < h - 3,
+                                    "{block:?} at world ({}, {wy}, {}) is not below h-3 (h = {h})",
+                                    base_wx + lx as i32,
+                                    base_wz + lz as i32
+                                );
+                                assert!(
+                                    wy > -32,
+                                    "{block:?} at world y {wy} intrudes into bedrock"
+                                );
+                                assert!(
+                                    (min_depth..=max_depth).contains(&depth),
+                                    "{block:?} depth {depth} at ({}, {wy}, {}) outside band {min_depth}..={max_depth}",
+                                    base_wx + lx as i32,
+                                    base_wz + lz as i32
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "no ore blocks found to validate");
+    }
+
+    #[test]
+    fn test_both_ores_visible_from_subsurface_air() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut coal_exposed = 0usize;
+        let mut iron_exposed = 0usize;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -1..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                match chunk.get(lx, ly, lz) {
+                                    BlockId::CoalOre
+                                        if has_subsurface_air_neighbor(
+                                            &chunk, pos, lx, ly, lz, seed,
+                                        ) =>
+                                    {
+                                        coal_exposed += 1;
+                                    }
+                                    BlockId::IronOre
+                                        if has_subsurface_air_neighbor(
+                                            &chunk, pos, lx, ly, lz, seed,
+                                        ) =>
+                                    {
+                                        iron_exposed += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            coal_exposed > 0,
+            "no coal ore adjacent to subsurface cave Air"
+        );
+        assert!(
+            iron_exposed > 0,
+            "no iron ore adjacent to subsurface cave Air"
+        );
+    }
+
+    #[test]
+    fn test_different_seeds_change_ore_layout() {
+        let mut layout_a = Vec::new();
+        let mut layout_b = Vec::new();
+        for cy in -1..=1 {
+            for cz in -1..=1 {
+                for cx in -1..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    for (seed, layout) in [(1337u32, &mut layout_a), (424_242u32, &mut layout_b)] {
+                        let chunk = generate_chunk_seeded(pos, seed);
+                        for lz in 0..CHUNK_SIZE {
+                            for ly in 0..CHUNK_SIZE {
+                                for lx in 0..CHUNK_SIZE {
+                                    let block = chunk.get(lx, ly, lz);
+                                    if matches!(block, BlockId::CoalOre | BlockId::IronOre) {
+                                        layout.push((pos.x, pos.y, pos.z, lx, ly, lz, block as u8));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!layout_a.is_empty(), "seed 1337 produced no ores");
+        assert!(!layout_b.is_empty(), "seed 424242 produced no ores");
+        assert_ne!(
+            layout_a, layout_b,
+            "different seeds produced identical ore layouts"
+        );
+    }
+
+    #[test]
+    fn test_can_place_ore_guards_surface_bedrock_and_bands() {
+        let h = 40;
+        assert!(can_place_ore(BlockId::Stone, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Stone, h - 3, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Stone, h, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Air, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Dirt, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Sand, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Bedrock, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::OakLog, h - 4, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Stone, -32, h, BlockId::CoalOre));
+
+        // Coal depth band is 4..=36.
+        assert!(can_place_ore(BlockId::Stone, h - 4, h, BlockId::CoalOre));
+        assert!(can_place_ore(BlockId::Stone, h - 36, h, BlockId::CoalOre));
+        assert!(!can_place_ore(BlockId::Stone, h - 37, h, BlockId::CoalOre));
+
+        // Iron depth band is 12..=90; use a tall column to test the deep edge.
+        let deep_h = 200;
+        assert!(!can_place_ore(
+            BlockId::Stone,
+            deep_h - 11,
+            deep_h,
+            BlockId::IronOre
+        ));
+        assert!(can_place_ore(
+            BlockId::Stone,
+            deep_h - 12,
+            deep_h,
+            BlockId::IronOre
+        ));
+        assert!(can_place_ore(
+            BlockId::Stone,
+            deep_h - 90,
+            deep_h,
+            BlockId::IronOre
+        ));
+        assert!(!can_place_ore(
+            BlockId::Stone,
+            deep_h - 91,
+            deep_h,
+            BlockId::IronOre
+        ));
+        assert!(!can_place_ore(BlockId::Stone, h - 4, h, BlockId::IronOre));
+        assert!(!can_place_ore(BlockId::Stone, h - 4, h, BlockId::Stone));
     }
 }
