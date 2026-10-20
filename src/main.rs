@@ -12,6 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
+use minecraft_clone::player::mining::{MiningState, MiningTick};
 use minecraft_clone::player::physics::InputState;
 use minecraft_clone::player::raycast::raycast_voxels;
 use minecraft_clone::render::buffer::ChunkRenderStore;
@@ -31,6 +32,7 @@ use minecraft_clone::ui::screens::{
     FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
     ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
+use minecraft_clone::ui::hud::mining_progress_quads;
 use minecraft_clone::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
@@ -536,6 +538,14 @@ struct GameApp {
     session: WorldSession,
     input: InputState,
     cursor_grabbed: bool,
+    /// The hold-to-mine accumulator (S02): pure state machine driven once per
+    /// frame from the RedrawRequested pass. Any reset boundary below clears it
+    /// so a menu/focus/session change never inherits partial progress.
+    mining: MiningState,
+    /// Whether the left mouse button is physically held from a gameplay
+    /// press. Set only after the screen routing and click-to-grab early
+    /// returns, cleared on release, focus loss, and screen/session changes.
+    left_mouse_held: bool,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -631,6 +641,8 @@ impl GameApp {
             session,
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
+            mining: MiningState::new(),
+            left_mouse_held: false,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -755,6 +767,8 @@ impl GameApp {
             self.main_menu_message = None;
         }
         self.input.reset();
+        self.left_mouse_held = false;
+        self.mining.reset();
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, false);
@@ -785,6 +799,10 @@ impl GameApp {
     /// Return to gameplay: re-grab the cursor (settings/pause return paths)
     /// and close any open settings menu, keeping the sync invariant.
     fn enter_playing(&mut self) {
+        // Defensive: a hold or partial progress must never survive a trip
+        // through a menu and back into gameplay.
+        self.left_mouse_held = false;
+        self.mining.reset();
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, true);
@@ -825,6 +843,8 @@ impl GameApp {
             gpu.render_store.clear();
         }
         self.input.reset();
+        self.left_mouse_held = false;
+        self.mining.reset();
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -1317,6 +1337,8 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::Focused(false) => {
                 self.input.reset();
+                self.left_mouse_held = false;
+                self.mining.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -1518,6 +1540,17 @@ impl ApplicationHandler for GameApp {
                 }
             }
             WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // A release can arrive while a menu owns the input, so this
+                // arm deliberately bypasses the screen routing: clearing the
+                // hold and any partial progress is always safe.
+                self.left_mouse_held = false;
+                self.mining.reset();
+            }
+            WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
@@ -1565,30 +1598,23 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
 
-                if let Some(hit) = raycast_voxels(
-                    self.session.camera.position,
-                    self.session.camera.forward(),
-                    8.0,
-                    |x, y, z| self.session.world.get_block(x, y, z),
-                ) {
-                    match button {
-                        MouseButton::Left => {
-                            let bp = hit.block_pos;
-                            if self.session.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
-                                let remeshed =
-                                    self.session.world
-                                        .set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
-                                for (cpos, mesh) in remeshed {
-                                    gpu.render_store.upload_mesh(
-                                        &gpu.ctx.device,
-                                        &gpu.renderer.chunk_bind_group_layout,
-                                        cpos,
-                                        &mesh,
-                                    );
-                                }
-                            }
-                        }
-                        MouseButton::Right => {
+                // Hold-to-mine (S02): a Left press only arms the hold — no
+                // raycast and no break happen here. The break happens once
+                // per frame in RedrawRequested from the held candidate, so a
+                // press can never break a block instantly (double-break
+                // hazard). Right click keeps its byte-identical instant
+                // placement path, including the raycast.
+                match button {
+                    MouseButton::Left => {
+                        self.left_mouse_held = true;
+                    }
+                    MouseButton::Right => {
+                        if let Some(hit) = raycast_voxels(
+                            self.session.camera.position,
+                            self.session.camera.forward(),
+                            8.0,
+                            |x, y, z| self.session.world.get_block(x, y, z),
+                        ) {
                             let ap = hit.adjacent_pos;
                             if !self.session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
                                 let place_block = BlockId::HOTBAR[self.session.player.selected_slot];
@@ -1605,8 +1631,8 @@ impl ApplicationHandler for GameApp {
                                 }
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1672,13 +1698,51 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                let target_block = raycast_voxels(
+                let hit = raycast_voxels(
                     self.session.camera.position,
                     self.session.camera.forward(),
                     8.0,
                     |x, y, z| self.session.world.get_block(x, y, z),
-                )
-                .map(|h| h.block_pos);
+                );
+                // Hold-to-mine candidate: only a held Left button on the
+                // grabbed gameplay surface feeds the accumulator. Every
+                // other frame passes None, which resets stale progress
+                // (released, paused, or cursor not grabbed).
+                let candidate = if playing && self.cursor_grabbed && self.left_mouse_held {
+                    hit.map(|h| {
+                        (
+                            h.block_pos,
+                            self.session
+                                .world
+                                .get_block(h.block_pos.x, h.block_pos.y, h.block_pos.z),
+                        )
+                    })
+                } else {
+                    None
+                };
+                let mut target_block = hit.map(|h| h.block_pos);
+                if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
+                    // The only production break site (S02): hardness
+                    // gating happens in MiningState, so Bedrock (no
+                    // duration) can never reach this arm. `block` is
+                    // kept for S03's collection hook.
+                    let _ = block;
+                    let remeshed = self
+                        .session
+                        .world
+                        .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+                    for (cpos, mesh) in remeshed {
+                        gpu.render_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
+                    // The cell is Air now; do not draw the wireframe
+                    // around the block that just disappeared.
+                    target_block = None;
+                }
 
                 // Translucent dark panel behind the stats text: the visible
                 // proof that pixel-space quads render in the UI pass. Width is
@@ -1806,6 +1870,15 @@ impl ApplicationHandler for GameApp {
                         load_play_text_area = Some(gpu.load_play_text.text_area(play_x, play_y));
                         load_delete_text_area =
                             Some(gpu.load_delete_text.text_area(delete_x, play_y));
+                    }
+                }
+                if playing {
+                    if let Some(progress) = self.mining.progress() {
+                        quads.extend(mining_progress_quads(
+                            progress,
+                            gpu.ctx.config.width,
+                            gpu.ctx.config.height,
+                        ));
                     }
                 }
                 gpu.ui.set_quads(
@@ -1997,6 +2070,8 @@ mod tests {
     use minecraft_clone::player::camera::Camera;
     use minecraft_clone::world::persistence::ChunkEditMap;
     use minecraft_clone::world::terrain::terrain_height_at_seeded;
+
+    use glam::IVec3;
 
     #[test]
     fn menu_text_lists_every_row_with_its_live_value() {
@@ -2657,6 +2732,62 @@ mod tests {
         assert!(
             !app.input.forward && !app.input.jump_or_up && !app.input.sprint,
             "input flags reset at the boundary"
+        );
+    }
+
+    /// S02-T03: entering a non-Playing screen drops both the held-button
+    /// latch and any partial mining progress — a menu must never inherit a
+    /// hold or show a stale bar.
+    #[test]
+    fn enter_screen_clears_held_mouse_and_mining_progress() {
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+        );
+        app.left_mouse_held = true;
+        app.mining
+            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        assert!(
+            app.mining.progress().is_some(),
+            "0.5s on Stone leaves partial progress"
+        );
+
+        app.enter_screen(LifecycleScreen::MainMenu);
+
+        assert!(
+            !app.left_mouse_held,
+            "held latch cleared on screen entry"
+        );
+        assert!(
+            app.mining.progress().is_none(),
+            "partial mining progress cleared on screen entry"
+        );
+    }
+
+    /// S02-T03: a world swap clears the hold/progress too, so a new world
+    /// can never start with progress inherited from the outgoing session.
+    #[test]
+    fn start_world_session_clears_held_mouse_and_mining_progress() {
+        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+        );
+        app.left_mouse_held = true;
+        app.mining
+            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        assert!(app.mining.progress().is_some());
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+        ));
+
+        assert!(!app.left_mouse_held, "held latch cleared on session swap");
+        assert!(
+            app.mining.progress().is_none(),
+            "partial mining progress cleared on session swap"
         );
     }
 
