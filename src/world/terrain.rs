@@ -948,9 +948,9 @@ mod tests {
         let base_wx = pos.x * CHUNK_SIZE as i32;
         let base_wz = pos.z * CHUNK_SIZE as i32;
         let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                heights[lz][lx] = terrain_height_at_seeded(
+        for (lz, row) in heights.iter_mut().enumerate() {
+            for (lx, h) in row.iter_mut().enumerate() {
+                *h = terrain_height_at_seeded(
                     base_wx + lx as i32,
                     base_wz + lz as i32,
                     seed,
@@ -980,9 +980,9 @@ mod tests {
                 let second = generate_chunk_seeded(pos, seed);
                 let heights = chunk_heights(pos, seed);
                 let base_wy = pos.y * CHUNK_SIZE as i32;
-                for lz in 0..CHUNK_SIZE {
+                for (lz, row) in heights.iter().enumerate() {
                     for ly in 0..CHUNK_SIZE {
-                        for lx in 0..CHUNK_SIZE {
+                        for (lx, &h) in row.iter().enumerate() {
                             let a = first.get(lx, ly, lz);
                             assert_eq!(
                                 a,
@@ -990,10 +990,7 @@ mod tests {
                                 "seed {seed} chunk {pos:?} differs at ({lx}, {ly}, {lz})"
                             );
                             let wy = base_wy + ly as i32;
-                            if a == BlockId::Air
-                                && wy > -32
-                                && wy < heights[lz][lx] - 3
-                            {
+                            if a == BlockId::Air && wy > -32 && wy < h - 3 {
                                 carved_air += 1;
                             }
                             if matches!(a, BlockId::CoalOre | BlockId::IronOre) {
@@ -1216,9 +1213,8 @@ mod tests {
                     let chunk = generate_chunk_seeded(pos, seed);
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let top_wy = base_wy + CHUNK_SIZE as i32 - 1;
-                    for lz in 0..CHUNK_SIZE {
-                        for lx in 0..CHUNK_SIZE {
-                            let h = heights[lz][lx];
+                    for (lz, row) in heights.iter().enumerate() {
+                        for (lx, &h) in row.iter().enumerate() {
                             let wx = base_wx + lx as i32;
                             let wz = base_wz + lz as i32;
                             for ly in 0..CHUNK_SIZE {

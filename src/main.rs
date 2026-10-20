@@ -2404,8 +2404,10 @@ mod tests {
         // load does not deduplicate; first-match priority in Keybinds
         // declaration order keeps routing deterministic instead of
         // last-write-wins per flag.
-        let mut binds = Keybinds::default();
-        binds.backward = KeyCode::KeyW; // collides with forward
+        let binds = Keybinds {
+            backward: KeyCode::KeyW, // collides with forward
+            ..Keybinds::default()
+        };
         let mut input = InputState::default();
         assert!(apply_gameplay_key(&mut input, &binds, KeyCode::KeyW, true));
         assert!(input.forward, "forward is declared first and wins");
@@ -3634,8 +3636,9 @@ mod tests {
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
     /// rebinding nothing else) — a valid, conflict-free state.
     fn opencraft_keybinds_jump_arrow_up() -> opencraft::settings::Keybinds {
-        let mut binds = opencraft::settings::Keybinds::default();
-        binds.jump_or_up = KeyCode::ArrowUp;
-        binds
+        opencraft::settings::Keybinds {
+            jump_or_up: KeyCode::ArrowUp,
+            ..opencraft::settings::Keybinds::default()
+        }
     }
 }

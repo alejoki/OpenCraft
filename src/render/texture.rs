@@ -301,7 +301,9 @@ mod tests {
         assert_eq!(layers.len(), 16);
         for layer in &layers {
             assert_eq!(layer.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
-            assert!(layer.chunks_exact(4).all(|px| px[3] == 255));
+            let (pixels, remainder) = layer.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(pixels.iter().all(|px| px[3] == 255));
         }
     }
 
@@ -316,14 +318,16 @@ mod tests {
         assert_ne!(iron, stone, "iron ore must differ from stone");
         assert_ne!(coal, iron, "coal and iron ore must differ");
 
-        let first = &coal[..4];
+        let (coal_pixels, _) = coal.as_chunks::<4>();
+        let first = &coal_pixels[0];
         assert!(
-            coal.chunks_exact(4).any(|px| px != first),
+            coal_pixels.iter().any(|px| px != first),
             "coal ore texture must not be a flat color"
         );
-        let first = &iron[..4];
+        let (iron_pixels, _) = iron.as_chunks::<4>();
+        let first = &iron_pixels[0];
         assert!(
-            iron.chunks_exact(4).any(|px| px != first),
+            iron_pixels.iter().any(|px| px != first),
             "iron ore texture must not be a flat color"
         );
     }
