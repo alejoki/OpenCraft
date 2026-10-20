@@ -2033,7 +2033,7 @@ impl ApplicationHandler for GameApp {
                                 ""
                             };
                             window.set_title(&format!(
-                                "Minecraft Clone{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
+                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
                                 screen_title_tag(self.lifecycle.screen()),
                                 fps,
                                 ms,

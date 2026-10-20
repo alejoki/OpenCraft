@@ -105,15 +105,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: None
 - Validation: cargo test --locked --lib -- ui::hud; cargo test --locked --bin opencraft
 
-### R011 — Package, library, and binary named opencraft with no stale minecraft-clone identity
+### R011 — Package, library, and binary named opencraft with no stale legacy project identity
 - Class: launchability
 - Status: active
-- Description: Package, library, and binary named opencraft with no stale minecraft-clone identity.
+- Description: Package, library, and binary named opencraft with no stale legacy project identity.
 - Why it matters: The shipped identity must match OpenCraft.
 - Source: M003 / D022 item 11
 - Primary owning slice: M003/S04
 - Supporting slices: None
-- Validation: cargo build --locked; test -x target/debug/opencraft; ! rg -q 'minecraft[-_]clone' Cargo.toml Cargo.lock src scripts
+- Validation: cargo build --locked; test -x target/debug/opencraft; ! rg -qi 'minecraft[-_ ]?clone' Cargo.toml Cargo.lock src scripts
 
 ### R012 — MIT LICENSE and Cargo license = "MIT"
 - Class: compliance/security

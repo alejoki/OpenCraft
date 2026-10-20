@@ -10,7 +10,9 @@
 #   6. every M003 slice (S01-S05) is covered by at least one mapped record,
 #   7. the M003 criterion trace table matches the expected requirement/slice
 #      mapping for criteria 1-5 and carries non-empty evidence,
-#   8. the validated criterion trace table is printed.
+#   8. the shipped identity surface (manifest, lockfile, src, scripts) contains
+#      no legacy project-name reference, in any case or separator form,
+#   9. the validated criterion trace table is printed.
 #
 # REQUIREMENTS_FILE overrides the registry path (used by the negative-path
 # selftest). The default is <repo-root>/REQUIREMENTS-REGISTRY.md.
@@ -255,7 +257,31 @@ done
 pass "M003 criterion trace rows 1-5 match expected requirement/slice mappings with evidence"
 
 # ---------------------------------------------------------------------------
-# 8. Print the validated criterion trace table.
+# 8. Shipped identity. The legacy project name must not survive anywhere in
+#    the manifest, lockfile, source, or scripts. The pattern accepts hyphen,
+#    underscore, or space separators and is case-insensitive so the shipped
+#    window title cannot slip past the gate. IDENTITY_SCAN_ROOT lets the
+#    negative-path selftest point this check at a throwaway tree.
+# ---------------------------------------------------------------------------
+IDENTITY_ROOT="${IDENTITY_SCAN_ROOT:-$REPO_ROOT}"
+identity_matches=""
+for surface in \
+    "$IDENTITY_ROOT/Cargo.toml" \
+    "$IDENTITY_ROOT/Cargo.lock" \
+    "$IDENTITY_ROOT/src" \
+    "$IDENTITY_ROOT/scripts"; do
+    [[ -e "$surface" ]] || continue
+    matches="$(grep -REin 'minecraft[ _-]?clone' "$surface" 2>/dev/null || true)"
+    if [[ -n "$matches" ]]; then
+        identity_matches+="$matches"$'\n'
+    fi
+done
+[[ -z "$identity_matches" ]] \
+    || fail "legacy project identity found on the shipped surface:"$'\n'"$identity_matches"
+pass "shipped identity is opencraft with no legacy project-name references"
+
+# ---------------------------------------------------------------------------
+# 9. Print the validated criterion trace table.
 # ---------------------------------------------------------------------------
 echo
 echo "M003 Criterion Trace"

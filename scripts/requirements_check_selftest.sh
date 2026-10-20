@@ -8,6 +8,7 @@
 #   3. lost M003 slice mapping
 #   4. wrong M003 criterion -> requirement mapping
 #   5. missing per-record Validation field
+#   6. stale legacy project identity on the shipped surface
 #
 # Every mutation is applied to a throwaway copy under mktemp -d; the canonical
 # REQUIREMENTS-REGISTRY.md is never written. The selftest asserts the on-disk
@@ -125,6 +126,24 @@ awk '
 ' "$REGISTRY" > "$case6"
 assert_mutated "validation field" "$case1" "$case6"
 expect_fail "missing Validation field on R005" "$case6"
+
+# --- Case 7: stale legacy identity on the shipped surface ----------------
+case7="$SCRATCH/case7.md"
+cp "$REGISTRY" "$case7"
+identity_root="$SCRATCH/identity-root"
+mkdir -p "$identity_root/src" "$identity_root/scripts"
+cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "$identity_root/"
+printf 'fn main() { let _ = "Minecraft%sClone"; }\n' ' ' > "$identity_root/src/stale.rs"
+rc=0
+IDENTITY_SCAN_ROOT="$identity_root" REQUIREMENTS_FILE="$case7" \
+    bash "$CHECKER" >"$CHECK_LOG" 2>&1 || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: stale legacy identity should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'legacy project identity found' "$CHECK_LOG" \
+    || { echo "FAIL: stale identity was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: stale legacy identity rejected"
 
 # --- Canonical registry must be untouched --------------------------------
 cmp -s "$PRISTINE" "$REGISTRY" \
