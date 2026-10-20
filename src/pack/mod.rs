@@ -4,4 +4,5 @@
 //! imports may appear here so the whole surface is testable headlessly.
 //! Later tasks add the manifest, PNG decode, and `LoadedPack` contract.
 
+pub mod decode;
 pub mod resample;
