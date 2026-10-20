@@ -5,4 +5,5 @@
 //! Later tasks add the manifest, PNG decode, and `LoadedPack` contract.
 
 pub mod decode;
+pub mod manifest;
 pub mod resample;
