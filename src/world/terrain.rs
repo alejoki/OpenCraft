@@ -944,4 +944,379 @@ mod tests {
         assert!(!can_place_ore(BlockId::Stone, h - 4, h, BlockId::IronOre));
         assert!(!can_place_ore(BlockId::Stone, h - 4, h, BlockId::Stone));
     }
+
+    fn chunk_heights(pos: ChunkPos, seed: u32) -> [[i32; CHUNK_SIZE]; CHUNK_SIZE] {
+        let base_wx = pos.x * CHUNK_SIZE as i32;
+        let base_wz = pos.z * CHUNK_SIZE as i32;
+        let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                heights[lz][lx] = terrain_height_at_seeded(
+                    base_wx + lx as i32,
+                    base_wz + lz as i32,
+                    seed,
+                );
+            }
+        }
+        heights
+    }
+
+    /// Slice acceptance: generation is byte-for-byte deterministic, the sample
+    /// is non-vacuous (carved cave Air and ore both present), and changing the
+    /// seed changes the generated world.
+    #[test]
+    fn test_acceptance_generation_deterministic_and_nonvacuous() {
+        let positions = [
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-1, 1, 2),
+        ];
+        let mut carved_air = 0usize;
+        let mut ore_blocks = 0usize;
+
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            for &pos in &positions {
+                let first = generate_chunk_seeded(pos, seed);
+                let second = generate_chunk_seeded(pos, seed);
+                let heights = chunk_heights(pos, seed);
+                let base_wy = pos.y * CHUNK_SIZE as i32;
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let a = first.get(lx, ly, lz);
+                            assert_eq!(
+                                a,
+                                second.get(lx, ly, lz),
+                                "seed {seed} chunk {pos:?} differs at ({lx}, {ly}, {lz})"
+                            );
+                            let wy = base_wy + ly as i32;
+                            if a == BlockId::Air
+                                && wy > -32
+                                && wy < heights[lz][lx] - 3
+                            {
+                                carved_air += 1;
+                            }
+                            if matches!(a, BlockId::CoalOre | BlockId::IronOre) {
+                                ore_blocks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut seed_changed_any_block = false;
+        for &pos in &positions {
+            let first = generate_chunk_seeded(pos, DEFAULT_WORLD_SEED);
+            let second = generate_chunk_seeded(pos, 424_242);
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if first.get(lx, ly, lz) != second.get(lx, ly, lz) {
+                            seed_changed_any_block = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(carved_air > 0, "acceptance sample contains no carved cave Air below h-3");
+        assert!(ore_blocks > 0, "acceptance sample contains no ore blocks");
+        assert!(
+            seed_changed_any_block,
+            "seeds 1337 and 424242 produced identical blocks across the acceptance sample"
+        );
+    }
+
+    /// Slice acceptance: cave surfaces produce interior mesh quads (a uniform
+    /// stone chunk only meshes boundary quads), and exposed ore faces are
+    /// emitted into the correct face buckets with texture layers 14/15.
+    #[test]
+    fn test_acceptance_caves_and_ores_are_visible_in_mesh() {
+        use crate::mesh::greedy::{mesh_chunk, PaddedChunk};
+
+        let seed = DEFAULT_WORLD_SEED;
+        let max_local = CHUNK_SIZE as i32 - 1;
+        let mut cave_chunks = 0usize;
+        let mut interior_quads = 0usize;
+        let mut coal_faces = 0usize;
+        let mut iron_faces = 0usize;
+
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                for cy in -1..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    let heights = chunk_heights(pos, seed);
+                    let base_wy = pos.y * CHUNK_SIZE as i32;
+                    let mut has_carved_air = false;
+                    let mut exposed_ores: Vec<(BlockId, u8)> = Vec::new();
+
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let h = heights[lz][lx];
+                            for ly in 0..CHUNK_SIZE {
+                                let wy = base_wy + ly as i32;
+                                let block = chunk.get(lx, ly, lz);
+                                if block == BlockId::Air && wy > -32 && wy < h - 3 {
+                                    has_carved_air = true;
+                                }
+                                if !matches!(block, BlockId::CoalOre | BlockId::IronOre) {
+                                    continue;
+                                }
+                                for (face_dir, &(dx, dy, dz)) in
+                                    NEIGHBOR_OFFSETS.iter().enumerate()
+                                {
+                                    let nlx = lx as i32 + dx;
+                                    let nly = ly as i32 + dy;
+                                    let nlz = lz as i32 + dz;
+                                    if !(0..=max_local).contains(&nlx)
+                                        || !(0..=max_local).contains(&nly)
+                                        || !(0..=max_local).contains(&nlz)
+                                    {
+                                        continue;
+                                    }
+                                    let (nlx, nly, nlz) = (nlx as usize, nly as usize, nlz as usize);
+                                    if chunk.get(nlx, nly, nlz) != BlockId::Air {
+                                        continue;
+                                    }
+                                    let nwy = base_wy + nly as i32;
+                                    if nwy < heights[nlz][nlx] - 3 {
+                                        exposed_ores.push((block, face_dir as u8));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !has_carved_air && exposed_ores.is_empty() {
+                        continue;
+                    }
+
+                    let mesh = mesh_chunk(&PaddedChunk::from_center_only(&chunk));
+                    if has_carved_air {
+                        cave_chunks += 1;
+                        for bucket in &mesh.buckets {
+                            for quad in bucket {
+                                let (x, y, z, _, _, face_dir, _, _) = quad.unpack();
+                                let axis_d = match face_dir / 2 {
+                                    0 => x,
+                                    1 => y,
+                                    _ => z,
+                                };
+                                if axis_d > 0 && axis_d < CHUNK_SIZE as u32 - 1 {
+                                    interior_quads += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    for (ore, face_dir) in exposed_ores {
+                        let layer = ore.face_tex_layer(face_dir);
+                        if mesh.buckets[face_dir as usize]
+                            .iter()
+                            .any(|q| q.unpack().6 == layer)
+                        {
+                            match ore {
+                                BlockId::CoalOre => coal_faces += 1,
+                                BlockId::IronOre => iron_faces += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(cave_chunks > 0, "no chunk with carved cave Air in the mesh scan region");
+        assert!(
+            interior_quads > 0,
+            "cave chunk meshing produced no interior-axis quads; cave surfaces were not meshed"
+        );
+        assert!(coal_faces > 0, "no coal ore face meshed with texture layer 14");
+        assert!(iron_faces > 0, "no iron ore face meshed with texture layer 15");
+    }
+
+    /// Slice acceptance: seed 1337 has deterministic, human-reachable dig
+    /// targets. Coordinates are printed for the closeout UAT (`-- --nocapture`).
+    #[test]
+    fn test_acceptance_uat_dig_targets_near_origin() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut shallowest_coal: Option<(i32, i32, i32)> = None;
+        let mut shallowest_iron: Option<(i32, i32, i32)> = None;
+
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                for cy in -1..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                let block = chunk.get(lx, ly, lz);
+                                if !matches!(block, BlockId::CoalOre | BlockId::IronOre)
+                                    || !has_subsurface_air_neighbor(
+                                        &chunk, pos, lx, ly, lz, seed,
+                                    )
+                                {
+                                    continue;
+                                }
+                                let coord = (
+                                    base_wx + lx as i32,
+                                    base_wy + ly as i32,
+                                    base_wz + lz as i32,
+                                );
+                                let slot = if block == BlockId::CoalOre {
+                                    &mut shallowest_coal
+                                } else {
+                                    &mut shallowest_iron
+                                };
+                                if slot.is_none_or(|(_, best_y, _)| coord.1 > best_y) {
+                                    *slot = Some(coord);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let coal = shallowest_coal.expect("seed 1337 has no reachable coal ore near origin");
+        let iron = shallowest_iron.expect("seed 1337 has no reachable iron ore near origin");
+        eprintln!(
+            "UAT seed {seed}: visible coal ore at world ({}, {}, {})",
+            coal.0, coal.1, coal.2
+        );
+        eprintln!(
+            "UAT seed {seed}: visible iron ore at world ({}, {}, {})",
+            iron.0, iron.1, iron.2
+        );
+    }
+
+    /// Slice acceptance invariants over a broad region: ores stay strictly
+    /// below the h-3 roof and inside their depth bands, the bedrock floor is
+    /// intact, the surface skin (h, h-1..h-3) is never carved, and Stone
+    /// mountain tops (h >= 58) are never punched through.
+    #[test]
+    fn test_acceptance_invariants_over_broad_region() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut ore_count = 0usize;
+        let mut mountain_surface_checks = 0usize;
+
+        for cx in -8..=8 {
+            for cz in -8..=8 {
+                let heights = chunk_heights(ChunkPos::new(cx, 0, cz), seed);
+                let base_wx = cx * CHUNK_SIZE as i32;
+                let base_wz = cz * CHUNK_SIZE as i32;
+                for cy in -1..=2 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let top_wy = base_wy + CHUNK_SIZE as i32 - 1;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let h = heights[lz][lx];
+                            let wx = base_wx + lx as i32;
+                            let wz = base_wz + lz as i32;
+                            for ly in 0..CHUNK_SIZE {
+                                let wy = base_wy + ly as i32;
+                                let block = chunk.get(lx, ly, lz);
+                                if wy == -32 {
+                                    assert_eq!(
+                                        block,
+                                        BlockId::Bedrock,
+                                        "wy == -32 is not Bedrock at ({wx}, {wy}, {wz})"
+                                    );
+                                }
+                                if let Some((min_depth, max_depth)) = ore_depth_band(block) {
+                                    ore_count += 1;
+                                    assert!(
+                                        wy < h - 3,
+                                        "{block:?} at ({wx}, {wy}, {wz}) is not below h-3 (h = {h})"
+                                    );
+                                    assert!(
+                                        wy > -32,
+                                        "{block:?} at ({wx}, {wy}, {wz}) intrudes into bedrock"
+                                    );
+                                    let depth = h - wy;
+                                    assert!(
+                                        (min_depth..=max_depth).contains(&depth),
+                                        "{block:?} depth {depth} at ({wx}, {wy}, {wz}) outside {min_depth}..={max_depth}"
+                                    );
+                                }
+                            }
+                            for wy in (h - 3)..=h {
+                                if !(base_wy..=top_wy).contains(&wy) {
+                                    continue;
+                                }
+                                let ly = (wy - base_wy) as usize;
+                                assert_ne!(
+                                    chunk.get(lx, ly, lz),
+                                    BlockId::Air,
+                                    "surface skin carved at world ({wx}, {wy}, {wz}) (h = {h})"
+                                );
+                            }
+                            if h >= 58 && (base_wy..=top_wy).contains(&h) {
+                                let ly = (h - base_wy) as usize;
+                                let surface = chunk.get(lx, ly, lz);
+                                assert_ne!(
+                                    surface,
+                                    BlockId::Air,
+                                    "mountain-top surface carved at ({wx}, {h}, {wz})"
+                                );
+                                if h < 68 {
+                                    assert_eq!(
+                                        surface,
+                                        BlockId::Stone,
+                                        "expected Stone mountain top at ({wx}, {h}, {wz})"
+                                    );
+                                }
+                                mountain_surface_checks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(ore_count > 0, "broad invariant scan found no ore blocks");
+
+        if mountain_surface_checks == 0 {
+            // The near-origin region has no mountain; probe wider terrain so
+            // the carve guard against surface holes is exercised non-vacuously.
+            let mut highest: Option<(i32, i32, i32)> = None;
+            for wz in (-1024..=1024).step_by(16) {
+                for wx in (-1024..=1024).step_by(16) {
+                    let h = terrain_height_at_seeded(wx, wz, seed);
+                    if highest.is_none_or(|(_, _, best)| h > best) {
+                        highest = Some((wx, wz, h));
+                    }
+                }
+            }
+            let (wx, wz, h) = highest.expect("height search must yield a column");
+            assert!(h >= 58, "height search did not reach mountain terrain (max h = {h})");
+            let pos = ChunkPos::new(
+                wx.div_euclid(CHUNK_SIZE as i32),
+                h.div_euclid(CHUNK_SIZE as i32),
+                wz.div_euclid(CHUNK_SIZE as i32),
+            );
+            let chunk = generate_chunk_seeded(pos, seed);
+            let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
+            let ly = h.rem_euclid(CHUNK_SIZE as i32) as usize;
+            let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
+            assert_ne!(
+                chunk.get(lx, ly, lz),
+                BlockId::Air,
+                "cave punched a hole in the mountain surface at ({wx}, {h}, {wz})"
+            );
+        } else {
+            eprintln!(
+                "acceptance invariants: checked {mountain_surface_checks} mountain-top surface cells"
+            );
+        }
+    }
 }

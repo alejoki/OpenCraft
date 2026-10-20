@@ -331,6 +331,43 @@ mod tests {
     }
 
     #[test]
+    fn test_save_roundtrips_additive_ore_block_ids() {
+        let coal_index = linear_index(1, 2, 3) as u16;
+        let iron_index = linear_index(4, 5, 6) as u16;
+        let mut chunk = rustc_hash::FxHashMap::default();
+        chunk.insert(coal_index, BlockId::CoalOre);
+        chunk.insert(iron_index, BlockId::IronOre);
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(-1, 2, 3), chunk);
+
+        let data = WorldSaveData {
+            seed: 1337,
+            player: SavedPlayerState {
+                position: [1.0, 2.0, 3.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                fly_mode: false,
+                selected_slot: 0,
+                render_distance: 16,
+            },
+            chunk_edits: edits,
+        };
+
+        assert_eq!(SAVE_VERSION, 1);
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+
+        let loaded_chunk = loaded
+            .chunk_edits
+            .get(&ChunkPos::new(-1, 2, 3))
+            .expect("edited chunk must round-trip");
+        assert_eq!(loaded_chunk[&coal_index], BlockId::CoalOre);
+        assert_eq!(loaded_chunk[&iron_index], BlockId::IronOre);
+        assert_eq!(loaded.seed, data.seed);
+    }
+
+    #[test]
     fn test_corrupted_save_rejected() {
         assert!(matches!(
             load_world_from_bytes(b"NOPE0000"),
