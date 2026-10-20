@@ -8,7 +8,7 @@
 #   (b) captured output contains no "panicked" / "RUST_BACKTRACE" text.
 #
 # The script builds nothing itself; it expects `cargo build` to have produced
-# ./target/debug/minecraft-clone. The /tmp save path keeps the player's real
+# ./target/debug/opencraft. The /tmp save path keeps the player's real
 # save file untouched.
 
 set -u
@@ -27,8 +27,8 @@ if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
     fi
 fi
 
-BIN="./target/debug/minecraft-clone"
-SMOKE_DIR="/tmp/minecraft-clone-smoke"
+BIN="./target/debug/opencraft"
+SMOKE_DIR="/tmp/opencraft-smoke"
 OUT="$SMOKE_DIR/output.log"
 
 if [[ ! -x "$BIN" ]]; then

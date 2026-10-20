@@ -23,7 +23,7 @@
 #           seeded junk (cmp against a saved copy).
 #
 # The script builds nothing itself; it expects `cargo build` to have produced
-# ./target/debug/minecraft-clone. Both variants run ONLY inside mktemp working
+# ./target/debug/opencraft. Both variants run ONLY inside mktemp working
 # directories, so the crate root's real saves/ and settings.toml are never
 # touched.
 
@@ -46,15 +46,15 @@ fi
 # Resolve the binary absolutely before changing directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$CRATE_ROOT/target/debug/minecraft-clone"
+BIN="$CRATE_ROOT/target/debug/opencraft"
 
 if [[ ! -x "$BIN" ]]; then
     echo "MENU SMOKE FAIL: $BIN not found — run cargo build first" >&2
     exit 1
 fi
 
-TEMP_DIR_A="$(mktemp -d /tmp/minecraft-clone-menu-smoke-a.XXXXXX)"
-TEMP_DIR_B="$(mktemp -d /tmp/minecraft-clone-menu-smoke-b.XXXXXX)"
+TEMP_DIR_A="$(mktemp -d /tmp/opencraft-menu-smoke-a.XXXXXX)"
+TEMP_DIR_B="$(mktemp -d /tmp/opencraft-menu-smoke-b.XXXXXX)"
 cleanup() { rm -rf "$TEMP_DIR_A" "$TEMP_DIR_B"; }
 trap cleanup EXIT
 

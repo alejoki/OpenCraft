@@ -12,20 +12,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use minecraft_clone::mesh::quad::ChunkMesh;
-use minecraft_clone::player::inventory::HOTBAR_SLOTS;
-use minecraft_clone::player::mining::{MiningState, MiningTick};
-use minecraft_clone::player::physics::InputState;
-use minecraft_clone::player::raycast::raycast_voxels;
-use minecraft_clone::render::buffer::ChunkRenderStore;
-use minecraft_clone::render::context::RenderContext;
-use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
-use minecraft_clone::settings::keybind::key_to_string;
-use minecraft_clone::settings::{
+use opencraft::mesh::quad::ChunkMesh;
+use opencraft::player::inventory::HOTBAR_SLOTS;
+use opencraft::player::mining::{MiningState, MiningTick};
+use opencraft::player::physics::InputState;
+use opencraft::player::raycast::raycast_voxels;
+use opencraft::render::buffer::ChunkRenderStore;
+use opencraft::render::context::RenderContext;
+use opencraft::render::pipeline::{UiPass, VoxelRenderer};
+use opencraft::settings::keybind::key_to_string;
+use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
 };
-use minecraft_clone::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
-use minecraft_clone::ui::screens::{
+use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
+use opencraft::ui::screens::{
     delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
     hovered_new_game_target, hovered_pause_row, load_back_rect, load_cancel_rect,
     load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect, load_row_rect,
@@ -34,25 +34,25 @@ use minecraft_clone::ui::screens::{
     FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
     ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
-use minecraft_clone::ui::hud::{
+use opencraft::ui::hud::{
     hotbar_count_label, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
     HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
-use minecraft_clone::ui::{
+use opencraft::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
-use minecraft_clone::world::block::BlockId;
-use minecraft_clone::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
-use minecraft_clone::world::catalog_fs::WorldCatalogFs;
-use minecraft_clone::world::chunk::{world_to_chunk_and_local, ChunkPos};
-use minecraft_clone::{random_seed, WorldSession};
-use minecraft_clone::world::persistence::{
+use opencraft::world::block::BlockId;
+use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
+use opencraft::world::catalog_fs::WorldCatalogFs;
+use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
+use opencraft::{random_seed, WorldSession};
+use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
     WorldSaveData, DEFAULT_SAVE_PATH,
 };
-use minecraft_clone::world::terrain::DEFAULT_WORLD_SEED;
+use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
@@ -2141,17 +2141,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minecraft_clone::ui::SettingsCaller;
-    use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use minecraft_clone::player::inventory::{ItemStack, HOTBAR_SLOTS};
-    use minecraft_clone::world::chunk::{Chunk, ChunkPos};
-    use minecraft_clone::world::terrain::generate_chunk_seeded;
+    use opencraft::ui::SettingsCaller;
+    use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
+    use opencraft::player::inventory::{ItemStack, HOTBAR_SLOTS};
+    use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
-    use minecraft_clone::player::camera::Camera;
-    use minecraft_clone::world::persistence::ChunkEditMap;
-    use minecraft_clone::world::terrain::terrain_height_at_seeded;
+    use opencraft::player::camera::Camera;
+    use opencraft::world::persistence::ChunkEditMap;
+    use opencraft::world::terrain::terrain_height_at_seeded;
 
     use glam::IVec3;
 
@@ -2183,7 +2183,7 @@ mod tests {
     #[test]
     fn menu_text_reflects_changed_settings_values() {
         let settings = Settings {
-            keybinds: minecraft_clone_keybinds_jump_arrow_up(),
+            keybinds: opencraft_keybinds_jump_arrow_up(),
             mouse_sensitivity: 0.005,
             fov_degrees: 90.0,
             fullscreen: true,
@@ -2311,7 +2311,7 @@ mod tests {
     #[test]
     fn rebound_keys_take_effect_and_the_replaced_key_goes_dead() {
         // same rebind as the compose test: jump_or_up from Space to ArrowUp
-        let binds = minecraft_clone_keybinds_jump_arrow_up();
+        let binds = opencraft_keybinds_jump_arrow_up();
         let mut input = InputState::default();
         assert!(apply_gameplay_key(
             &mut input,
@@ -3569,7 +3569,7 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
-                hotbar: minecraft_clone::player::inventory::Hotbar::empty(),
+                hotbar: opencraft::player::inventory::Hotbar::empty(),
             },
             chunk_edits: ChunkEditMap::default(),
         }
@@ -3633,8 +3633,8 @@ mod tests {
 
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
     /// rebinding nothing else) — a valid, conflict-free state.
-    fn minecraft_clone_keybinds_jump_arrow_up() -> minecraft_clone::settings::Keybinds {
-        let mut binds = minecraft_clone::settings::Keybinds::default();
+    fn opencraft_keybinds_jump_arrow_up() -> opencraft::settings::Keybinds {
+        let mut binds = opencraft::settings::Keybinds::default();
         binds.jump_or_up = KeyCode::ArrowUp;
         binds
     }

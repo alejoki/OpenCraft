@@ -35,14 +35,14 @@ fi
 # Resolve the binary absolutely before changing directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$CRATE_ROOT/target/debug/minecraft-clone"
+BIN="$CRATE_ROOT/target/debug/opencraft"
 
 if [[ ! -x "$BIN" ]]; then
     echo "SMOKE FAIL: $BIN not found — run cargo build first" >&2
     exit 1
 fi
 
-TEMP_DIR="$(mktemp -d /tmp/minecraft-clone-settings-smoke.XXXXXX)"
+TEMP_DIR="$(mktemp -d /tmp/opencraft-settings-smoke.XXXXXX)"
 cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
