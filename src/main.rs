@@ -26,6 +26,7 @@ use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
 };
+use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
     delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
@@ -68,6 +69,23 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// often keeps the T01 pure tick counter time-sane without giving the menu
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
+
+/// Load the persisted texture pack at startup, returning it together with its
+/// per-file fallback warnings so the caller can merge them into
+/// `startup_warnings` (the S03 routing contract: warnings are data shown in the
+/// menu, never logs). `None` selection is the built-in Default pack: no data,
+/// no warnings.
+fn load_startup_pack(
+    packs_root: &Path,
+    selected: Option<&str>,
+) -> (Option<LoadedPack>, Vec<SettingsWarning>) {
+    let Some(name) = selected else {
+        return (None, Vec::new());
+    };
+    let loaded = pack::load_pack_by_name(packs_root, name);
+    let warnings = loaded.warnings.clone();
+    (Some(loaded), warnings)
+}
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     if grab {
@@ -591,6 +609,11 @@ struct Ready {
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
     /// drawn in the same UI pass, after the stats text area.
     menu_text: StatsOverlay,
+    /// Vista text title (M004/S04): the large "OpenCraft" label shown on the
+    /// main-menu cluster when the active pack has no logo. Sized with
+    /// `logo::TITLE_FONT_SIZE`/`TITLE_LINE_HEIGHT`; change-gated like
+    /// `menu_text`.
+    title_text: StatsOverlay,
     /// Load-screen "Play" label column (S05-T02): one "Play" line per
     /// catalog row, drawn in the same UI pass after `menu_text`, at
     /// `load_play_rect`'s left/top so buffer line i lands on row i's
@@ -722,11 +745,9 @@ impl GameApp {
         // (D031/MEM121, MEM009: warnings are data, never logs).
         let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
         let available_packs = pack::available_pack_names(&packs_root);
-        let current_pack = settings.texture_pack.as_deref().map(|name| {
-            let loaded = pack::load_pack_by_name(&packs_root, name);
-            startup_warnings.extend(loaded.warnings.iter().cloned());
-            loaded
-        });
+        let (current_pack, pack_warnings) =
+            load_startup_pack(&packs_root, settings.texture_pack.as_deref());
+        startup_warnings.extend(pack_warnings);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -1473,8 +1494,21 @@ impl ApplicationHandler for GameApp {
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
+        // Startup logo upload (M004/S04): the texture is created exactly once
+        // per pack selection, never on the render hot path. Default (`None`)
+        // leaves the logo renderer empty so the text title shows instead.
+        ui.set_logo(
+            &ctx.device,
+            &ctx.queue,
+            self.current_pack.as_ref().and_then(|pack| pack.logo.as_ref()),
+        );
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
+        let title_text = StatsOverlay::with_metrics(
+            &mut ui.font_system,
+            logo::TITLE_FONT_SIZE,
+            logo::TITLE_LINE_HEIGHT,
+        );
         let load_play_text = StatsOverlay::new(&mut ui.font_system);
         let load_delete_text = StatsOverlay::new(&mut ui.font_system);
         let hotbar_counts = std::array::from_fn(|_| {
@@ -1513,6 +1547,7 @@ impl ApplicationHandler for GameApp {
             ui,
             stats,
             menu_text,
+            title_text,
             load_play_text,
             load_delete_text,
             hotbar_counts,
@@ -1794,8 +1829,18 @@ impl ApplicationHandler for GameApp {
                                 Some(pack) => pack.layers.clone(),
                                 None => generate_all_texture_layers_rgba(),
                             };
+                            // The logo is cloned too, for the same reason:
+                            // both reads of `self.current_pack` happen before
+                            // the `self.gpu.as_mut()` borrow (P005). Cycling
+                            // back to Default passes None and clears the logo
+                            // so the text title returns.
+                            let logo = match &self.current_pack {
+                                Some(pack) => pack.logo.clone(),
+                                None => None,
+                            };
                             if let Some(gpu) = self.gpu.as_mut() {
                                 gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
+                                gpu.ui.set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
                             }
                         }
                     } else {
@@ -1995,6 +2040,56 @@ impl ApplicationHandler for GameApp {
                     color: [0.0, 0.0, 0.0, 0.4],
                 }];
 
+                // Vista branding (M004/S04), gated to the main-menu cluster:
+                // the pack's overlay tint darkens the panorama at the head of
+                // the quad list (all panels/text draw above it), the logo
+                // frame is rebuilt every frame, and with no logo the large
+                // text title is centered in the title strip. Non-vista
+                // screens pass `None` explicitly so no stale logo or tint
+                // follows the player into Pause/Playing.
+                let (brand_w, brand_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                if vista {
+                    if let Some(tint) = self
+                        .current_pack
+                        .as_ref()
+                        .and_then(|pack| pack.overlay_tint)
+                    {
+                        quads.insert(0, logo::tint_quad(brand_w, brand_h, tint));
+                    }
+                }
+                let logo_rect = if vista {
+                    self.current_pack.as_ref().and_then(|pack| {
+                        pack.logo.as_ref().map(|pack_logo| {
+                            logo::logo_rect(
+                                brand_w,
+                                pack_logo.width,
+                                pack_logo.height,
+                                logo::TITLE_STRIP_HEIGHT,
+                            )
+                        })
+                    })
+                } else {
+                    None
+                };
+                gpu.ui
+                    .set_logo_frame(&gpu.ctx.device, logo_rect, brand_w, brand_h);
+
+                // Default title: a large engine-styled "OpenCraft" line,
+                // centered manually (cosmic-text 0.10 has no alignment API).
+                let mut title_text_area = None;
+                if vista && logo_rect.is_none() {
+                    gpu.title_text.update(
+                        &mut gpu.ui.font_system,
+                        brand_w as f32,
+                        brand_h as f32,
+                        logo::TITLE_TEXT,
+                    );
+                    let measured_w = gpu.title_text.measured_width();
+                    let left = logo::centered_title_left(brand_w as f32, measured_w);
+                    title_text_area =
+                        Some(gpu.title_text.text_area(left, logo::TITLE_STRIP_TOP));
+                }
+
                 // While any non-Playing screen is open (S02-T02): draw its
                 // dark panel plus a translucent highlight over the hovered
                 // target, and shape the screen text. The settings screen keeps
@@ -2150,6 +2245,11 @@ impl ApplicationHandler for GameApp {
                 // no pipeline change (MEM014).
                 let stats_text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
                 let mut areas = vec![stats_text_area];
+                // The vista title draws before (under) the screen text, so a
+                // panel containing the title still wins visually.
+                if let Some(title_text_area) = title_text_area {
+                    areas.push(title_text_area);
+                }
                 if let Some(menu_text_area) = menu_text_area {
                     areas.push(menu_text_area);
                 }
@@ -2874,6 +2974,67 @@ mod tests {
             "warning names the failing layer: {}",
             message.text
         );
+    }
+
+    #[test]
+    fn load_startup_pack_corrupt_logo_falls_back_to_none_with_file_named_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+        let broken = packs_root.join("broken");
+        write_pack_fixture(&broken, "Broken Pack");
+        std::fs::write(
+            broken.join("pack.toml"),
+            "name = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
+        )
+        .expect("write pack.toml");
+        std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
+
+        let (pack, warnings) = load_startup_pack(&packs_root, Some("broken"));
+
+        let pack = pack.expect("a usable pack is still returned");
+        assert!(pack.logo.is_none(), "corrupt logo falls back to the text title");
+        assert_eq!(pack.layers.len(), 16, "layers stay fully usable");
+        assert!(
+            warnings.iter().any(|w| w.field == "title.png"),
+            "warning names the bare logo file: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_startup_pack_valid_logo_keeps_native_dimensions_without_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+        let branded = packs_root.join("branded");
+        write_pack_fixture(&branded, "Branded Pack");
+        std::fs::write(
+            branded.join("pack.toml"),
+            "name = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
+        )
+        .expect("write pack.toml");
+        write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
+
+        let (pack, warnings) = load_startup_pack(&packs_root, Some("branded"));
+
+        let pack = pack.expect("pack loads");
+        let pack_logo = pack.logo.expect("valid logo decodes");
+        assert_eq!((pack_logo.width, pack_logo.height), (16, 16));
+        assert_eq!(pack_logo.rgba.len(), 16 * 16 * 4);
+        assert_eq!(pack.overlay_tint, Some([0, 0, 0, 120]));
+        assert!(
+            !warnings.iter().any(|w| w.field == "logo.png"),
+            "a valid logo emits no warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_startup_pack_default_selection_is_none_without_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+
+        let (pack, warnings) = load_startup_pack(&packs_root, None);
+
+        assert!(pack.is_none(), "Default is the built-in procedural pack");
+        assert!(warnings.is_empty(), "Default emits no warnings");
     }
 
     /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`

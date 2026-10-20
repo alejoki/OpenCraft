@@ -68,6 +68,18 @@ impl StatsOverlay {
         self.buffer.shape_until_scroll(font_system);
     }
 
+    /// Shaped width of the widest laid-out line, in physical pixels.
+    ///
+    /// cosmic-text 0.10 exposes no alignment API, so horizontally centered
+    /// text (the vista title) measures the shaped runs and positions the
+    /// text area manually. Returns 0.0 for an empty buffer.
+    pub fn measured_width(&self) -> f32 {
+        self.buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0, f32::max)
+    }
+
     /// Build the glyphon text area for this overlay. `left`/`top` are physical
     /// pixels from the surface's top-left corner.
     pub fn text_area(&self, left: f32, top: f32) -> TextArea<'_> {
