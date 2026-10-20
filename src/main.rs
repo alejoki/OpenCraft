@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use minecraft_clone::mesh::quad::ChunkMesh;
+use minecraft_clone::player::inventory::HOTBAR_SLOTS;
 use minecraft_clone::player::mining::{MiningState, MiningTick};
 use minecraft_clone::player::physics::InputState;
 use minecraft_clone::player::raycast::raycast_voxels;
@@ -33,7 +34,10 @@ use minecraft_clone::ui::screens::{
     FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
     ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
-use minecraft_clone::ui::hud::mining_progress_quads;
+use minecraft_clone::ui::hud::{
+    hotbar_count_label, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
+    HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+};
 use minecraft_clone::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
@@ -582,6 +586,9 @@ struct Ready {
     /// Load-screen "Delete" label column (S05-T02): same as
     /// `load_play_text`, positioned at `load_delete_rect`'s left/top.
     load_delete_text: StatsOverlay,
+    /// Per-slot hotbar count labels (S03-T04): one change-gated buffer per
+    /// slot, positioned at the same `hotbar_slot_rects` the outlines use.
+    hotbar_counts: [StatsOverlay; HOTBAR_SLOTS],
 }
 
 struct GameApp {
@@ -1334,6 +1341,13 @@ impl ApplicationHandler for GameApp {
         let menu_text = StatsOverlay::new(&mut ui.font_system);
         let load_play_text = StatsOverlay::new(&mut ui.font_system);
         let load_delete_text = StatsOverlay::new(&mut ui.font_system);
+        let hotbar_counts = std::array::from_fn(|_| {
+            StatsOverlay::with_metrics(
+                &mut ui.font_system,
+                HOTBAR_COUNT_FONT_SIZE,
+                HOTBAR_COUNT_LINE_HEIGHT,
+            )
+        });
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -1364,6 +1378,7 @@ impl ApplicationHandler for GameApp {
             menu_text,
             load_play_text,
             load_delete_text,
+            hotbar_counts,
         });
     }
 
@@ -1926,6 +1941,22 @@ impl ApplicationHandler for GameApp {
                     gpu.ctx.config.height,
                 );
 
+                // S03-T04: per-slot hotbar counts share the outlines' layout
+                // helper, then draw on every screen (including pause) so the
+                // HUD never flashes. First pass updates the buffers while the
+                // mutable borrow is confined to `hotbar_counts`; the text
+                // areas are assembled afterwards from immutable borrows.
+                let hotbar_rects =
+                    hotbar_slot_rects(gpu.ctx.config.width, gpu.ctx.config.height);
+                for (slot, counts) in gpu.hotbar_counts.iter_mut().enumerate() {
+                    counts.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &hotbar_count_label(self.session.player.hotbar.stack(slot)),
+                    );
+                }
+
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
                 // (the crate is log-free by convention). The menu's text
@@ -1943,6 +1974,16 @@ impl ApplicationHandler for GameApp {
                 }
                 if let Some(load_delete_text_area) = load_delete_text_area {
                     areas.push(load_delete_text_area);
+                }
+                // Hotbar count labels ride the same UI pass, after the
+                // screen text areas. Empty slots push nothing, so the
+                // renderer only sees non-empty labels.
+                for (slot, counts) in gpu.hotbar_counts.iter().enumerate() {
+                    let label = hotbar_count_label(self.session.player.hotbar.stack(slot));
+                    if !label.is_empty() {
+                        let (x, y) = hotbar_count_text_origin(hotbar_rects[slot]);
+                        areas.push(counts.text_area(x, y));
+                    }
                 }
                 let prepare_ok = gpu
                     .ui

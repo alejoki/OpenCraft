@@ -19,8 +19,19 @@ pub const LINE_HEIGHT: f32 = 22.0;
 
 impl StatsOverlay {
     pub fn new(font_system: &mut glyphon::FontSystem) -> Self {
+        Self::with_metrics(font_system, FONT_SIZE, LINE_HEIGHT)
+    }
+
+    /// Builds an overlay with explicit text metrics, so HUD elements with a
+    /// different visual weight (e.g. per-slot hotbar counts) reuse the same
+    /// change-gated buffer without duplicating its logic.
+    pub fn with_metrics(
+        font_system: &mut glyphon::FontSystem,
+        font_size: f32,
+        line_height: f32,
+    ) -> Self {
         Self {
-            buffer: Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+            buffer: Buffer::new(font_system, Metrics::new(font_size, line_height)),
             last_text: String::new(),
             last_width: 0.0,
             last_height: 0.0,
