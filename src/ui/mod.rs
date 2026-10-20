@@ -1,5 +1,6 @@
 pub mod hud;
 pub mod lifecycle;
+pub mod logo;
 pub mod menu;
 pub mod quad;
 pub mod screens;
