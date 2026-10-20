@@ -2,7 +2,7 @@
 /.superpowers
 /saves
 /settings.toml
-docs/
+docs/superpowers/
 .agents/
 skills-lock.json
 

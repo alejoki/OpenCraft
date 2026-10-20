@@ -16,6 +16,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Rebindable key controls for movement and actions.
     *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
+*   **Texture Packs**: Swap block textures and menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
 *   **Comprehensive UI System**:
     *   Main Menu, New Game, Load Game, and Pause screens.
     *   In-game settings menu for live adjustments.
