@@ -39,6 +39,10 @@ pub const LAYER_FILES: [&str; 16] = [
     "iron_ore.png",  // 15
 ];
 
+/// Directory-name convention for packs, resolved relative to the process
+/// working directory (same convention as `saves/` and `settings.toml`).
+pub const PACKS_DIR: &str = "packs";
+
 /// Smallest accepted layer side length, in pixels.
 const MIN_LAYER_SIDE: u32 = 16;
 /// Largest accepted layer side length, in pixels.
@@ -117,6 +121,27 @@ pub fn load_pack_from_dir(dir: &Path) -> LoadedPack {
         display_name,
         warnings,
     }
+}
+
+/// Sorted names of the pack directories directly under `packs_root`.
+///
+/// Only subdirectories count as packs; regular files (and symlinks that do
+/// not resolve to a directory) are skipped. A missing or unreadable root is
+/// not an error: a fresh install simply has no packs, so the result is empty.
+/// Names that are not valid UTF-8 cannot be addressed as a setting and are
+/// skipped as well.
+pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(packs_root) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Load `packs_root/name`, treating a missing pack folder as an empty pack.
@@ -484,6 +509,51 @@ whatever = true
         assert_eq!((logo.width, logo.height), (32, 16));
         assert_eq!(logo.rgba.len(), 32 * 16 * 4);
         assert!(pack.warnings.is_empty());
+    }
+
+    #[test]
+    fn available_pack_names_lists_only_directories_in_sorted_order() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["zeta", "alpha", "middle"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        // Regular files are not packs.
+        fs::write(root.path().join("notes.txt"), b"not a dir").unwrap();
+        // A symlink to a file is not a pack either.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.path().join("notes.txt"),
+            root.path().join("link-to-file"),
+        )
+        .unwrap();
+        // A symlink that resolves to a directory is addressable like a pack.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path().join("alpha"), root.path().join("link-to-dir"))
+            .unwrap();
+
+        let mut expected = vec![
+            "alpha".to_string(),
+            "middle".to_string(),
+            "zeta".to_string(),
+        ];
+        #[cfg(unix)]
+        {
+            expected.push("link-to-dir".to_string());
+            expected.sort();
+        }
+
+        assert_eq!(available_pack_names(root.path()), expected);
+    }
+
+    #[test]
+    fn available_pack_names_is_empty_for_a_missing_or_empty_root() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            available_pack_names(&root.path().join("no-such-packs-dir")),
+            Vec::<String>::new()
+        );
+        assert!(available_pack_names(root.path()).is_empty());
     }
 
     #[test]

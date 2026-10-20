@@ -450,6 +450,25 @@ pub fn evaluate_rebind_candidate(
     RebindDecision::Accept(pressed)
 }
 
+/// Advance the Texture Pack choice one step through `available`.
+///
+/// `None` always means the built-in Default pack. Starting from Default moves
+/// to the first available pack; each named pack advances to the next, and the
+/// pack after the last wraps back to Default (`None`). An empty `available`
+/// list means Default is the only choice. A `current` name that is no longer
+/// available (its folder was deleted) deterministically lands on Default
+/// instead of sticking to a stale selection.
+pub fn cycle_texture_pack(current: Option<&str>, available: &[String]) -> Option<String> {
+    let Some(current) = current else {
+        return available.first().cloned();
+    };
+
+    match available.iter().position(|name| name == current) {
+        Some(index) => available.get(index + 1).cloned(),
+        None => None,
+    }
+}
+
 /// Warning text for a rejected rebind, or `None` for an accept. Keeps the
 /// decision data and its display wording in one place.
 pub fn rebind_rejection_message(decision: &RebindDecision) -> Option<String> {
@@ -914,6 +933,36 @@ mod tests {
         );
         assert_eq!(clamp_render_distance(0), RENDER_DISTANCE_MIN);
         assert_eq!(clamp_render_distance(900), RENDER_DISTANCE_MAX);
+    }
+
+    #[test]
+    fn texture_pack_cycle_advances_and_wraps_to_default() {
+        let packs = vec!["alpha".to_string(), "beta".to_string()];
+
+        // Default -> first pack.
+        assert_eq!(cycle_texture_pack(None, &packs), Some("alpha".to_string()));
+        // First -> second.
+        assert_eq!(
+            cycle_texture_pack(Some("alpha"), &packs),
+            Some("beta".to_string())
+        );
+        // Last -> Default (wrap).
+        assert_eq!(cycle_texture_pack(Some("beta"), &packs), None);
+    }
+
+    #[test]
+    fn texture_pack_cycle_with_only_default_stays_on_default() {
+        let packs: Vec<String> = Vec::new();
+
+        assert_eq!(cycle_texture_pack(None, &packs), None);
+        assert_eq!(cycle_texture_pack(Some("ghost"), &packs), None);
+    }
+
+    #[test]
+    fn texture_pack_cycle_from_a_deleted_pack_lands_on_default() {
+        let packs = vec!["alpha".to_string()];
+
+        assert_eq!(cycle_texture_pack(Some("deleted"), &packs), None);
     }
 
     #[test]
