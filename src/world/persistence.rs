@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
-use crate::player::inventory::{Hotbar, ItemStack, MAX_STACK_COUNT};
+use crate::player::inventory::{Hotbar, ItemStack};
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
 
@@ -354,6 +354,7 @@ pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::inventory::MAX_STACK_COUNT;
     use crate::world::block::BlockId;
     use crate::world::chunk::{linear_index, ChunkPos};
 

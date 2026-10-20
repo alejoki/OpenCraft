@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -12,6 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
+use minecraft_clone::mesh::quad::ChunkMesh;
 use minecraft_clone::player::mining::{MiningState, MiningTick};
 use minecraft_clone::player::physics::InputState;
 use minecraft_clone::player::raycast::raycast_voxels;
@@ -41,7 +42,7 @@ use minecraft_clone::ui::{
 use minecraft_clone::world::block::BlockId;
 use minecraft_clone::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use minecraft_clone::world::catalog_fs::WorldCatalogFs;
-use minecraft_clone::world::chunk::world_to_chunk_and_local;
+use minecraft_clone::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use minecraft_clone::{random_seed, WorldSession};
 use minecraft_clone::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
@@ -118,6 +119,59 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         session.world.mark_saved();
     }
     result
+}
+
+/// Breaks `pos` and collects the caller-supplied pre-break `block` into the
+/// session hotbar.
+///
+/// The world edit returns the chunks it remeshed. An empty result means the
+/// edit did not apply (unloaded chunk or outside the vertical world range),
+/// so nothing is collected — mining can never duplicate items through an
+/// edit that never happened.
+fn collect_mined_block(
+    session: &mut WorldSession,
+    pos: IVec3,
+    block: BlockId,
+) -> Vec<(ChunkPos, ChunkMesh)> {
+    let remeshed = session
+        .world
+        .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+    if !remeshed.is_empty() {
+        session.player.hotbar.collect(block, 1);
+    }
+    remeshed
+}
+
+/// Places the selected hotbar stack with the game's right-click semantics:
+/// raycast 8 blocks from the camera, reject a placement that overlaps the
+/// player, place the stack's block into the hit cell's adjacent cell, and
+/// consume exactly one item only after the world edit actually applied.
+///
+/// Returns the remeshed chunks for the caller to upload, or `None` when the
+/// ray misses, the cell is inside the player, the selected slot is empty, or
+/// the edit did not apply (unloaded/out-of-range).
+fn try_place_selected_block(
+    session: &mut WorldSession,
+) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    let ap = hit.adjacent_pos;
+    if session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
+        return None;
+    }
+    let stack = session.player.hotbar.stack(session.player.selected_slot)?;
+    let remeshed = session
+        .world
+        .set_block_immediate(ap.x, ap.y, ap.z, stack.block);
+    if remeshed.is_empty() {
+        return None;
+    }
+    session.player.hotbar.consume(session.player.selected_slot);
+    Some(remeshed)
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -1610,26 +1664,14 @@ impl ApplicationHandler for GameApp {
                         self.left_mouse_held = true;
                     }
                     MouseButton::Right => {
-                        if let Some(hit) = raycast_voxels(
-                            self.session.camera.position,
-                            self.session.camera.forward(),
-                            8.0,
-                            |x, y, z| self.session.world.get_block(x, y, z),
-                        ) {
-                            let ap = hit.adjacent_pos;
-                            if !self.session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
-                                let place_block = BlockId::HOTBAR[self.session.player.selected_slot];
-                                let remeshed =
-                                    self.session.world
-                                        .set_block_immediate(ap.x, ap.y, ap.z, place_block);
-                                for (cpos, mesh) in remeshed {
-                                    gpu.render_store.upload_mesh(
-                                        &gpu.ctx.device,
-                                        &gpu.renderer.chunk_bind_group_layout,
-                                        cpos,
-                                        &mesh,
-                                    );
-                                }
+                        if let Some(remeshed) = try_place_selected_block(&mut self.session) {
+                            for (cpos, mesh) in remeshed {
+                                gpu.render_store.upload_mesh(
+                                    &gpu.ctx.device,
+                                    &gpu.renderer.chunk_bind_group_layout,
+                                    cpos,
+                                    &mesh,
+                                );
                             }
                         }
                     }
@@ -1725,13 +1767,8 @@ impl ApplicationHandler for GameApp {
                 if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
                     // The only production break site (S02): hardness
                     // gating happens in MiningState, so Bedrock (no
-                    // duration) can never reach this arm. `block` is
-                    // kept for S03's collection hook.
-                    let _ = block;
-                    let remeshed = self
-                        .session
-                        .world
-                        .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+                    // duration) can never reach this arm.
+                    let remeshed = collect_mined_block(&mut self.session, pos, block);
                     for (cpos, mesh) in remeshed {
                         gpu.render_store.upload_mesh(
                             &gpu.ctx.device,
@@ -1942,7 +1979,15 @@ impl ApplicationHandler for GameApp {
                             let ms = (elapsed * 1000.0) / self.frame_count.max(1) as f32;
                             let vram_kb = gpu.render_store.total_vram_bytes / 1024;
                             let mode = if self.session.player.fly_mode { "Fly" } else { "Walk" };
-                            let block_name = BlockId::HOTBAR[self.session.player.selected_slot].name();
+                            let block_name = match self
+                                .session
+                                .player
+                                .hotbar
+                                .stack(self.session.player.selected_slot)
+                            {
+                                Some(stack) => format!("{} x{}", stack.block.name(), stack.count),
+                                None => "Empty".to_string(),
+                            };
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -2063,7 +2108,8 @@ mod tests {
     use super::*;
     use minecraft_clone::ui::SettingsCaller;
     use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use minecraft_clone::world::chunk::ChunkPos;
+    use minecraft_clone::player::inventory::{ItemStack, HOTBAR_SLOTS};
+    use minecraft_clone::world::chunk::{Chunk, ChunkPos};
     use minecraft_clone::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
@@ -2372,6 +2418,178 @@ mod tests {
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
         app
+    }
+
+    /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`
+    /// can only remesh a chunk whose full face neighbourhood is resident, so the
+    /// headless collection/placement helpers need this halo to observe an edit.
+    fn insert_test_chunk_with_face_neighbors(session: &mut WorldSession, block: BlockId) {
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(block));
+        for pos in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            session
+                .world
+                .insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+        }
+    }
+
+    /// Camera looking straight down at the stone placed by the placement tests.
+    fn aim_placement_camera(session: &mut WorldSession) {
+        session.camera.position = Vec3::new(0.5, 10.0, 0.5);
+        session.camera.yaw = 0.0;
+        session.camera.pitch = -std::f32::consts::FRAC_PI_2;
+    }
+
+    #[test]
+    fn mining_collects_broken_blocks_into_the_hotbar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(7, dir.path().join("mined.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+
+        let first = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        assert!(
+            !first.is_empty(),
+            "an applied break remeshes at least its own chunk"
+        );
+        let second = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        assert!(!second.is_empty());
+
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn mining_collects_the_pre_break_block_not_the_now_air_cell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+
+        let remeshed =
+            collect_mined_block(&mut session, IVec3::new(0, 10, 1), BlockId::CoalOre);
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 10, 1), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::CoalOre,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn mining_an_unloaded_chunk_collects_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(9, dir.path().join("missing.mcvx"));
+
+        let remeshed = collect_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
+
+        assert!(remeshed.is_empty(), "no loaded chunk means no remesh");
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar.stack(slot), None);
+        }
+    }
+
+    #[test]
+    fn hotbar_stacks_survive_save_and_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("stacks.mcvx");
+        let mut session = WorldSession::new_session(4242, save_path.clone());
+        session.player.hotbar.collect(BlockId::CoalOre, 2);
+        session.player.hotbar.collect(BlockId::IronOre, 1);
+        session.player.selected_slot = 1;
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+
+        assert_eq!(restored.world.seed(), 4242);
+        assert_eq!(restored.player.selected_slot, 1);
+        assert_eq!(restored.player.hotbar, session.player.hotbar);
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(restored.player.hotbar.stack(slot), session.player.hotbar.stack(slot));
+        }
+    }
+
+    #[test]
+    fn placing_the_selected_stack_consumes_exactly_one_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(10, dir.path().join("place.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.hotbar.collect(BlockId::Stone, 2);
+        session.player.selected_slot = 0;
+
+        let remeshed = try_place_selected_block(&mut session).expect("placement applies");
+
+        assert!(!remeshed.is_empty(), "placement remeshes its chunk");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn placement_rejects_empty_slots_and_player_overlap_without_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.hotbar.collect(BlockId::Stone, 2);
+        session.player.selected_slot = 5;
+
+        assert!(
+            try_place_selected_block(&mut session).is_none(),
+            "an empty selected slot cannot place"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "nothing was consumed"
+        );
+
+        session.player.selected_slot = 0;
+        session.player.position = Vec3::new(0.5, 6.0, 0.5);
+        assert!(
+            try_place_selected_block(&mut session).is_none(),
+            "a placement overlapping the player AABB is rejected"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "rejected placement does not consume"
+        );
     }
 
     #[test]

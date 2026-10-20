@@ -18,18 +18,6 @@ pub enum BlockId {
 }
 
 impl BlockId {
-    pub const HOTBAR: [BlockId; 9] = [
-        BlockId::Grass,
-        BlockId::Dirt,
-        BlockId::Stone,
-        BlockId::Cobblestone,
-        BlockId::Sand,
-        BlockId::OakLog,
-        BlockId::OakLeaves,
-        BlockId::OakPlanks,
-        BlockId::Brick,
-    ];
-
     #[inline]
     pub const fn is_solid(self) -> bool {
         !matches!(self, BlockId::Air)
