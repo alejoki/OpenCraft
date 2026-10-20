@@ -113,7 +113,8 @@ impl BindAction {
 }
 
 /// One selectable menu line. The full list is 7 keybind rows plus
-/// sensitivity, FOV, render distance, fullscreen, vsync, and a close row.
+/// sensitivity, FOV, render distance, fullscreen, vsync, texture pack, and
+/// a close row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuRow {
     Bind(BindAction),
@@ -122,11 +123,12 @@ pub enum MenuRow {
     RenderDistance,
     Fullscreen,
     Vsync,
+    TexturePack,
     Close,
 }
 
 /// All rows top-to-bottom, in menu order.
-pub const ROWS: [MenuRow; 13] = [
+pub const ROWS: [MenuRow; 14] = [
     MenuRow::Bind(BindAction::Forward),
     MenuRow::Bind(BindAction::Backward),
     MenuRow::Bind(BindAction::Left),
@@ -139,6 +141,7 @@ pub const ROWS: [MenuRow; 13] = [
     MenuRow::RenderDistance,
     MenuRow::Fullscreen,
     MenuRow::Vsync,
+    MenuRow::TexturePack,
     MenuRow::Close,
 ];
 
@@ -162,6 +165,7 @@ impl MenuRow {
             MenuRow::RenderDistance => "Render Distance",
             MenuRow::Fullscreen => "Fullscreen",
             MenuRow::Vsync => "VSync",
+            MenuRow::TexturePack => "Texture Pack",
             MenuRow::Close => "Close Menu",
         }
     }
@@ -891,7 +895,7 @@ mod tests {
 
     #[test]
     fn rows_cover_all_seven_binds_plus_settings_and_close_in_order() {
-        assert_eq!(ROW_COUNT, 13);
+        assert_eq!(ROW_COUNT, 14);
         for (i, action) in BindAction::ALL.iter().enumerate() {
             assert_eq!(ROWS[i], MenuRow::Bind(*action), "row {i}");
         }
@@ -900,7 +904,8 @@ mod tests {
         assert_eq!(ROWS[9], MenuRow::RenderDistance);
         assert_eq!(ROWS[10], MenuRow::Fullscreen);
         assert_eq!(ROWS[11], MenuRow::Vsync);
-        assert_eq!(ROWS[12], MenuRow::Close);
+        assert_eq!(ROWS[12], MenuRow::TexturePack);
+        assert_eq!(ROWS[13], MenuRow::Close);
         // every row has a non-empty label
         for r in ROWS {
             assert!(!r.label().is_empty());

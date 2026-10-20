@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::HOTBAR_SLOTS;
 use opencraft::player::mining::{MiningState, MiningTick};
 use opencraft::player::physics::InputState;
@@ -20,6 +21,7 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::pipeline::{UiPass, VoxelRenderer};
+use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
@@ -190,11 +192,13 @@ fn on_off(value: bool) -> &'static str {
 
 /// Compose the menu's display text: one "label: value" line per row, a
 /// capture hint line while a rebind is pending, and the transient message
-/// line. Pure function of (settings, menu) so it is unit-testable without
-/// GPU or events; called per frame while the menu is open, where
-/// `StatsOverlay::update` skips the expensive re-shape unless the
-/// composed string actually changed.
-fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
+/// line. `pack_label` is the active texture pack's display name ("Default"
+/// for the built-in procedural pack), kept as a parameter so this stays a
+/// pure function of its inputs — unit-testable without GPU or events.
+/// Called per frame while the menu is open, where `StatsOverlay::update`
+/// skips the expensive re-shape unless the composed string actually
+/// changed.
+fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label: &str) -> String {
     let mut lines = Vec::with_capacity(menu::ROW_COUNT + 2);
     for row in menu::ROWS {
         let line = match row {
@@ -218,6 +222,7 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
                 format!("{}: {}", row.label(), on_off(settings.fullscreen))
             }
             MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
+            MenuRow::TexturePack => format!("{}: {pack_label}", row.label()),
             MenuRow::Close => row.label().to_string(),
         };
         lines.push(line);
@@ -688,6 +693,19 @@ struct GameApp {
     /// settings saves are provable headless without writing the crate
     /// root. Loading still reads the same path at startup.
     settings_path: PathBuf,
+    /// Root directory pack folders are discovered under (M004/S03):
+    /// `packs/` relative to the process cwd, the same convention as
+    /// `saves/` and `settings.toml`. Injected by tests like
+    /// `settings_path`.
+    packs_root: PathBuf,
+    /// Sorted pack names discovered under `packs_root` at startup. Cycling
+    /// walks this list; a pack authored while the game is running appears
+    /// on the next launch (no filesystem polling in the menu).
+    available_packs: Vec<String>,
+    /// The active pack's loaded layers and presentation data; `None` is
+    /// the built-in procedural Default pack (MEM113). Never holds a
+    /// half-loaded pack: `load_pack_by_name` always returns usable layers.
+    current_pack: Option<LoadedPack>,
 }
 
 impl GameApp {
@@ -696,7 +714,19 @@ impl GameApp {
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
         let settings_path = Path::new(DEFAULT_SETTINGS_PATH).to_path_buf();
-        let (settings, startup_warnings) = load_with_warnings(&settings_path);
+        let (settings, mut startup_warnings) = load_with_warnings(&settings_path);
+        // Pack discovery and startup apply (M004/S03): the persisted choice
+        // is re-applied on every launch. A missing/deleted pack folder still
+        // yields a fully usable procedural pack plus one warning naming it,
+        // surfaced through the existing first-Settings-open message path
+        // (D031/MEM121, MEM009: warnings are data, never logs).
+        let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
+        let available_packs = pack::available_pack_names(&packs_root);
+        let current_pack = settings.texture_pack.as_deref().map(|name| {
+            let loaded = pack::load_pack_by_name(&packs_root, name);
+            startup_warnings.extend(loaded.warnings.iter().cloned());
+            loaded
+        });
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -758,6 +788,9 @@ impl GameApp {
             main_menu_message: None,
             message_tick_timer: Instant::now(),
             settings_path,
+            packs_root,
+            available_packs,
+            current_pack,
         }
     }
 
@@ -833,6 +866,12 @@ impl GameApp {
                 // the RenderContext; see the doc comment above).
                 save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
             }
+            MenuRow::TexturePack => {
+                // Cycling is not an adjust row: any button advances one step.
+                // The GPU re-upload needs the RenderContext, so it happens in
+                // the caller right after this call (same P005 split as vsync).
+                self.apply_texture_pack_cycle();
+            }
             MenuRow::Close => {
                 // Close now dispatches Back through the lifecycle state
                 // (S02-T02): return to the caller screen — MainMenu or
@@ -863,6 +902,30 @@ impl GameApp {
             .set_render_distance(self.settings.render_distance);
         self.vista_world
             .set_render_distance(self.settings.render_distance);
+        save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+    }
+
+    /// Apply one Texture Pack row click: advance through the discovered
+    /// packs (Default -> first -> ... -> Default), load the new pack, surface
+    /// any load warnings in the menu message slot (MEM009), and persist the
+    /// choice. Extracted from `menu_click` so the headless tests can drive
+    /// the exact click semantics without a live event loop; the live GPU
+    /// re-upload stays in the caller (P005 borrow split).
+    fn apply_texture_pack_cycle(&mut self) {
+        let next =
+            menu::cycle_texture_pack(self.settings.texture_pack.as_deref(), &self.available_packs);
+        self.settings.texture_pack = next.clone();
+        match next {
+            None => self.current_pack = None,
+            Some(name) => {
+                let loaded = pack::load_pack_by_name(&self.packs_root, &name);
+                if !loaded.warnings.is_empty() {
+                    let lines = menu::format_warnings(&loaded.warnings).join(" | ");
+                    self.menu.set_message(lines);
+                }
+                self.current_pack = Some(loaded);
+            }
+        }
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
@@ -1400,6 +1463,13 @@ impl ApplicationHandler for GameApp {
 
         let mut ctx = RenderContext::new(window.clone());
         let renderer = VoxelRenderer::new(&ctx);
+        // Re-apply the persisted texture pack to the freshly created GPU
+        // texture (M004/S03): the renderer is still a local here, so the
+        // initial upload reuses the same live-apply path as cycling. A
+        // missing pack still carries usable procedural layers.
+        if let Some(pack) = &self.current_pack {
+            renderer.write_block_layers(&ctx.queue, &pack.layers);
+        }
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
@@ -1712,6 +1782,22 @@ impl ApplicationHandler for GameApp {
                                 apply_vsync(&mut gpu.ctx, self.settings.vsync);
                             }
                         }
+                        if clicked == Some(MenuRow::TexturePack) {
+                            // Live apply (MEM111): rewrite the EXISTING block
+                            // texture array's contents — same texture, view,
+                            // and bind group, so nothing needs recreation.
+                            // Clone/copy the layer bytes BEFORE the `as_mut`
+                            // borrow split (P005); Default re-uploads the
+                            // procedural layers so wrapping back restores
+                            // the built-in textures.
+                            let layers = match &self.current_pack {
+                                Some(pack) => pack.layers.clone(),
+                                None => generate_all_texture_layers_rgba(),
+                            };
+                            if let Some(gpu) = self.gpu.as_mut() {
+                                gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
+                            }
+                        }
                     } else {
                         // Other lifecycle screens own the click (T01 hit
                         // tests); gpu is not touched after this call on
@@ -1967,7 +2053,11 @@ impl ApplicationHandler for GameApp {
                         });
                     }
                     let text = if settings_open {
-                        compose_menu_text(&self.settings, &self.menu)
+                        let pack_label = self
+                            .current_pack
+                            .as_ref()
+                            .map_or("Default", |pack| pack.display_name.as_str());
+                        compose_menu_text(&self.settings, &self.menu, pack_label)
                     } else {
                         compose_screen_text(
                             active_screen,
@@ -2292,7 +2382,7 @@ mod tests {
         let settings = Settings::default();
         let mut menu = menu::SettingsMenu::new();
         menu.open();
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Move Forward: KeyW"));
         assert!(text.contains("Move Backward: KeyS"));
         assert!(text.contains("Move Left: KeyA"));
@@ -2305,6 +2395,7 @@ mod tests {
         assert!(text.contains("Render Distance: 16"));
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
+        assert!(text.contains("Texture Pack: Default"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
         assert!(
@@ -2325,13 +2416,14 @@ mod tests {
             texture_pack: None,
         };
         let menu = menu::SettingsMenu::new();
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Jump / Up: ArrowUp"));
         assert!(text.contains("Mouse Sensitivity: 0.0050"));
         assert!(text.contains("Field of View: 90"));
         assert!(text.contains("Render Distance: 24"));
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
+        assert!(text.contains("Texture Pack: Default"));
     }
 
     #[test]
@@ -2340,13 +2432,13 @@ mod tests {
         let mut menu = menu::SettingsMenu::new();
         menu.open();
         menu.begin_rebind(menu::BindAction::JumpOrUp);
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.contains("Jump / Up: <press a key>"));
         assert!(text.contains("press a key for 'jump_or_up' (Escape cancels)"));
 
         // Transient messages append as the final line.
         menu.set_message_for_ticks("key already bound to 'forward'", 1);
-        let text = compose_menu_text(&settings, &menu);
+        let text = compose_menu_text(&settings, &menu, "Default");
         assert!(text.ends_with("key already bound to 'forward'"));
     }
 
@@ -2645,6 +2737,143 @@ mod tests {
         assert_eq!(app.settings.render_distance, 36);
         assert_eq!(app.session.world.render_distance(), 36);
         assert_eq!(app.vista_world.render_distance(), 36);
+    }
+
+    // --- texture pack wiring (M004/S03) ---
+
+    /// A headless GameApp whose pack root and settings save path live inside
+    /// `dir` (the same injection pattern as `settings_path`). Defaults to no
+    /// pack selected so each test drives the cycle from a known state.
+    fn app_with_packs(dir: &Path) -> GameApp {
+        let mut app = app_at_screen(
+            dir,
+            LifecycleScreen::Settings(SettingsCaller::MainMenu),
+        );
+        app.settings_path = dir.join("settings.toml");
+        app.packs_root = dir.join("packs");
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+        app.settings.texture_pack = None;
+        app.current_pack = None;
+        app
+    }
+
+    fn write_pack_fixture(dir: &Path, manifest_name: &str) {
+        std::fs::create_dir_all(dir).expect("create pack dir");
+        std::fs::write(dir.join("pack.toml"), format!("name = \"{manifest_name}\"\n"))
+            .expect("write pack.toml");
+    }
+
+    fn write_solid_png(path: &Path, rgba: [u8; 4]) {
+        let file = std::fs::File::create(path).expect("create fixture png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write png header");
+        let mut data = Vec::with_capacity(16 * 16 * 4);
+        for _ in 0..16 * 16 {
+            data.extend_from_slice(&rgba);
+        }
+        writer.write_image_data(&data).expect("write png data");
+    }
+
+    #[test]
+    fn menu_text_shows_the_active_texture_pack_label() {
+        let settings = Settings::default();
+        let menu = menu::SettingsMenu::new();
+        let text = compose_menu_text(&settings, &menu, "Alpha Pack");
+        assert!(text.contains("Texture Pack: Alpha Pack"));
+        assert_eq!(text.lines().count(), menu::ROW_COUNT);
+    }
+
+    #[test]
+    fn texture_pack_cycle_advances_to_the_first_pack_and_persists_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
+        // A real override layer proves the loaded pack's layers reach
+        // GameApp (not just its manifest).
+        write_solid_png(&packs_root.join("alpha").join("grass_top.png"), [200, 10, 20, 255]);
+        app.available_packs = pack::available_pack_names(&packs_root);
+        assert_eq!(app.available_packs, vec!["alpha", "beta"]);
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
+        let loaded = app.current_pack.as_ref().expect("pack loaded");
+        assert_eq!(loaded.display_name, "Alpha Pack");
+        assert_eq!(loaded.layers.len(), 16);
+        assert_ne!(
+            loaded.layers[0],
+            generate_all_texture_layers_rgba()[0],
+            "the pack's authored layer replaces the procedural one"
+        );
+        assert!(loaded.warnings.is_empty(), "clean pack has no warnings");
+
+        // The choice is durable at the injected path.
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.texture_pack.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn texture_pack_cycle_wraps_the_last_pack_back_to_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.texture_pack = Some("alpha".to_string());
+        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
+        assert!(app.current_pack.is_none(), "Default holds no pack data");
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.texture_pack, None);
+    }
+
+    #[test]
+    fn texture_pack_cycle_from_a_deleted_pack_lands_on_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        // The persisted choice names a pack that is no longer on disk.
+        app.settings.texture_pack = Some("deleted".to_string());
+        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "deleted"));
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack, None);
+        assert!(app.current_pack.is_none());
+    }
+
+    #[test]
+    fn texture_pack_cycle_surfaces_load_warnings_in_the_menu_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        let broken = packs_root.join("broken");
+        write_pack_fixture(&broken, "Broken Pack");
+        std::fs::write(broken.join("grass_top.png"), b"not a png").expect("corrupt layer");
+        app.available_packs = pack::available_pack_names(&packs_root);
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
+        let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
+        assert_eq!(loaded.layers.len(), 16, "fallback still fully usable");
+        let message = app.menu.message.as_ref().expect("warning in the menu");
+        assert!(
+            message.text.contains("grass_top.png"),
+            "warning names the failing layer: {}",
+            message.text
+        );
     }
 
     /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`
