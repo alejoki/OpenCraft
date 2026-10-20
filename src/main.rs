@@ -47,10 +47,12 @@ use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
+use opencraft::world::manager::WorldManager;
+use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
-    WorldSaveData, DEFAULT_SAVE_PATH,
+    load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
+    SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH,
 };
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 
@@ -575,6 +577,10 @@ struct Ready {
     ctx: RenderContext,
     renderer: VoxelRenderer,
     render_store: ChunkRenderStore,
+    /// GPU meshes for the menu vista world (M004/S02). Deliberately separate
+    /// from `render_store`: the vista and the player session are distinct
+    /// worlds, and a session swap must never clear the menu's GPU state.
+    vista_store: ChunkRenderStore,
     ui: UiRenderer,
     stats: StatsOverlay,
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
@@ -601,6 +607,15 @@ struct GameApp {
     /// save path every save site writes to. One always-present session,
     /// swapped atomically at `start_world_session`.
     session: WorldSession,
+    /// The menu vista's own demo world (M004/S02): built directly with the
+    /// fixed `vista::VISTA_SEED`, never a `WorldSession`, never saved and
+    /// never swapped through `start_world_session`. Streamed only while
+    /// `vista::vista_visible` reports a main-menu-cluster screen.
+    vista_world: WorldManager,
+    /// Construction epoch for the vista's procedural yaw drift: drift is
+    /// `elapsed()` from this single Instant, so it survives menu<->game
+    /// transitions with no per-frame accumulation or reset bookkeeping.
+    vista_epoch: Instant,
     input: InputState,
     cursor_grabbed: bool,
     /// The hold-to-mine accumulator (S02): pure state machine driven once per
@@ -705,10 +720,22 @@ impl GameApp {
         session
             .world
             .set_render_distance(settings.render_distance);
+        // The vista is a second, independent world with the same
+        // settings-driven render distance (the session's is a source of
+        // truth; the vista is never a WorldSession). `ChunkEditMap::default()`
+        // matches `WorldManager::new`; the fixed seed is the demo contract.
+        let mut vista_world = WorldManager::with_seed_and_edits(
+            settings.render_distance,
+            vista::VISTA_SEED,
+            ChunkEditMap::default(),
+        );
+        vista_world.set_render_distance(settings.render_distance);
         Self {
             window: None,
             gpu: None,
             session,
+            vista_world,
+            vista_epoch: Instant::now(),
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
@@ -783,16 +810,7 @@ impl GameApp {
             }
             MenuRow::RenderDistance => {
                 if let Some(direction) = adjust_direction(button) {
-                    self.settings.render_distance =
-                        menu::adjust_render_distance(self.settings.render_distance, direction);
-                    // Live apply: the streaming loop reads
-                    // `world.render_distance()` every frame, so updating the
-                    // manager immediately changes both the load radius and
-                    // the fog distance the renderer receives.
-                    self.session
-                        .world
-                        .set_render_distance(self.settings.render_distance);
-                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+                    self.apply_render_distance_adjust(direction);
                 }
             }
             MenuRow::Fullscreen => {
@@ -827,6 +845,25 @@ impl GameApp {
                 );
             }
         }
+    }
+
+    /// Apply one Render Distance row adjustment: clamp/store the setting,
+    /// live-apply it to BOTH worlds (player session and menu vista), and
+    /// save. The session and vista loops both read `render_distance()`
+    /// every frame, so updating the managers immediately changes load
+    /// radius and fog distance. Extracted from `menu_click` so the
+    /// headless tests can drive the exact click semantics without a live
+    /// `ActiveEventLoop`/`Window` (menu_click's other arms need those
+    /// only for Close/Fullscreen).
+    fn apply_render_distance_adjust(&mut self, direction: AdjustDirection) {
+        self.settings.render_distance =
+            menu::adjust_render_distance(self.settings.render_distance, direction);
+        self.session
+            .world
+            .set_render_distance(self.settings.render_distance);
+        self.vista_world
+            .set_render_distance(self.settings.render_distance);
+        save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
     /// Enter a lifecycle screen — the one transition entry point every
@@ -1355,6 +1392,7 @@ impl ApplicationHandler for GameApp {
         let mut ctx = RenderContext::new(window.clone());
         let renderer = VoxelRenderer::new(&ctx);
         let render_store = ChunkRenderStore::new();
+        let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(&ctx);
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
@@ -1392,6 +1430,7 @@ impl ApplicationHandler for GameApp {
             ctx,
             renderer,
             render_store,
+            vista_store,
             ui,
             stats,
             menu_text,
@@ -1735,6 +1774,11 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Vista discriminator (M004/S02): the single `vista_visible`
+                // truth source — true only for the main-menu cluster. Pause,
+                // Settings-from-pause, and Playing keep rendering the session
+                // world (frozen for Pause), so neither stream runs there.
+                let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
                     self.session.player
                         .update(dt, &self.input, |x, y, z| self.session.world.get_block(x, y, z));
@@ -1759,6 +1803,30 @@ impl ApplicationHandler for GameApp {
                     }
                     for (cpos, mesh) in new_meshes {
                         gpu.render_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
+                } else if vista {
+                    // Menu vista streaming (M004/S02): mirror the session
+                    // block against the vista world. The vista never saves
+                    // and never touches `session`/save paths; paused screens
+                    // fail `vista` above, so the frozen paused world stays
+                    // frozen with no chunk loads/unloads.
+                    let anchor = vista::vista_anchor();
+                    let (vista_chunk, _) = world_to_chunk_and_local(
+                        anchor.x.floor() as i32,
+                        anchor.y.floor() as i32,
+                        anchor.z.floor() as i32,
+                    );
+                    let (new_meshes, unloaded) = self.vista_world.update_streaming(vista_chunk);
+                    for upos in unloaded {
+                        gpu.vista_store.remove_chunk(upos);
+                    }
+                    for (cpos, mesh) in new_meshes {
+                        gpu.vista_store.upload_mesh(
                             &gpu.ctx.device,
                             &gpu.renderer.chunk_bind_group_layout,
                             cpos,
@@ -2022,16 +2090,45 @@ impl ApplicationHandler for GameApp {
                     .is_ok();
                 let ui_pass: Option<&dyn UiPass> = if prepare_ok { Some(&gpu.ui) } else { None };
 
-                match gpu.renderer.render_frame(
-                    &gpu.ctx,
-                    &gpu.render_store,
-                    &self.session.camera,
-                    self.session.world.render_distance(),
-                    target_block,
-                    self.session.player.selected_slot,
-                    playing,
-                    ui_pass,
-                ) {
+                // Single render_frame call site (M004/S02): menu-cluster
+                // screens render the drifting vista from its own store and
+                // world render distance; every other screen renders the
+                // session exactly as before. The vista camera is built per
+                // frame from the epoch + settings FOV (pure math, cheap),
+                // so live FOV changes reach the panorama. target_block is
+                // always None on vista frames (overlays are off anyway).
+                let vista_camera = if vista {
+                    Some(vista::vista_camera(
+                        self.vista_epoch.elapsed().as_secs_f32(),
+                        self.settings.fov_degrees.to_radians(),
+                    ))
+                } else {
+                    None
+                };
+                let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
+                    gpu.renderer.render_frame(
+                        &gpu.ctx,
+                        &gpu.vista_store,
+                        vista_camera,
+                        self.vista_world.render_distance(),
+                        None,
+                        self.session.player.selected_slot,
+                        false,
+                        ui_pass,
+                    )
+                } else {
+                    gpu.renderer.render_frame(
+                        &gpu.ctx,
+                        &gpu.render_store,
+                        &self.session.camera,
+                        self.session.world.render_distance(),
+                        target_block,
+                        self.session.player.selected_slot,
+                        playing,
+                        ui_pass,
+                    )
+                };
+                match frame_result {
                     Ok(visible_chunks) => {
                         self.frame_count += 1;
                         let elapsed = self.title_timer.elapsed().as_secs_f32();
@@ -2484,6 +2581,60 @@ mod tests {
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
         app
+    }
+
+    #[test]
+    fn fresh_game_app_has_a_fixed_seed_vista_at_the_settings_render_distance() {
+        let app = app_at_screen(Path::new("/nonexistent/saves"), LifecycleScreen::MainMenu);
+        assert_eq!(app.vista_world.seed(), vista::VISTA_SEED);
+        assert_eq!(
+            app.vista_world.render_distance(),
+            app.settings.render_distance,
+            "the vista follows the settings-driven render distance"
+        );
+        // The vista is its own world, not a hidden alias of the session.
+        assert_ne!(
+            app.vista_world.seed(),
+            app.session.world.seed(),
+            "vista and session are distinct, independently seeded worlds"
+        );
+    }
+
+    #[test]
+    fn render_distance_adjust_updates_the_session_and_vista_worlds_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Settings(
+            SettingsCaller::MainMenu,
+        ));
+        // Keep the click's settings save inside the tempdir, never the crate
+        // root (S04-T02's injection precedent).
+        app.settings_path = dir.path().join("settings.toml");
+        app.settings.render_distance = 16;
+        app.session.world.set_render_distance(16);
+        app.vista_world.set_render_distance(16);
+
+        // The exact helper the MenuRow::RenderDistance click arm calls
+        // (menu_click itself requires a live ActiveEventLoop/Window; the
+        // RenderDistance arm's whole behavior lives in this helper).
+        app.apply_render_distance_adjust(AdjustDirection::Up);
+
+        assert_eq!(app.settings.render_distance, 18);
+        assert_eq!(app.session.world.render_distance(), 18);
+        assert_eq!(app.vista_world.render_distance(), 18);
+        assert!(
+            dir.path().join("settings.toml").exists(),
+            "the click saves the settings exactly as before"
+        );
+
+        // Boundary: at the max the click clamps and both worlds stay
+        // pinned to the same clamped value (negative-path guard).
+        app.settings.render_distance = 36;
+        app.session.world.set_render_distance(36);
+        app.vista_world.set_render_distance(36);
+        app.apply_render_distance_adjust(AdjustDirection::Up);
+        assert_eq!(app.settings.render_distance, 36);
+        assert_eq!(app.session.world.render_distance(), 36);
+        assert_eq!(app.vista_world.render_distance(), 36);
     }
 
     /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`
