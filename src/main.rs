@@ -2322,6 +2322,7 @@ mod tests {
             render_distance: 24,
             fullscreen: true,
             vsync: true,
+            texture_pack: None,
         };
         let menu = menu::SettingsMenu::new();
         let text = compose_menu_text(&settings, &menu);

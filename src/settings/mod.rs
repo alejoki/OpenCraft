@@ -76,6 +76,10 @@ pub struct Settings {
     pub render_distance: i32,
     pub fullscreen: bool,
     pub vsync: bool,
+    /// Selected texture pack folder name under `packs/`. `None` means the
+    /// built-in Default textures, so a default save contains no `[packs]`
+    /// section at all (byte-identical to the pre-S03 format).
+    pub texture_pack: Option<String>,
 }
 
 impl Default for Settings {
@@ -87,6 +91,7 @@ impl Default for Settings {
             render_distance: DEFAULT_RENDER_DISTANCE,
             fullscreen: false,
             vsync: false,
+            texture_pack: None,
         }
     }
 }
@@ -182,6 +187,9 @@ impl Settings {
                 fullscreen: self.fullscreen,
                 vsync: self.vsync,
             },
+            packs: self.texture_pack.as_ref().map(|name| PacksToml {
+                texture_pack: Some(name.clone()),
+            }),
         };
 
         let contents = toml::to_string(&mirror)
@@ -223,6 +231,8 @@ struct SettingsToml {
     keybinds: KeybindsToml,
     mouse: MouseToml,
     video: VideoToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packs: Option<PacksToml>,
 }
 
 #[derive(serde::Serialize)]
@@ -247,6 +257,12 @@ struct VideoToml {
     render_distance: i32,
     fullscreen: bool,
     vsync: bool,
+}
+
+#[derive(serde::Serialize)]
+struct PacksToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    texture_pack: Option<String>,
 }
 
 /// Load settings from `path`, discarding warnings. Thin wrapper over
@@ -401,6 +417,27 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
         }
     }
 
+    // Optional section: missing `[packs]` or missing `texture_pack` keeps
+    // Default silently. An empty string is accepted as-is (runtime pack
+    // resolution simply won't find a folder named "").
+    if let Some(packs_value) = root.get("packs") {
+        match packs_value.as_table() {
+            Some(table) => {
+                settings.texture_pack = load_optional_string(
+                    table,
+                    "texture_pack",
+                    settings.texture_pack,
+                    "packs.texture_pack",
+                    &mut warnings,
+                );
+            }
+            None => warnings.push(SettingsWarning {
+                field: "packs".to_string(),
+                reason: format!("expected a table, found {}", packs_value.type_str()),
+            }),
+        }
+    }
+
     (settings, warnings)
 }
 
@@ -508,6 +545,31 @@ fn load_clamped_i32(
                 warnings.push(SettingsWarning {
                     field: field.to_string(),
                     reason: format!("expected an integer, found {}", value.type_str()),
+                });
+                current
+            }
+        },
+    }
+}
+
+/// Extract an optional string field from a table. Missing key -> current
+/// (Default `None`), no warning. Wrong type -> current + warning naming the
+/// full field path.
+fn load_optional_string(
+    table: &toml::value::Table,
+    key: &str,
+    current: Option<String>,
+    field: &str,
+    warnings: &mut Vec<SettingsWarning>,
+) -> Option<String> {
+    match table.get(key) {
+        None => current,
+        Some(value) => match value.as_str() {
+            Some(s) => Some(s.to_string()),
+            None => {
+                warnings.push(SettingsWarning {
+                    field: field.to_string(),
+                    reason: format!("expected a string, found {}", value.type_str()),
                 });
                 current
             }
@@ -842,6 +904,7 @@ vsync = false
             render_distance: 24,
             fullscreen: true,
             vsync: true,
+            texture_pack: None,
         };
         original.save(&path).unwrap();
         let (loaded, warnings) = load_with_warnings(&path);
@@ -874,6 +937,77 @@ vsync = false
         assert!(text.contains("render_distance = 16"));
         assert!(text.contains("fullscreen = false"));
         assert!(text.contains("vsync = false"));
+        // Default pack means no [packs] section at all: byte-identical to
+        // the pre-S03 format (settings_smoke.sh unchanged-file invariant).
+        assert!(!text.contains("[packs]"), "default save must omit [packs]:\n{text}");
+        assert!(!text.contains("texture_pack"));
+
+        let with_pack = Settings {
+            texture_pack: Some("dungeon".to_string()),
+            ..Settings::default()
+        };
+        with_pack.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[packs]"), "named pack must emit [packs]:\n{text}");
+        assert!(text.contains("texture_pack = \"dungeon\""));
+    }
+
+    #[test]
+    fn texture_pack_round_trips_through_save_and_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let original = Settings {
+            texture_pack: Some("dungeon".to_string()),
+            ..Settings::default()
+        };
+        original.save(&path).unwrap();
+        let (loaded, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn wrong_type_texture_pack_falls_back_to_default_with_one_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\ntexture_pack = 7\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.texture_pack, None);
+        assert_eq!(warning_fields(&warnings), vec!["packs.texture_pack"]);
+        assert!(warnings[0].reason.contains("expected a string"));
+        assert!(warnings[0].reason.contains("integer"));
+    }
+
+    #[test]
+    fn missing_packs_section_or_key_keeps_default_pack_without_warnings() {
+        let dir = tempdir().unwrap();
+
+        let no_section = write_settings_file(&dir, "[video]\nvsync = false\n");
+        let (settings, warnings) = load_with_warnings(&no_section);
+        assert_eq!(settings.texture_pack, None);
+        assert!(warnings.is_empty());
+
+        let empty_section = write_settings_file(&dir, "[packs]\nunknown = 1\n");
+        let (settings, warnings) = load_with_warnings(&empty_section);
+        assert_eq!(settings.texture_pack, None);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn empty_texture_pack_string_is_accepted_without_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\ntexture_pack = \"\"\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.texture_pack.as_deref(), Some(""));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn wrong_type_packs_section_falls_back_with_one_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "packs = 3\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.texture_pack, None);
+        assert_eq!(warning_fields(&warnings), vec!["packs"]);
     }
 
     #[test]
