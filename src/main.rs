@@ -209,6 +209,9 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu) -> String {
                 format!("{}: {:.4}", row.label(), settings.mouse_sensitivity)
             }
             MenuRow::Fov => format!("{}: {:.0}", row.label(), settings.fov_degrees),
+            MenuRow::RenderDistance => {
+                format!("{}: {}", row.label(), settings.render_distance)
+            }
             MenuRow::Fullscreen => {
                 format!("{}: {}", row.label(), on_off(settings.fullscreen))
             }
@@ -692,11 +695,16 @@ impl GameApp {
             LifecycleScreen::MainMenu
         };
         // The loaded Settings are the single source of truth for video
-        // parameters: FOV applies to the session's camera at startup
-        // (defaults are 75 degrees either way, so this is
-        // behavior-neutral). The session's camera arrives already synced
-        // to its player by the WorldSession constructors.
+        // parameters: FOV applies to the session's camera at startup, and
+        // render distance to its world (defaults are 75 degrees / 16
+        // chunks either way, so this is behavior-neutral). The session's
+        // camera arrives already synced to its player by the WorldSession
+        // constructors. Settings win over a save's stored render distance:
+        // the setting is global and the world save follows it from now on.
         session.camera.fov_y_radians = settings.fov_degrees.to_radians();
+        session
+            .world
+            .set_render_distance(settings.render_distance);
         Self {
             window: None,
             gpu: None,
@@ -770,6 +778,20 @@ impl GameApp {
                     // in view_proj, so updating the pub field updates the
                     // projection with no reconstruction.
                     self.session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+                }
+            }
+            MenuRow::RenderDistance => {
+                if let Some(direction) = adjust_direction(button) {
+                    self.settings.render_distance =
+                        menu::adjust_render_distance(self.settings.render_distance, direction);
+                    // Live apply: the streaming loop reads
+                    // `world.render_distance()` every frame, so updating the
+                    // manager immediately changes both the load radius and
+                    // the fog distance the renderer receives.
+                    self.session
+                        .world
+                        .set_render_distance(self.settings.render_distance);
                     save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
                 }
             }
@@ -898,8 +920,11 @@ impl GameApp {
     fn start_world_session(&mut self, mut session: WorldSession) {
         // The loaded Settings stay the single source of truth for video
         // parameters across a session swap too (GameApp::new does the
-        // same at startup; defaults are 75 degrees either way).
+        // same at startup; defaults are 75 degrees / 16 chunks either way).
         session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+        session
+            .world
+            .set_render_distance(self.settings.render_distance);
         self.session = session;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
@@ -1533,14 +1558,6 @@ impl ApplicationHandler for GameApp {
                             // the way back here).
                             self.enter_screen(LifecycleScreen::Pause);
                         }
-                        KeyCode::BracketLeft if pressed && !event.repeat => {
-                            let rd = (self.session.world.render_distance() - 2).max(4);
-                            self.session.world.set_render_distance(rd);
-                        }
-                        KeyCode::BracketRight if pressed && !event.repeat => {
-                            let rd = (self.session.world.render_distance() + 2).min(36);
-                            self.session.world.set_render_distance(rd);
-                        }
                         KeyCode::Digit1 if pressed => self.session.player.selected_slot = 0,
                         KeyCode::Digit2 if pressed => self.session.player.selected_slot = 1,
                         KeyCode::Digit3 if pressed => self.session.player.selected_slot = 2,
@@ -1556,7 +1573,7 @@ impl ApplicationHandler for GameApp {
                         // via the pure helper. The 7 rebindable routes sit
                         // AFTER the non-rebindable utility keys on purpose:
                         // Escape must always toggle the menu and F/F5/
-                        // brackets/digits keep their hardcoded behavior even
+                        // digits keep their hardcoded behavior even
                         // if a gameplay action is rebound onto one of them
                         // (Escape is a rebindable target, so the menu must
                         // stay reachable no matter what is bound).
@@ -2170,6 +2187,7 @@ mod tests {
         assert!(text.contains("Sprint: ControlLeft"));
         assert!(text.contains("Mouse Sensitivity: 0.0022"));
         assert!(text.contains("Field of View: 75"));
+        assert!(text.contains("Render Distance: 16"));
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
         assert!(text.contains("Close Menu"));
@@ -2186,6 +2204,7 @@ mod tests {
             keybinds: opencraft_keybinds_jump_arrow_up(),
             mouse_sensitivity: 0.005,
             fov_degrees: 90.0,
+            render_distance: 24,
             fullscreen: true,
             vsync: true,
         };
@@ -2194,6 +2213,7 @@ mod tests {
         assert!(text.contains("Jump / Up: ArrowUp"));
         assert!(text.contains("Mouse Sensitivity: 0.0050"));
         assert!(text.contains("Field of View: 90"));
+        assert!(text.contains("Render Distance: 24"));
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
     }
@@ -2960,6 +2980,9 @@ mod tests {
         app.input.forward = true;
         app.input.jump_or_up = true;
         app.input.sprint = true;
+        // The settings value is authoritative across a swap, including over
+        // a session that arrived with a different saved render distance.
+        app.settings.render_distance = 22;
 
         app.start_world_session(WorldSession::new_session(
             42,
@@ -2985,6 +3008,11 @@ mod tests {
         );
         assert_eq!(app.session.camera.yaw, app.session.player.yaw);
         assert_eq!(app.session.camera.pitch, app.session.player.pitch);
+        assert_eq!(
+            app.session.world.render_distance(),
+            22,
+            "the settings render distance applies at the swap boundary"
+        );
         assert!(
             !app.input.forward && !app.input.jump_or_up && !app.input.sprint,
             "input flags reset at the boundary"

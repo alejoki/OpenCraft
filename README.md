@@ -14,7 +14,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Raycasting for block breaking and placing.
 *   **Customizable Settings**:
     *   Rebindable key controls for movement and actions.
-    *   Adjustable mouse sensitivity, field of view (FOV), VSync, and fullscreen settings.
+    *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
 *   **Comprehensive UI System**:
     *   Main Menu, New Game, Load Game, and Pause screens.
@@ -91,7 +91,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | **Right Click** | Place block. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
-| **[** / **]** | Decrease / Increase render distance. |
+| **Escape** | Open the pause menu (settings are available from there). |
 
 ## 📂 Project Structure
 

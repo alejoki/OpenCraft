@@ -16,7 +16,8 @@ use winit::keyboard::KeyCode;
 use super::LINE_HEIGHT;
 use crate::settings::keybind::key_to_string;
 use crate::settings::{
-    Keybinds, SettingsWarning, FOV_MAX, FOV_MIN, SENSITIVITY_MAX, SENSITIVITY_MIN,
+    Keybinds, SettingsWarning, FOV_MAX, FOV_MIN, RENDER_DISTANCE_MAX, RENDER_DISTANCE_MIN,
+    SENSITIVITY_MAX, SENSITIVITY_MIN,
 };
 
 /// Fixed panel width in px. Wide enough for "Mouse Sensitivity: 0.0022"
@@ -32,6 +33,10 @@ pub const SENSITIVITY_STEP: f32 = 0.0005;
 /// One step of the FOV adjustment in degrees, within
 /// [`FOV_MIN`, `FOV_MAX`].
 pub const FOV_STEP: f32 = 5.0;
+/// One step of the render-distance adjustment in chunks, within
+/// [`RENDER_DISTANCE_MIN`, `RENDER_DISTANCE_MAX`]. Matches the old
+/// bracket-key step so the setting preserves the previous feel.
+pub const RENDER_DISTANCE_STEP: i32 = 2;
 /// Default warning-message lifetime: the caller decrements once per frame,
 /// so at 60 fps this is ~10 seconds. The module never owns a clock.
 pub const MESSAGE_TICKS: u32 = 600;
@@ -108,19 +113,20 @@ impl BindAction {
 }
 
 /// One selectable menu line. The full list is 7 keybind rows plus
-/// sensitivity, FOV, fullscreen, vsync, and a close row.
+/// sensitivity, FOV, render distance, fullscreen, vsync, and a close row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuRow {
     Bind(BindAction),
     MouseSensitivity,
     Fov,
+    RenderDistance,
     Fullscreen,
     Vsync,
     Close,
 }
 
 /// All rows top-to-bottom, in menu order.
-pub const ROWS: [MenuRow; 12] = [
+pub const ROWS: [MenuRow; 13] = [
     MenuRow::Bind(BindAction::Forward),
     MenuRow::Bind(BindAction::Backward),
     MenuRow::Bind(BindAction::Left),
@@ -130,6 +136,7 @@ pub const ROWS: [MenuRow; 12] = [
     MenuRow::Bind(BindAction::Sprint),
     MenuRow::MouseSensitivity,
     MenuRow::Fov,
+    MenuRow::RenderDistance,
     MenuRow::Fullscreen,
     MenuRow::Vsync,
     MenuRow::Close,
@@ -152,6 +159,7 @@ impl MenuRow {
             MenuRow::Bind(BindAction::Sprint) => "Sprint",
             MenuRow::MouseSensitivity => "Mouse Sensitivity",
             MenuRow::Fov => "Field of View",
+            MenuRow::RenderDistance => "Render Distance",
             MenuRow::Fullscreen => "Fullscreen",
             MenuRow::Vsync => "VSync",
             MenuRow::Close => "Close Menu",
@@ -359,6 +367,13 @@ pub fn clamp_fov(value: f32) -> f32 {
     ((value as f64).clamp(FOV_MIN, FOV_MAX)) as f32
 }
 
+/// Clamp a render distance to [`RENDER_DISTANCE_MIN`,
+/// `RENDER_DISTANCE_MAX`] in chunks. Kept in sync with `WorldManager`'s
+/// own clamp so the menu can never request an out-of-range world.
+pub fn clamp_render_distance(value: i32) -> i32 {
+    value.clamp(RENDER_DISTANCE_MIN, RENDER_DISTANCE_MAX)
+}
+
 /// One-step adjustment direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdjustDirection {
@@ -384,6 +399,16 @@ pub fn adjust_fov(current: f32, direction: AdjustDirection) -> f32 {
         AdjustDirection::Down => -FOV_STEP,
     };
     clamp_fov(current + delta)
+}
+
+/// Step the render distance up or down by [`RENDER_DISTANCE_STEP`] chunks,
+/// clamped to the valid range. Stepping past either bound pins at the bound.
+pub fn adjust_render_distance(current: i32, direction: AdjustDirection) -> i32 {
+    let delta = match direction {
+        AdjustDirection::Up => RENDER_DISTANCE_STEP,
+        AdjustDirection::Down => -RENDER_DISTANCE_STEP,
+    };
+    clamp_render_distance(current + delta)
 }
 
 /// Verdict on a key pressed while capturing a rebind.
@@ -847,19 +872,48 @@ mod tests {
 
     #[test]
     fn rows_cover_all_seven_binds_plus_settings_and_close_in_order() {
-        assert_eq!(ROW_COUNT, 12);
+        assert_eq!(ROW_COUNT, 13);
         for (i, action) in BindAction::ALL.iter().enumerate() {
             assert_eq!(ROWS[i], MenuRow::Bind(*action), "row {i}");
         }
         assert_eq!(ROWS[7], MenuRow::MouseSensitivity);
         assert_eq!(ROWS[8], MenuRow::Fov);
-        assert_eq!(ROWS[9], MenuRow::Fullscreen);
-        assert_eq!(ROWS[10], MenuRow::Vsync);
-        assert_eq!(ROWS[11], MenuRow::Close);
+        assert_eq!(ROWS[9], MenuRow::RenderDistance);
+        assert_eq!(ROWS[10], MenuRow::Fullscreen);
+        assert_eq!(ROWS[11], MenuRow::Vsync);
+        assert_eq!(ROWS[12], MenuRow::Close);
         // every row has a non-empty label
         for r in ROWS {
             assert!(!r.label().is_empty());
         }
+    }
+
+    #[test]
+    fn render_distance_steps_by_two_chunks_and_clamps_both_directions() {
+        assert_eq!(adjust_render_distance(16, AdjustDirection::Up), 18);
+        assert_eq!(adjust_render_distance(16, AdjustDirection::Down), 14);
+        assert_eq!(
+            adjust_render_distance(RENDER_DISTANCE_MAX - 1, AdjustDirection::Up),
+            RENDER_DISTANCE_MAX,
+            "clamps at the ceiling"
+        );
+        assert_eq!(
+            adjust_render_distance(RENDER_DISTANCE_MAX, AdjustDirection::Up),
+            RENDER_DISTANCE_MAX,
+            "pinned at MAX"
+        );
+        assert_eq!(
+            adjust_render_distance(RENDER_DISTANCE_MIN + 1, AdjustDirection::Down),
+            RENDER_DISTANCE_MIN,
+            "clamps at the floor"
+        );
+        assert_eq!(
+            adjust_render_distance(RENDER_DISTANCE_MIN, AdjustDirection::Down),
+            RENDER_DISTANCE_MIN,
+            "pinned at MIN"
+        );
+        assert_eq!(clamp_render_distance(0), RENDER_DISTANCE_MIN);
+        assert_eq!(clamp_render_distance(900), RENDER_DISTANCE_MAX);
     }
 
     #[test]

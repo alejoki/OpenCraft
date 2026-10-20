@@ -21,6 +21,13 @@ pub const SENSITIVITY_MAX: f64 = 0.01;
 pub const FOV_MIN: f64 = 30.0;
 /// Inclusive upper bound for `video.fov` in degrees (f64); see `FOV_MIN`.
 pub const FOV_MAX: f64 = 120.0;
+/// Inclusive lower bound for `video.render_distance` in chunks. Matches
+/// `WorldManager`'s own clamp so settings and streaming agree exactly.
+pub const RENDER_DISTANCE_MIN: i32 = 4;
+/// Inclusive upper bound for `video.render_distance` in chunks.
+pub const RENDER_DISTANCE_MAX: i32 = 36;
+/// The default render distance in chunks: the fresh-world value.
+pub const DEFAULT_RENDER_DISTANCE: i32 = 16;
 
 /// Player keybind preferences, mirroring `InputState` in
 /// `src/player/physics.rs`: exactly one physical key per action.
@@ -58,13 +65,15 @@ impl Default for Keybinds {
 /// Full player preferences. Defaults equal today's hardcoded values so the
 /// S04 wiring swap is behavior-neutral: sensitivity 0.0022
 /// (`src/main.rs` device_event), FOV 75.0 (`src/player/camera.rs`
-/// `Camera::new`), fullscreen false, vsync false (`src/render/context.rs`
-/// prefers Immediate -> no vsync).
+/// `Camera::new`), render distance 16 (`WorldSession::new_session`),
+/// fullscreen false, vsync false (`src/render/context.rs` prefers
+/// Immediate -> no vsync).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub keybinds: Keybinds,
     pub mouse_sensitivity: f32,
     pub fov_degrees: f32,
+    pub render_distance: i32,
     pub fullscreen: bool,
     pub vsync: bool,
 }
@@ -75,6 +84,7 @@ impl Default for Settings {
             keybinds: Keybinds::default(),
             mouse_sensitivity: 0.0022,
             fov_degrees: 75.0,
+            render_distance: DEFAULT_RENDER_DISTANCE,
             fullscreen: false,
             vsync: false,
         }
@@ -168,6 +178,7 @@ impl Settings {
             },
             video: VideoToml {
                 fov: f64::from(self.fov_degrees),
+                render_distance: self.render_distance,
                 fullscreen: self.fullscreen,
                 vsync: self.vsync,
             },
@@ -233,6 +244,7 @@ struct MouseToml {
 #[derive(serde::Serialize)]
 struct VideoToml {
     fov: f64,
+    render_distance: i32,
     fullscreen: bool,
     vsync: bool,
 }
@@ -363,6 +375,15 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
                     "video.fov",
                     &mut warnings,
                 );
+                settings.render_distance = load_clamped_i32(
+                    table,
+                    "render_distance",
+                    RENDER_DISTANCE_MIN,
+                    RENDER_DISTANCE_MAX,
+                    settings.render_distance,
+                    "video.render_distance",
+                    &mut warnings,
+                );
                 settings.fullscreen = load_bool(
                     table,
                     "fullscreen",
@@ -451,6 +472,49 @@ fn load_clamped_f32(
     }
 }
 
+/// Extract an integer field from a table and clamp to `[min, max]` with a
+/// warning (never reject). Wrong type -> current (default) + warning.
+fn load_clamped_i32(
+    table: &toml::value::Table,
+    key: &str,
+    min: i32,
+    max: i32,
+    current: i32,
+    field: &str,
+    warnings: &mut Vec<SettingsWarning>,
+) -> i32 {
+    match table.get(key) {
+        None => current,
+        Some(value) => match value.as_integer() {
+            Some(n) => {
+                let (min, max) = (i64::from(min), i64::from(max));
+                if n < min {
+                    warnings.push(SettingsWarning {
+                        field: field.to_string(),
+                        reason: format!("{n} below minimum {min}, clamped to {min}"),
+                    });
+                    min as i32
+                } else if n > max {
+                    warnings.push(SettingsWarning {
+                        field: field.to_string(),
+                        reason: format!("{n} above maximum {max}, clamped to {max}"),
+                    });
+                    max as i32
+                } else {
+                    n as i32
+                }
+            }
+            None => {
+                warnings.push(SettingsWarning {
+                    field: field.to_string(),
+                    reason: format!("expected an integer, found {}", value.type_str()),
+                });
+                current
+            }
+        },
+    }
+}
+
 /// Extract a boolean field from a table. Wrong type -> current + warning.
 fn load_bool(
     table: &toml::value::Table,
@@ -508,6 +572,8 @@ mod tests {
         let d = Settings::default();
         assert_eq!(d.mouse_sensitivity, 0.0022);
         assert_eq!(d.fov_degrees, 75.0);
+        assert_eq!(d.render_distance, DEFAULT_RENDER_DISTANCE);
+        assert_eq!(d.render_distance, 16);
         assert!(!d.fullscreen);
         assert!(!d.vsync);
         assert_eq!(d.keybinds, Keybinds::default());
@@ -556,6 +622,34 @@ fullscreen = true
         assert_eq!(settings.fov_degrees, Settings::default().fov_degrees);
         assert!(settings.fullscreen);
         assert_eq!(warning_fields(&warnings), vec!["video.fov"]);
+    }
+
+    #[test]
+    fn render_distance_loads_and_out_of_range_values_clamp_with_warnings() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[video]\nrender_distance = 24\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.render_distance, 24);
+        assert!(warnings.is_empty());
+
+        let low = write_settings_file(&dir, "[video]\nrender_distance = 0\n");
+        let (settings, warnings) = load_with_warnings(&low);
+        assert_eq!(settings.render_distance, RENDER_DISTANCE_MIN);
+        assert_eq!(warning_fields(&warnings), vec!["video.render_distance"]);
+
+        let high = write_settings_file(&dir, "[video]\nrender_distance = 900\n");
+        let (settings, warnings) = load_with_warnings(&high);
+        assert_eq!(settings.render_distance, RENDER_DISTANCE_MAX);
+        assert_eq!(warning_fields(&warnings), vec!["video.render_distance"]);
+    }
+
+    #[test]
+    fn wrong_type_render_distance_falls_back_with_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[video]\nrender_distance = \"far\"\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.render_distance, DEFAULT_RENDER_DISTANCE);
+        assert_eq!(warning_fields(&warnings), vec!["video.render_distance"]);
     }
 
     #[test]
@@ -745,6 +839,7 @@ vsync = false
             },
             mouse_sensitivity: 0.005,
             fov_degrees: 90.0,
+            render_distance: 24,
             fullscreen: true,
             vsync: true,
         };
@@ -776,6 +871,7 @@ vsync = false
         assert!(text.contains("crouch_or_down = \"ShiftLeft\""));
         assert!(text.contains("[mouse]"));
         assert!(text.contains("[video]"));
+        assert!(text.contains("render_distance = 16"));
         assert!(text.contains("fullscreen = false"));
         assert!(text.contains("vsync = false"));
     }
@@ -843,6 +939,7 @@ jump_or_up = "KeyW"
         let changed = Settings {
             mouse_sensitivity: 0.005,
             fov_degrees: 90.0,
+            render_distance: 20,
             vsync: true,
             ..Settings::default()
         };
