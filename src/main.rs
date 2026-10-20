@@ -109,6 +109,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             fly_mode: session.player.fly_mode,
             selected_slot: session.player.selected_slot as u8,
             render_distance: session.world.render_distance() as u16,
+            hotbar: session.player.hotbar.clone(),
         },
         chunk_edits: session.world.chunk_edits().clone(),
     };
@@ -3315,6 +3316,7 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
+                hotbar: minecraft_clone::player::inventory::Hotbar::empty(),
             },
             chunk_edits: ChunkEditMap::default(),
         }
