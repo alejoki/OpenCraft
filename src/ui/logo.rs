@@ -1,11 +1,16 @@
-//! Pure title/logo/tint geometry for the vista front door.
+//! Title/logo/tint helpers and the textured-quad logo pipeline for the
+//! vista front door.
 //!
-//! Everything here is GPU-free: the `LogoRenderer` pipeline (added in a
-//! later task) consumes these helpers, but never the other way around. This
-//! keeps the geometry headless-testable while the textured-quad pipeline
-//! stays build-only evidence.
+//! The geometry at the top of this file is GPU-free and headless-testable;
+//! `LogoRenderer` at the bottom consumes those helpers but never the other
+//! way around, so the pure math can be proven without a device.
+
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 
 use super::quad::Quad;
+use crate::pack::PackLogo;
+use crate::render::context::RenderContext;
 
 /// Engine-styled title text. "Engine-styled" is the same monospace family
 /// every other UI string uses (see `ui::text`).
@@ -66,7 +71,8 @@ pub fn logo_rect(surface_w: u32, logo_w: u32, logo_h: u32, max_h: f32) -> (f32, 
 ///
 /// Same `clip_pos` shape as `render::pipeline::OverlayVertex`, but carries a
 /// texture coordinate instead of a color.
-#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct LogoVertex {
     pub clip_pos: [f32; 4],
     pub uv: [f32; 2],
@@ -113,6 +119,293 @@ pub fn logo_to_vertices(
 /// convention as `screens::centered_x`.
 pub fn centered_title_left(surface_w: f32, measured_w: f32) -> f32 {
     ((surface_w - measured_w) / 2.0).max(0.0)
+}
+
+/// Straight-alpha textured-quad shader for the pack logo.
+///
+/// One texture + sampler at group 0, no uniforms: the GPU cost is a single
+/// two-triangle draw per frame when a logo is present.
+const LOGO_SHADER_WGSL: &str = r#"
+struct LogoOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@vertex
+fn vs_main(
+    @location(0) clip_pos: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+) -> LogoOutput {
+    var out: LogoOutput;
+    out.clip_pos = clip_pos;
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: LogoOutput) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+
+/// Draws the optional pack logo as one textured quad inside the color-only
+/// UI pass.
+///
+/// Texture creation and upload happen only in [`set_logo`](Self::set_logo),
+/// i.e. at startup and when the Texture Pack selection changes — never on
+/// the render hot path. [`set_logo_frame`](Self::set_logo_frame) rebuilds a
+/// small CPU vertex buffer per frame (same pattern as `QuadRenderer`).
+///
+/// Draw this between the quad renderer (panels/tint) and glyphon text so the
+/// logo sits above the panorama tint and below the UI text.
+pub struct LogoRenderer {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    // The bind group owns the texture view, which keeps the texture alive;
+    // dropping the bind group (set_logo(None)/replacement) releases both.
+    bind_group: Option<wgpu::BindGroup>,
+    vertex_buffer: Option<wgpu::Buffer>,
+    vertex_count: u32,
+}
+
+impl LogoRenderer {
+    pub fn new(ctx: &RenderContext) -> Self {
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ui_logo_shader"),
+                source: wgpu::ShaderSource::Wgsl(LOGO_SHADER_WGSL.into()),
+            });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ui_logo_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ui_logo_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ui_logo_pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<LogoVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 16,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: ctx.config.format,
+                        // Straight (non-premultiplied) RGBA, same convention as
+                        // QuadRenderer: transparent PNG logos composite correctly.
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            bind_group: None,
+            vertex_buffer: None,
+            vertex_count: 0,
+        }
+    }
+
+    /// Replace the logo texture. Call on pack load/switch only.
+    ///
+    /// `None` clears the texture, bind group, and any pending frame geometry
+    /// so the caller falls back to the text title. A logo whose byte payload
+    /// does not match its declared dimensions is treated as absent rather
+    /// than handed to `write_texture` (which would panic on the size
+    /// mismatch).
+    pub fn set_logo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, logo: Option<&PackLogo>) {
+        self.vertex_buffer = None;
+        self.vertex_count = 0;
+
+        let Some(logo) = logo else {
+            self.bind_group = None;
+            return;
+        };
+
+        let width = logo.width.max(1);
+        let height = logo.height.max(1);
+        let expected_len = width as usize * height as usize * 4;
+        if logo.rgba.len() != expected_len {
+            self.bind_group = None;
+            return;
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui_logo_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // sRGB texture matching the sRGB surface: pure-color logos are
+            // not gamma-shifted. NPOT/non-square logos need no mipmaps.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &logo.rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                // RGBA8 is 4 bytes per texel, so rows are always 4-aligned.
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ui_logo_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui_logo_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        }));
+    }
+
+    /// Rebuild the per-frame logo vertex buffer. Pure CPU work (no texture
+    /// upload); call once per frame before the UI pass opens.
+    ///
+    /// The vertex buffer is cleared when there is no logo or no rect, so a
+    /// `None` call is the explicit "do not draw a logo this frame" signal
+    /// (used to keep the logo off Pause/Playing screens).
+    pub fn set_logo_frame(
+        &mut self,
+        device: &wgpu::Device,
+        rect: Option<(f32, f32, f32, f32)>,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        let verts = match rect {
+            Some((x, y, w, h))
+                if self.bind_group.is_some() && w > 0.0 && h > 0.0 && x.is_finite() && y.is_finite() =>
+            {
+                logo_to_vertices(x, y, w, h, surface_w, surface_h)
+            }
+            _ => Vec::new(),
+        };
+
+        self.vertex_count = verts.len() as u32;
+        self.vertex_buffer = if verts.is_empty() {
+            None
+        } else {
+            Some(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui_logo_vbuf"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            )
+        };
+    }
+
+    /// Draw the logo into the UI pass. No-op when no texture or frame
+    /// geometry is pending. Call after quads and before glyphon text.
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        if self.vertex_count == 0 {
+            return;
+        }
+        let (Some(bind_group), Some(buffer)) = (&self.bind_group, &self.vertex_buffer) else {
+            return;
+        };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..self.vertex_count, 0..1);
+    }
 }
 
 #[cfg(test)]
