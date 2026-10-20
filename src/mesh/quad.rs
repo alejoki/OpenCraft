@@ -18,15 +18,14 @@ pub struct PackedQuad(pub [u32; 2]);
 impl PackedQuad {
     #[inline]
     pub const fn new(
-        x: u32,
-        y: u32,
-        z: u32,
-        w: u32,
-        h: u32,
+        pos: [u32; 3],
+        extent: [u32; 2],
         face_dir: u32,
         tex_layer: u8,
         ao_packed: u8,
     ) -> Self {
+        let [x, y, z] = pos;
+        let [w, h] = extent;
         debug_assert!(x < 32 && y < 32 && z < 32);
         debug_assert!(w >= 1 && w <= 32 && h >= 1 && h <= 32);
         debug_assert!(face_dir < 6);
@@ -72,5 +71,22 @@ impl ChunkMesh {
 
     pub fn total_quads(&self) -> usize {
         self.buckets.iter().map(|b| b.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_quad_layout_and_round_trip_unchanged() {
+        let quad = PackedQuad::new([5, 6, 7], [3, 4], 5, 9, 0b1010_0101);
+
+        assert_eq!(
+            quad.0[0],
+            5 | (6 << 5) | (7 << 10) | (2 << 15) | (3 << 20) | (5 << 25)
+        );
+        assert_eq!(quad.0[1], 9 | (0b1010_0101 << 8));
+        assert_eq!(quad.unpack(), (5, 6, 7, 3, 4, 5, 9, 0b1010_0101));
     }
 }

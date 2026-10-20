@@ -23,7 +23,7 @@ pub struct CliConfig {
 }
 
 impl CliConfig {
-    pub fn from_iter<I, S>(args: I) -> Self
+    pub fn parse_args<I, S>(args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -657,9 +657,31 @@ mod tests {
 
     #[test]
     fn test_cli_args_parsing() {
-        let cfg = CliConfig::from_iter(["--seed", "999", "--save", "custom.mcvx", "--new"]);
+        let cfg = CliConfig::parse_args(["--seed", "999", "--save", "custom.mcvx", "--new"]);
         assert_eq!(cfg.seed_override, Some(999));
         assert_eq!(cfg.save_path, std::path::PathBuf::from("custom.mcvx"));
         assert!(cfg.force_new_world);
+    }
+
+    #[test]
+    fn test_cli_args_ignore_malformed_and_incomplete_flags() {
+        // A non-numeric seed is ignored; "--save" still consumes the following
+        // token as its value, so "--new" never becomes a flag.
+        let cfg = CliConfig::parse_args(["--seed", "not-a-number", "--save", "--new"]);
+        assert_eq!(cfg.seed_override, None);
+        assert_eq!(cfg.save_path, std::path::PathBuf::from("--new"));
+        assert!(!cfg.force_new_world);
+
+        // A flag with no following value keeps the default path and seed.
+        let incomplete = CliConfig::parse_args(["--seed"]);
+        assert_eq!(incomplete.seed_override, None);
+        assert_eq!(
+            incomplete.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A seed that overflows u32 is rejected rather than truncated.
+        let overflow = CliConfig::parse_args(["--seed", "4294967296"]);
+        assert_eq!(overflow.seed_override, None);
     }
 }

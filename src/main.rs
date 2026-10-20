@@ -1125,17 +1125,14 @@ impl GameApp {
             }
         };
         let session = WorldSession::new_session(seed, save_path);
-        match self
+        // Unreachable: attempt_create only runs while the new-game screen is
+        // open, and that screen accepts Create.
+        if let Ok(LifecycleDecision::StartNewGame) = self
             .lifecycle
             .dispatch(LifecycleIntent::NewGame(NewGameIntent::Create))
         {
-            Ok(LifecycleDecision::StartNewGame) => {
-                self.start_world_session(session);
-                self.enter_playing();
-            }
-            // Unreachable: attempt_create only runs while the new-game
-            // screen is open, and that screen accepts Create.
-            _ => {}
+            self.start_world_session(session);
+            self.enter_playing();
         }
     }
 
@@ -1190,17 +1187,14 @@ impl GameApp {
         };
         let session =
             WorldSession::session_from_save(save, self.catalog.saves_dir().join(&row.file_name));
-        match self
+        // Unreachable: play_row only runs while the load screen is
+        // open, and that screen accepts Load.
+        if let Ok(LifecycleDecision::LoadWorld) = self
             .lifecycle
             .dispatch(LifecycleIntent::LoadGame(LoadGameIntent::Load))
         {
-            Ok(LifecycleDecision::LoadWorld) => {
-                self.start_world_session(session);
-                self.enter_playing();
-            }
-            // Unreachable: play_row only runs while the load screen is
-            // open, and that screen accepts Load.
-            _ => {}
+            self.start_world_session(session);
+            self.enter_playing();
         }
     }
 
@@ -2133,7 +2127,7 @@ impl ApplicationHandler for GameApp {
 }
 
 fn main() {
-    let cli = CliConfig::from_iter(std::env::args().skip(1));
+    let cli = CliConfig::parse_args(std::env::args().skip(1));
 
     let session = startup_session(&cli);
 
@@ -2421,24 +2415,24 @@ mod tests {
     #[test]
     fn cli_bypass_condition_is_exactly_the_three_flag_disjunction() {
         // Bare launch: no CLI world intent — the main menu owns startup.
-        assert!(!cli_has_world_intent(&CliConfig::from_iter(
+        assert!(!cli_has_world_intent(&CliConfig::parse_args(
             Vec::<String>::new()
         )));
         // The default save path alone is NOT an intent (byte-identical default).
-        assert!(!cli_has_world_intent(&CliConfig::from_iter([
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
             "--save",
             "saves/default.mcvx"
         ])));
         // Each flag alone forces the direct-launch bypass into gameplay.
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--new"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--new-world"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--seed", "7"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter([
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--new"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--new-world"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--seed", "7"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--save",
             "other.mcvx"
         ])));
         // Every flag together still bypasses (the smoke scripts' launches).
-        assert!(cli_has_world_intent(&CliConfig::from_iter([
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--new",
             "--seed",
             "999",
@@ -2451,7 +2445,7 @@ mod tests {
     /// and the given screen entered through the real `enter_screen` path
     /// (LoadGame entry refreshes rows from the tempdir catalog).
     fn app_at_screen(saves_dir: &Path, screen: LifecycleScreen) -> GameApp {
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -2811,7 +2805,7 @@ mod tests {
         // atomic save's create_dir_all cannot succeed.
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(9, blocker.join("deep.mcvx")),
@@ -2863,7 +2857,7 @@ mod tests {
     fn save_and_quit_success_returns_to_the_main_menu_with_no_message() {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("kept.mcvx");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
@@ -2901,7 +2895,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("exit-game.mcvx");
         let settings_path = dir.path().join("settings.toml");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         // Bare CliConfig: GameApp::new starts at the main menu over the
         // loaded default session (the same S03 test pattern as the
         // SaveAndQuit tests).
@@ -2949,7 +2943,7 @@ mod tests {
         // which is exactly the headless case; the GPU-clear leg rides on
         // the launch smoke script and S04's human UAT — see the honest
         // limitation documented on `ChunkRenderStore::clear`).
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -3000,7 +2994,7 @@ mod tests {
     /// hold or show a stale bar.
     #[test]
     fn enter_screen_clears_held_mouse_and_mining_progress() {
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -3029,7 +3023,7 @@ mod tests {
     /// can never start with progress inherited from the outgoing session.
     #[test]
     fn start_world_session_clears_held_mouse_and_mining_progress() {
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -3059,7 +3053,7 @@ mod tests {
         let data = sample_save(31337);
         save_world_to_path(&save_path, &data).expect("write save file");
 
-        let cli = CliConfig::from_iter(["--save", save_path_str.as_str()]);
+        let cli = CliConfig::parse_args(["--save", save_path_str.as_str()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), 31337);
         assert_eq!(
@@ -3085,7 +3079,7 @@ mod tests {
 
         // Missing file + seed override: fresh session at the override seed.
         let missing = dir.path().join("missing.mcvx");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             missing.to_str().unwrap(),
             "--seed",
@@ -3103,7 +3097,7 @@ mod tests {
 
         // Missing file, no override: the default seed.
         let missing2 = dir.path().join("other.mcvx");
-        let cli = CliConfig::from_iter(["--save", missing2.to_str().unwrap()]);
+        let cli = CliConfig::parse_args(["--save", missing2.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
         assert_eq!(session.save_path, missing2);
@@ -3112,7 +3106,7 @@ mod tests {
         // behavior — main() matched Err(_) the same way).
         let corrupt = dir.path().join("corrupt.mcvx");
         std::fs::write(&corrupt, b"NOPE!1234").expect("write corrupt save");
-        let cli = CliConfig::from_iter(["--save", corrupt.to_str().unwrap()]);
+        let cli = CliConfig::parse_args(["--save", corrupt.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
         assert_eq!(
@@ -3125,7 +3119,7 @@ mod tests {
         // (legacy direct-launch behavior, byte-identical).
         let existing = dir.path().join("ignored.mcvx");
         save_world_to_path(&existing, &sample_save(999)).expect("write existing save");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             existing.to_str().unwrap(),
             "--new",
@@ -3261,7 +3255,7 @@ mod tests {
         // session owns the CLI save path at the override seed.
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("smoke.mcvx");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             save_path.to_str().unwrap(),
             "--seed",
@@ -3285,7 +3279,7 @@ mod tests {
         // content, so the test tracks the fixture instead of pinning it);
         // a missing/corrupt default save falls back to the fresh default
         // seed. Read-only either way.
-        let bare = CliConfig::from_iter(Vec::<String>::new());
+        let bare = CliConfig::parse_args(Vec::<String>::new());
         assert!(!cli_has_world_intent(&bare));
         assert_eq!(bare.save_path, Path::new(DEFAULT_SAVE_PATH));
         let session = startup_session(&bare);

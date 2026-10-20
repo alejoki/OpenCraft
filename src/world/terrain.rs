@@ -388,10 +388,10 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
     // Precompute column heights in 32x32
     let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
     let mut max_h = i32::MIN;
-    for lz in 0..CHUNK_SIZE {
-        for lx in 0..CHUNK_SIZE {
+    for (lz, row) in heights.iter_mut().enumerate() {
+        for (lx, height) in row.iter_mut().enumerate() {
             let h = terrain_height_at_seeded(base_wx + lx as i32, base_wz + lz as i32, seed);
-            heights[lz][lx] = h;
+            *height = h;
             max_h = max_h.max(h);
         }
     }
@@ -405,11 +405,10 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
     let cave_field = CaveField::new(pos, seed);
 
     let mut chunk = Chunk::new_uniform(BlockId::Air);
-    for lz in 0..CHUNK_SIZE {
-        for lx in 0..CHUNK_SIZE {
+    for (lz, row) in heights.iter().enumerate() {
+        for (lx, &h) in row.iter().enumerate() {
             let wx = base_wx + lx as i32;
             let wz = base_wz + lz as i32;
-            let h = heights[lz][lx];
 
             for ly in 0..CHUNK_SIZE {
                 let wy = base_wy + ly as i32;
