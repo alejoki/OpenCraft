@@ -13,6 +13,8 @@ pub enum BlockId {
     Brick = 9,
     Snow = 10,
     Bedrock = 11,
+    CoalOre = 12,
+    IronOre = 13,
 }
 
 impl BlockId {
@@ -48,11 +50,13 @@ impl BlockId {
             9 => Some(BlockId::Brick),
             10 => Some(BlockId::Snow),
             11 => Some(BlockId::Bedrock),
+            12 => Some(BlockId::CoalOre),
+            13 => Some(BlockId::IronOre),
             _ => None,
         }
     }
 
-    /// Returns texture array layer index (0..14) for a face direction:
+    /// Returns texture array layer index (0..16) for a face direction:
     /// 0 = +X, 1 = -X, 2 = +Y (top), 3 = -Y (bottom), 4 = +Z, 5 = -Z
     #[inline]
     pub const fn face_tex_layer(self, face_dir: u8) -> u8 {
@@ -80,6 +84,8 @@ impl BlockId {
                 _ => 13, // snow grass side
             },
             BlockId::Bedrock => 12,
+            BlockId::CoalOre => 14,
+            BlockId::IronOre => 15,
         }
     }
 
@@ -97,6 +103,8 @@ impl BlockId {
             BlockId::Brick => "Brick",
             BlockId::Snow => "Snow",
             BlockId::Bedrock => "Bedrock",
+            BlockId::CoalOre => "Coal Ore",
+            BlockId::IronOre => "Iron Ore",
         }
     }
 }
@@ -115,5 +123,25 @@ mod tests {
         assert_eq!(BlockId::OakLog.face_tex_layer(2), 6);
         assert_eq!(BlockId::OakLog.face_tex_layer(4), 7);
         assert_eq!(BlockId::Stone.name(), "Stone");
+    }
+
+    #[test]
+    fn test_block_ids_roundtrip_and_ore_metadata() {
+        for id in 0u8..=13 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(block as u8, id, "block id {id} must round-trip");
+        }
+        assert_eq!(BlockId::from_u8(14), None);
+        assert_eq!(BlockId::from_u8(99), None);
+
+        assert_eq!(BlockId::CoalOre.name(), "Coal Ore");
+        assert_eq!(BlockId::IronOre.name(), "Iron Ore");
+        assert!(BlockId::CoalOre.is_solid());
+        assert!(BlockId::IronOre.is_solid());
+
+        for face_dir in 0u8..6 {
+            assert_eq!(BlockId::CoalOre.face_tex_layer(face_dir), 14);
+            assert_eq!(BlockId::IronOre.face_tex_layer(face_dir), 15);
+        }
     }
 }
