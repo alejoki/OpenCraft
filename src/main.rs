@@ -1767,12 +1767,20 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                let hit = raycast_voxels(
-                    self.session.camera.position,
-                    self.session.camera.forward(),
-                    8.0,
-                    |x, y, z| self.session.world.get_block(x, y, z),
-                );
+                // Gameplay raycast feeds both the targeted-block wireframe
+                // and hold-to-mine. Menus suppress it entirely: no wireframe
+                // can float behind a panel, and mining.tick(None, ..) resets
+                // stale progress exactly as before.
+                let hit = if playing {
+                    raycast_voxels(
+                        self.session.camera.position,
+                        self.session.camera.forward(),
+                        8.0,
+                        |x, y, z| self.session.world.get_block(x, y, z),
+                    )
+                } else {
+                    None
+                };
                 // Hold-to-mine candidate: only a held Left button on the
                 // grabbed gameplay surface feeds the accumulator. Every
                 // other frame passes None, which resets stale progress
@@ -2021,6 +2029,7 @@ impl ApplicationHandler for GameApp {
                     self.session.world.render_distance(),
                     target_block,
                     self.session.player.selected_slot,
+                    playing,
                     ui_pass,
                 ) {
                     Ok(visible_chunks) => {

@@ -233,7 +233,14 @@ pub fn build_overlay_line_vertices(
     aspect: f32,
     target_block: Option<IVec3>,
     selected_slot: usize,
+    show_overlays: bool,
 ) -> Vec<OverlayVertex> {
+    // Single gate for every gameplay overlay (3D targeted-block wireframe,
+    // center crosshair, hotbar outlines). Menus draw through UiPass instead.
+    if !show_overlays {
+        return Vec::new();
+    }
+
     let mut verts = Vec::with_capacity(160);
 
     // 1. 3D Wireframe around targeted block (12 edges = 24 vertices)
@@ -578,10 +585,10 @@ impl VoxelRenderer {
         }
     }
 
-    // 8 args: the existing world-pass parameters plus the T01 `ui_pass`
-    // hook. Kept flat rather than grouped into a struct to avoid churn at
-    // the single call site in src/main.rs; this is the frame-draw entry
-    // point, not a general-purpose API.
+    // 9 args: the existing world-pass parameters plus the T01 `ui_pass`
+    // hook and the T02 `show_overlays` gate. Kept flat rather than grouped
+    // into a struct to avoid churn at the single call site in src/main.rs;
+    // this is the frame-draw entry point, not a general-purpose API.
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
@@ -591,6 +598,7 @@ impl VoxelRenderer {
         render_distance: i32,
         target_block: Option<IVec3>,
         selected_slot: usize,
+        show_overlays: bool,
         ui_pass: Option<&dyn UiPass>,
     ) -> Result<usize, wgpu::SurfaceError> {
         let output = ctx.surface.get_current_texture()?;
@@ -612,7 +620,8 @@ impl VoxelRenderer {
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
 
-        let overlay_verts = build_overlay_line_vertices(&vp, aspect, target_block, selected_slot);
+        let overlay_verts =
+            build_overlay_line_vertices(&vp, aspect, target_block, selected_slot, show_overlays);
         let overlay_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -732,10 +741,30 @@ mod tests {
 
     #[test]
     fn test_overlay_vertices_include_wireframe_crosshair_and_hotbar() {
-        let verts =
-            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 0);
+        let verts = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            0,
+            true,
+        );
         // 24 (wireframe) + 4 (crosshair) + 9 * 8 (hotbar) = 100 vertices
         assert_eq!(verts.len(), 100);
+    }
+
+    #[test]
+    fn test_overlay_vertices_empty_when_overlays_hidden() {
+        // Non-Playing screens must suppress the wireframe, crosshair, AND
+        // hotbar even when the inputs still carry a target and a selected
+        // slot — the flag alone gates all three.
+        let verts = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            4,
+            false,
+        );
+        assert!(verts.is_empty(), "hidden overlays must emit no vertices");
     }
 
     fn assert_close(actual: f32, expected: f32, what: &str) {
