@@ -361,6 +361,7 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
+                hotbar: crate::player::inventory::Hotbar::empty(),
             },
             chunk_edits: edits,
         }

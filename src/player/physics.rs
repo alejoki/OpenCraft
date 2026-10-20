@@ -1,5 +1,6 @@
 use glam::Vec3;
 
+use crate::player::inventory::Hotbar;
 use crate::world::block::BlockId;
 
 pub const PLAYER_HALF_WIDTH: f32 = 0.3;
@@ -68,6 +69,7 @@ pub struct Player {
     pub on_ground: bool,
     pub fly_mode: bool,
     pub selected_slot: usize,
+    pub hotbar: Hotbar,
 }
 
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
@@ -101,6 +103,7 @@ impl Player {
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
             selected_slot: 0,
+            hotbar: Hotbar::empty(),
         }
     }
 

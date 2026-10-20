@@ -1,3 +1,4 @@
+pub mod hud;
 pub mod lifecycle;
 pub mod menu;
 pub mod quad;

@@ -1219,7 +1219,7 @@ mod tests {
         assert_eq!(screen.name().value(), "My World");
         assert_eq!(screen.seed().value(), "");
         let over_long = "a".repeat(MAX_WORLD_NAME_LEN + 5);
-        screen.apply(TextInputAction::InsertText(over_long.into()));
+        screen.apply(TextInputAction::InsertText(over_long));
         assert_eq!(
             screen.name().len(),
             MAX_WORLD_NAME_LEN,
@@ -1232,7 +1232,7 @@ mod tests {
         assert_eq!(screen.seed().value(), "glacier 7");
         assert_eq!(screen.name().value().chars().take(8).collect::<String>(), "My World");
         let long_seed = "s".repeat(SEED_MAX_CHARS + 5);
-        screen.apply(TextInputAction::InsertText(long_seed.into()));
+        screen.apply(TextInputAction::InsertText(long_seed));
         assert_eq!(screen.seed().len(), SEED_MAX_CHARS, "the seed field is bounded");
     }
 

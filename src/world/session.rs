@@ -52,6 +52,7 @@ impl WorldSession {
         player.pitch = data.player.pitch;
         player.fly_mode = data.player.fly_mode;
         player.selected_slot = (data.player.selected_slot as usize).min(8);
+        player.hotbar = data.player.hotbar;
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 data.player.render_distance as i32,
@@ -100,6 +101,7 @@ mod tests {
                 fly_mode: false,
                 selected_slot: 3,
                 render_distance: 12,
+                hotbar: crate::player::inventory::Hotbar::empty(),
             },
             chunk_edits: ChunkEditMap::default(),
         }
@@ -204,12 +206,45 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 0,
                 render_distance: 16,
+                hotbar: crate::player::inventory::Hotbar::empty(),
             },
             chunk_edits: edits.clone(),
         };
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
         assert_eq!(session.world.seed(), seed);
         assert_eq!(session.world.chunk_edits(), &edits);
+    }
+
+    #[test]
+    fn session_from_save_restores_hotbar_stacks_exactly() {
+        use crate::player::inventory::{Hotbar, ItemStack};
+        use crate::world::block::BlockId;
+
+        let hotbar = Hotbar::from_slots([
+            Some(ItemStack::new(BlockId::CoalOre, 3).unwrap()),
+            Some(ItemStack::new(BlockId::IronOre, 2).unwrap()),
+            None,
+            None,
+            Some(ItemStack::new(BlockId::Stone, 999).unwrap()),
+            None,
+            None,
+            None,
+            Some(ItemStack::new(BlockId::Brick, 1).unwrap()),
+        ]);
+        let mut data = make_save(11u32);
+        data.player.hotbar = hotbar.clone();
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(session.player.hotbar, hotbar);
+    }
+
+    #[test]
+    fn new_session_starts_with_an_empty_hotbar() {
+        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        assert_eq!(
+            session.player.hotbar,
+            crate::player::inventory::Hotbar::empty()
+        );
     }
 
     #[test]

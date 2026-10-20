@@ -102,8 +102,8 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
     for axis in 0..3 {
         // Precompute 34x34 solidity masks along d (0..34) so AO and face culling are fast
         let mut solid_masks = [[0u64; PADDED_SIZE]; PADDED_SIZE];
-        for pv in 0..PADDED_SIZE {
-            for pu in 0..PADDED_SIZE {
+        for (pv, mask_row) in solid_masks.iter_mut().enumerate() {
+            for (pu, cell) in mask_row.iter_mut().enumerate() {
                 let mut mask = 0u64;
                 for pd in 0..PADDED_SIZE {
                     let (px, py, pz) = get_axis_coord(axis, pd, pu, pv);
@@ -111,7 +111,7 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                         mask |= 1u64 << pd;
                     }
                 }
-                solid_masks[pv][pu] = mask;
+                *cell = mask;
             }
         }
 
@@ -119,14 +119,14 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
         for is_pos in [true, false] {
             let face_dir = (axis * 2 + usize::from(!is_pos)) as u8;
 
-            // slice_keys[d][v][u] for d in 0..32, v in 0..32, u in 0..32
+            // slice_keys[v][u][d] for d in 0..32, v in 0..32, u in 0..32
             // 0 means no visible face; non-zero is ((tex_layer as u16 + 1) | ((ao_packed as u16) << 8))
             let mut slice_keys = [[[0u16; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE];
             let mut slice_row_masks = [[0u32; CHUNK_SIZE]; CHUNK_SIZE];
 
-            for v in 0..CHUNK_SIZE {
+            for (v, keys_v) in slice_keys.iter_mut().enumerate() {
                 let pv = v + 1;
-                for u in 0..CHUNK_SIZE {
+                for (u, keys_v_u) in keys_v.iter_mut().enumerate() {
                     let pu = u + 1;
                     let col_mask = solid_masks[pv][pu];
                     if col_mask == 0 {
@@ -167,7 +167,7 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                         let ao_packed = ao00 | (ao10 << 2) | (ao01 << 4) | (ao11 << 6);
 
                         let key = (tex_layer as u16 + 1) | ((ao_packed as u16) << 8);
-                        slice_keys[d][v][u] = key;
+                        keys_v_u[d] = key;
                         slice_row_masks[d][v] |= 1u32 << u;
                     }
                 }
@@ -180,13 +180,13 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                 for v in 0..CHUNK_SIZE {
                     while row_masks[v] != 0 {
                         let u = row_masks[v].trailing_zeros() as usize;
-                        let key = slice_keys[d][v][u];
+                        let key = slice_keys[v][u][d];
 
                         // Expand width w along u
                         let mut w = 1usize;
                         while u + w < CHUNK_SIZE
                             && (row_masks[v] & (1u32 << (u + w))) != 0
-                            && slice_keys[d][v][u + w] == key
+                            && slice_keys[v][u + w][d] == key
                         {
                             w += 1;
                         }
@@ -204,28 +204,23 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                             if (row_masks[v + h] & span_mask) != span_mask {
                                 break;
                             }
-                            for ku in u..(u + w) {
-                                if slice_keys[d][v + h][ku] != key {
-                                    break 'height;
-                                }
+                            if slice_keys[v + h][u..(u + w)].iter().any(|k| k[d] != key) {
+                                break 'height;
                             }
                             h += 1;
                         }
 
                         // Clear merged bits from row_masks
-                        for kv in v..(v + h) {
-                            row_masks[kv] &= !span_mask;
+                        for mask in &mut row_masks[v..(v + h)] {
+                            *mask &= !span_mask;
                         }
 
                         let tex_layer = ((key & 0xFF) - 1) as u8;
                         let ao_packed = (key >> 8) as u8;
                         let (qx, qy, qz) = get_axis_coord(axis, d, u, v);
                         bucket.push(PackedQuad::new(
-                            qx as u32,
-                            qy as u32,
-                            qz as u32,
-                            w as u32,
-                            h as u32,
+                            [qx as u32, qy as u32, qz as u32],
+                            [w as u32, h as u32],
                             face_dir as u32,
                             tex_layer,
                             ao_packed,

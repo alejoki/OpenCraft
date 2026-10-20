@@ -1,5 +1,5 @@
 pub const TEX_SIZE: u32 = 16;
-pub const NUM_TEX_LAYERS: u32 = 14;
+pub const NUM_TEX_LAYERS: u32 = 16;
 pub const MIP_LEVELS: u32 = 5;
 
 #[inline]
@@ -153,6 +153,38 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 [clamp_u8(134 + j * 2), clamp_u8(96 + j), clamp_u8(67 + j)]
             }
         }),
+        // 14: Coal Ore - stone base with clustered near-black lumps
+        make_layer(23, |x, y, j| {
+            let lump_a = (x as i32 - 4).pow(2) + (y as i32 - 5).pow(2) < 6;
+            let lump_b = (x as i32 - 11).pow(2) + (y as i32 - 10).pow(2) < 8;
+            let lump_c = (x as i32 - 10).pow(2) + (y as i32 - 3).pow(2) < 3;
+            if lump_a || lump_b || lump_c {
+                let v = clamp_u8(26 + j / 2);
+                [v, v, clamp_u8(v as i32 + 2)]
+            } else {
+                let streak = if (x + y * 3) % 7 == 0 { -10 } else { 0 };
+                let v = clamp_u8(128 + j + streak);
+                [v, v, clamp_u8(v as i32 + 3)]
+            }
+        }),
+        // 15: Iron Ore - stone base with clustered warm tan/rust lumps
+        make_layer(24, |x, y, j| {
+            let lump_a = (x as i32 - 5).pow(2) + (y as i32 - 10).pow(2) < 7;
+            let lump_b = (x as i32 - 11).pow(2) + (y as i32 - 4).pow(2) < 6;
+            let lump_c = (x as i32 - 2).pow(2) + (y as i32 - 2).pow(2) < 3;
+            if lump_a || lump_b || lump_c {
+                let rust = (hash_pixel(x, y, 77) % 24) as i32;
+                [
+                    clamp_u8(184 + j / 2 - rust / 2),
+                    clamp_u8(124 + j / 2 - rust / 3),
+                    clamp_u8(70 + j / 2),
+                ]
+            } else {
+                let streak = if (x + y * 3) % 7 == 0 { -10 } else { 0 };
+                let v = clamp_u8(128 + j + streak);
+                [v, v, clamp_u8(v as i32 + 3)]
+            }
+        }),
     ]
 }
 
@@ -265,10 +297,38 @@ mod tests {
     #[test]
     fn test_procedural_texture_layers_non_empty() {
         let layers = generate_all_texture_layers_rgba();
-        assert_eq!(layers.len(), 14);
+        assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
+        assert_eq!(layers.len(), 16);
         for layer in &layers {
-            assert_eq!(layer.len(), 16 * 16 * 4);
-            assert!(layer.chunks_exact(4).all(|px| px[3] == 255));
+            assert_eq!(layer.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
+            let (pixels, remainder) = layer.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(pixels.iter().all(|px| px[3] == 255));
         }
+    }
+
+    #[test]
+    fn test_ore_texture_layers_are_distinct_and_non_uniform() {
+        let layers = generate_all_texture_layers_rgba();
+        let stone = &layers[3];
+        let coal = &layers[14];
+        let iron = &layers[15];
+
+        assert_ne!(coal, stone, "coal ore must differ from stone");
+        assert_ne!(iron, stone, "iron ore must differ from stone");
+        assert_ne!(coal, iron, "coal and iron ore must differ");
+
+        let (coal_pixels, _) = coal.as_chunks::<4>();
+        let first = &coal_pixels[0];
+        assert!(
+            coal_pixels.iter().any(|px| px != first),
+            "coal ore texture must not be a flat color"
+        );
+        let (iron_pixels, _) = iron.as_chunks::<4>();
+        let first = &iron_pixels[0];
+        assert!(
+            iron_pixels.iter().any(|px| px != first),
+            "iron ore texture must not be a flat color"
+        );
     }
 }

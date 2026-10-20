@@ -4,6 +4,7 @@ use wgpu::util::DeviceExt;
 
 use crate::mesh::quad::PackedQuad;
 use crate::player::camera::{visible_face_mask, Camera, Frustum};
+use crate::player::inventory::HOTBAR_SLOTS;
 use crate::render::buffer::ChunkRenderStore;
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::texture::create_block_texture_array;
@@ -203,6 +204,30 @@ fn fs_main(in: OverlayOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Layout of hotbar slot `index` in normalised device coordinates.
+///
+/// Returns `(x0, y0, x1, y1)` with y pointing up in NDC. The bar is centered
+/// on x = 0 at the bottom of the screen. `index >= HOTBAR_SLOTS` returns a
+/// zero-sized rect at the bar's left edge instead of panicking, so defensive
+/// callers can use it without a bounds check.
+pub fn hotbar_slot_rect_ndc(index: usize, aspect: f32) -> (f32, f32, f32, f32) {
+    let aspect = aspect.max(0.5);
+    let slot_w = 0.09 / aspect;
+    let slot_h = 0.085;
+    let gap = 0.012 / aspect;
+    let total_w = HOTBAR_SLOTS as f32 * slot_w + (HOTBAR_SLOTS - 1) as f32 * gap;
+    let start_x = -total_w * 0.5;
+    let y0 = -0.92;
+    let y1 = y0 + slot_h;
+
+    if index >= HOTBAR_SLOTS {
+        return (start_x, y0, start_x, y0);
+    }
+
+    let x0 = start_x + index as f32 * (slot_w + gap);
+    (x0, y0, x0 + slot_w, y1)
+}
+
 pub fn build_overlay_line_vertices(
     view_proj: &Mat4,
     aspect: f32,
@@ -284,18 +309,11 @@ pub fn build_overlay_line_vertices(
         color: white,
     });
 
-    // 3. 9-Slot Block Hotbar at bottom of screen
-    let slot_w = 0.09 / aspect.max(0.5);
-    let slot_h = 0.085;
-    let gap = 0.012 / aspect.max(0.5);
-    let total_w = 9.0 * slot_w + 8.0 * gap;
-    let start_x = -total_w * 0.5;
-    let y0 = -0.92;
-    let y1 = y0 + slot_h;
-
-    for i in 0..9 {
-        let x0 = start_x + i as f32 * (slot_w + gap);
-        let x1 = x0 + slot_w;
+    // 3. 9-Slot Block Hotbar at bottom of screen. Geometry comes from the
+    // same helper the HUD count labels use, so outlines and labels cannot
+    // drift with aspect ratio or resolution.
+    for i in 0..HOTBAR_SLOTS {
+        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(i, aspect);
         let is_sel = i == selected_slot;
         let color = if is_sel {
             [1.0, 0.92, 0.25, 1.0]
@@ -718,5 +736,58 @@ mod tests {
             build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 0);
         // 24 (wireframe) + 4 (crosshair) + 9 * 8 (hotbar) = 100 vertices
         assert_eq!(verts.len(), 100);
+    }
+
+    fn assert_close(actual: f32, expected: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "{what}: {actual} != {expected}"
+        );
+    }
+
+    #[test]
+    fn hotbar_slots_are_uniform_adjacent_and_centered() {
+        let rects: Vec<_> = (0..HOTBAR_SLOTS)
+            .map(|i| hotbar_slot_rect_ndc(i, 1.77))
+            .collect();
+
+        let (first_x0, y0, _, y1) = rects[0];
+        let (_, _, last_x1, _) = rects[HOTBAR_SLOTS - 1];
+        assert_close(first_x0, -last_x1, "bar centered on x=0");
+        assert_close(y0, -0.92, "bar bottom");
+        assert_close(y1, -0.835, "bar top");
+
+        let (w0, h0) = (rects[0].2 - rects[0].0, rects[0].3 - rects[0].1);
+        let gap = rects[1].0 - rects[0].2;
+        assert!(gap > 0.0, "gap must be positive, got {gap}");
+
+        for (i, rect) in rects.iter().enumerate() {
+            assert_close(rect.2 - rect.0, w0, &format!("slot {i} width"));
+            assert_close(rect.3 - rect.1, h0, &format!("slot {i} height"));
+            assert_close(rect.1, y0, &format!("slot {i} bottom"));
+            assert_close(rect.3, y1, &format!("slot {i} top"));
+            if i > 0 {
+                assert_close(rect.0 - rects[i - 1].2, gap, &format!("slot {i} gap"));
+            }
+        }
+    }
+
+    #[test]
+    fn hotbar_layout_clamps_narrow_aspects() {
+        for i in 0..HOTBAR_SLOTS {
+            assert_eq!(
+                hotbar_slot_rect_ndc(i, 0.1),
+                hotbar_slot_rect_ndc(i, 0.5),
+                "aspect below 0.5 clamps to 0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn hotbar_out_of_range_index_is_degenerate_and_finite() {
+        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(HOTBAR_SLOTS, 1.77);
+        assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
+        assert!(x0.is_finite() && y0.is_finite());
+        assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
     }
 }

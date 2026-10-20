@@ -153,7 +153,7 @@ impl WorldManager {
             (0, 0, -1),
         ] {
             let ny = pos.y + dy;
-            if ny < MIN_CHUNK_Y || ny > MAX_CHUNK_Y {
+            if !(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny) {
                 continue;
             }
             let npos = ChunkPos::new(pos.x + dx, ny, pos.z + dz);

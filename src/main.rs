@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -12,17 +12,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use minecraft_clone::player::physics::InputState;
-use minecraft_clone::player::raycast::raycast_voxels;
-use minecraft_clone::render::buffer::ChunkRenderStore;
-use minecraft_clone::render::context::RenderContext;
-use minecraft_clone::render::pipeline::{UiPass, VoxelRenderer};
-use minecraft_clone::settings::keybind::key_to_string;
-use minecraft_clone::settings::{
+use opencraft::mesh::quad::ChunkMesh;
+use opencraft::player::inventory::HOTBAR_SLOTS;
+use opencraft::player::mining::{MiningState, MiningTick};
+use opencraft::player::physics::InputState;
+use opencraft::player::raycast::raycast_voxels;
+use opencraft::render::buffer::ChunkRenderStore;
+use opencraft::render::context::RenderContext;
+use opencraft::render::pipeline::{UiPass, VoxelRenderer};
+use opencraft::settings::keybind::key_to_string;
+use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
 };
-use minecraft_clone::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
-use minecraft_clone::ui::screens::{
+use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
+use opencraft::ui::screens::{
     delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
     hovered_new_game_target, hovered_pause_row, load_back_rect, load_cancel_rect,
     load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect, load_row_rect,
@@ -31,21 +34,25 @@ use minecraft_clone::ui::screens::{
     FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
     ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
-use minecraft_clone::ui::{
+use opencraft::ui::hud::{
+    hotbar_count_label, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
+    HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+};
+use opencraft::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
-use minecraft_clone::world::block::BlockId;
-use minecraft_clone::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
-use minecraft_clone::world::catalog_fs::WorldCatalogFs;
-use minecraft_clone::world::chunk::world_to_chunk_and_local;
-use minecraft_clone::{random_seed, WorldSession};
-use minecraft_clone::world::persistence::{
+use opencraft::world::block::BlockId;
+use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
+use opencraft::world::catalog_fs::WorldCatalogFs;
+use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
+use opencraft::{random_seed, WorldSession};
+use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
     WorldSaveData, DEFAULT_SAVE_PATH,
 };
-use minecraft_clone::world::terrain::DEFAULT_WORLD_SEED;
+use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
@@ -107,6 +114,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             fly_mode: session.player.fly_mode,
             selected_slot: session.player.selected_slot as u8,
             render_distance: session.world.render_distance() as u16,
+            hotbar: session.player.hotbar.clone(),
         },
         chunk_edits: session.world.chunk_edits().clone(),
     };
@@ -115,6 +123,59 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         session.world.mark_saved();
     }
     result
+}
+
+/// Breaks `pos` and collects the caller-supplied pre-break `block` into the
+/// session hotbar.
+///
+/// The world edit returns the chunks it remeshed. An empty result means the
+/// edit did not apply (unloaded chunk or outside the vertical world range),
+/// so nothing is collected — mining can never duplicate items through an
+/// edit that never happened.
+fn collect_mined_block(
+    session: &mut WorldSession,
+    pos: IVec3,
+    block: BlockId,
+) -> Vec<(ChunkPos, ChunkMesh)> {
+    let remeshed = session
+        .world
+        .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+    if !remeshed.is_empty() {
+        session.player.hotbar.collect(block, 1);
+    }
+    remeshed
+}
+
+/// Places the selected hotbar stack with the game's right-click semantics:
+/// raycast 8 blocks from the camera, reject a placement that overlaps the
+/// player, place the stack's block into the hit cell's adjacent cell, and
+/// consume exactly one item only after the world edit actually applied.
+///
+/// Returns the remeshed chunks for the caller to upload, or `None` when the
+/// ray misses, the cell is inside the player, the selected slot is empty, or
+/// the edit did not apply (unloaded/out-of-range).
+fn try_place_selected_block(
+    session: &mut WorldSession,
+) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    let ap = hit.adjacent_pos;
+    if session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
+        return None;
+    }
+    let stack = session.player.hotbar.stack(session.player.selected_slot)?;
+    let remeshed = session
+        .world
+        .set_block_immediate(ap.x, ap.y, ap.z, stack.block);
+    if remeshed.is_empty() {
+        return None;
+    }
+    session.player.hotbar.consume(session.player.selected_slot);
+    Some(remeshed)
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -525,6 +586,9 @@ struct Ready {
     /// Load-screen "Delete" label column (S05-T02): same as
     /// `load_play_text`, positioned at `load_delete_rect`'s left/top.
     load_delete_text: StatsOverlay,
+    /// Per-slot hotbar count labels (S03-T04): one change-gated buffer per
+    /// slot, positioned at the same `hotbar_slot_rects` the outlines use.
+    hotbar_counts: [StatsOverlay; HOTBAR_SLOTS],
 }
 
 struct GameApp {
@@ -536,6 +600,14 @@ struct GameApp {
     session: WorldSession,
     input: InputState,
     cursor_grabbed: bool,
+    /// The hold-to-mine accumulator (S02): pure state machine driven once per
+    /// frame from the RedrawRequested pass. Any reset boundary below clears it
+    /// so a menu/focus/session change never inherits partial progress.
+    mining: MiningState,
+    /// Whether the left mouse button is physically held from a gameplay
+    /// press. Set only after the screen routing and click-to-grab early
+    /// returns, cleared on release, focus loss, and screen/session changes.
+    left_mouse_held: bool,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -631,6 +703,8 @@ impl GameApp {
             session,
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
+            mining: MiningState::new(),
+            left_mouse_held: false,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -755,6 +829,8 @@ impl GameApp {
             self.main_menu_message = None;
         }
         self.input.reset();
+        self.left_mouse_held = false;
+        self.mining.reset();
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, false);
@@ -785,6 +861,10 @@ impl GameApp {
     /// Return to gameplay: re-grab the cursor (settings/pause return paths)
     /// and close any open settings menu, keeping the sync invariant.
     fn enter_playing(&mut self) {
+        // Defensive: a hold or partial progress must never survive a trip
+        // through a menu and back into gameplay.
+        self.left_mouse_held = false;
+        self.mining.reset();
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, true);
@@ -825,6 +905,8 @@ impl GameApp {
             gpu.render_store.clear();
         }
         self.input.reset();
+        self.left_mouse_held = false;
+        self.mining.reset();
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -1043,17 +1125,14 @@ impl GameApp {
             }
         };
         let session = WorldSession::new_session(seed, save_path);
-        match self
+        // Unreachable: attempt_create only runs while the new-game screen is
+        // open, and that screen accepts Create.
+        if let Ok(LifecycleDecision::StartNewGame) = self
             .lifecycle
             .dispatch(LifecycleIntent::NewGame(NewGameIntent::Create))
         {
-            Ok(LifecycleDecision::StartNewGame) => {
-                self.start_world_session(session);
-                self.enter_playing();
-            }
-            // Unreachable: attempt_create only runs while the new-game
-            // screen is open, and that screen accepts Create.
-            _ => {}
+            self.start_world_session(session);
+            self.enter_playing();
         }
     }
 
@@ -1108,17 +1187,14 @@ impl GameApp {
         };
         let session =
             WorldSession::session_from_save(save, self.catalog.saves_dir().join(&row.file_name));
-        match self
+        // Unreachable: play_row only runs while the load screen is
+        // open, and that screen accepts Load.
+        if let Ok(LifecycleDecision::LoadWorld) = self
             .lifecycle
             .dispatch(LifecycleIntent::LoadGame(LoadGameIntent::Load))
         {
-            Ok(LifecycleDecision::LoadWorld) => {
-                self.start_world_session(session);
-                self.enter_playing();
-            }
-            // Unreachable: play_row only runs while the load screen is
-            // open, and that screen accepts Load.
-            _ => {}
+            self.start_world_session(session);
+            self.enter_playing();
         }
     }
 
@@ -1259,6 +1335,13 @@ impl ApplicationHandler for GameApp {
         let menu_text = StatsOverlay::new(&mut ui.font_system);
         let load_play_text = StatsOverlay::new(&mut ui.font_system);
         let load_delete_text = StatsOverlay::new(&mut ui.font_system);
+        let hotbar_counts = std::array::from_fn(|_| {
+            StatsOverlay::with_metrics(
+                &mut ui.font_system,
+                HOTBAR_COUNT_FONT_SIZE,
+                HOTBAR_COUNT_LINE_HEIGHT,
+            )
+        });
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -1289,6 +1372,7 @@ impl ApplicationHandler for GameApp {
             menu_text,
             load_play_text,
             load_delete_text,
+            hotbar_counts,
         });
     }
 
@@ -1317,6 +1401,8 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::Focused(false) => {
                 self.input.reset();
+                self.left_mouse_held = false;
+                self.mining.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -1518,6 +1604,17 @@ impl ApplicationHandler for GameApp {
                 }
             }
             WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // A release can arrive while a menu owns the input, so this
+                // arm deliberately bypasses the screen routing: clearing the
+                // hold and any partial progress is always safe.
+                self.left_mouse_held = false;
+                self.mining.reset();
+            }
+            WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
@@ -1565,48 +1662,29 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
 
-                if let Some(hit) = raycast_voxels(
-                    self.session.camera.position,
-                    self.session.camera.forward(),
-                    8.0,
-                    |x, y, z| self.session.world.get_block(x, y, z),
-                ) {
-                    match button {
-                        MouseButton::Left => {
-                            let bp = hit.block_pos;
-                            if self.session.world.get_block(bp.x, bp.y, bp.z) != BlockId::Bedrock {
-                                let remeshed =
-                                    self.session.world
-                                        .set_block_immediate(bp.x, bp.y, bp.z, BlockId::Air);
-                                for (cpos, mesh) in remeshed {
-                                    gpu.render_store.upload_mesh(
-                                        &gpu.ctx.device,
-                                        &gpu.renderer.chunk_bind_group_layout,
-                                        cpos,
-                                        &mesh,
-                                    );
-                                }
-                            }
-                        }
-                        MouseButton::Right => {
-                            let ap = hit.adjacent_pos;
-                            if !self.session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
-                                let place_block = BlockId::HOTBAR[self.session.player.selected_slot];
-                                let remeshed =
-                                    self.session.world
-                                        .set_block_immediate(ap.x, ap.y, ap.z, place_block);
-                                for (cpos, mesh) in remeshed {
-                                    gpu.render_store.upload_mesh(
-                                        &gpu.ctx.device,
-                                        &gpu.renderer.chunk_bind_group_layout,
-                                        cpos,
-                                        &mesh,
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
+                // Hold-to-mine (S02): a Left press only arms the hold — no
+                // raycast and no break happen here. The break happens once
+                // per frame in RedrawRequested from the held candidate, so a
+                // press can never break a block instantly (double-break
+                // hazard). Right click keeps its byte-identical instant
+                // placement path, including the raycast.
+                match button {
+                    MouseButton::Left => {
+                        self.left_mouse_held = true;
                     }
+                    MouseButton::Right => {
+                        if let Some(remeshed) = try_place_selected_block(&mut self.session) {
+                            for (cpos, mesh) in remeshed {
+                                gpu.render_store.upload_mesh(
+                                    &gpu.ctx.device,
+                                    &gpu.renderer.chunk_bind_group_layout,
+                                    cpos,
+                                    &mesh,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1672,13 +1750,46 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                let target_block = raycast_voxels(
+                let hit = raycast_voxels(
                     self.session.camera.position,
                     self.session.camera.forward(),
                     8.0,
                     |x, y, z| self.session.world.get_block(x, y, z),
-                )
-                .map(|h| h.block_pos);
+                );
+                // Hold-to-mine candidate: only a held Left button on the
+                // grabbed gameplay surface feeds the accumulator. Every
+                // other frame passes None, which resets stale progress
+                // (released, paused, or cursor not grabbed).
+                let candidate = if playing && self.cursor_grabbed && self.left_mouse_held {
+                    hit.map(|h| {
+                        (
+                            h.block_pos,
+                            self.session
+                                .world
+                                .get_block(h.block_pos.x, h.block_pos.y, h.block_pos.z),
+                        )
+                    })
+                } else {
+                    None
+                };
+                let mut target_block = hit.map(|h| h.block_pos);
+                if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
+                    // The only production break site (S02): hardness
+                    // gating happens in MiningState, so Bedrock (no
+                    // duration) can never reach this arm.
+                    let remeshed = collect_mined_block(&mut self.session, pos, block);
+                    for (cpos, mesh) in remeshed {
+                        gpu.render_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
+                    // The cell is Air now; do not draw the wireframe
+                    // around the block that just disappeared.
+                    target_block = None;
+                }
 
                 // Translucent dark panel behind the stats text: the visible
                 // proof that pixel-space quads render in the UI pass. Width is
@@ -1808,12 +1919,37 @@ impl ApplicationHandler for GameApp {
                             Some(gpu.load_delete_text.text_area(delete_x, play_y));
                     }
                 }
+                if playing {
+                    if let Some(progress) = self.mining.progress() {
+                        quads.extend(mining_progress_quads(
+                            progress,
+                            gpu.ctx.config.width,
+                            gpu.ctx.config.height,
+                        ));
+                    }
+                }
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
                     &quads,
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
+
+                // S03-T04: per-slot hotbar counts share the outlines' layout
+                // helper, then draw on every screen (including pause) so the
+                // HUD never flashes. First pass updates the buffers while the
+                // mutable borrow is confined to `hotbar_counts`; the text
+                // areas are assembled afterwards from immutable borrows.
+                let hotbar_rects =
+                    hotbar_slot_rects(gpu.ctx.config.width, gpu.ctx.config.height);
+                for (slot, counts) in gpu.hotbar_counts.iter_mut().enumerate() {
+                    counts.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &hotbar_count_label(self.session.player.hotbar.stack(slot)),
+                    );
+                }
 
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
@@ -1832,6 +1968,16 @@ impl ApplicationHandler for GameApp {
                 }
                 if let Some(load_delete_text_area) = load_delete_text_area {
                     areas.push(load_delete_text_area);
+                }
+                // Hotbar count labels ride the same UI pass, after the
+                // screen text areas. Empty slots push nothing, so the
+                // renderer only sees non-empty labels.
+                for (slot, counts) in gpu.hotbar_counts.iter().enumerate() {
+                    let label = hotbar_count_label(self.session.player.hotbar.stack(slot));
+                    if !label.is_empty() {
+                        let (x, y) = hotbar_count_text_origin(hotbar_rects[slot]);
+                        areas.push(counts.text_area(x, y));
+                    }
                 }
                 let prepare_ok = gpu
                     .ui
@@ -1868,7 +2014,15 @@ impl ApplicationHandler for GameApp {
                             let ms = (elapsed * 1000.0) / self.frame_count.max(1) as f32;
                             let vram_kb = gpu.render_store.total_vram_bytes / 1024;
                             let mode = if self.session.player.fly_mode { "Fly" } else { "Walk" };
-                            let block_name = BlockId::HOTBAR[self.session.player.selected_slot].name();
+                            let block_name = match self
+                                .session
+                                .player
+                                .hotbar
+                                .stack(self.session.player.selected_slot)
+                            {
+                                Some(stack) => format!("{} x{}", stack.block.name(), stack.count),
+                                None => "Empty".to_string(),
+                            };
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -1879,7 +2033,7 @@ impl ApplicationHandler for GameApp {
                                 ""
                             };
                             window.set_title(&format!(
-                                "Minecraft Clone{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
+                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
                                 screen_title_tag(self.lifecycle.screen()),
                                 fps,
                                 ms,
@@ -1973,7 +2127,7 @@ impl ApplicationHandler for GameApp {
 }
 
 fn main() {
-    let cli = CliConfig::from_iter(std::env::args().skip(1));
+    let cli = CliConfig::parse_args(std::env::args().skip(1));
 
     let session = startup_session(&cli);
 
@@ -1987,16 +2141,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minecraft_clone::ui::SettingsCaller;
-    use minecraft_clone::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use minecraft_clone::world::chunk::ChunkPos;
-    use minecraft_clone::world::terrain::generate_chunk_seeded;
+    use opencraft::ui::SettingsCaller;
+    use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
+    use opencraft::player::inventory::{ItemStack, HOTBAR_SLOTS};
+    use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
-    use minecraft_clone::player::camera::Camera;
-    use minecraft_clone::world::persistence::ChunkEditMap;
-    use minecraft_clone::world::terrain::terrain_height_at_seeded;
+    use opencraft::player::camera::Camera;
+    use opencraft::world::persistence::ChunkEditMap;
+    use opencraft::world::terrain::terrain_height_at_seeded;
+
+    use glam::IVec3;
 
     #[test]
     fn menu_text_lists_every_row_with_its_live_value() {
@@ -2026,7 +2183,7 @@ mod tests {
     #[test]
     fn menu_text_reflects_changed_settings_values() {
         let settings = Settings {
-            keybinds: minecraft_clone_keybinds_jump_arrow_up(),
+            keybinds: opencraft_keybinds_jump_arrow_up(),
             mouse_sensitivity: 0.005,
             fov_degrees: 90.0,
             fullscreen: true,
@@ -2154,7 +2311,7 @@ mod tests {
     #[test]
     fn rebound_keys_take_effect_and_the_replaced_key_goes_dead() {
         // same rebind as the compose test: jump_or_up from Space to ArrowUp
-        let binds = minecraft_clone_keybinds_jump_arrow_up();
+        let binds = opencraft_keybinds_jump_arrow_up();
         let mut input = InputState::default();
         assert!(apply_gameplay_key(
             &mut input,
@@ -2247,8 +2404,10 @@ mod tests {
         // load does not deduplicate; first-match priority in Keybinds
         // declaration order keeps routing deterministic instead of
         // last-write-wins per flag.
-        let mut binds = Keybinds::default();
-        binds.backward = KeyCode::KeyW; // collides with forward
+        let binds = Keybinds {
+            backward: KeyCode::KeyW, // collides with forward
+            ..Keybinds::default()
+        };
         let mut input = InputState::default();
         assert!(apply_gameplay_key(&mut input, &binds, KeyCode::KeyW, true));
         assert!(input.forward, "forward is declared first and wins");
@@ -2258,24 +2417,24 @@ mod tests {
     #[test]
     fn cli_bypass_condition_is_exactly_the_three_flag_disjunction() {
         // Bare launch: no CLI world intent — the main menu owns startup.
-        assert!(!cli_has_world_intent(&CliConfig::from_iter(
+        assert!(!cli_has_world_intent(&CliConfig::parse_args(
             Vec::<String>::new()
         )));
         // The default save path alone is NOT an intent (byte-identical default).
-        assert!(!cli_has_world_intent(&CliConfig::from_iter([
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
             "--save",
             "saves/default.mcvx"
         ])));
         // Each flag alone forces the direct-launch bypass into gameplay.
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--new"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--new-world"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter(["--seed", "7"])));
-        assert!(cli_has_world_intent(&CliConfig::from_iter([
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--new"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--new-world"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args(["--seed", "7"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--save",
             "other.mcvx"
         ])));
         // Every flag together still bypasses (the smoke scripts' launches).
-        assert!(cli_has_world_intent(&CliConfig::from_iter([
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--new",
             "--seed",
             "999",
@@ -2288,7 +2447,7 @@ mod tests {
     /// and the given screen entered through the real `enter_screen` path
     /// (LoadGame entry refreshes rows from the tempdir catalog).
     fn app_at_screen(saves_dir: &Path, screen: LifecycleScreen) -> GameApp {
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -2296,6 +2455,178 @@ mod tests {
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
         app
+    }
+
+    /// Loads the chunk at (0,0,0) plus its six face neighbours. `set_block_immediate`
+    /// can only remesh a chunk whose full face neighbourhood is resident, so the
+    /// headless collection/placement helpers need this halo to observe an edit.
+    fn insert_test_chunk_with_face_neighbors(session: &mut WorldSession, block: BlockId) {
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(block));
+        for pos in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            session
+                .world
+                .insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+        }
+    }
+
+    /// Camera looking straight down at the stone placed by the placement tests.
+    fn aim_placement_camera(session: &mut WorldSession) {
+        session.camera.position = Vec3::new(0.5, 10.0, 0.5);
+        session.camera.yaw = 0.0;
+        session.camera.pitch = -std::f32::consts::FRAC_PI_2;
+    }
+
+    #[test]
+    fn mining_collects_broken_blocks_into_the_hotbar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(7, dir.path().join("mined.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+
+        let first = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        assert!(
+            !first.is_empty(),
+            "an applied break remeshes at least its own chunk"
+        );
+        let second = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        assert!(!second.is_empty());
+
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn mining_collects_the_pre_break_block_not_the_now_air_cell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+
+        let remeshed =
+            collect_mined_block(&mut session, IVec3::new(0, 10, 1), BlockId::CoalOre);
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 10, 1), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::CoalOre,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn mining_an_unloaded_chunk_collects_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(9, dir.path().join("missing.mcvx"));
+
+        let remeshed = collect_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
+
+        assert!(remeshed.is_empty(), "no loaded chunk means no remesh");
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar.stack(slot), None);
+        }
+    }
+
+    #[test]
+    fn hotbar_stacks_survive_save_and_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("stacks.mcvx");
+        let mut session = WorldSession::new_session(4242, save_path.clone());
+        session.player.hotbar.collect(BlockId::CoalOre, 2);
+        session.player.hotbar.collect(BlockId::IronOre, 1);
+        session.player.selected_slot = 1;
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+
+        assert_eq!(restored.world.seed(), 4242);
+        assert_eq!(restored.player.selected_slot, 1);
+        assert_eq!(restored.player.hotbar, session.player.hotbar);
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(restored.player.hotbar.stack(slot), session.player.hotbar.stack(slot));
+        }
+    }
+
+    #[test]
+    fn placing_the_selected_stack_consumes_exactly_one_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(10, dir.path().join("place.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.hotbar.collect(BlockId::Stone, 2);
+        session.player.selected_slot = 0;
+
+        let remeshed = try_place_selected_block(&mut session).expect("placement applies");
+
+        assert!(!remeshed.is_empty(), "placement remeshes its chunk");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn placement_rejects_empty_slots_and_player_overlap_without_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.hotbar.collect(BlockId::Stone, 2);
+        session.player.selected_slot = 5;
+
+        assert!(
+            try_place_selected_block(&mut session).is_none(),
+            "an empty selected slot cannot place"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "nothing was consumed"
+        );
+
+        session.player.selected_slot = 0;
+        session.player.position = Vec3::new(0.5, 6.0, 0.5);
+        assert!(
+            try_place_selected_block(&mut session).is_none(),
+            "a placement overlapping the player AABB is rejected"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "rejected placement does not consume"
+        );
     }
 
     #[test]
@@ -2476,7 +2807,7 @@ mod tests {
         // atomic save's create_dir_all cannot succeed.
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(9, blocker.join("deep.mcvx")),
@@ -2528,7 +2859,7 @@ mod tests {
     fn save_and_quit_success_returns_to_the_main_menu_with_no_message() {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("kept.mcvx");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
@@ -2566,7 +2897,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("exit-game.mcvx");
         let settings_path = dir.path().join("settings.toml");
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         // Bare CliConfig: GameApp::new starts at the main menu over the
         // loaded default session (the same S03 test pattern as the
         // SaveAndQuit tests).
@@ -2614,7 +2945,7 @@ mod tests {
         // which is exactly the headless case; the GPU-clear leg rides on
         // the launch smoke script and S04's human UAT — see the honest
         // limitation documented on `ChunkRenderStore::clear`).
-        let cli = CliConfig::from_iter(Vec::<String>::new());
+        let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
@@ -2660,6 +2991,62 @@ mod tests {
         );
     }
 
+    /// S02-T03: entering a non-Playing screen drops both the held-button
+    /// latch and any partial mining progress — a menu must never inherit a
+    /// hold or show a stale bar.
+    #[test]
+    fn enter_screen_clears_held_mouse_and_mining_progress() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+        );
+        app.left_mouse_held = true;
+        app.mining
+            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        assert!(
+            app.mining.progress().is_some(),
+            "0.5s on Stone leaves partial progress"
+        );
+
+        app.enter_screen(LifecycleScreen::MainMenu);
+
+        assert!(
+            !app.left_mouse_held,
+            "held latch cleared on screen entry"
+        );
+        assert!(
+            app.mining.progress().is_none(),
+            "partial mining progress cleared on screen entry"
+        );
+    }
+
+    /// S02-T03: a world swap clears the hold/progress too, so a new world
+    /// can never start with progress inherited from the outgoing session.
+    #[test]
+    fn start_world_session_clears_held_mouse_and_mining_progress() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+        );
+        app.left_mouse_held = true;
+        app.mining
+            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        assert!(app.mining.progress().is_some());
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+        ));
+
+        assert!(!app.left_mouse_held, "held latch cleared on session swap");
+        assert!(
+            app.mining.progress().is_none(),
+            "partial mining progress cleared on session swap"
+        );
+    }
+
     #[test]
     fn startup_session_loads_an_existing_save_file_at_the_cli_save_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2668,7 +3055,7 @@ mod tests {
         let data = sample_save(31337);
         save_world_to_path(&save_path, &data).expect("write save file");
 
-        let cli = CliConfig::from_iter(["--save", save_path_str.as_str()]);
+        let cli = CliConfig::parse_args(["--save", save_path_str.as_str()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), 31337);
         assert_eq!(
@@ -2694,7 +3081,7 @@ mod tests {
 
         // Missing file + seed override: fresh session at the override seed.
         let missing = dir.path().join("missing.mcvx");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             missing.to_str().unwrap(),
             "--seed",
@@ -2712,7 +3099,7 @@ mod tests {
 
         // Missing file, no override: the default seed.
         let missing2 = dir.path().join("other.mcvx");
-        let cli = CliConfig::from_iter(["--save", missing2.to_str().unwrap()]);
+        let cli = CliConfig::parse_args(["--save", missing2.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
         assert_eq!(session.save_path, missing2);
@@ -2721,7 +3108,7 @@ mod tests {
         // behavior — main() matched Err(_) the same way).
         let corrupt = dir.path().join("corrupt.mcvx");
         std::fs::write(&corrupt, b"NOPE!1234").expect("write corrupt save");
-        let cli = CliConfig::from_iter(["--save", corrupt.to_str().unwrap()]);
+        let cli = CliConfig::parse_args(["--save", corrupt.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
         assert_eq!(
@@ -2734,7 +3121,7 @@ mod tests {
         // (legacy direct-launch behavior, byte-identical).
         let existing = dir.path().join("ignored.mcvx");
         save_world_to_path(&existing, &sample_save(999)).expect("write existing save");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             existing.to_str().unwrap(),
             "--new",
@@ -2870,7 +3257,7 @@ mod tests {
         // session owns the CLI save path at the override seed.
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("smoke.mcvx");
-        let cli = CliConfig::from_iter([
+        let cli = CliConfig::parse_args([
             "--save",
             save_path.to_str().unwrap(),
             "--seed",
@@ -2894,7 +3281,7 @@ mod tests {
         // content, so the test tracks the fixture instead of pinning it);
         // a missing/corrupt default save falls back to the fresh default
         // seed. Read-only either way.
-        let bare = CliConfig::from_iter(Vec::<String>::new());
+        let bare = CliConfig::parse_args(Vec::<String>::new());
         assert!(!cli_has_world_intent(&bare));
         assert_eq!(bare.save_path, Path::new(DEFAULT_SAVE_PATH));
         let session = startup_session(&bare);
@@ -3184,6 +3571,7 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
+                hotbar: opencraft::player::inventory::Hotbar::empty(),
             },
             chunk_edits: ChunkEditMap::default(),
         }
@@ -3247,9 +3635,10 @@ mod tests {
 
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
     /// rebinding nothing else) — a valid, conflict-free state.
-    fn minecraft_clone_keybinds_jump_arrow_up() -> minecraft_clone::settings::Keybinds {
-        let mut binds = minecraft_clone::settings::Keybinds::default();
-        binds.jump_or_up = KeyCode::ArrowUp;
-        binds
+    fn opencraft_keybinds_jump_arrow_up() -> opencraft::settings::Keybinds {
+        opencraft::settings::Keybinds {
+            jump_or_up: KeyCode::ArrowUp,
+            ..opencraft::settings::Keybinds::default()
+        }
     }
 }

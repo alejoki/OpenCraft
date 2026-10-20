@@ -1,7 +1,8 @@
 [package]
-name = "minecraft-clone"
+name = "opencraft"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }

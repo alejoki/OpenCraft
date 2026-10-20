@@ -13,21 +13,11 @@ pub enum BlockId {
     Brick = 9,
     Snow = 10,
     Bedrock = 11,
+    CoalOre = 12,
+    IronOre = 13,
 }
 
 impl BlockId {
-    pub const HOTBAR: [BlockId; 9] = [
-        BlockId::Grass,
-        BlockId::Dirt,
-        BlockId::Stone,
-        BlockId::Cobblestone,
-        BlockId::Sand,
-        BlockId::OakLog,
-        BlockId::OakLeaves,
-        BlockId::OakPlanks,
-        BlockId::Brick,
-    ];
-
     #[inline]
     pub const fn is_solid(self) -> bool {
         !matches!(self, BlockId::Air)
@@ -48,11 +38,13 @@ impl BlockId {
             9 => Some(BlockId::Brick),
             10 => Some(BlockId::Snow),
             11 => Some(BlockId::Bedrock),
+            12 => Some(BlockId::CoalOre),
+            13 => Some(BlockId::IronOre),
             _ => None,
         }
     }
 
-    /// Returns texture array layer index (0..14) for a face direction:
+    /// Returns texture array layer index (0..16) for a face direction:
     /// 0 = +X, 1 = -X, 2 = +Y (top), 3 = -Y (bottom), 4 = +Z, 5 = -Z
     #[inline]
     pub const fn face_tex_layer(self, face_dir: u8) -> u8 {
@@ -80,6 +72,8 @@ impl BlockId {
                 _ => 13, // snow grass side
             },
             BlockId::Bedrock => 12,
+            BlockId::CoalOre => 14,
+            BlockId::IronOre => 15,
         }
     }
 
@@ -97,6 +91,31 @@ impl BlockId {
             BlockId::Brick => "Brick",
             BlockId::Snow => "Snow",
             BlockId::Bedrock => "Bedrock",
+            BlockId::CoalOre => "Coal Ore",
+            BlockId::IronOre => "Iron Ore",
+        }
+    }
+
+    /// Seconds of held left-click needed to break this block.
+    ///
+    /// `None` marks structurally unbreakable blocks (Air has nothing to break,
+    /// Bedrock is the world floor). The mining loop treats `None` as "no target".
+    pub const fn break_duration_secs(self) -> Option<f32> {
+        match self {
+            BlockId::Air => None,
+            BlockId::Grass => Some(0.5),
+            BlockId::Dirt => Some(0.45),
+            BlockId::Stone => Some(1.2),
+            BlockId::Cobblestone => Some(1.5),
+            BlockId::Sand => Some(0.45),
+            BlockId::OakLog => Some(0.9),
+            BlockId::OakLeaves => Some(0.2),
+            BlockId::OakPlanks => Some(0.8),
+            BlockId::Brick => Some(1.8),
+            BlockId::Snow => Some(0.3),
+            BlockId::Bedrock => None,
+            BlockId::CoalOre => Some(1.6),
+            BlockId::IronOre => Some(2.2),
         }
     }
 }
@@ -115,5 +134,64 @@ mod tests {
         assert_eq!(BlockId::OakLog.face_tex_layer(2), 6);
         assert_eq!(BlockId::OakLog.face_tex_layer(4), 7);
         assert_eq!(BlockId::Stone.name(), "Stone");
+    }
+
+    #[test]
+    fn test_block_ids_roundtrip_and_ore_metadata() {
+        for id in 0u8..=13 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(block as u8, id, "block id {id} must round-trip");
+        }
+        assert_eq!(BlockId::from_u8(14), None);
+        assert_eq!(BlockId::from_u8(99), None);
+
+        assert_eq!(BlockId::CoalOre.name(), "Coal Ore");
+        assert_eq!(BlockId::IronOre.name(), "Iron Ore");
+        assert!(BlockId::CoalOre.is_solid());
+        assert!(BlockId::IronOre.is_solid());
+
+        for face_dir in 0u8..6 {
+            assert_eq!(BlockId::CoalOre.face_tex_layer(face_dir), 14);
+            assert_eq!(BlockId::IronOre.face_tex_layer(face_dir), 15);
+        }
+    }
+
+    #[test]
+    fn test_break_durations_cover_every_breakable_block() {
+        for id in 0u8..=13 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            match block {
+                BlockId::Air | BlockId::Bedrock => {
+                    assert_eq!(
+                        block.break_duration_secs(),
+                        None,
+                        "{block:?} must be unbreakable"
+                    );
+                }
+                _ => {
+                    let duration = block
+                        .break_duration_secs()
+                        .unwrap_or_else(|| panic!("{block:?} must be breakable"));
+                    assert!(duration > 0.0, "{block:?} duration must be positive");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_break_durations_are_ordered_by_hardness() {
+        let leaves = BlockId::OakLeaves.break_duration_secs().unwrap();
+        let dirt = BlockId::Dirt.break_duration_secs().unwrap();
+        let stone = BlockId::Stone.break_duration_secs().unwrap();
+        let coal = BlockId::CoalOre.break_duration_secs().unwrap();
+        let iron = BlockId::IronOre.break_duration_secs().unwrap();
+        assert!(leaves < dirt, "leaves must be faster than dirt");
+        assert!(dirt < stone, "dirt must be faster than stone");
+        assert!(stone < coal, "stone must be faster than coal ore");
+        assert!(coal < iron, "coal ore must be faster than iron ore");
+
+        let cobblestone = BlockId::Cobblestone.break_duration_secs().unwrap();
+        let brick = BlockId::Brick.break_duration_secs().unwrap();
+        assert!(brick > cobblestone, "brick must be slower than cobblestone");
     }
 }
