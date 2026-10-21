@@ -272,6 +272,8 @@ struct SkyVertex {
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) corner: vec2<f32>,
+    @location(2) kind: f32,
 };
 
 fn rotate_z(dir: vec3<f32>, angle: f32) -> vec3<f32> {
@@ -318,12 +320,26 @@ fn vs_main(vertex: SkyVertex) -> VertexOutput {
     var out: VertexOutput;
     out.clip_pos = camera.view_proj * vec4<f32>(world, 1.0);
     out.color = vec4<f32>(vertex.color.rgb, vertex.color.a * alpha);
+    // Pass the quad corner through for the per-fragment star mask. The kind
+    // tags are 0/1/2, exact in f32, so plain interpolation is safe.
+    out.corner = vertex.corner;
+    out.kind = f32(vertex.kind);
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
+    var color = in.color;
+    // Stars are hard square quads; carve a soft circular disc out of their
+    // alpha instead of tessellating 600 CPU discs (D057). The smoothstep edge
+    // anti-aliases the boundary on the 1-sample sky pipeline. Sun (1) and
+    // moon (2) bypass the mask entirely: the sun stays a quad and the moon
+    // keeps its S07 crescent geometry.
+    if (in.kind < 0.5) {
+        let mask = 1.0 - smoothstep(0.85, 1.0, length(in.corner));
+        color.a = color.a * mask;
+    }
+    return color;
 }
 "#;
 
@@ -733,5 +749,52 @@ mod tests {
         assert!(SKY_SHADER_WGSL.contains("sky.params.z"));
         assert!(SKY_SHADER_WGSL.contains("smoothstep(-0.12, 0.12, body_dir.y)"));
         assert!(SKY_SHADER_WGSL.contains("vertex.color.a * alpha"));
+    }
+
+    #[test]
+    fn sky_shader_masks_stars_with_a_kind_gated_circular_alpha() {
+        // D057: stars stay 6-vertex quads and the disc is carved per fragment.
+        // The soft edge doubles as anti-aliasing on the 1-sample pipeline.
+        assert!(
+            SKY_SHADER_WGSL.contains("smoothstep(0.85, 1.0, length(in.corner))"),
+            "fs_main must carve a soft circular disc out of the star quad"
+        );
+        assert!(
+            SKY_SHADER_WGSL.contains("if (in.kind < 0.5)"),
+            "the mask must be gated to KIND_STAR (0) so sun/moon bypass it"
+        );
+        assert!(
+            SKY_SHADER_WGSL.contains("@location(1) corner: vec2<f32>"),
+            "VertexOutput must carry the quad corner for the fragment mask"
+        );
+        assert!(
+            SKY_SHADER_WGSL.contains("@location(2) kind: f32"),
+            "VertexOutput must carry the interpolated kind as an f32 pass-through"
+        );
+        assert!(SKY_SHADER_WGSL.contains("out.corner = vertex.corner;"));
+        assert!(
+            SKY_SHADER_WGSL.contains("out.kind = f32(vertex.kind);"),
+            "kind 0/1/2 is exact in f32, so no flat interpolation is needed"
+        );
+        // The mask must actually reach the returned alpha, not just exist.
+        assert!(SKY_SHADER_WGSL.contains("color.a = color.a * mask;"));
+        // Sun (1) and moon (2) bypass the mask: the mask test only names the
+        // star kind lower bound.
+        assert!(
+            !SKY_SHADER_WGSL.contains("in.kind != 0.0")
+                && !SKY_SHADER_WGSL.contains("in.kind > 0.5"),
+            "the mask must be star-only, never applied to sun/moon"
+        );
+    }
+
+    #[test]
+    fn vista_golden_hour_never_shows_stars() {
+        // The menu arm renders the pinned golden hour, where the sun is still
+        // up: star visibility (and therefore the materialised mask) is zero.
+        assert_eq!(
+            SkyUniform::from_time(daycycle::VISTA_GOLDEN_HOUR).params[2],
+            0.0,
+            "the vista never shows stars, so the mask is a no-op there"
+        );
     }
 }
