@@ -252,8 +252,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Why it matters: Every sound must be moddable content, not code (D015), and no pack file state may ever block launch.
 - Source: M005 / S05 pack sounds
 - Primary owning slice: M005/S05
-- Supporting slices: None
-- Validation: cargo test --locked --lib -- pack::sound; bash scripts/pack_smoke.sh
+- Supporting slices: M005/S09
+- Validation: cargo test --locked --lib -- pack::sound; bash scripts/pack_smoke.sh (incl. S09 scenario-0 doc reader-test: the author-creates-packs/ discoverability wording, the copy-paste four-sound example section, and the packs/uat-sound fixture as the documented runnable example)
 
 ### R026 — M005 closure surface: registry rows R021-R026, the M005 criterion trace, four green smoke harnesses, and recorded human UAT for the human-sensory criteria
 - Class: admin/support
@@ -262,8 +262,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Why it matters: Milestone validation must trace every M005 criterion to stable registry IDs and the sensory outcomes need recorded human judgment.
 - Source: M005 / S06 closure
 - Primary owning slice: M005/S06
-- Supporting slices: None
-- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+- Supporting slices: M005/S09
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh (S09 records the UAT-H5 re-test protocol against the packs/uat-sound fixture)
 
 ## M003 Criterion Trace
 
