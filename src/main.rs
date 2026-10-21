@@ -5102,6 +5102,46 @@ mod tests {
         assert_eq!(refresh_interval(1_000_001), None, "above 1000 Hz");
     }
 
+    #[test]
+    fn sky_params_probe_pins_dusk_midnight_and_dawn_srgb_values() {
+        // These are the exact values the sky pass clears the sRGB surface with
+        // (`LoadOp::Clear` of `clear_color`) and the fog uniform terrain fades
+        // into. Dusk/dawn carry the warm DUSK/DAWN keyframe; midnight must be
+        // the NIGHT keyframe, not a lingering dusk lerp (UAT-H2 / S07-T01).
+        let cases = [
+            (12_000u32, [0.96f32, 0.66, 0.42], [0.92f32, 0.68, 0.48]),
+            (18_000u32, [0.035f32, 0.05, 0.12], [0.05f32, 0.07, 0.15]),
+            (0u32, [0.96f32, 0.66, 0.42], [0.92f32, 0.68, 0.48]),
+        ];
+        for (tick, sky, fog) in cases {
+            let params = sky_params(daycycle::sky_palette(tick), tick);
+            assert_eq!(params.time_of_day, tick);
+            assert_eq!(params.clear_color.r, sky[0] as f64);
+            assert_eq!(params.clear_color.g, sky[1] as f64);
+            assert_eq!(params.clear_color.b, sky[2] as f64);
+            assert_eq!(params.clear_color.a, 1.0);
+            assert_eq!(params.fog_color, [fog[0], fog[1], fog[2], 1.0]);
+        }
+
+        // The midnight clear/fog must equal the NIGHT keyframe exactly.
+        let midnight = sky_params(daycycle::sky_palette(18_000), 18_000);
+        let night = daycycle::sky_palette(18_000);
+        assert_eq!(midnight.clear_color.r, night.sky_color[0] as f64);
+        assert_eq!(midnight.clear_color.g, night.sky_color[1] as f64);
+        assert_eq!(midnight.clear_color.b, night.sky_color[2] as f64);
+        assert_eq!(
+            midnight.fog_color,
+            [
+                night.fog_color[0],
+                night.fog_color[1],
+                night.fog_color[2],
+                1.0
+            ]
+        );
+        assert_eq!(midnight.day_factor, night.day_factor);
+        assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
     /// rebinding nothing else) — a valid, conflict-free state.
     fn opencraft_keybinds_jump_arrow_up() -> opencraft::settings::Keybinds {

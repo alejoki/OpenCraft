@@ -204,13 +204,26 @@ const NIGHT: SkyPalette = SkyPalette {
     fog_color: [0.05, 0.07, 0.15],
 };
 
+/// Tick at which the dusk-to-night ramp completes (and the moonlit hold starts).
+const NIGHTFALL_TICK: u32 = 13_200;
+
+/// Tick at which the night hold ends and the pre-dawn ramp toward DAWN starts.
+const PRE_DAWN_TICK: u32 = 22_800;
+
 /// (tick, palette) pairs covering 0..=DAY_TICKS; dawn repeats at the end so the
 /// wrap at tick 0 is continuous.
-const KEYFRAMES: [(u32, SkyPalette); 5] = [
+///
+/// The dusk-to-night ramp is deliberately short (12,000..=13,200, 60 s of real
+/// time at scale 1) instead of spanning to 18,000: human UAT (UAT-H2) showed
+/// the long ramp left muddy warm dusk colors on screen for ~5 real minutes.
+/// The pre-dawn ramp is its mirror (22,800..=24,000), and both night keyframes
+/// carry the exact NIGHT palette so the night hold is bit-identical.
+const KEYFRAMES: [(u32, SkyPalette); 6] = [
     (0, DAWN),
     (DEFAULT_TIME_OF_DAY, NOON),
     (12_000, DUSK),
-    (18_000, NIGHT),
+    (NIGHTFALL_TICK, NIGHT),
+    (PRE_DAWN_TICK, NIGHT),
     (DAY_TICKS, DAWN),
 ];
 
@@ -498,6 +511,61 @@ mod tests {
         assert_eq!(palette.day_factor, 1.0);
         assert_eq!(palette.sky_color, NOON_SKY);
         assert_eq!(palette.fog_color, NOON_SKY);
+    }
+
+    #[test]
+    fn dusk_is_exact_dusk_keyframe() {
+        assert_eq!(sky_palette(12_000), DUSK);
+    }
+
+    #[test]
+    fn dawn_is_exact_dawn_keyframe() {
+        assert_eq!(sky_palette(0), DAWN);
+        assert_eq!(sky_palette(DAY_TICKS), DAWN);
+    }
+
+    #[test]
+    fn midnight_is_exact_night_keyframe() {
+        // The "fails if the midnight values are not the night keyframe"
+        // clause: equality against the keyframe, not epsilon closeness.
+        assert_eq!(sky_palette(18_000), NIGHT);
+        assert_eq!(sky_palette(NIGHTFALL_TICK), NIGHT);
+        assert_eq!(sky_palette(PRE_DAWN_TICK), NIGHT);
+    }
+
+    #[test]
+    fn nightfall_completes_within_twelve_hundred_ticks() {
+        // UAT-H2: the old ramp DUSK(12,000) -> NIGHT(18,000) painted muddy
+        // warm dusk for ~5 real minutes. The ramp must finish at 13,200 ticks
+        // (60 s real, 3 s at --time-scale 20) and then hold.
+        assert_eq!(NIGHTFALL_TICK - 12_000, 1_200);
+        assert_eq!(DAY_TICKS - PRE_DAWN_TICK, 1_200);
+        // Symmetric pre-dawn ramp: 22,800 -> 24,000 mirrors 12,000 -> 13,200.
+        for offset in [0u32, 300, 600, 900, 1_200] {
+            let dusk = sky_palette(12_000 + offset);
+            let pre_dawn = sky_palette((DAY_TICKS - offset) % DAY_TICKS);
+            assert_close(dusk.day_factor, pre_dawn.day_factor);
+            assert_color_close(dusk.sky_color, pre_dawn.sky_color);
+            assert_color_close(dusk.fog_color, pre_dawn.fog_color);
+        }
+    }
+
+    #[test]
+    fn sky_is_decisively_night_shortly_after_dusk() {
+        // Tick 14,000 is past the completed 1,200-tick ramp: the sky must be
+        // decisively blue-dominant, not a muddy dusk lerp.
+        let palette = sky_palette(14_000);
+        assert_eq!(palette, NIGHT);
+        let [r, g, b] = palette.sky_color;
+        assert!(
+            b > r + 0.05,
+            "night sky should be clearly blue-dominant, got {palette:?}"
+        );
+        assert!(
+            b > g,
+            "night blue channel should beat green, got {palette:?}"
+        );
+        assert_close(palette.day_factor, MOONLIT_FLOOR);
     }
 
     #[test]
