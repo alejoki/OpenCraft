@@ -79,10 +79,37 @@ Image rules:
 - A missing or corrupt logo does not break the menu: the game falls back to the built-in OpenCraft text title and shows a warning naming the logo file.
 - `overlay_tint` dims the whole panorama behind the menu. Use four values in RGBA order, 0 to 255; for example `[24, 32, 48, 96]` is a dark, mostly transparent blue-grey. An invalid tint is ignored and a warning is shown.
 
+## Sounds
+
+A pack can replace the game's four built-in sounds. Save audio files flat in the pack folder, next to the textures, using these exact base names:
+
+1. `break` — breaking a block
+2. `place` — placing a block
+3. `mine_complete` — finishing a block's mining time
+4. `ui_click` — clicking a menu row or button
+
+Each sound may use any of these formats. If several files share a base name, only the highest-priority one is read:
+
+1. `.wav` (WAV)
+2. `.ogg` (Ogg Vorbis)
+3. `.flac` (FLAC)
+4. `.mp3` (MP3)
+5. `.m4a` (M4A/MP4)
+
+For example, `break.wav` or `ui_click.ogg`. Each file must be 1 MiB (1,048,576 bytes) or smaller.
+
+Sound rules:
+
+- A missing sound file is fine and silently keeps the built-in synthesized sound for that slot.
+- A corrupt, oversized, or empty (zero-sample) file also keeps the built-in sound, but the menu shows a warning that names the file.
+- Partial packs always work — add one sound or all four, with or without textures.
+- Sounds apply live when you cycle the **Texture Pack** row; no restart is needed.
+- Cycling back to **Default** restores all four built-in sounds.
+
 ## Selecting a pack in game
 
 - Open **Settings** and click the **Texture Pack** row. Each click advances through `Default` and every pack folder found under `packs/`, wrapping back to `Default`.
-- The change applies immediately — no restart is needed. The logo, the menu tint, and the block textures update live.
+- The change applies immediately — no restart is needed. The logo, the menu tint, the block textures, and the pack's sounds update live.
 - The choice is saved in `settings.toml` under `[packs]` as `texture_pack = "folder-name"`, so it comes back on the next launch.
 - If the selected pack folder is deleted or renamed, the game keeps running with the built-in Default textures and shows an in-menu warning naming the pack. Cycle the row back to `Default` (or to the new folder name) to clear the stale selection.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
@@ -104,3 +131,6 @@ Warnings appear in the Settings menu as `name: reason` lines, joined together if
 | `stone.png: image is 8x8, layers must be between 16 and 256 pixels per side` | A block texture is outside the accepted size range. | Resize it to 16 to 256 pixels per side. |
 | `logo.png: ... larger than the 1024 px logo limit` | The logo is too large. | Resize the logo to 1024 pixels or less per side. |
 | `my-pack: pack folder ... is missing` | `settings.toml` points at a pack folder that no longer exists. | Restore the folder, or cycle the Texture Pack row back to Default. |
+| `break.wav: failed to decode sound file ...` | The file is not readable audio in a supported format. | Re-export it as WAV, Ogg Vorbis, FLAC, MP3, or M4A. |
+| `break.wav: sound file is ... bytes, the limit is 1048576 bytes` | The sound file is larger than the 1 MiB cap. | Shorten it or export at a lower bitrate. |
+| `break.wav: sound file decoded to zero samples` | The file has a valid header but contains no audio frames. | Export the sound again with actual audio data. |
