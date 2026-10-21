@@ -12,6 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
+use opencraft::audio::{AudioEngine, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::HOTBAR_SLOTS;
@@ -87,6 +88,21 @@ fn load_startup_pack(
     let loaded = pack::load_pack_by_name(packs_root, name);
     let warnings = loaded.warnings.clone();
     (Some(loaded), warnings)
+}
+
+/// Build the app's sound engine. Production opens the default output device
+/// and degrades to a silent no-op engine on any construction failure (launch
+/// is never blocked by audio). Test builds use the explicit silent
+/// constructor instead: the suite builds many headless `GameApp`s and must
+/// never open real CPAL streams or a device for them.
+#[cfg(not(test))]
+fn new_audio_engine() -> AudioEngine {
+    AudioEngine::new()
+}
+
+#[cfg(test)]
+fn new_audio_engine() -> AudioEngine {
+    AudioEngine::disabled()
 }
 
 fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
@@ -772,6 +788,12 @@ struct GameApp {
     /// frame from the RedrawRequested pass. Any reset boundary below clears it
     /// so a menu/focus/session change never inherits partial progress.
     mining: MiningState,
+    /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
+    /// `play` is a silent no-op when no device was opened. Every call site is
+    /// confined to `window_event`/`menu_click`/`screen_click` arms so the
+    /// headless tests (which drive free helpers and `GameApp::new` directly)
+    /// never emit sound.
+    audio: AudioEngine,
     /// Whether the left mouse button is physically held from a gameplay
     /// press. Set only after the screen routing and click-to-grab early
     /// returns, cleared on release, focus loss, and screen/session changes.
@@ -948,6 +970,7 @@ impl GameApp {
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
+            audio: new_audio_engine(),
             left_mouse_held: false,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
@@ -1002,6 +1025,21 @@ impl GameApp {
         let Some(row) = menu::hovered_row(cursor, surface_w, surface_h) else {
             return;
         };
+        // One UI click per ACTING row click. The Volume row is excluded here
+        // because its arm below plays its own click at the NEW volume — that
+        // is the row's audible live-apply proof. The stepped rows only act on
+        // the Left/Right adjust buttons, so other buttons stay silent, as do
+        // clicks outside the panel (returned above).
+        let acts = match row {
+            MenuRow::Volume => false,
+            MenuRow::MouseSensitivity | MenuRow::Fov | MenuRow::RenderDistance => {
+                adjust_direction(button).is_some()
+            }
+            _ => true,
+        };
+        if acts {
+            self.audio.play(SoundSlot::UiClick, self.settings.volume);
+        }
         match row {
             MenuRow::Bind(action) => self.menu.begin_rebind(action),
             MenuRow::MouseSensitivity => {
@@ -1058,6 +1096,11 @@ impl GameApp {
                     let next = menu::adjust_volume(i32::from(self.settings.volume), direction);
                     self.settings.volume = next.clamp(VOLUME_MIN, VOLUME_MAX) as u8;
                     save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+                    // Audible live-apply proof: per-play volume reads the
+                    // setting, so this click already uses the level just
+                    // stored. Exactly one click per Volume adjustment (the
+                    // generic pre-match click skips this row).
+                    self.audio.play(SoundSlot::UiClick, self.settings.volume);
                 }
             }
             MenuRow::TexturePack => {
@@ -1562,6 +1605,7 @@ impl GameApp {
                     MainMenuRow::ExitGame => LifecycleIntent::MainMenu(MainMenuIntent::ExitGame),
                 };
                 self.dispatch_screen_intent(event_loop, intent);
+                self.audio.play(SoundSlot::UiClick, self.settings.volume);
             }
             LifecycleScreen::Pause => {
                 let Some(row) = hovered_pause_row(cursor, surface_w, surface_h) else {
@@ -1573,6 +1617,7 @@ impl GameApp {
                     PauseRow::SaveAndQuit => LifecycleIntent::Pause(PauseIntent::SaveAndQuit),
                 };
                 self.dispatch_screen_intent(event_loop, intent);
+                self.audio.play(SoundSlot::UiClick, self.settings.volume);
             }
             LifecycleScreen::NewGame => {
                 let Some(target) = hovered_new_game_target(cursor, surface_w, surface_h) else {
@@ -1593,6 +1638,9 @@ impl GameApp {
                         );
                     }
                 }
+                // Every NewGame target is an action (field focus included),
+                // so one click follows the match.
+                self.audio.play(SoundSlot::UiClick, self.settings.volume);
             }
             LifecycleScreen::LoadGame => {
                 let row_count = self.load.row_count();
@@ -1602,30 +1650,39 @@ impl GameApp {
                 };
                 match target {
                     // The text portion of a row carries no click action
-                    // (Play and Delete are the row's actions).
+                    // (Play and Delete are the row's actions), so no click
+                    // sound.
                     LoadTarget::Row(_) => {}
-                    LoadTarget::Play(index) => self.play_row(index),
+                    LoadTarget::Play(index) => {
+                        self.play_row(index);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
                     LoadTarget::Delete(index) => {
                         self.load.request_delete(index);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
                     }
                     LoadTarget::Back => {
                         self.dispatch_screen_intent(
                             event_loop,
                             LifecycleIntent::LoadGame(LoadGameIntent::Back),
                         );
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
                     }
                     // Confirm/cancel are live only while a delete is
                     // pending (T01 geometry always exists; the pending
                     // state decides clickability, mirroring the hover
-                    // rule in `hovered_target_rect`).
+                    // rule in `hovered_target_rect`). An inactive click is
+                    // a no-op and stays silent.
                     LoadTarget::ConfirmDelete => {
                         if self.load.is_delete_pending() {
                             self.confirm_pending_delete();
+                            self.audio.play(SoundSlot::UiClick, self.settings.volume);
                         }
                     }
                     LoadTarget::CancelDelete => {
                         if self.load.is_delete_pending() {
                             self.load.cancel_delete();
+                            self.audio.play(SoundSlot::UiClick, self.settings.volume);
                         }
                     }
                 }
@@ -2042,6 +2099,11 @@ impl ApplicationHandler for GameApp {
                     }
                     MouseButton::Right => {
                         if let Some(remeshed) = try_place_selected_block(&mut self.session) {
+                            // Placement applied: one thump at the current
+                            // volume. A rejected placement returns None and
+                            // stays silent. Field-disjoint from the live
+                            // `gpu` borrow (P005).
+                            self.audio.play(SoundSlot::Place, self.settings.volume);
                             for (cpos, mesh) in remeshed {
                                 gpu.render_store.upload_mesh(
                                     &gpu.ctx.device,
@@ -2209,6 +2271,14 @@ impl ApplicationHandler for GameApp {
                     // gating happens in MiningState, so Bedrock (no
                     // duration) can never reach this arm.
                     let remeshed = collect_mined_block(&mut self.session, pos, block);
+                    // Only an edit that actually applied makes noise (the
+                    // helper returns empty for a no-op break). Break then
+                    // the rising completion pop, both at the current volume
+                    // and field-disjoint from the live `gpu` borrow (P005).
+                    if !remeshed.is_empty() {
+                        self.audio.play(SoundSlot::Break, self.settings.volume);
+                        self.audio.play(SoundSlot::MineComplete, self.settings.volume);
+                    }
                     for (cpos, mesh) in remeshed {
                         gpu.render_store.upload_mesh(
                             &gpu.ctx.device,
@@ -3313,6 +3383,27 @@ mod tests {
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
         app
+    }
+
+    #[test]
+    fn game_app_in_test_builds_owns_a_silent_audio_engine() {
+        // The suite builds many headless GameApps; the cfg(test) constructor
+        // must never open a real device/CPAL stream. Playback itself is
+        // unreachable from the test-driven free helpers (the wiring rule),
+        // so a silent engine is the complete test-side contract.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_at_screen(dir.path(), LifecycleScreen::MainMenu);
+        assert!(
+            app.audio.is_silent(),
+            "test GameApps must use AudioEngine::disabled()"
+        );
+        // The real play surface is still callable and a no-op at every
+        // volume boundary (0 mutes, 100 normal, >100 clamps internally).
+        for slot in SoundSlot::ALL {
+            app.audio.play(slot, 0);
+            app.audio.play(slot, app.settings.volume);
+            app.audio.play(slot, 255);
+        }
     }
 
     #[test]
