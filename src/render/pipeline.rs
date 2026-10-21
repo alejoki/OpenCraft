@@ -27,9 +27,11 @@ pub struct CameraUniform {
 /// [`crate::world::daycycle::sky_palette`].
 ///
 /// Grouped into one type so `render_frame`'s long signature grows by a single
-/// parameter rather than three. The day factor rides in the otherwise unused
+/// parameter rather than four. The day factor rides in the otherwise unused
 /// `CameraUniform::fog_start_end.z` slot, so the 112-byte uniform layout and the
-/// WGSL struct stay untouched.
+/// WGSL struct stay untouched; the celestial inputs (sun/moon direction,
+/// brightness fades, star visibility and rotation) travel in the separate
+/// 48-byte [`sky::SkyUniform`] derived from `time_of_day`.
 #[derive(Copy, Clone, Debug)]
 pub struct SkyParams {
     /// Multiplier applied to terrain light: 1.0 at noon down to the moonlit
@@ -37,8 +39,11 @@ pub struct SkyParams {
     pub day_factor: f32,
     /// Linear RGBA fog color the terrain fades into.
     pub fog_color: [f32; 4],
-    /// Background clear color for the world pass.
+    /// Background clear color for the sky pass (and thus the horizon).
     pub clear_color: wgpu::Color,
+    /// Game time in day-cycle ticks (`0..DAY_TICKS`), the input the pure
+    /// [`daycycle`] helpers turn into sun/moon/star placement.
+    pub time_of_day: u32,
 }
 
 #[repr(C)]
@@ -670,9 +675,13 @@ impl VoxelRenderer {
 
     // 10 args: the existing world-pass parameters plus the T01 `ui_pass`
     // hook, the T02 `show_overlays` gate, and the S02-T03 grouped `sky`
-    // inputs. Kept flat rather than grouped further to avoid churn at the
-    // single call site in src/main.rs; this is the frame-draw entry point,
-    // not a general-purpose API.
+    // inputs (which since S03 also carry `time_of_day` for the sky pass, so
+    // the signature did not grow). Kept flat rather than grouped further to
+    // avoid churn at the single call site in src/main.rs; this is the
+    // frame-draw entry point, not a general-purpose API.
+    //
+    // Pass order on the encoder: sky (clears color) -> world (loads color,
+    // clears depth) -> overlay -> optional UI (loads color).
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
@@ -705,6 +714,17 @@ impl VoxelRenderer {
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
 
+        // Per-frame celestial state: three vec4s derived from the game clock by
+        // the pure day-cycle helpers (directions, brightness fades, star
+        // visibility and rotation). One 48-byte write per frame; all sky
+        // geometry itself is static.
+        let sky_uniform = sky::SkyUniform::from_time(sky.time_of_day);
+        ctx.queue.write_buffer(
+            &self.sky_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&sky_uniform),
+        );
+
         let overlay_verts =
             build_overlay_line_vertices(&vp, aspect, target_block, selected_slot, show_overlays);
         let overlay_buf = ctx
@@ -722,6 +742,39 @@ impl VoxelRenderer {
             });
 
         let mut visible_chunks = 0usize;
+
+        // Sky pass: FIRST pass on the encoder, before the world pass. It is
+        // color-only (no depth attachment) and clears the color target to the
+        // palette sky color, then draws the camera-relative sun/moon/star
+        // billboards. It is deliberately UNCONDITIONAL: the world pass below
+        // loads (not clears) the color attachment, so skipping this pass would
+        // present stale or undefined content. Terrain then overwrites sky
+        // pixels wherever geometry lands (occlusion by draw order).
+        {
+            let mut sky_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sky_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(sky.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            sky_rpass.set_pipeline(&self.sky_pipeline);
+            // Group 0 is the shared camera bind group; the sky shader declares
+            // only the view_proj/camera_pos members it reads.
+            sky_rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            sky_rpass.set_bind_group(1, &self.sky_bind_group, &[]);
+            sky_rpass.set_vertex_buffer(0, self.sky_vertex_buffer.slice(..));
+            sky_rpass.draw(0..self.sky_vertex_count, 0..1);
+        }
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -729,7 +782,9 @@ impl VoxelRenderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(sky.clear_color),
+                        // Load: the sky pass already cleared and painted the
+                        // color target above. Depth is cleared here as before.
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -873,6 +928,104 @@ mod tests {
             false,
         );
         assert!(verts.is_empty(), "hidden overlays must emit no vertices");
+    }
+
+    #[test]
+    fn sky_params_carries_time_of_day_into_the_sky_uniform() {
+        // The same grouped struct that carries the palette also carries the
+        // game time, so render_frame's 10-arg signature did not grow. The
+        // time is what the pure day-cycle helpers turn into sun/moon/star
+        // placement for the sky pass.
+        let params = SkyParams {
+            day_factor: 0.35,
+            fog_color: [0.1, 0.12, 0.2, 1.0],
+            clear_color: wgpu::Color {
+                r: 0.1,
+                g: 0.12,
+                b: 0.2,
+                a: 1.0,
+            },
+            time_of_day: 18_000,
+        };
+        assert_eq!(params.time_of_day, 18_000);
+        assert_eq!(params.day_factor, 0.35);
+
+        // Midnight: moon up, stars out, sun below the horizon.
+        let uniform = sky::SkyUniform::from_time(params.time_of_day);
+        assert!(uniform.sun_dir[1] < 0.0, "sun is below the horizon");
+        assert!(uniform.moon_dir[1] > 0.0, "moon is above the horizon");
+        assert!(uniform.params[1] > 0.0, "moon brightness is non-zero");
+        assert!(uniform.params[2] > 0.0, "stars are visible at midnight");
+    }
+
+    #[test]
+    fn vista_sky_params_use_the_pinned_golden_hour() {
+        // Source pin: the vista arm must pass VISTA_GOLDEN_HOUR (S02's single
+        // home for the constant) rather than the world clock, and the session
+        // arm must pass the live clock. Both go through `sky_params`.
+        let src = include_str!("../main.rs");
+        assert!(
+            src.contains("sky_params(palette, daycycle::VISTA_GOLDEN_HOUR)"),
+            "vista frames must pin the sky time to golden hour"
+        );
+        assert!(
+            src.contains("sky_params(palette, self.session.clock.time_of_day)"),
+            "session frames must follow the live clock"
+        );
+    }
+
+    #[test]
+    fn sky_pass_is_first_and_world_pass_loads_its_color() {
+        // Static source pin on render_frame's pass order. The sky pass clears
+        // the target and must run before the world pass; the world pass then
+        // Loads (never Clears) color so the sky survives behind terrain. The
+        // sky pass is unconditional: no guard may sit between the encoder and
+        // the pass that clears the target.
+        let src = include_str!("pipeline.rs");
+        let encoder_at = src
+            .find("label: Some(\"frame_encoder\")")
+            .expect("encoder exists");
+        let sky_at = src
+            .find("label: Some(\"sky_pass\")")
+            .expect("sky pass exists");
+        let main_at = src
+            .find("label: Some(\"main_pass\")")
+            .expect("main pass exists");
+        assert!(
+            encoder_at < sky_at && sky_at < main_at,
+            "pass order must be encoder -> sky_pass -> main_pass"
+        );
+
+        let before_sky = &src[encoder_at..sky_at];
+        assert!(
+            !before_sky.contains("return") && !before_sky.contains("if "),
+            "the sky pass must be unconditional (it owns the color clear)"
+        );
+
+        let sky_block = &src[sky_at..main_at];
+        assert!(
+            sky_block.contains("load: wgpu::LoadOp::Clear(sky.clear_color)"),
+            "the sky pass must clear the color target"
+        );
+        assert!(
+            sky_block.contains("depth_stencil_attachment: None"),
+            "the sky pass is color-only"
+        );
+        assert!(sky_block.contains("set_pipeline(&self.sky_pipeline)"));
+        assert!(
+            sky_block.contains("draw(0..self.sky_vertex_count, 0..1)"),
+            "the sky pass must draw the static billboard buffer"
+        );
+
+        let main_block = &src[main_at..src.len().min(main_at + 700)];
+        assert!(
+            main_block.contains("load: wgpu::LoadOp::Load,"),
+            "the world pass must load the sky pass output"
+        );
+        assert!(
+            !main_block.contains("LoadOp::Clear(sky.clear_color)"),
+            "the world pass must not clear the color the sky pass wrote"
+        );
     }
 
     fn assert_close(actual: f32, expected: f32, what: &str) {

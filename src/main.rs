@@ -279,13 +279,18 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
     lines.join("\n")
 }
 
-/// Render-side sky inputs from a pure day-cycle palette.
+/// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
-/// Session frames use the live clock's palette; vista frames use the pinned
-/// [`daycycle::VISTA_GOLDEN_HOUR`] palette and never derive it from the world
-/// clock or `vista_epoch` (that only drives camera drift).
-fn sky_params(palette: daycycle::SkyPalette) -> SkyParams {
+/// Session frames use the live clock's palette *and* its
+/// `clock.time_of_day`; vista frames use the pinned
+/// [`daycycle::VISTA_GOLDEN_HOUR`] palette and that same constant as the sky
+/// time, never deriving either from the world clock or `vista_epoch` (that
+/// only drives camera drift). Passing the constant here is what makes the
+/// golden-hour sun appear: `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above
+/// the eastern horizon.
+fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
     SkyParams {
+        time_of_day,
         day_factor: palette.day_factor,
         fog_color: [
             palette.fog_color[0],
@@ -2496,7 +2501,7 @@ impl ApplicationHandler for GameApp {
                         None,
                         self.session.player.selected_slot,
                         false,
-                        sky_params(palette),
+                        sky_params(palette, daycycle::VISTA_GOLDEN_HOUR),
                         ui_pass,
                     )
                 } else {
@@ -2511,7 +2516,7 @@ impl ApplicationHandler for GameApp {
                         target_block,
                         self.session.player.selected_slot,
                         playing,
-                        sky_params(palette),
+                        sky_params(palette, self.session.clock.time_of_day),
                         ui_pass,
                     )
                 };
