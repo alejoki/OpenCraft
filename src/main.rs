@@ -24,7 +24,8 @@ use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
-    load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH,
+    load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
+    VOLUME_MIN,
 };
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
@@ -262,6 +263,7 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
                 format!("{}: {}", row.label(), on_off(settings.fullscreen))
             }
             MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
+            MenuRow::Volume => format!("{}: {}%", row.label(), settings.volume),
             MenuRow::TexturePack => format!("{}: {pack_label}", row.label()),
             MenuRow::Close => row.label().to_string(),
         };
@@ -1046,6 +1048,17 @@ impl GameApp {
                 // The live present-mode swap happens in the caller (needs
                 // the RenderContext; see the doc comment above).
                 save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+            }
+            MenuRow::Volume => {
+                if let Some(direction) = adjust_direction(button) {
+                    // Clamp BEFORE storing: in-memory Settings are unclamped
+                    // (only load clamps), so the menu helper plus the shared
+                    // bounds are mandatory here. Per-play volume reads this
+                    // field, so the next sound already plays at the new level.
+                    let next = menu::adjust_volume(i32::from(self.settings.volume), direction);
+                    self.settings.volume = next.clamp(VOLUME_MIN, VOLUME_MAX) as u8;
+                    save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+                }
             }
             MenuRow::TexturePack => {
                 // Cycling is not an adjust row: any button advances one step.
@@ -2738,6 +2751,7 @@ mod tests {
         assert!(text.contains("Render Distance: 16"));
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
+        assert!(text.contains("Volume: 100%"));
         assert!(text.contains("Texture Pack: Default"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
@@ -2768,6 +2782,22 @@ mod tests {
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
         assert!(text.contains("Texture Pack: Default"));
+    }
+
+    #[test]
+    fn menu_text_volume_row_reflects_the_live_setting() {
+        for volume in [0u8, 60, 100] {
+            let settings = Settings {
+                volume,
+                ..Settings::default()
+            };
+            let menu = menu::SettingsMenu::new();
+            let text = compose_menu_text(&settings, &menu, "Default");
+            assert!(
+                text.contains(&format!("Volume: {volume}%")),
+                "volume {volume}: {text}"
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use super::LINE_HEIGHT;
 use crate::settings::keybind::key_to_string;
 use crate::settings::{
     Keybinds, SettingsWarning, FOV_MAX, FOV_MIN, RENDER_DISTANCE_MAX, RENDER_DISTANCE_MIN,
-    SENSITIVITY_MAX, SENSITIVITY_MIN,
+    SENSITIVITY_MAX, SENSITIVITY_MIN, VOLUME_MAX, VOLUME_MIN, VOLUME_STEP,
 };
 
 /// Fixed panel width in px. Wide enough for "Mouse Sensitivity: 0.0022"
@@ -113,8 +113,8 @@ impl BindAction {
 }
 
 /// One selectable menu line. The full list is 7 keybind rows plus
-/// sensitivity, FOV, render distance, fullscreen, vsync, texture pack, and
-/// a close row.
+/// sensitivity, FOV, render distance, fullscreen, vsync, volume, texture
+/// pack, and a close row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuRow {
     Bind(BindAction),
@@ -123,12 +123,13 @@ pub enum MenuRow {
     RenderDistance,
     Fullscreen,
     Vsync,
+    Volume,
     TexturePack,
     Close,
 }
 
 /// All rows top-to-bottom, in menu order.
-pub const ROWS: [MenuRow; 14] = [
+pub const ROWS: [MenuRow; 15] = [
     MenuRow::Bind(BindAction::Forward),
     MenuRow::Bind(BindAction::Backward),
     MenuRow::Bind(BindAction::Left),
@@ -141,6 +142,7 @@ pub const ROWS: [MenuRow; 14] = [
     MenuRow::RenderDistance,
     MenuRow::Fullscreen,
     MenuRow::Vsync,
+    MenuRow::Volume,
     MenuRow::TexturePack,
     MenuRow::Close,
 ];
@@ -165,6 +167,7 @@ impl MenuRow {
             MenuRow::RenderDistance => "Render Distance",
             MenuRow::Fullscreen => "Fullscreen",
             MenuRow::Vsync => "VSync",
+            MenuRow::Volume => "Volume",
             MenuRow::TexturePack => "Texture Pack",
             MenuRow::Close => "Close Menu",
         }
@@ -378,6 +381,11 @@ pub fn clamp_render_distance(value: i32) -> i32 {
     value.clamp(RENDER_DISTANCE_MIN, RENDER_DISTANCE_MAX)
 }
 
+/// Clamp a volume to [`VOLUME_MIN`, `VOLUME_MAX`] in percent.
+pub fn clamp_volume(value: i32) -> i32 {
+    value.clamp(VOLUME_MIN, VOLUME_MAX)
+}
+
 /// One-step adjustment direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdjustDirection {
@@ -413,6 +421,16 @@ pub fn adjust_render_distance(current: i32, direction: AdjustDirection) -> i32 {
         AdjustDirection::Down => -RENDER_DISTANCE_STEP,
     };
     clamp_render_distance(current + delta)
+}
+
+/// Step the volume up or down by [`VOLUME_STEP`] percent, clamped to the
+/// valid range. Stepping past either bound pins at the bound.
+pub fn adjust_volume(current: i32, direction: AdjustDirection) -> i32 {
+    let delta = match direction {
+        AdjustDirection::Up => VOLUME_STEP,
+        AdjustDirection::Down => -VOLUME_STEP,
+    };
+    clamp_volume(current + delta)
 }
 
 /// Verdict on a key pressed while capturing a rebind.
@@ -895,7 +913,7 @@ mod tests {
 
     #[test]
     fn rows_cover_all_seven_binds_plus_settings_and_close_in_order() {
-        assert_eq!(ROW_COUNT, 14);
+        assert_eq!(ROW_COUNT, 15);
         for (i, action) in BindAction::ALL.iter().enumerate() {
             assert_eq!(ROWS[i], MenuRow::Bind(*action), "row {i}");
         }
@@ -904,8 +922,9 @@ mod tests {
         assert_eq!(ROWS[9], MenuRow::RenderDistance);
         assert_eq!(ROWS[10], MenuRow::Fullscreen);
         assert_eq!(ROWS[11], MenuRow::Vsync);
-        assert_eq!(ROWS[12], MenuRow::TexturePack);
-        assert_eq!(ROWS[13], MenuRow::Close);
+        assert_eq!(ROWS[12], MenuRow::Volume);
+        assert_eq!(ROWS[13], MenuRow::TexturePack);
+        assert_eq!(ROWS[14], MenuRow::Close);
         // every row has a non-empty label
         for r in ROWS {
             assert!(!r.label().is_empty());
@@ -938,6 +957,35 @@ mod tests {
         );
         assert_eq!(clamp_render_distance(0), RENDER_DISTANCE_MIN);
         assert_eq!(clamp_render_distance(900), RENDER_DISTANCE_MAX);
+    }
+
+    #[test]
+    fn volume_steps_by_ten_percent_and_pins_at_both_bounds() {
+        assert_eq!(adjust_volume(60, AdjustDirection::Up), 70);
+        assert_eq!(adjust_volume(60, AdjustDirection::Down), 50);
+        assert_eq!(
+            adjust_volume(95, AdjustDirection::Up),
+            100,
+            "clamps at the ceiling"
+        );
+        assert_eq!(
+            adjust_volume(VOLUME_MAX, AdjustDirection::Up),
+            VOLUME_MAX,
+            "pinned at MAX"
+        );
+        assert_eq!(
+            adjust_volume(5, AdjustDirection::Down),
+            0,
+            "clamps at the floor"
+        );
+        assert_eq!(
+            adjust_volume(VOLUME_MIN, AdjustDirection::Down),
+            VOLUME_MIN,
+            "pinned at MIN"
+        );
+        assert_eq!(clamp_volume(-20), VOLUME_MIN);
+        assert_eq!(clamp_volume(250), VOLUME_MAX);
+        assert_eq!(clamp_volume(37), 37, "in-range values pass through");
     }
 
     #[test]
