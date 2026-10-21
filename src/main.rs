@@ -12,7 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::HOTBAR_SLOTS;
@@ -88,6 +88,23 @@ fn load_startup_pack(
     let loaded = pack::load_pack_by_name(packs_root, name);
     let warnings = loaded.warnings.clone();
     (Some(loaded), warnings)
+}
+
+/// Resolve the startup sound buffers and warnings for the persisted pack.
+///
+/// `None` selection is the built-in Default pack: the synthesized buffers stay
+/// untouched and no warnings are produced. A selected pack is resolved
+/// independently of its texture result (a pack whose layers partially failed
+/// may still ship usable sounds); the loader never fails, so this can never
+/// block launch (D054).
+fn load_startup_sounds(
+    packs_root: &Path,
+    selected: Option<&str>,
+) -> ([SoundBuffer; 4], Vec<SettingsWarning>) {
+    let Some(name) = selected else {
+        return (default_buffers(), Vec::new());
+    };
+    pack::sound::load_sound_overrides(&packs_root.join(name))
 }
 
 /// Build the app's sound engine. Production opens the default output device
@@ -919,6 +936,17 @@ impl GameApp {
         let (current_pack, pack_warnings) =
             load_startup_pack(&packs_root, settings.texture_pack.as_deref());
         startup_warnings.extend(pack_warnings);
+        // Startup sound overrides (M005/S05): resolved independently of the
+        // texture result, so a pack whose layers partially failed still
+        // supplies its sounds. The never-fail loader returns a complete
+        // buffer set; its warnings merge into the same one-time Settings-entry
+        // message path as every other startup warning (MEM009/D054). The
+        // engine is constructed first because `set_buffers` is device-free.
+        let mut audio = new_audio_engine();
+        let (startup_sounds, sound_warnings) =
+            load_startup_sounds(&packs_root, settings.texture_pack.as_deref());
+        audio.set_buffers(startup_sounds);
+        startup_warnings.extend(sound_warnings);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -970,7 +998,7 @@ impl GameApp {
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
-            audio: new_audio_engine(),
+            audio,
             left_mouse_held: false,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
@@ -1153,11 +1181,23 @@ impl GameApp {
             menu::cycle_texture_pack(self.settings.texture_pack.as_deref(), &self.available_packs);
         self.settings.texture_pack = next.clone();
         match next {
-            None => self.current_pack = None,
+            None => {
+                // Cycling back to Default restores the synthesized sounds
+                // (mirrors MEM135's procedural texture re-upload).
+                self.current_pack = None;
+                self.audio.set_buffers(default_buffers());
+            }
             Some(name) => {
                 let loaded = pack::load_pack_by_name(&self.packs_root, &name);
-                if !loaded.warnings.is_empty() {
-                    let lines = menu::format_warnings(&loaded.warnings).join(" | ");
+                // Sounds load independently of texture success and apply live
+                // on the same click (the helper holds no GPU borrow).
+                let (buffers, sound_warnings) =
+                    pack::sound::load_sound_overrides(&self.packs_root.join(&name));
+                self.audio.set_buffers(buffers);
+                let mut warnings = loaded.warnings.clone();
+                warnings.extend(sound_warnings);
+                if !warnings.is_empty() {
+                    let lines = menu::format_warnings(&warnings).join(" | ");
                     self.menu.set_message(lines);
                 }
                 self.current_pack = Some(loaded);
@@ -3506,6 +3546,36 @@ mod tests {
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
     }
 
+    /// Canonical 44-byte-header RIFF/WAVE PCM16 fixture, matching the shape
+    /// `src/pack/sound.rs` tests use, so the GameApp wiring tests exercise
+    /// rodio's real symphonia decoder rather than a mock.
+    fn write_wav_fixture(path: &Path, channels: u16, sample_rate: u32) {
+        let samples: Vec<i16> = (0..128usize)
+            .map(|i| ((i.wrapping_mul(517) % 20_000) as i16) - 10_000)
+            .collect();
+        let data_len = (samples.len() * 2) as u32;
+        let block_align = channels * 2;
+        let byte_rate = sample_rate * u32::from(block_align);
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write wav fixture");
+    }
+
     #[test]
     fn texture_pack_cycle_advances_to_the_first_pack_and_persists_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3595,6 +3665,138 @@ mod tests {
             "warning names the failing layer: {}",
             message.text
         );
+    }
+
+    #[test]
+    fn texture_pack_cycle_swaps_in_valid_pack_sounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("soundy"), "Soundy Pack");
+        write_wav_fixture(&packs_root.join("soundy").join("break.wav"), 1, 22_050);
+        app.available_packs = pack::available_pack_names(&packs_root);
+        assert_eq!(
+            *app.audio.buffer(SoundSlot::Break),
+            default_buffers()[SoundSlot::Break.index()],
+            "baseline is the synthesized default"
+        );
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("soundy"));
+        let swapped = app.audio.buffer(SoundSlot::Break);
+        assert_eq!(swapped.channels(), 1, "mono WAV keeps its channel count");
+        assert_eq!(swapped.sample_rate(), 22_050, "rate passes through");
+        assert_ne!(
+            *swapped,
+            default_buffers()[SoundSlot::Break.index()],
+            "the pack file replaces the synthesized buffer"
+        );
+        // Slots the pack does not provide stay on the synthesized default.
+        assert_eq!(
+            *app.audio.buffer(SoundSlot::Place),
+            default_buffers()[SoundSlot::Place.index()]
+        );
+        assert!(
+            app.menu.message.is_none(),
+            "a clean sound pack emits no warning"
+        );
+    }
+
+    #[test]
+    fn texture_pack_cycle_surfaces_corrupt_sound_warning_naming_the_bare_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        let broken = packs_root.join("broken-sound");
+        write_pack_fixture(&broken, "Broken Sound Pack");
+        std::fs::write(broken.join("place.wav"), b"not a wav at all").expect("corrupt sound");
+        app.available_packs = pack::available_pack_names(&packs_root);
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken-sound"));
+        let message = app.menu.message.as_ref().expect("sound warning in the menu");
+        assert!(
+            message.text.contains("place.wav"),
+            "warning names the bare sound file: {}",
+            message.text
+        );
+        assert_eq!(
+            *app.audio.buffer(SoundSlot::Place),
+            default_buffers()[SoundSlot::Place.index()],
+            "the corrupt slot falls back to the synthesized default"
+        );
+    }
+
+    #[test]
+    fn texture_pack_cycle_back_to_default_restores_synthesized_sounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        write_wav_fixture(&packs_root.join("alpha").join("break.wav"), 1, 22_050);
+        app.available_packs = pack::available_pack_names(&packs_root);
+        // Start on the pack with its sounds already applied, as a real run
+        // would after cycling onto it.
+        app.settings.texture_pack = Some("alpha".to_string());
+        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
+        let (pack_buffers, _) = pack::sound::load_sound_overrides(&packs_root.join("alpha"));
+        app.audio.set_buffers(pack_buffers);
+        assert_ne!(
+            *app.audio.buffer(SoundSlot::Break),
+            default_buffers()[SoundSlot::Break.index()]
+        );
+
+        app.apply_texture_pack_cycle();
+
+        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
+        for slot in SoundSlot::ALL {
+            assert_eq!(
+                *app.audio.buffer(slot),
+                default_buffers()[slot.index()],
+                "Default must restore the synthesized {} sound",
+                slot.name()
+            );
+        }
+    }
+
+    #[test]
+    fn startup_sound_overrides_merge_warnings_and_apply_buffers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let packs_root = dir.path().join("packs");
+        let pack_dir = packs_root.join("soundy");
+        write_pack_fixture(&pack_dir, "Soundy Pack");
+        write_wav_fixture(&pack_dir.join("break.wav"), 1, 22_050);
+        std::fs::write(pack_dir.join("ui_click.wav"), b"junk").expect("corrupt sound");
+
+        // Mirrors GameApp::new: pack warnings and sound warnings feed the same
+        // startup Vec shown once through the Settings-entry path (MEM009).
+        let (_, mut startup_warnings) = load_startup_pack(&packs_root, Some("soundy"));
+        let (buffers, sound_warnings) = load_startup_sounds(&packs_root, Some("soundy"));
+        startup_warnings.extend(sound_warnings);
+
+        assert!(
+            startup_warnings
+                .iter()
+                .any(|w| w.field == "ui_click.wav"),
+            "the corrupt sound reaches the startup warning Vec: {startup_warnings:?}"
+        );
+        assert_ne!(
+            buffers[SoundSlot::Break.index()],
+            default_buffers()[SoundSlot::Break.index()],
+            "the valid startup sound is applied"
+        );
+        assert_eq!(
+            buffers[SoundSlot::UiClick.index()],
+            default_buffers()[SoundSlot::UiClick.index()],
+            "the corrupt slot falls back"
+        );
+
+        // Default selection keeps the synthesized set and adds nothing.
+        let (default_sounds, default_warnings) = load_startup_sounds(&packs_root, None);
+        assert_eq!(default_sounds, default_buffers());
+        assert!(default_warnings.is_empty());
     }
 
     #[test]
