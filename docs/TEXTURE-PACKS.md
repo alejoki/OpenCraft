@@ -5,7 +5,7 @@ A texture pack replaces the game's block textures and can also supply a custom t
 ## Quickstart
 
 1. Find the folder that contains the game's `settings.toml` (the game's working directory).
-2. Create a folder named `packs/my-first-pack/` next to `settings.toml`.
+2. Create a folder named `packs/` next to `settings.toml` — the game does not ship one and never creates it for you — and inside it a folder named `my-first-pack/`.
 3. Save the file below as `pack.toml` inside `packs/my-first-pack/`.
 4. Launch the game, open **Settings**, and cycle the **Texture Pack** row until it shows your pack.
 
@@ -23,6 +23,7 @@ That pack is valid on its own: with no image files it simply keeps every built-i
 
 Packs are folders under `packs/`, relative to the game's working directory — the same place the game keeps `saves/` and `settings.toml`.
 
+- The game does not ship a `packs/` folder and never creates one itself. If it does not exist yet, you create it in the game's working directory, and pack folders go directly inside it.
 - The pack folder name is the pack's fallback display name in the Settings menu when `pack.toml` does not set `name`.
 - Every pack should include a `pack.toml`. A folder with no manifest still appears, but it loads with default values and shows a warning naming `pack.toml`.
 - The game only reads packs. It never writes files inside `packs/`.
@@ -105,6 +106,49 @@ Sound rules:
 - Partial packs always work — add one sound or all four, with or without textures.
 - Sounds apply live when you cycle the **Texture Pack** row; no restart is needed.
 - Cycling back to **Default** restores all four built-in sounds.
+
+## A complete sound pack
+
+A sound pack is a `pack.toml` manifest plus up to four optional sound files. Copy
+this manifest and save it as `packs/my-sounds/pack.toml`:
+
+```toml
+name = "My Sounds"
+description = "Custom break, place, mine-complete, and UI-click audio"
+```
+
+The folder looks like this — a pack may contain any subset of the sound files:
+
+```
+packs/my-sounds/
+  pack.toml
+  break.wav         # optional - block broken
+  place.wav         # optional - block placed
+  mine_complete.wav # optional - mining sequence finished
+  ui_click.wav      # optional - menu interaction
+```
+
+Every sound file is optional. A missing slot silently keeps the built-in sound for
+that event, so you do not need placeholder files. Any of the five accepted
+extensions (`.wav`, `.ogg`, `.flac`, `.mp3`, `.m4a`) works; see [Sounds](#sounds)
+for the accepted formats and the 1 MiB per-file cap.
+
+### Runnable example: `packs/uat-sound/`
+
+The project repository ships a ready-made example pack at `packs/uat-sound/`:
+
+- `break.wav`, `place.wav`, and `mine_complete.wav` are valid 16-bit stereo PCM WAVs.
+- `ui_click.wav` is deliberately corrupt ASCII so you can see the in-menu fallback
+  warning: the menu reports that the file could not be decoded and keeps playing the
+  built-in tick instead of crashing.
+
+It is a test fixture, not part of a normal game install. To try it, copy the
+`uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
+creating the `packs/` folder yourself first if it does not exist — then cycle the
+**Texture Pack** row to `uat-sound`. Break and place a block and finish a mining
+sequence to hear the custom sounds; open the settings menu to see the corrupt-file
+warning while the built-in click keeps playing. Cycling back to **Default** restores
+the built-in sounds.
 
 ## Selecting a pack in game
 
