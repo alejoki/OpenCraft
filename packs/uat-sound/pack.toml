@@ -1,0 +1,5 @@
+name = "UAT Sound Test"
+description = "Agent-authored pack for M005 human UAT: three valid sounds plus one corrupt file to prove per-slot fallback"
+
+[menu]
+overlay_tint = [24, 32, 48, 96]
