@@ -950,11 +950,7 @@ mod tests {
         let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
         for (lz, row) in heights.iter_mut().enumerate() {
             for (lx, h) in row.iter_mut().enumerate() {
-                *h = terrain_height_at_seeded(
-                    base_wx + lx as i32,
-                    base_wz + lz as i32,
-                    seed,
-                );
+                *h = terrain_height_at_seeded(base_wx + lx as i32, base_wz + lz as i32, seed);
             }
         }
         heights
@@ -1017,7 +1013,10 @@ mod tests {
             }
         }
 
-        assert!(carved_air > 0, "acceptance sample contains no carved cave Air below h-3");
+        assert!(
+            carved_air > 0,
+            "acceptance sample contains no carved cave Air below h-3"
+        );
         assert!(ore_blocks > 0, "acceptance sample contains no ore blocks");
         assert!(
             seed_changed_any_block,
@@ -1061,8 +1060,7 @@ mod tests {
                                 if !matches!(block, BlockId::CoalOre | BlockId::IronOre) {
                                     continue;
                                 }
-                                for (face_dir, &(dx, dy, dz)) in
-                                    NEIGHBOR_OFFSETS.iter().enumerate()
+                                for (face_dir, &(dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate()
                                 {
                                     let nlx = lx as i32 + dx;
                                     let nly = ly as i32 + dy;
@@ -1073,7 +1071,8 @@ mod tests {
                                     {
                                         continue;
                                     }
-                                    let (nlx, nly, nlz) = (nlx as usize, nly as usize, nlz as usize);
+                                    let (nlx, nly, nlz) =
+                                        (nlx as usize, nly as usize, nlz as usize);
                                     if chunk.get(nlx, nly, nlz) != BlockId::Air {
                                         continue;
                                     }
@@ -1125,13 +1124,22 @@ mod tests {
             }
         }
 
-        assert!(cave_chunks > 0, "no chunk with carved cave Air in the mesh scan region");
+        assert!(
+            cave_chunks > 0,
+            "no chunk with carved cave Air in the mesh scan region"
+        );
         assert!(
             interior_quads > 0,
             "cave chunk meshing produced no interior-axis quads; cave surfaces were not meshed"
         );
-        assert!(coal_faces > 0, "no coal ore face meshed with texture layer 14");
-        assert!(iron_faces > 0, "no iron ore face meshed with texture layer 15");
+        assert!(
+            coal_faces > 0,
+            "no coal ore face meshed with texture layer 14"
+        );
+        assert!(
+            iron_faces > 0,
+            "no iron ore face meshed with texture layer 15"
+        );
     }
 
     /// Slice acceptance: seed 1337 has deterministic, human-reachable dig
@@ -1155,9 +1163,7 @@ mod tests {
                             for lx in 0..CHUNK_SIZE {
                                 let block = chunk.get(lx, ly, lz);
                                 if !matches!(block, BlockId::CoalOre | BlockId::IronOre)
-                                    || !has_subsurface_air_neighbor(
-                                        &chunk, pos, lx, ly, lz, seed,
-                                    )
+                                    || !has_subsurface_air_neighbor(&chunk, pos, lx, ly, lz, seed)
                                 {
                                     continue;
                                 }
@@ -1293,7 +1299,10 @@ mod tests {
                 }
             }
             let (wx, wz, h) = highest.expect("height search must yield a column");
-            assert!(h >= 58, "height search did not reach mountain terrain (max h = {h})");
+            assert!(
+                h >= 58,
+                "height search did not reach mountain terrain (max h = {h})"
+            );
             let pos = ChunkPos::new(
                 wx.div_euclid(CHUNK_SIZE as i32),
                 h.div_euclid(CHUNK_SIZE as i32),

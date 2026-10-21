@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod mesh;
 pub mod pack;
 pub mod player;

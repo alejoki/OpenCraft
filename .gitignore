@@ -77,3 +77,6 @@ tmp/
 .gsd/milestones/**/*-CONTINUE.md
 .gsd/milestones/**/continue.md
 REQUIREMENTS-REGISTRY.md
+
+# Rootless ALSA devel extraction (machine-local build prerequisite)
+/.toolchain/

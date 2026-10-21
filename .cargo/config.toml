@@ -1,0 +1,6 @@
+# Machine-local build prerequisite: the ALSA development headers/package-config
+# are not installed system-wide on this Fedora host, so a rootless extraction of
+# alsa-lib-devel lives in .toolchain/alsa (gitignored). pkg-config still falls
+# back to the system alsa.pc on machines that have alsa-lib-devel installed.
+[env]
+PKG_CONFIG_PATH = { value = ".toolchain/alsa/usr/lib64/pkgconfig", relative = true }
