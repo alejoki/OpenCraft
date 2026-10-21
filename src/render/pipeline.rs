@@ -7,10 +7,12 @@ use crate::player::camera::{visible_face_mask, Camera, Frustum};
 use crate::player::inventory::HOTBAR_SLOTS;
 use crate::render::buffer::ChunkRenderStore;
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
+use crate::render::sky;
 use crate::render::texture::{
     block_layers_match_shape, create_block_texture_array, upload_block_layers,
 };
 use crate::world::chunk::CHUNK_SIZE;
+use crate::world::daycycle;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -400,9 +402,17 @@ pub struct VoxelRenderer {
     pub block_texture: wgpu::Texture,
     pub voxel_pipeline: wgpu::RenderPipeline,
     pub overlay_pipeline: wgpu::RenderPipeline,
+    /// Color-only sky pass pipeline (sun/moon/star billboards).
+    pub sky_pipeline: wgpu::RenderPipeline,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
     pub chunk_bind_group_layout: wgpu::BindGroupLayout,
+    /// Per-frame 48-byte sky state (directions, fades, star angle).
+    pub sky_uniform_buffer: wgpu::Buffer,
+    pub sky_bind_group: wgpu::BindGroup,
+    /// Static sun/moon/star billboard vertices, uploaded once at construction.
+    pub sky_vertex_buffer: wgpu::Buffer,
+    pub sky_vertex_count: u32,
 }
 
 impl VoxelRenderer {
@@ -494,6 +504,21 @@ impl VoxelRenderer {
                         count: None,
                     }],
                 });
+
+        // Sky pass resources: the pipeline reused the camera bind group for
+        // group 0 and a small dedicated 48-byte uniform for group 1. The
+        // billboard geometry (sun, moon, fixed-seed star field) is static.
+        let sky_bind_group_layout = sky::create_sky_bind_group_layout(&ctx.device);
+        let sky_uniform_buffer = sky::create_sky_uniform_buffer(&ctx.device);
+        let sky_bind_group = sky::create_sky_bind_group(
+            &ctx.device,
+            &sky_bind_group_layout,
+            &sky_uniform_buffer,
+        );
+        let sky_pipeline =
+            sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
+        let (sky_vertex_buffer, sky_vertex_count) =
+            sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
 
         let voxel_shader = ctx
             .device
@@ -621,9 +646,14 @@ impl VoxelRenderer {
             block_texture,
             voxel_pipeline,
             overlay_pipeline,
+            sky_pipeline,
             camera_buffer,
             camera_bind_group,
             chunk_bind_group_layout,
+            sky_uniform_buffer,
+            sky_bind_group,
+            sky_vertex_buffer,
+            sky_vertex_count,
         }
     }
 

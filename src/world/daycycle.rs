@@ -725,7 +725,9 @@ mod tests {
         assert!((0.05..=0.08).contains(&SUN_ANGULAR_SIZE));
         assert!((0.05..=0.08).contains(&MOON_ANGULAR_SIZE));
         assert!((0.01..=0.03).contains(&STAR_ANGULAR_SIZE));
-        assert!(STAR_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
-        assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
+        const {
+            assert!(STAR_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
+            assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
+        };
     }
 }
