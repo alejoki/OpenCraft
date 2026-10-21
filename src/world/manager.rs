@@ -5,6 +5,7 @@ use crate::mesh::greedy::{mesh_chunk, PaddedChunk};
 use crate::mesh::quad::ChunkMesh;
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::light::{self, LightGrid};
 use crate::world::persistence::ChunkEditMap;
 use crate::world::terrain::{generate_chunk_seeded, DEFAULT_WORLD_SEED};
 
@@ -17,6 +18,9 @@ pub struct WorldManager {
     pending_mesh: FxHashSet<ChunkPos>,
     meshed_chunks: FxHashSet<ChunkPos>,
     dirty_mesh_queue: FxHashSet<ChunkPos>,
+    /// Per-chunk sky-light grids (D038/D044). Derived data only: never
+    /// persisted, recomputed deterministically from chunks + edits.
+    light_grids: FxHashMap<ChunkPos, LightGrid>,
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
     mesh_tx: Sender<(ChunkPos, ChunkMesh)>,
@@ -30,8 +34,13 @@ pub struct WorldManager {
 }
 
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
-    // Load 1 extra ring of chunks beyond render_distance so chunks at the edge have neighbors for meshing
-    let gen_radius = radius + 1;
+    // One extra ring beyond render_distance supplied the 6 face neighbours for
+    // meshing. Meshing now also needs sky light in the 3x3 column neighborhood
+    // (face halos plus the 12 edge strips), so load a second extra ring: that
+    // keeps the diagonal neighbour columns of chunks on the render-distance
+    // circle generated (and therefore light-ready) instead of leaving a
+    // permanently unmeshed ring at the 45-degree edge.
+    let gen_radius = radius + 2;
     let mut offsets = Vec::with_capacity(((gen_radius * 2 + 1) * (gen_radius * 2 + 1)) as usize);
     for dz in -gen_radius..=gen_radius {
         for dx in -gen_radius..=gen_radius {
@@ -59,6 +68,7 @@ impl WorldManager {
             pending_mesh: FxHashSet::default(),
             meshed_chunks: FxHashSet::default(),
             dirty_mesh_queue: FxHashSet::default(),
+            light_grids: FxHashMap::default(),
             gen_tx,
             gen_rx,
             mesh_tx,
@@ -164,6 +174,181 @@ impl WorldManager {
         true
     }
 
+    /// True when every chunk of `(cx, cz)` across the full loaded Y range is
+    /// resident. Sky-light propagation is column-granular: a partial column
+    /// cannot produce a trustworthy grid.
+    fn column_is_complete(&self, cx: i32, cz: i32) -> bool {
+        (MIN_CHUNK_Y..=MAX_CHUNK_Y)
+            .all(|cy| self.chunks.contains_key(&ChunkPos::new(cx, cy, cz)))
+    }
+
+    /// True when every chunk of `(cx, cz)` has a sky-light grid. Grids are only
+    /// stored for complete columns, so this is also the mesh-readiness signal.
+    pub fn has_column_light(&self, cx: i32, cz: i32) -> bool {
+        (MIN_CHUNK_Y..=MAX_CHUNK_Y)
+            .all(|cy| self.light_grids.contains_key(&ChunkPos::new(cx, cy, cz)))
+    }
+
+    /// Meshing reads light from the 3x3 column neighborhood around a chunk
+    /// (6 face halos plus the 12 edge strips), so all nine columns must be lit
+    /// before a mesh may be baked.
+    fn has_light_neighborhood(&self, cx: i32, cz: i32) -> bool {
+        (-1..=1)
+            .all(|dx| (-1..=1).all(|dz| self.has_column_light(cx + dx, cz + dz)))
+    }
+
+    /// Sky light at a world position, used for the padded snapshot's 12 edge
+    /// strips.
+    ///
+    /// Missing grids fall back to full sky light. That fallback is only
+    /// reachable for direct `build_padded_chunk` callers (headless edit tests)
+    /// before light is seeded: the streaming path refuses to mesh until the 3x3
+    /// light neighborhood is ready.
+    pub fn light_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+            return 0;
+        }
+        if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+            return light::MAX_SKY_LIGHT;
+        }
+        let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+        self.light_grids
+            .get(&cpos)
+            .map_or(light::MAX_SKY_LIGHT, |grid| grid.get(lx, ly, lz))
+    }
+
+    /// Compute sky light for the inclusive chunk-column region with the same
+    /// out-of-range semantics as `get_block`.
+    fn compute_light_region(
+        &self,
+        cx0: i32,
+        cx1: i32,
+        cz0: i32,
+        cz1: i32,
+    ) -> FxHashMap<ChunkPos, LightGrid> {
+        let chunks = &self.chunks;
+        light::compute_region_light(
+            |wx, wy, wz| {
+                if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+                    return BlockId::Bedrock;
+                }
+                if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+                    return BlockId::Air;
+                }
+                let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+                chunks
+                    .get(&cpos)
+                    .map_or(BlockId::Air, |chunk| chunk.get(lx, ly, lz))
+            },
+            cx0,
+            cx1,
+            cz0,
+            cz1,
+        )
+    }
+
+    /// Store freshly computed grids, dirtying already-meshed chunks whose light
+    /// actually changed, then re-evaluate mesh readiness for the neighborhood.
+    fn apply_light_region(
+        &mut self,
+        grids: FxHashMap<ChunkPos, LightGrid>,
+        cx0: i32,
+        cx1: i32,
+        cz0: i32,
+        cz1: i32,
+    ) {
+        let mut changed_any = false;
+        for (pos, grid) in grids {
+            // A 3x3 region around a completing column also contains columns
+            // that are still loading; their absent chunks read as air and
+            // would produce an over-lit grid. Do not store a grid until the
+            // column itself is complete -- its own completion recomputes it.
+            if !self.column_is_complete(pos.x, pos.z) {
+                continue;
+            }
+            let changed = match self.light_grids.get(&pos) {
+                Some(existing) => light::grids_differ(existing, &grid),
+                None => true,
+            };
+            if !changed {
+                continue;
+            }
+            self.light_grids.insert(pos, grid);
+            changed_any = true;
+            if self.meshed_chunks.contains(&pos) || self.pending_mesh.contains(&pos) {
+                // Dirty-on-light-diff: any mesh baked from the old grid (or an
+                // in-flight job carrying one) is stale. Cancelling the pending
+                // job makes the drain discard its late result, exactly like the
+                // synchronous edit path does.
+                self.pending_mesh.remove(&pos);
+                self.dirty_mesh_queue.insert(pos);
+            }
+        }
+        if changed_any {
+            // Light-readiness can flip for chunks in columns adjacent to the
+            // freshly lit region.
+            self.queue_light_ready_chunks(cx0 - 1, cx1 + 1, cz0 - 1, cz1 + 1);
+        }
+    }
+
+    /// Queue resident, unmeshed chunks whose face and light neighborhoods are
+    /// both ready. The 3x3 gate is the mesh-readiness contract from D045.
+    fn queue_light_ready_chunks(&mut self, cx0: i32, cx1: i32, cz0: i32, cz1: i32) {
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                if !self.has_light_neighborhood(cx, cz) {
+                    continue;
+                }
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    if self.chunks.contains_key(&pos)
+                        && !self.meshed_chunks.contains(&pos)
+                        && !self.pending_mesh.contains(&pos)
+                        && self.has_all_face_neighbors(pos)
+                    {
+                        self.dirty_mesh_queue.insert(pos);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Column-ready trigger: once a column is complete it gains sky light, and
+    /// the surrounding 3x3 columns are recomputed so lateral bleed into already
+    /// loaded neighbours is captured. Runs on the generation/edit cadence only.
+    fn propagate_light_for_completed_column(&mut self, cx: i32, cz: i32) {
+        if self.has_column_light(cx, cz) || !self.column_is_complete(cx, cz) {
+            return;
+        }
+        let grids = self.compute_light_region(cx - 1, cx + 1, cz - 1, cz + 1);
+        self.apply_light_region(grids, cx - 1, cx + 1, cz - 1, cz + 1);
+    }
+
+    /// Test seam: recompute sky light for every resident complete column without
+    /// going through rayon streaming. Computes one region spanning all complete
+    /// columns plus a one-chunk margin, so every column's light is independent
+    /// of the region boundary (max lateral attenuation 15 < 32).
+    pub fn recompute_light_for_test(&mut self) {
+        let mut complete: Vec<(i32, i32)> = self
+            .chunks
+            .keys()
+            .map(|pos| (pos.x, pos.z))
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .filter(|&(cx, cz)| self.column_is_complete(cx, cz))
+            .collect();
+        if complete.is_empty() {
+            return;
+        }
+        complete.sort_unstable();
+        let cx0 = complete.iter().map(|c| c.0).min().unwrap() - 1;
+        let cx1 = complete.iter().map(|c| c.0).max().unwrap() + 1;
+        let cz0 = complete.iter().map(|c| c.1).min().unwrap() - 1;
+        let cz1 = complete.iter().map(|c| c.1).max().unwrap() + 1;
+        let grids = self.compute_light_region(cx0, cx1, cz0, cz1);
+        self.apply_light_region(grids, cx0, cx1, cz0, cz1);
+    }
+
     pub fn build_padded_chunk(&self, pos: ChunkPos) -> Option<PaddedChunk> {
         let center = self.chunks.get(&pos)?;
         if !self.has_all_face_neighbors(pos) {
@@ -250,6 +435,76 @@ impl WorldManager {
             }
         }
 
+        // Sky light mirrors the voxel halo geometry exactly: the center grid
+        // fills the inner 32^3, the 6 face halos come from the neighbour chunk
+        // grids, and the 12 edge strips use the world-space light accessor.
+        if let Some(grid) = self.light_grids.get(&pos) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set_light(lx + 1, ly + 1, lz + 1, grid.get(lx, ly, lz));
+                    }
+                }
+            }
+        }
+
+        // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
+        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
+                }
+            }
+        }
+        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
+                }
+            }
+        }
+
+        // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
+        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
+                }
+            }
+        }
+        if pos.y > MIN_CHUNK_Y {
+            if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
+                    }
+                }
+            }
+        } else {
+            // Below MIN_CHUNK_Y is opaque bedrock, so no sky light reaches it.
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, 0, lz + 1, 0);
+                }
+            }
+        }
+
+        // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
+        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
+                }
+            }
+        }
+        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
+                }
+            }
+        }
+
         // Populate 12 edge strips for seamless corner AO across chunk borders
         let base_wx = pos.x * cs as i32;
         let base_wy = pos.y * cs as i32;
@@ -278,6 +533,35 @@ impl WorldManager {
                     base_wz + pz as i32 - 1,
                 );
                 padded.set(i, py, pz, b);
+            }
+        }
+
+        // ... and the matching light edge strips, through the grid map. Missing
+        // grids fall back to full light (see `light_at_world`).
+        for i in 0..=cs + 1 {
+            for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+                let l = self.light_at_world(
+                    base_wx + px as i32 - 1,
+                    base_wy + py as i32 - 1,
+                    base_wz + i as i32 - 1,
+                );
+                padded.set_light(px, py, i, l);
+            }
+            for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+                let l = self.light_at_world(
+                    base_wx + px as i32 - 1,
+                    base_wy + i as i32 - 1,
+                    base_wz + pz as i32 - 1,
+                );
+                padded.set_light(px, i, pz, l);
+            }
+            for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+                let l = self.light_at_world(
+                    base_wx + i as i32 - 1,
+                    base_wy + py as i32 - 1,
+                    base_wz + pz as i32 - 1,
+                );
+                padded.set_light(i, py, pz, l);
             }
         }
 
@@ -359,6 +643,11 @@ impl WorldManager {
             }
             self.chunks.insert(pos, chunk);
 
+            // Column-ready trigger: this chunk may be the last piece of a full
+            // 192-block column. Light runs on the generation cadence, never
+            // per frame.
+            self.propagate_light_for_completed_column(pos.x, pos.z);
+
             // Check if this chunk and its 6 neighbors can now be queued for meshing
             for (dx, dy, dz) in [
                 (0, 0, 0),
@@ -376,6 +665,7 @@ impl WorldManager {
                     && !self.pending_mesh.contains(&npos)
                     && self.chunks.contains_key(&npos)
                     && self.has_all_face_neighbors(npos)
+                    && self.has_light_neighborhood(npos.x, npos.z)
                 {
                     self.dirty_mesh_queue.insert(npos);
                 }
@@ -410,6 +700,18 @@ impl WorldManager {
                     unloaded.push(pos);
                 }
                 keep
+            });
+
+            // Light is derived data: drop it with the chunks and let the
+            // column-ready trigger recompute on reload. Residual staleness in a
+            // still-loaded neighbour (its light was fed by an unloaded column)
+            // is invisible: unloads happen beyond render_distance + 2 while
+            // meshes only exist within render_distance, so every meshed chunk
+            // keeps its full halo ring resident.
+            self.light_grids.retain(|&pos, _| {
+                let dx = pos.x - center_chunk.x;
+                let dz = pos.z - center_chunk.z;
+                dx * dx + dz * dz <= unload_r2
             });
         }
 
@@ -458,6 +760,9 @@ impl WorldManager {
             .iter()
             .copied()
             .filter(|pos| {
+                if !self.has_light_neighborhood(pos.x, pos.z) {
+                    return false;
+                }
                 let dx = pos.x - center_chunk.x;
                 let dz = pos.z - center_chunk.z;
                 dx * dx + dz * dz <= rd2
@@ -611,10 +916,144 @@ mod tests {
                 }
             }
         }
+        mgr.recompute_light_for_test();
         mgr.queue_all_loaded_for_test();
         assert!(mgr.dirty_mesh_queue_len() > 25);
 
         mgr.update_streaming(ChunkPos::new(0, 0, 0));
         assert_eq!(mgr.dirty_mesh_queue_len(), 0);
+    }
+
+    /// Insert every chunk of the 3x3 column neighborhood around (0,0), all as
+    /// `block` except the optional stone chunk at the origin column's y = 0.
+    fn insert_3x3_columns(mgr: &mut WorldManager, stone_center: bool, skip: Option<ChunkPos>) {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    if skip == Some(pos) {
+                        continue;
+                    }
+                    let block = if stone_center && dx == 0 && dz == 0 && cy == 0 {
+                        BlockId::Stone
+                    } else {
+                        BlockId::Air
+                    };
+                    mgr.insert_chunk_for_test(pos, Chunk::new_uniform(block));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mesh_dispatch_waits_for_full_light_neighborhood() {
+        let mut mgr = WorldManager::new(4);
+        // Full 3x3 column ring around the stone chunk, but column (1,0) is
+        // missing its top chunk, so it can never become light-ready yet.
+        insert_3x3_columns(
+            &mut mgr,
+            true,
+            Some(ChunkPos::new(1, MAX_CHUNK_Y, 0)),
+        );
+        mgr.recompute_light_for_test();
+        assert!(!mgr.has_column_light(1, 0));
+
+        mgr.queue_all_loaded_for_test();
+        let center = ChunkPos::new(0, 0, 0);
+        assert!(mgr.dirty_mesh_queue.contains(&center));
+
+        // Not dispatched while one halo column has no light.
+        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        assert!(
+            mgr.dirty_mesh_queue.contains(&center),
+            "a chunk with an unlit halo column must stay queued"
+        );
+        assert!(!mgr.pending_mesh.contains(&center));
+
+        // Completing the missing column lights it; dispatch may proceed.
+        mgr.insert_chunk_for_test(
+            ChunkPos::new(1, MAX_CHUNK_Y, 0),
+            Chunk::new_uniform(BlockId::Air),
+        );
+        mgr.recompute_light_for_test();
+        assert!(mgr.has_column_light(1, 0));
+        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        assert!(!mgr.dirty_mesh_queue.contains(&center));
+        assert!(mgr.pending_mesh.contains(&center));
+    }
+
+    #[test]
+    fn test_light_diff_requeues_already_meshed_chunk() {
+        let mut mgr = WorldManager::new(4);
+        insert_3x3_columns(&mut mgr, false, None);
+        mgr.recompute_light_for_test();
+
+        let center = ChunkPos::new(0, 0, 0);
+        assert_eq!(mgr.light_at_world(5, 5, 5), light::MAX_SKY_LIGHT);
+        mgr.meshed_chunks.insert(center);
+        mgr.dirty_mesh_queue.remove(&center);
+
+        // A solid roof on the meshed chunk's own column shuts its sky shaft;
+        // light now only bleeds in laterally, so the meshed chunk's grid changes
+        // and its baked mesh is stale.
+        mgr.insert_chunk_for_test(
+            ChunkPos::new(0, MAX_CHUNK_Y, 0),
+            Chunk::new_uniform(BlockId::Stone),
+        );
+        mgr.recompute_light_for_test();
+
+        assert!(mgr.light_at_world(5, 5, 5) < light::MAX_SKY_LIGHT);
+        assert!(
+            mgr.dirty_mesh_queue.contains(&center),
+            "a light change in a meshed chunk must re-queue it"
+        );
+    }
+
+    #[test]
+    fn test_loaded_edge_padded_halo_light_matches_grids() {
+        // Unloads happen beyond render_distance + 2 while meshes exist only
+        // within render_distance, so a rendered chunk always keeps its full
+        // 3x3 halo ring resident; residual staleness fed by an unloaded column
+        // therefore cannot reach a visible mesh.
+        let mut mgr = WorldManager::new(4);
+        insert_3x3_columns(&mut mgr, true, None);
+        mgr.recompute_light_for_test();
+
+        let center = ChunkPos::new(0, 0, 0);
+        let padded = mgr.build_padded_chunk(center).expect("halo is resident");
+
+        // Inner volume comes from the center chunk's own grid (stone chunk =
+        // dark). The +X face halo comes from the air column at (1,0).
+        assert_eq!(padded.light_at(1, 1, 1), 0);
+        assert_eq!(padded.light_at(33, 1, 1), light::MAX_SKY_LIGHT);
+        // +Y halo is open sky above the loaded world.
+        assert_eq!(padded.light_at(17, 33, 17), light::MAX_SKY_LIGHT);
+
+        // The 12 edge strips read the same world-space values as the manager
+        // accessor, including the chunk-border seam cells.
+        let cs = CHUNK_SIZE as i32;
+        for &(px, py, pz) in &[
+            (0usize, 0usize, 17usize),
+            (cs as usize + 1, 0, 17),
+            (17, 0, 0),
+            (17, cs as usize + 1, 0),
+            (0, 17, cs as usize + 1),
+            (cs as usize + 1, 17, cs as usize + 1),
+        ] {
+            let wx = center.x * cs + px as i32 - 1;
+            let wy = center.y * cs + py as i32 - 1;
+            let wz = center.z * cs + pz as i32 - 1;
+            assert_eq!(
+                padded.light_at(px, py, pz),
+                mgr.light_at_world(wx, wy, wz),
+                "edge strip light at padded ({px},{py},{pz})"
+            );
+        }
+
+        // Missing grids default to full sky light; outside the world the
+        // physically meaningful values apply.
+        assert_eq!(mgr.light_at_world(10_000, 10, 10_000), light::MAX_SKY_LIGHT);
+        assert_eq!(mgr.light_at_world(0, (MAX_CHUNK_Y + 1) * cs, 0), 15);
+        assert_eq!(mgr.light_at_world(0, MIN_CHUNK_Y * cs - 1, 0), 0);
     }
 }
