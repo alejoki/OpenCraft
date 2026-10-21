@@ -222,8 +222,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Why it matters: The sky must visibly live through a full day — a wheeling cycle sells the world while the moonlit floor keeps night readable before torches exist.
 - Source: M005 / S02 day cycle and S03 sky pass
 - Primary owning slice: M005/S02
-- Supporting slices: M005/S03, M005/S07
-- Validation: cargo test --locked --lib -- world::daycycle (incl. NIGHTFALL/pre-dawn keyframe pins and dusk/midnight/dawn sRGB probe); cargo test --locked --lib -- render::sky (incl. crescent MOON_VERTEX_COUNT geometry pins); cargo test --locked --bin opencraft
+- Supporting slices: M005/S03, M005/S07, M005/S08
+- Validation: cargo test --locked --lib -- world::daycycle (incl. NIGHTFALL/pre-dawn keyframe pins and dusk/midnight/dawn sRGB probe; S08 exhaustive step-1 sun-brightness-zero star-visibility sweep + boundary-tick pins + STAR_ANGULAR_SIZE ratio pins); cargo test --locked --lib -- render::sky (incl. crescent MOON_VERTEX_COUNT geometry pins and S08 kind-gated circular alpha mask WGSL pins); cargo test --locked --bin opencraft
 
 ### R023 — Honest game-time clock: it advances only while Playing, freezes in every menu and pause, wraps at cycle end, and persists per world as a SAVE_VERSION 3 time-of-day field with v1/v2 migration to default noon, so Save-and-Quit resumes the exact time of day
 - Class: continuity
