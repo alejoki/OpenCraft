@@ -149,6 +149,7 @@ fn vsync_interval(window: &Window) -> Option<Duration> {
 fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError> {
     let data = WorldSaveData {
         seed: session.world.seed(),
+        time_of_day: session.clock.time_of_day,
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -4236,6 +4237,7 @@ mod tests {
     fn sample_save(seed: u32) -> WorldSaveData {
         WorldSaveData {
             seed,
+            time_of_day: opencraft::world::daycycle::DEFAULT_TIME_OF_DAY,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,

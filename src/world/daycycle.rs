@@ -231,7 +231,9 @@ mod tests {
             (0.3..0.4).contains(&MOONLIT_FLOOR),
             "moonlit floor must be roughly one third, got {MOONLIT_FLOOR}"
         );
-        assert!(VISTA_GOLDEN_HOUR > 0 && VISTA_GOLDEN_HOUR < DEFAULT_TIME_OF_DAY);
+        const {
+            assert!(VISTA_GOLDEN_HOUR > 0 && VISTA_GOLDEN_HOUR < DEFAULT_TIME_OF_DAY)
+        };
     }
 
     #[test]

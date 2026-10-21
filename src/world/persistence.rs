@@ -8,12 +8,15 @@ use rustc_hash::FxHashMap;
 use crate::player::inventory::{Hotbar, ItemStack};
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
+use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
 
 pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 2;
+pub const SAVE_VERSION: u32 = 3;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
+/// First save version that carries the time-of-day `u32`.
+pub const TIME_OF_DAY_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CliConfig {
@@ -78,6 +81,11 @@ pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSaveData {
     pub seed: u32,
+    /// Game time of day (0 = dawn, 6,000 = noon, 12,000 = dusk, 18,000 =
+    /// midnight), persisted per world rather than derived from the wall
+    /// clock. World state, so it sits next to `seed` rather than in
+    /// `player`.
+    pub time_of_day: u32,
     pub player: SavedPlayerState,
     pub chunk_edits: ChunkEditMap,
 }
@@ -104,7 +112,10 @@ impl fmt::Display for PersistenceError {
             PersistenceError::Io(e) => write!(f, "could not read or write the save file: {e}"),
             PersistenceError::InvalidMagic => write!(f, "not a valid save file (bad magic)"),
             PersistenceError::UnsupportedVersion(v) => {
-                write!(f, "unsupported save version {v} (this build reads version {SAVE_VERSION})")
+                write!(
+                    f,
+                    "unsupported save version {v} (this build reads version {SAVE_VERSION})"
+                )
             }
             PersistenceError::InvalidBlockId(b) => write!(f, "unknown block id {b} in save"),
             PersistenceError::InvalidLocalIndex(i) => {
@@ -147,6 +158,10 @@ pub fn save_world_to_bytes(
             }
         }
     }
+
+    // v3 time-of-day header: one u32 immediately after the hotbar block and
+    // before the variable-length chunk section (absolute offset 63).
+    out.extend_from_slice(&data.time_of_day.clamp(0, DAY_TICKS).to_le_bytes());
 
     let mut non_empty_chunks: Vec<(&ChunkPos, &FxHashMap<u16, BlockId>)> = data
         .chunk_edits
@@ -244,6 +259,16 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         Hotbar::empty()
     };
 
+    // v3 added the time-of-day u32 between the hotbar and chunk_count.
+    // v1/v2 saves migrate to noon. A scalar degrades gracefully, so an
+    // out-of-range value clamps instead of failing the whole save (unlike
+    // the strictly validated hotbar). `DAY_TICKS` wraps to dawn.
+    let time_of_day = if version >= TIME_OF_DAY_VERSION {
+        read_u32(&mut cur)?.min(DAY_TICKS - 1)
+    } else {
+        DEFAULT_TIME_OF_DAY
+    };
+
     let chunk_count = read_u32(&mut cur)?;
     if chunk_count > 1_000_000 {
         return Err(PersistenceError::InvalidPlayerState);
@@ -276,6 +301,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
 
     Ok(WorldSaveData {
         seed,
+        time_of_day,
         player: SavedPlayerState {
             position: [px, py, pz],
             yaw,
@@ -369,6 +395,7 @@ mod tests {
 
         let data = WorldSaveData {
             seed: 424242,
+            time_of_day: 4321,
             player: SavedPlayerState {
                 position: [-12.5, 64.25, 108.0],
                 yaw: 1.25,
@@ -407,6 +434,7 @@ mod tests {
 
         let data = WorldSaveData {
             seed: 1337,
+            time_of_day: 12345,
             player: SavedPlayerState {
                 position: [1.0, 2.0, 3.0],
                 yaw: 0.0,
@@ -419,7 +447,7 @@ mod tests {
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, 2);
+        assert_eq!(SAVE_VERSION, 3);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -447,6 +475,7 @@ mod tests {
         edits.insert(ChunkPos::new(0, 0, 0), c0);
         let data = WorldSaveData {
             seed: 1,
+            time_of_day: DEFAULT_TIME_OF_DAY,
             player: SavedPlayerState {
                 position: [0.0, 50.0, 0.0],
                 yaw: 0.0,
@@ -491,9 +520,10 @@ mod tests {
         ])
     }
 
-    fn sample_v2_data(hotbar: Hotbar) -> WorldSaveData {
+    fn sample_v3_data(hotbar: Hotbar) -> WorldSaveData {
         WorldSaveData {
             seed: 2024,
+            time_of_day: DEFAULT_TIME_OF_DAY,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -510,13 +540,14 @@ mod tests {
     #[test]
     fn test_v2_hotbar_roundtrips_exactly() {
         let hotbar = hotbar_sample();
-        let data = sample_v2_data(hotbar.clone());
+        let data = sample_v3_data(hotbar.clone());
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
 
         // Header layout: 36 bytes through render_distance, then 9 * 3
-        // hotbar bytes, then chunk_count. No edits means 4 more bytes.
-        assert_eq!(bytes.len(), 36 + 27 + 4);
+        // hotbar bytes, then the v3 time u32, then chunk_count. No edits
+        // means 4 more bytes.
+        assert_eq!(bytes.len(), 36 + 27 + 4 + 4);
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
 
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -563,6 +594,10 @@ mod tests {
         let loaded = load_world_from_bytes(&bytes).expect("v1 must migrate, not fail");
 
         assert_eq!(loaded.seed, 777);
+        assert_eq!(
+            loaded.time_of_day, DEFAULT_TIME_OF_DAY,
+            "v1 predates game time and migrates to noon"
+        );
         assert_eq!(loaded.player.position, [-4.5, 70.25, 9.0]);
         assert_eq!(loaded.player.yaw, 1.5);
         assert_eq!(loaded.player.pitch, -0.25);
@@ -579,8 +614,11 @@ mod tests {
         assert_eq!(chunk[&iron_index], BlockId::IronOre);
     }
 
-    /// Byte offset of the first hotbar slot in a v2 save.
+    /// Byte offset of the first hotbar slot in a v2/v3 save.
     const V2_HOTBAR_OFFSET: usize = 36;
+    /// Byte offset of the v3 time-of-day u32 (after magic, version, seed,
+    /// 12 position, 4 yaw, 4 pitch, fly, slot, render_distance, 27 hotbar).
+    const V3_TIME_OFFSET: usize = 63;
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -588,16 +626,90 @@ mod tests {
         bytes[off + 1..off + 3].copy_from_slice(&count.to_le_bytes());
     }
 
+    fn valid_v3_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &sample_v3_data(Hotbar::empty())).unwrap();
+        bytes
+    }
+
+    /// Hand-build a real v2 save: hotbar header present, no time-of-day.
     fn valid_v2_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &sample_v2_data(Hotbar::empty())).unwrap();
+        bytes.extend_from_slice(SAVE_MAGIC);
+        bytes.extend_from_slice(&HOTBAR_HEADER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2024u32.to_le_bytes());
+        for c in [1.0f32, 64.0, -2.0] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0.5f32.to_le_bytes()); // yaw
+        bytes.extend_from_slice(&(-0.25f32).to_le_bytes()); // pitch
+        bytes.push(1); // fly_mode
+        bytes.push(4); // selected_slot
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // render_distance
+        for _ in 0..crate::player::inventory::HOTBAR_SLOTS {
+            bytes.push(0); // empty slot sentinel
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // chunk_count
         bytes
+    }
+
+    #[test]
+    fn test_v2_save_migrates_to_default_time_of_day() {
+        let loaded = load_world_from_bytes(&valid_v2_bytes()).expect("v2 must migrate, not fail");
+        assert_eq!(loaded.player.hotbar, Hotbar::empty());
+        assert_eq!(
+            loaded.time_of_day, DEFAULT_TIME_OF_DAY,
+            "v2 predates game time and migrates to noon"
+        );
+    }
+
+    #[test]
+    fn test_v3_time_of_day_roundtrips_exactly() {
+        let mut data = sample_v3_data(Hotbar::empty());
+        data.time_of_day = 12_345;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+        assert_eq!(
+            &bytes[V3_TIME_OFFSET..V3_TIME_OFFSET + 4],
+            &12_345u32.to_le_bytes(),
+            "time-of-day must sit immediately after the hotbar block"
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+        assert_eq!(loaded.time_of_day, 12_345);
+        assert_eq!(loaded.time_of_day, data.time_of_day);
+    }
+
+    #[test]
+    fn test_v3_out_of_range_time_is_clamped_on_load() {
+        for garbage in [DAY_TICKS, DAY_TICKS + 1, u32::MAX] {
+            let mut bytes = valid_v3_bytes();
+            bytes[V3_TIME_OFFSET..V3_TIME_OFFSET + 4].copy_from_slice(&garbage.to_le_bytes());
+            let loaded = load_world_from_bytes(&bytes).expect("clamp, not error");
+            assert_eq!(
+                loaded.time_of_day,
+                DAY_TICKS - 1,
+                "garbage time {garbage} must clamp into the cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v3_truncated_time_field_is_typed_io_error() {
+        let bytes = valid_v3_bytes();
+        // Two time bytes present, two missing: the u32 read hits EOF.
+        let truncated = &bytes[..V3_TIME_OFFSET + 2];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
     }
 
     #[test]
     fn test_v2_hotbar_rejects_invalid_slots() {
         // Empty sentinel must carry count 0.
-        let mut bytes = valid_v2_bytes();
+        let mut bytes = valid_v3_bytes();
         set_v2_slot(&mut bytes, 0, BlockId::Air as u8, 5);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -605,7 +717,7 @@ mod tests {
         ));
 
         // A non-empty block id may not carry count 0.
-        let mut bytes = valid_v2_bytes();
+        let mut bytes = valid_v3_bytes();
         set_v2_slot(&mut bytes, 0, BlockId::Grass as u8, 0);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -613,7 +725,7 @@ mod tests {
         ));
 
         // Bedrock cannot be carried.
-        let mut bytes = valid_v2_bytes();
+        let mut bytes = valid_v3_bytes();
         set_v2_slot(&mut bytes, 0, BlockId::Bedrock as u8, 1);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -621,7 +733,7 @@ mod tests {
         ));
 
         // Unknown ids surface as InvalidBlockId.
-        let mut bytes = valid_v2_bytes();
+        let mut bytes = valid_v3_bytes();
         set_v2_slot(&mut bytes, 0, 99, 1);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -629,7 +741,7 @@ mod tests {
         ));
 
         // Counts above MAX_STACK_COUNT are invalid.
-        let mut bytes = valid_v2_bytes();
+        let mut bytes = valid_v3_bytes();
         set_v2_slot(&mut bytes, 0, BlockId::CoalOre as u8, MAX_STACK_COUNT + 1);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -638,8 +750,8 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_hotbar_truncated_and_unsupported_version() {
-        let bytes = valid_v2_bytes();
+    fn test_v3_hotbar_truncated_and_unsupported_version() {
+        let bytes = valid_v3_bytes();
         // Cut mid-hotbar (after slot 1's block byte) so the count read hits EOF.
         let truncated = &bytes[..V2_HOTBAR_OFFSET + 4];
         assert!(matches!(
@@ -647,11 +759,11 @@ mod tests {
             Err(PersistenceError::Io(_))
         ));
 
-        let mut future = valid_v2_bytes();
-        future[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let mut future = valid_v3_bytes();
+        future[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert!(matches!(
             load_world_from_bytes(&future),
-            Err(PersistenceError::UnsupportedVersion(3))
+            Err(PersistenceError::UnsupportedVersion(4))
         ));
     }
 

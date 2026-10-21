@@ -13,6 +13,7 @@ use glam::Vec3;
 
 use crate::player::camera::Camera;
 use crate::player::physics::Player;
+use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
 use crate::world::terrain::terrain_height_at_seeded;
@@ -23,6 +24,9 @@ pub struct WorldSession {
     pub world: WorldManager,
     pub player: Player,
     pub camera: Camera,
+    /// The session-owned game clock. Every save/load boundary restores it
+    /// from persisted game time, never from the wall clock.
+    pub clock: GameClock,
     pub save_path: PathBuf,
 }
 
@@ -36,6 +40,7 @@ impl WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(Vec3::new(0.5, spawn_y, 0.5)),
             camera: Camera::new(Vec3::ZERO),
+            clock: GameClock::new(),
             save_path,
         };
         session.sync_camera();
@@ -47,6 +52,7 @@ impl WorldSession {
     /// `selected_slot` clamped to the 9-slot hotbar, and the world rebuilt
     /// with the saved render distance, seed, and chunk edits.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
+        let clock = GameClock::from_time(data.time_of_day);
         let mut player = Player::new(Vec3::from_array(data.player.position));
         player.yaw = data.player.yaw;
         player.pitch = data.player.pitch;
@@ -61,6 +67,7 @@ impl WorldSession {
             ),
             player,
             camera: Camera::new(Vec3::ZERO),
+            clock,
             save_path,
         };
         session.sync_camera();
@@ -94,6 +101,7 @@ mod tests {
     fn make_save(seed: u32) -> WorldSaveData {
         WorldSaveData {
             seed,
+            time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             player: crate::world::persistence::SavedPlayerState {
                 position: [1.5, 20.5, 2.5],
                 yaw: 0.75,
@@ -153,10 +161,7 @@ mod tests {
     fn session_from_save_round_trips_player_state() {
         let data = make_save(31337u32);
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
-        assert_eq!(
-            session.player.position,
-            Vec3::new(1.5, 20.5, 2.5)
-        );
+        assert_eq!(session.player.position, Vec3::new(1.5, 20.5, 2.5));
         assert_eq!(session.player.yaw, 0.75);
         assert_eq!(session.player.pitch, -0.15);
         assert!(!session.player.fly_mode);
@@ -199,6 +204,7 @@ mod tests {
 
         let data = WorldSaveData {
             seed,
+            time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             player: SavedPlayerState {
                 position: [0.0, 8.0, 0.0],
                 yaw: 0.0,
@@ -254,6 +260,23 @@ mod tests {
         assert_eq!(session.camera.position, session.player.eye_position());
         assert_eq!(session.camera.yaw, session.player.yaw);
         assert_eq!(session.camera.pitch, session.player.pitch);
+    }
+
+    #[test]
+    fn new_session_starts_at_default_time_of_day() {
+        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        assert_eq!(
+            session.clock.time_of_day,
+            crate::world::daycycle::DEFAULT_TIME_OF_DAY
+        );
+    }
+
+    #[test]
+    fn session_from_save_restores_a_non_default_time_of_day_exactly() {
+        let mut data = make_save(77u32);
+        data.time_of_day = 12_345;
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(session.clock.time_of_day, 12_345);
     }
 
     #[test]

@@ -30,8 +30,7 @@ use crate::world::catalog::{
     self, CatalogRow, PendingDelete, RowProblem, RowStatus, WorldNameError,
 };
 use crate::world::persistence::{
-    load_world_from_path, save_world_to_path, PersistenceError, WorldSaveData,
-    DEFAULT_SAVE_PATH,
+    load_world_from_path, save_world_to_path, PersistenceError, WorldSaveData, DEFAULT_SAVE_PATH,
 };
 
 /// Saves directory derived from the existing default save path
@@ -199,12 +198,7 @@ fn build_row(path: &Path) -> CatalogRow {
         },
         // Invalid stems degrade, not disappear: keep the raw stem so the
         // row can still be displayed and explicitly deleted.
-        Err(_) => CatalogRow::corrupt(
-            stem,
-            file_name,
-            modified_secs,
-            RowProblem::InvalidName,
-        ),
+        Err(_) => CatalogRow::corrupt(stem, file_name, modified_secs, RowProblem::InvalidName),
     }
 }
 
@@ -299,14 +293,11 @@ impl WorldCatalogFs {
     /// surfaced with the world name for display.
     pub fn load_row(&self, row: &CatalogRow) -> Result<WorldSaveData, CatalogLoadError> {
         match row.status {
-            RowStatus::Loadable => {
-                load_world_from_path(&self.saves_dir.join(&row.file_name)).map_err(|source| {
-                    CatalogLoadError::Load {
-                        name: row.name.clone(),
-                        source,
-                    }
-                })
-            }
+            RowStatus::Loadable => load_world_from_path(&self.saves_dir.join(&row.file_name))
+                .map_err(|source| CatalogLoadError::Load {
+                    name: row.name.clone(),
+                    source,
+                }),
             RowStatus::Corrupt(problem) => Err(CatalogLoadError::Corrupt {
                 name: row.name.clone(),
                 problem,
@@ -325,7 +316,9 @@ impl WorldCatalogFs {
     /// — the world save is gone — is already true.
     pub fn delete_confirmed(&self, pending: &PendingDelete) -> Result<(), CatalogDeleteError> {
         if !is_safe_world_file_name(&pending.file_name) {
-            return Err(CatalogDeleteError::UnsafeFileName(pending.file_name.clone()));
+            return Err(CatalogDeleteError::UnsafeFileName(
+                pending.file_name.clone(),
+            ));
         }
         let path = self.saves_dir.join(&pending.file_name);
         match fs::remove_file(&path) {
@@ -354,6 +347,7 @@ mod tests {
         edits.insert(ChunkPos::new(0, 0, 0), chunk);
         WorldSaveData {
             seed,
+            time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -448,7 +442,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
 
-        catalog_fs.save_world("real", &sample_save(1)).expect("save");
+        catalog_fs
+            .save_world("real", &sample_save(1))
+            .expect("save");
         fs::write(dir.path().join("notes.txt"), b"not a save").expect("write txt");
         // Leftover from an interrupted atomic rename must not be listed.
         fs::write(dir.path().join("leftover.mcvx.tmp"), b"garbage").expect("write tmp");
@@ -481,7 +477,10 @@ mod tests {
         assert_eq!(rows.len(), 4);
 
         let badmagic = row_for(&rows, "badmagic");
-        assert_eq!(badmagic.status, RowStatus::Corrupt(RowProblem::InvalidFormat));
+        assert_eq!(
+            badmagic.status,
+            RowStatus::Corrupt(RowProblem::InvalidFormat)
+        );
         let short = row_for(&rows, "short");
         assert_eq!(short.status, RowStatus::Corrupt(RowProblem::InvalidFormat));
         let oldver = row_for(&rows, "oldver");
@@ -522,7 +521,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
-        catalog_fs.save_world("secret", &sample_save(3)).expect("save");
+        catalog_fs
+            .save_world("secret", &sample_save(3))
+            .expect("save");
 
         use std::os::unix::fs::PermissionsExt;
         let path = dir.path().join("secret.mcvx");
@@ -540,7 +541,9 @@ mod tests {
     fn vanished_files_surface_as_structured_load_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
-        catalog_fs.save_world("ghost", &sample_save(5)).expect("save");
+        catalog_fs
+            .save_world("ghost", &sample_save(5))
+            .expect("save");
 
         let rows = catalog_fs.list_rows();
         let ghost = row_for(&rows, "ghost").clone();
@@ -565,8 +568,12 @@ mod tests {
     fn delete_requires_pure_confirmation_and_only_removes_the_named_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
-        catalog_fs.save_world("doomed", &sample_save(1)).expect("save");
-        catalog_fs.save_world("spared", &sample_save(2)).expect("save");
+        catalog_fs
+            .save_world("doomed", &sample_save(1))
+            .expect("save");
+        catalog_fs
+            .save_world("spared", &sample_save(2))
+            .expect("save");
 
         let mut confirm = DeleteConfirmation::new();
         let doomed_row = row_for(&catalog_fs.list_rows(), "doomed").clone();
@@ -600,7 +607,9 @@ mod tests {
     fn delete_refuses_unsafe_and_non_world_file_names() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
-        catalog_fs.save_world("real", &sample_save(1)).expect("save");
+        catalog_fs
+            .save_world("real", &sample_save(1))
+            .expect("save");
         fs::write(dir.path().join("notes.txt"), b"keep me").expect("write txt");
 
         for bad in ["../escape.mcvx", "notes.txt", "sub/dir.mcvx", "..", ""] {
