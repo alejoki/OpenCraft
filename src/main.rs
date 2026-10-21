@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glam::{IVec3, Vec3};
 use winit::application::ApplicationHandler;
@@ -99,20 +99,40 @@ fn set_cursor_grab(window: &winit::window::Window, grab: bool) {
     }
 }
 
-/// Apply the vsync setting to the surface's present mode and reconfigure
-/// (the same set-present_mode-then-configure mechanism the resize path
-/// uses; `ctx.config` is pub). `Fifo` (blocking, always supported) when
-/// vsync is on; uncapped `Immediate` when off. NOTE: on Wayland the
-/// compositor may not honor `Immediate` — presenting then degrades to the
-/// compositor's schedule (an accepted visual no-op per plan; do not fight
-/// the compositor).
+/// Apply the vsync setting to the surface's present mode and reconfigure.
+/// Mode selection is capability-checked inside
+/// [`RenderContext::set_vsync`]: vsync prefers `Mailbox` (v-synchronized but
+/// non-blocking) with `Fifo` as the always-supported fallback, and no-vsync
+/// prefers uncapped `Immediate`. The render loop pairs a vsync-on Mailbox
+/// surface with the refresh-rate limiter in `about_to_wait`.
+///
+/// NOTE: on Wayland the compositor may not honor `Immediate` — presenting
+/// then degrades to the compositor's schedule (an accepted visual no-op per
+/// plan; do not fight the compositor).
 fn apply_vsync(ctx: &mut RenderContext, vsync: bool) {
-    ctx.config.present_mode = if vsync {
-        wgpu::PresentMode::Fifo
-    } else {
-        wgpu::PresentMode::Immediate
-    };
-    ctx.surface.configure(&ctx.device, &ctx.config);
+    ctx.set_vsync(vsync);
+}
+
+/// Frame period for a monitor refresh expressed in millihertz (the unit
+/// winit reports). Returns `None` for an implausible or missing rate rather
+/// than scheduling a bogus wakeup.
+fn refresh_interval(refresh_millihertz: u32) -> Option<Duration> {
+    if !(1_000..=1_000_000).contains(&refresh_millihertz) {
+        return None;
+    }
+    // 1 Hz = 1_000 mHz, so one period is 1e12 / mHz nanoseconds.
+    Some(Duration::from_nanos(
+        1_000_000_000_000 / u64::from(refresh_millihertz),
+    ))
+}
+
+/// The display refresh period for the window's current monitor, if the
+/// platform reports a usable rate. Used only while vsync is enabled.
+fn vsync_interval(window: &Window) -> Option<Duration> {
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .and_then(refresh_interval)
 }
 
 /// Save the active session's world to the session's own save path
@@ -2441,10 +2461,38 @@ impl ApplicationHandler for GameApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        // Vsync on: Mailbox presents at vblank but does not block the render
+        // thread, so pace the loop to the monitor refresh explicitly. This
+        // keeps rendering at the display rate (instead of spinning uncapped)
+        // and avoids the half-refresh stall a blocking Fifo surface can hit
+        // on compositors that hold fullscreen scanout buffers for an extra
+        // vblank. `WaitUntil` leaves the loop idle between deadlines while
+        // still waking immediately for input events.
+        if self.settings.vsync {
+            if let Some(interval) = vsync_interval(window) {
+                let deadline = self.last_frame + interval;
+                let now = Instant::now();
+                if now >= deadline {
+                    window.request_redraw();
+                    // `RedrawRequested` updates `last_frame`; wake once more
+                    // after the next period in case the request is delayed.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline + interval));
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+                return;
+            }
+            // Unknown refresh rate: fall back to the old uncapped polling
+            // loop. A Fifo fallback still throttles at present time.
         }
+
+        event_loop.set_control_flow(ControlFlow::Poll);
+        window.request_redraw();
     }
 }
 
@@ -4255,6 +4303,27 @@ mod tests {
         );
         assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
         assert!(!dir.path().parent().unwrap().join("escape.mcvx").exists());
+    }
+
+    #[test]
+    fn refresh_interval_matches_common_display_rates() {
+        assert_eq!(
+            refresh_interval(60_000),
+            Some(Duration::from_nanos(16_666_666)),
+            "60 Hz is one frame every ~16.67 ms"
+        );
+        assert_eq!(
+            refresh_interval(144_000),
+            Some(Duration::from_nanos(6_944_444)),
+            "144 Hz is one frame every ~6.94 ms"
+        );
+    }
+
+    #[test]
+    fn refresh_interval_rejects_missing_or_implausible_rates() {
+        assert_eq!(refresh_interval(0), None);
+        assert_eq!(refresh_interval(999), None, "below 1 Hz");
+        assert_eq!(refresh_interval(1_000_001), None, "above 1000 Hz");
     }
 
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
