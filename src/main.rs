@@ -20,7 +20,7 @@ use opencraft::player::physics::InputState;
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
-use opencraft::render::pipeline::{UiPass, VoxelRenderer};
+use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
@@ -46,6 +46,7 @@ use opencraft::ui::{
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
+use opencraft::world::daycycle;
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
@@ -276,6 +277,29 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
         lines.push(message.text.clone());
     }
     lines.join("\n")
+}
+
+/// Render-side sky inputs from a pure day-cycle palette.
+///
+/// Session frames use the live clock's palette; vista frames use the pinned
+/// [`daycycle::VISTA_GOLDEN_HOUR`] palette and never derive it from the world
+/// clock or `vista_epoch` (that only drives camera drift).
+fn sky_params(palette: daycycle::SkyPalette) -> SkyParams {
+    SkyParams {
+        day_factor: palette.day_factor,
+        fog_color: [
+            palette.fog_color[0],
+            palette.fog_color[1],
+            palette.fog_color[2],
+            1.0,
+        ],
+        clear_color: wgpu::Color {
+            r: palette.sky_color[0] as f64,
+            g: palette.sky_color[1] as f64,
+            b: palette.sky_color[2] as f64,
+            a: 1.0,
+        },
+    }
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -2326,6 +2350,9 @@ impl ApplicationHandler for GameApp {
                     None
                 };
                 let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
+                    // Vista sky is pinned at golden hour: never the world clock
+                    // and never `vista_epoch` (that only drifts the camera).
+                    let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.vista_store,
@@ -2334,9 +2361,13 @@ impl ApplicationHandler for GameApp {
                         None,
                         self.session.player.selected_slot,
                         false,
+                        sky_params(palette),
                         ui_pass,
                     )
                 } else {
+                    // Per-frame palette from the live session clock (pure math,
+                    // cheap — same rationale as the per-frame vista camera).
+                    let palette = daycycle::sky_palette(self.session.clock.time_of_day);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
@@ -2345,6 +2376,7 @@ impl ApplicationHandler for GameApp {
                         target_block,
                         self.session.player.selected_slot,
                         playing,
+                        sky_params(palette),
                         ui_pass,
                     )
                 };

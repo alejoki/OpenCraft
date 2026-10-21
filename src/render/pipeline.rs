@@ -21,6 +21,24 @@ pub struct CameraUniform {
     pub fog_start_end: [f32; 4],
 }
 
+/// Per-frame sky inputs for the world pass, derived from
+/// [`crate::world::daycycle::sky_palette`].
+///
+/// Grouped into one type so `render_frame`'s long signature grows by a single
+/// parameter rather than three. The day factor rides in the otherwise unused
+/// `CameraUniform::fog_start_end.z` slot, so the 112-byte uniform layout and the
+/// WGSL struct stay untouched.
+#[derive(Copy, Clone, Debug)]
+pub struct SkyParams {
+    /// Multiplier applied to terrain light: 1.0 at noon down to the moonlit
+    /// floor at midnight.
+    pub day_factor: f32,
+    /// Linear RGBA fog color the terrain fades into.
+    pub fog_color: [f32; 4],
+    /// Background clear color for the world pass.
+    pub clear_color: wgpu::Color,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct OverlayVertex {
@@ -177,7 +195,11 @@ fn vs_main(
     out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tex_layer = tex_layer;
-    out.light = face_sun_factor(face_dir) * ao_factor * light_factor;
+    // Day factor rides in the unused fog_start_end.z slot: keeps CameraUniform
+    // at seven vec4s while still dimming lit terrain at night. Cave vertices
+    // stay dark regardless because their light_factor is already ~0.
+    let day_factor = camera.fog_start_end.z;
+    out.light = face_sun_factor(face_dir) * ao_factor * light_factor * day_factor;
     out.cam_dist = distance(world_pos, camera.camera_pos.xyz);
     return out;
 }
@@ -392,7 +414,8 @@ impl VoxelRenderer {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0; 4],
             fog_color: [0.53, 0.76, 0.96, 1.0],
-            fog_start_end: [300.0, 512.0, 0.0, 0.0],
+            // z is the day factor: full brightness before the first frame.
+            fog_start_end: [300.0, 512.0, 1.0, 0.0],
         };
 
         let camera_buffer = ctx
@@ -615,10 +638,11 @@ impl VoxelRenderer {
         upload_block_layers(&self.block_texture, queue, layers);
     }
 
-    // 9 args: the existing world-pass parameters plus the T01 `ui_pass`
-    // hook and the T02 `show_overlays` gate. Kept flat rather than grouped
-    // into a struct to avoid churn at the single call site in src/main.rs;
-    // this is the frame-draw entry point, not a general-purpose API.
+    // 10 args: the existing world-pass parameters plus the T01 `ui_pass`
+    // hook, the T02 `show_overlays` gate, and the S02-T03 grouped `sky`
+    // inputs. Kept flat rather than grouped further to avoid churn at the
+    // single call site in src/main.rs; this is the frame-draw entry point,
+    // not a general-purpose API.
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
@@ -629,6 +653,7 @@ impl VoxelRenderer {
         target_block: Option<IVec3>,
         selected_slot: usize,
         show_overlays: bool,
+        sky: SkyParams,
         ui_pass: Option<&dyn UiPass>,
     ) -> Result<usize, wgpu::SurfaceError> {
         let output = ctx.surface.get_current_texture()?;
@@ -644,8 +669,8 @@ impl VoxelRenderer {
         let cam_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 1.0],
-            fog_color: [0.53, 0.76, 0.96, 1.0],
-            fog_start_end: [max_dist * 0.65, max_dist, 0.0, 0.0],
+            fog_color: sky.fog_color,
+            fog_start_end: [max_dist * 0.65, max_dist, sky.day_factor, 0.0],
         };
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
@@ -674,12 +699,7 @@ impl VoxelRenderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.53,
-                            g: 0.76,
-                            b: 0.96,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(sky.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -768,6 +788,34 @@ impl VoxelRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_uniform_stays_seven_vec4s() {
+        // WGSL uniform members must be 16-byte aligned, and the day factor
+        // rides in the unused `fog_start_end.z` slot precisely so this stays
+        // true. The struct is one mat4x4 (4 vec4s) plus camera_pos, fog_color
+        // and fog_start_end (3 vec4s) = 7 vec4s = 112 bytes. Any new field
+        // here would change the CPU/GPU layout contract.
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 112);
+        assert_eq!(std::mem::size_of::<CameraUniform>() % 16, 0);
+        assert_eq!(
+            std::mem::size_of::<CameraUniform>(),
+            7 * std::mem::size_of::<[f32; 4]>()
+        );
+        assert_eq!(std::mem::offset_of!(CameraUniform, fog_start_end), 96);
+    }
+
+    #[test]
+    fn voxel_shader_applies_day_factor_from_fog_start_end_z() {
+        assert!(
+            VOXEL_SHADER_WGSL.contains("let day_factor = camera.fog_start_end.z;"),
+            "vs_main must read the day factor from the unused fog_start_end.z slot"
+        );
+        assert!(
+            VOXEL_SHADER_WGSL.contains("ao_factor * light_factor * day_factor"),
+            "terrain vertex light must be scaled by the day factor"
+        );
+    }
 
     #[test]
     fn test_overlay_vertices_include_wireframe_crosshair_and_hotbar() {
