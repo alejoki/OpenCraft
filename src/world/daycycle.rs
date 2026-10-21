@@ -8,6 +8,8 @@
 
 use std::time::Instant;
 
+use glam::Vec3;
+
 /// Ticks in one full day/night cycle.
 ///
 /// 24,000 ticks over the 20-real-minute (1,200 s) cycle is 20 ticks per
@@ -23,6 +25,28 @@ pub const DEFAULT_TIME_OF_DAY: u32 = 6_000;
 
 /// Dimmest the world gets at midnight, roughly one third of full daylight.
 pub const MOONLIT_FLOOR: f32 = 0.34;
+
+/// Number of stars in the fixed-seed sky field.
+pub const STAR_COUNT: usize = 600;
+
+/// Angular radius of the sun billboard, in radians (~3.4 degrees).
+pub const SUN_ANGULAR_SIZE: f32 = 0.06;
+
+/// Angular radius of the moon billboard, in radians (~3.4 degrees).
+pub const MOON_ANGULAR_SIZE: f32 = 0.06;
+
+/// Angular radius of a star billboard, in radians (~1.1 degrees).
+pub const STAR_ANGULAR_SIZE: f32 = 0.02;
+
+/// Half-width of the smooth horizon band used to fade a body's brightness.
+///
+/// The sun/moon quad reaches alpha 0 at `direction.y == -HORIZON_FADE_BAND`
+/// and full brightness at `+HORIZON_FADE_BAND`, so the body never pops in or
+/// out exactly at the horizon.
+const HORIZON_FADE_BAND: f32 = 0.08;
+
+/// Fixed seed for [`generate_star_field`]; no wall-clock or global state.
+const STAR_SEED: u32 = 0x5EED_5A17;
 
 /// Pinned time of day for the main-menu vista: a dawn-side golden hour that is
 /// warm and clearly not noon-blue. This is the single home for the constant;
@@ -200,6 +224,113 @@ fn lerp_color(start: [f32; 3], end: [f32; 3], fraction: f32) -> [f32; 3] {
         lerp(start[1], end[1], fraction),
         lerp(start[2], end[2], fraction),
     ]
+}
+
+/// Angle of a celestial body's orbit for a time of day, in radians.
+fn body_angle(time_of_day: u32) -> f32 {
+    let t = time_of_day % DAY_TICKS;
+    std::f32::consts::TAU * t as f32 / DAY_TICKS as f32
+}
+
+/// Direction of the sun on the sky unit sphere.
+///
+/// `0` is dawn on the eastern horizon `(1, 0, 0)`, `6,000` is noon at the
+/// zenith `(0, 1, 0)`, `12,000` is dusk on the western horizon `(-1, 0, 0)`,
+/// and `18,000` is midnight below the horizon. The orbit lies in the XY plane
+/// with `+Y` up, matching the renderer's world axes.
+pub fn sun_direction(time_of_day: u32) -> Vec3 {
+    let theta = body_angle(time_of_day);
+    Vec3::new(theta.cos(), theta.sin(), 0.0)
+}
+
+/// Direction of the moon: exactly opposite the sun (high at midnight).
+pub fn moon_direction(time_of_day: u32) -> Vec3 {
+    -sun_direction(time_of_day)
+}
+
+/// Smooth 0..1 fade for a body height, saturating outside the horizon band.
+fn horizon_fade(height: f32) -> f32 {
+    let x = ((height + HORIZON_FADE_BAND) / (2.0 * HORIZON_FADE_BAND)).clamp(0.0, 1.0);
+    // Smoothstep so the brightness ramp has no visible kink at the band edges.
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Sun billboard brightness in `0..=1`; `0` once the sun is below the horizon.
+pub fn sun_brightness(time_of_day: u32) -> f32 {
+    horizon_fade(sun_direction(time_of_day).y)
+}
+
+/// Moon billboard brightness in `0..=1`; `0` once the moon is below the horizon.
+pub fn moon_brightness(time_of_day: u32) -> f32 {
+    horizon_fade(moon_direction(time_of_day).y)
+}
+
+/// Star-field visibility in `0..=1`.
+///
+/// Zero through the day, ramps up from dusk (12,000) to midnight (18,000),
+/// then ramps back down to dawn (24,000). The window matches the palette
+/// keyframes so stars appear exactly as the sky darkens.
+pub fn star_visibility(time_of_day: u32) -> f32 {
+    let t = time_of_day % DAY_TICKS;
+    const DUSK_TICK: u32 = 12_000;
+    const MIDNIGHT_TICK: u32 = 18_000;
+    if t <= DUSK_TICK {
+        0.0
+    } else if t < MIDNIGHT_TICK {
+        let fraction = (t - DUSK_TICK) as f32 / (MIDNIGHT_TICK - DUSK_TICK) as f32;
+        smoothstep(fraction)
+    } else {
+        let fraction = (t - MIDNIGHT_TICK) as f32 / (DAY_TICKS - MIDNIGHT_TICK) as f32;
+        smoothstep(1.0 - fraction)
+    }
+}
+
+fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Deterministic fixed-seed star field of [`STAR_COUNT`] unit directions.
+///
+/// Directions are spread over the whole sphere (roughly half above the
+/// horizon). The field is generated once per renderer instance from a private
+/// xorshift32 stream, so two calls are byte-identical and nothing depends on
+/// the wall clock.
+pub fn generate_star_field() -> Vec<Vec3> {
+    let mut rng = Xorshift32::new(STAR_SEED);
+    let mut stars = Vec::with_capacity(STAR_COUNT);
+    for _ in 0..STAR_COUNT {
+        let u = (rng.next() >> 8) as f32 / (1u32 << 24) as f32;
+        let v = (rng.next() >> 8) as f32 / (1u32 << 24) as f32;
+        // Uniform sphere: z is uniform in -1..1, phi uniform in 0..TAU.
+        let y = 2.0 * u - 1.0;
+        let phi = std::f32::consts::TAU * v;
+        let radius = (1.0 - y * y).max(0.0).sqrt();
+        stars.push(Vec3::new(radius * phi.cos(), y, radius * phi.sin()));
+    }
+    stars
+}
+
+/// Deterministic per-field xorshift32 stream. No wall-clock or global state,
+/// so the star field is identical on every launch.
+struct Xorshift32(u32);
+
+impl Xorshift32 {
+    #[inline]
+    fn new(seed: u32) -> Self {
+        // xorshift32 locks up at zero, so force a non-zero state.
+        Self(seed | 1)
+    }
+
+    #[inline]
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +574,158 @@ mod tests {
     fn sky_palette_wraps_out_of_range_time() {
         assert_eq!(sky_palette(DAY_TICKS + DEFAULT_TIME_OF_DAY), sky_palette(DEFAULT_TIME_OF_DAY));
         assert_eq!(sky_palette(u32::MAX), sky_palette(u32::MAX % DAY_TICKS));
+    }
+
+    fn assert_vec_close(actual: Vec3, expected: Vec3) {
+        for (a, e) in [
+            (actual.x, expected.x),
+            (actual.y, expected.y),
+            (actual.z, expected.z),
+        ] {
+            assert!((a - e).abs() < 1e-5, "expected {expected}, got {actual}");
+        }
+    }
+
+    #[test]
+    fn sun_direction_hits_dawn_noon_dusk_and_midnight() {
+        assert_vec_close(sun_direction(0), Vec3::new(1.0, 0.0, 0.0));
+        assert_vec_close(sun_direction(6_000), Vec3::new(0.0, 1.0, 0.0));
+        assert_vec_close(sun_direction(12_000), Vec3::new(-1.0, 0.0, 0.0));
+        assert_vec_close(sun_direction(18_000), Vec3::new(0.0, -1.0, 0.0));
+    }
+
+    #[test]
+    fn sun_direction_is_a_unit_vector_across_the_cycle() {
+        for t in (0..DAY_TICKS).step_by(500) {
+            let sun = sun_direction(t);
+            assert!((sun.length() - 1.0).abs() < 1e-5, "sun at {t}: {sun}");
+            assert!(sun.is_finite());
+            assert_eq!(sun.z, 0.0, "the sun orbit stays in the XY plane");
+        }
+    }
+
+    #[test]
+    fn moon_is_exactly_opposite_the_sun() {
+        for t in (0..DAY_TICKS).step_by(750) {
+            let sun = sun_direction(t);
+            let moon = moon_direction(t);
+            assert_eq!(moon, -sun, "moon must be antipodal at tick {t}");
+            assert!((moon.length() - 1.0).abs() < 1e-5, "moon at {t}: {moon}");
+        }
+    }
+
+    #[test]
+    fn moon_is_high_at_midnight_and_below_the_horizon_at_noon() {
+        assert_vec_close(moon_direction(18_000), Vec3::new(0.0, 1.0, 0.0));
+        assert!(moon_direction(6_000).y < 0.0);
+        assert!(moon_brightness(18_000) > 0.99);
+        assert_eq!(moon_brightness(6_000), 0.0);
+    }
+
+    #[test]
+    fn sun_brightness_is_zero_below_horizon_and_full_at_transit() {
+        assert_eq!(sun_brightness(18_000), 0.0);
+        assert_close(sun_brightness(0), 0.5);
+        assert!(sun_brightness(6_000) > 0.99);
+        // The horizon fade lifts the sun smoothly through dawn.
+        assert!(sun_brightness(50) < sun_brightness(150));
+        assert!(sun_brightness(150) < sun_brightness(300));
+        for t in (0..DAY_TICKS).step_by(250) {
+            let brightness = sun_brightness(t);
+            assert!((0.0..=1.0).contains(&brightness), "sun at {t}: {brightness}");
+        }
+    }
+
+    #[test]
+    fn moon_brightness_is_the_opposite_phase() {
+        for t in (0..DAY_TICKS).step_by(500) {
+            assert_close(
+                moon_brightness(t),
+                sun_brightness((t + 12_000) % DAY_TICKS),
+            );
+        }
+        assert!(moon_brightness(18_000) > 0.99);
+        assert_eq!(moon_brightness(6_000), 0.0);
+    }
+
+    #[test]
+    fn star_visibility_is_zero_by_day_and_peaks_at_midnight() {
+        for t in [0u32, 2_000, 6_000, 10_000, 12_000] {
+            assert_eq!(star_visibility(t), 0.0, "stars visible at tick {t}");
+        }
+        assert!(star_visibility(18_000) > 0.99);
+        assert!(star_visibility(15_000) > 0.0 && star_visibility(15_000) < 1.0);
+        assert!(star_visibility(21_000) > 0.0 && star_visibility(21_000) < 1.0);
+        assert_eq!(star_visibility(DAY_TICKS), 0.0);
+    }
+
+    #[test]
+    fn star_visibility_ramps_monotonically_in_and_out_of_the_night() {
+        let mut previous = star_visibility(12_000);
+        for t in (12_000..=18_000).step_by(250) {
+            let value = star_visibility(t);
+            assert!(value >= previous - 1e-6, "dusk ramp fell at {t}");
+            previous = value;
+        }
+        previous = star_visibility(18_000);
+        for t in (18_000..=DAY_TICKS).step_by(250) {
+            let value = star_visibility(t % DAY_TICKS);
+            assert!(value <= previous + 1e-6, "dawn ramp rose at {t}");
+            previous = value;
+        }
+        assert_eq!(star_visibility(DAY_TICKS), 0.0);
+    }
+
+    #[test]
+    fn star_visibility_wraps_out_of_range_time() {
+        for t in [DAY_TICKS + 15_000, DAY_TICKS + 21_000, u32::MAX] {
+            assert_eq!(star_visibility(t), star_visibility(t % DAY_TICKS));
+        }
+    }
+
+    #[test]
+    fn generate_star_field_is_deterministic() {
+        let first = generate_star_field();
+        let second = generate_star_field();
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.x.to_bits(), b.x.to_bits());
+            assert_eq!(a.y.to_bits(), b.y.to_bits());
+            assert_eq!(a.z.to_bits(), b.z.to_bits());
+        }
+    }
+
+    #[test]
+    fn star_field_has_expected_count_and_unit_directions() {
+        let stars = generate_star_field();
+        assert_eq!(stars.len(), STAR_COUNT);
+        for star in &stars {
+            assert!(star.is_finite(), "non-finite star {star}");
+            assert!(
+                (star.length() - 1.0).abs() < 1e-5,
+                "star is not unit length: {star}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughly_half_the_star_field_sits_above_the_horizon() {
+        let stars = generate_star_field();
+        let above = stars.iter().filter(|star| star.y > 0.0).count();
+        let fraction = above as f32 / stars.len() as f32;
+        assert!(
+            (0.4..=0.6).contains(&fraction),
+            "only {above}/{} stars above the horizon",
+            stars.len()
+        );
+    }
+
+    #[test]
+    fn angular_size_constants_stay_in_readable_range() {
+        assert!((0.05..=0.08).contains(&SUN_ANGULAR_SIZE));
+        assert!((0.05..=0.08).contains(&MOON_ANGULAR_SIZE));
+        assert!((0.01..=0.03).contains(&STAR_ANGULAR_SIZE));
+        assert!(STAR_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
+        assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
     }
 }
