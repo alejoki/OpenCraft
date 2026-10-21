@@ -39,8 +39,12 @@ pub const SUN_ANGULAR_SIZE: f32 = 0.06;
 /// carry the rest of the identity.
 pub const MOON_ANGULAR_SIZE: f32 = 0.045;
 
-/// Angular radius of a star billboard, in radians (~1.1 degrees).
-pub const STAR_ANGULAR_SIZE: f32 = 0.02;
+/// Angular radius of a star billboard, in radians (~0.46 degrees).
+///
+/// Kept far below [`SUN_ANGULAR_SIZE`] and [`MOON_ANGULAR_SIZE`] (at most a
+/// quarter of either) so a star stays a point-like disc and the moon remains
+/// the only large bright body at night.
+pub const STAR_ANGULAR_SIZE: f32 = 0.008;
 
 /// Half-width of the smooth horizon band used to fade a body's brightness.
 ///
@@ -282,23 +286,45 @@ pub fn moon_brightness(time_of_day: u32) -> f32 {
     horizon_fade(moon_direction(time_of_day).y)
 }
 
+/// First tick where [`sun_brightness`] is exactly `0.0` on the dusk side.
+///
+/// Derived from the `HORIZON_FADE_BAND` smoothstep with a step-1 sweep: tick
+/// 12,305 still carries ~7e-6 brightness while 12,306 is the first exact
+/// zero. Hardcoded deliberately; deriving it from float math at runtime would
+/// sit on a borderline-precision edge (MEM184).
+pub const STAR_DUSK_CLEAR_TICK: u32 = 12_306;
+
+/// Last tick where [`sun_brightness`] is exactly `0.0` before dawn.
+///
+/// The mirror of [`STAR_DUSK_CLEAR_TICK`]: 23,694 is the last exact zero and
+/// 23,695 already carries ~7e-6 brightness. Both are 894 ticks outside the
+/// S07 palette ramp endpoints (`NIGHTFALL_TICK` / `PRE_DAWN_TICK`).
+pub const STAR_DAWN_CLEAR_TICK: u32 = 23_694;
+
 /// Star-field visibility in `0..=1`.
 ///
-/// Zero through the day, ramps up from dusk (12,000) to midnight (18,000),
-/// then ramps back down to dawn (24,000). The window matches the palette
-/// keyframes so stars appear exactly as the sky darkens.
+/// Stars appear only once the sun has exactly zero brightness: visibility is
+/// `0.0` through tick [`STAR_DUSK_CLEAR_TICK`], ramps up over
+/// [`STAR_DUSK_CLEAR_TICK`]..=[`NIGHTFALL_TICK`] (894 ticks), holds at `1.0`
+/// through [`PRE_DAWN_TICK`], then ramps down over
+/// [`PRE_DAWN_TICK`]..=[`STAR_DAWN_CLEAR_TICK`] and stays `0.0` through the
+/// wrap. The ramps complete exactly with the S07 palette ramps.
 pub fn star_visibility(time_of_day: u32) -> f32 {
     let t = time_of_day % DAY_TICKS;
-    const DUSK_TICK: u32 = 12_000;
-    const MIDNIGHT_TICK: u32 = 18_000;
-    if t <= DUSK_TICK {
+    if t <= STAR_DUSK_CLEAR_TICK {
         0.0
-    } else if t < MIDNIGHT_TICK {
-        let fraction = (t - DUSK_TICK) as f32 / (MIDNIGHT_TICK - DUSK_TICK) as f32;
+    } else if t < NIGHTFALL_TICK {
+        let fraction = (t - STAR_DUSK_CLEAR_TICK) as f32
+            / (NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK) as f32;
         smoothstep(fraction)
-    } else {
-        let fraction = (t - MIDNIGHT_TICK) as f32 / (DAY_TICKS - MIDNIGHT_TICK) as f32;
+    } else if t <= PRE_DAWN_TICK {
+        1.0
+    } else if t <= STAR_DAWN_CLEAR_TICK {
+        let fraction = (t - PRE_DAWN_TICK) as f32
+            / (STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK) as f32;
         smoothstep(1.0 - fraction)
+    } else {
+        0.0
     }
 }
 
@@ -726,9 +752,65 @@ mod tests {
             assert_eq!(star_visibility(t), 0.0, "stars visible at tick {t}");
         }
         assert!(star_visibility(18_000) > 0.99);
-        assert!(star_visibility(15_000) > 0.0 && star_visibility(15_000) < 1.0);
-        assert!(star_visibility(21_000) > 0.0 && star_visibility(21_000) < 1.0);
+        // Samples inside the dusk and dawn ramps; 15,000 and 21,000 sit in the
+        // night hold, where visibility is pinned to exactly 1.0 below.
+        assert!(star_visibility(12_700) > 0.0 && star_visibility(12_700) < 1.0);
+        assert!(star_visibility(23_200) > 0.0 && star_visibility(23_200) < 1.0);
+        assert_eq!(star_visibility(15_000), 1.0, "night hold must be exactly 1");
+        assert_eq!(star_visibility(21_000), 1.0, "night hold must be exactly 1");
         assert_eq!(star_visibility(DAY_TICKS), 0.0);
+    }
+
+    /// THE S08 criterion pin: no star is visible anywhere the sun has any
+    /// brightness at all (step-1 sweep over the whole cycle).
+    #[test]
+    fn star_visibility_is_zero_wherever_the_sun_has_any_brightness() {
+        for t in 0..DAY_TICKS {
+            if sun_brightness(t) > 0.0 {
+                assert_eq!(
+                    star_visibility(t),
+                    0.0,
+                    "stars visible while the sun is bright at tick {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn star_window_is_pinned_to_the_sun_zero_brightness_band() {
+        assert!(sun_brightness(12_305) > 0.0);
+        assert_eq!(star_visibility(12_305), 0.0);
+        assert_eq!(sun_brightness(STAR_DUSK_CLEAR_TICK), 0.0);
+        assert_eq!(
+            star_visibility(STAR_DUSK_CLEAR_TICK),
+            0.0,
+            "ramp origin is the first star-free tick"
+        );
+        assert_eq!(sun_brightness(STAR_DAWN_CLEAR_TICK), 0.0);
+        assert_eq!(
+            star_visibility(STAR_DAWN_CLEAR_TICK),
+            0.0,
+            "dawn ramp must be fully down on the last dark tick"
+        );
+        assert!(sun_brightness(23_695) > 0.0);
+        assert_eq!(star_visibility(23_695), 0.0);
+    }
+
+    #[test]
+    fn star_ramps_complete_exactly_with_the_palette_ramps() {
+        assert_eq!(star_visibility(NIGHTFALL_TICK), 1.0);
+        assert_eq!(star_visibility(PRE_DAWN_TICK), 1.0);
+        assert_eq!(NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK, 894);
+        assert_eq!(STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK, 894);
+    }
+
+    #[test]
+    fn star_visibility_is_zero_at_the_vista_golden_hour() {
+        assert_eq!(
+            star_visibility(VISTA_GOLDEN_HOUR),
+            0.0,
+            "the menu vista never shows stars"
+        );
     }
 
     #[test]
@@ -796,9 +878,10 @@ mod tests {
     fn angular_size_constants_stay_in_readable_range() {
         assert!((0.05..=0.08).contains(&SUN_ANGULAR_SIZE));
         assert!((0.04..=0.06).contains(&MOON_ANGULAR_SIZE));
-        assert!((0.01..=0.03).contains(&STAR_ANGULAR_SIZE));
+        assert!((0.005..=0.012).contains(&STAR_ANGULAR_SIZE));
         const {
-            assert!(STAR_ANGULAR_SIZE < MOON_ANGULAR_SIZE);
+            assert!(STAR_ANGULAR_SIZE <= SUN_ANGULAR_SIZE / 4.0);
+            assert!(STAR_ANGULAR_SIZE < MOON_ANGULAR_SIZE / 4.0);
             assert!(MOON_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
             assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
         };
