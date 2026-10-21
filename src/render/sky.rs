@@ -1,9 +1,9 @@
 //! Sky pass GPU layer: sun, moon and star billboards.
 //!
 //! All celestial geometry is static and camera-relative: `build_sky_vertices`
-//! expands the sun quad, the moon crescent and every star into billboard
-//! vertices once at renderer construction, and the vertex shader positions
-//! them on a sphere around `camera.camera_pos`. Per-frame state is a single
+//! expands the sun and moon quads and every star into billboard vertices once
+//! at renderer construction, and the vertex shader positions them on a sphere
+//! around `camera.camera_pos`. Per-frame state is a single
 //! 48-byte [`SkyUniform`] (the sun/moon directions, their brightness fades,
 //! the star visibility and the star rotation angle) written with
 //! `queue.write_buffer`.
@@ -48,89 +48,12 @@ const QUAD_CORNERS: [[f32; 2]; 6] = [
     [-1.0, 1.0],
 ];
 
-/// Radius of the offset terminator circle that carves the moon crescent, in
-/// unit-disc radii.
-const MOON_TERMINATOR_RADIUS: f32 = 0.85;
-/// Offset of the terminator circle's centre along +X, in unit-disc radii.
-/// With `MOON_TERMINATOR_RADIUS` this guarantees the circles intersect
-/// (`radius + offset > 1`, `|radius - offset| < 1`).
-const MOON_TERMINATOR_OFFSET: f32 = 0.35;
-/// Number of quad strips used to tessellate the crescent between its two arcs.
-const MOON_ARC_SEGMENTS: usize = 6;
-/// Fixed vertex count of the static moon crescent (two triangles per strip).
-pub const MOON_VERTEX_COUNT: usize = MOON_ARC_SEGMENTS * 6;
-
-/// The two tips where the unit-disc limb and the terminator circle intersect.
-fn moon_tips() -> ((f32, f32), (f32, f32)) {
-    // The two circles must intersect for the lune to exist: the terminator
-    // centre sits inside the unit disc, and the terminator crosses the limb.
-    // If these ever stop holding, the tips below would produce NaN/empty
-    // geometry — fail at compile time instead.
-    const {
-        assert!(MOON_TERMINATOR_OFFSET > 0.0 && MOON_TERMINATOR_OFFSET < MOON_TERMINATOR_RADIUS);
-        assert!(MOON_TERMINATOR_RADIUS + MOON_TERMINATOR_OFFSET > 1.0);
-        assert!(MOON_TERMINATOR_RADIUS - MOON_TERMINATOR_OFFSET < 1.0);
-    }
-
-    let offset = MOON_TERMINATOR_OFFSET;
-    let radius = MOON_TERMINATOR_RADIUS;
-    let x = (1.0 - radius * radius + offset * offset) / (2.0 * offset);
-    let y = (1.0 - x * x).max(0.0).sqrt();
-    ((x, y), (x, -y))
-}
-
-/// Static corner coordinates of the moon crescent in the same `-1..1`
-/// billboard space the old quad used.
+/// Fixed vertex count of the static moon quad (two triangles).
 ///
-/// The outline is two arcs between the tips returned by [`moon_tips`]: the
-/// unit-disc limb (outer, bulging left) and the offset terminator circle
-/// (inner, cutting the bite out of the right side). Both arcs are sampled at
-/// the same parameter and joined into a fixed strip, so the shape is pure
-/// deterministic CPU math evaluated once at construction — no per-frame
-/// state, no shader change, no RNG.
-fn crescent_corners() -> [[f32; 2]; MOON_VERTEX_COUNT] {
-    use std::f32::consts::TAU;
-
-    let offset = MOON_TERMINATOR_OFFSET;
-    let radius = MOON_TERMINATOR_RADIUS;
-    let (tip_top, _tip_bottom) = moon_tips();
-
-    // Polar angles of the top tip on each arc. The outer arc runs
-    // `theta0 -> TAU - theta0` through the left limb; the inner arc runs the
-    // same way through the terminator circle's left side.
-    let theta0 = tip_top.1.atan2(tip_top.0);
-    let alpha0 = tip_top.1.atan2(tip_top.0 - offset);
-
-    let mut corners = [[0.0f32; 2]; MOON_VERTEX_COUNT];
-    for segment in 0..MOON_ARC_SEGMENTS {
-        let t0 = segment as f32 / MOON_ARC_SEGMENTS as f32;
-        let t1 = (segment + 1) as f32 / MOON_ARC_SEGMENTS as f32;
-
-        let outer = |t: f32| {
-            let theta = theta0 + t * (TAU - 2.0 * theta0);
-            [theta.cos(), theta.sin()]
-        };
-        let inner = |t: f32| {
-            let alpha = alpha0 + t * (TAU - 2.0 * alpha0);
-            [offset + radius * alpha.cos(), radius * alpha.sin()]
-        };
-
-        let (outer0, outer1) = (outer(t0), outer(t1));
-        let (inner0, inner1) = (inner(t0), inner(t1));
-        let base = segment * 6;
-        // Two triangles: (outer0, outer1, inner1) and (outer0, inner1, inner0).
-        // The end segments collapse one triangle onto the shared tip, which is
-        // expected: the crescent closes to a point there.
-        corners[base] = outer0;
-        corners[base + 1] = outer1;
-        corners[base + 2] = inner1;
-        corners[base + 3] = outer0;
-        corners[base + 4] = inner1;
-        corners[base + 5] = inner0;
-    }
-
-    corners
-}
+/// The moon is a square billboard like the sun; size and the cool dim tint
+/// carry its identity instead of a crescent silhouette. Kept as a named
+/// constant because the static-buffer layout tests index past it.
+pub const MOON_VERTEX_COUNT: usize = 6;
 
 /// Per-frame sky state shared by every billboard.
 ///
@@ -192,21 +115,6 @@ impl SkyVertex {
             kind,
         })
     }
-
-    fn crescent(
-        dir: Vec3,
-        size: f32,
-        color: [f32; 4],
-        kind: u32,
-    ) -> [SkyVertex; MOON_VERTEX_COUNT] {
-        crescent_corners().map(|corner| SkyVertex {
-            dir: [dir.x, dir.y, dir.z],
-            corner,
-            size,
-            color,
-            kind,
-        })
-    }
 }
 
 /// Expand the sun, moon and fixed-seed star field into static billboard
@@ -221,7 +129,7 @@ pub fn build_sky_vertices(star_field: &[Vec3]) -> Vec<SkyVertex> {
     for v in SkyVertex::quad(Vec3::X, daycycle::SUN_ANGULAR_SIZE, SUN_COLOR, KIND_SUN) {
         verts.push(v);
     }
-    for v in SkyVertex::crescent(
+    for v in SkyVertex::quad(
         -Vec3::X,
         daycycle::MOON_ANGULAR_SIZE,
         MOON_COLOR,
@@ -333,8 +241,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Stars are hard square quads; carve a soft circular disc out of their
     // alpha instead of tessellating 600 CPU discs (D057). The smoothstep edge
     // anti-aliases the boundary on the 1-sample sky pipeline. Sun (1) and
-    // moon (2) bypass the mask entirely: the sun stays a quad and the moon
-    // keeps its S07 crescent geometry.
+    // moon (2) bypass the mask entirely: both stay hard square quads.
     if (in.kind < 0.5) {
         let mask = 1.0 - smoothstep(0.85, 1.0, length(in.corner));
         color.a = color.a * mask;
@@ -386,7 +293,7 @@ pub fn create_sky_bind_group(
     })
 }
 
-/// Build the static sky vertex buffer (sun quad + moon crescent + every star
+/// Build the static sky vertex buffer (sun quad + moon quad + every star
 /// quad) once at renderer construction.
 pub fn create_sky_vertex_buffer(
     device: &wgpu::Device,
@@ -620,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn moon_geometry_is_a_static_crescent_not_a_quad() {
+    fn moon_geometry_is_a_static_square_quad() {
         let verts = build_sky_vertices(&[]);
         let moon: Vec<SkyVertex> = verts
             .iter()
@@ -629,67 +536,19 @@ mod tests {
             .collect();
 
         assert_eq!(moon.len(), MOON_VERTEX_COUNT);
-        const {
+        assert_eq!(MOON_VERTEX_COUNT, 6, "the moon is a single quad");
+
+        // The square must use exactly the six shared quad corners, including
+        // the four diagonal (-1,-1) style corners a crescent never reaches.
+        for corner in QUAD_CORNERS {
             assert!(
-                MOON_VERTEX_COUNT > 6,
-                "a crescent needs more than the old six-vertex quad"
+                moon.iter().any(|v| v.corner == corner),
+                "missing square corner {corner:?}"
             );
         }
 
-        // Every corner lies on or inside the unit disc. A quad would put four
-        // corners at radius sqrt(2) on the diagonals and can span the full
-        // -1..1 box; the crescent cannot.
-        for v in &moon {
-            let radius = v.corner[0].hypot(v.corner[1]);
-            assert!(
-                radius <= 1.0 + 1e-5,
-                "corner escapes the unit disc: {v:?}"
-            );
-            assert!(v.corner[0].abs() <= 1.0 + 1e-5);
-            assert!(v.corner[1].abs() <= 1.0 + 1e-5);
-            assert!(
-                !(v.corner[0].abs() > 0.999 && v.corner[1].abs() > 0.999),
-                "crescent must not reach a quad diagonal corner: {v:?}"
-            );
-        }
-
-        // The outer limb reaches the left edge; the offset terminator cuts the
-        // right side away, so the silhouette is a lune rather than a disc.
-        let min_x = moon
-            .iter()
-            .map(|v| v.corner[0])
-            .fold(f32::INFINITY, f32::min);
-        let max_x = moon
-            .iter()
-            .map(|v| v.corner[0])
-            .fold(f32::NEG_INFINITY, f32::max);
-        assert!(min_x < -0.999, "outer limb should reach the left edge, got {min_x}");
-        assert!(
-            (0.5..0.7).contains(&max_x),
-            "the tips should sit right of centre, got {max_x}"
-        );
-
-        // The two arc intersections are where the arcs meet. Each tip appears
-        // three times in the strip expansion: the apex is shared by both
-        // triangles of its segment and the other arc's endpoint is the same
-        // point (the end segments legitimately collapse one triangle).
-        let (tip_top, tip_bottom) = moon_tips();
-        let near = |corner: [f32; 2], tip: (f32, f32)| {
-            (corner[0] - tip.0).abs() < 1e-5 && (corner[1] - tip.1).abs() < 1e-5
-        };
-        assert_eq!(
-            moon.iter().filter(|v| near(v.corner, tip_top)).count(),
-            3,
-            "the top tip is where both arcs meet"
-        );
-        assert_eq!(
-            moon.iter().filter(|v| near(v.corner, tip_bottom)).count(),
-            3,
-            "the bottom tip is where both arcs meet"
-        );
-
-        // Identity is belt-and-braces: silhouette plus smaller size plus a
-        // cool, dim tint that is clearly not the warm-white sun.
+        // Identity is belt-and-braces: square silhouette plus smaller size
+        // plus a cool, dim tint that is clearly not the warm-white sun.
         for v in &moon {
             assert_eq!(v.color, MOON_COLOR);
             assert_eq!(v.size, daycycle::MOON_ANGULAR_SIZE);

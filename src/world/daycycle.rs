@@ -35,16 +35,16 @@ pub const SUN_ANGULAR_SIZE: f32 = 0.06;
 /// Angular radius of the moon billboard, in radians (~2.6 degrees).
 ///
 /// Deliberately smaller than [`SUN_ANGULAR_SIZE`] so the moon never reads as
-/// the sun reversing course (UAT-H3); the crescent silhouette and cool tint
-/// carry the rest of the identity.
+/// the sun reversing course (UAT-H3); the smaller square silhouette and cool
+/// dim tint carry the rest of the identity.
 pub const MOON_ANGULAR_SIZE: f32 = 0.045;
 
-/// Angular radius of a star billboard, in radians (~0.46 degrees).
+/// Angular radius of a star billboard, in radians (~0.23 degrees).
 ///
 /// Kept far below [`SUN_ANGULAR_SIZE`] and [`MOON_ANGULAR_SIZE`] (at most a
 /// quarter of either) so a star stays a point-like disc and the moon remains
 /// the only large bright body at night.
-pub const STAR_ANGULAR_SIZE: f32 = 0.008;
+pub const STAR_ANGULAR_SIZE: f32 = 0.002;
 
 /// Half-width of the smooth horizon band used to fade a body's brightness.
 ///
@@ -213,18 +213,26 @@ const NIGHT: SkyPalette = SkyPalette {
 };
 
 /// Tick at which the dusk-to-night ramp completes (and the moonlit hold starts).
-const NIGHTFALL_TICK: u32 = 13_200;
+///
+/// The moon rises at dusk (tick 12,000) and reaches full brightness at
+/// [`STAR_DUSK_CLEAR_TICK`] (12,306). A 400-tick ramp finishes at 12,400, so
+/// the sky is already deep night by the time the moon is fully up. The old
+/// 1,200-tick ramp stayed visibly bright well into moonrise (UAT-H2 follow-up).
+const NIGHTFALL_TICK: u32 = 12_400;
 
 /// Tick at which the night hold ends and the pre-dawn ramp toward DAWN starts.
-const PRE_DAWN_TICK: u32 = 22_800;
+///
+/// Mirror of [`NIGHTFALL_TICK`]: 24,000 - 400 = 23,600.
+const PRE_DAWN_TICK: u32 = 23_600;
 
 /// (tick, palette) pairs covering 0..=DAY_TICKS; dawn repeats at the end so the
 /// wrap at tick 0 is continuous.
 ///
-/// The dusk-to-night ramp is deliberately short (12,000..=13,200, 60 s of real
+/// The dusk-to-night ramp is deliberately short (12,000..=12,400, 20 s of real
 /// time at scale 1) instead of spanning to 18,000: human UAT (UAT-H2) showed
-/// the long ramp left muddy warm dusk colors on screen for ~5 real minutes.
-/// The pre-dawn ramp is its mirror (22,800..=24,000), and both night keyframes
+/// the long ramp left muddy warm dusk colors on screen for ~5 real minutes,
+/// and the follow-up run still read as bright while the moon was fully up.
+/// The pre-dawn ramp is its mirror (23,600..=24,000), and both night keyframes
 /// carry the exact NIGHT palette so the night hold is bit-identical.
 const KEYFRAMES: [(u32, SkyPalette); 6] = [
     (0, DAWN),
@@ -297,15 +305,15 @@ pub const STAR_DUSK_CLEAR_TICK: u32 = 12_306;
 /// Last tick where [`sun_brightness`] is exactly `0.0` before dawn.
 ///
 /// The mirror of [`STAR_DUSK_CLEAR_TICK`]: 23,694 is the last exact zero and
-/// 23,695 already carries ~7e-6 brightness. Both are 894 ticks outside the
-/// S07 palette ramp endpoints (`NIGHTFALL_TICK` / `PRE_DAWN_TICK`).
+/// 23,695 already carries ~7e-6 brightness. Both are 94 ticks outside the
+/// palette ramp endpoints (`NIGHTFALL_TICK` / `PRE_DAWN_TICK`).
 pub const STAR_DAWN_CLEAR_TICK: u32 = 23_694;
 
 /// Star-field visibility in `0..=1`.
 ///
 /// Stars appear only once the sun has exactly zero brightness: visibility is
 /// `0.0` through tick [`STAR_DUSK_CLEAR_TICK`], ramps up over
-/// [`STAR_DUSK_CLEAR_TICK`]..=[`NIGHTFALL_TICK`] (894 ticks), holds at `1.0`
+/// [`STAR_DUSK_CLEAR_TICK`]..=[`NIGHTFALL_TICK`] (94 ticks), holds at `1.0`
 /// through [`PRE_DAWN_TICK`], then ramps down over
 /// [`PRE_DAWN_TICK`]..=[`STAR_DAWN_CLEAR_TICK`] and stays `0.0` through the
 /// wrap. The ramps complete exactly with the S07 palette ramps.
@@ -564,14 +572,15 @@ mod tests {
     }
 
     #[test]
-    fn nightfall_completes_within_twelve_hundred_ticks() {
+    fn nightfall_completes_within_four_hundred_ticks() {
         // UAT-H2: the old ramp DUSK(12,000) -> NIGHT(18,000) painted muddy
-        // warm dusk for ~5 real minutes. The ramp must finish at 13,200 ticks
-        // (60 s real, 3 s at --time-scale 20) and then hold.
-        assert_eq!(NIGHTFALL_TICK - 12_000, 1_200);
-        assert_eq!(DAY_TICKS - PRE_DAWN_TICK, 1_200);
-        // Symmetric pre-dawn ramp: 22,800 -> 24,000 mirrors 12,000 -> 13,200.
-        for offset in [0u32, 300, 600, 900, 1_200] {
+        // warm dusk for ~5 real minutes, and the 1,200-tick follow-up still
+        // read bright while the moon was fully up. The ramp must finish at
+        // 12,400 ticks (20 s real, 1 s at --time-scale 20) and then hold.
+        assert_eq!(NIGHTFALL_TICK - 12_000, 400);
+        assert_eq!(DAY_TICKS - PRE_DAWN_TICK, 400);
+        // Symmetric pre-dawn ramp: 23,600 -> 24,000 mirrors 12,000 -> 12,400.
+        for offset in [0u32, 100, 200, 300, 400] {
             let dusk = sky_palette(12_000 + offset);
             let pre_dawn = sky_palette((DAY_TICKS - offset) % DAY_TICKS);
             assert_close(dusk.day_factor, pre_dawn.day_factor);
@@ -582,7 +591,7 @@ mod tests {
 
     #[test]
     fn sky_is_decisively_night_shortly_after_dusk() {
-        // Tick 14,000 is past the completed 1,200-tick ramp: the sky must be
+        // Tick 14,000 is past the completed 400-tick ramp: the sky must be
         // decisively blue-dominant, not a muddy dusk lerp.
         let palette = sky_palette(14_000);
         assert_eq!(palette, NIGHT);
@@ -754,8 +763,8 @@ mod tests {
         assert!(star_visibility(18_000) > 0.99);
         // Samples inside the dusk and dawn ramps; 15,000 and 21,000 sit in the
         // night hold, where visibility is pinned to exactly 1.0 below.
-        assert!(star_visibility(12_700) > 0.0 && star_visibility(12_700) < 1.0);
-        assert!(star_visibility(23_200) > 0.0 && star_visibility(23_200) < 1.0);
+        assert!(star_visibility(12_350) > 0.0 && star_visibility(12_350) < 1.0);
+        assert!(star_visibility(23_650) > 0.0 && star_visibility(23_650) < 1.0);
         assert_eq!(star_visibility(15_000), 1.0, "night hold must be exactly 1");
         assert_eq!(star_visibility(21_000), 1.0, "night hold must be exactly 1");
         assert_eq!(star_visibility(DAY_TICKS), 0.0);
@@ -800,8 +809,8 @@ mod tests {
     fn star_ramps_complete_exactly_with_the_palette_ramps() {
         assert_eq!(star_visibility(NIGHTFALL_TICK), 1.0);
         assert_eq!(star_visibility(PRE_DAWN_TICK), 1.0);
-        assert_eq!(NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK, 894);
-        assert_eq!(STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK, 894);
+        assert_eq!(NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK, 94);
+        assert_eq!(STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK, 94);
     }
 
     #[test]
@@ -878,7 +887,7 @@ mod tests {
     fn angular_size_constants_stay_in_readable_range() {
         assert!((0.05..=0.08).contains(&SUN_ANGULAR_SIZE));
         assert!((0.04..=0.06).contains(&MOON_ANGULAR_SIZE));
-        assert!((0.005..=0.012).contains(&STAR_ANGULAR_SIZE));
+        assert!((0.002..=0.012).contains(&STAR_ANGULAR_SIZE));
         const {
             assert!(STAR_ANGULAR_SIZE <= SUN_ANGULAR_SIZE / 4.0);
             assert!(STAR_ANGULAR_SIZE < MOON_ANGULAR_SIZE / 4.0);
