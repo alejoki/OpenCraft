@@ -32,8 +32,12 @@ pub const STAR_COUNT: usize = 600;
 /// Angular radius of the sun billboard, in radians (~3.4 degrees).
 pub const SUN_ANGULAR_SIZE: f32 = 0.06;
 
-/// Angular radius of the moon billboard, in radians (~3.4 degrees).
-pub const MOON_ANGULAR_SIZE: f32 = 0.06;
+/// Angular radius of the moon billboard, in radians (~2.6 degrees).
+///
+/// Deliberately smaller than [`SUN_ANGULAR_SIZE`] so the moon never reads as
+/// the sun reversing course (UAT-H3); the crescent silhouette and cool tint
+/// carry the rest of the identity.
+pub const MOON_ANGULAR_SIZE: f32 = 0.045;
 
 /// Angular radius of a star billboard, in radians (~1.1 degrees).
 pub const STAR_ANGULAR_SIZE: f32 = 0.02;
@@ -791,10 +795,11 @@ mod tests {
     #[test]
     fn angular_size_constants_stay_in_readable_range() {
         assert!((0.05..=0.08).contains(&SUN_ANGULAR_SIZE));
-        assert!((0.05..=0.08).contains(&MOON_ANGULAR_SIZE));
+        assert!((0.04..=0.06).contains(&MOON_ANGULAR_SIZE));
         assert!((0.01..=0.03).contains(&STAR_ANGULAR_SIZE));
         const {
-            assert!(STAR_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
+            assert!(STAR_ANGULAR_SIZE < MOON_ANGULAR_SIZE);
+            assert!(MOON_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
             assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
         };
     }
