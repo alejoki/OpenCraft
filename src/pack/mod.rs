@@ -16,6 +16,7 @@ use crate::settings::SettingsWarning;
 pub mod decode;
 pub mod manifest;
 pub mod resample;
+pub mod sound;
 
 /// File names for the 16 block texture layers, index-aligned with
 /// `BlockId::face_tex_layer` (layers 0..16). These names are the authoring
