@@ -249,6 +249,10 @@ impl WorldManager {
 
     /// Store freshly computed grids, dirtying already-meshed chunks whose light
     /// actually changed, then re-evaluate mesh readiness for the neighborhood.
+    ///
+    /// Returns every chunk whose packed grid changed (whether or not it was
+    /// already meshed) so the edit path can merge them into its synchronous
+    /// remesh set — the dirty-on-light-diff contract.
     fn apply_light_region(
         &mut self,
         grids: FxHashMap<ChunkPos, LightGrid>,
@@ -256,8 +260,9 @@ impl WorldManager {
         cx1: i32,
         cz0: i32,
         cz1: i32,
-    ) {
+    ) -> Vec<ChunkPos> {
         let mut changed_any = false;
+        let mut changed_positions = Vec::new();
         for (pos, grid) in grids {
             // A 3x3 region around a completing column also contains columns
             // that are still loading; their absent chunks read as air and
@@ -275,6 +280,7 @@ impl WorldManager {
             }
             self.light_grids.insert(pos, grid);
             changed_any = true;
+            changed_positions.push(pos);
             if self.meshed_chunks.contains(&pos) || self.pending_mesh.contains(&pos) {
                 // Dirty-on-light-diff: any mesh baked from the old grid (or an
                 // in-flight job carrying one) is stale. Cancelling the pending
@@ -289,6 +295,22 @@ impl WorldManager {
             // freshly lit region.
             self.queue_light_ready_chunks(cx0 - 1, cx1 + 1, cz0 - 1, cz1 + 1);
         }
+        changed_positions
+    }
+
+    /// Edit-path light recompute: the 3x3 column ring around the edited chunk.
+    ///
+    /// Sufficiency proof: a one-block edit's light delta propagates at most 15
+    /// blocks laterally (one level lost per BFS step), and 15 < 32 = one chunk
+    /// column, so it cannot escape the edited chunk-column +/-1 ring. The whole
+    /// 192-block column is recomputed, so there is no vertical escape either.
+    ///
+    /// Returns the chunks whose packed grid actually changed; callers remesh
+    /// them even when they are not voxel-adjacent to the edit.
+    fn recompute_light_region_for_edit(&mut self, cx: i32, cz: i32) -> Vec<ChunkPos> {
+        let (cx0, cx1, cz0, cz1) = (cx - 1, cx + 1, cz - 1, cz + 1);
+        let grids = self.compute_light_region(cx0, cx1, cz0, cz1);
+        self.apply_light_region(grids, cx0, cx1, cz0, cz1)
     }
 
     /// Queue resident, unmeshed chunks whose face and light neighborhoods are
@@ -591,6 +613,19 @@ impl WorldManager {
             .insert(linear_index(lx, ly, lz) as u16, block);
         self.unsaved_changes = true;
 
+        // A block edit changes sky light. Recompute the edit's chunk-column
+        // +/-1 ring (the provably sufficient region: max lateral attenuation
+        // 15 < one 32-block chunk, full 192-block height). Chunks whose light
+        // grid changed must be remeshed even when the edit is not at their
+        // voxel boundary. Skip while the edited column is still loading: the
+        // column-ready trigger will recompute it once it is complete, and a
+        // region computed with absent chunks would be over-lit.
+        let light_dirty = if self.column_is_complete(cpos.x, cpos.z) {
+            self.recompute_light_region_for_edit(cpos.x, cpos.z)
+        } else {
+            Vec::new()
+        };
+
         let mut dirty = vec![cpos];
         let last = CHUNK_SIZE - 1;
         if lx == 0 {
@@ -607,6 +642,11 @@ impl WorldManager {
             dirty.push(ChunkPos::new(cpos.x, cpos.y, cpos.z - 1));
         } else if lz == last {
             dirty.push(ChunkPos::new(cpos.x, cpos.y, cpos.z + 1));
+        }
+        for pos in light_dirty {
+            if !dirty.contains(&pos) {
+                dirty.push(pos);
+            }
         }
 
         let mut out = Vec::with_capacity(dirty.len());
@@ -1055,5 +1095,131 @@ mod tests {
         assert_eq!(mgr.light_at_world(10_000, 10, 10_000), light::MAX_SKY_LIGHT);
         assert_eq!(mgr.light_at_world(0, (MAX_CHUNK_Y + 1) * cs, 0), 15);
         assert_eq!(mgr.light_at_world(0, MIN_CHUNK_Y * cs - 1, 0), 0);
+    }
+
+    /// Insert full columns for the 3x3 ring around (0,0) plus one extra column
+    /// at x = 2. The extra column supplies the outer face neighbour of column
+    /// (1,0), so a light-diff chunk there can be meshed synchronously inside
+    /// `set_block_immediate`. Every chunk is handed to `build`, which lets a
+    /// test hand-place overhangs and shafts before light is seeded.
+    fn insert_light_edit_columns<F>(mgr: &mut WorldManager, mut build: F)
+    where
+        F: FnMut(ChunkPos) -> Chunk,
+    {
+        for dx in -1..=2 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    mgr.insert_chunk_for_test(pos, build(pos));
+                }
+            }
+        }
+    }
+
+    /// Build the shared overhang fixture: a stone roof at world y = 4 spanning
+    /// world x 16..=47 (chunk columns 0 and 1) and all z of chunk columns 0..1.
+    /// `hole` optionally opens one roof cell, letting sky light down a shaft.
+    fn overhang_chunk(pos: ChunkPos, hole: Option<(i32, i32)>) -> Chunk {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        if pos.y != 0 || pos.z != 0 {
+            return chunk;
+        }
+        let base_x = pos.x * CHUNK_SIZE as i32;
+        for world_x in 16..=47 {
+            let lx = world_x - base_x;
+            if !(0..CHUNK_SIZE as i32).contains(&lx) {
+                continue;
+            }
+            for lz in 0..CHUNK_SIZE {
+                let is_hole = hole == Some((world_x, lz as i32));
+                if !is_hole {
+                    chunk.set(lx as usize, 4, lz, BlockId::Stone);
+                }
+            }
+        }
+        chunk
+    }
+
+    #[test]
+    fn test_break_under_overhang_remeshes_non_adjacent_light_diff_chunk() {
+        let mut mgr = WorldManager::new(4);
+        insert_light_edit_columns(&mut mgr, |pos| overhang_chunk(pos, None));
+        mgr.recompute_light_for_test();
+
+        // The edit sits at local x = 24 of chunk (0,0,0), nowhere near a chunk
+        // boundary, so the voxel-adjacency set is exactly {(0,0,0)}.
+        let edit_chunk = world_to_chunk_and_local(24, 4, 15).0;
+        assert_eq!(edit_chunk, ChunkPos::new(0, 0, 0));
+        assert_eq!(mgr.light_at_world(24, 4, 15), 0, "roof cell is opaque");
+        let before_neighbor = mgr.light_at_world(32, 3, 15);
+        assert_eq!(
+            before_neighbor, 0,
+            "under-roof cells of the neighbor chunk start dark (17+ steps from the open edge)"
+        );
+
+        let remeshed = mgr.set_block_immediate(24, 4, 15, BlockId::Air);
+
+        assert_eq!(
+            mgr.light_at_world(24, 4, 15),
+            light::MAX_SKY_LIGHT,
+            "the freed cell opens a sky shaft"
+        );
+        assert!(
+            mgr.light_at_world(32, 3, 15) > before_neighbor,
+            "light bleeds into the neighbor chunk under the roof"
+        );
+
+        let positions: Vec<ChunkPos> = remeshed.iter().map(|(p, _)| *p).collect();
+        assert!(positions.contains(&edit_chunk), "the edited chunk remeshes");
+        assert!(
+            positions.contains(&ChunkPos::new(1, 0, 0)),
+            "the light-diff chunk must remesh despite not being voxel-adjacent: {positions:?}"
+        );
+    }
+
+    #[test]
+    fn test_place_into_open_shaft_darkens_cells_below_and_remeshes() {
+        let mut mgr = WorldManager::new(4);
+        insert_light_edit_columns(&mut mgr, |pos| overhang_chunk(pos, Some((30, 15))));
+        mgr.recompute_light_for_test();
+
+        // The hole at (30,4,15) feeds a shaft: cells below it near the hole are
+        // lit, including cells in the neighboring chunk.
+        assert_eq!(
+            mgr.light_at_world(30, 3, 15),
+            light::MAX_SKY_LIGHT,
+            "the open shaft is fully sky-lit"
+        );
+        let before = mgr.light_at_world(32, 3, 15);
+        assert!(before > 0, "lateral bleed reaches the neighbor chunk");
+
+        let remeshed = mgr.set_block_immediate(30, 4, 15, BlockId::Stone);
+
+        assert!(
+            mgr.light_at_world(32, 3, 15) < before,
+            "sealing the shaft darkens cells below it"
+        );
+        let positions: Vec<ChunkPos> = remeshed.iter().map(|(p, _)| *p).collect();
+        assert!(positions.contains(&ChunkPos::new(0, 0, 0)));
+        assert!(
+            positions.contains(&ChunkPos::new(1, 0, 0)),
+            "the affected light-diff chunk remeshes: {positions:?}"
+        );
+    }
+
+    #[test]
+    fn test_light_neutral_edit_returns_only_voxel_adjacency_remesh_set() {
+        let mut mgr = WorldManager::new(4);
+        insert_light_edit_columns(&mut mgr, |_| Chunk::new_uniform(BlockId::Stone));
+        mgr.recompute_light_for_test();
+
+        // A fully sealed world is zero-light everywhere. Swapping one opaque
+        // block type for another cannot change light, so the remesh set must
+        // stay exactly the pre-light (voxel-adjacency) set: the interior chunk.
+        assert_eq!(mgr.light_at_world(5, 5, 5), 0);
+        let remeshed = mgr.set_block_immediate(5, 5, 5, BlockId::Cobblestone);
+        let positions: Vec<ChunkPos> = remeshed.iter().map(|(p, _)| *p).collect();
+        assert_eq!(positions, vec![ChunkPos::new(0, 0, 0)]);
+        assert_eq!(mgr.light_at_world(5, 5, 5), 0);
     }
 }
