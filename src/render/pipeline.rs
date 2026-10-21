@@ -91,11 +91,17 @@ fn vs_main(
 
     let tex_layer = w1 & 255u;
     let ao_packed = (w1 >> 8u) & 255u;
+    let light_packed = (w1 >> 16u) & 0xFFFFu;
 
     let ao00 = ao_packed & 3u;
     let ao10 = (ao_packed >> 2u) & 3u;
     let ao01 = (ao_packed >> 4u) & 3u;
     let ao11 = (ao_packed >> 6u) & 3u;
+
+    let l00 = light_packed & 15u;
+    let l10 = (light_packed >> 4u) & 15u;
+    let l01 = (light_packed >> 8u) & 15u;
+    let l11 = (light_packed >> 12u) & 15u;
 
     let flip_diag = (ao00 + ao11) > (ao10 + ao01);
     var corner: u32 = 0u;
@@ -154,19 +160,24 @@ fn vs_main(
     }
 
     var ao_val: u32 = ao00;
+    var light_val: u32 = l00;
     if corner == 1u {
         ao_val = ao10;
+        light_val = l10;
     } else if corner == 2u {
         ao_val = ao01;
+        light_val = l01;
     } else if corner == 3u {
         ao_val = ao11;
+        light_val = l11;
     }
     let ao_factor = 0.45 + (f32(ao_val) / 3.0) * 0.55;
+    let light_factor = f32(light_val) / 15.0;
 
     out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tex_layer = tex_layer;
-    out.light = face_sun_factor(face_dir) * ao_factor;
+    out.light = face_sun_factor(face_dir) * ao_factor * light_factor;
     out.cam_dist = distance(world_pos, camera.camera_pos.xyz);
     return out;
 }

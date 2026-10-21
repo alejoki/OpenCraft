@@ -1095,7 +1095,7 @@ mod tests {
                         cave_chunks += 1;
                         for bucket in &mesh.buckets {
                             for quad in bucket {
-                                let (x, y, z, _, _, face_dir, _, _) = quad.unpack();
+                                let (x, y, z, _, _, face_dir, _, _, _) = quad.unpack();
                                 let axis_d = match face_dir / 2 {
                                     0 => x,
                                     1 => y,

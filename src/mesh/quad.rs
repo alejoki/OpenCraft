@@ -23,6 +23,7 @@ impl PackedQuad {
         face_dir: u32,
         tex_layer: u8,
         ao_packed: u8,
+        light_packed: u16,
     ) -> Self {
         let [x, y, z] = pos;
         let [w, h] = extent;
@@ -35,12 +36,14 @@ impl PackedQuad {
             | (((w - 1) & 31) << 15)
             | (((h - 1) & 31) << 20)
             | ((face_dir & 7) << 25);
-        let word1 = (tex_layer as u32) | ((ao_packed as u32) << 8);
+        let word1 = (tex_layer as u32)
+            | ((ao_packed as u32) << 8)
+            | ((light_packed as u32) << 16);
         Self([word0, word1])
     }
 
     #[inline]
-    pub const fn unpack(self) -> (u32, u32, u32, u32, u32, u32, u8, u8) {
+    pub const fn unpack(self) -> (u32, u32, u32, u32, u32, u32, u8, u8, u16) {
         let w0 = self.0[0];
         let w1 = self.0[1];
         let x = w0 & 31;
@@ -51,7 +54,8 @@ impl PackedQuad {
         let face_dir = (w0 >> 25) & 7;
         let tex_layer = (w1 & 0xFF) as u8;
         let ao_packed = ((w1 >> 8) & 0xFF) as u8;
-        (x, y, z, w, h, face_dir, tex_layer, ao_packed)
+        let light_packed = ((w1 >> 16) & 0xFFFF) as u16;
+        (x, y, z, w, h, face_dir, tex_layer, ao_packed, light_packed)
     }
 }
 
@@ -80,13 +84,27 @@ mod tests {
 
     #[test]
     fn packed_quad_layout_and_round_trip_unchanged() {
-        let quad = PackedQuad::new([5, 6, 7], [3, 4], 5, 9, 0b1010_0101);
+        let ao = 0b1010_0101u8;
+        let light = 0xA5C3u16;
+        let quad = PackedQuad::new([5, 6, 7], [3, 4], 5, 9, ao, light);
 
         assert_eq!(
             quad.0[0],
             5 | (6 << 5) | (7 << 10) | (2 << 15) | (3 << 20) | (5 << 25)
         );
-        assert_eq!(quad.0[1], 9 | (0b1010_0101 << 8));
-        assert_eq!(quad.unpack(), (5, 6, 7, 3, 4, 5, 9, 0b1010_0101));
+        assert_eq!(quad.0[1], 9 | ((ao as u32) << 8) | ((light as u32) << 16));
+        // Light occupies word1 bits 16-31 and does not bleed into tex_layer/AO.
+        assert_eq!(quad.0[1] >> 16, light as u32);
+        assert_eq!(quad.unpack(), (5, 6, 7, 3, 4, 5, 9, ao, light));
+    }
+
+    #[test]
+    fn packed_quad_light_bits_round_trip_at_boundaries() {
+        for light in [0u16, 1, 15, 0x00FF, 0xFF00, 0xFFFF] {
+            let quad = PackedQuad::new([0, 0, 0], [1, 1], 0, 0, 0, light);
+            assert_eq!(quad.unpack().8, light);
+            assert_eq!(quad.unpack().6, 0);
+            assert_eq!(quad.unpack().7, 0);
+        }
     }
 }
