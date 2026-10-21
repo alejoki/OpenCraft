@@ -111,11 +111,7 @@ fn average_light(samples: [Option<u8>; 4]) -> u8 {
         sum += value as u32;
         count += 1;
     }
-    if count == 0 {
-        0
-    } else {
-        (sum / count) as u8
-    }
+    sum.checked_div(count).unwrap_or(0) as u8
 }
 
 #[inline]

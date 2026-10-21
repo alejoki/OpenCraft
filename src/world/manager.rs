@@ -1222,4 +1222,86 @@ mod tests {
         assert_eq!(positions, vec![ChunkPos::new(0, 0, 0)]);
         assert_eq!(mgr.light_at_world(5, 5, 5), 0);
     }
+
+    /// Recorded greedy-mesh cost of real sky light. The same bounded
+    /// fixed-seed terrain region is meshed twice: once with propagated light
+    /// and once with every grid overwritten to uniform 15. The delta measures
+    /// how many extra quads per-corner light variation costs (and the strict
+    /// `real > uniform` assertion catches light that accidentally went uniform
+    /// or never reached the mesher at all).
+    #[test]
+    fn quad_count_real_vs_uniform_light_measurement() {
+        const SEED: u32 = 1337;
+        // Measured region: 5x5 chunk columns x 6 chunk layers = 150 chunks,
+        // i.e. 160x160 blocks of terrain. One resident halo column ring
+        // supplies the face neighbours `build_padded_chunk` needs; the outer
+        // halo is not measured.
+        const RADIUS: i32 = 2;
+        const HALO: i32 = 1;
+
+        let mut mgr = WorldManager::with_seed_and_edits(6, SEED, ChunkEditMap::default());
+        for cx in -RADIUS - HALO..=RADIUS + HALO {
+            for cz in -RADIUS - HALO..=RADIUS + HALO {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    mgr.insert_chunk_for_test(pos, generate_chunk_seeded(pos, SEED));
+                }
+            }
+        }
+        mgr.recompute_light_for_test();
+
+        let measured: Vec<ChunkPos> = (-RADIUS..=RADIUS)
+            .flat_map(|cx| {
+                (-RADIUS..=RADIUS).flat_map(move |cz| {
+                    (MIN_CHUNK_Y..=MAX_CHUNK_Y).map(move |cy| ChunkPos::new(cx, cy, cz))
+                })
+            })
+            .collect();
+        let mesh_total = |mgr: &WorldManager| -> usize {
+            measured
+                .iter()
+                .map(|&pos| {
+                    let padded = mgr
+                        .build_padded_chunk(pos)
+                        .expect("measured chunks keep their face-neighbour ring resident");
+                    mesh_chunk(&padded).total_quads()
+                })
+                .sum()
+        };
+
+        let real = mesh_total(&mgr);
+
+        // Uniform-light baseline: same geometry, every corner lit 15.
+        for grid in mgr.light_grids.values_mut() {
+            *grid = light::full_light_grid();
+        }
+        let uniform = mesh_total(&mgr);
+
+        let ratio = real as f64 / uniform as f64;
+        eprintln!(
+            "sky-light quad measurement: {}x{} columns x {} layers = {} chunks; \
+             real={} uniform={} ratio={:.3}",
+            RADIUS * 2 + 1,
+            RADIUS * 2 + 1,
+            MAX_CHUNK_Y - MIN_CHUNK_Y + 1,
+            measured.len(),
+            real,
+            uniform,
+            ratio,
+        );
+
+        assert!(uniform > 0, "measurement region must contain visible faces");
+        assert!(
+            real > uniform,
+            "per-corner light variation must split greedy merges: real {real} vs uniform {uniform}"
+        );
+        // Just above the measured ratio (113536 / 112424 = 1.010): real light
+        // barely fragments this terrain, but the bound guards against a
+        // runaway light-aware merge key while still catching uniform light.
+        assert!(
+            real * 4 <= uniform * 5,
+            "light fragmentation must stay bounded (measured ratio 1.010): \
+             real {real} vs uniform {uniform}"
+        );
+    }
 }
