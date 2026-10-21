@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Negative-path selftest for scripts/requirements_check.sh (M003/S05-T03,
-# extended M004/S05-T02).
+# extended M004/S05-T02 and M005/S06-T02).
 #
 # Proves the registry checker is not a happy-path-only gate: a pristine copy
 # must be accepted, and each of the following defects must be rejected:
@@ -15,11 +15,16 @@
 #   9. lost M004 slice mapping
 #  10. wrong M004 criterion -> requirement mapping
 #  11. out-of-range criterion row in the M004 trace table
+#  12. duplicate M005 requirement ID
+#  13. lost M005 slice mapping
+#  14. wrong M005 criterion -> requirement mapping
+#  15. out-of-range criterion row in the M005 trace table
 #
-# Cases 8-11 exercise the M004 checker surface added with R016-R020: the two
-# criterion tables restart their row numbers at 1, so these cases plus the
-# positive control prove the checker parses them section-scoped rather than
-# counting colliding criterion 1 rows from both tables.
+# Cases 8-11 exercise the M004 checker surface added with R016-R020, and cases
+# 12-15 exercise the M005 surface added with R021-R026. All three criterion
+# tables restart their row numbers at 1, so these cases plus the positive
+# control prove the checker parses each table section-scoped rather than
+# counting colliding criterion 1 rows across tables.
 #
 # Every mutation is applied to a throwaway copy under mktemp -d; the canonical
 # REQUIREMENTS-REGISTRY.md is never written. The selftest asserts the on-disk
@@ -111,13 +116,15 @@ assert_mutated "duplicate ID" "$case1" "$case2"
 expect_fail "duplicate requirement ID" "$case2"
 
 # --- Case 3: missing ID --------------------------------------------------
-# Retargeted to the new last record: renumbering R020 to R021 removes R020
-# from the R001-R020 range. Before R016-R020 landed this case renumbered R015
-# to R016, which would now create a duplicate instead of a missing record.
+# Retargeted to the new last record: renumbering R026 to R027 removes R026
+# from the R001-R026 range. Retarget chain: R015->R016 was pre-M004,
+# R020->R021 was pre-M005, and now R026->R027 is the current last record.
+# (Renumbering R020 to R021 today would create a duplicate instead of a
+# missing record, which is why the old mutation had to move.)
 case3="$(new_case "$SCRATCH/case3.md")"
-sed -i 's/^### R020 /### R021 /' "$case3"
+sed -i 's/^### R026 /### R027 /' "$case3"
 assert_mutated "missing ID" "$case1" "$case3"
-expect_fail "missing requirement ID R020" "$case3"
+expect_fail "missing requirement ID R026" "$case3"
 
 # --- Case 4: removed M003 slice mapping ----------------------------------
 case4="$(new_case "$SCRATCH/case4.md")"
@@ -197,6 +204,46 @@ fi
 grep -q 'M004 table' "$CHECK_LOG" \
     || { echo "FAIL: out-of-range M004 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 echo "PASS: out-of-range M004 trace row rejected"
+
+# --- Case 12: duplicate M005 ID ------------------------------------------
+case12="$(new_case "$SCRATCH/case12.md")"
+sed -i 's/^### R023 /### R022 /' "$case12"
+assert_mutated "duplicate M005 ID" "$case1" "$case12"
+expect_fail "duplicate M005 requirement ID R022" "$case12"
+
+# --- Case 13: removed M005 slice mapping ---------------------------------
+# The M005 trace table's slice cells use bare S04, so this mutation only
+# affects R024's Primary owning slice field, not the table itself (same
+# precedent as the M004 case 9).
+case13="$(new_case "$SCRATCH/case13.md")"
+sed -i 's#M005/S04#M005/S99#g' "$case13"
+assert_mutated "M005 slice mapping" "$case1" "$case13"
+expect_fail "removed M005/S04 slice mapping" "$case13"
+
+# --- Case 14: wrong M005 criterion mapping -------------------------------
+# Row 3 of the M003 table is 'R008, R009, R010' and row 3 of the M004 table
+# is 'R018', so this pattern only matches the M005 table's row 3.
+case14="$(new_case "$SCRATCH/case14.md")"
+sed -i 's/^| 3 | R023 | S02 |/| 3 | R024 | S02 |/' "$case14"
+assert_mutated "M005 criterion mapping" "$case1" "$case14"
+expect_fail "M005 criterion 3 requirement mapping drifted" "$case14"
+
+# --- Case 15: out-of-range row in the M005 trace table -------------------
+# Appending criterion 9 after the M005 table's row 8 must be rejected by the
+# M005 range check (1-8), proving the third section branch is range-scoped
+# and does not collide with the M003/M004 tables.
+case15="$(new_case "$SCRATCH/case15.md")"
+sed -i '/^| 8 | R026 | S06 |/a\| 9 | R026 | S06 | cargo test --locked |' "$case15"
+assert_mutated "M005 out-of-range row" "$case1" "$case15"
+rc=0
+run_checker "$case15" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: out-of-range M005 trace row should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'M005 table' "$CHECK_LOG" \
+    || { echo "FAIL: out-of-range M005 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: out-of-range M005 trace row rejected"
 
 # --- Canonical registry must be untouched --------------------------------
 cmp -s "$PRISTINE" "$REGISTRY" \
