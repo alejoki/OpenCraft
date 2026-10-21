@@ -163,13 +163,57 @@ pub fn synth_ui_click() -> Vec<f32> {
     out
 }
 
+/// One decoded sound, interleaved as f32 with its own channel count and sample
+/// rate.
+///
+/// Pack sounds (S05) can be mono 22 050 Hz OGG or stereo 48 000 Hz WAV, so the
+/// engine carries the metadata per buffer instead of assuming the synthesized
+/// stereo 44 100 Hz shape. rodio's `Mixer::add` wraps every source in
+/// `UniformSourceIterator`, which converts rate and channels; the engine never
+/// resamples itself.
+///
+/// Deliberately no `Eq` derive: `f32` has no `Eq`, so this type must never end
+/// up inside `LoadedPack` (which derives `Eq`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundBuffer {
+    samples: Vec<f32>,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl SoundBuffer {
+    /// Builds a buffer from interleaved f32 samples and their format.
+    pub fn new(samples: Vec<f32>, channels: u16, sample_rate: u32) -> Self {
+        Self {
+            samples,
+            channels,
+            sample_rate,
+        }
+    }
+
+    /// Interleaved f32 samples.
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    /// Channel count of `samples` (1 = mono, 2 = stereo, ...).
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Sample rate of `samples` in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
 /// The four built-in fallback buffers, indexed by [`SoundSlot::index`].
-pub fn default_buffers() -> [Vec<f32>; 4] {
+pub fn default_buffers() -> [SoundBuffer; 4] {
     [
-        synth_break(),
-        synth_place(),
-        synth_mine_complete(),
-        synth_ui_click(),
+        SoundBuffer::new(synth_break(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_place(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_mine_complete(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_ui_click(), CHANNELS, SAMPLE_RATE),
     ]
 }
 
@@ -185,7 +229,7 @@ pub fn default_buffers() -> [Vec<f32>; 4] {
 /// synchronization.
 pub struct AudioEngine {
     sink: Option<MixerDeviceSink>,
-    buffers: [Vec<f32>; 4],
+    buffers: [SoundBuffer; 4],
 }
 
 impl AudioEngine {
@@ -220,6 +264,18 @@ impl AudioEngine {
         self.sink.is_none()
     }
 
+    /// Replaces every slot buffer, e.g. with pack overrides or the synthesized
+    /// defaults. Works on a disabled engine (`sink: None`): no device is needed
+    /// to swap buffers, which keeps headless tests and startup ordering simple.
+    pub fn set_buffers(&mut self, buffers: [SoundBuffer; 4]) {
+        self.buffers = buffers;
+    }
+
+    /// Read accessor for one slot's buffer metadata/samples.
+    pub fn buffer(&self, slot: SoundSlot) -> &SoundBuffer {
+        &self.buffers[slot.index()]
+    }
+
     /// Plays one sound slot at `volume_percent` (0-100; values above 100 are
     /// clamped). 0 mutes outright.
     pub fn play(&self, slot: SoundSlot, volume_percent: u8) {
@@ -229,15 +285,13 @@ impl AudioEngine {
         let Some(sink) = self.sink.as_ref() else {
             return;
         };
-        let channels = ChannelCount::new(CHANNELS).expect("CHANNELS is nonzero");
-        let sample_rate = SampleRate::new(SAMPLE_RATE).expect("SAMPLE_RATE is nonzero");
+        let buffer = &self.buffers[slot.index()];
+        let channels = ChannelCount::new(buffer.channels).expect("buffer channels are nonzero");
+        let sample_rate =
+            SampleRate::new(buffer.sample_rate).expect("buffer sample rate is nonzero");
         let volume = f32::from(volume_percent.min(100)) / 100.0;
-        let source = SamplesBuffer::new(
-            channels,
-            sample_rate,
-            self.buffers[slot.index()].clone(),
-        )
-        .amplify_normalized(volume);
+        let source = SamplesBuffer::new(channels, sample_rate, buffer.samples.clone())
+            .amplify_normalized(volume);
         sink.mixer().add(source);
     }
 }
@@ -335,6 +389,91 @@ mod tests {
         assert_eq!(SoundSlot::UiClick.name(), "ui_click");
         for (index, slot) in SoundSlot::ALL.iter().enumerate() {
             assert_eq!(slot.index(), index);
+        }
+    }
+
+    #[test]
+    fn default_buffers_carry_stereo_44100_metadata() {
+        let buffers = default_buffers();
+        for (index, buffer) in buffers.iter().enumerate() {
+            assert_eq!(buffer.channels(), CHANNELS, "slot {index} channels");
+            assert_eq!(
+                buffer.sample_rate(),
+                SAMPLE_RATE,
+                "slot {index} sample rate"
+            );
+            assert!(
+                !buffer.samples().is_empty(),
+                "slot {index} has no samples"
+            );
+            assert_eq!(
+                buffer.samples().len() % buffer.channels() as usize,
+                0,
+                "slot {index} has a partial frame"
+            );
+            for (i, sample) in buffer.samples().iter().enumerate() {
+                assert!(
+                    sample.is_finite(),
+                    "slot {index} sample {i} is not finite: {sample}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_buffers_match_the_synth_functions() {
+        let buffers = default_buffers();
+        assert_eq!(buffers[SoundSlot::Break.index()].samples(), synth_break());
+        assert_eq!(buffers[SoundSlot::Place.index()].samples(), synth_place());
+        assert_eq!(
+            buffers[SoundSlot::MineComplete.index()].samples(),
+            synth_mine_complete()
+        );
+        assert_eq!(
+            buffers[SoundSlot::UiClick.index()].samples(),
+            synth_ui_click()
+        );
+    }
+
+    #[test]
+    fn set_buffers_swaps_per_slot_metadata_on_a_disabled_engine() {
+        let mut engine = AudioEngine::disabled();
+        assert!(engine.is_silent());
+        let custom = [
+            SoundBuffer::new(vec![0.1, -0.1, 0.2], 1, 22_050),
+            SoundBuffer::new(vec![0.3, 0.4], 2, 48_000),
+            SoundBuffer::new(vec![0.0; 4], 2, SAMPLE_RATE),
+            SoundBuffer::new(vec![-0.5], 1, 8_000),
+        ];
+        engine.set_buffers(custom.clone());
+        for slot in SoundSlot::ALL {
+            let buffer = engine.buffer(slot);
+            assert_eq!(*buffer, custom[slot.index()], "slot {slot:?} mismatch");
+        }
+        assert_eq!(engine.buffer(SoundSlot::Break).channels(), 1);
+        assert_eq!(engine.buffer(SoundSlot::Break).sample_rate(), 22_050);
+        assert_eq!(engine.buffer(SoundSlot::Place).sample_rate(), 48_000);
+        assert!(engine.is_silent(), "swapping buffers must not open a device");
+    }
+
+    #[test]
+    fn set_buffers_and_play_never_panics_on_a_disabled_engine() {
+        let mut engine = AudioEngine::disabled();
+        engine.set_buffers([
+            SoundBuffer::new(vec![0.0, 0.0], 1, 22_050),
+            SoundBuffer::new(Vec::new(), 1, 44_100),
+            SoundBuffer::new(vec![0.0; 3], 2, 48_000),
+            SoundBuffer::new(vec![0.25], 1, 8_000),
+        ]);
+        for slot in SoundSlot::ALL {
+            engine.play(slot, 0);
+            engine.play(slot, 100);
+            engine.play(slot, 255);
+        }
+        engine.set_buffers(default_buffers());
+        for slot in SoundSlot::ALL {
+            engine.play(slot, 0);
+            engine.play(slot, 100);
         }
     }
 }
