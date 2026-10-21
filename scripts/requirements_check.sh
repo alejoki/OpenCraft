@@ -4,17 +4,17 @@
 # Validates the checked-in REQUIREMENTS-REGISTRY.md:
 #   1. the registry file exists,
 #   2. every "### R### — ..." record parses into the eight contract bullets,
-#   3. exactly R001-R020 appear once each, with no duplicate or malformed IDs,
+#   3. exactly R001-R026 appear once each, with no duplicate or malformed IDs,
 #   4. required fields are non-empty and Status is exactly "active",
-#   5. ownership follows M001/M002 for R001-R004, M003 for R005-R015, and
-#      M004 for R016-R020,
-#   6. every M003 and M004 slice is covered by at least one mapped record,
-#   7. the M003 (criteria 1-5) and M004 (criteria 1-7) criterion trace tables
-#      are parsed section-scoped and match their expected requirement/slice
-#      mappings with non-empty evidence,
+#   5. ownership follows M001/M002 for R001-R004, M003 for R005-R015,
+#      M004 for R016-R020, and M005 for R021-R026,
+#   6. every M003, M004, and M005 slice is covered by at least one mapped record,
+#   7. the M003 (criteria 1-5), M004 (criteria 1-7), and M005 (criteria 1-8)
+#      criterion trace tables are parsed section-scoped and match their expected
+#      requirement/slice mappings with non-empty evidence,
 #   8. the shipped identity surface (manifest, lockfile, src, scripts) contains
 #      no legacy project-name reference, in any case or separator form,
-#   9. both validated criterion trace tables are printed.
+#   9. all three validated criterion trace tables are printed.
 #
 # REQUIREMENTS_FILE overrides the registry path (used by the negative-path
 # selftest). The default is <repo-root>/REQUIREMENTS-REGISTRY.md.
@@ -52,7 +52,8 @@ pass "registry file exists: $REGISTRY"
 record_tmp="$(mktemp)"
 criteria_m3_tmp="$(mktemp)"
 criteria_m4_tmp="$(mktemp)"
-trap 'rm -f "$record_tmp" "$criteria_m3_tmp" "$criteria_m4_tmp"' EXIT
+criteria_m5_tmp="$(mktemp)"
+trap 'rm -f "$record_tmp" "$criteria_m3_tmp" "$criteria_m4_tmp" "$criteria_m5_tmp"' EXIT
 
 # ---------------------------------------------------------------------------
 # 2. Parse each record heading and its contract bullets.
@@ -84,7 +85,7 @@ END { flush() }
 ' "$REGISTRY" > "$record_tmp"
 
 # ---------------------------------------------------------------------------
-# 3. Exactly 20 unique R001-R020 records.
+# 3. Exactly 26 unique R001-R026 records.
 # ---------------------------------------------------------------------------
 declare -A seen=()
 declare -A class_of=()
@@ -114,14 +115,14 @@ while IFS='|' read -r id class status desc why src own supp val; do
     record_count=$((record_count + 1))
 done < "$record_tmp"
 
-[[ "$record_count" -eq 20 ]] || fail "expected 20 requirement records, found $record_count"
+[[ "$record_count" -eq 26 ]] || fail "expected 26 requirement records, found $record_count"
 
-for n in $(seq 1 20); do
+for n in $(seq 1 26); do
     id="$(printf 'R%03d' "$n")"
     [[ -n "${seen[$id]:-}" ]] || fail "missing requirement record: $id"
 done
 
-pass "20 requirement records R001-R020 present exactly once with unique IDs"
+pass "26 requirement records R001-R026 present exactly once with unique IDs"
 
 # ---------------------------------------------------------------------------
 # 4. Required fields are non-empty; Status is exactly "active".
@@ -139,7 +140,8 @@ done
 pass "all records carry non-empty Class/Description/Why/Source/Owner/Validation and Status active"
 
 # ---------------------------------------------------------------------------
-# 5. Ownership: R001-R004 -> M001 or M002; R005-R015 -> M003; R016-R020 -> M004.
+# 5. Ownership: R001-R004 -> M001 or M002; R005-R015 -> M003; R016-R020 -> M004;
+#    R021-R026 -> M005.
 # ---------------------------------------------------------------------------
 for n in $(seq 1 4); do
     id="$(printf 'R%03d' "$n")"
@@ -161,7 +163,14 @@ for n in $(seq 16 20); do
     [[ "$text" == *"M004"* ]] \
         || fail "$id is not owned by M004 (owner/supporting: '$text')"
 done
-pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, and M004 for R016-R020"
+
+for n in $(seq 21 26); do
+    id="$(printf 'R%03d' "$n")"
+    text="${owner_of[$id]} ${supp_of[$id]}"
+    [[ "$text" == *"M005"* ]] \
+        || fail "$id is not owned by M005 (owner/supporting: '$text')"
+done
+pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, M004 for R016-R020, and M005 for R021-R026"
 
 # ---------------------------------------------------------------------------
 # 6. M003 slice coverage. A mapping counts when the slice token appears in the
@@ -213,14 +222,25 @@ has_slice R020 M004/S05 || fail "no requirement maps to M004/S05 (expected R020)
 pass "M004 slices S01-S05 are each mapped to at least one requirement"
 
 # ---------------------------------------------------------------------------
+# 6c. M005 slice coverage.
+# ---------------------------------------------------------------------------
+has_slice R021 M005/S01 || fail "no requirement maps to M005/S01 (expected R021)"
+has_slice R022 M005/S02 || fail "no requirement maps to M005/S02 (expected R022)"
+has_slice R023 M005/S02 || fail "no requirement maps to M005/S02 (expected R023)"
+has_slice R024 M005/S04 || fail "no requirement maps to M005/S04 (expected R024)"
+has_slice R025 M005/S05 || fail "no requirement maps to M005/S05 (expected R025)"
+has_slice R026 M005/S06 || fail "no requirement maps to M005/S06 (expected R026)"
+pass "M005 slices S01-S06 are each mapped to at least one requirement"
+
+# ---------------------------------------------------------------------------
 # 7. Criterion trace tables, parsed section-scoped.
 #
-# A whole-file /^\| [1-5] \|/ match would collide because both the M003 and
-# M004 tables restart their criterion numbers at 1. Track the current table by
-# its exact heading, reset on any other "## " heading ("### R###" record
+# A whole-file /^\| [1-5] \|/ match would collide because the M003, M004 and
+# M005 tables all restart their criterion numbers at 1. Track the current table
+# by its exact heading, reset on any other "## " heading ("### R###" record
 # headings do not match), and enforce each table's own criterion range.
 # ---------------------------------------------------------------------------
-awk -F'|' -v m3="$criteria_m3_tmp" -v m4="$criteria_m4_tmp" '
+awk -F'|' -v m3="$criteria_m3_tmp" -v m4="$criteria_m4_tmp" -v m5="$criteria_m5_tmp" '
 function emit(c, r, s, e, dest) {
     gsub(/[[:space:]]/, "", c)
     gsub(/[[:space:]]/, "", r)
@@ -231,6 +251,7 @@ function emit(c, r, s, e, dest) {
 }
 /^## M003 Criterion Trace/ { section = "m3"; next }
 /^## M004 Criterion Trace/ { section = "m4"; next }
+/^## M005 Criterion Trace/ { section = "m5"; next }
 /^## /                    { section = ""; next }
 /^\| [0-9]+ \|/ {
     if (section == "") next
@@ -243,17 +264,24 @@ function emit(c, r, s, e, dest) {
             next
         }
         emit($2, $3, $4, $5, m3)
-    } else {
+    } else if (section == "m4") {
         if (c + 0 < 1 || c + 0 > 7) {
             print "ERROR: criterion row out of range in M004 table: " c > "/dev/stderr"
             bad = 1
             next
         }
         emit($2, $3, $4, $5, m4)
+    } else if (section == "m5") {
+        if (c + 0 < 1 || c + 0 > 8) {
+            print "ERROR: criterion row out of range in M005 table: " c > "/dev/stderr"
+            bad = 1
+            next
+        }
+        emit($2, $3, $4, $5, m5)
     }
 }
 END { exit bad ? 1 : 0 }
-' "$REGISTRY" || fail "criterion trace row out of range (M003 allows 1-5, M004 allows 1-7)"
+' "$REGISTRY" || fail "criterion trace row out of range (M003 allows 1-5, M004 allows 1-7, M005 allows 1-8)"
 
 declare -A crit_req=()
 declare -A crit_sl=()
@@ -364,6 +392,61 @@ for c in 1 2 3 4 5 6 7; do
 done
 pass "M004 criterion trace rows 1-7 match expected requirement/slice mappings with evidence"
 
+declare -A crit5_req=()
+declare -A crit5_sl=()
+declare -A crit5_ev=()
+declare -A crit5_count=()
+
+while IFS='|' read -r c r s e; do
+    [[ -n "$c" ]] || continue
+    crit5_count[$c]=$(( ${crit5_count[$c]:-0} + 1 ))
+    crit5_req[$c]="$r"
+    crit5_sl[$c]="$s"
+    crit5_ev[$c]="$e"
+done < "$criteria_m5_tmp"
+
+declare -A expected_req_m5=(
+    [1]="R022"
+    [2]="R021"
+    [3]="R023"
+    [4]="R024"
+    [5]="R025"
+    [6]="R024"
+    [7]="R022"
+    [8]="R026"
+)
+declare -A expected_sl_m5=(
+    [1]="S02,S03"
+    [2]="S01"
+    [3]="S02"
+    [4]="S04"
+    [5]="S05"
+    [6]="S04"
+    [7]="S02,S03"
+    [8]="S06"
+)
+
+for c in 1 2 3 4 5 6 7 8; do
+    [[ "${crit5_count[$c]:-0}" -eq 1 ]] \
+        || fail "M005 criterion $c must have exactly one trace row, found ${crit5_count[$c]:-0}"
+    [[ "${crit5_req[$c]}" == "${expected_req_m5[$c]}" ]] \
+        || fail "M005 criterion $c requirements must be '${expected_req_m5[$c]}', got '${crit5_req[$c]}'"
+    [[ "${crit5_sl[$c]}" == "${expected_sl_m5[$c]}" ]] \
+        || fail "M005 criterion $c slices must be '${expected_sl_m5[$c]}', got '${crit5_sl[$c]}'"
+    [[ -n "${crit5_ev[$c]}" ]] \
+        || fail "M005 criterion $c has an empty Evidence cell"
+
+    IFS=',' read -r -a refs <<< "${crit5_req[$c]}"
+    for rid in "${refs[@]}"; do
+        [[ -n "${seen[$rid]:-}" ]] \
+            || fail "M005 criterion $c references unknown requirement: $rid"
+        text="${owner_of[$rid]} ${supp_of[$rid]}"
+        [[ "$text" == *"M005"* ]] \
+            || fail "M005 criterion $c references requirement $rid which is not M005-owned"
+    done
+done
+pass "M005 criterion trace rows 1-8 match expected requirement/slice mappings with evidence"
+
 # ---------------------------------------------------------------------------
 # 8. Shipped identity. The legacy project name must not survive anywhere in
 #    the manifest, lockfile, source, or scripts. The pattern accepts hyphen,
@@ -389,7 +472,7 @@ done
 pass "shipped identity is opencraft with no legacy project-name references"
 
 # ---------------------------------------------------------------------------
-# 9. Print both validated criterion trace tables.
+# 9. Print all three validated criterion trace tables.
 # ---------------------------------------------------------------------------
 echo
 echo "M003 Criterion Trace"
@@ -402,6 +485,12 @@ echo "M004 Criterion Trace"
 printf '%-10s %-27s %-9s %s\n' "Criterion" "Requirements" "Slices" "Evidence"
 for c in 1 2 3 4 5 6 7; do
     printf '%-10s %-27s %-9s %s\n' "$c" "${crit4_req[$c]}" "${crit4_sl[$c]}" "${crit4_ev[$c]}"
+done
+echo
+echo "M005 Criterion Trace"
+printf '%-10s %-27s %-9s %s\n' "Criterion" "Requirements" "Slices" "Evidence"
+for c in 1 2 3 4 5 6 7 8; do
+    printf '%-10s %-27s %-9s %s\n' "$c" "${crit5_req[$c]}" "${crit5_sl[$c]}" "${crit5_ev[$c]}"
 done
 echo
 

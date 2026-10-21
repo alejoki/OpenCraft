@@ -205,6 +205,66 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: None
 - Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; bash scripts/pack_smoke.sh
 
+### R021 — Sky-light occlusion: 15-level propagated sky light with per-vertex terrain lighting keeps caves and overhangs genuinely dark at any time of day with no visible chunk-border seams
+- Class: core-capability
+- Status: active
+- Description: Sky-light occlusion: 15-level propagated sky light with per-vertex terrain lighting keeps caves and overhangs genuinely dark at any time of day with no visible chunk-border seams.
+- Why it matters: Darkness must come from real occlusion of world geometry, not uniform dimming, so caves read as caves and the world stays honest at every hour.
+- Source: M005 / S01 skylight propagation
+- Primary owning slice: M005/S01
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::light; cargo test --locked --lib -- world::manager
+
+### R022 — Day/night cycle visuals: a 20-real-minute game-time cycle wheels interpolated sky and fog colors, sun and moon quads, a night star field, and terrain dimming down to the roughly one-third moonlit floor and back, with the main-menu vista pinned at a fixed golden hour
+- Class: quality-attribute
+- Status: active
+- Description: Day/night cycle visuals: a 20-real-minute game-time cycle wheels interpolated sky and fog colors, sun and moon quads, a night star field, and terrain dimming down to the roughly one-third moonlit floor and back, with the main-menu vista pinned at a fixed golden hour.
+- Why it matters: The sky must visibly live through a full day — a wheeling cycle sells the world while the moonlit floor keeps night readable before torches exist.
+- Source: M005 / S02 day cycle and S03 sky pass
+- Primary owning slice: M005/S02
+- Supporting slices: M005/S03
+- Validation: cargo test --locked --lib -- world::daycycle; cargo test --locked --lib -- render::sky; cargo test --locked --bin opencraft
+
+### R023 — Honest game-time clock: it advances only while Playing, freezes in every menu and pause, wraps at cycle end, and persists per world as a SAVE_VERSION 3 time-of-day field with v1/v2 migration to default noon, so Save-and-Quit resumes the exact time of day
+- Class: continuity
+- Status: active
+- Description: Honest game-time clock: it advances only while Playing, freezes in every menu and pause, wraps at cycle end, and persists per world as a SAVE_VERSION 3 time-of-day field with v1/v2 migration to default noon, so Save-and-Quit resumes the exact time of day.
+- Why it matters: A paused or closed world must be a frozen world — game time is world state, never wall-clock (D013), and relaunching must resume where the player left off.
+- Source: M005 / S02 game-time clock
+- Primary owning slice: M005/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::session; cargo test --locked --bin opencraft
+
+### R024 — Audio layer: a fail-soft rodio engine plays discrete synthesized break, place, mining-complete and UI-click sounds, and the Volume row (0-100 percent in 10 percent steps) live-applies, atomically saves, persists across restart, and mutes at 0 percent; a machine with no or blocked audio device launches and plays silently
+- Class: core-capability
+- Status: active
+- Description: Audio layer: a fail-soft rodio engine plays discrete synthesized break, place, mining-complete and UI-click sounds, and the Volume row (0-100 percent in 10 percent steps) live-applies, atomically saves, persists across restart, and mutes at 0 percent; a machine with no or blocked audio device launches and plays silently.
+- Why it matters: Sound is a core sensory channel and volume must be a first-class persistent setting; audio failure must never block launch or surface an error state.
+- Source: M005 / S04 audio engine
+- Primary owning slice: M005/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- audio::; cargo test --locked --lib -- settings::; bash scripts/launch_smoke.sh
+
+### R025 — Pack-loadable sound overrides: pack sound files override the synthesized defaults per slot with never-fail fallback (missing is silent; corrupt, oversized or empty warns in-menu and keeps the default), live apply on Texture Pack cycling, and Default restore of the built-in sounds
+- Class: differentiator
+- Status: active
+- Description: Pack-loadable sound overrides: pack sound files override the synthesized defaults per slot with never-fail fallback (missing is silent; corrupt, oversized or empty warns in-menu and keeps the default), live apply on Texture Pack cycling, and Default restore of the built-in sounds.
+- Why it matters: Every sound must be moddable content, not code (D015), and no pack file state may ever block launch.
+- Source: M005 / S05 pack sounds
+- Primary owning slice: M005/S05
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- pack::sound; bash scripts/pack_smoke.sh
+
+### R026 — M005 closure surface: registry rows R021-R026, the M005 criterion trace, four green smoke harnesses, and recorded human UAT for the human-sensory criteria
+- Class: admin/support
+- Status: active
+- Description: M005 closure surface: registry rows R021-R026, the M005 criterion trace, four green smoke harnesses, and recorded human UAT for the human-sensory criteria.
+- Why it matters: Milestone validation must trace every M005 criterion to stable registry IDs and the sensory outcomes need recorded human judgment.
+- Source: M005 / S06 closure
+- Primary owning slice: M005/S06
+- Supporting slices: None
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -226,3 +286,16 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 5 | R016, R017, R018, R019 | S01, S02, S03, S04 | cargo test --locked |
 | 6 | R014, R020 | S05 | bash scripts/launch_smoke.sh && bash scripts/menu_smoke.sh && bash scripts/settings_smoke.sh && bash scripts/pack_smoke.sh && bash scripts/requirements_check.sh |
 | 7 | R020 | S05 | docs/TEXTURE-PACKS.md quickstart reader-test in bash scripts/pack_smoke.sh |
+
+## M005 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R022 | S02, S03 | cargo test --locked --lib -- world::daycycle && cargo test --locked --lib -- render::sky && bounded --time-scale 60 full-cycle run |
+| 2 | R021 | S01 | cargo test --locked --lib -- world::light && cargo test --locked --lib -- world::manager |
+| 3 | R023 | S02 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session && cargo test --locked --bin opencraft |
+| 4 | R024 | S04 | cargo test --locked --lib -- audio:: && cargo test --locked --lib -- settings:: && cargo test --locked --bin opencraft |
+| 5 | R025 | S05 | cargo test --locked --lib -- pack::sound && bash scripts/pack_smoke.sh |
+| 6 | R024 | S04 | injected no-device unit proof && bash scripts/launch_smoke.sh |
+| 7 | R022 | S02, S03 | cargo test --locked --lib -- world::daycycle && vista golden-hour wiring pins |
+| 8 | R026 | S06 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && recorded human UAT |
