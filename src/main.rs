@@ -56,7 +56,7 @@ use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
-    SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH,
+    SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 
@@ -673,6 +673,76 @@ struct Ready {
     hotbar_counts: [StatsOverlay; HOTBAR_SLOTS],
 }
 
+/// Bounded accelerated-demo watch (S02-T04): `--time-scale` is a test seam
+/// for observing a full day cycle. Sums the game-time ticks actually
+/// advanced by the frame loop and reports completion once one whole
+/// `DAY_TICKS` cycle has elapsed. Frame-rate independent because it reads
+/// the clock, not the wall time.
+#[derive(Debug)]
+struct DemoCycleWatch {
+    remaining_ticks: u32,
+    last_time_of_day: u32,
+}
+
+impl DemoCycleWatch {
+    fn new(time_of_day: u32) -> Self {
+        Self {
+            remaining_ticks: daycycle::DAY_TICKS,
+            last_time_of_day: time_of_day % daycycle::DAY_TICKS,
+        }
+    }
+
+    /// Feed one frame's time of day. Returns true exactly when the summed
+    /// advance reaches a full cycle (wrap-safe at the cycle boundary).
+    fn observe(&mut self, time_of_day: u32) -> bool {
+        let time_of_day = time_of_day % daycycle::DAY_TICKS;
+        let delta =
+            (time_of_day + daycycle::DAY_TICKS - self.last_time_of_day) % daycycle::DAY_TICKS;
+        self.last_time_of_day = time_of_day;
+        self.remaining_ticks = self.remaining_ticks.saturating_sub(delta);
+        self.remaining_ticks == 0
+    }
+}
+
+/// Arm/observe the bounded accelerated demo in one place, shared by the
+/// RedrawRequested pass and its headless tests. Never arms at the default
+/// 1.0 scale (a normal run is unbounded) and never counts paused frames
+/// (the clock itself is frozen there).
+fn observe_demo_cycle(
+    watch: &mut Option<DemoCycleWatch>,
+    time_scale: f32,
+    playing: bool,
+    time_of_day: u32,
+) -> bool {
+    if !playing || time_scale <= DEFAULT_TIME_SCALE {
+        return false;
+    }
+    match watch {
+        Some(watch) => watch.observe(time_of_day),
+        None => {
+            *watch = Some(DemoCycleWatch::new(time_of_day));
+            false
+        }
+    }
+}
+
+/// Extra wall-clock allowance on top of one accelerated cycle before the
+/// bounded demo shuts down even if no redraws are being delivered.
+const DEMO_SHUTDOWN_GRACE_SECS: f32 = 5.0;
+
+/// Wall-clock safety net for a bounded accelerated run: one full cycle at
+/// the given scale plus a small grace for startup. The frame-driven
+/// [`DemoCycleWatch`] is the primary completion signal; this deadline keeps
+/// the run bounded even if the compositor stops delivering redraws.
+/// `None` at the default scale (a normal run is unbounded).
+fn demo_shutdown_deadline(time_scale: f32) -> Option<Instant> {
+    if time_scale <= DEFAULT_TIME_SCALE {
+        return None;
+    }
+    let cycle_secs = daycycle::DAY_SECONDS / time_scale;
+    Some(Instant::now() + Duration::from_secs_f32(cycle_secs + DEMO_SHUTDOWN_GRACE_SECS))
+}
+
 struct GameApp {
     window: Option<Arc<Window>>,
     gpu: Option<Ready>,
@@ -774,9 +844,36 @@ struct GameApp {
     /// the built-in procedural Default pack (MEM113). Never holds a
     /// half-loaded pack: `load_pack_by_name` always returns usable layers.
     current_pack: Option<LoadedPack>,
+    /// Clock acceleration from `--time-scale` (S02-T04): an app-level
+    /// setting like FOV, NOT session state — the session clock stays
+    /// world-swappable through `start_world_session`, and every session
+    /// carries its own correct `time_of_day`. Passed per frame to
+    /// `GameClock::tick`, so the clock itself stays config-free.
+    time_scale: f32,
+    /// Bounded accelerated-demo watch (S02-T04): armed on the first Playing
+    /// frame of an accelerated run, cleared when one full cycle has been
+    /// observed. `demo_finished` is then latched so `about_to_wait` can
+    /// perform the shutdown (the RedrawRequested region already holds
+    /// disjoint `gpu`/`window` borrows).
+    demo_cycle: Option<DemoCycleWatch>,
+    demo_finished: bool,
+    /// Wall-clock safety net for the bounded accelerated demo (S02-T04):
+    /// armed only when the launch starts directly in Playing with an
+    /// accelerated scale. `None` for every normal run.
+    demo_shutdown_deadline: Option<Instant>,
 }
 
 impl GameApp {
+    /// Clean shutdown shared by the window-close path and the bounded
+    /// accelerated demo: persist the world and settings, then leave the
+    /// loop. Save errors are ignored — the process is exiting and there is
+    /// no menu left to display them in.
+    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        let _ = save_current_world(&mut self.session);
+        let _ = self.settings.save(&self.settings_path);
+        event_loop.exit();
+    }
+
     fn new(cli: CliConfig, mut session: WorldSession) -> Self {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
@@ -804,6 +901,15 @@ impl GameApp {
             LifecycleScreen::Playing
         } else {
             LifecycleScreen::MainMenu
+        };
+        // Bounded accelerated demo (S02-T04): a direct-launch gameplay run
+        // with `--time-scale > 1` carries a wall-clock deadline as a safety
+        // net. Menu-first launches stay unbounded until gameplay begins (the
+        // frame-driven cycle watch still completes them).
+        let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
+            demo_shutdown_deadline(cli.time_scale)
+        } else {
+            None
         };
         // The loaded Settings are the single source of truth for video
         // parameters: FOV applies to the session's camera at startup, and
@@ -857,6 +963,10 @@ impl GameApp {
             packs_root,
             available_packs,
             current_pack,
+            time_scale: cli.time_scale,
+            demo_cycle: None,
+            demo_finished: false,
+            demo_shutdown_deadline,
         }
     }
 
@@ -1613,14 +1723,13 @@ impl ApplicationHandler for GameApp {
 
         match event {
             WindowEvent::CloseRequested => {
-                let _ = save_current_world(&mut self.session);
+                // Save-first shutdown: world + settings, then leave the loop.
                 // Crash-safety settings save on quit: every accepted change
                 // already saved immediately, so this only catches anything
                 // not yet persisted (e.g. a hand-edited in-memory state).
                 // Save errors are ignored here — the process is exiting and
                 // there is no menu left to display them in.
-                let _ = self.settings.save(&self.settings_path);
-                event_loop.exit();
+                self.shutdown(event_loop);
             }
             WindowEvent::Focused(false) => {
                 self.input.reset();
@@ -1959,6 +2068,32 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Game time (S02-T04): advance only on Playing frames, before
+                // the player update, with the app-owned acceleration scale.
+                // The same two lines as `GameApp::tick_clock` (which the
+                // integration tests drive); inlined here because `gpu` and
+                // `window` already hold disjoint `self` borrows across this
+                // region, so a `&mut self` method call cannot be used.
+                self.session.clock.tick(playing, now, self.time_scale);
+                // Bounded accelerated demo (S02-T04): `--time-scale` is a
+                // test seam, so an accelerated run self-terminates after
+                // exactly one full day cycle and exits cleanly (status 0).
+                // That makes completion a health signal the harness can read
+                // directly, instead of inferring it from an external
+                // timeout kill. The exit itself is deferred to
+                // `about_to_wait` because `gpu`/`window` borrows span this
+                // region; only plain fields are touched here.
+                if !self.demo_finished
+                    && observe_demo_cycle(
+                        &mut self.demo_cycle,
+                        self.time_scale,
+                        playing,
+                        self.session.clock.time_of_day,
+                    )
+                {
+                    self.demo_cycle = None;
+                    self.demo_finished = true;
+                }
                 // Vista discriminator (M004/S02): the single `vista_visible`
                 // truth source — true only for the main-menu cluster. Pause,
                 // Settings-from-pause, and Playing keep rendering the session
@@ -2495,6 +2630,28 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Bounded accelerated demo completed: the last frame latched
+        // `demo_finished`; persist and leave the loop with status 0. Checked
+        // here rather than in RedrawRequested because the render region
+        // holds disjoint `gpu`/`window` borrows and a whole-`self` shutdown
+        // call cannot coexist with them.
+        if self.demo_finished {
+            self.shutdown(event_loop);
+            return;
+        }
+
+        // Wall-clock safety net: if redraws stall, the accelerated run still
+        // ends after one cycle plus grace instead of relying on an external
+        // timeout kill.
+        if self
+            .demo_shutdown_deadline
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(false)
+        {
+            self.shutdown(event_loop);
+            return;
+        }
+
         let Some(window) = &self.window else {
             return;
         };
@@ -2842,6 +2999,21 @@ mod tests {
             "--save",
             "other.mcvx"
         ])));
+        // `--time-scale` is a test seam, NOT a world intent: a bare
+        // accelerated launch still opens the main menu.
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--time-scale",
+            "60"
+        ])));
+        let scaled = GameApp::new(
+            CliConfig::parse_args(["--time-scale", "60"]),
+            WorldSession::new_session(9, PathBuf::from("unused.mcvx")),
+        );
+        assert_eq!(scaled.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert_eq!(
+            scaled.time_scale, 60.0,
+            "the CLI scale reaches the app but never forces gameplay"
+        );
         // Every flag together still bypasses (the smoke scripts' launches).
         assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--new",
@@ -2850,6 +3022,247 @@ mod tests {
             "--save",
             "custom.mcvx"
         ])));
+    }
+
+    /// One frame of clock progression exactly as the RedrawRequested pass
+    /// does it: `playing` from the live lifecycle screen, scale from the app.
+    fn tick_app_clock(app: &mut GameApp, now: Instant) {
+        let playing = app.lifecycle.screen() == LifecycleScreen::Playing;
+        app.session.clock.tick(playing, now, app.time_scale);
+    }
+
+    /// A headless Playing app owning a tempdir save path (no window/GPU).
+    fn playing_app(dir: &Path, name: &str) -> GameApp {
+        let save_path = dir.join(name);
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let app = GameApp::new(cli, WorldSession::new_session(11, save_path));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        app
+    }
+
+    #[test]
+    fn game_clock_freezes_while_paused_and_resume_leaks_no_paused_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = playing_app(dir.path(), "freeze.mcvx");
+        let start = Instant::now();
+
+        // First playing frame only arms the marker (zero advance).
+        tick_app_clock(&mut app, start);
+        assert_eq!(
+            app.session.clock.time_of_day,
+            daycycle::DEFAULT_TIME_OF_DAY
+        );
+
+        // One real second at scale 1.0 is 20 ticks.
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+        let before_pause = app.session.clock.time_of_day;
+        assert_eq!(
+            before_pause,
+            (daycycle::DEFAULT_TIME_OF_DAY + 20) % daycycle::DAY_TICKS
+        );
+
+        // Pause: the frame loop keeps ticking the clock with playing=false
+        // across a long simulated wall-clock gap. Game time must not move.
+        app.enter_screen(LifecycleScreen::Pause);
+        tick_app_clock(&mut app, start + Duration::from_secs(2));
+        tick_app_clock(&mut app, start + Duration::from_secs(600));
+        assert_eq!(
+            app.session.clock.time_of_day, before_pause,
+            "paused frames never advance game time"
+        );
+
+        // Resume: `enter_playing` carries NO clock hook; the clock's own
+        // disarm makes the first resumed frame contribute zero, so the 600 s
+        // pause cannot leak. The next frame advances normally again.
+        app.enter_playing();
+        tick_app_clock(&mut app, start + Duration::from_secs(600));
+        assert_eq!(
+            app.session.clock.time_of_day, before_pause,
+            "the first frame after resume contributes zero, no pause leak"
+        );
+        tick_app_clock(&mut app, start + Duration::from_secs(601));
+        assert_eq!(
+            app.session.clock.time_of_day,
+            (before_pause + 20) % daycycle::DAY_TICKS,
+            "normal advance resumes on the second playing frame"
+        );
+    }
+
+    #[test]
+    fn game_clock_wraps_at_cycle_end_under_accelerated_ticks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = playing_app(dir.path(), "wrap.mcvx");
+        app.time_scale = 60.0;
+        app.session.clock =
+            opencraft::world::daycycle::GameClock::from_time(daycycle::DAY_TICKS - 10);
+
+        let start = Instant::now();
+        tick_app_clock(&mut app, start);
+        // 1 s * 60 * 20 ticks/s = 1,200 ticks: crosses the cycle boundary.
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+
+        assert_eq!(
+            app.session.clock.time_of_day,
+            (daycycle::DAY_TICKS - 10 + 1_200) % daycycle::DAY_TICKS
+        );
+        assert!(app.session.clock.time_of_day < daycycle::DAY_TICKS);
+    }
+
+    #[test]
+    fn accelerated_clock_covers_in_seconds_what_scale_one_covers_in_minutes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = playing_app(dir.path(), "scale.mcvx");
+        let start = Instant::now();
+
+        // Scale 1.0 for one second.
+        tick_app_clock(&mut app, start);
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+        let normal_advance = app.session.clock.time_of_day - daycycle::DEFAULT_TIME_OF_DAY;
+
+        // Fresh clock, scale 60 for one second: 60x the ticks.
+        app.session.clock =
+            opencraft::world::daycycle::GameClock::from_time(daycycle::DEFAULT_TIME_OF_DAY);
+        app.time_scale = 60.0;
+        tick_app_clock(&mut app, start);
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+        let accelerated_advance =
+            app.session.clock.time_of_day - daycycle::DEFAULT_TIME_OF_DAY;
+
+        assert_eq!(normal_advance, 20);
+        assert_eq!(accelerated_advance, normal_advance * 60);
+    }
+
+    #[test]
+    fn demo_cycle_watch_completes_after_one_full_day_and_never_arms_at_default_scale() {
+        // A normal (1.0x) run is unbounded: the bounded-demo seam never arms.
+        let mut watch = None;
+        for time in [0, 6_000, 12_000, 18_000, 23_999] {
+            assert!(!observe_demo_cycle(&mut watch, DEFAULT_TIME_SCALE, true, time));
+        }
+        assert!(watch.is_none(), "default scale never starts a demo watch");
+
+        // An accelerated run arms on the first Playing frame and completes
+        // only once a full 24,000-tick cycle has been observed.
+        let mut watch = None;
+        let start = daycycle::DEFAULT_TIME_OF_DAY;
+        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start));
+        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start + 12_000));
+        assert!(!observe_demo_cycle(
+            &mut watch,
+            60.0,
+            true,
+            (start + daycycle::DAY_TICKS - 1) % daycycle::DAY_TICKS
+        ));
+        assert!(observe_demo_cycle(
+            &mut watch,
+            60.0,
+            true,
+            (start + daycycle::DAY_TICKS) % daycycle::DAY_TICKS
+        ));
+    }
+
+    #[test]
+    fn demo_cycle_watch_is_wrap_safe_and_ignores_paused_frames() {
+        let mut watch = Some(DemoCycleWatch::new(daycycle::DAY_TICKS - 10));
+
+        // Paused frames contribute nothing: the real clock is frozen there.
+        assert!(!observe_demo_cycle(
+            &mut watch,
+            60.0,
+            false,
+            daycycle::DAY_TICKS - 10
+        ));
+
+        // 15 ticks across the cycle boundary...
+        assert!(!observe_demo_cycle(&mut watch, 60.0, true, 5));
+        // ...and exactly the remaining ticks complete the full cycle.
+        assert!(observe_demo_cycle(
+            &mut watch,
+            60.0,
+            true,
+            (5 + daycycle::DAY_TICKS - 15) % daycycle::DAY_TICKS
+        ));
+    }
+
+    #[test]
+    fn accelerated_app_run_reaches_the_bounded_demo_cycle_after_twenty_seconds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = playing_app(dir.path(), "demo.mcvx");
+        app.time_scale = 60.0;
+        let start = Instant::now();
+
+        // First Playing frame arms both the clock marker and the demo watch.
+        tick_app_clock(&mut app, start);
+        assert!(!observe_demo_cycle(
+            &mut app.demo_cycle,
+            app.time_scale,
+            true,
+            app.session.clock.time_of_day
+        ));
+
+        // 60x covers the 1,200 s / 24,000-tick cycle in 20 real seconds.
+        let mut frames = 0;
+        let mut finished = false;
+        while frames < 25 && !finished {
+            frames += 1;
+            tick_app_clock(&mut app, start + Duration::from_secs(frames));
+            finished = observe_demo_cycle(
+                &mut app.demo_cycle,
+                app.time_scale,
+                true,
+                app.session.clock.time_of_day,
+            );
+        }
+
+        assert!(
+            finished,
+            "a scale-60 run must complete one full cycle in 20 simulated seconds"
+        );
+        assert_eq!(frames, 20, "24,000 ticks / 1,200 ticks-per-second = 20 s");
+    }
+
+    #[test]
+    fn accelerated_runs_get_a_bounded_wall_clock_shutdown_deadline() {
+        // Default and slower-than-real scales are unbounded normal runs.
+        assert!(demo_shutdown_deadline(DEFAULT_TIME_SCALE).is_none());
+        assert!(demo_shutdown_deadline(0.5).is_none());
+
+        // 60x: a 20 s cycle plus the 5 s redraw-stall grace.
+        let before = Instant::now();
+        let deadline = demo_shutdown_deadline(60.0).expect("accelerated deadline");
+        let after = Instant::now();
+        assert!(deadline >= before + Duration::from_secs(24));
+        assert!(deadline <= after + Duration::from_secs(26));
+    }
+
+    #[test]
+    fn saved_time_of_day_resumes_exactly_across_a_save_and_relaunch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("time.mcvx");
+        let mut app = playing_app(dir.path(), "time.mcvx");
+        app.session.clock =
+            opencraft::world::daycycle::GameClock::from_time(17_432);
+        assert_ne!(17_432, daycycle::DEFAULT_TIME_OF_DAY);
+
+        // The real save path writes `session.clock.time_of_day`.
+        save_current_world(&mut app.session).expect("save succeeds");
+
+        // Session-level relaunch: load the file, round-trip it through the
+        // bytes API, and rebuild a session the way startup does.
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let mut bytes = Vec::new();
+        opencraft::world::persistence::save_world_to_bytes(&mut bytes, &loaded)
+            .expect("re-save to bytes");
+        let decoded = opencraft::world::persistence::load_world_from_bytes(&bytes)
+            .expect("bytes load succeeds");
+        let relaunched = WorldSession::session_from_save(decoded, save_path.clone());
+
+        assert_eq!(relaunched.clock.time_of_day, 17_432);
+        assert_eq!(relaunched.save_path, save_path);
     }
 
     /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,

@@ -18,11 +18,23 @@ pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
 pub const TIME_OF_DAY_VERSION: u32 = 3;
 
+/// Default acceleration scale for the game clock: 1.0 is the real 20-real-minute
+/// cycle. `--time-scale` overrides it (a test seam for observing a full cycle in
+/// a bounded run, MEM146).
+pub const DEFAULT_TIME_SCALE: f32 = 1.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CliConfig {
     pub save_path: PathBuf,
     pub seed_override: Option<u32>,
     pub force_new_world: bool,
+    /// Clock acceleration multiplier from `--time-scale` (app-level setting,
+    /// not a world intent — it never affects `cli_has_world_intent`). A value
+    /// above 1.0 is the MEM146 test seam for observing a full cycle in a
+    /// bounded run: the accelerated run saves and exits cleanly (status 0)
+    /// after exactly one day cycle, so completion is a health signal rather
+    /// than an external timeout kill.
+    pub time_scale: f32,
 }
 
 impl CliConfig {
@@ -34,6 +46,7 @@ impl CliConfig {
         let mut save_path = PathBuf::from(DEFAULT_SAVE_PATH);
         let mut seed_override = None;
         let mut force_new_world = false;
+        let mut time_scale = DEFAULT_TIME_SCALE;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -50,6 +63,17 @@ impl CliConfig {
                         }
                     }
                 }
+                "--time-scale" => {
+                    // Lenient like the other value flags: a missing, non-numeric,
+                    // or non-positive value keeps the default scale.
+                    if let Some(val) = iter.next() {
+                        if let Ok(parsed) = val.as_ref().parse::<f32>() {
+                            if parsed.is_finite() && parsed > 0.0 {
+                                time_scale = parsed;
+                            }
+                        }
+                    }
+                }
                 "--new" | "--new-world" => {
                     force_new_world = true;
                 }
@@ -61,6 +85,7 @@ impl CliConfig {
             save_path,
             seed_override,
             force_new_world,
+            time_scale,
         }
     }
 }
@@ -769,10 +794,47 @@ mod tests {
 
     #[test]
     fn test_cli_args_parsing() {
-        let cfg = CliConfig::parse_args(["--seed", "999", "--save", "custom.mcvx", "--new"]);
+        let cfg = CliConfig::parse_args([
+            "--seed",
+            "999",
+            "--save",
+            "custom.mcvx",
+            "--new",
+            "--time-scale",
+            "60",
+        ]);
         assert_eq!(cfg.seed_override, Some(999));
         assert_eq!(cfg.save_path, std::path::PathBuf::from("custom.mcvx"));
         assert!(cfg.force_new_world);
+        assert_eq!(cfg.time_scale, 60.0);
+    }
+
+    #[test]
+    fn test_time_scale_defaults_and_rejects_bad_values() {
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.time_scale, DEFAULT_TIME_SCALE);
+
+        // Missing value at end of argv, non-numeric, zero, negative, NaN, and
+        // infinity all keep the default (lenient parse, no panic).
+        for args in [
+            vec!["--time-scale"],
+            vec!["--time-scale", "fast"],
+            vec!["--time-scale", "0"],
+            vec!["--time-scale", "-4"],
+            vec!["--time-scale", "NaN"],
+            vec!["--time-scale", "inf"],
+        ] {
+            let cfg = CliConfig::parse_args(args.iter().copied());
+            assert_eq!(
+                cfg.time_scale, DEFAULT_TIME_SCALE,
+                "bad value {:?} must keep the default",
+                args
+            );
+        }
+
+        // A fractional scale is accepted verbatim.
+        let fractional = CliConfig::parse_args(["--time-scale", "2.5"]);
+        assert_eq!(fractional.time_scale, 2.5);
     }
 
     #[test]
@@ -795,5 +857,10 @@ mod tests {
         // A seed that overflows u32 is rejected rather than truncated.
         let overflow = CliConfig::parse_args(["--seed", "4294967296"]);
         assert_eq!(overflow.seed_override, None);
+
+        // A missing --time-scale value is lenient: it does not swallow the
+        // default and does not panic.
+        let missing_scale = CliConfig::parse_args(["--time-scale"]);
+        assert_eq!(missing_scale.time_scale, DEFAULT_TIME_SCALE);
     }
 }
