@@ -2757,6 +2757,7 @@ mod tests {
             fullscreen: true,
             vsync: true,
             texture_pack: None,
+            volume: 100,
         };
         let menu = menu::SettingsMenu::new();
         let text = compose_menu_text(&settings, &menu, "Default");

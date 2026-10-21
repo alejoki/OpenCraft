@@ -28,6 +28,17 @@ pub const RENDER_DISTANCE_MIN: i32 = 4;
 pub const RENDER_DISTANCE_MAX: i32 = 36;
 /// The default render distance in chunks: the fresh-world value.
 pub const DEFAULT_RENDER_DISTANCE: i32 = 16;
+/// Inclusive lower bound for `audio.volume` in percent: values below this
+/// clamp up on load. Public so the settings menu clamps its live
+/// adjustments through the same single source of truth.
+pub const VOLUME_MIN: i32 = 0;
+/// Inclusive upper bound for `audio.volume` in percent; see `VOLUME_MIN`.
+pub const VOLUME_MAX: i32 = 100;
+/// Menu adjustment granularity for `audio.volume` in percent. Load-time
+/// values are not required to be a multiple of this.
+pub const VOLUME_STEP: i32 = 10;
+/// The default volume in percent: a default save omits the `[audio]` section.
+pub const DEFAULT_VOLUME: u8 = 100;
 
 /// Player keybind preferences, mirroring `InputState` in
 /// `src/player/physics.rs`: exactly one physical key per action.
@@ -80,6 +91,10 @@ pub struct Settings {
     /// built-in Default textures, so a default save contains no `[packs]`
     /// section at all (byte-identical to the pre-S03 format).
     pub texture_pack: Option<String>,
+    /// Master volume in percent (0..=100). 100 is the default, so a default
+    /// save contains no `[audio]` section at all. Clamped on load; the menu
+    /// clamps live adjustments against `VOLUME_MIN`/`VOLUME_MAX`.
+    pub volume: u8,
 }
 
 impl Default for Settings {
@@ -92,6 +107,7 @@ impl Default for Settings {
             fullscreen: false,
             vsync: false,
             texture_pack: None,
+            volume: DEFAULT_VOLUME,
         }
     }
 }
@@ -190,6 +206,9 @@ impl Settings {
             packs: self.texture_pack.as_ref().map(|name| PacksToml {
                 texture_pack: Some(name.clone()),
             }),
+            audio: (self.volume != DEFAULT_VOLUME).then(|| AudioToml {
+                volume: u32::from(self.volume),
+            }),
         };
 
         let contents = toml::to_string(&mirror)
@@ -233,6 +252,8 @@ struct SettingsToml {
     video: VideoToml,
     #[serde(skip_serializing_if = "Option::is_none")]
     packs: Option<PacksToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<AudioToml>,
 }
 
 #[derive(serde::Serialize)]
@@ -263,6 +284,11 @@ struct VideoToml {
 struct PacksToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     texture_pack: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AudioToml {
+    volume: u32,
 }
 
 /// Load settings from `path`, discarding warnings. Thin wrapper over
@@ -434,6 +460,30 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
             None => warnings.push(SettingsWarning {
                 field: "packs".to_string(),
                 reason: format!("expected a table, found {}", packs_value.type_str()),
+            }),
+        }
+    }
+
+    // Optional section: missing `[audio]` or missing `volume` keeps the
+    // default (100) silently. Values are clamped to `[VOLUME_MIN,
+    // VOLUME_MAX]` on load; any in-range value is accepted (the 10-step is
+    // menu granularity only, not a file invariant).
+    if let Some(audio_value) = root.get("audio") {
+        match audio_value.as_table() {
+            Some(table) => {
+                settings.volume = load_clamped_i32(
+                    table,
+                    "volume",
+                    VOLUME_MIN,
+                    VOLUME_MAX,
+                    i32::from(settings.volume),
+                    "audio.volume",
+                    &mut warnings,
+                ) as u8;
+            }
+            None => warnings.push(SettingsWarning {
+                field: "audio".to_string(),
+                reason: format!("expected a table, found {}", audio_value.type_str()),
             }),
         }
     }
@@ -638,6 +688,8 @@ mod tests {
         assert_eq!(d.render_distance, 16);
         assert!(!d.fullscreen);
         assert!(!d.vsync);
+        assert_eq!(d.volume, DEFAULT_VOLUME);
+        assert_eq!(d.volume, 100);
         assert_eq!(d.keybinds, Keybinds::default());
     }
 
@@ -724,8 +776,8 @@ unknown_top_level = 7
 forward = "KeyZ"
 unknown_action = "KeyX"
 
-[audio]
-volume = 11
+[network]
+ping = 7
 
 [mouse]
 sensitivity = 0.005
@@ -905,6 +957,7 @@ vsync = false
             fullscreen: true,
             vsync: true,
             texture_pack: None,
+            volume: 60,
         };
         original.save(&path).unwrap();
         let (loaded, warnings) = load_with_warnings(&path);
@@ -941,6 +994,13 @@ vsync = false
         // the pre-S03 format (settings_smoke.sh unchanged-file invariant).
         assert!(!text.contains("[packs]"), "default save must omit [packs]:\n{text}");
         assert!(!text.contains("texture_pack"));
+        // Default volume means no [audio] section at all, keeping the default
+        // save byte-identical to the pre-audio format.
+        assert!(
+            !text.contains("[audio]"),
+            "default save must omit [audio]:\n{text}"
+        );
+        assert!(!text.contains("volume"));
 
         let with_pack = Settings {
             texture_pack: Some("dungeon".to_string()),
@@ -950,6 +1010,18 @@ vsync = false
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[packs]"), "named pack must emit [packs]:\n{text}");
         assert!(text.contains("texture_pack = \"dungeon\""));
+
+        let with_volume = Settings {
+            volume: 60,
+            ..Settings::default()
+        };
+        with_volume.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[audio]"),
+            "non-default volume must emit [audio]:\n{text}"
+        );
+        assert!(text.contains("volume = 60"));
     }
 
     #[test]
@@ -1008,6 +1080,82 @@ vsync = false
         let (settings, warnings) = load_with_warnings(&path);
         assert_eq!(settings.texture_pack, None);
         assert_eq!(warning_fields(&warnings), vec!["packs"]);
+    }
+
+    #[test]
+    fn volume_round_trips_through_save_and_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for volume in [0u8, 60, 100] {
+            let original = Settings {
+                volume,
+                ..Settings::default()
+            };
+            original.save(&path).unwrap();
+            let (loaded, warnings) = load_with_warnings(&path);
+            assert!(warnings.is_empty(), "volume {volume}: {warnings:?}");
+            assert_eq!(loaded, original, "volume {volume}");
+        }
+    }
+
+    #[test]
+    fn volume_clamps_out_of_range_values_with_warnings() {
+        let dir = tempdir().unwrap();
+
+        let low = write_settings_file(&dir, "[audio]\nvolume = -5\n");
+        let (settings, warnings) = load_with_warnings(&low);
+        assert_eq!(settings.volume, 0);
+        assert_eq!(warning_fields(&warnings), vec!["audio.volume"]);
+
+        let high = write_settings_file(&dir, "[audio]\nvolume = 250\n");
+        let (settings, warnings) = load_with_warnings(&high);
+        assert_eq!(settings.volume, 100);
+        assert_eq!(warning_fields(&warnings), vec!["audio.volume"]);
+    }
+
+    #[test]
+    fn volume_boundaries_and_arbitrary_in_range_values_load_silently() {
+        let dir = tempdir().unwrap();
+        for volume in [0u8, 1, 37, 99, 100] {
+            let path = write_settings_file(&dir, &format!("[audio]\nvolume = {volume}\n"));
+            let (settings, warnings) = load_with_warnings(&path);
+            assert_eq!(settings.volume, volume);
+            assert!(warnings.is_empty(), "volume {volume}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn wrong_type_volume_falls_back_to_default_with_one_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[audio]\nvolume = \"loud\"\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.volume, DEFAULT_VOLUME);
+        assert_eq!(warning_fields(&warnings), vec!["audio.volume"]);
+        assert!(warnings[0].reason.contains("expected an integer"));
+    }
+
+    #[test]
+    fn missing_audio_section_or_key_keeps_default_volume_without_warnings() {
+        let dir = tempdir().unwrap();
+
+        let no_section = write_settings_file(&dir, "[video]\nvsync = false\n");
+        let (settings, warnings) = load_with_warnings(&no_section);
+        assert_eq!(settings.volume, DEFAULT_VOLUME);
+        assert!(warnings.is_empty());
+
+        let empty_section = write_settings_file(&dir, "[audio]\nunknown = 1\n");
+        let (settings, warnings) = load_with_warnings(&empty_section);
+        assert_eq!(settings.volume, DEFAULT_VOLUME);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn wrong_type_audio_section_falls_back_with_one_warning() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "audio = 3\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.volume, DEFAULT_VOLUME);
+        assert_eq!(warning_fields(&warnings), vec!["audio"]);
     }
 
     #[test]
