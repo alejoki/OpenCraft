@@ -41,8 +41,8 @@ pub const MAX_GRID_SLOTS: usize = 16;
 /// Side length of the player (inventory) crafting grid.
 pub const PLAYER_GRID_DIM: usize = 2;
 
-/// Side length of the crafting-table grid.
-pub const TABLE_GRID_DIM: usize = 3;
+/// Side length of the crafting-table grid (4x4, as chosen in M006).
+pub const TABLE_GRID_DIM: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Legacy block-stack compatibility layer
@@ -872,7 +872,7 @@ impl Default for Inventory {
 pub enum GridKind {
     /// 2x2 grid available from the player inventory.
     Player,
-    /// 3x3 grid available from a crafting table.
+    /// 4x4 grid available from a placed crafting table.
     Table,
 }
 
@@ -1170,8 +1170,9 @@ fn recipe_for(grid: &CraftingGrid) -> Option<&'static Recipe> {
 }
 
 /// A bounded crafting grid. Only the active `dim * dim` region is addressable;
-/// the remaining fixed storage is reserved for future grid sizes and is
-/// validated to stay empty when decoding persisted state.
+/// the fixed storage is sized for the largest supported grid (4x4), so a 2x2
+/// player grid leaves its tail inactive. Inactive cells are validated to stay
+/// empty when decoding persisted state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CraftingGrid {
     kind: GridKind,
@@ -2070,19 +2071,26 @@ mod tests {
         assert_eq!(player.take(4), Err(CraftError::OutOfBounds));
 
         let mut table = CraftingGrid::new(GridKind::Table);
-        assert_eq!(table.dim(), 3);
+        assert_eq!(table.dim(), 4);
+        assert_eq!(table.kind().slot_count(), MAX_GRID_SLOTS);
         table
-            .set(8, Some(block(BlockId::OakLog, 1)))
+            .set(15, Some(block(BlockId::OakLog, 1)))
             .expect("last active cell");
         assert_eq!(
-            table.set(9, Some(block(BlockId::OakLog, 1))),
-            Err(CraftError::OutOfBounds)
+            table.slot(15).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::OakLog)),
+            "table cell 15 must be readable"
         );
         assert_eq!(
-            table.take(8).map(|item| item.map(|item| item.id())),
+            table.set(16, Some(block(BlockId::OakLog, 1))),
+            Err(CraftError::OutOfBounds)
+        );
+        assert_eq!(table.take(16), Err(CraftError::OutOfBounds));
+        assert_eq!(
+            table.take(15).map(|item| item.map(|item| item.id())),
             Ok(Some(ItemId::Block(BlockId::OakLog)))
         );
-        assert_eq!(table.take(8), Ok(None));
+        assert_eq!(table.take(15), Ok(None));
 
         let mut slots = [None; MAX_GRID_SLOTS];
         slots[4] = Some(block(BlockId::OakLog, 1));
@@ -2259,8 +2267,12 @@ mod tests {
         table
             .set(0, Some(block(BlockId::OakPlanks, 1)))
             .expect("cell 0");
-        table.set(3, Some(stick(1))).expect("cell 3");
-        table.set(6, Some(stick(1))).expect("cell 6");
+        table
+            .set(TABLE_GRID_DIM, Some(stick(1)))
+            .expect("cell below 0");
+        table
+            .set(2 * TABLE_GRID_DIM, Some(stick(1)))
+            .expect("cell two below 0");
         assert_eq!(
             table.preview().map(|preview| preview.recipe),
             Some(RecipeId::WoodShovel)

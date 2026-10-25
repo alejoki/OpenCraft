@@ -299,10 +299,10 @@ mod tests {
         let mut table_grid = CraftingGrid::new(GridKind::Table);
         table_grid
             .set(
-                4,
+                15,
                 Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
             )
-            .expect("table grid cell");
+            .expect("4x4 table grid cell above index 8");
 
         let mut data = make_save(21u32);
         data.player.selected_slot = 2;
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(
             session.player.player_grid().kind(),
             GridKind::Player,
-            "a 3x3 grid in the player position defaults to an empty 2x2 grid"
+            "a 4x4 grid in the player position defaults to an empty 2x2 grid"
         );
         assert!(session.player.player_grid().is_empty());
         assert_eq!(session.player.table_grid().kind(), GridKind::Table);

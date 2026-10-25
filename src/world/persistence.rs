@@ -128,7 +128,7 @@ pub struct SavedPlayerState {
     pub inventory: Inventory,
     /// Unfinished player-inventory crafting grid (2x2 active cells).
     pub player_grid: CraftingGrid,
-    /// Unfinished crafting-table grid (3x3 active cells).
+    /// Unfinished crafting-table grid (4x4 active cells).
     pub table_grid: CraftingGrid,
 }
 
@@ -1000,8 +1000,8 @@ mod tests {
     /// (36 header + 27 hotbar + 4 time + 4 chunk_count).
     const V4_EXTENSION_OFFSET: usize = 71;
     /// Extension size for an empty inventory: 36 slot records + cursor +
-    /// player grid (kind + 4 cells) + table grid (kind + 9 cells).
-    const V4_EXTENSION_LEN: usize = INVENTORY_SLOTS + 1 + (1 + 4) + (1 + 9);
+    /// player grid (kind + 4 cells) + table grid (kind + 16 cells).
+    const V4_EXTENSION_LEN: usize = INVENTORY_SLOTS + 1 + (1 + 4) + (1 + 16);
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -1250,6 +1250,15 @@ mod tests {
                 Some(Item::new(ItemId::Material(Material::Stick), 2).unwrap()),
             )
             .unwrap();
+        // A cell above the old 3x3 limit proves the 4x4 active region is what
+        // gets persisted, not just the first nine slots.
+        player
+            .table_grid
+            .set(
+                15,
+                Some(Item::new(ItemId::Block(BlockId::OakPlanks), 1).unwrap()),
+            )
+            .unwrap();
         player
     }
 
@@ -1288,6 +1297,11 @@ mod tests {
         assert!(!loaded.player.table_grid.is_empty());
         assert_eq!(loaded.player.player_grid.kind(), GridKind::Player);
         assert_eq!(loaded.player.table_grid.kind(), GridKind::Table);
+        assert_eq!(
+            loaded.player.table_grid.slot(15).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::OakPlanks)),
+            "4x4 table cell above index 8 must survive load"
+        );
 
         // The legacy block-only header cannot express the tool: it stays the
         // empty sentinel while the v4 extension is authoritative.

@@ -78,7 +78,7 @@ pub struct Player {
     inventory: Inventory,
     /// Unfinished 2x2 inventory crafting grid carried with the player.
     player_grid: CraftingGrid,
-    /// Unfinished 3x3 crafting-table grid carried with the player.
+    /// Unfinished 4x4 crafting-table grid carried with the player.
     table_grid: CraftingGrid,
 }
 
@@ -123,7 +123,7 @@ impl Player {
     ///
     /// The inventory is already validated by its own constructors; the grids
     /// are kind-checked here so a mismatched persisted grid safely defaults to
-    /// the empty grid of the position's kind instead of putting 3x3 contents
+    /// the empty grid of the position's kind instead of putting 4x4 contents
     /// into the 2x2 player grid.
     pub fn with_inventory(
         position: Vec3,
