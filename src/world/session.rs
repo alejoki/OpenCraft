@@ -58,7 +58,10 @@ impl WorldSession {
         player.pitch = data.player.pitch;
         player.fly_mode = data.player.fly_mode;
         player.selected_slot = (data.player.selected_slot as usize).min(8);
-        player.hotbar = data.player.hotbar;
+        // Pre-inventory runtime state is still a block-only hotbar. Project
+        // the durable aggregate's block hotbar slots until T03 moves Player
+        // onto Inventory; non-block hotbar items cannot be represented yet.
+        player.hotbar = data.player.legacy_hotbar();
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 data.player.render_distance as i32,
@@ -109,7 +112,13 @@ mod tests {
                 fly_mode: false,
                 selected_slot: 3,
                 render_distance: 12,
-                hotbar: crate::player::inventory::Hotbar::empty(),
+                inventory: crate::player::inventory::Inventory::empty(),
+                player_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Player,
+                ),
+                table_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Table,
+                ),
             },
             chunk_edits: ChunkEditMap::default(),
         }
@@ -212,7 +221,13 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 0,
                 render_distance: 16,
-                hotbar: crate::player::inventory::Hotbar::empty(),
+                inventory: crate::player::inventory::Inventory::empty(),
+                player_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Player,
+                ),
+                table_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Table,
+                ),
             },
             chunk_edits: edits.clone(),
         };
@@ -238,7 +253,7 @@ mod tests {
             Some(ItemStack::new(BlockId::Brick, 1).unwrap()),
         ]);
         let mut data = make_save(11u32);
-        data.player.hotbar = hotbar.clone();
+        data.player.inventory = crate::player::inventory::Inventory::from_legacy_hotbar(&hotbar);
 
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
         assert_eq!(session.player.hotbar, hotbar);

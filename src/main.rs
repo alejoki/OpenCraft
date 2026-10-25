@@ -15,7 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::inventory::HOTBAR_SLOTS;
+use opencraft::player::inventory::{CraftingGrid, GridKind, Inventory, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTick};
 use opencraft::player::physics::InputState;
 use opencraft::player::raycast::raycast_voxels;
@@ -192,7 +192,9 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             fly_mode: session.player.fly_mode,
             selected_slot: session.player.selected_slot as u8,
             render_distance: session.world.render_distance() as u16,
-            hotbar: session.player.hotbar.clone(),
+            inventory: Inventory::from_legacy_hotbar(&session.player.hotbar),
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
         },
         chunk_edits: session.world.chunk_edits().clone(),
     };
@@ -5019,7 +5021,9 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
-                hotbar: opencraft::player::inventory::Hotbar::empty(),
+                inventory: Inventory::empty(),
+                player_grid: CraftingGrid::new(GridKind::Player),
+                table_grid: CraftingGrid::new(GridKind::Table),
             },
             chunk_edits: ChunkEditMap::default(),
         }
