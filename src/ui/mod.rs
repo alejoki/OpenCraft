@@ -1,4 +1,5 @@
 pub mod hud;
+pub mod inventory;
 pub mod lifecycle;
 pub mod logo;
 pub mod menu;
@@ -7,22 +8,27 @@ pub mod screens;
 pub mod text;
 pub mod text_input;
 
+pub use inventory::{
+    hit_test as hit_test_inventory, item_color, layout as inventory_layout, screen_labels,
+    screen_quads, target_rect as inventory_target_rect, InventoryLabel, InventoryLayout,
+    InventoryMode, InventoryScreen, InventoryTarget, MAX_LABELS,
+};
 pub use lifecycle::{
     decide as decide_lifecycle, LifecycleDecision, LifecycleError, LifecycleIntent,
     LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
     NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
 };
-pub use text_input::{TextInput, TextInputAction, TextInputOutcome};
 pub use screens::{
     delete_prompt_line, format_modified_secs, format_row_line, hovered_load_target,
     hovered_main_menu_row, hovered_new_game_target, hovered_pause_row, load_back_rect,
     load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect,
     load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
     new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
-    validate_create, FocusField, LOAD_SCREEN_WIDTH, LoadScreen, LoadTarget, MainMenuRow,
-    MAIN_MENU_ROWS, NewGameFormError, NewGameScreen, NewGameTarget, NEW_GAME_ROWS, PauseRow,
-    PAUSE_ROWS, ScreenKeyAction, SCREEN_WIDTH, SEED_MAX_CHARS,
+    validate_create, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameFormError,
+    NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, LOAD_SCREEN_WIDTH, MAIN_MENU_ROWS,
+    NEW_GAME_ROWS, PAUSE_ROWS, SCREEN_WIDTH, SEED_MAX_CHARS,
 };
+pub use text_input::{TextInput, TextInputAction, TextInputOutcome};
 
 use crate::pack::PackLogo;
 use crate::render::context::RenderContext;
