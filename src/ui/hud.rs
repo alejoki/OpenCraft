@@ -3,7 +3,7 @@
 //! No GPU or window types appear here: callers feed surface dimensions and
 //! append the returned [`Quad`]s to the existing UI quad list.
 
-use crate::player::inventory::{ItemStack, HOTBAR_SLOTS};
+use crate::player::inventory::{Inventory, Item, ItemStack, HOTBAR_SLOTS};
 use crate::render::pipeline::hotbar_slot_rect_ndc;
 use crate::ui::quad::Quad;
 
@@ -24,10 +24,7 @@ pub const HOTBAR_COUNT_LINE_HEIGHT: f32 = 16.0;
 /// Derived from the same NDC helper the overlay outlines use, so labels and
 /// outlines cannot drift. `max(1)` keeps the conversion finite on a
 /// zero-sized surface, matching the rest of the HUD geometry.
-pub fn hotbar_slot_rects(
-    surface_w: u32,
-    surface_h: u32,
-) -> [(f32, f32, f32, f32); HOTBAR_SLOTS] {
+pub fn hotbar_slot_rects(surface_w: u32, surface_h: u32) -> [(f32, f32, f32, f32); HOTBAR_SLOTS] {
     let w_px = surface_w.max(1) as f32;
     let h_px = surface_h.max(1) as f32;
     let aspect = w_px / h_px;
@@ -49,6 +46,29 @@ pub fn hotbar_count_label(stack: Option<ItemStack>) -> String {
     match stack {
         Some(stack) => stack.count.to_string(),
         None => String::new(),
+    }
+}
+
+/// Count label for a hotbar slot, read straight off the durable inventory.
+///
+/// Takes a shared borrow so the HUD can observe counts but can never mutate
+/// slot state; non-block hotbar items (tools) show their count of one.
+pub fn hotbar_count_label_for(inventory: &Inventory, slot: usize) -> String {
+    match inventory.hotbar(slot) {
+        Some(item) => item.count().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Selected-item title fragment for the window title: blocks and materials show
+/// `Name xCount`, tools show `Name (remaining/max)`, and empty shows `Empty`.
+pub fn selected_item_label(item: Option<Item>) -> String {
+    let Some(item) = item else {
+        return "Empty".to_string();
+    };
+    match (item.durability(), item.max_durability()) {
+        (Some(remaining), Some(max)) => format!("{} ({}/{})", item.id().name(), remaining, max),
+        _ => format!("{} x{}", item.id().name(), item.count()),
     }
 }
 
@@ -224,14 +244,50 @@ mod tests {
     #[test]
     fn count_labels_are_counts_only() {
         assert!(hotbar_count_label(None).is_empty());
-        assert_eq!(
-            hotbar_count_label(ItemStack::new(BlockId::CoalOre, 1)),
-            "1"
-        );
+        assert_eq!(hotbar_count_label(ItemStack::new(BlockId::CoalOre, 1)), "1");
         assert_eq!(
             hotbar_count_label(ItemStack::new(BlockId::CoalOre, 999)),
             "999"
         );
+    }
+
+    #[test]
+    fn inventory_count_labels_read_the_hotbar_only() {
+        use crate::player::inventory::{Item, ItemId, Material, INVENTORY_SLOTS};
+
+        let mut inventory = Inventory::empty();
+        inventory
+            .collect_block(BlockId::CoalOre, 4)
+            .expect("collect into the hotbar");
+        assert_eq!(hotbar_count_label_for(&inventory, 0), "4");
+        for slot in 1..HOTBAR_SLOTS {
+            assert!(hotbar_count_label_for(&inventory, slot).is_empty());
+        }
+
+        // Main-storage and out-of-range indices never surface as hotbar labels.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[HOTBAR_SLOTS] =
+            Some(Item::new(ItemId::Material(Material::Stick), 12).expect("sticks"));
+        let inventory = Inventory::from_parts(slots, None);
+        for slot in 0..HOTBAR_SLOTS {
+            assert!(hotbar_count_label_for(&inventory, slot).is_empty());
+        }
+        assert!(hotbar_count_label_for(&inventory, HOTBAR_SLOTS).is_empty());
+        assert!(hotbar_count_label_for(&inventory, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn selected_item_label_names_blocks_tools_and_empty() {
+        use crate::player::inventory::{Item, ItemId, Material, ToolKind, ToolTier};
+
+        assert_eq!(selected_item_label(None), "Empty");
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 3).expect("stone");
+        assert_eq!(selected_item_label(Some(stone)), "Stone x3");
+        let sticks = Item::new(ItemId::Material(Material::Stick), 1).expect("sticks");
+        assert_eq!(selected_item_label(Some(sticks)), "Stick x1");
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
+        assert_eq!(selected_item_label(Some(pickaxe)), "Iron Pickaxe (137/250)");
     }
 
     #[test]

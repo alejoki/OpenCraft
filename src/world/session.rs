@@ -48,20 +48,26 @@ impl WorldSession {
     }
 
     /// Reconstruct a session from persisted save data, exactly mirroring
-    /// main()'s load branch: player position/yaw/pitch/fly_mode copied,
+    /// main()'s load branch: player position/yaw/pitch/fly_mode copied, the
+    /// validated inventory aggregate and both crafting grids restored, and
     /// `selected_slot` clamped to the 9-slot hotbar, and the world rebuilt
     /// with the saved render distance, seed, and chunk edits.
+    ///
+    /// `Player::with_inventory` and `restore_selected_slot` are the only
+    /// restore entry points, so a save can never publish an out-of-range
+    /// selection or a grid stored under the wrong kind.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
         let clock = GameClock::from_time(data.time_of_day);
-        let mut player = Player::new(Vec3::from_array(data.player.position));
+        let mut player = Player::with_inventory(
+            Vec3::from_array(data.player.position),
+            data.player.inventory,
+            data.player.player_grid,
+            data.player.table_grid,
+        );
         player.yaw = data.player.yaw;
         player.pitch = data.player.pitch;
         player.fly_mode = data.player.fly_mode;
-        player.selected_slot = (data.player.selected_slot as usize).min(8);
-        // Pre-inventory runtime state is still a block-only hotbar. Project
-        // the durable aggregate's block hotbar slots until T03 moves Player
-        // onto Inventory; non-block hotbar items cannot be represented yet.
-        player.hotbar = data.player.legacy_hotbar();
+        player.restore_selected_slot(data.player.selected_slot as usize);
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 data.player.render_distance as i32,
@@ -174,7 +180,7 @@ mod tests {
         assert_eq!(session.player.yaw, 0.75);
         assert_eq!(session.player.pitch, -0.15);
         assert!(!session.player.fly_mode);
-        assert_eq!(session.player.selected_slot, 3);
+        assert_eq!(session.player.selected_slot(), 3);
     }
 
     #[test]
@@ -182,7 +188,7 @@ mod tests {
         let mut data = make_save(5u32);
         data.player.selected_slot = 200;
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
-        assert_eq!(session.player.selected_slot, 8);
+        assert_eq!(session.player.selected_slot(), 8);
     }
 
     #[test]
@@ -256,16 +262,183 @@ mod tests {
         data.player.inventory = crate::player::inventory::Inventory::from_legacy_hotbar(&hotbar);
 
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
-        assert_eq!(session.player.hotbar, hotbar);
+        for slot in 0..crate::player::inventory::HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar_stack(slot), hotbar.stack(slot));
+        }
+        assert!(
+            session.player.inventory().main(0).is_none(),
+            "legacy saves default main storage to empty"
+        );
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
     }
 
     #[test]
-    fn new_session_starts_with_an_empty_hotbar() {
-        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+    fn session_from_save_preserves_tool_durability_cursor_main_slots_and_grids() {
+        use crate::player::inventory::{
+            CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
+        };
+        use crate::world::block::BlockId;
+
+        let mut slots = [None; crate::player::inventory::INVENTORY_SLOTS];
+        slots[2] = Some(Item::new(ItemId::Block(BlockId::Stone), 7).expect("stone"));
+        slots[crate::player::inventory::HOTBAR_SLOTS + 5] =
+            Some(Item::new(ItemId::Material(Material::Stick), 4).expect("sticks"));
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
+        let inventory = Inventory::from_parts(slots, Some(pickaxe));
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                3,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("stick")),
+            )
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                4,
+                Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
+            )
+            .expect("table grid cell");
+
+        let mut data = make_save(21u32);
+        data.player.selected_slot = 2;
+        data.player.inventory = inventory.clone();
+        data.player.player_grid = player_grid.clone();
+        data.player.table_grid = table_grid.clone();
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(session.player.selected_slot(), 2);
+        assert_eq!(session.player.inventory(), &inventory);
         assert_eq!(
-            session.player.hotbar,
-            crate::player::inventory::Hotbar::empty()
+            session
+                .player
+                .inventory()
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(137),
+            "cursor tool durability round-trips through the session"
         );
+        assert_eq!(
+            session.player.inventory().main(5).map(|item| item.count()),
+            Some(4)
+        );
+        assert_eq!(session.player.player_grid(), &player_grid);
+        assert_eq!(session.player.table_grid(), &table_grid);
+    }
+
+    #[test]
+    fn session_from_save_defaults_mismatched_grid_kinds() {
+        use crate::player::inventory::{CraftingGrid, GridKind, Inventory, Item, ItemId};
+        use crate::world::block::BlockId;
+
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone")),
+            )
+            .expect("table grid cell");
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::Dirt), 1).expect("dirt")),
+            )
+            .expect("player grid cell");
+
+        let mut data = make_save(22u32);
+        data.player.inventory = Inventory::empty();
+        data.player.player_grid = table_grid;
+        data.player.table_grid = player_grid;
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(
+            session.player.player_grid().kind(),
+            GridKind::Player,
+            "a 3x3 grid in the player position defaults to an empty 2x2 grid"
+        );
+        assert!(session.player.player_grid().is_empty());
+        assert_eq!(session.player.table_grid().kind(), GridKind::Table);
+        assert!(session.player.table_grid().is_empty());
+    }
+
+    #[test]
+    fn new_session_starts_with_an_empty_inventory_and_grids() {
+        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        assert!(session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .all(Option::is_none));
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
+        assert_eq!(session.player.selected_slot(), 0);
+    }
+
+    #[test]
+    fn session_from_a_hand_built_v3_save_migrates_the_hotbar_and_defaults_new_state() {
+        use crate::player::inventory::{Hotbar, ItemStack};
+        use crate::world::block::BlockId;
+        use crate::world::persistence::{load_world_from_bytes, SAVE_MAGIC, TIME_OF_DAY_VERSION};
+
+        let hotbar = Hotbar::from_slots([
+            Some(ItemStack::new(BlockId::Stone, 12).expect("stone")),
+            None,
+            None,
+            Some(ItemStack::new(BlockId::CoalOre, 1).expect("coal")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+
+        // A real version-3 payload: header, 27-byte hotbar, time, no chunks.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SAVE_MAGIC);
+        bytes.extend_from_slice(&TIME_OF_DAY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2024u32.to_le_bytes());
+        for c in [1.0f32, 64.0, -2.0] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&(-0.25f32).to_le_bytes());
+        bytes.push(1); // fly_mode
+        bytes.push(4); // selected_slot
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        for stack in hotbar.stacks() {
+            match stack {
+                Some(stack) => {
+                    bytes.push(stack.block as u8);
+                    bytes.extend_from_slice(&stack.count.to_le_bytes());
+                }
+                None => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
+        }
+        bytes.extend_from_slice(&4321u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // chunk_count
+
+        let data = load_world_from_bytes(&bytes).expect("v3 save must migrate");
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/legacy.mcvx"));
+
+        assert_eq!(session.player.selected_slot(), 4);
+        for slot in 0..crate::player::inventory::HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar_stack(slot), hotbar.stack(slot));
+        }
+        assert!(session.player.inventory().main(0).is_none());
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
+        assert_eq!(session.clock.time_of_day, 4321);
     }
 
     #[test]

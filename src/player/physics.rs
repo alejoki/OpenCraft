@@ -1,6 +1,8 @@
 use glam::Vec3;
 
-use crate::player::inventory::Hotbar;
+use crate::player::inventory::{
+    CollectOutcome, CraftingGrid, GridKind, Inventory, Item, ItemStack, HOTBAR_SLOTS,
+};
 use crate::world::block::BlockId;
 
 pub const PLAYER_HALF_WIDTH: f32 = 0.3;
@@ -68,8 +70,16 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub fly_mode: bool,
-    pub selected_slot: usize,
-    pub hotbar: Hotbar,
+    /// Selected hotbar slot, always in `0..HOTBAR_SLOTS`. Private so the only
+    /// ways to change it are the bounds-checked methods below; session restore
+    /// cannot publish an out-of-range selection.
+    selected_slot: usize,
+    /// The one authoritative item aggregate (9 hotbar + 27 main + cursor).
+    inventory: Inventory,
+    /// Unfinished 2x2 inventory crafting grid carried with the player.
+    player_grid: CraftingGrid,
+    /// Unfinished 3x3 crafting-table grid carried with the player.
+    table_grid: CraftingGrid,
 }
 
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
@@ -103,8 +113,102 @@ impl Player {
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
             selected_slot: 0,
-            hotbar: Hotbar::empty(),
+            inventory: Inventory::empty(),
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
         }
+    }
+
+    /// Rebuilds a player from a persisted aggregate (session restore).
+    ///
+    /// The inventory is already validated by its own constructors; the grids
+    /// are kind-checked here so a mismatched persisted grid safely defaults to
+    /// the empty grid of the position's kind instead of putting 3x3 contents
+    /// into the 2x2 player grid.
+    pub fn with_inventory(
+        position: Vec3,
+        inventory: Inventory,
+        player_grid: CraftingGrid,
+        table_grid: CraftingGrid,
+    ) -> Self {
+        let mut player = Self::new(position);
+        player.inventory = inventory;
+        player.player_grid = if player_grid.kind() == GridKind::Player {
+            player_grid
+        } else {
+            CraftingGrid::new(GridKind::Player)
+        };
+        player.table_grid = if table_grid.kind() == GridKind::Table {
+            table_grid
+        } else {
+            CraftingGrid::new(GridKind::Table)
+        };
+        player
+    }
+
+    /// Selected hotbar index, guaranteed to be in `0..HOTBAR_SLOTS`.
+    pub const fn selected_slot(&self) -> usize {
+        self.selected_slot
+    }
+
+    /// Selects a hotbar slot. Returns `false` (and keeps the previous slot)
+    /// when `slot` is outside the nine-slot hotbar.
+    pub fn select_slot(&mut self, slot: usize) -> bool {
+        if slot >= HOTBAR_SLOTS {
+            return false;
+        }
+        self.selected_slot = slot;
+        true
+    }
+
+    /// Cycles the selection by `step`, wrapping inside the nine hotbar slots.
+    pub fn select_relative(&mut self, step: isize) {
+        let slots = HOTBAR_SLOTS as isize;
+        self.selected_slot = ((self.selected_slot as isize + step).rem_euclid(slots)) as usize;
+    }
+
+    /// Restores a persisted selection, clamping into the hotbar. Used only at
+    /// the save/load boundary; it never leaves `selected_slot` out of range.
+    pub fn restore_selected_slot(&mut self, slot: usize) {
+        self.selected_slot = slot.min(HOTBAR_SLOTS - 1);
+    }
+
+    /// Read-only view of the durable inventory aggregate.
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
+    }
+
+    pub fn player_grid(&self) -> &CraftingGrid {
+        &self.player_grid
+    }
+
+    pub fn table_grid(&self) -> &CraftingGrid {
+        &self.table_grid
+    }
+
+    /// Legacy block-only read of a hotbar slot (`None` for tools/out of range).
+    pub fn hotbar_stack(&self, slot: usize) -> Option<ItemStack> {
+        self.inventory.hotbar_stack(slot)
+    }
+
+    /// The selected hotbar item, if any.
+    pub fn selected_item(&self) -> Option<Item> {
+        self.inventory.hotbar(self.selected_slot)
+    }
+
+    /// The selected hotbar item's block identity, for placement.
+    pub fn selected_block(&self) -> Option<BlockId> {
+        self.selected_item()?.block_stack().map(|stack| stack.block)
+    }
+
+    /// Collects one broken block into the inventory (hotbar first, then main).
+    pub fn collect_block(&mut self, block: BlockId) -> Option<CollectOutcome> {
+        self.inventory.collect_block(block, 1)
+    }
+
+    /// Consumes exactly one item from the selected hotbar slot.
+    pub fn consume_selected(&mut self) -> Option<Item> {
+        self.inventory.consume_one(self.selected_slot)
     }
 
     #[inline]
@@ -302,6 +406,199 @@ mod tests {
         });
 
         assert!(p_sprint.position.x > p_walk.position.x + 0.05);
+    }
+
+    #[test]
+    fn player_starts_with_empty_inventory_grids_and_selection() {
+        let player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert_eq!(player.selected_slot(), 0);
+        assert!(player.inventory().slots().iter().all(Option::is_none));
+        assert!(player.inventory().cursor().is_none());
+        assert!(player.player_grid().is_empty());
+        assert!(player.table_grid().is_empty());
+        assert_eq!(player.selected_item(), None);
+        assert_eq!(player.selected_block(), None);
+    }
+
+    #[test]
+    fn select_slot_rejects_out_of_range_without_changing_selection() {
+        let mut player = Player::new(Vec3::ZERO);
+        assert!(player.select_slot(4));
+        assert_eq!(player.selected_slot(), 4);
+
+        assert!(!player.select_slot(HOTBAR_SLOTS));
+        assert!(!player.select_slot(usize::MAX));
+        assert_eq!(
+            player.selected_slot(),
+            4,
+            "a rejected selection leaves the previous slot intact"
+        );
+    }
+
+    #[test]
+    fn select_relative_wraps_within_the_nine_slot_hotbar() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.select_relative(-1);
+        assert_eq!(player.selected_slot(), HOTBAR_SLOTS - 1);
+        player.select_relative(1);
+        assert_eq!(player.selected_slot(), 0);
+        player.select_relative(4);
+        player.select_relative(-9);
+        assert_eq!(player.selected_slot(), 4);
+    }
+
+    #[test]
+    fn restore_selected_slot_clamps_into_the_hotbar() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.restore_selected_slot(200);
+        assert_eq!(player.selected_slot(), HOTBAR_SLOTS - 1);
+        player.restore_selected_slot(3);
+        assert_eq!(player.selected_slot(), 3);
+    }
+
+    #[test]
+    fn collect_block_fills_the_hotbar_then_spills_into_main_storage() {
+        let mut player = Player::new(Vec3::ZERO);
+        let hotbar_blocks = [
+            BlockId::Stone,
+            BlockId::Dirt,
+            BlockId::Grass,
+            BlockId::Sand,
+            BlockId::OakLog,
+            BlockId::OakLeaves,
+            BlockId::Brick,
+            BlockId::CoalOre,
+            BlockId::IronOre,
+        ];
+        for block in hotbar_blocks {
+            let outcome = player.collect_block(block).expect("block collects");
+            assert!(outcome.first_slot < HOTBAR_SLOTS);
+            assert_eq!(outcome.accepted, 1);
+        }
+        assert!(
+            player.inventory().main(0).is_none(),
+            "nine distinct blocks fill exactly the hotbar"
+        );
+        assert!(
+            player.collect_block(BlockId::Bedrock).is_none(),
+            "uncarryable blocks are rejected without mutation"
+        );
+    }
+
+    #[test]
+    fn collect_block_spills_into_main_storage_when_the_hotbar_is_full() {
+        let mut player = Player::new(Vec3::ZERO);
+        for block in [
+            BlockId::Stone,
+            BlockId::Dirt,
+            BlockId::Grass,
+            BlockId::Sand,
+            BlockId::OakLog,
+            BlockId::OakLeaves,
+            BlockId::Brick,
+            BlockId::CoalOre,
+            BlockId::IronOre,
+        ] {
+            player.collect_block(block).expect("block collects");
+        }
+
+        let outcome = player
+            .collect_block(BlockId::CraftingTable)
+            .expect("a tenth identity has room in main storage");
+        assert_eq!(outcome.first_slot, HOTBAR_SLOTS);
+        assert_eq!(
+            player.inventory().main(0).map(|item| item.id()),
+            Some(crate::player::inventory::ItemId::Block(
+                BlockId::CraftingTable
+            ))
+        );
+    }
+
+    #[test]
+    fn consume_selected_takes_exactly_one_and_clears_the_slot_at_zero() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.collect_block(BlockId::Stone).expect("collect");
+        player.collect_block(BlockId::Stone).expect("collect");
+        player.select_slot(0);
+
+        assert_eq!(player.selected_item().map(|item| item.count()), Some(2));
+        let consumed = player.consume_selected().expect("one item consumed");
+        assert_eq!(consumed.count(), 1);
+        assert_eq!(player.selected_item().map(|item| item.count()), Some(1));
+
+        let consumed = player.consume_selected().expect("second item consumed");
+        assert_eq!(consumed.count(), 1);
+        assert_eq!(player.selected_item(), None);
+        assert_eq!(player.consume_selected(), None, "empty slot is a no-op");
+    }
+
+    #[test]
+    fn with_inventory_preserves_cursor_tool_and_unfinished_grids() {
+        use crate::player::inventory::{
+            Item, ItemId, Material, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 3).expect("stone"));
+        slots[HOTBAR_SLOTS + 2] =
+            Some(Item::new(ItemId::Material(Material::Stick), 12).expect("sticks"));
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
+        let inventory = Inventory::from_parts(slots, Some(pickaxe));
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("stick")),
+            )
+            .expect("grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                8,
+                Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
+            )
+            .expect("grid cell");
+
+        let player = Player::with_inventory(
+            Vec3::new(1.0, 2.0, 3.0),
+            inventory.clone(),
+            player_grid.clone(),
+            table_grid.clone(),
+        );
+        assert_eq!(player.inventory(), &inventory);
+        assert_eq!(player.player_grid(), &player_grid);
+        assert_eq!(player.table_grid(), &table_grid);
+        assert_eq!(
+            player
+                .inventory()
+                .main(2)
+                .map(|item| (item.count(), item.id())),
+            Some((12, ItemId::Material(Material::Stick)))
+        );
+        assert_eq!(
+            player
+                .inventory()
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(137),
+            "tool durability survives the player boundary"
+        );
+    }
+
+    #[test]
+    fn with_inventory_defaults_mismatched_grid_kinds_safely() {
+        let player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Table),
+            CraftingGrid::new(GridKind::Player),
+        );
+        assert_eq!(player.player_grid().kind(), GridKind::Player);
+        assert_eq!(player.table_grid().kind(), GridKind::Table);
+        assert!(player.player_grid().is_empty());
+        assert!(player.table_grid().is_empty());
     }
 
     #[test]

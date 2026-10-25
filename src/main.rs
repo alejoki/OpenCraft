@@ -15,7 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::inventory::{CraftingGrid, GridKind, Inventory, HOTBAR_SLOTS};
+use opencraft::player::inventory::HOTBAR_SLOTS;
 use opencraft::player::mining::{MiningState, MiningTick};
 use opencraft::player::physics::InputState;
 use opencraft::player::raycast::raycast_voxels;
@@ -28,6 +28,10 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
+use opencraft::ui::hud::{
+    hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
+    selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
@@ -39,28 +43,24 @@ use opencraft::ui::screens::{
     FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
     ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
-use opencraft::ui::hud::{
-    hotbar_count_label, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
-    HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
-};
 use opencraft::ui::{
     LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
-use opencraft::world::daycycle;
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
+use opencraft::world::daycycle;
 use opencraft::world::manager::WorldManager;
-use opencraft::world::vista;
-use opencraft::{random_seed, WorldSession};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
+use opencraft::world::vista;
+use opencraft::{random_seed, WorldSession};
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
@@ -190,11 +190,11 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             yaw: session.player.yaw,
             pitch: session.player.pitch,
             fly_mode: session.player.fly_mode,
-            selected_slot: session.player.selected_slot as u8,
+            selected_slot: session.player.selected_slot() as u8,
             render_distance: session.world.render_distance() as u16,
-            inventory: Inventory::from_legacy_hotbar(&session.player.hotbar),
-            player_grid: CraftingGrid::new(GridKind::Player),
-            table_grid: CraftingGrid::new(GridKind::Table),
+            inventory: session.player.inventory().clone(),
+            player_grid: session.player.player_grid().clone(),
+            table_grid: session.player.table_grid().clone(),
         },
         chunk_edits: session.world.chunk_edits().clone(),
     };
@@ -206,7 +206,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
 }
 
 /// Breaks `pos` and collects the caller-supplied pre-break `block` into the
-/// session hotbar.
+/// session inventory (hotbar first, then main storage).
 ///
 /// The world edit returns the chunks it remeshed. An empty result means the
 /// edit did not apply (unloaded chunk or outside the vertical world range),
@@ -221,7 +221,7 @@ fn collect_mined_block(
         .world
         .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
     if !remeshed.is_empty() {
-        session.player.hotbar.collect(block, 1);
+        session.player.collect_block(block);
     }
     remeshed
 }
@@ -234,9 +234,7 @@ fn collect_mined_block(
 /// Returns the remeshed chunks for the caller to upload, or `None` when the
 /// ray misses, the cell is inside the player, the selected slot is empty, or
 /// the edit did not apply (unloaded/out-of-range).
-fn try_place_selected_block(
-    session: &mut WorldSession,
-) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
     let hit = raycast_voxels(
         session.camera.position,
         session.camera.forward(),
@@ -247,14 +245,12 @@ fn try_place_selected_block(
     if session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
         return None;
     }
-    let stack = session.player.hotbar.stack(session.player.selected_slot)?;
-    let remeshed = session
-        .world
-        .set_block_immediate(ap.x, ap.y, ap.z, stack.block);
+    let block = session.player.selected_block()?;
+    let remeshed = session.world.set_block_immediate(ap.x, ap.y, ap.z, block);
     if remeshed.is_empty() {
         return None;
     }
-    session.player.hotbar.consume(session.player.selected_slot);
+    session.player.consume_selected();
     Some(remeshed)
 }
 
@@ -978,9 +974,7 @@ impl GameApp {
         // constructors. Settings win over a save's stored render distance:
         // the setting is global and the world save follows it from now on.
         session.camera.fov_y_radians = settings.fov_degrees.to_radians();
-        session
-            .world
-            .set_render_distance(settings.render_distance);
+        session.world.set_render_distance(settings.render_distance);
         // The vista is a second, independent world with the same
         // settings-driven render distance (the session's is a source of
         // truth; the vista is never a WorldSession). `ChunkEditMap::default()`
@@ -1772,7 +1766,9 @@ impl ApplicationHandler for GameApp {
         ui.set_logo(
             &ctx.device,
             &ctx.queue,
-            self.current_pack.as_ref().and_then(|pack| pack.logo.as_ref()),
+            self.current_pack
+                .as_ref()
+                .and_then(|pack| pack.logo.as_ref()),
         );
         let stats = StatsOverlay::new(&mut ui.font_system);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
@@ -1982,15 +1978,33 @@ impl ApplicationHandler for GameApp {
                             // the way back here).
                             self.enter_screen(LifecycleScreen::Pause);
                         }
-                        KeyCode::Digit1 if pressed => self.session.player.selected_slot = 0,
-                        KeyCode::Digit2 if pressed => self.session.player.selected_slot = 1,
-                        KeyCode::Digit3 if pressed => self.session.player.selected_slot = 2,
-                        KeyCode::Digit4 if pressed => self.session.player.selected_slot = 3,
-                        KeyCode::Digit5 if pressed => self.session.player.selected_slot = 4,
-                        KeyCode::Digit6 if pressed => self.session.player.selected_slot = 5,
-                        KeyCode::Digit7 if pressed => self.session.player.selected_slot = 6,
-                        KeyCode::Digit8 if pressed => self.session.player.selected_slot = 7,
-                        KeyCode::Digit9 if pressed => self.session.player.selected_slot = 8,
+                        KeyCode::Digit1 if pressed => {
+                            self.session.player.select_slot(0);
+                        }
+                        KeyCode::Digit2 if pressed => {
+                            self.session.player.select_slot(1);
+                        }
+                        KeyCode::Digit3 if pressed => {
+                            self.session.player.select_slot(2);
+                        }
+                        KeyCode::Digit4 if pressed => {
+                            self.session.player.select_slot(3);
+                        }
+                        KeyCode::Digit5 if pressed => {
+                            self.session.player.select_slot(4);
+                        }
+                        KeyCode::Digit6 if pressed => {
+                            self.session.player.select_slot(5);
+                        }
+                        KeyCode::Digit7 if pressed => {
+                            self.session.player.select_slot(6);
+                        }
+                        KeyCode::Digit8 if pressed => {
+                            self.session.player.select_slot(7);
+                        }
+                        KeyCode::Digit9 if pressed => {
+                            self.session.player.select_slot(8);
+                        }
                         // Rebindable gameplay keys (S04-T03): press sets the
                         // InputState flag, release clears it — both
                         // transitions route through the loaded keybind map
@@ -2040,8 +2054,7 @@ impl ApplicationHandler for GameApp {
                     }
                 };
                 if step != 0 {
-                    self.session.player.selected_slot =
-                        (self.session.player.selected_slot as isize + step).rem_euclid(9) as usize;
+                    self.session.player.select_relative(step);
                 }
             }
             WindowEvent::MouseInput {
@@ -2111,7 +2124,8 @@ impl ApplicationHandler for GameApp {
                             };
                             if let Some(gpu) = self.gpu.as_mut() {
                                 gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
-                                gpu.ui.set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                                gpu.ui
+                                    .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
                             }
                         }
                     } else {
@@ -2222,8 +2236,9 @@ impl ApplicationHandler for GameApp {
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
-                    self.session.player
-                        .update(dt, &self.input, |x, y, z| self.session.world.get_block(x, y, z));
+                    self.session.player.update(dt, &self.input, |x, y, z| {
+                        self.session.world.get_block(x, y, z)
+                    });
                     self.session.camera.position = self.session.player.eye_position();
                     self.session.camera.yaw = self.session.player.yaw;
                     self.session.camera.pitch = self.session.player.pitch;
@@ -2299,9 +2314,11 @@ impl ApplicationHandler for GameApp {
                     hit.map(|h| {
                         (
                             h.block_pos,
-                            self.session
-                                .world
-                                .get_block(h.block_pos.x, h.block_pos.y, h.block_pos.z),
+                            self.session.world.get_block(
+                                h.block_pos.x,
+                                h.block_pos.y,
+                                h.block_pos.z,
+                            ),
                         )
                     })
                 } else {
@@ -2319,7 +2336,8 @@ impl ApplicationHandler for GameApp {
                     // and field-disjoint from the live `gpu` borrow (P005).
                     if !remeshed.is_empty() {
                         self.audio.play(SoundSlot::Break, self.settings.volume);
-                        self.audio.play(SoundSlot::MineComplete, self.settings.volume);
+                        self.audio
+                            .play(SoundSlot::MineComplete, self.settings.volume);
                     }
                     for (cpos, mesh) in remeshed {
                         gpu.render_store.upload_mesh(
@@ -2396,8 +2414,7 @@ impl ApplicationHandler for GameApp {
                     );
                     let measured_w = gpu.title_text.measured_width();
                     let left = logo::centered_title_left(brand_w as f32, measured_w);
-                    title_text_area =
-                        Some(gpu.title_text.text_area(left, logo::TITLE_STRIP_TOP));
+                    title_text_area = Some(gpu.title_text.text_area(left, logo::TITLE_STRIP_TOP));
                 }
 
                 // While any non-Playing screen is open (S02-T02): draw its
@@ -2537,14 +2554,13 @@ impl ApplicationHandler for GameApp {
                 // HUD never flashes. First pass updates the buffers while the
                 // mutable borrow is confined to `hotbar_counts`; the text
                 // areas are assembled afterwards from immutable borrows.
-                let hotbar_rects =
-                    hotbar_slot_rects(gpu.ctx.config.width, gpu.ctx.config.height);
+                let hotbar_rects = hotbar_slot_rects(gpu.ctx.config.width, gpu.ctx.config.height);
                 for (slot, counts) in gpu.hotbar_counts.iter_mut().enumerate() {
                     counts.update(
                         &mut gpu.ui.font_system,
                         gpu.ctx.config.width as f32,
                         gpu.ctx.config.height as f32,
-                        &hotbar_count_label(self.session.player.hotbar.stack(slot)),
+                        &hotbar_count_label_for(self.session.player.inventory(), slot),
                     );
                 }
 
@@ -2575,7 +2591,7 @@ impl ApplicationHandler for GameApp {
                 // screen text areas. Empty slots push nothing, so the
                 // renderer only sees non-empty labels.
                 for (slot, counts) in gpu.hotbar_counts.iter().enumerate() {
-                    let label = hotbar_count_label(self.session.player.hotbar.stack(slot));
+                    let label = hotbar_count_label_for(self.session.player.inventory(), slot);
                     if !label.is_empty() {
                         let (x, y) = hotbar_count_text_origin(hotbar_rects[slot]);
                         areas.push(counts.text_area(x, y));
@@ -2624,7 +2640,7 @@ impl ApplicationHandler for GameApp {
                         vista_camera,
                         self.vista_world.render_distance(),
                         None,
-                        self.session.player.selected_slot,
+                        self.session.player.selected_slot(),
                         false,
                         sky_params(palette, daycycle::VISTA_GOLDEN_HOUR),
                         ui_pass,
@@ -2639,7 +2655,7 @@ impl ApplicationHandler for GameApp {
                         &self.session.camera,
                         self.session.world.render_distance(),
                         target_block,
-                        self.session.player.selected_slot,
+                        self.session.player.selected_slot(),
                         playing,
                         sky_params(palette, self.session.clock.time_of_day),
                         ui_pass,
@@ -2653,16 +2669,13 @@ impl ApplicationHandler for GameApp {
                             let fps = (self.frame_count as f32 / elapsed).round() as u32;
                             let ms = (elapsed * 1000.0) / self.frame_count.max(1) as f32;
                             let vram_kb = gpu.render_store.total_vram_bytes / 1024;
-                            let mode = if self.session.player.fly_mode { "Fly" } else { "Walk" };
-                            let block_name = match self
-                                .session
-                                .player
-                                .hotbar
-                                .stack(self.session.player.selected_slot)
-                            {
-                                Some(stack) => format!("{} x{}", stack.block.name(), stack.count),
-                                None => "Empty".to_string(),
+                            let mode = if self.session.player.fly_mode {
+                                "Fly"
+                            } else {
+                                "Walk"
                             };
+                            let block_name =
+                                selected_item_label(self.session.player.selected_item());
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -2685,7 +2698,7 @@ impl ApplicationHandler for GameApp {
                                 self.session.player.position.y,
                                 self.session.player.position.z,
                                 mode,
-                                self.session.player.selected_slot + 1,
+                                self.session.player.selected_slot() + 1,
                                 block_name,
                                 self.session.world.render_distance(),
                                 self.session.world.seed(),
@@ -2720,8 +2733,7 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.resize(gpu.ctx.size);
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
-                        let _ =
-                            save_current_world(&mut self.session);
+                        let _ = save_current_world(&mut self.session);
                         event_loop.exit();
                     }
                     Err(wgpu::SurfaceError::Timeout) => {}
@@ -2831,9 +2843,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencraft::player::inventory::{
+        CraftingGrid, GridKind, Inventory, ItemStack, HOTBAR_SLOTS,
+    };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use opencraft::player::inventory::{ItemStack, HOTBAR_SLOTS};
     use opencraft::world::chunk::{Chunk, ChunkPos};
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
@@ -3141,8 +3155,12 @@ mod tests {
         ])));
         // Each flag alone forces the direct-launch bypass into gameplay.
         assert!(cli_has_world_intent(&CliConfig::parse_args(["--new"])));
-        assert!(cli_has_world_intent(&CliConfig::parse_args(["--new-world"])));
-        assert!(cli_has_world_intent(&CliConfig::parse_args(["--seed", "7"])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
+            "--new-world"
+        ])));
+        assert!(cli_has_world_intent(&CliConfig::parse_args([
+            "--seed", "7"
+        ])));
         assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--save",
             "other.mcvx"
@@ -3182,11 +3200,8 @@ mod tests {
     /// A headless Playing app owning a tempdir save path (no window/GPU).
     fn playing_app(dir: &Path, name: &str) -> GameApp {
         let save_path = dir.join(name);
-        let cli = CliConfig::parse_args([
-            "--new",
-            "--save",
-            save_path.to_str().expect("utf8 path"),
-        ]);
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
         let app = GameApp::new(cli, WorldSession::new_session(11, save_path));
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         app
@@ -3200,10 +3215,7 @@ mod tests {
 
         // First playing frame only arms the marker (zero advance).
         tick_app_clock(&mut app, start);
-        assert_eq!(
-            app.session.clock.time_of_day,
-            daycycle::DEFAULT_TIME_OF_DAY
-        );
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
 
         // One real second at scale 1.0 is 20 ticks.
         tick_app_clock(&mut app, start + Duration::from_secs(1));
@@ -3277,8 +3289,7 @@ mod tests {
         app.time_scale = 60.0;
         tick_app_clock(&mut app, start);
         tick_app_clock(&mut app, start + Duration::from_secs(1));
-        let accelerated_advance =
-            app.session.clock.time_of_day - daycycle::DEFAULT_TIME_OF_DAY;
+        let accelerated_advance = app.session.clock.time_of_day - daycycle::DEFAULT_TIME_OF_DAY;
 
         assert_eq!(normal_advance, 20);
         assert_eq!(accelerated_advance, normal_advance * 60);
@@ -3289,7 +3300,12 @@ mod tests {
         // A normal (1.0x) run is unbounded: the bounded-demo seam never arms.
         let mut watch = None;
         for time in [0, 6_000, 12_000, 18_000, 23_999] {
-            assert!(!observe_demo_cycle(&mut watch, DEFAULT_TIME_SCALE, true, time));
+            assert!(!observe_demo_cycle(
+                &mut watch,
+                DEFAULT_TIME_SCALE,
+                true,
+                time
+            ));
         }
         assert!(watch.is_none(), "default scale never starts a demo watch");
 
@@ -3392,8 +3408,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("time.mcvx");
         let mut app = playing_app(dir.path(), "time.mcvx");
-        app.session.clock =
-            opencraft::world::daycycle::GameClock::from_time(17_432);
+        app.session.clock = opencraft::world::daycycle::GameClock::from_time(17_432);
         assert_ne!(17_432, daycycle::DEFAULT_TIME_OF_DAY);
 
         // The real save path writes `session.clock.time_of_day`.
@@ -3468,9 +3483,10 @@ mod tests {
     #[test]
     fn render_distance_adjust_updates_the_session_and_vista_worlds_together() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_at_screen(dir.path(), LifecycleScreen::Settings(
-            SettingsCaller::MainMenu,
-        ));
+        let mut app = app_at_screen(
+            dir.path(),
+            LifecycleScreen::Settings(SettingsCaller::MainMenu),
+        );
         // Keep the click's settings save inside the tempdir, never the crate
         // root (S04-T02's injection precedent).
         app.settings_path = dir.path().join("settings.toml");
@@ -3508,10 +3524,7 @@ mod tests {
     /// `dir` (the same injection pattern as `settings_path`). Defaults to no
     /// pack selected so each test drives the cycle from a known state.
     fn app_with_packs(dir: &Path) -> GameApp {
-        let mut app = app_at_screen(
-            dir,
-            LifecycleScreen::Settings(SettingsCaller::MainMenu),
-        );
+        let mut app = app_at_screen(dir, LifecycleScreen::Settings(SettingsCaller::MainMenu));
         app.settings_path = dir.join("settings.toml");
         app.packs_root = dir.join("packs");
         app.available_packs = pack::available_pack_names(&app.packs_root);
@@ -3522,8 +3535,11 @@ mod tests {
 
     fn write_pack_fixture(dir: &Path, manifest_name: &str) {
         std::fs::create_dir_all(dir).expect("create pack dir");
-        std::fs::write(dir.join("pack.toml"), format!("name = \"{manifest_name}\"\n"))
-            .expect("write pack.toml");
+        std::fs::write(
+            dir.join("pack.toml"),
+            format!("name = \"{manifest_name}\"\n"),
+        )
+        .expect("write pack.toml");
     }
 
     fn write_solid_png(path: &Path, rgba: [u8; 4]) {
@@ -3587,7 +3603,10 @@ mod tests {
         write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
         // A real override layer proves the loaded pack's layers reach
         // GameApp (not just its manifest).
-        write_solid_png(&packs_root.join("alpha").join("grass_top.png"), [200, 10, 20, 255]);
+        write_solid_png(
+            &packs_root.join("alpha").join("grass_top.png"),
+            [200, 10, 20, 255],
+        );
         app.available_packs = pack::available_pack_names(&packs_root);
         assert_eq!(app.available_packs, vec!["alpha", "beta"]);
 
@@ -3718,7 +3737,11 @@ mod tests {
         app.apply_texture_pack_cycle();
 
         assert_eq!(app.settings.texture_pack.as_deref(), Some("broken-sound"));
-        let message = app.menu.message.as_ref().expect("sound warning in the menu");
+        let message = app
+            .menu
+            .message
+            .as_ref()
+            .expect("sound warning in the menu");
         assert!(
             message.text.contains("place.wav"),
             "warning names the bare sound file: {}",
@@ -3779,9 +3802,7 @@ mod tests {
         startup_warnings.extend(sound_warnings);
 
         assert!(
-            startup_warnings
-                .iter()
-                .any(|w| w.field == "ui_click.wav"),
+            startup_warnings.iter().any(|w| w.field == "ui_click.wav"),
             "the corrupt sound reaches the startup warning Vec: {startup_warnings:?}"
         );
         assert_ne!(
@@ -3817,7 +3838,10 @@ mod tests {
         let (pack, warnings) = load_startup_pack(&packs_root, Some("broken"));
 
         let pack = pack.expect("a usable pack is still returned");
-        assert!(pack.logo.is_none(), "corrupt logo falls back to the text title");
+        assert!(
+            pack.logo.is_none(),
+            "corrupt logo falls back to the text title"
+        );
         assert_eq!(pack.layers.len(), 16, "layers stay fully usable");
         assert!(
             warnings.iter().any(|w| w.field == "title.png"),
@@ -3906,7 +3930,7 @@ mod tests {
 
         assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
         assert_eq!(
-            session.player.hotbar.stack(0),
+            session.player.hotbar_stack(0),
             Some(ItemStack {
                 block: BlockId::Stone,
                 count: 2,
@@ -3920,13 +3944,12 @@ mod tests {
         let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
-        let remeshed =
-            collect_mined_block(&mut session, IVec3::new(0, 10, 1), BlockId::CoalOre);
+        let remeshed = collect_mined_block(&mut session, IVec3::new(0, 10, 1), BlockId::CoalOre);
 
         assert!(!remeshed.is_empty());
         assert_eq!(session.world.get_block(0, 10, 1), BlockId::Air);
         assert_eq!(
-            session.player.hotbar.stack(0),
+            session.player.hotbar_stack(0),
             Some(ItemStack {
                 block: BlockId::CoalOre,
                 count: 1,
@@ -3943,7 +3966,7 @@ mod tests {
 
         assert!(remeshed.is_empty(), "no loaded chunk means no remesh");
         for slot in 0..HOTBAR_SLOTS {
-            assert_eq!(session.player.hotbar.stack(slot), None);
+            assert_eq!(session.player.hotbar_stack(slot), None);
         }
     }
 
@@ -3952,20 +3975,100 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("stacks.mcvx");
         let mut session = WorldSession::new_session(4242, save_path.clone());
-        session.player.hotbar.collect(BlockId::CoalOre, 2);
-        session.player.hotbar.collect(BlockId::IronOre, 1);
-        session.player.selected_slot = 1;
+        session.player.collect_block(BlockId::CoalOre);
+        session.player.collect_block(BlockId::IronOre);
+        assert!(session.player.select_slot(1));
 
         save_current_world(&mut session).expect("save succeeds");
         let loaded = load_world_from_path(&save_path).expect("load succeeds");
         let restored = WorldSession::session_from_save(loaded, save_path.clone());
 
         assert_eq!(restored.world.seed(), 4242);
-        assert_eq!(restored.player.selected_slot, 1);
-        assert_eq!(restored.player.hotbar, session.player.hotbar);
+        assert_eq!(restored.player.selected_slot(), 1);
+        assert_eq!(restored.player.inventory(), session.player.inventory());
         for slot in 0..HOTBAR_SLOTS {
-            assert_eq!(restored.player.hotbar.stack(slot), session.player.hotbar.stack(slot));
+            assert_eq!(
+                restored.player.hotbar_stack(slot),
+                session.player.hotbar_stack(slot)
+            );
         }
+    }
+
+    #[test]
+    fn inventory_tools_cursor_main_slots_and_grids_survive_named_world_restart() {
+        use opencraft::player::inventory::{
+            Item, ItemId, Material, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("full.mcvx");
+        let mut session = WorldSession::new_session(909, save_path.clone());
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"));
+        slots[HOTBAR_SLOTS + 4] =
+            Some(Item::new(ItemId::Material(Material::Stick), 3).expect("sticks"));
+        let axe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Stone, 77).expect("worn axe");
+        let inventory = Inventory::from_parts(slots, Some(axe));
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                1,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("stick")),
+            )
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                7,
+                Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
+            )
+            .expect("table grid cell");
+
+        let mut player = Player::with_inventory(
+            session.player.position,
+            inventory.clone(),
+            player_grid.clone(),
+            table_grid.clone(),
+        );
+        player.yaw = 1.5;
+        assert!(player.select_slot(1));
+        session.player = player;
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.player.selected_slot, 1);
+        assert_eq!(loaded.player.inventory, inventory);
+        assert_eq!(loaded.player.player_grid, player_grid);
+        assert_eq!(loaded.player.table_grid, table_grid);
+
+        let mut restored = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(restored.player.selected_slot(), 1);
+        assert_eq!(restored.player.inventory(), &inventory);
+        assert_eq!(restored.player.player_grid(), &player_grid);
+        assert_eq!(restored.player.table_grid(), &table_grid);
+        assert_eq!(
+            restored
+                .player
+                .inventory()
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(77),
+            "worn tool durability survives the runtime/save boundary"
+        );
+
+        // Saving the restored session reproduces byte-identical state.
+        let second_path = dir.path().join("full-again.mcvx");
+        restored.save_path = second_path.clone();
+        save_current_world(&mut restored).expect("re-save succeeds");
+        assert_eq!(
+            std::fs::read(&save_path).expect("read first save"),
+            std::fs::read(&second_path).expect("read second save"),
+            "session restore followed by save is byte-identical"
+        );
     }
 
     #[test]
@@ -3976,15 +4079,16 @@ mod tests {
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
         aim_placement_camera(&mut session);
-        session.player.hotbar.collect(BlockId::Stone, 2);
-        session.player.selected_slot = 0;
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
 
         let remeshed = try_place_selected_block(&mut session).expect("placement applies");
 
         assert!(!remeshed.is_empty(), "placement remeshes its chunk");
         assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
         assert_eq!(
-            session.player.hotbar.stack(0),
+            session.player.hotbar_stack(0),
             Some(ItemStack {
                 block: BlockId::Stone,
                 count: 1,
@@ -4000,8 +4104,9 @@ mod tests {
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
         aim_placement_camera(&mut session);
-        session.player.hotbar.collect(BlockId::Stone, 2);
-        session.player.selected_slot = 5;
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(5));
 
         assert!(
             try_place_selected_block(&mut session).is_none(),
@@ -4009,7 +4114,7 @@ mod tests {
         );
         assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
         assert_eq!(
-            session.player.hotbar.stack(0),
+            session.player.hotbar_stack(0),
             Some(ItemStack {
                 block: BlockId::Stone,
                 count: 2,
@@ -4017,7 +4122,7 @@ mod tests {
             "nothing was consumed"
         );
 
-        session.player.selected_slot = 0;
+        assert!(session.player.select_slot(0));
         session.player.position = Vec3::new(0.5, 6.0, 0.5);
         assert!(
             try_place_selected_block(&mut session).is_none(),
@@ -4025,7 +4130,7 @@ mod tests {
         );
         assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
         assert_eq!(
-            session.player.hotbar.stack(0),
+            session.player.hotbar_stack(0),
             Some(ItemStack {
                 block: BlockId::Stone,
                 count: 2,
@@ -4038,7 +4143,8 @@ mod tests {
     fn valid_create_starts_a_world_session_and_enters_playing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
-        app.new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
+        app.new_game
+            .apply(TextInputAction::InsertText("Deep Dark".into()));
         app.new_game.cycle_focus();
         app.new_game.apply(TextInputAction::InsertText("42".into()));
         app.attempt_create();
@@ -4066,7 +4172,8 @@ mod tests {
     fn blank_seed_create_uses_a_fresh_seed_and_still_enters_playing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
-        app.new_game.apply(TextInputAction::InsertText("Blank Seed".into()));
+        app.new_game
+            .apply(TextInputAction::InsertText("Blank Seed".into()));
         // Seed field left blank: the create resolves a fresh time-derived
         // seed (session::random_seed). The value itself is not predictable,
         // so assert the session is internally consistent with its own seed
@@ -4086,9 +4193,12 @@ mod tests {
         // Duplicate: attempt_create fetches FRESH rows, so a row saved
         // after the screen opened still collides (case-insensitively).
         let catalog = WorldCatalogFs::new(dir.path());
-        catalog.save_world("Alpha", &sample_save(9)).expect("save alpha");
+        catalog
+            .save_world("Alpha", &sample_save(9))
+            .expect("save alpha");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
-        app.new_game.apply(TextInputAction::InsertText("alpha".into()));
+        app.new_game
+            .apply(TextInputAction::InsertText("alpha".into()));
         app.attempt_create();
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::NewGame);
         let message = app.new_game.message().expect("duplicate surfaces inline");
@@ -4102,7 +4212,8 @@ mod tests {
 
         // Invalid name: the typed WorldNameError displays inline too.
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
-        app.new_game.apply(TextInputAction::InsertText("bad/name".into()));
+        app.new_game
+            .apply(TextInputAction::InsertText("bad/name".into()));
         app.attempt_create();
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::NewGame);
         let message = app
@@ -4148,7 +4259,7 @@ mod tests {
         assert_eq!(app.session.player.yaw, 0.5);
         assert_eq!(app.session.player.pitch, -0.25);
         assert!(app.session.player.fly_mode);
-        assert_eq!(app.session.player.selected_slot, 2);
+        assert_eq!(app.session.player.selected_slot(), 2);
         assert_eq!(app.session.world.chunk_edits(), &edits);
         assert_eq!(
             app.session.save_path,
@@ -4163,7 +4274,9 @@ mod tests {
     fn corrupt_and_vanished_plays_stay_on_load_game_with_inline_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
-        app.catalog.save_world("ghost", &sample_save(5)).expect("save ghost");
+        app.catalog
+            .save_world("ghost", &sample_save(5))
+            .expect("save ghost");
         std::fs::write(dir.path().join("broken.mcvx"), b"NOPE!1234").expect("write broken");
         app.refresh_load_rows();
         let ghost = app
@@ -4213,16 +4326,15 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(
-            cli,
-            WorldSession::new_session(9, blocker.join("deep.mcvx")),
-        );
+        let mut app = GameApp::new(cli, WorldSession::new_session(9, blocker.join("deep.mcvx")));
         // An unsaved chunk edit: the flag the failure must preserve.
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
             .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
-        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        app.session
+            .world
+            .set_block_immediate(0, 40, 5, BlockId::Brick);
         assert!(app.session.world.has_unsaved_changes());
 
         // Pause -> SaveAndQuit through the extracted, loop-free decision
@@ -4270,7 +4382,9 @@ mod tests {
         app.session
             .world
             .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
-        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        app.session
+            .world
+            .set_block_immediate(0, 40, 5, BlockId::Brick);
 
         app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
         let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
@@ -4307,7 +4421,9 @@ mod tests {
         app.session
             .world
             .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
-        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        app.session
+            .world
+            .set_block_immediate(0, 40, 5, BlockId::Brick);
         assert!(app.session.world.has_unsaved_changes());
 
         app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
@@ -4324,7 +4440,10 @@ mod tests {
             vista::vista_visible(app.lifecycle.screen()),
             "the main menu renders the vista, not the saved world"
         );
-        assert!(app.main_menu_message.is_none(), "successful save, no message");
+        assert!(
+            app.main_menu_message.is_none(),
+            "successful save, no message"
+        );
         assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
     }
 
@@ -4353,7 +4472,9 @@ mod tests {
         app.session
             .world
             .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
-        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        app.session
+            .world
+            .set_block_immediate(0, 40, 5, BlockId::Brick);
         assert!(app.session.world.has_unsaved_changes());
 
         let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::ExitGame);
@@ -4366,7 +4487,10 @@ mod tests {
         );
         // The session's world was saved at its own tempdir save path and
         // the unsaved-changes flag cleared.
-        assert!(save_path.is_file(), "world saved at the session's save path");
+        assert!(
+            save_path.is_file(),
+            "world saved at the session's save path"
+        );
         assert!(!app.session.world.has_unsaved_changes());
         // Settings were durably written at the injected tempdir path.
         assert!(
@@ -4460,10 +4584,7 @@ mod tests {
 
         app.enter_screen(LifecycleScreen::MainMenu);
 
-        assert!(
-            !app.left_mouse_held,
-            "held latch cleared on screen entry"
-        );
+        assert!(!app.left_mouse_held, "held latch cleared on screen entry");
         assert!(
             app.mining.progress().is_none(),
             "partial mining progress cleared on screen entry"
@@ -4514,9 +4635,12 @@ mod tests {
         assert_eq!(session.player.yaw, 0.5);
         assert_eq!(session.player.pitch, -0.25);
         assert!(session.player.fly_mode);
-        assert_eq!(session.player.selected_slot, 2);
+        assert_eq!(session.player.selected_slot(), 2);
         assert_eq!(session.world.render_distance(), 16);
-        assert_eq!(session.save_path, save_path, "session owns the cli save path");
+        assert_eq!(
+            session.save_path, save_path,
+            "session owns the cli save path"
+        );
         assert_eq!(
             session.camera.position,
             session.player.eye_position(),
@@ -4530,12 +4654,7 @@ mod tests {
 
         // Missing file + seed override: fresh session at the override seed.
         let missing = dir.path().join("missing.mcvx");
-        let cli = CliConfig::parse_args([
-            "--save",
-            missing.to_str().unwrap(),
-            "--seed",
-            "777",
-        ]);
+        let cli = CliConfig::parse_args(["--save", missing.to_str().unwrap(), "--seed", "777"]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), 777);
         assert_eq!(session.save_path, missing);
@@ -4570,15 +4689,14 @@ mod tests {
         // (legacy direct-launch behavior, byte-identical).
         let existing = dir.path().join("ignored.mcvx");
         save_world_to_path(&existing, &sample_save(999)).expect("write existing save");
-        let cli = CliConfig::parse_args([
-            "--save",
-            existing.to_str().unwrap(),
-            "--new",
-            "--seed",
-            "5",
-        ]);
+        let cli =
+            CliConfig::parse_args(["--save", existing.to_str().unwrap(), "--new", "--seed", "5"]);
         let session = startup_session(&cli);
-        assert_eq!(session.world.seed(), 5, "force_new ignores the existing save");
+        assert_eq!(
+            session.world.seed(),
+            5,
+            "force_new ignores the existing save"
+        );
         let expected_y = (terrain_height_at_seeded(0, 0, 5) + 4) as f32;
         assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
         assert_eq!(session.save_path, existing);
@@ -4596,7 +4714,8 @@ mod tests {
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
 
         // The create flow: name "alpha", seed text "42".
-        app.new_game.apply(TextInputAction::InsertText("alpha".into()));
+        app.new_game
+            .apply(TextInputAction::InsertText("alpha".into()));
         app.new_game.cycle_focus();
         app.new_game.apply(TextInputAction::InsertText("42".into()));
         app.attempt_create();
@@ -4613,7 +4732,9 @@ mod tests {
         app.session
             .world
             .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, expected_seed));
-        app.session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        app.session
+            .world
+            .set_block_immediate(0, 40, 5, BlockId::Brick);
         assert_eq!(app.session.world.get_block(0, 40, 5), BlockId::Brick);
         assert!(app.session.world.has_unsaved_changes());
         let edits_before = app.session.world.chunk_edits().clone();
@@ -4621,7 +4742,7 @@ mod tests {
         app.session.player.yaw = 1.25;
         app.session.player.pitch = -0.5;
         app.session.player.fly_mode = true;
-        app.session.player.selected_slot = 5;
+        assert!(app.session.player.select_slot(5));
 
         // Escape to pause, then Save and Quit through the real, loop-free
         // decision apply: back to the main menu with the session saved to
@@ -4630,7 +4751,10 @@ mod tests {
         let exit_requested = app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit);
         assert!(!exit_requested);
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
-        assert!(app.main_menu_message.is_none(), "save succeeded, no message");
+        assert!(
+            app.main_menu_message.is_none(),
+            "save succeeded, no message"
+        );
         assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
 
         // The save file exists with exactly the session's own data.
@@ -4669,7 +4793,7 @@ mod tests {
         assert_eq!(app.session.player.yaw, 1.25);
         assert_eq!(app.session.player.pitch, -0.5);
         assert!(app.session.player.fly_mode);
-        assert_eq!(app.session.player.selected_slot, 5);
+        assert_eq!(app.session.player.selected_slot(), 5);
         assert_eq!(
             app.session.world.chunk_edits(),
             &edits_before,
@@ -4706,12 +4830,7 @@ mod tests {
         // session owns the CLI save path at the override seed.
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("smoke.mcvx");
-        let cli = CliConfig::parse_args([
-            "--save",
-            save_path.to_str().unwrap(),
-            "--seed",
-            "7",
-        ]);
+        let cli = CliConfig::parse_args(["--save", save_path.to_str().unwrap(), "--seed", "7"]);
         assert!(cli_has_world_intent(&cli));
         let session = startup_session(&cli);
         assert_eq!(session.save_path, cli.save_path);
@@ -4771,7 +4890,10 @@ mod tests {
             "the expiring tick is false"
         );
         assert!(message.is_none(), "expires at zero");
-        assert!(!tick_transient_message(&mut message), "no message stays false");
+        assert!(
+            !tick_transient_message(&mut message),
+            "no message stays false"
+        );
     }
 
     #[test]
@@ -5033,8 +5155,12 @@ mod tests {
     fn apply_confirmed_delete_refreshes_rows_and_surfaces_delete_failures() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog = WorldCatalogFs::new(dir.path());
-        catalog.save_world("doomed", &sample_save(1)).expect("save doomed");
-        catalog.save_world("spared", &sample_save(2)).expect("save spared");
+        catalog
+            .save_world("doomed", &sample_save(1))
+            .expect("save doomed");
+        catalog
+            .save_world("spared", &sample_save(2))
+            .expect("save spared");
 
         // Confirmed request deletes exactly the named file and the
         // refreshed rows drop it; success shows no message.
