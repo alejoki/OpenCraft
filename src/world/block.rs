@@ -25,6 +25,17 @@ impl BlockId {
         !matches!(self, BlockId::Air)
     }
 
+    /// Whether right-clicking this block opens a crafting station interface.
+    ///
+    /// Deliberately narrow: the crafting table is the only interactive
+    /// station today, so every other block (including Air and unbreakable
+    /// terrain) falls through to the placement/interaction-free path. Solid,
+    /// breakable, and texture behavior are untouched by this classification.
+    #[inline]
+    pub const fn is_table_interactable(self) -> bool {
+        matches!(self, BlockId::CraftingTable)
+    }
+
     #[inline]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -171,6 +182,25 @@ mod tests {
         for face_dir in 0u8..6 {
             assert_eq!(BlockId::CraftingTable.face_tex_layer(face_dir), 9);
         }
+    }
+
+    #[test]
+    fn test_only_the_crafting_table_is_table_interactable() {
+        for id in 0u8..=14 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(
+                block.is_table_interactable(),
+                block == BlockId::CraftingTable,
+                "{block:?} interaction classification drifted"
+            );
+        }
+        assert!(!BlockId::Air.is_table_interactable());
+        assert!(!BlockId::Bedrock.is_table_interactable());
+        assert!(!BlockId::OakPlanks.is_table_interactable());
+        // The classification is additive: table blocks keep their existing
+        // solid/breakable behavior.
+        assert!(BlockId::CraftingTable.is_solid());
+        assert!(BlockId::CraftingTable.break_duration_secs().is_some());
     }
 
     #[test]

@@ -9,14 +9,20 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::player::camera::Camera;
 use crate::player::physics::Player;
+use crate::player::raycast::raycast_voxels;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
 use crate::world::terrain::terrain_height_at_seeded;
+
+/// Maximum eye-to-block distance (blocks) at which a placed crafting table is
+/// reachable. Shared with the placement/mining ray length so every world
+/// interaction uses one reach budget.
+pub const TABLE_INTERACT_REACH: f32 = 8.0;
 
 /// The active world session GameApp holds (S03-T02). One always-present
 /// session is swapped atomically at the `start_world_session` boundary.
@@ -28,6 +34,11 @@ pub struct WorldSession {
     /// from persisted game time, never from the wall clock.
     pub clock: GameClock,
     pub save_path: PathBuf,
+    /// Ephemeral crafting-station state: the position of the table whose
+    /// interface is open, if any. Deliberately not persisted (`SAVE_VERSION`
+    /// unchanged) and reset by both constructors, so a restart always starts
+    /// with no table open.
+    open_table: Option<IVec3>,
 }
 
 impl WorldSession {
@@ -42,6 +53,7 @@ impl WorldSession {
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
             save_path,
+            open_table: None,
         };
         session.sync_camera();
         session
@@ -78,6 +90,7 @@ impl WorldSession {
             camera: Camera::new(Vec3::ZERO),
             clock,
             save_path,
+            open_table: None,
         };
         session.sync_camera();
         session
@@ -89,6 +102,92 @@ impl WorldSession {
         self.camera.position = self.player.eye_position();
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
+    }
+
+    /// The position of the crafting table whose interface is open, if any.
+    ///
+    /// Read-only accessor: validity is re-established by
+    /// [`Self::sync_open_table`] and [`Self::open_table_at`], never by the
+    /// reader. The state is ephemeral and never part of a save.
+    pub const fn open_table_position(&self) -> Option<IVec3> {
+        self.open_table
+    }
+
+    /// Opens the crafting table at `pos` only when the *live* world block
+    /// there is a crafting table and the player's eye is within
+    /// [`TABLE_INTERACT_REACH`].
+    ///
+    /// `pos` is treated as untrusted (it comes from a raycast or any caller),
+    /// so the world is re-read at interaction time. A missing/wrong/replaced/
+    /// out-of-reach coordinate returns `false` and mutates nothing: a failed
+    /// interaction must not silently close a table that is already open.
+    pub fn open_table_at(&mut self, pos: IVec3) -> bool {
+        if !self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_table_interactable()
+        {
+            return false;
+        }
+        if !self.table_within_reach(pos) {
+            return false;
+        }
+        self.open_table = Some(pos);
+        true
+    }
+
+    /// Raycasts one bounded step from the session camera and opens the targeted
+    /// crafting table.
+    ///
+    /// Returns the opened position, or `None` when the ray misses, hits a
+    /// non-table block, or the hit is out of reach. The caller then falls
+    /// through to its normal placement/interaction path, so a non-table click
+    /// behaves exactly as it did before table stations existed.
+    pub fn try_open_targeted_table(&mut self) -> Option<IVec3> {
+        let hit = raycast_voxels(
+            self.camera.position,
+            self.camera.forward(),
+            TABLE_INTERACT_REACH,
+            |x, y, z| self.world.get_block(x, y, z),
+        )?;
+        if self.open_table_at(hit.block_pos) {
+            Some(hit.block_pos)
+        } else {
+            None
+        }
+    }
+
+    /// Re-validates the open table against the current world and reach,
+    /// closing it when the block was removed/replaced or the player walked
+    /// away. Returns the still-open position. One bounded block lookup.
+    pub fn sync_open_table(&mut self) -> Option<IVec3> {
+        let pos = self.open_table?;
+        if self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_table_interactable()
+            && self.table_within_reach(pos)
+        {
+            Some(pos)
+        } else {
+            self.open_table = None;
+            None
+        }
+    }
+
+    /// Closes the open table, if any. Idempotent.
+    pub fn close_table(&mut self) {
+        self.open_table = None;
+    }
+
+    /// Reach check against the block's axis-aligned box: the player may
+    /// interact when the nearest point of the table block is within
+    /// [`TABLE_INTERACT_REACH`] of the eye.
+    fn table_within_reach(&self, pos: IVec3) -> bool {
+        let eye = self.player.eye_position();
+        let min = pos.as_vec3();
+        let closest = eye.clamp(min, min + Vec3::ONE);
+        eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
     }
 }
 
@@ -472,5 +571,224 @@ mod tests {
         let path = PathBuf::from("saves/beta.mcvx");
         let session = WorldSession::session_from_save(make_save(2u32), path.clone());
         assert_eq!(session.save_path, path);
+    }
+
+    /// A session with a deterministic all-air chunk at the origin, so table
+    /// placement and raycasts never depend on generated terrain.
+    fn table_session() -> WorldSession {
+        use crate::world::block::BlockId;
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = WorldSession::new_session(31u32, PathBuf::from("/tmp/table.mcvx"));
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+    }
+
+    /// Aim the player's eyes straight down from three blocks above `pos`.
+    fn aim_down_at(session: &mut WorldSession, pos: IVec3) {
+        session.player.position =
+            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 3.0, pos.z as f32 + 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = -std::f32::consts::FRAC_PI_2;
+        session.sync_camera();
+    }
+
+    #[test]
+    fn targeting_a_placed_table_opens_it() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.open_table_position(), None);
+
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+        assert_eq!(session.open_table_position(), Some(pos));
+        // A still-valid table survives re-validation.
+        assert_eq!(session.sync_open_table(), Some(pos));
+        assert_eq!(session.open_table_position(), Some(pos));
+    }
+
+    #[test]
+    fn targeting_a_non_table_block_does_not_open() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_down_at(&mut session, pos);
+
+        assert_eq!(session.try_open_targeted_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn targeting_air_does_not_open() {
+        let mut session = table_session();
+        aim_down_at(&mut session, IVec3::new(0, 5, 0));
+
+        assert_eq!(session.try_open_targeted_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_replaced_table_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+        assert!(session.try_open_targeted_table().is_none());
+    }
+
+    #[test]
+    fn a_removed_table_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn walking_out_of_reach_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session.player.position = Vec3::new(20.5, 8.0, 0.5);
+        session.sync_camera();
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn an_out_of_reach_table_is_rejected_even_when_valid() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let far = IVec3::new(20, 5, 0);
+        session
+            .world
+            .set_block_immediate(far.x, far.y, far.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, IVec3::new(0, 5, 0));
+
+        assert!(
+            !session.open_table_at(far),
+            "a table beyond the reach budget must not open"
+        );
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn missing_chunk_and_air_coordinates_are_rejected() {
+        let mut session = table_session();
+
+        assert!(
+            !session.open_table_at(IVec3::new(0, 5, 0)),
+            "air is not a table"
+        );
+        assert!(
+            !session.open_table_at(IVec3::new(500, 5, 500)),
+            "unloaded chunk"
+        );
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_rejected_target_does_not_close_an_already_open_table() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let open = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(open.x, open.y, open.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, open);
+        assert_eq!(session.try_open_targeted_table(), Some(open));
+
+        // Failed interactions are side-effect free: they must not silently
+        // close a table that is still valid.
+        assert!(!session.open_table_at(IVec3::new(0, 6, 0)));
+        assert!(!session.open_table_at(IVec3::new(500, 5, 500)));
+        assert_eq!(session.open_table_position(), Some(open));
+    }
+
+    #[test]
+    fn close_table_clears_the_open_state_idempotently() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session.close_table();
+        assert_eq!(session.open_table_position(), None);
+        session.close_table();
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn table_open_state_is_never_restored_from_a_save() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert!(session.try_open_targeted_table().is_some());
+
+        // Ephemeral by construction: the save schema has no table-open field,
+        // and both constructors start closed.
+        let restored =
+            WorldSession::session_from_save(make_save(31u32), PathBuf::from("/tmp/table.mcvx"));
+        assert_eq!(restored.open_table_position(), None);
+        assert_eq!(
+            WorldSession::new_session(31u32, PathBuf::from("/tmp/fresh.mcvx"))
+                .open_table_position(),
+            None
+        );
     }
 }

@@ -254,6 +254,35 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
     Some(remeshed)
 }
 
+/// Outcome of one production right-click world interaction.
+///
+/// Table targeting runs first and is a pure session decision: a successfully
+/// targeted crafting table neither edits the world nor consumes the selected
+/// stack. Anything else falls through to the pre-existing placement path, so
+/// non-table clicks stay byte-compatible with the placement-only behavior.
+///
+/// `sync_open_table` runs at the interaction boundary so a stale open station
+/// (the table was removed/replaced or the player walked away) is closed before
+/// the click is interpreted — replaced tables fall through to placement.
+fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
+    session.sync_open_table();
+    if session.try_open_targeted_table().is_some() {
+        return RightClickOutcome::TableOpened;
+    }
+    match try_place_selected_block(session) {
+        Some(remeshed) => RightClickOutcome::Placed(remeshed),
+        None => RightClickOutcome::Nothing,
+    }
+}
+
+enum RightClickOutcome {
+    /// A table was opened; the authoritative position is exposed by
+    /// [`WorldSession::open_table_position`], not duplicated in this outcome.
+    TableOpened,
+    Placed(Vec<(ChunkPos, ChunkMesh)>),
+    Nothing,
+}
+
 fn on_off(value: bool) -> &'static str {
     if value {
         "On"
@@ -2154,20 +2183,28 @@ impl ApplicationHandler for GameApp {
                         self.left_mouse_held = true;
                     }
                     MouseButton::Right => {
-                        if let Some(remeshed) = try_place_selected_block(&mut self.session) {
-                            // Placement applied: one thump at the current
-                            // volume. A rejected placement returns None and
-                            // stays silent. Field-disjoint from the live
-                            // `gpu` borrow (P005).
-                            self.audio.play(SoundSlot::Place, self.settings.volume);
-                            for (cpos, mesh) in remeshed {
-                                gpu.render_store.upload_mesh(
-                                    &gpu.ctx.device,
-                                    &gpu.renderer.chunk_bind_group_layout,
-                                    cpos,
-                                    &mesh,
-                                );
+                        // Table interaction (S02-T02) is attempted before
+                        // placement: a targeted crafting table opens,
+                        // edits nothing, and consumes nothing. Non-table
+                        // and missing targets fall through to the existing
+                        // instant placement path.
+                        match right_click_interaction(&mut self.session) {
+                            RightClickOutcome::Placed(remeshed) => {
+                                // Placement applied: one thump at the current
+                                // volume. A rejected placement stays silent.
+                                // Field-disjoint from the live `gpu` borrow
+                                // (P005).
+                                self.audio.play(SoundSlot::Place, self.settings.volume);
+                                for (cpos, mesh) in remeshed {
+                                    gpu.render_store.upload_mesh(
+                                        &gpu.ctx.device,
+                                        &gpu.renderer.chunk_bind_group_layout,
+                                        cpos,
+                                        &mesh,
+                                    );
+                                }
                             }
+                            RightClickOutcome::TableOpened | RightClickOutcome::Nothing => {}
                         }
                     }
                     _ => {}
@@ -2242,6 +2279,11 @@ impl ApplicationHandler for GameApp {
                     self.session.camera.position = self.session.player.eye_position();
                     self.session.camera.yaw = self.session.player.yaw;
                     self.session.camera.pitch = self.session.player.pitch;
+                    // Open-table state is a world fact (S02-T02): close the
+                    // station as soon as its block is removed/replaced or
+                    // the player steps out of reach. One bounded lookup per
+                    // playing frame, never a scan.
+                    self.session.sync_open_table();
 
                     let (player_chunk, _) = world_to_chunk_and_local(
                         self.session.player.position.x.floor() as i32,
@@ -4142,6 +4184,232 @@ mod tests {
                 count: 2,
             }),
             "rejected placement does not consume"
+        );
+    }
+
+    /// Camera and player eyes looking straight down at `pos` from three
+    /// blocks above, kept in sync so the session's reach check and raycast
+    /// agree (unlike the placement tests, which only set the camera).
+    fn aim_table_interaction_at(session: &mut WorldSession, pos: IVec3) {
+        session.player.position =
+            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 3.0, pos.z as f32 + 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = -std::f32::consts::FRAC_PI_2;
+        session.sync_camera();
+    }
+
+    #[test]
+    fn right_click_on_a_placed_table_opens_without_placing_or_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(20, dir.path().join("table.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::TableOpened),
+            "a targeted table must open"
+        );
+        assert_eq!(
+            session.open_table_position(),
+            Some(IVec3::new(0, 5, 0)),
+            "the session exposes the active table position"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "opening a table must not place the selected block"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "opening a table must not consume the selected stack"
+        );
+    }
+
+    #[test]
+    fn right_click_on_a_table_opens_even_with_an_empty_selected_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(21, dir.path().join("table-empty.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(session.player.select_slot(4));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::TableOpened),
+            "table interaction must not depend on the held stack"
+        );
+        assert_eq!(session.open_table_position(), Some(IVec3::new(0, 5, 0)));
+        assert!(session.player.hotbar_stack(4).is_none());
+    }
+
+    #[test]
+    fn right_click_on_a_non_table_falls_through_to_placement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(22, dir.path().join("fallback.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "a non-table target must use the placement path"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Stone,
+            "placement is byte-compatible with the pre-table path"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            }),
+            "placement consumes exactly one selected item"
+        );
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn right_click_on_air_opens_and_places_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(23, dir.path().join("air-click.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(session.open_table_position(), None);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            }),
+            "a click that applies nothing consumes nothing"
+        );
+    }
+
+    #[test]
+    fn right_click_placement_fallback_with_an_empty_slot_mutates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(24, dir.path().join("empty-slot.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::Nothing));
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "no placement happened"
+        );
+        assert!(session.player.hotbar_stack(0).is_none());
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_replaced_table_closes_the_open_state_and_falls_through_to_placement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(25, dir.path().join("replaced.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::TableOpened
+        ));
+
+        // An unrelated world edit replaces the station; the next click must
+        // observe the stale open state as closed and place normally.
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert_eq!(
+            session.open_table_position(),
+            None,
+            "a replaced table must not stay open"
+        );
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "the same click falls through to placement"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+    }
+
+    #[test]
+    fn a_placed_crafting_table_can_then_be_targeted_and_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(26, dir.path().join("place-then-open.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        session.player.collect_block(BlockId::CraftingTable);
+        assert!(session.player.select_slot(0));
+
+        // The first click targets the stone support, so the held crafting
+        // table is placed above it through the normal placement path.
+        assert!(
+            matches!(
+                right_click_interaction(&mut session),
+                RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()
+            ),
+            "placing a held crafting table must use the placement path"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::CraftingTable);
+        assert!(
+            session.player.hotbar_stack(0).is_none(),
+            "the placed stack was consumed"
+        );
+        assert_eq!(session.open_table_position(), None);
+
+        // Targeting the real placed block now opens that station instead of
+        // stacking another block on top of it.
+        aim_table_interaction_at(&mut session, IVec3::new(0, 6, 0));
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::TableOpened),
+            "the placed station opens from its actual world coordinate"
+        );
+        assert_eq!(session.open_table_position(), Some(IVec3::new(0, 6, 0)));
+        assert_eq!(
+            session.world.get_block(0, 7, 0),
+            BlockId::Air,
+            "nothing was placed on top of the table"
         );
     }
 
