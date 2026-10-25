@@ -36,9 +36,7 @@ impl PackedQuad {
             | (((w - 1) & 31) << 15)
             | (((h - 1) & 31) << 20)
             | ((face_dir & 7) << 25);
-        let word1 = (tex_layer as u32)
-            | ((ao_packed as u32) << 8)
-            | ((light_packed as u32) << 16);
+        let word1 = (tex_layer as u32) | ((ao_packed as u32) << 8) | ((light_packed as u32) << 16);
         Self([word0, word1])
     }
 

@@ -120,8 +120,7 @@ impl SkyVertex {
 /// Expand the sun, moon and fixed-seed star field into static billboard
 /// vertices. Called once at renderer construction; the result never changes.
 pub fn build_sky_vertices(star_field: &[Vec3]) -> Vec<SkyVertex> {
-    let mut verts =
-        Vec::with_capacity(6 + MOON_VERTEX_COUNT + star_field.len() * 6);
+    let mut verts = Vec::with_capacity(6 + MOON_VERTEX_COUNT + star_field.len() * 6);
 
     // Sun and moon directions are placeholders: the shader replaces them with
     // the per-frame uniform directions, so the static buffer stays valid all
@@ -129,12 +128,7 @@ pub fn build_sky_vertices(star_field: &[Vec3]) -> Vec<SkyVertex> {
     for v in SkyVertex::quad(Vec3::X, daycycle::SUN_ANGULAR_SIZE, SUN_COLOR, KIND_SUN) {
         verts.push(v);
     }
-    for v in SkyVertex::quad(
-        -Vec3::X,
-        daycycle::MOON_ANGULAR_SIZE,
-        MOON_COLOR,
-        KIND_MOON,
-    ) {
+    for v in SkyVertex::quad(-Vec3::X, daycycle::MOON_ANGULAR_SIZE, MOON_COLOR, KIND_MOON) {
         verts.push(v);
     }
     for star in star_field {
@@ -295,10 +289,7 @@ pub fn create_sky_bind_group(
 
 /// Build the static sky vertex buffer (sun quad + moon quad + every star
 /// quad) once at renderer construction.
-pub fn create_sky_vertex_buffer(
-    device: &wgpu::Device,
-    star_field: &[Vec3],
-) -> (wgpu::Buffer, u32) {
+pub fn create_sky_vertex_buffer(device: &wgpu::Device, star_field: &[Vec3]) -> (wgpu::Buffer, u32) {
     use wgpu::util::DeviceExt;
     let vertices = build_sky_vertices(star_field);
     let count = vertices.len() as u32;
@@ -408,11 +399,15 @@ mod tests {
     #[test]
     fn sky_uniform_from_time_tracks_the_pure_day_cycle() {
         let noon = SkyUniform::from_time(daycycle::DEFAULT_TIME_OF_DAY);
-        assert!((noon.sun_dir[1] - 1.0).abs() < 1e-5, "noon sun is at zenith");
+        assert!(
+            (noon.sun_dir[1] - 1.0).abs() < 1e-5,
+            "noon sun is at zenith"
+        );
         assert!((noon.params[0] - 1.0).abs() < 1e-5, "noon sun is bright");
         assert_eq!(noon.params[2], 0.0, "no stars at noon");
 
-        let midnight = SkyUniform::from_time(daycycle::DAY_TICKS / 2 + daycycle::DEFAULT_TIME_OF_DAY);
+        let midnight =
+            SkyUniform::from_time(daycycle::DAY_TICKS / 2 + daycycle::DEFAULT_TIME_OF_DAY);
         assert!(
             (midnight.moon_dir[1] - 1.0).abs() < 1e-5,
             "midnight moon is at zenith"
@@ -510,9 +505,15 @@ mod tests {
 
         assert_eq!(stars.len(), daycycle::STAR_COUNT);
         assert_eq!(verts.len(), star_base + stars.len() * 6);
-        assert_eq!(&verts[0..6].iter().map(|v| v.kind).collect::<Vec<_>>(), &[KIND_SUN; 6]);
         assert_eq!(
-            &verts[6..star_base].iter().map(|v| v.kind).collect::<Vec<_>>(),
+            &verts[0..6].iter().map(|v| v.kind).collect::<Vec<_>>(),
+            &[KIND_SUN; 6]
+        );
+        assert_eq!(
+            &verts[6..star_base]
+                .iter()
+                .map(|v| v.kind)
+                .collect::<Vec<_>>(),
             &[KIND_MOON; MOON_VERTEX_COUNT]
         );
         assert!(verts[star_base..].iter().all(|v| v.kind == KIND_STAR));
@@ -552,7 +553,11 @@ mod tests {
         for v in &moon {
             assert_eq!(v.color, MOON_COLOR);
             assert_eq!(v.size, daycycle::MOON_ANGULAR_SIZE);
-            assert_eq!(Vec3::from(v.dir), -Vec3::X, "moon dir is a shader placeholder");
+            assert_eq!(
+                Vec3::from(v.dir),
+                -Vec3::X,
+                "moon dir is a shader placeholder"
+            );
         }
         const {
             assert!(MOON_COLOR[2] > MOON_COLOR[0], "moon tint must be cool");

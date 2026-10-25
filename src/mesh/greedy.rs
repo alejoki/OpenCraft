@@ -247,30 +247,14 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                             Some(neighbor_light(padded, axis, air_d, pu + 1, pv + 1))
                         };
 
-                        let l00 = average_light([
-                            Some(center_light),
-                            light_um,
-                            light_vm,
-                            light_c00,
-                        ]);
-                        let l10 = average_light([
-                            Some(center_light),
-                            light_up,
-                            light_vm,
-                            light_c10,
-                        ]);
-                        let l01 = average_light([
-                            Some(center_light),
-                            light_um,
-                            light_vp,
-                            light_c01,
-                        ]);
-                        let l11 = average_light([
-                            Some(center_light),
-                            light_up,
-                            light_vp,
-                            light_c11,
-                        ]);
+                        let l00 =
+                            average_light([Some(center_light), light_um, light_vm, light_c00]);
+                        let l10 =
+                            average_light([Some(center_light), light_up, light_vm, light_c10]);
+                        let l01 =
+                            average_light([Some(center_light), light_um, light_vp, light_c01]);
+                        let l11 =
+                            average_light([Some(center_light), light_up, light_vp, light_c11]);
                         let light_packed = (l00 as u32)
                             | ((l10 as u32) << 4)
                             | ((l01 as u32) << 8)

@@ -178,8 +178,7 @@ impl WorldManager {
     /// resident. Sky-light propagation is column-granular: a partial column
     /// cannot produce a trustworthy grid.
     fn column_is_complete(&self, cx: i32, cz: i32) -> bool {
-        (MIN_CHUNK_Y..=MAX_CHUNK_Y)
-            .all(|cy| self.chunks.contains_key(&ChunkPos::new(cx, cy, cz)))
+        (MIN_CHUNK_Y..=MAX_CHUNK_Y).all(|cy| self.chunks.contains_key(&ChunkPos::new(cx, cy, cz)))
     }
 
     /// True when every chunk of `(cx, cz)` has a sky-light grid. Grids are only
@@ -193,8 +192,7 @@ impl WorldManager {
     /// (6 face halos plus the 12 edge strips), so all nine columns must be lit
     /// before a mesh may be baked.
     fn has_light_neighborhood(&self, cx: i32, cz: i32) -> bool {
-        (-1..=1)
-            .all(|dx| (-1..=1).all(|dz| self.has_column_light(cx + dx, cz + dz)))
+        (-1..=1).all(|dx| (-1..=1).all(|dz| self.has_column_light(cx + dx, cz + dz)))
     }
 
     /// Sky light at a world position, used for the padded snapshot's 12 edge
@@ -471,14 +469,20 @@ impl WorldManager {
         }
 
         // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
-        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+        if let Some(grid) = self
+            .light_grids
+            .get(&ChunkPos::new(pos.x + 1, pos.y, pos.z))
+        {
             for ly in 0..cs {
                 for lz in 0..cs {
                     padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
                 }
             }
         }
-        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+        if let Some(grid) = self
+            .light_grids
+            .get(&ChunkPos::new(pos.x - 1, pos.y, pos.z))
+        {
             for ly in 0..cs {
                 for lz in 0..cs {
                     padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
@@ -487,7 +491,10 @@ impl WorldManager {
         }
 
         // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
-        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+        if let Some(grid) = self
+            .light_grids
+            .get(&ChunkPos::new(pos.x, pos.y + 1, pos.z))
+        {
             for lz in 0..cs {
                 for lx in 0..cs {
                     padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
@@ -495,7 +502,10 @@ impl WorldManager {
             }
         }
         if pos.y > MIN_CHUNK_Y {
-            if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+            if let Some(grid) = self
+                .light_grids
+                .get(&ChunkPos::new(pos.x, pos.y - 1, pos.z))
+            {
                 for lz in 0..cs {
                     for lx in 0..cs {
                         padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
@@ -512,14 +522,20 @@ impl WorldManager {
         }
 
         // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
-        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+        if let Some(grid) = self
+            .light_grids
+            .get(&ChunkPos::new(pos.x, pos.y, pos.z + 1))
+        {
             for ly in 0..cs {
                 for lx in 0..cs {
                     padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
                 }
             }
         }
-        if let Some(grid) = self.light_grids.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+        if let Some(grid) = self
+            .light_grids
+            .get(&ChunkPos::new(pos.x, pos.y, pos.z - 1))
+        {
             for ly in 0..cs {
                 for lx in 0..cs {
                     padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
@@ -990,11 +1006,7 @@ mod tests {
         let mut mgr = WorldManager::new(4);
         // Full 3x3 column ring around the stone chunk, but column (1,0) is
         // missing its top chunk, so it can never become light-ready yet.
-        insert_3x3_columns(
-            &mut mgr,
-            true,
-            Some(ChunkPos::new(1, MAX_CHUNK_Y, 0)),
-        );
+        insert_3x3_columns(&mut mgr, true, Some(ChunkPos::new(1, MAX_CHUNK_Y, 0)));
         mgr.recompute_light_for_test();
         assert!(!mgr.has_column_light(1, 0));
 

@@ -32,7 +32,10 @@ use opencraft::ui::hud::{
     hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
     selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
-use opencraft::ui::inventory::{hit_test, layout, InventoryMode, InventoryScreen, InventoryTarget};
+use opencraft::ui::inventory::{
+    hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
+    MAX_LABELS,
+};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
@@ -967,6 +970,11 @@ struct Ready {
     /// Per-slot hotbar count labels (S03-T04): one change-gated buffer per
     /// slot, positioned at the same `hotbar_slot_rects` the outlines use.
     hotbar_counts: [StatsOverlay; HOTBAR_SLOTS],
+    /// Inventory/crafting panel labels (S03-T04): one change-gated buffer per
+    /// possible label, sized once to the pure `MAX_LABELS` bound. Only the
+    /// first `n` buffers are drawn for an `n`-label frame; a closed screen
+    /// draws none and never re-shapes anything.
+    inventory_labels: Vec<StatsOverlay>,
 }
 
 /// Bounded accelerated-demo watch (S02-T04): `--time-scale` is a test seam
@@ -1077,7 +1085,6 @@ struct GameApp {
     inventory: InventoryScreen,
     /// Last inventory-click status line. Read by the T04 panel renderer as the
     /// footer message; `None` until the first click of a session.
-    #[allow(dead_code)]
     inventory_status: Option<String>,
     /// Press-drag-release origin (S03-T03): the target a Left press picked a
     /// stack from. Cleared by any non-pick press, release, close, and screen
@@ -2068,6 +2075,18 @@ impl ApplicationHandler for GameApp {
                 HOTBAR_COUNT_LINE_HEIGHT,
             )
         });
+        // Inventory panel labels (S03-T04): same change-gated overlay type and
+        // metrics as the hotbar counts, sized once to the pure label bound so
+        // no frame allocates a text buffer.
+        let inventory_labels = (0..MAX_LABELS)
+            .map(|_| {
+                StatsOverlay::with_metrics(
+                    &mut ui.font_system,
+                    HOTBAR_COUNT_FONT_SIZE,
+                    HOTBAR_COUNT_LINE_HEIGHT,
+                )
+            })
+            .collect();
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -2101,6 +2120,7 @@ impl ApplicationHandler for GameApp {
             load_play_text,
             load_delete_text,
             hotbar_counts,
+            inventory_labels,
         });
     }
 
@@ -2999,6 +3019,29 @@ impl ApplicationHandler for GameApp {
                         ));
                     }
                 }
+                // Inventory/crafting panel (S03-T04): extend the same CPU quad
+                // list, after the HUD/mining quads and before the single
+                // `set_quads` upload, so the panel always draws above the
+                // world and the HUD with no new pipeline (P003/P004).
+                // Geometry comes only from the pure T01 module; a closed
+                // screen extends nothing.
+                let inventory_mode = self.inventory.mode(self.session.open_table_position());
+                let inventory_layout = if inventory_mode.is_open() {
+                    let layout =
+                        layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
+                    quads.extend(screen_quads(
+                        inventory_mode,
+                        &layout,
+                        self.session.player.inventory(),
+                        self.session.player.player_grid(),
+                        self.session.player.table_grid(),
+                        self.session.player.inventory().cursor(),
+                        self.cursor_pos,
+                    ));
+                    Some(layout)
+                } else {
+                    None
+                };
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
                     &quads,
@@ -3018,6 +3061,37 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.config.width as f32,
                         gpu.ctx.config.height as f32,
                         &hotbar_count_label_for(self.session.player.inventory(), slot),
+                    );
+                }
+
+                // Inventory panel labels (S03-T04): built from the same pure
+                // T01 module and the same change-gated overlay type as the
+                // hotbar counts. The first loop updates only the buffers this
+                // frame actually uses; the text areas are appended after
+                // `areas` exists (two-pass borrow, mirroring `hotbar_counts`).
+                // A closed screen produces no labels, so nothing is reshaped
+                // and no inventory text area is pushed.
+                let inventory_panel_labels = match inventory_layout {
+                    Some(layout) => screen_labels(
+                        inventory_mode,
+                        &layout,
+                        self.session.player.inventory(),
+                        self.session.player.player_grid(),
+                        self.session.player.table_grid(),
+                        self.inventory_status.as_deref(),
+                    ),
+                    None => Vec::new(),
+                };
+                for (buffer, label) in gpu
+                    .inventory_labels
+                    .iter_mut()
+                    .zip(inventory_panel_labels.iter())
+                {
+                    buffer.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &label.text,
                     );
                 }
 
@@ -3053,6 +3127,18 @@ impl ApplicationHandler for GameApp {
                         let (x, y) = hotbar_count_text_origin(hotbar_rects[slot]);
                         areas.push(counts.text_area(x, y));
                     }
+                }
+                // Inventory panel labels ride the same UI pass, above the
+                // HUD labels. The label count is bounded by the pure
+                // `MAX_LABELS` and by the buffer pool length, so the zip
+                // never drops a label silently.
+                debug_assert!(inventory_panel_labels.len() <= MAX_LABELS);
+                for (buffer, label) in gpu
+                    .inventory_labels
+                    .iter()
+                    .zip(inventory_panel_labels.iter())
+                {
+                    areas.push(buffer.text_area(label.left, label.top));
                 }
                 let prepare_ok = gpu
                     .ui
@@ -5482,6 +5568,390 @@ mod tests {
             Some(2),
             "the rejected drop leaves the stack on the cursor"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T04: panel rendering (pure quads/labels over live gameplay state)
+    // -----------------------------------------------------------------------
+
+    fn test_stack(block: BlockId, count: u16) -> Item {
+        Item::new(ItemId::Block(block), count).expect("test stacks are valid")
+    }
+
+    #[test]
+    fn inventory_quads_cover_every_slot_grid_cell_and_result_and_are_empty_when_closed() {
+        use opencraft::player::inventory::{INVENTORY_SLOTS, MAX_GRID_SLOTS};
+
+        let empty_inventory = Inventory::empty();
+        let empty_player_grid = CraftingGrid::new(GridKind::Player);
+        let empty_table_grid = CraftingGrid::new(GridKind::Table);
+        let layout = layout(1280, 720, InventoryMode::Player);
+
+        // A closed screen contributes no geometry and no text at all.
+        assert!(screen_quads(
+            InventoryMode::Closed,
+            &layout,
+            &empty_inventory,
+            &empty_player_grid,
+            &empty_table_grid,
+            Some(test_stack(BlockId::Stone, 3)),
+            Some((100.0, 100.0)),
+        )
+        .is_empty());
+        assert!(screen_labels(
+            InventoryMode::Closed,
+            &layout,
+            &empty_inventory,
+            &empty_player_grid,
+            &empty_table_grid,
+            Some("closed"),
+        )
+        .is_empty());
+
+        // Empty player mode: backdrop + 36 slot outlines + 4 grid cells + the
+        // player result slot. Table mode adds the 16 table cells and result.
+        let player_quads = screen_quads(
+            InventoryMode::Player,
+            &layout,
+            &empty_inventory,
+            &empty_player_grid,
+            &empty_table_grid,
+            None,
+            None,
+        );
+        assert_eq!(player_quads.len(), 1 + INVENTORY_SLOTS + 4 + 1);
+        let table_quads = screen_quads(
+            InventoryMode::Table,
+            &layout,
+            &empty_inventory,
+            &empty_player_grid,
+            &empty_table_grid,
+            None,
+            None,
+        );
+        assert_eq!(
+            table_quads.len(),
+            1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
+        );
+
+        // Occupied state adds exactly one fill per occupied cell plus the
+        // cursor ghost. Player mode never draws a table cell fill.
+        let stone = test_stack(BlockId::Stone, 3);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(stone);
+        let inventory = Inventory::from_parts(slots, Some(stone));
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid.set(0, Some(stone)).expect("player cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid.set(15, Some(stone)).expect("table cell");
+        let cursor = Some((200.0, 150.0));
+
+        let player_quads = screen_quads(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            Some(stone),
+            cursor,
+        );
+        assert_eq!(
+            player_quads.len(),
+            1 + INVENTORY_SLOTS + 4 + 1 // chrome
+                + 1 // slot 0 fill
+                + 1 // player cell 0 fill
+                + 1 // cursor ghost
+        );
+        let table_quads = screen_quads(
+            InventoryMode::Table,
+            &layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            Some(stone),
+            cursor,
+        );
+        assert_eq!(
+            table_quads.len(),
+            1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
+                + 1 // slot 0 fill
+                + 1 // player cell 0 fill
+                + 1 // table cell 15 fill
+                + 1 // cursor ghost
+        );
+    }
+
+    #[test]
+    fn inventory_labels_report_slot_counts_tool_durability_result_preview_cursor_and_status() {
+        use opencraft::player::inventory::{ToolKind, ToolTier, INVENTORY_SLOTS};
+
+        let pickaxe = Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 200)
+            .expect("worn iron pickaxe");
+        let plank = test_stack(BlockId::OakPlanks, 1);
+        let holding = test_stack(BlockId::Stone, 7);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(pickaxe);
+        let inventory = Inventory::from_parts(slots, Some(holding));
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for cell in 0..4 {
+            player_grid.set(cell, Some(plank)).expect("plank cell");
+        }
+        let table_grid = CraftingGrid::new(GridKind::Table);
+        let layout = layout(1280, 720, InventoryMode::Player);
+
+        let labels = screen_labels(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            Some("Crafted Crafting Table"),
+        );
+        let texts: Vec<&str> = labels.iter().map(|label| label.text.as_str()).collect();
+        assert!(texts.contains(&"Player Inventory"));
+        assert!(texts.contains(&"1"), "slot count for the pickaxe");
+        assert!(texts.contains(&"200/250"), "remaining/max durability");
+        assert!(
+            texts.contains(&"Crafting Table x1"),
+            "the 2x2 result preview is named"
+        );
+        assert!(texts.contains(&"Holding: Stone x7"));
+        assert!(texts.contains(&"Left click moves a stack"));
+        assert!(texts.contains(&"Crafted Crafting Table"));
+        assert!(labels.len() <= MAX_LABELS);
+
+        // Every label anchors inside the panel so nothing renders off-screen.
+        for label in &labels {
+            assert!(label.left >= layout.panel.0);
+            assert!(label.top >= layout.panel.1);
+            assert!(label.left <= layout.panel.0 + layout.panel.2);
+            assert!(label.top <= layout.panel.1 + layout.panel.3);
+        }
+    }
+
+    #[test]
+    fn player_grid_crafting_flow_through_clicks_crafts_a_table_item_exactly_once() {
+        use opencraft::player::inventory::{RecipeId, INVENTORY_SLOTS};
+
+        let plank = test_stack(BlockId::OakPlanks, 1);
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(4) {
+            *slot = Some(plank);
+        }
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+
+        // Four slot picks and four grid drops: the UI never computes counts.
+        for cell in 0..4 {
+            assert_eq!(
+                apply_inventory_click(&mut player, &screen, None, InventoryTarget::Slot(cell)),
+                Ok(InventoryClickOutcome::Moved)
+            );
+            assert_eq!(
+                apply_inventory_click(
+                    &mut player,
+                    &screen,
+                    None,
+                    InventoryTarget::GridCell {
+                        kind: GridKind::Player,
+                        index: cell,
+                    },
+                ),
+                Ok(InventoryClickOutcome::Moved)
+            );
+        }
+        assert_eq!(
+            player.player_grid().preview().map(|preview| (
+                preview.recipe,
+                preview.output,
+                preview.output_count
+            )),
+            Some((
+                RecipeId::CraftingTable,
+                ItemId::Block(BlockId::CraftingTable),
+                1
+            ))
+        );
+
+        let crafted = apply_inventory_click(
+            &mut player,
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+        )
+        .expect("four planks craft one table");
+        match crafted {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::Block(BlockId::CraftingTable));
+                assert_eq!(item.count(), 1);
+            }
+            InventoryClickOutcome::Moved => panic!("the result click must report the crafted item"),
+        }
+        assert!(player.player_grid().is_empty());
+        let tables: Vec<Item> = player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Block(BlockId::CraftingTable))
+            .copied()
+            .collect();
+        assert_eq!(tables.len(), 1, "exactly one table landed in the inventory");
+        assert_eq!(tables[0].count(), 1);
+
+        // The second result click has no recipe and changes nothing.
+        let inventory_before = player.inventory().clone();
+        let grid_before = player.player_grid().clone();
+        assert_eq!(
+            apply_inventory_click(
+                &mut player,
+                &screen,
+                None,
+                InventoryTarget::ResultSlot(GridKind::Player),
+            ),
+            Err(InventoryCommandError::Craft(CraftError::NoRecipe))
+        );
+        assert_eq!(player.inventory(), &inventory_before);
+        assert_eq!(player.player_grid(), &grid_before);
+    }
+
+    #[test]
+    fn placed_table_mode_reaches_cell_fifteen_through_clicks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(41, dir.path().join("table-4x4.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        assert!(
+            matches!(
+                right_click_interaction(&mut session),
+                RightClickOutcome::TableOpened
+            ),
+            "a real targeted table opens its station"
+        );
+        let table_open = session.open_table_position();
+        assert_eq!(table_open, Some(IVec3::new(0, 5, 0)));
+
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+        let target = InventoryTarget::GridCell {
+            kind: GridKind::Table,
+            index: 15,
+        };
+
+        // A live table alone never grants the 4x4 grid: a Player-mode screen
+        // rejects the same target before any mutation.
+        let mut player_screen = InventoryScreen::new();
+        player_screen.open_player();
+        let units_before = inventory_units(&session.player);
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &player_screen, table_open, target),
+            Err(InventoryCommandError::TableUnavailable)
+        );
+        assert_eq!(inventory_units(&session.player), units_before);
+        assert!(session.player.inventory().cursor().is_none());
+
+        // Table mode accepts cell 15 and moves the whole stack there.
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        assert_eq!(screen.mode(table_open), InventoryMode::Table);
+        assert_eq!(
+            apply_inventory_click(
+                &mut session.player,
+                &screen,
+                table_open,
+                InventoryTarget::Slot(0)
+            ),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, table_open, target),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert_eq!(
+            session.player.table_grid().slot(15).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Stone))
+        );
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.inventory().hotbar(0).is_none());
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::CraftingTable,
+            "the UI click touched no world block"
+        );
+    }
+
+    #[test]
+    fn inventory_screen_does_not_mutate_the_world_when_a_click_is_consumed() {
+        use opencraft::player::inventory::INVENTORY_SLOTS;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("ui-inert.mcvx");
+        let mut session = WorldSession::new_session(42, save_path.clone());
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        // Two separate stacks: slot 0 is selected and must never be touched by
+        // a click on the unrelated slot 1.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(test_stack(BlockId::Stone, 2));
+        slots[1] = Some(test_stack(BlockId::Stone, 5));
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        aim_placement_camera(&mut session);
+
+        let hit = raycast_voxels(
+            session.camera.position,
+            session.camera.forward(),
+            8.0,
+            |x, y, z| session.world.get_block(x, y, z),
+        )
+        .expect("the stone below is targeted");
+        let targeted_before =
+            session
+                .world
+                .get_block(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+        let selected_before = session.player.hotbar_stack(0);
+        assert_eq!(selected_before.map(|stack| stack.count), Some(2));
+
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, None, InventoryTarget::Slot(1)),
+            Ok(InventoryClickOutcome::Moved)
+        );
+
+        assert_eq!(
+            session
+                .world
+                .get_block(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z),
+            targeted_before,
+            "a consumed UI click edits no world block"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            selected_before,
+            "the selected stack is untouched by a click on another slot"
+        );
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(5),
+            "the clicked stack moved to the cursor"
+        );
+        assert_eq!(session.save_path, save_path, "the save path is unchanged");
+        assert!(!save_path.exists(), "a UI click never writes the save file");
     }
 
     #[test]

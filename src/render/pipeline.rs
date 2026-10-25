@@ -515,13 +515,9 @@ impl VoxelRenderer {
         // billboard geometry (sun, moon, fixed-seed star field) is static.
         let sky_bind_group_layout = sky::create_sky_bind_group_layout(&ctx.device);
         let sky_uniform_buffer = sky::create_sky_uniform_buffer(&ctx.device);
-        let sky_bind_group = sky::create_sky_bind_group(
-            &ctx.device,
-            &sky_bind_group_layout,
-            &sky_uniform_buffer,
-        );
-        let sky_pipeline =
-            sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
+        let sky_bind_group =
+            sky::create_sky_bind_group(&ctx.device, &sky_bind_group_layout, &sky_uniform_buffer);
+        let sky_pipeline = sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
         let (sky_vertex_buffer, sky_vertex_count) =
             sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
 
@@ -904,13 +900,8 @@ mod tests {
 
     #[test]
     fn test_overlay_vertices_include_wireframe_crosshair_and_hotbar() {
-        let verts = build_overlay_line_vertices(
-            &Mat4::IDENTITY,
-            1.77,
-            Some(IVec3::new(1, 2, 3)),
-            0,
-            true,
-        );
+        let verts =
+            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 0, true);
         // 24 (wireframe) + 4 (crosshair) + 9 * 8 (hotbar) = 100 vertices
         assert_eq!(verts.len(), 100);
     }
@@ -920,13 +911,8 @@ mod tests {
         // Non-Playing screens must suppress the wireframe, crosshair, AND
         // hotbar even when the inputs still carry a target and a selected
         // slot — the flag alone gates all three.
-        let verts = build_overlay_line_vertices(
-            &Mat4::IDENTITY,
-            1.77,
-            Some(IVec3::new(1, 2, 3)),
-            4,
-            false,
-        );
+        let verts =
+            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 4, false);
         assert!(verts.is_empty(), "hidden overlays must emit no vertices");
     }
 

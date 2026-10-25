@@ -273,7 +273,12 @@ impl LogoRenderer {
     /// does not match its declared dimensions is treated as absent rather
     /// than handed to `write_texture` (which would panic on the size
     /// mismatch).
-    pub fn set_logo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, logo: Option<&PackLogo>) {
+    pub fn set_logo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        logo: Option<&PackLogo>,
+    ) {
         self.vertex_buffer = None;
         self.vertex_count = 0;
 
@@ -371,7 +376,11 @@ impl LogoRenderer {
     ) {
         let verts = match rect {
             Some((x, y, w, h))
-                if self.bind_group.is_some() && w > 0.0 && h > 0.0 && x.is_finite() && y.is_finite() =>
+                if self.bind_group.is_some()
+                    && w > 0.0
+                    && h > 0.0
+                    && x.is_finite()
+                    && y.is_finite() =>
             {
                 logo_to_vertices(x, y, w, h, surface_w, surface_h)
             }
