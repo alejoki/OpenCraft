@@ -15,9 +15,9 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::inventory::{ToolWear, HOTBAR_SLOTS};
+use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
-use opencraft::player::physics::InputState;
+use opencraft::player::physics::{InputState, InventoryCommandError, Player};
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
@@ -32,6 +32,7 @@ use opencraft::ui::hud::{
     hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
     selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
+use opencraft::ui::inventory::{hit_test, layout, InventoryMode, InventoryScreen, InventoryTarget};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
@@ -351,6 +352,164 @@ enum RightClickOutcome {
     TableOpened,
     Placed(Vec<(ChunkPos, ChunkMesh)>),
     Nothing,
+}
+
+// ---------------------------------------------------------------------------
+// Inventory-screen adapter (S03-T03)
+//
+// The pure geometry lives in `ui::inventory` (T01) and every mutation lives in
+// the narrow `Player` command façade (T02). This layer only translates winit
+// input into one of those commands and back into a status line, so the screen
+// can never perform stack arithmetic of its own and gameplay input can never
+// leak through an open panel.
+// ---------------------------------------------------------------------------
+
+/// What one accepted inventory click did. `Crafted` carries the item so the
+/// status line can name it; transfer clicks stay a bare `Moved` (D061: the UI
+/// never inspects counts to decide behavior).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InventoryClickOutcome {
+    /// A whole stack moved between slots, the cursor, or a grid cell.
+    Moved,
+    /// A grid result slot produced this item exactly once.
+    Crafted(Item),
+}
+
+/// Opens the inventory panel from either the E key (`via_table = false`) or a
+/// successful table interaction (`via_table = true`), releasing the cursor and
+/// dropping every gameplay hold so the panel owns the pointer.
+///
+/// A free function because `window_event` already holds disjoint `gpu`/`window`
+/// borrows, making a `&mut self` method unusable there (P005).
+#[allow(clippy::too_many_arguments)]
+fn open_inventory(
+    screen: &mut InventoryScreen,
+    table_open: Option<IVec3>,
+    via_table: bool,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    drag: &mut Option<InventoryTarget>,
+    mining: &mut MiningState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    if via_table {
+        screen.open_table();
+    } else {
+        screen.toggle(table_open);
+    }
+    input.reset();
+    mining.reset();
+    *left_mouse_held = false;
+    *drag = None;
+    *cursor_grabbed = false;
+    set_cursor_grab(window, false);
+}
+
+/// Closes the inventory panel from the E/Escape paths and restores gameplay
+/// input ownership: the cursor is re-grabbed, holds are cleared, and the
+/// session station is closed so the 4x4 grid cannot outlive the screen.
+#[allow(clippy::too_many_arguments)]
+fn close_inventory(
+    screen: &mut InventoryScreen,
+    session: &mut WorldSession,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    drag: &mut Option<InventoryTarget>,
+    mining: &mut MiningState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.close();
+    session.close_table();
+    input.reset();
+    mining.reset();
+    *left_mouse_held = false;
+    *drag = None;
+    *cursor_grabbed = true;
+    set_cursor_grab(window, true);
+}
+
+/// Translates one clicked target into exactly one `Player` inventory command.
+///
+/// Table targets are rejected unless this frame's mode is `Table` (an attached
+/// screen alone is never enough — the live table must still exist), and every
+/// other target routes to the kind-specific façade method. No branch reads or
+/// computes stack counts.
+pub fn apply_inventory_click(
+    player: &mut Player,
+    screen: &InventoryScreen,
+    table_open: Option<IVec3>,
+    target: InventoryTarget,
+) -> Result<InventoryClickOutcome, InventoryCommandError> {
+    let mode = screen.mode(table_open);
+    let table_target = matches!(
+        target,
+        InventoryTarget::GridCell {
+            kind: GridKind::Table,
+            ..
+        } | InventoryTarget::ResultSlot(GridKind::Table)
+    );
+    if table_target && mode != InventoryMode::Table {
+        return Err(InventoryCommandError::TableUnavailable);
+    }
+    match target {
+        InventoryTarget::Slot(index) => player
+            .click_inventory_slot(index)
+            .map(|()| InventoryClickOutcome::Moved)
+            .map_err(InventoryCommandError::from),
+        InventoryTarget::GridCell {
+            kind: GridKind::Player,
+            index,
+        } => player
+            .click_grid_cell(GridKind::Player, index)
+            .map(|()| InventoryClickOutcome::Moved),
+        InventoryTarget::GridCell {
+            kind: GridKind::Table,
+            index,
+        } => player
+            .click_grid_cell(GridKind::Table, index)
+            .map(|()| InventoryClickOutcome::Moved),
+        InventoryTarget::ResultSlot(GridKind::Player) => player
+            .take_craft_result(GridKind::Player)
+            .map(InventoryClickOutcome::Crafted)
+            .map_err(InventoryCommandError::Craft),
+        InventoryTarget::ResultSlot(GridKind::Table) => player
+            .take_craft_result(GridKind::Table)
+            .map(InventoryClickOutcome::Crafted)
+            .map_err(InventoryCommandError::Craft),
+    }
+}
+
+/// One-line status for the panel footer: what moved, what was crafted, or the
+/// typed rejection (warnings-as-data, never a log — D006/MEM009).
+fn inventory_status_text(result: Result<InventoryClickOutcome, InventoryCommandError>) -> String {
+    match result {
+        Ok(InventoryClickOutcome::Moved) => "Moved".to_string(),
+        Ok(InventoryClickOutcome::Crafted(item)) => format!("Crafted {}", item.id().name()),
+        Err(InventoryCommandError::Inventory(error)) => format!("Inventory: {error:?}"),
+        Err(InventoryCommandError::Craft(error)) => format!("Craft: {error:?}"),
+        Err(InventoryCommandError::TableUnavailable) => "Table unavailable".to_string(),
+    }
+}
+
+/// True only when the screen was opened for a table that has since disappeared
+/// (broken, replaced, or out of reach). Delegates to the pure T01 state.
+fn inventory_should_close(screen: &InventoryScreen, table_open: Option<IVec3>) -> bool {
+    screen.table_lost(table_open)
+}
+
+/// Where a press-drag-release ends: only a different cell than the press origin
+/// receives the held stack. A same-cell release (the click-to-pick style) and a
+/// release off the panel are inert, leaving the stack on the cursor.
+fn drag_release_target(
+    origin: Option<InventoryTarget>,
+    target: Option<InventoryTarget>,
+) -> Option<InventoryTarget> {
+    match (origin, target) {
+        (Some(origin), Some(target)) if origin != target => Some(target),
+        _ => None,
+    }
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -912,6 +1071,18 @@ struct GameApp {
     /// press. Set only after the screen routing and click-to-grab early
     /// returns, cleared on release, focus loss, and screen/session changes.
     left_mouse_held: bool,
+    /// Inventory/crafting screen state (S03-T03): mode + table attachment from
+    /// the pure T01 model. Open only while the lifecycle screen is Playing —
+    /// the panel is a gameplay surface, not a lifecycle screen.
+    inventory: InventoryScreen,
+    /// Last inventory-click status line. Read by the T04 panel renderer as the
+    /// footer message; `None` until the first click of a session.
+    #[allow(dead_code)]
+    inventory_status: Option<String>,
+    /// Press-drag-release origin (S03-T03): the target a Left press picked a
+    /// stack from. Cleared by any non-pick press, release, close, and screen
+    /// change so a stale origin can never move a later stack.
+    inventory_drag: Option<InventoryTarget>,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -1095,6 +1266,9 @@ impl GameApp {
             mining: MiningState::new(),
             audio,
             left_mouse_held: false,
+            inventory: InventoryScreen::new(),
+            inventory_status: None,
+            inventory_drag: None,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -1325,6 +1499,12 @@ impl GameApp {
         self.input.reset();
         self.left_mouse_held = false;
         self.mining.reset();
+        // The inventory panel is a Playing-only surface. Any lifecycle screen
+        // entry drops it (with its transient drag/status) so a stale panel can
+        // never keep absorbing clicks meant for a menu.
+        self.inventory.close();
+        self.inventory_status = None;
+        self.inventory_drag = None;
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, false);
@@ -1404,6 +1584,9 @@ impl GameApp {
         self.input.reset();
         self.left_mouse_held = false;
         self.mining.reset();
+        self.inventory.close();
+        self.inventory_status = None;
+        self.inventory_drag = None;
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -2057,7 +2240,47 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Inventory panel owns the keyboard while open (S03-T03):
+                    // every key and release is consumed, so no digit, movement,
+                    // fly, save, or Escape-to-pause binding can fire through
+                    // the screen. E and Escape close it.
+                    if self.inventory.is_open() {
+                        if pressed
+                            && !event.repeat
+                            && matches!(code, KeyCode::KeyE | KeyCode::Escape)
+                        {
+                            close_inventory(
+                                &mut self.inventory,
+                                &mut self.session,
+                                &mut self.input,
+                                &mut self.left_mouse_held,
+                                &mut self.inventory_drag,
+                                &mut self.mining,
+                                &mut self.cursor_grabbed,
+                                window,
+                            );
+                        }
+                        return;
+                    }
+
                     match code {
+                        // E opens the 9+27 inventory with the 2x2 player grid
+                        // (S03-T03). When a table station is already open the
+                        // pure toggle attaches the screen to it and the 4x4
+                        // grid becomes reachable.
+                        KeyCode::KeyE if pressed && !event.repeat => {
+                            open_inventory(
+                                &mut self.inventory,
+                                self.session.open_table_position(),
+                                false,
+                                &mut self.input,
+                                &mut self.left_mouse_held,
+                                &mut self.inventory_drag,
+                                &mut self.mining,
+                                &mut self.cursor_grabbed,
+                                window,
+                            );
+                        }
                         KeyCode::KeyF if pressed && !event.repeat => {
                             self.session.player.fly_mode = !self.session.player.fly_mode;
                             self.session.player.velocity = Vec3::ZERO;
@@ -2128,8 +2351,10 @@ impl ApplicationHandler for GameApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Route-before-gameplay: while a screen is open the wheel is
                 // consumed — the hotbar is gameplay state and no screen has
-                // a scroll action in this slice.
-                if self.lifecycle.screen() != LifecycleScreen::Playing {
+                // a scroll action in this slice. The inventory panel consumes
+                // it for the same reason (S03-T03): no hotbar selection may
+                // change from inside the panel.
+                if self.lifecycle.screen() != LifecycleScreen::Playing || self.inventory.is_open() {
                     return;
                 }
                 let step: isize = match delta {
@@ -2161,6 +2386,33 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Inventory panel (S03-T03): a release resolves the drop for a
+                // press-drag-release gesture and always ends the gesture, so it
+                // can never reach gameplay. A same-cell or off-panel release
+                // leaves the stack on the cursor (click-to-pick style).
+                if self.inventory.is_open() {
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let table_open = self.session.open_table_position();
+                    let mode = self.inventory.mode(table_open);
+                    let layout = layout(surface_w, surface_h, mode);
+                    let release_target = self
+                        .cursor_pos
+                        .and_then(|cursor| hit_test(mode, &layout, cursor));
+                    if let Some(destination) =
+                        drag_release_target(self.inventory_drag.take(), release_target)
+                    {
+                        let result = apply_inventory_click(
+                            &mut self.session.player,
+                            &self.inventory,
+                            table_open,
+                            destination,
+                        );
+                        self.inventory_status = Some(inventory_status_text(result));
+                    }
+                    self.left_mouse_held = false;
+                    self.mining.reset();
+                    return;
+                }
                 // A release can arrive while a menu owns the input, so this
                 // arm deliberately bypasses the screen routing: clearing the
                 // hold and any partial progress is always safe.
@@ -2236,6 +2488,50 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
 
+                // Inventory panel (S03-T03): while open it owns every click.
+                // Left press issues exactly one whole-stack command; a press
+                // that picked a stack arms a possible drag, while a place,
+                // swap, or craft ends the gesture. Right press is consumed.
+                // Returning here keeps the click away from the re-grab branch,
+                // table interaction, placement, and hold-to-mine arming.
+                if self.inventory.is_open() {
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let table_open = self.session.open_table_position();
+                    let mode = self.inventory.mode(table_open);
+                    match button {
+                        MouseButton::Left => {
+                            let layout = layout(surface_w, surface_h, mode);
+                            let target = self
+                                .cursor_pos
+                                .and_then(|cursor| hit_test(mode, &layout, cursor));
+                            if let Some(target) = target {
+                                let result = apply_inventory_click(
+                                    &mut self.session.player,
+                                    &self.inventory,
+                                    table_open,
+                                    target,
+                                );
+                                self.inventory_status = Some(inventory_status_text(result));
+                                // A pick-up press (cursor now holding a stack)
+                                // begins a drag; every other accepted click ends it.
+                                self.inventory_drag = if result == Ok(InventoryClickOutcome::Moved)
+                                    && self.session.player.inventory().cursor().is_some()
+                                {
+                                    Some(target)
+                                } else {
+                                    None
+                                };
+                            } else {
+                                // Empty panel space: no command, no drag origin.
+                                self.inventory_drag = None;
+                            }
+                        }
+                        MouseButton::Right => {}
+                        _ => {}
+                    }
+                    return;
+                }
+
                 if !self.cursor_grabbed {
                     self.cursor_grabbed = true;
                     set_cursor_grab(window, true);
@@ -2274,7 +2570,24 @@ impl ApplicationHandler for GameApp {
                                     );
                                 }
                             }
-                            RightClickOutcome::TableOpened | RightClickOutcome::Nothing => {}
+                            RightClickOutcome::TableOpened => {
+                                // A successful table interaction opens the
+                                // panel attached to that live station (S03-T03);
+                                // a failed open stays on the placement fallback
+                                // above, byte-identical to before.
+                                open_inventory(
+                                    &mut self.inventory,
+                                    self.session.open_table_position(),
+                                    true,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.inventory_drag,
+                                    &mut self.mining,
+                                    &mut self.cursor_grabbed,
+                                    window,
+                                );
+                            }
+                            RightClickOutcome::Nothing => {}
                         }
                     }
                     _ => {}
@@ -2311,6 +2624,12 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Gameplay vs. world-liveness (S03-T03): the inventory panel
+                // freezes player movement, camera aim, the target raycast, and
+                // hold-to-mine, but NOT the world: time, table revalidation,
+                // streaming, and saves keep running so a panel opened next to a
+                // table cannot freeze the chunk pipeline.
+                let gameplay = playing && !self.inventory.is_open();
                 // Game time (S02-T04): advance only on Playing frames, before
                 // the player update, with the app-owned acceleration scale.
                 // The same two lines as `GameApp::tick_clock` (which the
@@ -2343,17 +2662,31 @@ impl ApplicationHandler for GameApp {
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
-                    self.session.player.update(dt, &self.input, |x, y, z| {
-                        self.session.world.get_block(x, y, z)
-                    });
-                    self.session.camera.position = self.session.player.eye_position();
-                    self.session.camera.yaw = self.session.player.yaw;
-                    self.session.camera.pitch = self.session.player.pitch;
+                    if gameplay {
+                        self.session.player.update(dt, &self.input, |x, y, z| {
+                            self.session.world.get_block(x, y, z)
+                        });
+                        self.session.camera.position = self.session.player.eye_position();
+                        self.session.camera.yaw = self.session.player.yaw;
+                        self.session.camera.pitch = self.session.player.pitch;
+                    }
                     // Open-table state is a world fact (S02-T02): close the
                     // station as soon as its block is removed/replaced or
                     // the player steps out of reach. One bounded lookup per
                     // playing frame, never a scan.
                     self.session.sync_open_table();
+                    // Table-loss close (S03-T03): an attached panel whose
+                    // station disappeared closes itself and restores gameplay
+                    // ownership. Field-by-field because `gpu`/`window` borrows
+                    // span this region, so no `&mut self` method is usable.
+                    if inventory_should_close(&self.inventory, self.session.open_table_position()) {
+                        self.inventory.close();
+                        self.session.close_table();
+                        self.inventory_drag = None;
+                        self.inventory_status = Some("Crafting Table closed".to_string());
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                    }
 
                     let (player_chunk, _) = world_to_chunk_and_local(
                         self.session.player.position.x.floor() as i32,
@@ -2408,7 +2741,7 @@ impl ApplicationHandler for GameApp {
                 // and hold-to-mine. Menus suppress it entirely: no wireframe
                 // can float behind a panel, and mining.tick(None, ..) resets
                 // stale progress exactly as before.
-                let hit = if playing {
+                let hit = if gameplay {
                     raycast_voxels(
                         self.session.camera.position,
                         self.session.camera.forward(),
@@ -2422,7 +2755,7 @@ impl ApplicationHandler for GameApp {
                 // grabbed gameplay surface feeds the accumulator. Every
                 // other frame passes None, which resets stale progress
                 // (released, paused, or cursor not grabbed).
-                let candidate = if playing && self.cursor_grabbed && self.left_mouse_held {
+                let candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
                     // T01: the target carries its effective duration, derived
                     // once from the block's hardness and the selected item,
                     // so tool rules live in `player::tools` and the
@@ -2968,7 +3301,8 @@ fn main() {
 mod tests {
     use super::*;
     use opencraft::player::inventory::{
-        CraftingGrid, GridKind, Inventory, ItemStack, HOTBAR_SLOTS,
+        CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack,
+        HOTBAR_SLOTS,
     };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
@@ -4801,6 +5135,352 @@ mod tests {
             session.world.get_block(0, 7, 0),
             BlockId::Air,
             "nothing was placed on top of the table"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T03: inventory panel adapter (mode state, cursor ownership, clicks)
+    // -----------------------------------------------------------------------
+
+    /// Total item count across all 36 slots, the cursor, and both grids — the
+    /// conservation invariant every UI command must preserve.
+    fn inventory_units(player: &Player) -> u32 {
+        let mut total = 0u32;
+        for item in player.inventory().slots().iter().flatten() {
+            total += u32::from(item.count());
+        }
+        if let Some(cursor) = player.inventory().cursor() {
+            total += u32::from(cursor.count());
+        }
+        for grid in [player.player_grid(), player.table_grid()] {
+            for index in 0..grid.kind().slot_count() {
+                if let Some(item) = grid.slot(index) {
+                    total += u32::from(item.count());
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn inventory_screen_toggles_to_player_mode_and_closed() {
+        let mut screen = InventoryScreen::new();
+        assert_eq!(screen.mode(None), InventoryMode::Closed);
+        assert!(!screen.is_open());
+
+        screen.toggle(None);
+        assert!(screen.is_open());
+        assert_eq!(screen.mode(None), InventoryMode::Player);
+        assert_eq!(
+            screen.mode(Some(IVec3::new(0, 5, 0))),
+            InventoryMode::Player
+        );
+        assert!(
+            !screen.table_attached(),
+            "the E path never attaches a table by itself"
+        );
+
+        screen.toggle(None);
+        assert_eq!(screen.mode(None), InventoryMode::Closed);
+        assert!(!screen.is_open());
+    }
+
+    #[test]
+    fn a_targeted_table_click_opens_table_mode_and_is_cleared_on_close() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(31, dir.path().join("ui-table.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        let mut screen = InventoryScreen::new();
+
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::TableOpened
+        ));
+        let table_open = session.open_table_position();
+        assert_eq!(table_open, Some(IVec3::new(0, 5, 0)));
+
+        // Exactly what the production TableOpened arm does (minus the winit
+        // cursor-grab call): attach the panel to the live station.
+        screen.open_table();
+        assert_eq!(screen.mode(table_open), InventoryMode::Table);
+
+        // Exactly what close_inventory does: clear the attachment and station.
+        screen.close();
+        session.close_table();
+        assert_eq!(
+            screen.mode(session.open_table_position()),
+            InventoryMode::Closed
+        );
+        assert!(!screen.table_attached());
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn table_targets_are_rejected_without_a_live_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(32, dir.path().join("stale-table.mcvx"));
+        session.player.collect_block(BlockId::Stone);
+        let mut screen = InventoryScreen::new();
+        // Attached, but the session has no live table: mode falls back to Player.
+        screen.open_table();
+        let before_inventory = session.player.inventory().clone();
+        let before_player_grid = session.player.player_grid().clone();
+        let before_table_grid = session.player.table_grid().clone();
+
+        for target in [
+            InventoryTarget::GridCell {
+                kind: GridKind::Table,
+                index: 0,
+            },
+            InventoryTarget::ResultSlot(GridKind::Table),
+        ] {
+            assert_eq!(
+                apply_inventory_click(&mut session.player, &screen, None, target),
+                Err(InventoryCommandError::TableUnavailable)
+            );
+        }
+        assert_eq!(session.player.inventory(), &before_inventory);
+        assert_eq!(session.player.player_grid(), &before_player_grid);
+        assert_eq!(session.player.table_grid(), &before_table_grid);
+    }
+
+    #[test]
+    fn apply_inventory_click_moves_a_slot_stack_without_touching_world_or_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(33, dir.path().join("slot-click.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        let world_before = session.world.get_block(0, 10, 0);
+
+        let outcome =
+            apply_inventory_click(&mut session.player, &screen, None, InventoryTarget::Slot(0))
+                .expect("a slot click moves the whole stack");
+
+        assert_eq!(outcome, InventoryClickOutcome::Moved);
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+        assert!(session.player.inventory().hotbar(0).is_none());
+        assert_eq!(session.player.selected_slot(), 0);
+        assert_eq!(session.world.get_block(0, 10, 0), world_before);
+    }
+
+    #[test]
+    fn apply_inventory_click_crafts_once_and_the_second_click_is_no_recipe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(34, dir.path().join("craft-click.mcvx"));
+        session.player.collect_block(BlockId::OakLog);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+
+        // Pick the log out of the hotbar and drop it into the 2x2 grid.
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, None, InventoryTarget::Slot(0)),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert_eq!(
+            apply_inventory_click(
+                &mut session.player,
+                &screen,
+                None,
+                InventoryTarget::GridCell {
+                    kind: GridKind::Player,
+                    index: 0,
+                },
+            ),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert!(session.player.player_grid().slot(0).is_some());
+
+        let crafted = apply_inventory_click(
+            &mut session.player,
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+        )
+        .expect("one log crafts four planks");
+        match crafted {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::Block(BlockId::OakPlanks));
+                assert_eq!(item.count(), 4);
+            }
+            InventoryClickOutcome::Moved => panic!("a result click must report the crafted item"),
+        }
+        assert!(session.player.player_grid().is_empty());
+
+        // The grid is empty now: the same click consumes nothing.
+        let before = session.player.inventory().clone();
+        assert_eq!(
+            apply_inventory_click(
+                &mut session.player,
+                &screen,
+                None,
+                InventoryTarget::ResultSlot(GridKind::Player),
+            ),
+            Err(InventoryCommandError::Craft(CraftError::NoRecipe))
+        );
+        assert_eq!(session.player.inventory(), &before);
+    }
+
+    #[test]
+    fn inventory_should_close_only_for_an_attached_screen_losing_its_table() {
+        let live = Some(IVec3::new(0, 5, 0));
+        let closed = InventoryScreen::new();
+        assert!(!inventory_should_close(&closed, live));
+        assert!(!inventory_should_close(&closed, None));
+
+        let mut player_screen = InventoryScreen::new();
+        player_screen.open_player();
+        assert!(!inventory_should_close(&player_screen, None));
+        assert!(!inventory_should_close(&player_screen, live));
+
+        let mut table_screen = InventoryScreen::new();
+        table_screen.open_table();
+        assert!(!inventory_should_close(&table_screen, live));
+        assert!(inventory_should_close(&table_screen, None));
+    }
+
+    #[test]
+    fn inventory_status_text_names_success_and_every_error_shape() {
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone is carryable");
+
+        assert_eq!(
+            inventory_status_text(Ok(InventoryClickOutcome::Moved)),
+            "Moved"
+        );
+        assert_eq!(
+            inventory_status_text(Ok(InventoryClickOutcome::Crafted(stone))),
+            "Crafted Stone"
+        );
+        assert_eq!(
+            inventory_status_text(Err(InventoryCommandError::Inventory(
+                InventoryError::EmptySlot
+            ))),
+            "Inventory: EmptySlot"
+        );
+        assert_eq!(
+            inventory_status_text(Err(InventoryCommandError::Craft(CraftError::NoRecipe))),
+            "Craft: NoRecipe"
+        );
+        assert_eq!(
+            inventory_status_text(Err(InventoryCommandError::TableUnavailable)),
+            "Table unavailable"
+        );
+    }
+
+    #[test]
+    fn drag_release_target_only_routes_to_a_different_target() {
+        let slot_one = InventoryTarget::Slot(1);
+        let cell = InventoryTarget::GridCell {
+            kind: GridKind::Player,
+            index: 0,
+        };
+
+        assert_eq!(drag_release_target(None, Some(slot_one)), None);
+        assert_eq!(drag_release_target(Some(slot_one), Some(slot_one)), None);
+        assert_eq!(drag_release_target(Some(slot_one), None), None);
+        assert_eq!(drag_release_target(Some(slot_one), Some(cell)), Some(cell));
+    }
+
+    #[test]
+    fn a_press_release_on_the_same_slot_leaves_the_stack_on_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(35, dir.path().join("same-cell.mcvx"));
+        session.player.collect_block(BlockId::Stone);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        let target = InventoryTarget::Slot(0);
+
+        apply_inventory_click(&mut session.player, &screen, None, target).expect("pick up");
+        let destination = drag_release_target(Some(target), Some(target));
+
+        assert_eq!(destination, None, "a same-cell release is inert");
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(1),
+            "the picked stack stays in hand"
+        );
+    }
+
+    #[test]
+    fn a_press_drag_release_between_slots_moves_and_conserves_the_whole_stack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(36, dir.path().join("drag.mcvx"));
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        let total_before = inventory_units(&session.player);
+        let origin = InventoryTarget::Slot(0);
+
+        apply_inventory_click(&mut session.player, &screen, None, origin).expect("pick up");
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+
+        let destination = drag_release_target(Some(origin), Some(InventoryTarget::Slot(1)))
+            .expect("a different target receives the drop");
+        let outcome = apply_inventory_click(&mut session.player, &screen, None, destination)
+            .expect("drop the whole stack");
+
+        assert_eq!(outcome, InventoryClickOutcome::Moved);
+        assert!(session.player.inventory().cursor().is_none());
+        assert_eq!(
+            session
+                .player
+                .inventory()
+                .hotbar(1)
+                .map(|item| item.count()),
+            Some(2),
+            "the destination holds the original whole stack"
+        );
+        assert_eq!(inventory_units(&session.player), total_before);
+    }
+
+    #[test]
+    fn dragging_into_a_table_cell_without_a_live_table_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(37, dir.path().join("table-drag.mcvx"));
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        let origin = InventoryTarget::Slot(0);
+
+        apply_inventory_click(&mut session.player, &screen, None, origin).expect("pick up");
+        let before_inventory = session.player.inventory().clone();
+        let before_player_grid = session.player.player_grid().clone();
+        let before_table_grid = session.player.table_grid().clone();
+        let destination = drag_release_target(
+            Some(origin),
+            Some(InventoryTarget::GridCell {
+                kind: GridKind::Table,
+                index: 0,
+            }),
+        )
+        .expect("a table cell differs from the origin");
+
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, None, destination),
+            Err(InventoryCommandError::TableUnavailable)
+        );
+        assert_eq!(session.player.inventory(), &before_inventory);
+        assert_eq!(session.player.player_grid(), &before_player_grid);
+        assert_eq!(session.player.table_grid(), &before_table_grid);
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(2),
+            "the rejected drop leaves the stack on the cursor"
         );
     }
 
