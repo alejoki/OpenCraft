@@ -16,7 +16,7 @@ use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::HOTBAR_SLOTS;
-use opencraft::player::mining::{MiningState, MiningTick};
+use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::InputState;
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
@@ -2311,14 +2311,20 @@ impl ApplicationHandler for GameApp {
                 // other frame passes None, which resets stale progress
                 // (released, paused, or cursor not grabbed).
                 let candidate = if playing && self.cursor_grabbed && self.left_mouse_held {
-                    hit.map(|h| {
-                        (
+                    // T01: the target carries its effective duration, derived
+                    // once from the block's hardness and the selected item,
+                    // so tool rules live in `player::tools` and the
+                    // accumulator only integrates the result.
+                    hit.and_then(|h| {
+                        let block = self.session.world.get_block(
+                            h.block_pos.x,
+                            h.block_pos.y,
+                            h.block_pos.z,
+                        );
+                        MiningTarget::from_block(
                             h.block_pos,
-                            self.session.world.get_block(
-                                h.block_pos.x,
-                                h.block_pos.y,
-                                h.block_pos.z,
-                            ),
+                            block,
+                            self.session.player.selected_item(),
                         )
                     })
                 } else {
@@ -4575,8 +4581,10 @@ mod tests {
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
         );
         app.left_mouse_held = true;
-        app.mining
-            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        app.mining.tick(
+            0.5,
+            MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None),
+        );
         assert!(
             app.mining.progress().is_some(),
             "0.5s on Stone leaves partial progress"
@@ -4601,8 +4609,10 @@ mod tests {
             WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
         );
         app.left_mouse_held = true;
-        app.mining
-            .tick(0.5, Some((IVec3::new(0, 40, 0), BlockId::Stone)));
+        app.mining.tick(
+            0.5,
+            MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None),
+        );
         assert!(app.mining.progress().is_some());
 
         app.start_world_session(WorldSession::new_session(
