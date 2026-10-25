@@ -1,7 +1,8 @@
 use glam::Vec3;
 
 use crate::player::inventory::{
-    CollectOutcome, CraftingGrid, GridKind, Inventory, Item, ItemStack, HOTBAR_SLOTS,
+    CollectOutcome, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack, ToolWear,
+    HOTBAR_SLOTS,
 };
 use crate::world::block::BlockId;
 
@@ -209,6 +210,16 @@ impl Player {
     /// Consumes exactly one item from the selected hotbar slot.
     pub fn consume_selected(&mut self) -> Option<Item> {
         self.inventory.consume_one(self.selected_slot)
+    }
+
+    /// Spends exactly one durability point on the selected hotbar tool.
+    ///
+    /// This is the narrow forwarder the world-edit path uses so the inventory
+    /// aggregate itself stays private. An empty slot, an out-of-range
+    /// selection, or a non-tool is an [`InventoryError`] with no mutation, so
+    /// a bare-hand break can never fabricate or consume a tool.
+    pub fn wear_selected_tool(&mut self) -> Result<ToolWear, InventoryError> {
+        self.inventory.use_tool(self.selected_slot)
     }
 
     #[inline]
@@ -530,6 +541,70 @@ mod tests {
         assert_eq!(consumed.count(), 1);
         assert_eq!(player.selected_item(), None);
         assert_eq!(player.consume_selected(), None, "empty slot is a no-op");
+    }
+
+    #[test]
+    fn wear_selected_tool_forwarder_targets_only_the_selected_slot() {
+        use crate::player::inventory::{
+            Inventory, InventoryError, Item, ToolKind, ToolTier, ToolWear, INVENTORY_SLOTS,
+        };
+
+        let mut player = Player::new(Vec3::ZERO);
+        player
+            .collect_block(BlockId::Stone)
+            .expect("selected non-tool block");
+        assert!(player.select_slot(0));
+
+        assert_eq!(
+            player.wear_selected_tool(),
+            Err(InventoryError::NotATool),
+            "a non-tool selection spends nothing"
+        );
+        assert_eq!(
+            player.selected_item().map(|item| item.count()),
+            Some(1),
+            "the rejected wear left the block stack intact"
+        );
+
+        // A tool in a later hotbar slot can only be worn by selecting it.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[3] =
+            Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 3).expect("worn axe"));
+        player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(player.select_slot(3));
+
+        match player.wear_selected_tool() {
+            Ok(ToolWear::Worn(item)) => assert_eq!(item.durability(), Some(2)),
+            other => panic!("expected one point of wear, got {other:?}"),
+        }
+        assert_eq!(
+            player.selected_item().and_then(|item| item.durability()),
+            Some(2)
+        );
+
+        // Final durability breaks the tool through the same narrow forwarder.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[3] =
+            Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 1).expect("last use"));
+        player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(player.select_slot(3));
+        assert_eq!(player.wear_selected_tool(), Ok(ToolWear::Broke));
+        assert_eq!(player.selected_item(), None, "a broken tool frees its slot");
+        assert_eq!(
+            player.wear_selected_tool(),
+            Err(InventoryError::EmptySlot),
+            "the cleared slot is an explicit no-op"
+        );
     }
 
     #[test]

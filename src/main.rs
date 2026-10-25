@@ -15,7 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::inventory::HOTBAR_SLOTS;
+use opencraft::player::inventory::{ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::InputState;
 use opencraft::player::raycast::raycast_voxels;
@@ -205,25 +205,95 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
     result
 }
 
-/// Breaks `pos` and collects the caller-supplied pre-break `block` into the
-/// session inventory (hotbar first, then main storage).
+/// Why a mining break produced no world edit, and therefore no wear and no
+/// collected drop.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BreakRejection {
+    /// The reported block is structurally unbreakable (Air, Bedrock), so the
+    /// catalog refuses it regardless of what a caller claims.
+    Unbreakable,
+    /// The live world block at `pos` is not the reported pre-break block
+    /// (already removed, replaced, or in an unloaded chunk).
+    StaleTarget,
+    /// The world edit returned no remesh work, so it did not apply (unloaded
+    /// chunk or outside the vertical world range).
+    EditRejected,
+}
+
+/// What an applied break did to the selected hotbar slot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ToolWearOutcome {
+    /// The selected tool lost exactly one point and is still usable.
+    Worn { remaining: u16 },
+    /// The selected tool reached zero and its slot was cleared.
+    Broke,
+    /// The selected slot was empty or held a non-tool: nothing was worn.
+    Nothing,
+}
+
+/// Outcome of one production mining break.
 ///
-/// The world edit returns the chunks it remeshed. An empty result means the
-/// edit did not apply (unloaded chunk or outside the vertical world range),
-/// so nothing is collected — mining can never duplicate items through an
-/// edit that never happened.
-fn collect_mined_block(
-    session: &mut WorldSession,
-    pos: IVec3,
-    block: BlockId,
-) -> Vec<(ChunkPos, ChunkMesh)> {
+/// `Applied` is the only arm that carries remesh work, and it is produced
+/// only after the world edit proved it happened. Every other path — a stale
+/// target, an unbreakable block, or an edit that returned nothing — is a
+/// rejection that left the world, the inventory, and durability untouched.
+///
+/// Production only needs the remesh work, but the wear transition and the
+/// rejection reason are the outcome contract the executable harness asserts
+/// on, so they stay part of the value instead of being flattened away in the
+/// loop.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+enum BreakOutcome {
+    Applied {
+        remeshed: Vec<(ChunkPos, ChunkMesh)>,
+        wear: ToolWearOutcome,
+    },
+    Rejected(BreakRejection),
+}
+
+/// Applies one mining break with a fixed, testable ordering:
+///
+/// 1. re-read the world and refuse unbreakable/stale targets,
+/// 2. apply the world edit (the only authority that a break happened),
+/// 3. wear the selected tool exactly once, but only after non-empty remesh
+///    work proved the edit applied,
+/// 4. collect the pre-break block last, so a tool that broke has already
+///    freed its hotbar slot and the drop can land there.
+///
+/// An empty remesh result means the edit did not apply (unloaded chunk or
+/// outside the vertical world range), so nothing is worn or collected —
+/// mining can never duplicate items or spend durability through an edit that
+/// never happened.
+fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> BreakOutcome {
+    if block.break_duration_secs().is_none() {
+        return BreakOutcome::Rejected(BreakRejection::Unbreakable);
+    }
+    // `pos`/`block` come from the mining accumulator, which is not authority:
+    // re-read the live world so a stale or replaced target edits nothing.
+    if session.world.get_block(pos.x, pos.y, pos.z) != block {
+        return BreakOutcome::Rejected(BreakRejection::StaleTarget);
+    }
     let remeshed = session
         .world
         .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
-    if !remeshed.is_empty() {
-        session.player.collect_block(block);
+    if remeshed.is_empty() {
+        return BreakOutcome::Rejected(BreakRejection::EditRejected);
     }
-    remeshed
+
+    let wear = match session.player.wear_selected_tool() {
+        Ok(ToolWear::Worn(item)) => ToolWearOutcome::Worn {
+            remaining: item
+                .durability()
+                .expect("a successfully worn tool still reports durability"),
+        },
+        Ok(ToolWear::Broke) => ToolWearOutcome::Broke,
+        // Empty slot / non-tool / out-of-range selection: no mutation.
+        Err(_) => ToolWearOutcome::Nothing,
+    };
+    session.player.collect_block(block);
+
+    BreakOutcome::Applied { remeshed, wear }
 }
 
 /// Places the selected hotbar stack with the game's right-click semantics:
@@ -2375,29 +2445,35 @@ impl ApplicationHandler for GameApp {
                 let mut target_block = hit.map(|h| h.block_pos);
                 if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
                     // The only production break site (S02): hardness
-                    // gating happens in MiningState, so Bedrock (no
-                    // duration) can never reach this arm.
-                    let remeshed = collect_mined_block(&mut self.session, pos, block);
-                    // Only an edit that actually applied makes noise (the
-                    // helper returns empty for a no-op break). Break then
-                    // the rising completion pop, both at the current volume
-                    // and field-disjoint from the live `gpu` borrow (P005).
-                    if !remeshed.is_empty() {
-                        self.audio.play(SoundSlot::Break, self.settings.volume);
-                        self.audio
-                            .play(SoundSlot::MineComplete, self.settings.volume);
+                    // gating happens in MiningState and is re-checked by the
+                    // helper, so Bedrock (no duration) can never reach an
+                    // applied break. The helper owns the ordering: world edit
+                    // first, one post-edit tool wear, then collection.
+                    match break_mined_block(&mut self.session, pos, block) {
+                        BreakOutcome::Applied { remeshed, .. } => {
+                            // Only an edit that actually applied makes noise.
+                            // Break then the rising completion pop, both at the
+                            // current volume and field-disjoint from the live
+                            // `gpu` borrow (P005).
+                            self.audio.play(SoundSlot::Break, self.settings.volume);
+                            self.audio
+                                .play(SoundSlot::MineComplete, self.settings.volume);
+                            for (cpos, mesh) in remeshed {
+                                gpu.render_store.upload_mesh(
+                                    &gpu.ctx.device,
+                                    &gpu.renderer.chunk_bind_group_layout,
+                                    cpos,
+                                    &mesh,
+                                );
+                            }
+                            // The cell is Air now; do not draw the wireframe
+                            // around the block that just disappeared.
+                            target_block = None;
+                        }
+                        // A rejected break edited nothing, so the block is
+                        // still there and the wireframe stays truthful.
+                        BreakOutcome::Rejected(_) => {}
                     }
-                    for (cpos, mesh) in remeshed {
-                        gpu.render_store.upload_mesh(
-                            &gpu.ctx.device,
-                            &gpu.renderer.chunk_bind_group_layout,
-                            cpos,
-                            &mesh,
-                        );
-                    }
-                    // The cell is Air now; do not draw the wireframe
-                    // around the block that just disappeared.
-                    target_block = None;
                 }
 
                 // Translucent dark panel behind the stats text: the visible
@@ -3962,18 +4038,42 @@ mod tests {
         session.camera.pitch = -std::f32::consts::FRAC_PI_2;
     }
 
+    /// Unwraps an applied break so a rejection fails the test with its reason
+    /// instead of a bare `None`.
+    fn applied_break(outcome: BreakOutcome) -> (Vec<(ChunkPos, ChunkMesh)>, ToolWearOutcome) {
+        match outcome {
+            BreakOutcome::Applied { remeshed, wear } => (remeshed, wear),
+            BreakOutcome::Rejected(reason) => panic!("expected an applied break, got {reason:?}"),
+        }
+    }
+
     #[test]
     fn mining_collects_broken_blocks_into_the_hotbar() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(7, dir.path().join("mined.mcvx"));
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
-        let first = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        let (first, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            BlockId::Stone,
+        ));
         assert!(
             !first.is_empty(),
             "an applied break remeshes at least its own chunk"
         );
-        let second = collect_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::Stone);
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "a bare-hand break spends no durability"
+        );
+
+        session.world.set_block_immediate(0, 10, 0, BlockId::Stone);
+        let (second, _) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            BlockId::Stone,
+        ));
         assert!(!second.is_empty());
 
         assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
@@ -3991,8 +4091,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session
+            .world
+            .set_block_immediate(0, 10, 1, BlockId::CoalOre);
 
-        let remeshed = collect_mined_block(&mut session, IVec3::new(0, 10, 1), BlockId::CoalOre);
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 1),
+            BlockId::CoalOre,
+        ));
 
         assert!(!remeshed.is_empty());
         assert_eq!(session.world.get_block(0, 10, 1), BlockId::Air);
@@ -4010,12 +4117,296 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(9, dir.path().join("missing.mcvx"));
 
-        let remeshed = collect_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
+        let outcome = break_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
 
-        assert!(remeshed.is_empty(), "no loaded chunk means no remesh");
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::StaleTarget)),
+            "no loaded chunk means no live target, so no edit"
+        );
         for slot in 0..HOTBAR_SLOTS {
             assert_eq!(session.player.hotbar_stack(slot), None);
         }
+    }
+
+    #[test]
+    fn crafted_table_placed_then_mined_with_a_matching_axe_wears_exactly_once() {
+        use opencraft::player::inventory::{Inventory, Item, ItemId, ToolKind, ToolTier};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(11, dir.path().join("loop.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(0.5, 10.0, 0.5);
+        aim_placement_camera(&mut session);
+
+        // Real crafting step: a 2x2 player grid of planks yields one table.
+        let mut inventory = Inventory::empty();
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        let planks = Item::new(ItemId::Block(BlockId::OakPlanks), 1).expect("planks");
+        for cell in 0..4 {
+            player_grid.set(cell, Some(planks)).expect("grid cell");
+        }
+        let table = player_grid
+            .take_result(&mut inventory)
+            .expect("four planks craft one table");
+        assert_eq!(table.id(), ItemId::Block(BlockId::CraftingTable));
+
+        // A wood axe is the matching tool for a table and lands in slot 1.
+        inventory
+            .insert(
+                Item::new(
+                    ItemId::Tool {
+                        kind: ToolKind::Axe,
+                        tier: ToolTier::Wood,
+                    },
+                    1,
+                )
+                .expect("axe"),
+            )
+            .expect("axe fits");
+        session.player = Player::with_inventory(
+            session.player.position,
+            inventory,
+            player_grid,
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let placed = try_place_selected_block(&mut session).expect("crafted table places");
+        assert!(!placed.is_empty(), "placement remeshes its chunk");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::CraftingTable);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            None,
+            "placement consumed exactly the crafted table"
+        );
+
+        // Target the placed table through the same raycast the game loop uses.
+        assert!(session.player.select_slot(1));
+        let hit = raycast_voxels(
+            session.camera.position,
+            session.camera.forward(),
+            8.0,
+            |x, y, z| session.world.get_block(x, y, z),
+        )
+        .expect("the placed table is in reach");
+        assert_eq!(hit.block_pos, IVec3::new(0, 6, 0));
+        let target = MiningTarget::from_block(
+            hit.block_pos,
+            session
+                .world
+                .get_block(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z),
+            session.player.selected_item(),
+        )
+        .expect("the table is breakable");
+        assert_eq!(
+            target.duration(),
+            0.8 / 2.0,
+            "a wood axe halves the table's base duration"
+        );
+
+        // Full mining accumulator run: 0.4s at 0.1s per tick breaks on tick 4.
+        let mut mining = MiningState::new();
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            match mining.tick(0.1, Some(target)) {
+                MiningTick::Broke { pos, block } => {
+                    assert_eq!(pos, target.pos());
+                    assert_eq!(block, BlockId::CraftingTable);
+                    break;
+                }
+                MiningTick::Mining { progress } => {
+                    assert!((0.0..1.0).contains(&progress), "progress stays partial");
+                }
+                MiningTick::Idle => panic!("a valid target must never idle"),
+            }
+            assert!(ticks < 100, "mining must terminate");
+        }
+        assert_eq!(
+            ticks, 4,
+            "a wood axe breaks the table at half base duration"
+        );
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            target.pos(),
+            target.block(),
+        ));
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 58 },
+            "one applied break spends exactly one durability"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "the selected axe kept its identity and lost one point"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::CraftingTable,
+                count: 1,
+            }),
+            "the drop lands in the slot placement freed"
+        );
+
+        // The accumulator reset on completion, so the next tick starts over.
+        assert!(matches!(
+            mining.tick(0.1, Some(target)),
+            MiningTick::Mining { .. }
+        ));
+
+        // A replayed break for the same (now Air) cell is stale: no second
+        // wear and no duplicate drop.
+        assert!(matches!(
+            break_mined_block(&mut session, target.pos(), target.block()),
+            BreakOutcome::Rejected(BreakRejection::StaleTarget)
+        ));
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "a rejected replay spends no durability"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::CraftingTable,
+                count: 1,
+            }),
+            "a rejected replay collects nothing"
+        );
+    }
+
+    #[test]
+    fn rejected_breaks_spend_no_durability_and_mutate_nothing() {
+        use opencraft::player::inventory::{Inventory, Item, ToolKind, ToolTier, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Stone, 10)
+                .expect("worn pickaxe"),
+        );
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        // Stale target: the accumulator claims CoalOre, the world holds Stone.
+        assert!(matches!(
+            break_mined_block(&mut session, IVec3::new(0, 10, 0), BlockId::CoalOre),
+            BreakOutcome::Rejected(BreakRejection::StaleTarget)
+        ));
+        assert_eq!(
+            session.world.get_block(0, 10, 0),
+            BlockId::Stone,
+            "a stale target is not edited"
+        );
+
+        // Structurally unbreakable identities never reach the edit.
+        for block in [BlockId::Air, BlockId::Bedrock] {
+            assert!(matches!(
+                break_mined_block(&mut session, IVec3::new(0, 10, 0), block),
+                BreakOutcome::Rejected(BreakRejection::Unbreakable)
+            ));
+        }
+
+        // Missing/unloaded chunk: the live block is Air, so the target is stale.
+        assert!(matches!(
+            break_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone),
+            BreakOutcome::Rejected(BreakRejection::StaleTarget)
+        ));
+
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "every rejection left durability untouched"
+        );
+        for slot in 1..HOTBAR_SLOTS {
+            assert_eq!(
+                session.player.hotbar_stack(slot),
+                None,
+                "no rejection collected a drop"
+            );
+        }
+    }
+
+    #[test]
+    fn last_use_break_frees_the_slot_before_collecting_the_drop() {
+        use opencraft::player::inventory::{Inventory, Item, ToolKind, ToolTier, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(13, dir.path().join("last-use.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 10, 0, BlockId::CraftingTable);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] =
+            Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 1).expect("last use"));
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            BlockId::CraftingTable,
+        ));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Broke);
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::CraftingTable,
+                count: 1,
+            }),
+            "wear ran before collection, so the drop took the freed slot"
+        );
+        assert!(
+            !session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .flatten()
+                .any(|item| item.is_tool()),
+            "the broken tool disappeared cleanly"
+        );
+        assert_eq!(
+            session.player.inventory().main(0),
+            None,
+            "no drop spilled into main storage"
+        );
     }
 
     #[test]
