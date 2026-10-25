@@ -543,6 +543,31 @@ impl Inventory {
         self.cursor
     }
 
+    /// Removes and returns the whole cursor stack.
+    ///
+    /// This is the conservation-safe primitive UI commands use for "hand to
+    /// grid/cell": exactly the stack that was on the cursor comes back, and an
+    /// empty cursor is an explicit [`InventoryError::EmptyCursor`] with no
+    /// mutation. Callers must put the returned item somewhere or hand it back
+    /// with [`Inventory::put_cursor`]; nothing here can duplicate or shrink it.
+    pub fn take_cursor(&mut self) -> Result<Item, InventoryError> {
+        self.cursor.take().ok_or(InventoryError::EmptyCursor)
+    }
+
+    /// Stores an already-validated item on an empty cursor, untouched.
+    ///
+    /// An occupied cursor is [`InventoryError::CursorOccupied`] with no
+    /// mutation: this primitive never merges, splits, or swaps. Merging and
+    /// swapping stay in [`Inventory::pick_up`] / [`Inventory::put_down`] /
+    /// [`Inventory::swap_cursor`] so a UI click cannot silently change counts.
+    pub fn put_cursor(&mut self, item: Item) -> Result<(), InventoryError> {
+        if self.cursor.is_some() {
+            return Err(InventoryError::CursorOccupied);
+        }
+        self.cursor = Some(item);
+        Ok(())
+    }
+
     /// Legacy read-only block view of a hotbar slot; `None` for empty,
     /// non-block, or out-of-range slots.
     pub fn hotbar_stack(&self, slot: usize) -> Option<ItemStack> {
@@ -1969,6 +1994,65 @@ mod tests {
         let mut empty = Inventory::empty();
         assert_eq!(empty.swap_cursor(0), Err(InventoryError::EmptyCursor));
         assert_eq!(empty.pick_up(0), Err(InventoryError::EmptySlot));
+    }
+
+    #[test]
+    fn take_cursor_and_put_cursor_conserve_items() {
+        let mut inventory = Inventory::empty();
+        let stack = block(BlockId::Stone, 7);
+        inventory.put_cursor(stack).expect("empty cursor accepts");
+        assert_eq!(inventory.cursor(), Some(stack));
+        assert!(inventory.slots().iter().all(Option::is_none));
+
+        let taken = inventory.take_cursor().expect("cursor occupied");
+        assert_eq!(taken, stack, "the whole cursor stack comes back untouched");
+        assert_eq!(inventory.cursor(), None);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::Stone)), 0);
+
+        inventory.put_cursor(taken).expect("put it back");
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Stone)),
+            7,
+            "take/put round-trips conserve identity and count"
+        );
+    }
+
+    #[test]
+    fn put_cursor_rejects_an_occupied_cursor_without_change() {
+        let mut inventory = Inventory::empty();
+        inventory
+            .put_cursor(block(BlockId::Stone, 2))
+            .expect("empty cursor accepts");
+        let before = inventory.clone();
+
+        assert_eq!(
+            inventory.put_cursor(block(BlockId::Stone, 5)),
+            Err(InventoryError::CursorOccupied),
+            "no merging or replacing at the cursor primitive"
+        );
+        assert_eq!(inventory, before);
+
+        assert_eq!(
+            inventory.put_cursor(block(BlockId::OakPlanks, 1)),
+            Err(InventoryError::CursorOccupied),
+            "a different identity is rejected just the same"
+        );
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn take_cursor_rejects_an_empty_cursor() {
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(block(BlockId::Stone, 3))
+            .expect("stone fits in slot 0");
+        let before = inventory.clone();
+
+        assert_eq!(inventory.take_cursor(), Err(InventoryError::EmptyCursor));
+        assert_eq!(
+            inventory, before,
+            "an empty-cursor rejection leaves slots untouched"
+        );
     }
 
     #[test]
