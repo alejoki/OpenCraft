@@ -8621,6 +8621,875 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // S05-T03: all-nine-tool matrix and the break-at-zero generalization
+    // -----------------------------------------------------------------------
+
+    use opencraft::player::inventory::{
+        Material, ToolKind, ToolTier, INVENTORY_SLOTS, MAX_STACK_COUNT,
+    };
+
+    /// Table-grid cells the head row of `kind` occupies.
+    fn tool_head_cells(kind: ToolKind) -> &'static [usize] {
+        match kind {
+            ToolKind::Pickaxe => &[0, 1, 2],
+            ToolKind::Axe => &[0, 1, 4],
+            ToolKind::Shovel => &[0],
+        }
+    }
+
+    /// Table-grid cells the two Stick stacks occupy for `kind`.
+    fn tool_stick_cells(kind: ToolKind) -> &'static [usize] {
+        match kind {
+            ToolKind::Pickaxe | ToolKind::Axe => &[5, 9],
+            ToolKind::Shovel => &[4, 8],
+        }
+    }
+
+    /// One headless named world with a placed, open 4x4 crafting table and the
+    /// material stock the S04/S05 chain produces: eight Oak Planks, two
+    /// separate 4-Stick stacks, and two leftover logs.
+    ///
+    /// Gathering, every craft, placement, table open, break, wear point, and
+    /// drop in [`ToolLab::new`] runs through production seams: the real break
+    /// path, real inventory clicks, and the real placement/table-open
+    /// interactions. One fixture step does not: the 2x2 table recipe needs four
+    /// same-identity cells and the panel moves whole stacks with no split
+    /// gesture, so the sixteen crafted planks are redistributed through the
+    /// documented, conservation-asserted `Player::with_inventory` seam S04/S05
+    /// established (totals asserted unchanged).
+    struct ToolLab {
+        /// Keeps the tempdir world catalog alive for the app's lifetime.
+        _dir: tempfile::TempDir,
+        app: GameApp,
+        screen: InventoryScreen,
+    }
+
+    impl ToolLab {
+        fn player_cell(index: usize) -> InventoryTarget {
+            InventoryTarget::GridCell {
+                kind: GridKind::Player,
+                index,
+            }
+        }
+
+        fn table_cell(index: usize) -> InventoryTarget {
+            InventoryTarget::GridCell {
+                kind: GridKind::Table,
+                index,
+            }
+        }
+
+        /// Two production clicks: pick the whole stack up, put it down.
+        fn move_stack(&mut self, from: InventoryTarget, to: InventoryTarget) {
+            expect_moved(&mut self.app, &self.screen, from);
+            expect_moved(&mut self.app, &self.screen, to);
+        }
+
+        fn craft(&mut self, kind: GridKind, id: ItemId) -> Item {
+            expect_crafted(&mut self.app, &self.screen, kind, id)
+        }
+
+        fn count(&self, id: ItemId) -> u32 {
+            inventory_count_of(&self.app, id)
+        }
+
+        fn slot_of(&self, id: ItemId) -> usize {
+            inventory_slot_of(&self.app, id)
+        }
+
+        /// The first empty inventory slot: where a parked stack can land
+        /// without displacing anything already held.
+        fn empty_slot(&self) -> usize {
+            self.app
+                .session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .position(Option::is_none)
+                .expect("an empty inventory slot must exist")
+        }
+
+        /// Seeds `block` at `pos` and drives the real mining accumulator with
+        /// the selected item to exactly one `Broke`, then applies the
+        /// production break. Asserts the exact tier-adjusted duration, the
+        /// tick count the duration implies, and that the cell became Air.
+        fn mine(&mut self, pos: IVec3, block: BlockId, expected_duration: f32) -> ToolWearOutcome {
+            assert!(
+                !self
+                    .app
+                    .session
+                    .world
+                    .set_block_immediate(pos.x, pos.y, pos.z, block)
+                    .is_empty(),
+                "seeding {block:?} at {pos:?} must remesh"
+            );
+            let selected = self.app.session.player.selected_item();
+            let target = MiningTarget::from_block(pos, block, selected)
+                .unwrap_or_else(|| panic!("the selected item must be able to target {block:?}"));
+            assert!(
+                (target.duration() - expected_duration).abs() < 1e-6,
+                "{block:?} should take {expected_duration}s but the target says {}s",
+                target.duration()
+            );
+            let mut mining = MiningState::new();
+            let mut broke_after = None;
+            for tick in 1..=64usize {
+                match mining.tick(0.1, Some(target)) {
+                    MiningTick::Mining { .. } => {}
+                    MiningTick::Broke {
+                        pos: at,
+                        block: broken,
+                    } => {
+                        assert_eq!(
+                            (at, broken),
+                            (pos, block),
+                            "the accumulator broke the wrong target"
+                        );
+                        broke_after = Some(tick);
+                        break;
+                    }
+                    MiningTick::Idle => panic!("a held {block:?} target must not go idle"),
+                }
+            }
+            let broke_after = broke_after.expect("the held target must break");
+            let expected_ticks = (expected_duration / 0.1).ceil() as usize;
+            assert!(
+                broke_after.abs_diff(expected_ticks) <= 1,
+                "{block:?} broke after {broke_after} ticks, expected {expected_ticks}"
+            );
+            let (remeshed, wear) =
+                applied_break(break_mined_block(&mut self.app.session, pos, block));
+            assert!(!remeshed.is_empty(), "the mining break must remesh");
+            assert_eq!(
+                self.app.session.world.get_block(pos.x, pos.y, pos.z),
+                BlockId::Air,
+                "the applied break clears the cell"
+            );
+            wear
+        }
+
+        /// Crafts the wood pickaxe from the lab's plank/stick stock through real
+        /// clicks and selects it, then clears the leftover cells so the next
+        /// craft starts from an empty 4x4 grid. Returns the pickaxe identity and
+        /// the hotbar slot holding it.
+        fn craft_wood_pickaxe(&mut self) -> (ItemId, usize) {
+            for cell in [0usize, 1, 2] {
+                let slot = self.slot_of(ItemId::Block(BlockId::OakPlanks));
+                self.move_stack(InventoryTarget::Slot(slot), Self::table_cell(cell));
+            }
+            for cell in [5usize, 9] {
+                let slot = self.slot_of(ItemId::Material(Material::Stick));
+                self.move_stack(InventoryTarget::Slot(slot), Self::table_cell(cell));
+            }
+            let wood_pickaxe = ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            };
+            let pickaxe = self.craft(GridKind::Table, wood_pickaxe);
+            assert_eq!(pickaxe.durability(), Some(59));
+            let slot = self.slot_of(wood_pickaxe);
+            assert!(self.app.session.player.select_slot(slot));
+            assert_eq!(
+                self.app
+                    .session
+                    .player
+                    .selected_item()
+                    .map(|item| item.id()),
+                Some(wood_pickaxe)
+            );
+            assert_eq!(
+                self.count(ItemId::Block(BlockId::OakPlanks)),
+                5,
+                "the wood pickaxe consumed three planks"
+            );
+            assert_eq!(
+                self.count(ItemId::Material(Material::Stick)),
+                6,
+                "the wood pickaxe consumed two sticks"
+            );
+            for (cell, slot) in [(0usize, 1usize), (1, 2), (5, 3), (9, 4)] {
+                self.move_stack(Self::table_cell(cell), InventoryTarget::Slot(slot));
+            }
+            (wood_pickaxe, slot)
+        }
+
+        /// Mines `count` Stone blocks with the selected wood pickaxe through the
+        /// real accumulator, parking each Cobblestone drop as a one-item stack in
+        /// its own 2x2 cell so the 3-wide stone head rows get separate stacks
+        /// without any split gesture.
+        fn mine_stone_heads(&mut self, count: usize) {
+            for (mined, cell) in (0..count).enumerate() {
+                let pos = IVec3::new(3 + mined as i32, 8, 0);
+                let wear = self.mine(pos, BlockId::Stone, 0.6);
+                assert_eq!(
+                    wear,
+                    ToolWearOutcome::Worn {
+                        remaining: 59 - 1 - mined as u16
+                    },
+                    "the crafted wood pickaxe spends exactly one point per stone break"
+                );
+                let slot = self.slot_of(ItemId::Block(BlockId::Cobblestone));
+                self.move_stack(InventoryTarget::Slot(slot), Self::player_cell(cell));
+            }
+            assert_eq!(self.count(ItemId::Block(BlockId::Stone)), 0);
+            assert_eq!(
+                self.count(ItemId::Block(BlockId::Cobblestone)),
+                count as u32,
+                "every mined Stone yielded exactly one Cobblestone"
+            );
+        }
+
+        fn new(name: &str) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+            app.new_game.apply(TextInputAction::InsertText(name.into()));
+            app.new_game.cycle_focus();
+            app.new_game
+                .apply(TextInputAction::InsertText("4141".into()));
+            app.attempt_create();
+            assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+
+            // World fixture: the flat test chunk plus its face halo (the same
+            // headless seam every mining/placement test uses) and six seeded
+            // oak logs gathered through the real break path.
+            insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+            for x in 1..=6 {
+                assert!(
+                    !app.session
+                        .world
+                        .set_block_immediate(x, 10, 0, BlockId::OakLog)
+                        .is_empty(),
+                    "seeding each log remeshes"
+                );
+            }
+            for x in 1..=6 {
+                let (remeshed, wear) = applied_break(break_mined_block(
+                    &mut app.session,
+                    IVec3::new(x, 10, 0),
+                    BlockId::OakLog,
+                ));
+                assert!(!remeshed.is_empty(), "a real log break remeshes");
+                assert_eq!(
+                    wear,
+                    ToolWearOutcome::Nothing,
+                    "bare hands cost no durability"
+                );
+            }
+            assert_eq!(
+                app.session
+                    .player
+                    .hotbar_stack(0)
+                    .map(|stack| (stack.block, stack.count)),
+                Some((BlockId::OakLog, 6)),
+                "the real gather path collected every log into the hotbar"
+            );
+
+            let mut screen = InventoryScreen::new();
+            screen.open_player();
+
+            // Logs into the 2x2 grid and four real plank crafts. The panel
+            // moves whole stacks and exposes no split gesture, so the four
+            // separate 4-plank stacks the table recipe needs cannot be produced
+            // by clicks: redistribute the sixteen crafted planks through the
+            // same documented, conservation-asserted seam S04/S05 use.
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(0));
+            expect_moved(&mut app, &screen, Self::player_cell(0));
+            for _ in 0..4 {
+                let planks = expect_crafted(
+                    &mut app,
+                    &screen,
+                    GridKind::Player,
+                    ItemId::Block(BlockId::OakPlanks),
+                );
+                assert_eq!(planks.count(), 4);
+            }
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+                16,
+                "four real log crafts produce sixteen planks"
+            );
+            assert_eq!(inventory_count_of(&app, ItemId::Block(BlockId::OakLog)), 2);
+            // Park the two leftover logs so the grid is empty before the seam.
+            expect_moved(&mut app, &screen, Self::player_cell(0));
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(5));
+            assert!(app.session.player.player_grid().is_empty());
+
+            let planks_before = inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks));
+            let logs_before = inventory_count_of(&app, ItemId::Block(BlockId::OakLog));
+            let mut seeded_slots = [None; INVENTORY_SLOTS];
+            for slot in seeded_slots.iter_mut().take(4) {
+                *slot = Some(Item::new(ItemId::Block(BlockId::OakPlanks), 4).expect("plank stack"));
+            }
+            seeded_slots[5] =
+                Some(Item::new(ItemId::Block(BlockId::OakLog), 2).expect("log stack"));
+            let position = app.session.player.position;
+            let player_grid = app.session.player.player_grid().clone();
+            let table_grid = app.session.player.table_grid().clone();
+            app.session.player = Player::with_inventory(
+                position,
+                Inventory::from_parts(seeded_slots, None),
+                player_grid,
+                table_grid,
+            );
+            app.session.player.restore_selected_slot(0);
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+                planks_before,
+                "seeding redistributed the crafted planks without changing totals"
+            );
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Block(BlockId::OakLog)),
+                logs_before
+            );
+
+            // Four plank stacks make the crafting-table item in the 2x2 grid.
+            for slot in 0..4 {
+                expect_moved(&mut app, &screen, InventoryTarget::Slot(slot));
+                expect_moved(&mut app, &screen, Self::player_cell(slot));
+            }
+            let table = expect_crafted(
+                &mut app,
+                &screen,
+                GridKind::Player,
+                ItemId::Block(BlockId::CraftingTable),
+            );
+            assert_eq!(table.count(), 1);
+
+            // Two separate Stick stacks from the vertical plank pair.
+            expect_moved(&mut app, &screen, Self::player_cell(1));
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(1));
+            expect_moved(&mut app, &screen, Self::player_cell(3));
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(2));
+            let sticks = expect_crafted(
+                &mut app,
+                &screen,
+                GridKind::Player,
+                ItemId::Material(Material::Stick),
+            );
+            assert_eq!(sticks.count(), 4);
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(3));
+            let sticks = expect_crafted(
+                &mut app,
+                &screen,
+                GridKind::Player,
+                ItemId::Material(Material::Stick),
+            );
+            assert_eq!(sticks.count(), 4);
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(4));
+            expect_moved(&mut app, &screen, Self::player_cell(0));
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(6));
+            expect_moved(&mut app, &screen, Self::player_cell(2));
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(7));
+            assert!(
+                app.session.player.player_grid().is_empty(),
+                "the 2x2 grid is cleared before the table opens"
+            );
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+                8,
+                "the whole setup produced eight planks"
+            );
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Material(Material::Stick)),
+                8,
+                "the whole setup produced eight sticks"
+            );
+            assert_eq!(
+                inventory_count_of(&app, ItemId::Block(BlockId::OakLog)),
+                2,
+                "the whole setup left two spare logs"
+            );
+
+            // Place the crafted table through the production right-click path
+            // and open it through the same path.
+            assert!(app.session.player.select_slot(0));
+            assert_eq!(
+                app.session.player.selected_block(),
+                Some(BlockId::CraftingTable)
+            );
+            app.session.player.position = Vec3::new(5.5, 10.0, 5.5);
+            assert!(
+                !app.session
+                    .world
+                    .set_block_immediate(0, 5, 0, BlockId::Stone)
+                    .is_empty(),
+                "the placement support block remeshes"
+            );
+            aim_placement_camera(&mut app.session);
+            match right_click_interaction(&mut app.session) {
+                RightClickOutcome::Placed(remeshed) => {
+                    assert!(!remeshed.is_empty(), "placement remeshes its chunk")
+                }
+                _ => panic!("the targeted stone face must accept the table placement"),
+            }
+            let table_pos = IVec3::new(0, 6, 0);
+            assert_eq!(
+                app.session.world.get_block(0, 6, 0),
+                BlockId::CraftingTable,
+                "the placed table is a real world block"
+            );
+            assert!(
+                app.session.player.hotbar_stack(0).is_none(),
+                "placement consumed the crafted table"
+            );
+            aim_table_interaction_at(&mut app.session, table_pos);
+            assert!(
+                matches!(
+                    right_click_interaction(&mut app.session),
+                    RightClickOutcome::TableOpened
+                ),
+                "the real right-click path opens the placed table"
+            );
+            assert_eq!(app.session.open_table_position(), Some(table_pos));
+            screen.close();
+            screen.open_table();
+            assert_eq!(
+                screen.mode(app.session.open_table_position()),
+                InventoryMode::Table
+            );
+
+            Self {
+                _dir: dir,
+                app,
+                screen,
+            }
+        }
+    }
+
+    /// S05-T03 — the milestone's full tool matrix, end to end. Each of the nine
+    /// tier x kind combinations gets a fresh named world and is crafted and used
+    /// through production seams: the head material is gathered by real breaks
+    /// (wood = seeded oak logs, stone = a crafted wood pickaxe mining Stone,
+    /// iron = seeded ore broken bare-handed), the tool is crafted at the placed
+    /// 4x4 table with real inventory clicks, and one class-matching block is
+    /// mined through the real accumulator to prove the exact tier-adjusted
+    /// duration, exactly one durability point against 59/131/250 maxima, and
+    /// the expected drop. Break-at-zero beyond the wood tier and the recraft
+    /// live in `stone_tool_breaks_at_zero_and_is_recrafted_through_the_real_break_path`.
+    ///
+    /// Seeding notes: the flat chunk + face halo and the seeded log/stone/ore
+    /// blocks are the same headless world fixture every mining test uses, and
+    /// only the four separate 4-plank stacks are redistributed through the
+    /// documented, conservation-asserted S04/S05 seam (the panel has no split
+    /// gesture). Every craft, placement, table open, break, wear point, and drop
+    /// runs through production code.
+    #[test]
+    fn all_nine_tools_craft_and_wear_exactly_once_on_matching_blocks() {
+        let combinations = [
+            (ToolTier::Wood, ToolKind::Pickaxe),
+            (ToolTier::Wood, ToolKind::Axe),
+            (ToolTier::Wood, ToolKind::Shovel),
+            (ToolTier::Stone, ToolKind::Pickaxe),
+            (ToolTier::Stone, ToolKind::Axe),
+            (ToolTier::Stone, ToolKind::Shovel),
+            (ToolTier::Iron, ToolKind::Pickaxe),
+            (ToolTier::Iron, ToolKind::Axe),
+            (ToolTier::Iron, ToolKind::Shovel),
+        ];
+
+        for (tier, kind) in combinations {
+            let name = format!("matrix-{tier:?}-{kind:?}");
+            let mut lab = ToolLab::new(&name);
+            let head_count = tool_head_cells(kind).len();
+
+            // 1. Reach the head material through real breaks. Wood planks are
+            // already separate stacks; stone and iron heads are gathered one
+            // unit at a time and parked one per 2x2 cell so the 3-wide head
+            // rows can be filled with separate whole stacks.
+            match tier {
+                ToolTier::Wood => {
+                    for cell in 0..head_count {
+                        let slot = lab.slot_of(ItemId::Block(BlockId::OakPlanks));
+                        lab.move_stack(InventoryTarget::Slot(slot), ToolLab::player_cell(cell));
+                    }
+                    assert_eq!(
+                        lab.count(ItemId::Block(BlockId::OakPlanks)),
+                        8,
+                        "parking the plank heads conserves every plank"
+                    );
+                }
+                ToolTier::Stone => {
+                    // Stone-tier heads only exist because a crafted wood pickaxe
+                    // mines Stone; build that pickaxe through real clicks first.
+                    // The shovel pass needs one spare Cobblestone for its
+                    // break-at-zero recraft; every other stone tool mines exactly
+                    // the head row it spends.
+                    let (_, _) = lab.craft_wood_pickaxe();
+                    let needed = if kind == ToolKind::Shovel {
+                        head_count + 1
+                    } else {
+                        head_count
+                    };
+                    lab.mine_stone_heads(needed);
+                }
+                ToolTier::Iron => {
+                    assert!(
+                        lab.app.session.player.selected_item().is_none(),
+                        "iron ore is gathered bare-handed"
+                    );
+                    for cell in 0..head_count {
+                        let pos = IVec3::new(3 + cell as i32, 8, 0);
+                        let wear = lab.mine(pos, BlockId::IronOre, 2.2);
+                        assert_eq!(
+                            wear,
+                            ToolWearOutcome::Nothing,
+                            "bare hands break iron ore without durability"
+                        );
+                        let ore_slot = lab.slot_of(ItemId::Block(BlockId::IronOre));
+                        lab.move_stack(InventoryTarget::Slot(ore_slot), ToolLab::player_cell(cell));
+                    }
+                    assert_eq!(
+                        lab.count(ItemId::Block(BlockId::IronOre)),
+                        head_count as u32,
+                        "every mined ore is conserved"
+                    );
+                }
+            }
+
+            // 2. Craft the tool in the open 4x4 table from the separated head
+            // stacks plus two whole Stick stacks.
+            for (index, cell) in tool_head_cells(kind).iter().enumerate() {
+                lab.move_stack(ToolLab::player_cell(index), ToolLab::table_cell(*cell));
+            }
+            for cell in tool_stick_cells(kind) {
+                let slot = lab.slot_of(ItemId::Material(Material::Stick));
+                lab.move_stack(InventoryTarget::Slot(slot), ToolLab::table_cell(*cell));
+            }
+            let tool_id = ItemId::Tool { kind, tier };
+            let tool = lab.craft(GridKind::Table, tool_id);
+            assert_eq!(
+                tool.durability(),
+                Some(tier.max_durability()),
+                "a fresh craft is full durability"
+            );
+            assert_eq!(lab.count(tool_id), 1);
+            let tool_slot = lab.slot_of(tool_id);
+            assert!(
+                lab.app.session.player.select_slot(tool_slot),
+                "the crafted tool lands in the hotbar"
+            );
+            assert_eq!(
+                lab.app.session.player.selected_item().map(|item| item.id()),
+                Some(tool_id)
+            );
+
+            // 3. Negative surfaces: a tool outside its class never accelerates,
+            // and structurally unbreakable blocks never become targets.
+            let wrong_block = match kind {
+                ToolKind::Pickaxe => BlockId::Dirt,
+                ToolKind::Axe => BlockId::Stone,
+                ToolKind::Shovel => BlockId::OakLog,
+            };
+            let wrong = MiningTarget::from_block(IVec3::new(7, 8, 0), wrong_block, Some(tool))
+                .expect("a mismatched block is still breakable");
+            assert_eq!(
+                wrong.duration(),
+                wrong_block
+                    .break_duration_secs()
+                    .expect("a mismatched block keeps its base hardness"),
+                "a mismatched tool class must not shorten the break"
+            );
+            for unbreakable in [BlockId::Air, BlockId::Bedrock] {
+                assert!(
+                    MiningTarget::from_block(IVec3::new(7, 8, 0), unbreakable, Some(tool))
+                        .is_none(),
+                    "{unbreakable:?} must never become a target, even with a tool"
+                );
+            }
+
+            // 4. One class-matching break: the exact tier-adjusted duration,
+            // exactly one durability point, and the expected drop.
+            let (target_block, base_duration, expected_duration) = match kind {
+                ToolKind::Pickaxe => (
+                    BlockId::Stone,
+                    1.2,
+                    match tier {
+                        ToolTier::Wood => 0.6,
+                        ToolTier::Stone => 0.3,
+                        ToolTier::Iron => 0.2,
+                    },
+                ),
+                ToolKind::Axe => (
+                    BlockId::OakLog,
+                    0.9,
+                    match tier {
+                        ToolTier::Wood => 0.45,
+                        ToolTier::Stone => 0.225,
+                        ToolTier::Iron => 0.15,
+                    },
+                ),
+                ToolKind::Shovel => (
+                    BlockId::Dirt,
+                    0.45,
+                    match tier {
+                        ToolTier::Wood => 0.225,
+                        ToolTier::Stone => 0.1125,
+                        ToolTier::Iron => 0.075,
+                    },
+                ),
+            };
+            assert_eq!(target_block.break_duration_secs(), Some(base_duration));
+            let drop_id = ItemId::Block(target_block.mined_drop());
+            let drops_before = lab.count(drop_id);
+            let wear = lab.mine(IVec3::new(6, 8, 0), target_block, expected_duration);
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Worn {
+                    remaining: tier.max_durability() - 1
+                },
+                "{tier:?} {kind:?} spends exactly one point per applied break"
+            );
+            assert_eq!(lab.count(tool_id), 1, "one break leaves the tool held");
+            assert_eq!(
+                lab.count(drop_id),
+                drops_before + 1,
+                "the matching break yields {drop_id:?}"
+            );
+            assert_eq!(
+                lab.app
+                    .session
+                    .player
+                    .selected_item()
+                    .and_then(|item| item.durability()),
+                Some(tier.max_durability() - 1)
+            );
+        }
+    }
+
+    /// S05-T03 (break-at-zero half) — a stone-tier tool is driven to its last
+    /// durability point through real Dirt breaks, the final applied break frees
+    /// its hotbar slot *before* the drop is collected (MEM195 ordering), and a
+    /// full-durability replacement is recrafted from the remaining grid
+    /// materials through the real craft path. S04 proved this for the wood tier;
+    /// this proves the same semantics one tier up, where the maxima are not the
+    /// ones the wood chain exercised.
+    ///
+    /// Seeding notes: the world fixture and the four-way plank redistribution are
+    /// the same documented seams as the matrix test. The near-full inventory at
+    /// the final break is built through the documented
+    /// `Player::with_inventory`/`Inventory::from_parts` seam S04/S05 established:
+    /// only a saturated inventory can prove the final drop had exactly one home
+    /// (the slot the break frees). The worn tool, its durability, and both
+    /// recraft material stacks are asserted unchanged across that seam.
+    #[test]
+    fn stone_tool_breaks_at_zero_and_is_recrafted_through_the_real_break_path() {
+        let mut lab = ToolLab::new("break-at-zero");
+
+        // Stone-tier chain: crafted wood pickaxe -> two real Stone breaks (one
+        // head, one spare for the recraft) -> stone shovel at the open table.
+        let (_, _) = lab.craft_wood_pickaxe();
+        lab.mine_stone_heads(2);
+        lab.move_stack(ToolLab::player_cell(0), ToolLab::table_cell(0));
+        for cell in [4usize, 8] {
+            let slot = lab.slot_of(ItemId::Material(Material::Stick));
+            lab.move_stack(InventoryTarget::Slot(slot), ToolLab::table_cell(cell));
+        }
+        let shovel_id = ItemId::Tool {
+            kind: ToolKind::Shovel,
+            tier: ToolTier::Stone,
+        };
+        let shovel = lab.craft(GridKind::Table, shovel_id);
+        assert_eq!(
+            shovel.durability(),
+            Some(131),
+            "a fresh stone shovel is full"
+        );
+        let tool_slot = lab.slot_of(shovel_id);
+        assert!(lab.app.session.player.select_slot(tool_slot));
+
+        // Spend the first point on a real Dirt break, then every point but the
+        // last. Each applied break yields its drop.
+        let wear = lab.mine(IVec3::new(7, 8, 0), BlockId::Dirt, 0.1125);
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 130 },
+            "one applied break spends exactly one point"
+        );
+
+        // Pull the leftover Stick stacks out of the table grid so the recraft
+        // starts from an empty grid, into genuinely empty slots (the worn tool
+        // itself may sit where a stick stack used to be).
+        let slot = lab.empty_slot();
+        lab.move_stack(ToolLab::table_cell(4), InventoryTarget::Slot(slot));
+        let slot = lab.empty_slot();
+        lab.move_stack(ToolLab::table_cell(8), InventoryTarget::Slot(slot));
+        assert_eq!(
+            lab.slot_of(shovel_id),
+            tool_slot,
+            "moving the leftovers must not displace the worn tool"
+        );
+
+        let mut remaining = 130u16;
+        while remaining > 1 {
+            let wear = lab.mine(IVec3::new(7, 8, 0), BlockId::Dirt, 0.1125);
+            remaining -= 1;
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Worn { remaining },
+                "each applied break spends exactly one point"
+            );
+        }
+        assert_eq!(remaining, 1, "the stone shovel is on its last point");
+        assert_eq!(
+            lab.count(ItemId::Block(BlockId::Dirt)),
+            130,
+            "every real Dirt break yielded its drop"
+        );
+        assert_eq!(
+            lab.app
+                .session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(1)
+        );
+
+        // Saturate the inventory through the documented S04/S05 seam so the
+        // final drop has exactly one home: the slot the break frees.
+        let position = lab.app.session.player.position;
+        let player_grid = lab.app.session.player.player_grid().clone();
+        let table_grid = lab.app.session.player.table_grid().clone();
+        let cobble_before = lab.count(ItemId::Block(BlockId::Cobblestone));
+        let sticks_before = lab.count(ItemId::Material(Material::Stick));
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (slot, item) in slots
+            .iter_mut()
+            .zip(lab.app.session.player.inventory().slots())
+        {
+            *slot = match item {
+                Some(item) if item.id() == ItemId::Block(BlockId::Dirt) => Some(
+                    Item::new(ItemId::Block(BlockId::Dirt), MAX_STACK_COUNT).expect("full dirt"),
+                ),
+                other => *other,
+            };
+        }
+        for slot in slots.iter_mut().filter(|slot| slot.is_none()) {
+            *slot = Some(
+                Item::new(ItemId::Block(BlockId::Brick), MAX_STACK_COUNT).expect("full brick"),
+            );
+        }
+        lab.app.session.player = Player::with_inventory(
+            position,
+            Inventory::from_parts(slots, None),
+            player_grid,
+            table_grid,
+        );
+        lab.app.session.player.restore_selected_slot(tool_slot);
+        assert_eq!(
+            lab.slot_of(shovel_id),
+            tool_slot,
+            "the worn tool stays in its slot across the fixture seam"
+        );
+        assert_eq!(
+            lab.app
+                .session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(1)
+        );
+        assert_eq!(
+            lab.count(ItemId::Block(BlockId::Cobblestone)),
+            cobble_before,
+            "the recraft material survives the seam"
+        );
+        assert_eq!(
+            lab.count(ItemId::Material(Material::Stick)),
+            sticks_before,
+            "the recraft sticks survive the seam"
+        );
+        assert!(
+            lab.app
+                .session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .all(|slot| slot.is_some()),
+            "every slot is occupied before the final break"
+        );
+        assert!(
+            lab.app
+                .session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .flatten()
+                .all(|item| item.id() != ItemId::Block(BlockId::Dirt)
+                    || item.count() == MAX_STACK_COUNT),
+            "no Dirt stack has room for the final drop"
+        );
+
+        let dirt_before = lab.count(ItemId::Block(BlockId::Dirt));
+        let wear = lab.mine(IVec3::new(8, 8, 0), BlockId::Dirt, 0.1125);
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Broke,
+            "the last point breaks the stone shovel"
+        );
+        assert_eq!(lab.count(shovel_id), 0, "the broken tool is gone");
+        assert!(
+            lab.app
+                .session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .flatten()
+                .all(|item| item.id() != shovel_id),
+            "no slot still holds the broken tool identity"
+        );
+        assert_eq!(
+            lab.app
+                .session
+                .player
+                .inventory()
+                .slot(tool_slot)
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Dirt), 1)),
+            "the freed slot received the drop (MEM195: wear precedes collect)"
+        );
+        assert_eq!(
+            lab.count(ItemId::Block(BlockId::Dirt)),
+            dirt_before + 1,
+            "the final break still yields its drop"
+        );
+
+        // Recraft a full-durability replacement through the real craft path
+        // from the remaining grid materials.
+        lab.move_stack(ToolLab::player_cell(1), ToolLab::table_cell(0));
+        for cell in [4usize, 8] {
+            let slot = lab.slot_of(ItemId::Material(Material::Stick));
+            lab.move_stack(InventoryTarget::Slot(slot), ToolLab::table_cell(cell));
+        }
+        let recrafted = lab.craft(GridKind::Table, shovel_id);
+        assert_eq!(
+            recrafted.durability(),
+            Some(131),
+            "a recrafted stone shovel is full durability"
+        );
+        assert_eq!(lab.count(shovel_id), 1);
+
+        // Negative: the spent grid no longer matches any recipe, and a rejected
+        // result click mutates neither the grid nor the inventory.
+        let inventory_before = lab.app.session.player.inventory().clone();
+        let table_before = lab.app.session.player.table_grid().clone();
+        assert_eq!(
+            click_inventory(
+                &mut lab.app,
+                &lab.screen,
+                InventoryTarget::ResultSlot(GridKind::Table)
+            ),
+            Err(InventoryCommandError::Craft(CraftError::NoRecipe)),
+            "a spent grid cannot mint a second tool"
+        );
+        assert_eq!(lab.app.session.player.inventory(), &inventory_before);
+        assert_eq!(lab.app.session.player.table_grid(), &table_before);
+    }
+
     /// Keybinds with jump_or_up rebound to ArrowUp (leaves Space free by
     /// rebinding nothing else) — a valid, conflict-free state.
     fn opencraft_keybinds_jump_arrow_up() -> opencraft::settings::Keybinds {
