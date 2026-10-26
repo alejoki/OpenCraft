@@ -91,8 +91,9 @@ pub const DEFAULT_WORLD_SEED: u32 = 1337;
 /// This is the value that used to be the implicit `h <= 22` Sand threshold in
 /// `generate_chunk_seeded`, now named (D071).
 ///
-/// T04 fills every column with `h < SEA_LEVEL` with Water from the seabed up
-/// to this height; this task only carves the dry basins.
+/// Every column with `h < SEA_LEVEL` is filled with static `BlockId::Water`
+/// from just above the seabed skin up to this height (MEM230: worldgen only,
+/// no flow, never persisted and never a `ChunkEditMap` entry).
 pub const SEA_LEVEL: i32 = 22;
 
 /// Highest surface the height function may ever produce.
@@ -615,6 +616,13 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
                             }
                         }
                     }
+                } else if h < SEA_LEVEL && wy <= SEA_LEVEL {
+                    // Ocean basin: static worldgen water from just above the
+                    // seabed skin (wy > h) up to the named sea level. The
+                    // three-block skin below stays Sand and cave carving stops
+                    // at h - 4, so the seabed is a real seal. MEM230: no flow,
+                    // never a persisted edit (see T02's Water rejection paths).
+                    BlockId::Water
                 } else {
                     BlockId::Air
                 };
@@ -1710,6 +1718,167 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Water fill invariant: every ocean column is filled with static Water
+    /// from just above the seabed up to SEA_LEVEL, no land column ever holds
+    /// water, and water never appears below the seabed or above sea level.
+    #[test]
+    fn test_ocean_basins_are_filled_with_water_up_to_sea_level() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut water_blocks = 0usize;
+        let mut ocean_columns = 0usize;
+        let mut land_columns = 0usize;
+
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -1..=0 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let wx = base_wx + lx as i32;
+                            let wz = base_wz + lz as i32;
+                            let h = terrain_height_at_seeded(wx, wz, seed);
+                            let is_ocean = h < SEA_LEVEL;
+                            if is_ocean {
+                                ocean_columns += 1;
+                            } else {
+                                land_columns += 1;
+                            }
+
+                            for ly in 0..CHUNK_SIZE {
+                                let wy = base_wy + ly as i32;
+                                if chunk.get(lx, ly, lz) != BlockId::Water {
+                                    continue;
+                                }
+                                water_blocks += 1;
+                                assert!(
+                                    is_ocean,
+                                    "water in land column ({wx}, {wy}, {wz}) with h = {h}"
+                                );
+                                assert!(
+                                    (h + 1..=SEA_LEVEL).contains(&wy),
+                                    "water at ({wx}, {wy}, {wz}) outside seabed..sea band \
+                                     (h = {h}, SEA_LEVEL = {SEA_LEVEL})"
+                                );
+                            }
+
+                            if cy == 0 {
+                                // The layer that owns the whole sea band.
+                                for wy in (h + 1)..=SEA_LEVEL {
+                                    let ly = (wy - base_wy) as usize;
+                                    assert_eq!(
+                                        chunk.get(lx, ly, lz),
+                                        BlockId::Water,
+                                        "ocean column ({wx}, {wz}) is not filled at wy {wy} \
+                                         (h = {h})"
+                                    );
+                                }
+                                if is_ocean {
+                                    let ly = (SEA_LEVEL + 1 - base_wy) as usize;
+                                    assert_eq!(
+                                        chunk.get(lx, ly, lz),
+                                        BlockId::Air,
+                                        "ocean column ({wx}, {wz}) has a block above SEA_LEVEL"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(ocean_columns > 0, "scan found no ocean columns to fill");
+        assert!(land_columns > 0, "scan found no land columns");
+        assert!(water_blocks > 0, "scan found no Water blocks");
+        eprintln!(
+            "water fill scan: {ocean_columns} ocean columns, {land_columns} land columns, \
+             {water_blocks} Water blocks"
+        );
+    }
+
+    /// The seabed seal under a water column: the three-block subsurface skin
+    /// and the surface stay Sand. Caves only carve strictly below `h - 3`, so
+    /// they can never puncture the skin and drain a basin into a cave.
+    #[test]
+    fn test_water_columns_keep_seabed_skin_and_caves_below_it() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut checked = 0usize;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let chunk = generate_chunk_seeded(pos, seed);
+                let base_wx = cx * CHUNK_SIZE as i32;
+                let base_wy = 0;
+                let base_wz = cz * CHUNK_SIZE as i32;
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = base_wx + lx as i32;
+                        let wz = base_wz + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        if h >= SEA_LEVEL {
+                            continue;
+                        }
+                        checked += 1;
+                        assert!(
+                            (0..CHUNK_SIZE as i32).contains(&h),
+                            "ocean surface h {h} outside the inspected layer"
+                        );
+                        for wy in (h - 3)..=h {
+                            let ly = (wy - base_wy) as usize;
+                            assert_eq!(
+                                chunk.get(lx, ly, lz),
+                                BlockId::Sand,
+                                "seabed skin at ({wx}, {wy}, {wz}) is not Sand (h = {h})"
+                            );
+                            assert!(
+                                !is_cave_carvable(BlockId::Sand, wy, h),
+                                "a cave must never carve the seabed skin at wy {wy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "scan found no water columns to guard");
+        eprintln!("seabed skin scan: {checked} water columns kept their three-block seal");
+    }
+
+    /// Water generation is a pure function of position + seed: two repeats of
+    /// the same ocean chunk are byte-identical, including the water volume.
+    #[test]
+    fn test_water_generation_is_byte_identical_across_repeats() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut found_water = false;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let first = generate_chunk_seeded(pos, seed);
+                let second = generate_chunk_seeded(pos, seed);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let a = first.get(lx, ly, lz);
+                            assert_eq!(
+                                a,
+                                second.get(lx, ly, lz),
+                                "seed {seed} chunk {pos:?} differs at ({lx}, {ly}, {lz})"
+                            );
+                            found_water |= a == BlockId::Water;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_water,
+            "repeat scan never encountered the water volume"
+        );
     }
 
     /// First column of `biome` whose surface is high enough for trees (above

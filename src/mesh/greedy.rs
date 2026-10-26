@@ -18,6 +18,10 @@ pub struct PaddedChunk {
     /// placeholder keeps rendering identical until real light is wired in.
     pub light: Box<[u8; PADDED_VOLUME]>,
     pub has_any_solid: bool,
+    /// True when at least one liquid cell was copied into the padded volume.
+    /// Kept separate from `has_any_solid` (water is not solid) so the mesher
+    /// and the manager's fast skip still see water-bearing chunks.
+    pub has_any_liquid: bool,
 }
 
 impl PaddedChunk {
@@ -26,12 +30,24 @@ impl PaddedChunk {
             voxels: Box::new([BlockId::Air; PADDED_VOLUME]),
             light: Box::new([15u8; PADDED_VOLUME]),
             has_any_solid: false,
+            has_any_liquid: false,
         }
     }
 
     pub fn from_center_only(chunk: &Chunk) -> Self {
         let mut padded = Self::new_empty();
         if let Some(b) = chunk.is_uniform() {
+            if b.is_liquid() {
+                padded.has_any_liquid = true;
+                for py in 1..=CHUNK_SIZE {
+                    for pz in 1..=CHUNK_SIZE {
+                        for px in 1..=CHUNK_SIZE {
+                            padded.voxels[padded_index(px, py, pz)] = b;
+                        }
+                    }
+                }
+                return padded;
+            }
             if !b.is_solid() {
                 return padded;
             }
@@ -53,6 +69,9 @@ impl PaddedChunk {
                     if b.is_solid() {
                         padded.has_any_solid = true;
                         padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b;
+                    } else if b.is_liquid() {
+                        padded.has_any_liquid = true;
+                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b;
                     }
                 }
             }
@@ -64,6 +83,8 @@ impl PaddedChunk {
     pub fn set(&mut self, px: usize, py: usize, pz: usize, block: BlockId) {
         if block.is_solid() {
             self.has_any_solid = true;
+        } else if block.is_liquid() {
+            self.has_any_liquid = true;
         }
         self.voxels[padded_index(px, py, pz)] = block;
     }
@@ -128,7 +149,9 @@ fn get_axis_coord(axis: usize, d: usize, u: usize, v: usize) -> (usize, usize, u
 
 pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
     let mut mesh = ChunkMesh::new();
-    if !padded.has_any_solid {
+    // Water-only chunks must still be meshed (open ocean surface); only a
+    // chunk with neither solid nor liquid geometry can produce no faces.
+    if !padded.has_any_solid && !padded.has_any_liquid {
         return mesh;
     }
 
@@ -329,7 +352,97 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
         }
     }
 
+    mesh_water(padded, &mut mesh);
+
     mesh
+}
+
+/// Emit air-facing liquid faces into `ChunkMesh::water_quads` (D070).
+///
+/// Water is its own mask: it is never part of `solid_masks`, so a water cell
+/// can neither cull a stone face nor be culled by one — the seabed keeps real
+/// opaque faces and water quads never enter the opaque buckets. Only faces
+/// with Air on the far side are emitted (the open top surface at
+/// `SEA_LEVEL`, plus rare lateral air pockets); water↔water and water↔stone
+/// boundaries emit nothing here.
+fn mesh_water(padded: &PaddedChunk, mesh: &mut ChunkMesh) {
+    if !padded.has_any_liquid {
+        return;
+    }
+
+    // Water is unlit by the opaque sky-light model and uses a constant bright
+    // key: tex layer 0 (placeholder until S04 ships the water texture), all
+    // four AO corners full (3) and every corner at full light (15).
+    const WATER_TEX_LAYER: u8 = 0;
+    const WATER_AO: u8 = 0xFF;
+    const WATER_LIGHT: u16 = 0xFFFF;
+
+    for axis in 0..3 {
+        for is_pos in [true, false] {
+            let face_dir = (axis * 2 + usize::from(!is_pos)) as u8;
+            for d in 0..CHUNK_SIZE {
+                // visible[v][u]: a liquid cell at this slice has Air across
+                // the face. Kept strictly separate from `solid_masks`.
+                let mut visible = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+                let mut any_visible = false;
+                for v in 0..CHUNK_SIZE {
+                    for u in 0..CHUNK_SIZE {
+                        let (px, py, pz) = get_axis_coord(axis, d + 1, u + 1, v + 1);
+                        if !padded.get(px, py, pz).is_liquid() {
+                            continue;
+                        }
+                        let air_d = if is_pos { d + 2 } else { d };
+                        let (ax, ay, az) = get_axis_coord(axis, air_d, u + 1, v + 1);
+                        if padded.get(ax, ay, az) == BlockId::Air {
+                            visible[v][u] = true;
+                            any_visible = true;
+                        }
+                    }
+                }
+                if !any_visible {
+                    continue;
+                }
+
+                // Greedy merge within the slice. Every water face shares the
+                // same key, so the merge only has to grow rectangles.
+                for v in 0..CHUNK_SIZE {
+                    let mut u = 0usize;
+                    while u < CHUNK_SIZE {
+                        if !visible[v][u] {
+                            u += 1;
+                            continue;
+                        }
+                        let mut w = 1usize;
+                        while u + w < CHUNK_SIZE && visible[v][u + w] {
+                            w += 1;
+                        }
+                        let mut h = 1usize;
+                        'height: while v + h < CHUNK_SIZE {
+                            for uu in u..(u + w) {
+                                if !visible[v + h][uu] {
+                                    break 'height;
+                                }
+                            }
+                            h += 1;
+                        }
+                        for row in &mut visible[v..(v + h)] {
+                            row[u..(u + w)].fill(false);
+                        }
+                        let (qx, qy, qz) = get_axis_coord(axis, d, u, v);
+                        mesh.water_quads.push(PackedQuad::new(
+                            [qx as u32, qy as u32, qz as u32],
+                            [w as u32, h as u32],
+                            face_dir as u32,
+                            WATER_TEX_LAYER,
+                            WATER_AO,
+                            WATER_LIGHT,
+                        ));
+                        u += w;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +471,7 @@ mod tests {
         let padded = PaddedChunk::from_center_only(&chunk);
         let mesh = mesh_chunk(&padded);
         assert_eq!(mesh.total_quads(), 6);
+        assert_eq!(mesh.water_quad_count(), 0, "solid chunks carry no water");
         for dir in 0..6 {
             assert_eq!(mesh.buckets[dir].len(), 1);
             let (_, _, _, w, h, _, _, _, _) = mesh.buckets[dir][0].unpack();
@@ -431,5 +545,150 @@ mod tests {
         // Defensive masking keeps packed nibbles in 0-15 even without debug asserts.
         padded.light[padded_index(1, 1, 1)] = 0xFF;
         assert_eq!(padded.light_at(1, 1, 1), 15);
+    }
+
+    #[test]
+    fn real_ocean_chunk_emits_water_surface_quads_above_real_seabed_faces() {
+        use crate::world::chunk::ChunkPos;
+        use crate::world::terrain::{generate_chunk_seeded, SEA_LEVEL};
+
+        const SEED: u32 = 1337;
+        let mut found = None;
+        'scan: for cx in -4..=4 {
+            for cz in -4..=4 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let chunk = generate_chunk_seeded(pos, SEED);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        // Chunk layer 0 starts at wy 0, so local y == world y
+                        // and SEA_LEVEL is inside this layer.
+                        if chunk.get(lx, SEA_LEVEL as usize, lz) == BlockId::Water {
+                            found = Some(chunk);
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        let chunk = found.expect("near-origin scan must contain an ocean chunk");
+
+        let padded = PaddedChunk::from_center_only(&chunk);
+        let mesh = mesh_chunk(&padded);
+        assert!(
+            mesh.total_quads() > 0,
+            "the real seabed keeps opaque stone/sand faces"
+        );
+        assert!(
+            mesh.water_quad_count() > 0,
+            "a real ocean chunk emits water surface quads"
+        );
+        // The open top surface at local y = SEA_LEVEL is a PosY (face_dir 2)
+        // water quad. `from_center_only` leaves the halo Air, so side faces at
+        // the chunk border are emitted too; the top face is the one that must
+        // exist for the ocean to read as water.
+        let has_top = mesh
+            .water_quads
+            .iter()
+            .any(|q| q.unpack().5 == 2 && q.unpack().1 == SEA_LEVEL as u32);
+        assert!(has_top, "ocean chunk must contain a top water surface quad");
+    }
+
+    #[test]
+    fn water_only_padded_chunk_emits_water_quads_and_no_opaque_quads() {
+        let padded = PaddedChunk::from_center_only(&Chunk::new_uniform(BlockId::Water));
+        assert!(padded.has_any_liquid, "uniform water is recorded as liquid");
+        assert!(!padded.has_any_solid, "water is not solid");
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 0, "water never enters an opaque bucket");
+        for (dir, bucket) in mesh.buckets.iter().enumerate() {
+            assert!(
+                bucket.is_empty(),
+                "opaque bucket {dir} received a water quad"
+            );
+        }
+        // A 32x32x32 water cube exposed on all six sides greedy-merges to one
+        // water quad per face direction.
+        assert_eq!(mesh.water_quad_count(), 6);
+        let mut dirs: Vec<u32> = mesh.water_quads.iter().map(|q| q.unpack().5).collect();
+        dirs.sort_unstable();
+        assert_eq!(dirs, vec![0, 1, 2, 3, 4, 5]);
+        for quad in &mesh.water_quads {
+            let (_, _, _, w, h, _, _, _, light) = quad.unpack();
+            assert_eq!((w, h), (32, 32));
+            assert_eq!(light, 0xFFFF, "water quads carry a constant bright key");
+        }
+    }
+
+    #[test]
+    fn water_does_not_cull_stone_faces() {
+        // A stone chunk with one cell replaced by water: the six stone faces
+        // around the water cell must still be emitted (water is not solid and
+        // is never in `solid_masks`), and the water cell emits nothing because
+        // every neighbour is stone rather than Air.
+        let mut chunk = Chunk::new_uniform(BlockId::Stone);
+        chunk.set(5, 6, 7, BlockId::Water);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        assert!(padded.has_any_solid && padded.has_any_liquid);
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(
+            mesh.total_quads(),
+            12,
+            "6 outer stone faces + 6 cavity walls facing the water cell"
+        );
+        assert_eq!(
+            mesh.water_quad_count(),
+            0,
+            "water against stone is invisible"
+        );
+    }
+
+    #[test]
+    fn water_surrounded_by_air_emits_one_quad_per_face() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::Water);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 0);
+        assert_eq!(mesh.water_quad_count(), 6);
+        for quad in &mesh.water_quads {
+            let (_, _, _, w, h, _, _, _, _) = quad.unpack();
+            assert_eq!((w, h), (1, 1));
+        }
+    }
+
+    #[test]
+    fn water_water_and_water_stone_boundaries_emit_no_faces() {
+        // Two adjacent water cells share a face (no internal surface), and a
+        // water cell pressed against stone emits nothing. Only the shared
+        // air-facing faces appear.
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(4, 6, 7, BlockId::Water);
+        chunk.set(5, 6, 7, BlockId::Water);
+        chunk.set(6, 6, 7, BlockId::Stone);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        let mesh = mesh_chunk(&padded);
+
+        // The two-cell water pair has 9 air-facing unit faces: 5 for the
+        // -X cell and 4 for the +X cell (its shared -X face is water-water,
+        // its +X face is water-stone). Greedy merging across the pair turns
+        // the Y and Z faces into 2x1 quads: 1 + 2 + 2 = 5 quads for 9 units.
+        assert_eq!(mesh.water_quad_count(), 5);
+        let water_area: u32 = mesh
+            .water_quads
+            .iter()
+            .map(|q| {
+                let (_, _, _, w, h, _, _, _, _) = q.unpack();
+                w * h
+            })
+            .sum();
+        assert_eq!(
+            water_area, 9,
+            "water-water and water-stone faces stay invisible"
+        );
+        // The stone cell is a single voxel against Air on five sides and water
+        // on the -X side; water is not solid, so all six faces are opaque.
+        assert_eq!(mesh.total_quads(), 6);
     }
 }

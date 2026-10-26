@@ -1089,8 +1089,10 @@ impl WorldManager {
             let Some(padded) = self.build_padded_chunk(pos) else {
                 continue;
             };
-            // Fast path on main thread: if padded chunk has no solid voxels at all, skip worker dispatch
-            if !padded.has_any_solid {
+            // Fast path on main thread: if padded chunk has no solid and no
+            // liquid voxels, skip worker dispatch. Water must be included so a
+            // water-bearing (or water-only) chunk is still meshed.
+            if !padded.has_any_solid && !padded.has_any_liquid {
                 self.meshed_chunks.insert(pos);
                 continue;
             }
@@ -1693,6 +1695,150 @@ mod tests {
             real * 4 <= uniform * 5,
             "light fragmentation must stay bounded (measured ratio 1.010): \
              real {real} vs uniform {uniform}"
+        );
+    }
+
+    /// A chunk whose only content is water must still be dispatched through
+    /// the mesher: the `!has_any_solid` fast skip used to drop it silently.
+    #[test]
+    fn test_water_only_chunk_is_dispatched_and_meshes_water_quads() {
+        let center = ChunkPos::new(0, 0, 0);
+        let mut mgr = WorldManager::new(4);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    let chunk = if pos == center {
+                        Chunk::new_uniform(BlockId::Water)
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    mgr.insert_chunk_for_test(pos, chunk);
+                }
+            }
+        }
+        mgr.recompute_light_for_test();
+
+        let padded = mgr
+            .build_padded_chunk(center)
+            .expect("the center keeps its full face-neighbour ring");
+        assert!(padded.has_any_liquid, "water reaches the padded snapshot");
+        assert!(!padded.has_any_solid, "water is not solid");
+        let direct = mesh_chunk(&padded);
+        assert!(!direct.is_empty(), "a water-only mesh is not empty");
+        assert_eq!(
+            direct.total_quads(),
+            0,
+            "no water quad enters an opaque bucket"
+        );
+        assert!(direct.water_quad_count() > 0, "water faces are emitted");
+
+        mgr.queue_all_loaded_for_test();
+        mgr.update_streaming(center);
+        assert!(
+            mgr.pending_mesh.contains(&center),
+            "the water-only chunk must not be dropped by the no-solid fast skip"
+        );
+
+        let mut result = None;
+        for _ in 0..200 {
+            let (completed, _) = mgr.update_streaming(center);
+            if let Some((_, mesh)) = completed.iter().find(|(pos, _)| *pos == center) {
+                result = Some(mesh.clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mesh = result.expect("the water-only chunk must publish a mesh");
+        assert!(!mesh.is_empty(), "the published water mesh is not empty");
+        assert_eq!(mesh.total_quads(), 0, "the opaque path stays untouched");
+        assert!(
+            mesh.water_quad_count() > 0,
+            "the published mesh carries water"
+        );
+    }
+
+    /// The uniform-Air fast clear must keep firing only for `is_uniform() ==
+    /// Air`; a water-bearing chunk is not Air and must never be cleared as if
+    /// it had nothing to draw.
+    #[test]
+    fn test_uniform_air_fast_clear_ignores_water_chunks() {
+        let center = ChunkPos::new(0, 0, 0);
+        let mut mgr = WorldManager::new(4);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    mgr.insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+                }
+            }
+        }
+        // Air twin: the fast clear marks it meshed without a worker dispatch.
+        mgr.queue_all_loaded_for_test();
+        mgr.update_streaming(center);
+        assert!(
+            mgr.meshed_chunks.contains(&center),
+            "a uniform-Air chunk is still fast-cleared"
+        );
+        assert!(
+            !mgr.pending_mesh.contains(&center),
+            "a uniform-Air chunk is not dispatched"
+        );
+
+        // Water twin: same position, uniform Water instead of Air. It must not
+        // be swallowed by the Air fast clear.
+        let mut water_mgr = WorldManager::new(4);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    let chunk = if pos == center {
+                        Chunk::new_uniform(BlockId::Water)
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    water_mgr.insert_chunk_for_test(pos, chunk);
+                }
+            }
+        }
+        water_mgr.recompute_light_for_test();
+        water_mgr.queue_all_loaded_for_test();
+        water_mgr.update_streaming(center);
+        assert!(
+            water_mgr.pending_mesh.contains(&center),
+            "a uniform-Water chunk is dispatched, not fast-cleared"
+        );
+    }
+
+    /// Worldgen water never becomes a `ChunkEditMap` entry: generating a real
+    /// ocean region leaves the edit map empty, and T02 already rejects Water on
+    /// every persistence path.
+    #[test]
+    fn test_generated_water_never_enters_chunk_edits() {
+        let mut mgr = WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
+        let mut water_cells = 0usize;
+        for cx in -3..=3 {
+            for cz in -3..=3 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, 1337);
+                    for ly in 0..CHUNK_SIZE {
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                if chunk.get(lx, ly, lz) == BlockId::Water {
+                                    water_cells += 1;
+                                }
+                            }
+                        }
+                    }
+                    mgr.insert_chunk_for_test(pos, chunk);
+                }
+            }
+        }
+        assert!(water_cells > 0, "the generated region must contain water");
+        assert!(
+            mgr.chunk_edits().is_empty(),
+            "worldgen water must never create an edit entry"
         );
     }
 

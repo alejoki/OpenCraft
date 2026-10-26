@@ -59,7 +59,15 @@ impl PackedQuad {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChunkMesh {
+    /// The six opaque face buckets. These are the only quads the opaque GPU
+    /// upload (`ChunkRenderStore::upload_mesh`) ever sees.
     pub buckets: [Vec<PackedQuad>; 6],
+    /// Water surface quads, deliberately outside `buckets` (D070). Until S04
+    /// wires the translucent pass nothing uploads this field, so a water quad
+    /// can never enter the opaque vertex buffer or sample the opaque
+    /// texture-array layers. Fail-soft by construction: a missing water pass
+    /// leaves the opaque world rendering exactly as before.
+    pub water_quads: Vec<PackedQuad>,
 }
 
 impl ChunkMesh {
@@ -67,12 +75,31 @@ impl ChunkMesh {
         Self::default()
     }
 
+    /// A mesh is empty only when it has neither opaque nor water geometry.
+    /// Streaming bookkeeping uses this so a water-only chunk (open ocean
+    /// surface, no opaque faces against its neighbours) is never treated as
+    /// "nothing to draw".
     pub fn is_empty(&self) -> bool {
-        self.buckets.iter().all(|b| b.is_empty())
+        self.buckets.iter().all(|b| b.is_empty()) && self.water_quads.is_empty()
     }
 
+    /// Opaque quad count only. `ChunkRenderStore::upload_mesh` sizes its
+    /// vertex buffer and VRAM accounting from this, so water must stay out of
+    /// it until the translucent pass exists (otherwise the upload would
+    /// reserve space for quads it never writes).
     pub fn total_quads(&self) -> usize {
         self.buckets.iter().map(|b| b.len()).sum()
+    }
+
+    /// Water surface quad count (never uploaded in S01).
+    pub fn water_quad_count(&self) -> usize {
+        self.water_quads.len()
+    }
+
+    /// Every quad the mesher produced, opaque plus water. Diagnostic only;
+    /// never feed this to GPU upload accounting.
+    pub fn total_quads_including_water(&self) -> usize {
+        self.total_quads() + self.water_quad_count()
     }
 }
 
@@ -94,6 +121,30 @@ mod tests {
         // Light occupies word1 bits 16-31 and does not bleed into tex_layer/AO.
         assert_eq!(quad.0[1] >> 16, light as u32);
         assert_eq!(quad.unpack(), (5, 6, 7, 3, 4, 5, 9, ao, light));
+    }
+
+    #[test]
+    fn water_quads_are_outside_the_opaque_buckets_and_count_toward_emptiness() {
+        let mut mesh = ChunkMesh::new();
+        assert!(mesh.is_empty());
+        assert_eq!(mesh.total_quads(), 0);
+
+        mesh.water_quads
+            .push(PackedQuad::new([0, 0, 0], [1, 1], 2, 0, 0xFF, 0xFFFF));
+
+        assert!(
+            !mesh.is_empty(),
+            "a water-only mesh is not empty for streaming"
+        );
+        assert_eq!(mesh.total_quads(), 0, "opaque upload count excludes water");
+        assert_eq!(mesh.water_quad_count(), 1);
+        assert_eq!(mesh.total_quads_including_water(), 1);
+        for (dir, bucket) in mesh.buckets.iter().enumerate() {
+            assert!(
+                bucket.is_empty(),
+                "water must never enter opaque bucket {dir}"
+            );
+        }
     }
 
     #[test]
