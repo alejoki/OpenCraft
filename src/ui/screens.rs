@@ -193,22 +193,35 @@ pub fn hovered_pause_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> 
 // New-game screen: targets and geometry
 // ---------------------------------------------------------------------------
 
+/// Fixed season-length choices, in cycle order: game days per season.
+/// The first entry is the roadmap-pinned default and is kept equal to
+/// [`crate::world::season::DEFAULT_SEASON_LENGTH_DAYS`] so the row can
+/// never disagree with the persistence default. Clicking (or selecting)
+/// the row advances to the next choice and wraps, mirroring the settings
+/// menu's `cycle_texture_pack` cycler — there is no parse/validation
+/// path, so a bad value is unrepresentable.
+pub const NEW_GAME_SEASON_LENGTHS: [u32; 4] =
+    [crate::world::season::DEFAULT_SEASON_LENGTH_DAYS, 2, 4, 8];
+
 /// One clickable/hoverable target on the new-game screen, in display
-/// order: two text fields, then three action rows.
+/// order: two text fields, then four action rows (the season-length row
+/// is a cycler, like the settings-screen choice rows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewGameTarget {
     NameField,
     SeedField,
     Randomize,
+    SeasonLength,
     Create,
     Back,
 }
 
 /// All new-game rows, top-to-bottom in display order.
-pub const NEW_GAME_ROWS: [NewGameTarget; 5] = [
+pub const NEW_GAME_ROWS: [NewGameTarget; 6] = [
     NewGameTarget::NameField,
     NewGameTarget::SeedField,
     NewGameTarget::Randomize,
+    NewGameTarget::SeasonLength,
     NewGameTarget::Create,
     NewGameTarget::Back,
 ];
@@ -224,6 +237,7 @@ impl NewGameTarget {
             NewGameTarget::NameField => "World Name",
             NewGameTarget::SeedField => "Seed (blank = random)",
             NewGameTarget::Randomize => "Randomize Seed",
+            NewGameTarget::SeasonLength => "Season Length",
             NewGameTarget::Create => "Create World",
             NewGameTarget::Back => "Back",
         }
@@ -440,7 +454,8 @@ pub fn validate_create(name_value: &str, rows: &[CatalogRow]) -> Result<(), NewG
 }
 
 /// The new-game screen's mutable state: two bounded text fields, a focus
-/// field, and a transient message slot with the same tick-counter
+/// field, the season-length cycler index, and a transient message slot
+/// with the same tick-counter
 /// pattern as `menu::SettingsMenu` (the module owns no clock). Pure data
 /// plus transition methods — no rendering, no events, no filesystem.
 #[derive(Clone, Debug, PartialEq)]
@@ -448,6 +463,10 @@ pub struct NewGameScreen {
     name: TextInput,
     seed: TextInput,
     focus: FocusField,
+    /// Index into [`NEW_GAME_SEASON_LENGTHS`] — the season-length row's
+    /// cycler state. Always in range: only [`Self::cycle_season_length`]
+    /// writes it, and it wraps modulo the list length.
+    season_length_index: usize,
     message: Option<MenuMessage>,
 }
 
@@ -464,6 +483,7 @@ impl NewGameScreen {
             name: TextInput::new(MAX_WORLD_NAME_LEN),
             seed: TextInput::new(SEED_MAX_CHARS),
             focus: FocusField::Name,
+            season_length_index: 0,
             message: None,
         }
     }
@@ -498,6 +518,28 @@ impl NewGameScreen {
     /// (`catalog::SeedSource::Random`). The name field is untouched.
     pub fn randomize(&mut self) {
         self.seed.clear();
+    }
+
+    /// The selected season length in game days per season. Default is
+    /// [`NEW_GAME_SEASON_LENGTHS`]`[0]` (1 day, roadmap-pinned); the
+    /// value feeds `session::new_session` at Create time.
+    pub fn season_length_days(&self) -> u32 {
+        NEW_GAME_SEASON_LENGTHS[self.season_length_index]
+    }
+
+    /// The row's cycler index (0-based into
+    /// [`NEW_GAME_SEASON_LENGTHS`]) — exposed for tests that pin the
+    /// wrap order without duplicating the value list.
+    pub fn season_length_index(&self) -> usize {
+        self.season_length_index
+    }
+
+    /// Advance the season-length row to the next choice, wrapping after
+    /// the last (1 → 2 → 4 → 8 → 1). Returns the new value. Modelled on
+    /// the settings-screen cyclers: no text editing, no invalid states.
+    pub fn cycle_season_length(&mut self) -> u32 {
+        self.season_length_index = (self.season_length_index + 1) % NEW_GAME_SEASON_LENGTHS.len();
+        self.season_length_days()
     }
 
     /// The currently focused field, by reference.
@@ -583,11 +625,14 @@ fn insert_caret(value: &str, cursor: usize) -> String {
 }
 
 /// Compose the new-game screen's display lines, top-to-bottom: the two
-/// field rows with their current values, then the three action rows. The
-/// focused field's line is prefixed `> ` (every other line `  `) and
-/// shows a `|` caret at its value's cursor index; an unfocused blank
-/// (or whitespace-only) seed renders as "(random)", matching
-/// `catalog::SeedSource::Random`.
+/// field rows with their current values, the action rows, and the
+/// season-length cycler row with its current value. The focused field's
+/// line is prefixed `> ` (every other line `  `) and shows a `|` caret
+/// at its value's cursor index; an unfocused blank (or whitespace-only)
+/// seed renders as "(random)", matching `catalog::SeedSource::Random`.
+/// The season-length row never takes text focus (Tab only toggles
+/// [`FocusField`]), so it renders as a plain `Season Length: N day(s)`
+/// value line and the pluralization is honest: "1 day" but "4 days".
 pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
     let name = screen.name().value();
     let seed = screen.seed().value();
@@ -610,9 +655,19 @@ pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
         name_line,
         seed_line,
         NewGameTarget::Randomize.label().to_string(),
+        season_length_line(screen.season_length_days()),
         NewGameTarget::Create.label().to_string(),
         NewGameTarget::Back.label().to_string(),
     ]
+}
+
+/// The season-length row's display text, e.g. "Season Length: 1 day".
+fn season_length_line(days: u32) -> String {
+    if days == 1 {
+        "Season Length: 1 day".to_string()
+    } else {
+        format!("Season Length: {days} days")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1187,8 @@ mod tests {
         );
         assert_eq!(hovered_pause_row((x, 0.0), SW, SH), None, "above the panel");
 
-        // new-game targets: name field (0) and create (3)
+        // new-game targets: name field (0) and create (4; SeasonLength
+        // was inserted at 3, shifting the action rows down)
         let (x, y0, w, h) = new_game_row_rect(SW, SH, 0).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w / 2.0, y0 + h / 2.0), SW, SH),
@@ -1141,6 +1197,11 @@ mod tests {
         let (_, y3, w3, h3) = new_game_row_rect(SW, SH, 3).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w3 / 2.0, y3 + h3 / 2.0), SW, SH),
+            Some(NewGameTarget::SeasonLength)
+        );
+        let (_, y4, w4, h4) = new_game_row_rect(SW, SH, 4).unwrap();
+        assert_eq!(
+            hovered_new_game_target((x + w4 / 2.0, y4 + h4 / 2.0), SW, SH),
             Some(NewGameTarget::Create)
         );
         assert_eq!(hovered_new_game_target((0.0, 0.0), SW, SH), None);
@@ -1556,6 +1617,7 @@ mod tests {
                 "> World Name: |".to_string(),
                 "  Seed: (random)".to_string(),
                 "Randomize Seed".to_string(),
+                "Season Length: 1 day".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1572,6 +1634,7 @@ mod tests {
                 "  World Name: Deep Dark".to_string(),
                 "> Seed:   |".to_string(),
                 "Randomize Seed".to_string(),
+                "Season Length: 1 day".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1579,6 +1642,82 @@ mod tests {
 
         screen.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(new_game_row_lines(&screen)[1], "> Seed:   42|");
+    }
+
+    #[test]
+    fn new_game_rows_include_the_season_length_cycler_between_randomize_and_create() {
+        assert_eq!(
+            NEW_GAME_ROWS,
+            [
+                NewGameTarget::NameField,
+                NewGameTarget::SeedField,
+                NewGameTarget::Randomize,
+                NewGameTarget::SeasonLength,
+                NewGameTarget::Create,
+                NewGameTarget::Back,
+            ]
+        );
+        assert_eq!(NEW_GAME_ROW_COUNT, 6);
+        assert_eq!(NewGameTarget::SeasonLength.label(), "Season Length");
+        // Create/Back shifted down by one: the enum order is the click map.
+        assert_eq!(NEW_GAME_ROWS[4], NewGameTarget::Create);
+        assert_eq!(NEW_GAME_ROWS[5], NewGameTarget::Back);
+    }
+
+    #[test]
+    fn season_length_defaults_to_one_day_and_cycles_1_2_4_8_then_wraps() {
+        let mut screen = NewGameScreen::new();
+        assert_eq!(screen.season_length_days(), 1, "roadmap-pinned default");
+        assert_eq!(screen.season_length_index(), 0);
+        assert_eq!(
+            NEW_GAME_SEASON_LENGTHS[0],
+            crate::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+            "the row default must match the persistence default"
+        );
+        assert_eq!(
+            new_game_row_lines(&screen)[3],
+            "Season Length: 1 day",
+            "singular at one day"
+        );
+
+        assert_eq!(screen.cycle_season_length(), 2);
+        assert_eq!(new_game_row_lines(&screen)[3], "Season Length: 2 days");
+        assert_eq!(screen.cycle_season_length(), 4);
+        assert_eq!(new_game_row_lines(&screen)[3], "Season Length: 4 days");
+        assert_eq!(screen.cycle_season_length(), 8);
+        assert_eq!(new_game_row_lines(&screen)[3], "Season Length: 8 days");
+        assert_eq!(
+            screen.cycle_season_length(),
+            1,
+            "the last choice wraps back to the default"
+        );
+        assert_eq!(screen.season_length_index(), 0);
+        assert_eq!(new_game_row_lines(&screen)[3], "Season Length: 1 day");
+    }
+
+    #[test]
+    fn season_length_row_never_joins_the_text_focus_cycle() {
+        // Tab still toggles exactly the two text fields; the season-length
+        // row is a click-only cycler, so no ScreenKeyAction arm changes.
+        let mut screen = NewGameScreen::new();
+        assert_eq!(screen.cycle_focus(), FocusField::Seed);
+        assert_eq!(screen.cycle_focus(), FocusField::Name);
+        assert_eq!(screen.season_length_days(), 1, "Tab never cycles it");
+        assert_eq!(
+            screen_key_action(LifecycleScreen::NewGame, KeyCode::Tab, false),
+            ScreenKeyAction::CycleField
+        );
+        assert_eq!(
+            screen_key_action(LifecycleScreen::NewGame, KeyCode::Enter, false),
+            ScreenKeyAction::Create
+        );
+        // Cycling the value leaves the focused field and both text values
+        // untouched (one writer per event).
+        screen.apply(TextInputAction::InsertText("Deep Dark".into()));
+        screen.cycle_season_length();
+        assert_eq!(screen.focus(), FocusField::Name);
+        assert_eq!(screen.name().value(), "Deep Dark");
+        assert_eq!(screen.season_length_days(), 2);
     }
 
     #[test]

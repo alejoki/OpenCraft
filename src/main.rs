@@ -1937,8 +1937,10 @@ impl GameApp {
                 return;
             }
         };
-        // The New Game row owns the season length (S02-T04).
-        let session = WorldSession::new_session(seed, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        // The New Game row owns the season length (S02-T04): the screen's
+        // cycler value, defaulting to one game day per season.
+        let session =
+            WorldSession::new_session(seed, save_path, self.new_game.season_length_days());
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
         if let Ok(LifecycleDecision::StartNewGame) = self
@@ -2073,6 +2075,12 @@ impl GameApp {
                     NewGameTarget::NameField => self.new_game.set_focus(FocusField::Name),
                     NewGameTarget::SeedField => self.new_game.set_focus(FocusField::Seed),
                     NewGameTarget::Randomize => self.new_game.randomize(),
+                    // Cycler row: advance 1 → 2 → 4 → 8 → 1. Like the
+                    // field rows this is a click action (one writer per
+                    // event), so the click sound below still plays.
+                    NewGameTarget::SeasonLength => {
+                        self.new_game.cycle_season_length();
+                    }
                     NewGameTarget::Create => self.attempt_create(),
                     NewGameTarget::Back => {
                         self.dispatch_screen_intent(
@@ -6605,6 +6613,30 @@ mod tests {
     }
 
     #[test]
+    fn new_game_season_length_row_feeds_the_session_it_creates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Slow Seasons".into()));
+        // Default create: one game day per season, matching persistence.
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.season_length_days, 1);
+
+        // Cycling the row twice (1 -> 2 -> 4) before Create is what the
+        // new session persists; the row's value is the single source.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Long Seasons".into()));
+        assert_eq!(app.new_game.cycle_season_length(), 2);
+        assert_eq!(app.new_game.cycle_season_length(), 4);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.season_length_days, 4);
+    }
+
+    #[test]
     fn blank_seed_create_uses_a_fresh_seed_and_still_enters_playing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
@@ -8181,14 +8213,14 @@ mod tests {
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
-            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nCreate World\nBack"
+            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
-            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nCreate World\nBack"
+            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
