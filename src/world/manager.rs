@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -25,6 +27,24 @@ pub struct WorldManager {
     gen_rx: Receiver<(ChunkPos, Chunk)>,
     mesh_tx: Sender<(ChunkPos, ChunkMesh)>,
     mesh_rx: Receiver<(ChunkPos, ChunkMesh)>,
+    /// Completed columns waiting for a worker slot. `queued_light` is the
+    /// de-dupe companion; the deque is FIFO so a column triggered later can
+    /// never be dispatched (and therefore snapshotted) before an earlier one.
+    pending_light: VecDeque<(i32, i32, u64)>,
+    queued_light: FxHashSet<(i32, i32)>,
+    /// Columns whose light region is currently being computed on rayon.
+    light_inflight: FxHashSet<(i32, i32)>,
+    light_tx: Sender<LightJobResult>,
+    light_rx: Receiver<LightJobResult>,
+    /// Monotonic dispatch sequence per column. A later result must win over
+    /// an earlier one even when workers finish out of order (an older result
+    /// may have read a still-loading neighbour column as air and be over-lit).
+    next_light_seq: u64,
+    light_applied_seq: FxHashMap<(i32, i32), u64>,
+    /// Bumped on every block edit. In-flight results from before the edit may
+    /// carry pre-edit blocks, so their grids are discarded rather than allowed
+    /// to overwrite the edit path's synchronous light recompute.
+    light_epoch: u64,
     render_distance: i32,
     last_center: Option<ChunkPos>,
     spiral_offsets: Vec<(i32, i32)>,
@@ -32,6 +52,60 @@ pub struct WorldManager {
     chunk_edits: ChunkEditMap,
     unsaved_changes: bool,
 }
+
+/// Result of one rayon sky-light job. Produced entirely off the frame thread;
+/// `update_streaming` only inserts the finished grids.
+struct LightJobResult {
+    /// The complete column whose completion queued the job.
+    trigger: (i32, i32),
+    seq: u64,
+    epoch: u64,
+    grids: FxHashMap<ChunkPos, LightGrid>,
+    /// Columns that were complete in the worker's block snapshot. Only these
+    /// may receive a grid: a column that completed after the snapshot would
+    /// otherwise be lit from a view that still read its missing chunks as air
+    /// and stored an over-lit grid.
+    complete_columns: FxHashSet<(i32, i32)>,
+}
+
+/// Recompute sky light for a 3x3 column region from an owned chunk snapshot.
+///
+/// This mirrors `WorldManager::compute_light_region`'s out-of-range semantics
+/// exactly; the only difference is that the block source is the detached map
+/// the frame thread handed to rayon, so the worker never touches manager state.
+fn compute_light_region_snapshot(
+    chunks: &FxHashMap<ChunkPos, Chunk>,
+    cx0: i32,
+    cx1: i32,
+    cz0: i32,
+    cz1: i32,
+) -> FxHashMap<ChunkPos, LightGrid> {
+    light::compute_region_light(
+        |wx, wy, wz| {
+            if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+                return BlockId::Bedrock;
+            }
+            if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+                return BlockId::Air;
+            }
+            let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+            chunks
+                .get(&cpos)
+                .map_or(BlockId::Air, |chunk| chunk.get(lx, ly, lz))
+        },
+        cx0,
+        cx1,
+        cz0,
+        cz1,
+    )
+}
+
+/// Per-frame ceilings for the light pipeline. Grid application is cheap (map
+/// inserts plus mesh-queue dirt) but result payloads are large; dispatch is
+/// limited because snapshotting clones up to 54 chunk block arrays on the frame
+/// thread. Both are well below the MEM229 8 ms p95 budget.
+const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
+const LIGHT_DISPATCH_BUDGET: usize = 4;
 
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     // One extra ring beyond render_distance supplied the 6 face neighbours for
@@ -62,6 +136,7 @@ impl WorldManager {
         let rd = render_distance.clamp(4, 36);
         let (gen_tx, gen_rx) = unbounded();
         let (mesh_tx, mesh_rx) = unbounded();
+        let (light_tx, light_rx) = unbounded();
         Self {
             chunks: FxHashMap::default(),
             pending_gen: FxHashSet::default(),
@@ -73,6 +148,14 @@ impl WorldManager {
             gen_rx,
             mesh_tx,
             mesh_rx,
+            pending_light: VecDeque::new(),
+            queued_light: FxHashSet::default(),
+            light_inflight: FxHashSet::default(),
+            light_tx,
+            light_rx,
+            next_light_seq: 0,
+            light_applied_seq: FxHashMap::default(),
+            light_epoch: 0,
             render_distance: rd,
             last_center: None,
             spiral_offsets: build_spiral_offsets(rd),
@@ -335,13 +418,152 @@ impl WorldManager {
 
     /// Column-ready trigger: once a column is complete it gains sky light, and
     /// the surrounding 3x3 columns are recomputed so lateral bleed into already
-    /// loaded neighbours is captured. Runs on the generation/edit cadence only.
+    /// loaded neighbours is captured.
+    ///
+    /// The frame thread only enqueues here. The actual propagation runs on a
+    /// rayon worker and is applied on a later `update_streaming` call, so a
+    /// column completing mid-crossing cannot block the frame (MEM229 / D072,
+    /// decision decouple-light).
     fn propagate_light_for_completed_column(&mut self, cx: i32, cz: i32) {
         if self.has_column_light(cx, cz) || !self.column_is_complete(cx, cz) {
             return;
         }
-        let grids = self.compute_light_region(cx - 1, cx + 1, cz - 1, cz + 1);
-        self.apply_light_region(grids, cx - 1, cx + 1, cz - 1, cz + 1);
+        self.enqueue_light_column(cx, cz);
+    }
+
+    /// Queue one complete column for off-thread light computation. Deduped
+    /// against both the pending queue and in-flight jobs.
+    fn enqueue_light_column(&mut self, cx: i32, cz: i32) {
+        let key = (cx, cz);
+        if self.queued_light.contains(&key) || self.light_inflight.contains(&key) {
+            return;
+        }
+        self.next_light_seq += 1;
+        self.pending_light.push_back((cx, cz, self.next_light_seq));
+        self.queued_light.insert(key);
+    }
+
+    /// Snapshot the 3x3 column neighborhood of up to `LIGHT_DISPATCH_BUDGET`
+    /// queued columns and hand each snapshot to rayon. Runs late in
+    /// `update_streaming`, so the frame pays only the snapshot clone, never the
+    /// light BFS.
+    fn dispatch_light_jobs(&mut self) {
+        for _ in 0..LIGHT_DISPATCH_BUDGET {
+            let Some((cx, cz, seq)) = self.pending_light.pop_front() else {
+                break;
+            };
+            self.queued_light.remove(&(cx, cz));
+
+            // State may have changed while queued: an edit's synchronous
+            // recompute can light the column, or an unload can remove it.
+            // An incomplete column re-enqueues itself when it completes.
+            if self.has_column_light(cx, cz) || !self.column_is_complete(cx, cz) {
+                continue;
+            }
+
+            let mut chunks: FxHashMap<ChunkPos, Chunk> = FxHashMap::default();
+            let mut complete_columns: FxHashSet<(i32, i32)> = FxHashSet::default();
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let ccx = cx + dx;
+                    let ccz = cz + dz;
+                    if self.column_is_complete(ccx, ccz) {
+                        complete_columns.insert((ccx, ccz));
+                    }
+                    for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                        let pos = ChunkPos::new(ccx, cy, ccz);
+                        if let Some(chunk) = self.chunks.get(&pos) {
+                            chunks.insert(pos, chunk.clone());
+                        }
+                    }
+                }
+            }
+
+            let epoch = self.light_epoch;
+            let tx = self.light_tx.clone();
+            self.light_inflight.insert((cx, cz));
+            rayon::spawn(move || {
+                let grids = compute_light_region_snapshot(&chunks, cx - 1, cx + 1, cz - 1, cz + 1);
+                let _ = tx.send(LightJobResult {
+                    trigger: (cx, cz),
+                    seq,
+                    epoch,
+                    grids,
+                    complete_columns,
+                });
+            });
+        }
+    }
+
+    /// Apply finished light jobs from the frame thread. Bounded per call; a
+    /// result that raced an edit (epoch mismatch) or that read a still-loading
+    /// neighbourhood (older seq than already applied) is discarded, and any
+    /// column left unlit is re-queued so the pipeline cannot strand it.
+    fn drain_light_results(&mut self) {
+        for _ in 0..LIGHT_RESULT_DRAIN_BUDGET {
+            let Ok(result) = self.light_rx.try_recv() else {
+                break;
+            };
+            self.light_inflight.remove(&result.trigger);
+            self.apply_light_result(result);
+        }
+    }
+
+    fn apply_light_result(&mut self, result: LightJobResult) {
+        let stale_epoch = result.epoch != self.light_epoch;
+        let LightJobResult {
+            trigger,
+            seq,
+            grids,
+            complete_columns,
+            ..
+        } = result;
+
+        if stale_epoch {
+            // The edit path already recomputed the columns the edit can reach.
+            // Anything else in this job still lacks light and must be redone
+            // from a post-edit snapshot.
+            for &(cx, cz) in &complete_columns {
+                if !self.has_column_light(cx, cz) && self.column_is_complete(cx, cz) {
+                    self.enqueue_light_column(cx, cz);
+                }
+            }
+            return;
+        }
+
+        let mut accepted: FxHashMap<ChunkPos, LightGrid> = FxHashMap::default();
+        for (pos, grid) in grids {
+            let column = (pos.x, pos.z);
+            // Grids are only trustworthy for columns the worker snapshot saw
+            // complete (see `LightJobResult::complete_columns`).
+            if !complete_columns.contains(&column) {
+                continue;
+            }
+            // Out-of-order worker completion: a newer request already applied
+            // a grid for this column, so an older snapshot must not overwrite
+            // it (older snapshots can read missing neighbours as air).
+            if let Some(applied) = self.light_applied_seq.get(&column) {
+                if seq < *applied {
+                    continue;
+                }
+            }
+            accepted.insert(pos, grid);
+        }
+        for &column in &complete_columns {
+            let entry = self.light_applied_seq.entry(column).or_insert(seq);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+        // `apply_light_region` re-checks current completeness and the
+        // dirty-on-light-diff contract, exactly like the synchronous path.
+        self.apply_light_region(
+            accepted,
+            trigger.0 - 1,
+            trigger.0 + 1,
+            trigger.1 - 1,
+            trigger.1 + 1,
+        );
     }
 
     /// Test seam: recompute sky light for every resident complete column without
@@ -623,6 +845,11 @@ impl WorldManager {
         chunk.set(lx, ly, lz, block);
         chunk.try_compress();
 
+        // Any in-flight light job may have snapshotted the pre-edit block. Bump
+        // the epoch so its result is discarded instead of overwriting the
+        // synchronous recompute below.
+        self.light_epoch = self.light_epoch.wrapping_add(1);
+
         self.chunk_edits
             .entry(cpos)
             .or_default()
@@ -700,8 +927,8 @@ impl WorldManager {
             self.chunks.insert(pos, chunk);
 
             // Column-ready trigger: this chunk may be the last piece of a full
-            // 192-block column. Light runs on the generation cadence, never
-            // per frame.
+            // 192-block column. Only enqueue here; the light BFS runs on a
+            // rayon worker and lands on a later frame.
             self.propagate_light_for_completed_column(pos.x, pos.z);
 
             // Check if this chunk and its 6 neighbors can now be queued for meshing
@@ -728,7 +955,11 @@ impl WorldManager {
             }
         }
 
-        // 2. Drain up to 32 completed meshes per frame
+        // 2. Apply up to 8 finished light jobs. Grids were computed on rayon;
+        //    this step only inserts them and re-evaluates mesh readiness.
+        self.drain_light_results();
+
+        // 3. Drain up to 32 completed meshes per frame
         for _ in 0..32 {
             let Ok((pos, mesh)) = self.mesh_rx.try_recv() else {
                 break;
@@ -739,7 +970,7 @@ impl WorldManager {
             }
         }
 
-        // 3. Unload chunks far outside render_distance + 2 when player moves to a new chunk
+        // 4. Unload chunks far outside render_distance + 2 when player moves to a new chunk
         let center_2d = ChunkPos::new(center_chunk.x, 0, center_chunk.z);
         if self.last_center != Some(center_2d) {
             self.last_center = Some(center_2d);
@@ -769,9 +1000,27 @@ impl WorldManager {
                 let dz = pos.z - center_chunk.z;
                 dx * dx + dz * dz <= unload_r2
             });
+            // Drop queued/applied light bookkeeping for unloaded columns. Jobs
+            // already running finish and are skipped on arrival because their
+            // columns are no longer complete.
+            self.pending_light.retain(|&(cx, cz, _)| {
+                let dx = cx - center_chunk.x;
+                let dz = cz - center_chunk.z;
+                dx * dx + dz * dz <= unload_r2
+            });
+            self.queued_light.retain(|&(cx, cz)| {
+                let dx = cx - center_chunk.x;
+                let dz = cz - center_chunk.z;
+                dx * dx + dz * dz <= unload_r2
+            });
+            self.light_applied_seq.retain(|&(cx, cz), _| {
+                let dx = cx - center_chunk.x;
+                let dz = cz - center_chunk.z;
+                dx * dx + dz * dz <= unload_r2
+            });
         }
 
-        // 4. Dispatch new terrain generation tasks in spiral order around center_chunk
+        // 5. Dispatch new terrain generation tasks in spiral order around center_chunk
         let mut dispatched_gen = 0;
         let seed = self.world_seed;
         'spiral: for &(dx, dz) in &self.spiral_offsets {
@@ -797,7 +1046,7 @@ impl WorldManager {
             }
         }
 
-        // 5. Fast-clear any Uniform(Air) chunks from dirty_mesh_queue before counting the 24-chunk frame budget
+        // 6. Fast-clear any Uniform(Air) chunks from dirty_mesh_queue before counting the 24-chunk frame budget
         let mut empty_air_chunks = Vec::new();
         for &pos in &self.dirty_mesh_queue {
             if self.chunks.get(&pos).and_then(|c| c.is_uniform()) == Some(BlockId::Air) {
@@ -852,6 +1101,11 @@ impl WorldManager {
                 let _ = tx.send((pos, mesh));
             });
         }
+
+        // 7. Hand queued columns to rayon last, so snapshot cloning (up to 54
+        //    chunks of block data) never delays this frame's mesh dispatch. The
+        //    worker results are applied by step 2 of a later frame.
+        self.dispatch_light_jobs();
 
         (completed_meshes, unloaded)
     }
@@ -1032,6 +1286,131 @@ mod tests {
         mgr.update_streaming(ChunkPos::new(0, 0, 0));
         assert!(!mgr.dirty_mesh_queue.contains(&center));
         assert!(mgr.pending_mesh.contains(&center));
+    }
+
+    /// Fill every column the default spiral can ask for with uniform air so a
+    /// pumped `update_streaming` loop does not spawn real terrain generation
+    /// work; tests then overwrite the columns they care about.
+    fn prefill_spiral_with_air(mgr: &mut WorldManager) {
+        let offsets = mgr.spiral_offsets.clone();
+        for (dx, dz) in offsets {
+            for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                mgr.insert_chunk_for_test(
+                    ChunkPos::new(dx, cy, dz),
+                    Chunk::new_uniform(BlockId::Air),
+                );
+            }
+        }
+    }
+
+    fn grids_for_column(cx: i32, cz: i32, grid: &LightGrid) -> FxHashMap<ChunkPos, LightGrid> {
+        (MIN_CHUNK_Y..=MAX_CHUNK_Y)
+            .map(|cy| (ChunkPos::new(cx, cy, cz), grid.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_completed_column_light_is_deferred_to_worker() {
+        let mut mgr = WorldManager::new(4);
+        prefill_spiral_with_air(&mut mgr);
+        // Make the centre column opaque enough that its light is not simply
+        // the trivial all-sky answer.
+        mgr.insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Stone));
+
+        // The completion trigger must only enqueue: the frame thread never
+        // runs the 3x3 light region inline.
+        mgr.propagate_light_for_completed_column(0, 0);
+        assert!(
+            !mgr.has_column_light(0, 0),
+            "light must not be computed inline"
+        );
+        assert_eq!(mgr.pending_light.len(), 1, "the column must be queued");
+
+        // A later update dispatches the job to rayon; the grids land on a
+        // subsequent update once the worker finishes.
+        let center = ChunkPos::new(0, 0, 0);
+        for _ in 0..3000 {
+            mgr.update_streaming(center);
+            if mgr.has_column_light(0, 0) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            mgr.has_column_light(0, 0),
+            "the worker light result must be applied eventually"
+        );
+        assert!(mgr.has_light_neighborhood(0, 0));
+        assert!(mgr.pending_light.is_empty());
+        assert!(mgr.light_inflight.is_empty());
+    }
+
+    #[test]
+    fn test_out_of_order_light_result_cannot_overwrite_newer_grid() {
+        let mut mgr = WorldManager::new(4);
+        insert_3x3_columns(&mut mgr, false, None);
+        let complete: FxHashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
+
+        // A newer, correct result (fully lit) applies first.
+        let newer = LightJobResult {
+            trigger: (0, 0),
+            seq: 2,
+            epoch: mgr.light_epoch,
+            grids: grids_for_column(0, 0, &LightGrid::full()),
+            complete_columns: complete.clone(),
+        };
+        mgr.apply_light_result(newer);
+        assert_eq!(mgr.light_at_world(5, 5, 5), light::MAX_SKY_LIGHT);
+
+        // An older result whose snapshot still read a loading neighbour as air
+        // would be over-lit; it must not overwrite the newer grids. It also
+        // smuggles grids for a column its snapshot saw incomplete, which must
+        // be dropped.
+        let mut older_grids = grids_for_column(0, 0, &LightGrid::new());
+        older_grids.extend(grids_for_column(1, 0, &LightGrid::full()));
+        let older = LightJobResult {
+            trigger: (0, 0),
+            seq: 1,
+            epoch: mgr.light_epoch,
+            grids: older_grids,
+            complete_columns: complete,
+        };
+        mgr.apply_light_result(older);
+
+        assert_eq!(
+            mgr.light_at_world(5, 5, 5),
+            light::MAX_SKY_LIGHT,
+            "an older sequence must not overwrite newer light"
+        );
+        assert!(
+            !mgr.has_column_light(1, 0),
+            "grids for columns the worker snapshot saw incomplete must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_stale_epoch_light_result_is_discarded_and_requeued() {
+        let mut mgr = WorldManager::new(4);
+        insert_3x3_columns(&mut mgr, false, None);
+        let stale = LightJobResult {
+            trigger: (0, 0),
+            seq: 1,
+            epoch: mgr.light_epoch.wrapping_sub(1),
+            grids: grids_for_column(0, 0, &LightGrid::full()),
+            complete_columns: [(0, 0)].into_iter().collect(),
+        };
+        mgr.apply_light_result(stale);
+
+        assert!(
+            !mgr.has_column_light(0, 0),
+            "a result that raced an edit must be discarded"
+        );
+        assert!(
+            mgr.pending_light
+                .iter()
+                .any(|&(cx, cz, _)| (cx, cz) == (0, 0)),
+            "the unlit column must be re-queued from a post-edit snapshot"
+        );
     }
 
     #[test]
@@ -1314,6 +1693,168 @@ mod tests {
             real * 4 <= uniform * 5,
             "light fragmentation must stay bounded (measured ratio 1.010): \
              real {real} vs uniform {uniform}"
+        );
+    }
+
+    /// Frame-time harness for `WorldManager::update_streaming` (M007/S01).
+    ///
+    /// Ignored by default and release-only: the repo's tuned release profile
+    /// (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`) is what ships, and
+    /// debug-mode timings are not meaningful. Run it with:
+    ///
+    /// ```text
+    /// cargo test --locked --release --lib -- --ignored streaming_budget
+    /// ```
+    ///
+    /// It builds a real manager at `DEFAULT_RENDER_DISTANCE`, warms the initial
+    /// ring up so the first measured step is not just cold-cache dispatch, then
+    /// steps the streaming center `STEPS` chunks in +X and times each
+    /// `update_streaming` call. Asserts the MEM229 dispatch targets (p95 ≤ 8 ms,
+    /// max ≤ 16 ms) and prints sample count plus p50/p95/max/mean so the numbers
+    /// can be recorded for the pre/post-rewrite comparison. Append `--nocapture`
+    /// when the test passes: libtest hides the measurement line on success (a
+    /// failing run always prints it with the captured output).
+    ///
+    /// Only the main-thread call is timed: terrain generation and greedy meshing
+    /// stay on rayon workers, exactly as they do in the frame loop.
+    #[test]
+    #[ignore = "release-only frame-time harness: cargo test --locked --release --lib -- --ignored streaming_budget"]
+    fn streaming_budget() {
+        use crate::settings::DEFAULT_RENDER_DISTANCE;
+        use std::time::{Duration, Instant};
+
+        // More than the 32-chunk minimum crossing in the slice plan.
+        const STEPS: usize = 40;
+        const P95_BUDGET: Duration = Duration::from_millis(8);
+        const MAX_BUDGET: Duration = Duration::from_millis(16);
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "streaming_budget measures release timings: rerun with \
+                 `cargo test --locked --release --lib -- --ignored streaming_budget`"
+            );
+        }
+
+        let mut mgr = WorldManager::new(DEFAULT_RENDER_DISTANCE);
+        let start = ChunkPos::new(0, 0, 0);
+
+        // Warm up so every measured step pays the steady-state dispatch cost
+        // instead of the one-time cold fill of the initial ring. Bounded by both
+        // the idle-poll count and the iteration cap so a slow machine cannot
+        // hang the test.
+        let warmup_start = Instant::now();
+        let mut warmup_calls = 0usize;
+        let mut idle_polls = 0usize;
+        for _ in 0..2000 {
+            mgr.update_streaming(start);
+            warmup_calls += 1;
+            if mgr.pending_gen.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+            {
+                idle_polls += 1;
+                if idle_polls >= 4 {
+                    break;
+                }
+            } else {
+                idle_polls = 0;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let warmup_elapsed = warmup_start.elapsed();
+
+        let mut samples: Vec<Duration> = Vec::with_capacity(STEPS);
+        let mut meshes_completed = 0usize;
+        for step in 1..=STEPS {
+            let center = ChunkPos::new(start.x + step as i32, start.y, start.z);
+            let t0 = Instant::now();
+            let (meshes, _unloaded) = mgr.update_streaming(center);
+            samples.push(t0.elapsed());
+            meshes_completed += meshes.len();
+            // Roughly one frame of slack so background workers keep feeding the
+            // channels; the harness times only the main-thread call itself.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Let the decoupled light/mesh pipeline settle after the measured
+        // crossing. These calls are not timed; they only make the "pipeline
+        // actually ran" negative control count the work the crossing started.
+        for _ in 0..400 {
+            let (meshes, _) =
+                mgr.update_streaming(ChunkPos::new(start.x + STEPS as i32, 0, start.z));
+            meshes_completed += meshes.len();
+            if mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.dirty_mesh_queue.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let loaded_chunks = mgr.loaded_chunk_count();
+
+        let mut sorted = samples.clone();
+        sorted.sort();
+        let pct = |p: f64| -> Duration {
+            let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+            sorted[idx]
+        };
+        let p50 = pct(0.50);
+        let p95 = pct(0.95);
+        let max = *sorted.last().expect("at least one measured step");
+        let mean_ms =
+            samples.iter().map(|d| d.as_secs_f64()).sum::<f64>() / samples.len() as f64 * 1000.0;
+
+        eprintln!(
+            "streaming_budget: samples={} warmup_calls={} warmup={:.2}s \
+             p50={:.3}ms p95={:.3}ms max={:.3}ms mean={:.3}ms \
+             meshes={} loaded={} targets: p95<={:.0}ms max<={:.0}ms (release, rd={})",
+            samples.len(),
+            warmup_calls,
+            warmup_elapsed.as_secs_f64(),
+            p50.as_secs_f64() * 1000.0,
+            p95.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            mean_ms,
+            meshes_completed,
+            loaded_chunks,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
+            DEFAULT_RENDER_DISTANCE,
+        );
+
+        assert_eq!(samples.len(), STEPS, "every step must be timed");
+        // Negative control: the crossing must actually stream. A stalled rayon
+        // pipeline (or an empty drain) would make every call trivially cheap, so
+        // a green harness without this guard would be lying about the load it
+        // measured.
+        assert!(
+            meshes_completed >= STEPS,
+            "only {meshes_completed} completed meshes over {STEPS} steps: the streaming pipeline did not run"
+        );
+        // The 32-chunk/frame dispatch budget means a 40-chunk crossing only
+        // streams a fraction of the rd=16 ring before the settling pump runs;
+        // the pump then fills it. A floor of 1024 chunks proves the crossing
+        // streamed a real ring, not just the warmup leftovers.
+        assert!(
+            loaded_chunks >= 1024,
+            "only {loaded_chunks} chunks resident after settling a {STEPS}-chunk crossing at rd={DEFAULT_RENDER_DISTANCE}: \
+             the harness did not exercise real streaming"
+        );
+        assert!(
+            p95 <= P95_BUDGET,
+            "p95 update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: {sorted:?}",
+            p95.as_secs_f64() * 1000.0,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            max <= MAX_BUDGET,
+            "max update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: {sorted:?}",
+            max.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
         );
     }
 }
