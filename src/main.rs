@@ -7369,11 +7369,12 @@ mod tests {
                 .inventory()
                 .slot(1)
                 .map(|item| (item.id(), item.count())),
-            Some((ItemId::Block(BlockId::Stone), 58)),
-            "every break folded its drop into the first free hotbar slot"
+            Some((ItemId::Block(BlockId::Cobblestone), 58)),
+            "every break folded its mined drop into the first free hotbar slot"
         );
 
-        // 7. Leave a held cursor stack: pick the stone up and do not place it.
+        // 7. Leave a held cursor stack: pick the cobblestone up and do not
+        // place it.
         expect_moved(&mut app, &screen, InventoryTarget::Slot(1));
         assert_eq!(
             app.session
@@ -7381,7 +7382,7 @@ mod tests {
                 .inventory()
                 .cursor()
                 .map(|item| (item.id(), item.count())),
-            Some((ItemId::Block(BlockId::Stone), 58)),
+            Some((ItemId::Block(BlockId::Cobblestone), 58)),
             "the stack rides the cursor"
         );
 
@@ -7490,7 +7491,7 @@ mod tests {
                 .inventory()
                 .cursor()
                 .map(|item| (item.id(), item.count())),
-            Some((ItemId::Block(BlockId::Stone), 58)),
+            Some((ItemId::Block(BlockId::Cobblestone), 58)),
             "the held cursor stack is restored"
         );
         assert_eq!(
@@ -7750,8 +7751,8 @@ mod tests {
                 .inventory
                 .slot(20)
                 .map(|item| (item.id(), item.count())),
-            Some((ItemId::Block(BlockId::Stone), 59)),
-            "the restored held stack plus the last drop are conserved"
+            Some((ItemId::Block(BlockId::Cobblestone), 59)),
+            "the restored held stack plus the last mined drop are conserved"
         );
         assert_eq!(
             final_data
