@@ -47,13 +47,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R005 — Deterministic 3D caves and coal/iron veins with ores below h-3 and bedrock at wy=-32
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M007/S01
 - Description: Deterministic 3D caves and coal/iron veins with ores below h-3 and bedrock at wy=-32.
 - Why it matters: Cave and ore discovery is the resource-spine foundation.
 - Source: M003 / D022 item 5
 - Primary owning slice: M003/S01
 - Supporting slices: None
 - Validation: cargo test --locked --lib -- world::terrain
+- Note: Deliberately superseded by M007/S01 (four-biome terrain rewrite). What survives and stays pinned by the terrain tests: caves carve Stone only strictly below h-3/h-4, ores stay in their depth bands below h-3, and bedrock stays at wy=-32. Only the implicit single-biome grassland height envelope is replaced, not the cave/ore/bedrock contract.
 
 ### R006 — Per-block hardness hold-to-mine with visible progress and reset on release or retarget
 - Class: primary-user-loop

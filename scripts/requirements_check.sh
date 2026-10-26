@@ -3,9 +3,11 @@
 #
 # Validates the checked-in REQUIREMENTS-REGISTRY.md:
 #   1. the registry file exists,
-#   2. every "### R### — ..." record parses into the eight contract bullets,
+#   2. every "### R### — ..." record parses into the nine contract bullets,
 #   3. exactly R001-R026 appear once each, with no duplicate or malformed IDs,
-#   4. required fields are non-empty and Status is exactly "active",
+#   4. required fields are non-empty and Status is exactly "active" or
+#      "superseded" with a Superseded by: M###/S## line; R005's deliberate
+#      M007/S01 supersession is pinned so it cannot silently revert to active,
 #   5. ownership follows M001/M002 for R001-R004, M003 for R005-R015,
 #      M004 for R016-R020, and M005 for R021-R026,
 #   6. every M003, M004, and M005 slice is covered by at least one mapped record,
@@ -59,18 +61,18 @@ trap 'rm -f "$record_tmp" "$criteria_m3_tmp" "$criteria_m4_tmp" "$criteria_m5_tm
 # 2. Parse each record heading and its contract bullets.
 #
 # Emits one line per record:
-#   id|class|status|description|why|source|owner|supporting|validation
+#   id|class|status|description|why|source|owner|supporting|validation|superseded_by
 # A record ends at the next heading; bullets with no record are ignored.
 # ---------------------------------------------------------------------------
 awk '
 function flush() {
     if (id == "") return
-    print id "|" class "|" status "|" desc "|" why "|" src "|" own "|" supp "|" val
+    print id "|" class "|" status "|" desc "|" why "|" src "|" own "|" supp "|" val "|" supe
 }
 /^### R[0-9][0-9][0-9] / {
     flush()
     id = $2
-    class = status = desc = why = src = own = supp = val = ""
+    class = status = desc = why = src = own = supp = val = supe = ""
     next
 }
 /^- Class: /                { sub(/^- Class: /, "");                class = $0; next }
@@ -81,6 +83,7 @@ function flush() {
 /^- Primary owning slice: / { sub(/^- Primary owning slice: /, ""); own = $0; next }
 /^- Supporting slices: /    { sub(/^- Supporting slices: /, "");    supp = $0; next }
 /^- Validation: /           { sub(/^- Validation: /, "");           val = $0; next }
+/^- Superseded by: /        { sub(/^- Superseded by: /, "");        supe = $0; next }
 END { flush() }
 ' "$REGISTRY" > "$record_tmp"
 
@@ -96,9 +99,10 @@ declare -A src_of=()
 declare -A owner_of=()
 declare -A supp_of=()
 declare -A val_of=()
+declare -A supe_of=()
 
 record_count=0
-while IFS='|' read -r id class status desc why src own supp val; do
+while IFS='|' read -r id class status desc why src own supp val supe; do
     [[ -n "$id" ]] || continue
     [[ "$id" =~ ^R[0-9]{3}$ ]] || fail "invalid requirement ID: '$id' (expected R###)"
     [[ -z "${seen[$id]:-}" ]] || fail "duplicate requirement ID: $id"
@@ -112,6 +116,7 @@ while IFS='|' read -r id class status desc why src own supp val; do
     owner_of[$id]="$own"
     supp_of[$id]="$supp"
     val_of[$id]="$val"
+    supe_of[$id]="$supe"
     record_count=$((record_count + 1))
 done < "$record_tmp"
 
@@ -125,7 +130,8 @@ done
 pass "26 requirement records R001-R026 present exactly once with unique IDs"
 
 # ---------------------------------------------------------------------------
-# 4. Required fields are non-empty; Status is exactly "active".
+# 4. Required fields are non-empty; Status is exactly "active" or
+#    "superseded" with a non-empty Superseded by: M###/S## reference.
 # ---------------------------------------------------------------------------
 for id in "${!seen[@]}"; do
     [[ -n "${class_of[$id]}" ]] || fail "$id has an empty Class field"
@@ -134,10 +140,29 @@ for id in "${!seen[@]}"; do
     [[ -n "${src_of[$id]}" ]] || fail "$id has an empty Source field"
     [[ -n "${owner_of[$id]}" ]] || fail "$id has an empty Primary owning slice field"
     [[ -n "${val_of[$id]}" ]] || fail "$id has an empty Validation field"
-    [[ "${status_of[$id]}" == "active" ]] \
-        || fail "$id Status must be 'active', got '${status_of[$id]}'"
+    case "${status_of[$id]}" in
+        active) ;;
+        superseded)
+            [[ -n "${supe_of[$id]}" ]] \
+                || fail "$id Status is 'superseded' but has no 'Superseded by:' slice reference"
+            [[ "${supe_of[$id]}" =~ ^M[0-9]{3}/S[0-9]{2}$ ]] \
+                || fail "$id Superseded by must name an M###/S## slice, got '${supe_of[$id]}'"
+            ;;
+        *)
+            fail "$id Status must be 'active' or 'superseded' with a Superseded by: slice, got '${status_of[$id]}'"
+            ;;
+    esac
 done
-pass "all records carry non-empty Class/Description/Why/Source/Owner/Validation and Status active"
+pass "all records carry non-empty Class/Description/Why/Source/Owner/Validation and Status active or justified superseded"
+
+# R005's supersession is deliberate (M007/S01 rewrote the height envelope but
+# kept the cave/ore/bedrock contract). Pin it so an accidental revert to
+# "active" cannot quietly erase the recorded supersession.
+[[ "${status_of[R005]}" == "superseded" ]] \
+    || fail "R005 must record its deliberate M007/S01 supersession (got '${status_of[R005]}')"
+[[ "${supe_of[R005]}" == "M007/S01" ]] \
+    || fail "R005 must name M007/S01 as its superseding slice, got '${supe_of[R005]}'"
+pass "R005 records the deliberate M007/S01 supersession"
 
 # ---------------------------------------------------------------------------
 # 5. Ownership: R001-R004 -> M001 or M002; R005-R015 -> M003; R016-R020 -> M004;

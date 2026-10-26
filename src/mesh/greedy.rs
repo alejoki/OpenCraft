@@ -385,8 +385,8 @@ fn mesh_water(padded: &PaddedChunk, mesh: &mut ChunkMesh) {
                 // the face. Kept strictly separate from `solid_masks`.
                 let mut visible = [[false; CHUNK_SIZE]; CHUNK_SIZE];
                 let mut any_visible = false;
-                for v in 0..CHUNK_SIZE {
-                    for u in 0..CHUNK_SIZE {
+                for (v, row) in visible.iter_mut().enumerate() {
+                    for (u, cell) in row.iter_mut().enumerate() {
                         let (px, py, pz) = get_axis_coord(axis, d + 1, u + 1, v + 1);
                         if !padded.get(px, py, pz).is_liquid() {
                             continue;
@@ -394,7 +394,7 @@ fn mesh_water(padded: &PaddedChunk, mesh: &mut ChunkMesh) {
                         let air_d = if is_pos { d + 2 } else { d };
                         let (ax, ay, az) = get_axis_coord(axis, air_d, u + 1, v + 1);
                         if padded.get(ax, ay, az) == BlockId::Air {
-                            visible[v][u] = true;
+                            *cell = true;
                             any_visible = true;
                         }
                     }
@@ -418,10 +418,8 @@ fn mesh_water(padded: &PaddedChunk, mesh: &mut ChunkMesh) {
                         }
                         let mut h = 1usize;
                         'height: while v + h < CHUNK_SIZE {
-                            for uu in u..(u + w) {
-                                if !visible[v + h][uu] {
-                                    break 'height;
-                                }
+                            if !visible[v + h][u..(u + w)].iter().all(|&cell| cell) {
+                                break 'height;
                             }
                             h += 1;
                         }

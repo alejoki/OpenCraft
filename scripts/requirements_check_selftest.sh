@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Negative-path selftest for scripts/requirements_check.sh (M003/S05-T03,
-# extended M004/S05-T02 and M005/S06-T02).
+# extended M004/S05-T02, M005/S06-T02, and M007/S01-T06).
 #
 # Proves the registry checker is not a happy-path-only gate: a pristine copy
 # must be accepted, and each of the following defects must be rejected:
@@ -19,12 +19,16 @@
 #  13. lost M005 slice mapping
 #  14. wrong M005 criterion -> requirement mapping
 #  15. out-of-range criterion row in the M005 trace table
+#  16. superseded record missing its Superseded by: slice reference
+#  17. superseded record naming a malformed (non-slice) reference
+#  18. R005's deliberate M007/S01 supersession reverted to active
 #
-# Cases 8-11 exercise the M004 checker surface added with R016-R020, and cases
-# 12-15 exercise the M005 surface added with R021-R026. All three criterion
-# tables restart their row numbers at 1, so these cases plus the positive
-# control prove the checker parses each table section-scoped rather than
-# counting colliding criterion 1 rows across tables.
+# Cases 8-11 exercise the M004 checker surface added with R016-R020, cases
+# 12-15 exercise the M005 surface added with R021-R026, and cases 16-18
+# exercise the M007/S01 deliberate-supersession surface added to R005. All
+# three criterion tables restart their row numbers at 1, so these cases plus
+# the positive control prove the checker parses each table section-scoped
+# rather than counting colliding criterion 1 rows across tables.
 #
 # Every mutation is applied to a throwaway copy under mktemp -d; the canonical
 # REQUIREMENTS-REGISTRY.md is never written. The selftest asserts the on-disk
@@ -244,6 +248,62 @@ fi
 grep -q 'M005 table' "$CHECK_LOG" \
     || { echo "FAIL: out-of-range M005 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 echo "PASS: out-of-range M005 trace row rejected"
+
+# --- Case 16: superseded record without a Superseded by: line ------------
+# R005 is the deliberate M007/S01 supersession. Dropping its Superseded by:
+# line must fail closed: a status flip alone is not a recorded supersession.
+case16="$SCRATCH/case16.md"
+awk '
+    /^### R005 / { in_r005 = 1 }
+    in_r005 && !deleted && /^- Superseded by: / { deleted = 1; next }
+    { print }
+' "$REGISTRY" > "$case16"
+assert_mutated "superseded reference" "$case1" "$case16"
+rc=0
+run_checker "$case16" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: superseded record without Superseded by: should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q "has no 'Superseded by:' slice reference" "$CHECK_LOG" \
+    || { echo "FAIL: missing Superseded by: was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: superseded record without Superseded by: rejected"
+
+# --- Case 17: superseded record with a malformed reference ---------------
+# A bare milestone or free-text note is not a slice reference; the checker
+# requires the exact M###/S## shape so the supersession is traceable.
+case17="$(new_case "$SCRATCH/case17.md")"
+sed -i 's#^- Superseded by: M007/S01$#- Superseded by: M007#' "$case17"
+assert_mutated "malformed superseded reference" "$case1" "$case17"
+rc=0
+run_checker "$case17" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: malformed Superseded by: reference should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'must name an M###/S## slice' "$CHECK_LOG" \
+    || { echo "FAIL: malformed Superseded by: was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: malformed Superseded by: reference rejected"
+
+# --- Case 18: R005 supersession reverted to active -----------------------
+# The M007/S01 rewrite deliberately supersedes R005; silently flipping it
+# back to active would erase the recorded supersession from the registry.
+case18="$SCRATCH/case18.md"
+awk '
+    /^### R005 / { in_r005 = 1 }
+    in_r005 && /^- Status: / { sub(/- Status: .*/, "- Status: active"); in_r005 = 0 }
+    { print }
+' "$REGISTRY" > "$case18"
+assert_mutated "R005 status reverted" "$case1" "$case18"
+rc=0
+run_checker "$case18" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: reverted R005 supersession should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'R005 must record its deliberate M007/S01 supersession' "$CHECK_LOG" \
+    || { echo "FAIL: reverted R005 status was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: reverted R005 supersession rejected"
 
 # --- Canonical registry must be untouched --------------------------------
 cmp -s "$PRISTINE" "$REGISTRY" \
