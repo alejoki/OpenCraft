@@ -62,6 +62,7 @@ use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
+use opencraft::world::season::season_of;
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
@@ -2910,7 +2911,18 @@ impl ApplicationHandler for GameApp {
                         self.session.player.position.y.floor() as i32,
                         self.session.player.position.z.floor() as i32,
                     );
-                    let (new_meshes, unloaded) = self.session.world.update_streaming(player_chunk);
+                    // Live season (M007/S05): derived from the persisted
+                    // calendar every frame, so a day rollover starts the
+                    // manager's bounded seasonal rollover wave. Pure function
+                    // of (day_index, season_length_days, seed) — never the
+                    // wall clock.
+                    let season = season_of(
+                        self.session.clock.day_index,
+                        self.session.season_length_days,
+                        self.session.world.seed(),
+                    );
+                    let (new_meshes, unloaded) =
+                        self.session.world.update_streaming(player_chunk, season);
                     if !unloaded.is_empty()
                         && self.session.world.has_unsaved_changes()
                         && save_current_world(&mut self.session).is_ok()
@@ -2940,7 +2952,9 @@ impl ApplicationHandler for GameApp {
                         anchor.y.floor() as i32,
                         anchor.z.floor() as i32,
                     );
-                    let (new_meshes, unloaded) = self.vista_world.update_streaming(vista_chunk);
+                    let (new_meshes, unloaded) = self
+                        .vista_world
+                        .update_streaming(vista_chunk, vista::VISTA_SEASON);
                     for upos in unloaded {
                         gpu.vista_store.remove_chunk(upos);
                     }
@@ -7436,7 +7450,7 @@ mod tests {
         // same bounded streaming pump the WorldManager
         // unload/regeneration test uses — headless, rayon-driven).
         for _ in 0..40 {
-            app.session.world.update_streaming(cpos);
+            app.session.world.update_streaming(cpos, Season::Summer);
             if app.session.world.get_block(0, 40, 5) == BlockId::Brick {
                 break;
             }
@@ -8025,7 +8039,9 @@ mod tests {
             "nothing is resident before the streaming pump runs"
         );
         for _ in 0..120 {
-            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            app.session
+                .world
+                .update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
             if app
                 .session
                 .world
@@ -8051,7 +8067,9 @@ mod tests {
             {
                 break;
             }
-            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            app.session
+                .world
+                .update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(

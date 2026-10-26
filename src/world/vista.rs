@@ -11,6 +11,7 @@ use glam::Vec3;
 
 use crate::player::camera::Camera;
 use crate::ui::lifecycle::{LifecycleScreen, SettingsCaller};
+use crate::world::season::Season;
 use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
 /// Fixed seed for the vista demo world.
@@ -18,6 +19,15 @@ use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 /// Deliberately stable rather than random: every launch must show the same
 /// terrain, so the vista is reproducible and its camera anchor is meaningful.
 pub const VISTA_SEED: u32 = 0x5EED_4A11;
+
+/// Season the menu panorama always renders in.
+///
+/// Pinned to the blanket-absent baseline rather than derived from the live
+/// clock: the vista is a fixed demo world, so the menu must look identical
+/// across real-time years and across saves. Never replace this with a
+/// clock-derived value -- a season-keyed world manager would then reshuffle the
+/// background on every menu visit.
+pub const VISTA_SEASON: Season = Season::Summer;
 
 /// Slow linear yaw drift, in radians per second. At this rate a full turn
 /// takes roughly three minutes, so the panorama moves without being busy.
@@ -104,6 +114,14 @@ mod tests {
 
         let t2 = vista_camera(17.0, 1.0);
         assert_eq!(t2.yaw, VISTA_DRIFT_RATE_RADIANS_PER_SEC * 17.0);
+    }
+
+    #[test]
+    fn vista_season_is_pinned_to_the_blanket_absent_baseline() {
+        // The menu panorama is a fixed demo world: it must never follow the
+        // player's persisted clock, so the season is a named constant pinned
+        // here. Changing this intentionally also changes this assertion.
+        assert_eq!(VISTA_SEASON, Season::Summer);
     }
 
     #[test]

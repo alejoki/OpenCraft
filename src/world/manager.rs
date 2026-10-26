@@ -52,6 +52,22 @@ pub struct WorldManager {
     world_seed: u32,
     chunk_edits: ChunkEditMap,
     unsaved_changes: bool,
+    /// Season the resident chunk contents were generated under.
+    ///
+    /// Chunks are persisted only as `chunk_edits`, so every resident chunk was
+    /// generated under exactly one season: this single value keys all
+    /// generation staleness. A change starts one rollover wave.
+    generation_season: Season,
+    /// Target season of an in-flight rollover wave (`None` at rest).
+    season_rollover_target: Option<Season>,
+    /// Resident positions awaiting seasonal regeneration for the in-flight
+    /// wave, nearest-to-center first, so the player's surroundings change
+    /// before the horizon does.
+    season_rollover: VecDeque<ChunkPos>,
+    /// Positions whose in-flight generation result is a seasonal replacement
+    /// rather than a first load. Exactly the rollover dispatches, so a result
+    /// is only ever swapped in place when the wave produced it.
+    season_rollover_inflight: FxHashSet<ChunkPos>,
 }
 
 /// Result of one rayon sky-light job. Produced entirely off the frame thread;
@@ -108,6 +124,16 @@ fn compute_light_region_snapshot(
 const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
 const LIGHT_DISPATCH_BUDGET: usize = 4;
 
+/// Cap on generation jobs in flight (player-driven loads and seasonal rollover
+/// replacements share it, so a wave can never flood the pool).
+const PENDING_GEN_CAP: usize = 96;
+
+/// Per-frame ceiling for seasonal rollover replacements. Named to mirror
+/// `LIGHT_DISPATCH_BUDGET`; 32 matches the generation dispatch cap, so a
+/// season change is spread over at least ceil(resident / 32) frames instead of
+/// remeshing the whole world in one frame.
+const SEASON_ROLLOVER_BUDGET: usize = 32;
+
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     // One extra ring beyond render_distance supplied the 6 face neighbours for
     // meshing. Meshing now also needs sky light in the 3x3 column neighborhood
@@ -163,6 +189,13 @@ impl WorldManager {
             world_seed: seed,
             chunk_edits,
             unsaved_changes: false,
+            // Blanket-absent baseline, matching terrain.rs's unseeded
+            // `generate_chunk` default: a fresh world starts in Summer and its
+            // first season rollover is planned against that.
+            generation_season: Season::Summer,
+            season_rollover_target: None,
+            season_rollover: VecDeque::new(),
+            season_rollover_inflight: FxHashSet::default(),
         }
     }
 
@@ -206,6 +239,22 @@ impl WorldManager {
     #[inline]
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Season the resident chunk contents were generated under. Advances only
+    /// when a rollover wave drains; diagnostics and tests read it to prove a
+    /// wave actually completed.
+    #[inline]
+    pub fn generation_season(&self) -> Season {
+        self.generation_season
+    }
+
+    /// True while `pos` has resident block data. The rollover contract is that
+    /// a resident position is never removed first, so this stays true across a
+    /// seasonal swap (no Air gap for physics or edits).
+    #[inline]
+    pub fn is_resident(&self, pos: ChunkPos) -> bool {
+        self.chunks.contains_key(&pos)
     }
 
     #[inline]
@@ -906,12 +955,147 @@ impl WorldManager {
         out
     }
 
+    /// The season newly generated chunks must use: the target of an in-flight
+    /// rollover, or the settled generation season at rest.
+    ///
+    /// A chunk that loads while a wave is in flight must land already in the
+    /// target season. Otherwise it would be silently stale: the wave snapshot
+    /// predates it (so it is never queued) and `generation_season` advances
+    /// when the queue drains.
+    fn current_gen_season(&self) -> Season {
+        self.season_rollover_target
+            .unwrap_or(self.generation_season)
+    }
+
+    /// Start one rollover wave when the requested season differs from the one
+    /// the resident content was generated under.
+    ///
+    /// Nothing is dropped from `self.chunks`: the wave replaces chunks in place
+    /// through the normal generation queue. While a wave is in flight a second
+    /// season change is ignored; once it drains, the next call sees the new
+    /// mismatch and starts another wave (so a fast calendar costs bounded
+    /// waves, never a one-frame full-world remesh).
+    fn begin_season_rollover_if_needed(&mut self, center_chunk: ChunkPos, season: Season) {
+        if season == self.generation_season || self.season_rollover_target.is_some() {
+            return;
+        }
+        let mut positions: Vec<ChunkPos> = self.chunks.keys().copied().collect();
+        // `dirty_mesh_queue` is an unordered set, so the wave cannot inherit an
+        // order from it: sort explicitly, nearest-first by the same dist² key
+        // the mesh dispatch uses (x/z only, so a whole column travels
+        // together), with a total-order tie-break for reproducibility.
+        positions.sort_by_key(|pos| {
+            let dx = pos.x - center_chunk.x;
+            let dz = pos.z - center_chunk.z;
+            (dx * dx + dz * dz, pos.x, pos.z, pos.y)
+        });
+        self.season_rollover = positions.into();
+        self.season_rollover_target = Some(season);
+    }
+
+    /// Dispatch up to [`SEASON_ROLLOVER_BUDGET`] seasonal replacements per
+    /// frame through the existing `gen_tx`/`pending_gen` machinery, so their
+    /// results ride the ordinary generation drain and never a separate path.
+    fn dispatch_season_rollover(&mut self) {
+        let Some(target) = self.season_rollover_target else {
+            return;
+        };
+        let seed = self.world_seed;
+        let mut dispatched = 0usize;
+        while dispatched < SEASON_ROLLOVER_BUDGET && self.pending_gen.len() < PENDING_GEN_CAP {
+            let Some(pos) = self.season_rollover.pop_front() else {
+                break;
+            };
+            // Unloaded since the snapshot, or already covered by a player-
+            // driven generation dispatch: never double-track a position. A
+            // dropped position is harmless either way -- if it reloads it is
+            // generated in the target season via `current_gen_season`.
+            if !self.chunks.contains_key(&pos) || self.pending_gen.contains(&pos) {
+                continue;
+            }
+            self.pending_gen.insert(pos);
+            self.season_rollover_inflight.insert(pos);
+            let tx = self.gen_tx.clone();
+            rayon::spawn(move || {
+                let chunk = generate_chunk_seeded(pos, seed, target);
+                let _ = tx.send((pos, chunk));
+            });
+            dispatched += 1;
+        }
+        if self.season_rollover.is_empty() {
+            // The queue has drained: resident content is now (or is arriving
+            // as) the target season, and the settle point is where staleness
+            // keying moves. Steady-state streaming then resumes unchanged: a
+            // stable season never re-enters this path.
+            self.generation_season = target;
+            self.season_rollover_target = None;
+        }
+    }
+
+    /// Replace a resident chunk with its seasonal regeneration, in place.
+    ///
+    /// The old chunk is overwritten rather than removed first, so a resident
+    /// position never reads as Air: `get_block` cannot drop the player through
+    /// the floor, `set_block_immediate` cannot silently no-op on a missing
+    /// chunk, and the GPU keeps drawing the old mesh until the new one lands.
+    /// The caller has already re-applied `chunk_edits`, so edits always win:
+    /// mined blocks stay mined while the surroundings turn white.
+    fn swap_resident_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
+        self.chunks.insert(pos, chunk);
+
+        // Sky light is derived from these blocks. Drop the whole (x, z)
+        // column BEFORE asking for light: `propagate_light_for_completed_column`
+        // early-returns while `has_column_light` is true, so dropping afterwards
+        // would leave the wave permanently unlit.
+        for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+            self.light_grids.remove(&ChunkPos::new(pos.x, cy, pos.z));
+        }
+        if self.column_is_complete(pos.x, pos.z) {
+            self.force_enqueue_light_column(pos.x, pos.z);
+        }
+        // An incomplete column has no grids to drop and re-lights itself when
+        // it completes via the column-ready trigger.
+
+        // The old mesh is stale; drop it and let the wave re-mesh once the
+        // column's fresh light lands (the dispatch gate checks the 3x3 light
+        // neighborhood). The global `light_epoch` is deliberately NOT bumped:
+        // that would discard the whole in-flight light pipeline, while the
+        // per-column sequence guard is already sufficient.
+        self.pending_mesh.remove(&pos);
+        self.meshed_chunks.remove(&pos);
+        self.dirty_mesh_queue.insert(pos);
+    }
+
+    /// Enqueue a fresh light job for one column even when an older job is still
+    /// in flight, and floor `light_applied_seq` at the fresh sequence so the
+    /// older snapshot can never win on arrival.
+    ///
+    /// The edit path can afford the global `light_epoch` bump because it
+    /// recomputes synchronously. The rollover must stay inside the per-frame
+    /// light budgets, so it relies on the per-column sequence instead -- the
+    /// same guard that already resolves out-of-order worker completion. The
+    /// floor is the fresh sequence itself, so the fresh result (equal, not
+    /// older) is still accepted.
+    fn force_enqueue_light_column(&mut self, cx: i32, cz: i32) {
+        self.next_light_seq += 1;
+        let seq = self.next_light_seq;
+        self.light_applied_seq.insert((cx, cz), seq);
+        self.pending_light.push_back((cx, cz, seq));
+        self.queued_light.insert((cx, cz));
+    }
+
     pub fn update_streaming(
         &mut self,
         center_chunk: ChunkPos,
+        season: Season,
     ) -> (Vec<(ChunkPos, ChunkMesh)>, Vec<ChunkPos>) {
         let mut completed_meshes = Vec::new();
         let mut unloaded = Vec::new();
+
+        // 0. Season staleness: a requested season that differs from the one the
+        //    resident content was generated under starts one bounded rollover
+        //    wave. Nothing is dropped; replacements ride the normal gen queue.
+        self.begin_season_rollover_if_needed(center_chunk, season);
 
         // 1. Drain up to 48 generated chunks per frame
         for _ in 0..48 {
@@ -919,18 +1103,29 @@ impl WorldManager {
                 break;
             };
             self.pending_gen.remove(&pos);
+            // Only a rollover dispatch targets an already-resident position;
+            // track its own in-flight set so a first load can never be
+            // mistaken for a replacement (and vice versa).
+            let replacement =
+                self.season_rollover_inflight.remove(&pos) && self.chunks.contains_key(&pos);
             if let Some(edits) = self.chunk_edits.get(&pos) {
+                // Edits are applied to every generation result: they always win
+                // over the season.
                 for (&idx, &block) in edits {
                     chunk.set_by_index(idx, block);
                 }
                 chunk.try_compress();
             }
-            self.chunks.insert(pos, chunk);
+            if replacement {
+                self.swap_resident_chunk(pos, chunk);
+            } else {
+                self.chunks.insert(pos, chunk);
 
-            // Column-ready trigger: this chunk may be the last piece of a full
-            // 192-block column. Only enqueue here; the light BFS runs on a
-            // rayon worker and lands on a later frame.
-            self.propagate_light_for_completed_column(pos.x, pos.z);
+                // Column-ready trigger: this chunk may be the last piece of a
+                // full 192-block column. Only enqueue here; the light BFS runs
+                // on a rayon worker and lands on a later frame.
+                self.propagate_light_for_completed_column(pos.x, pos.z);
+            }
 
             // Check if this chunk and its 6 neighbors can now be queued for meshing
             for (dx, dy, dz) in [
@@ -1019,13 +1214,29 @@ impl WorldManager {
                 let dz = cz - center_chunk.z;
                 dx * dx + dz * dz <= unload_r2
             });
+            // Positions that left the world during a wave are dropped from the
+            // queue: if they ever reload they are generated in the target
+            // season through `current_gen_season`.
+            self.season_rollover.retain(|&pos| {
+                let dx = pos.x - center_chunk.x;
+                let dz = pos.z - center_chunk.z;
+                dx * dx + dz * dz <= unload_r2
+            });
         }
 
-        // 5. Dispatch new terrain generation tasks in spiral order around center_chunk
+        // 5. Seasonal rollover wave: replace at most SEASON_ROLLOVER_BUDGET
+        //    resident chunks per frame through the same generation queue, ahead
+        //    of new chunk loads so a wave is never starved by a crossing.
+        self.dispatch_season_rollover();
+
+        // 6. Dispatch new terrain generation tasks in spiral order around center_chunk
         let mut dispatched_gen = 0;
         let seed = self.world_seed;
+        // Chunks generated while a wave is in flight must land in the target
+        // season, or they would be stale the moment the wave drains.
+        let gen_season = self.current_gen_season();
         'spiral: for &(dx, dz) in &self.spiral_offsets {
-            if self.pending_gen.len() >= 96 || dispatched_gen >= 32 {
+            if self.pending_gen.len() >= PENDING_GEN_CAP || dispatched_gen >= 32 {
                 break;
             }
             let cx = center_chunk.x + dx;
@@ -1036,10 +1247,7 @@ impl WorldManager {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
                     rayon::spawn(move || {
-                        // Interim placeholder: T02 threads the manager's real
-                        // generation season through this closure. Summer keeps
-                        // the blanket-absent baseline for now.
-                        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+                        let chunk = generate_chunk_seeded(pos, seed, gen_season);
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -1050,7 +1258,7 @@ impl WorldManager {
             }
         }
 
-        // 6. Fast-clear any Uniform(Air) chunks from dirty_mesh_queue before counting the 24-chunk frame budget
+        // 7. Fast-clear any Uniform(Air) chunks from dirty_mesh_queue before counting the 24-chunk frame budget
         let mut empty_air_chunks = Vec::new();
         for &pos in &self.dirty_mesh_queue {
             if self.chunks.get(&pos).and_then(|c| c.is_uniform()) == Some(BlockId::Air) {
@@ -1108,7 +1316,7 @@ impl WorldManager {
             });
         }
 
-        // 7. Hand queued columns to rayon last, so snapshot cloning (up to 54
+        // 8. Hand queued columns to rayon last, so snapshot cloning (up to 54
         //    chunks of block data) never delays this frame's mesh dispatch. The
         //    worker results are applied by step 2 of a later frame.
         self.dispatch_light_jobs();
@@ -1188,7 +1396,7 @@ mod tests {
         assert_eq!(remeshed.len(), 1);
 
         // Subsequent streaming update must discard the stale in-flight mesh result
-        let (completed, _) = mgr.update_streaming(cpos);
+        let (completed, _) = mgr.update_streaming(cpos, Season::Summer);
         assert!(
             !completed.iter().any(|(p, _)| *p == cpos),
             "stale in-flight mesh must be ignored after set_block_immediate"
@@ -1216,7 +1424,7 @@ mod tests {
         assert_eq!(mgr.get_block(0, 40, 5), BlockId::Brick);
 
         // Move player far away (chunk 100, 1, 100) to force unloading chunk (0, 1, 0)
-        let (_, unloaded) = mgr.update_streaming(ChunkPos::new(100, 1, 100));
+        let (_, unloaded) = mgr.update_streaming(ChunkPos::new(100, 1, 100), Season::Summer);
         assert!(unloaded.contains(&c0));
         assert_eq!(mgr.get_block(0, 40, 5), BlockId::Air);
 
@@ -1231,7 +1439,7 @@ mod tests {
             && pump < 10_000
             && std::time::Instant::now() < deadline
         {
-            mgr.update_streaming(c0);
+            mgr.update_streaming(c0, Season::Summer);
             pump += 1;
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -1264,8 +1472,299 @@ mod tests {
         mgr.queue_all_loaded_for_test();
         assert!(mgr.dirty_mesh_queue_len() > 25);
 
-        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        mgr.update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
         assert_eq!(mgr.dirty_mesh_queue_len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // M007/S05-T02: season-keyed generation staleness and the bounded
+    // swap-on-arrival rollover wave.
+    // -----------------------------------------------------------------------
+
+    /// 42 resident chunks (14 columns x 3 vertical levels), all inside an rd=4
+    /// manager's unload radius, used as the rollover snapshot.
+    fn insert_rollover_resident(mgr: &mut WorldManager) -> Vec<ChunkPos> {
+        let mut positions = Vec::new();
+        for dx in -3..=3 {
+            for dz in 0..=1 {
+                for cy in 0..=2 {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    mgr.insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Stone));
+                    positions.push(pos);
+                }
+            }
+        }
+        positions
+    }
+
+    #[test]
+    fn test_season_rollover_is_bounded_per_frame_and_keeps_every_chunk_resident() {
+        let mut mgr = WorldManager::new(4);
+        let resident = insert_rollover_resident(&mut mgr);
+        assert_eq!(resident.len(), 42);
+        assert_eq!(mgr.generation_season(), Season::Summer);
+        let center = ChunkPos::new(0, 0, 0);
+
+        // A season mismatch enqueues the whole resident set but dispatches only
+        // one bounded slice: never a one-frame full-world remesh.
+        mgr.update_streaming(center, Season::Winter);
+        assert_eq!(mgr.season_rollover_target, Some(Season::Winter));
+        assert_eq!(
+            mgr.season_rollover.len(),
+            resident.len() - SEASON_ROLLOVER_BUDGET,
+            "the first call must dispatch exactly one bounded slice, not the whole world"
+        );
+        assert_eq!(
+            mgr.generation_season(),
+            Season::Summer,
+            "the generation season settles only once the queue has drained"
+        );
+        for pos in &resident {
+            assert!(mgr.is_resident(*pos), "resident chunk {pos:?} went absent");
+        }
+
+        // The wave drains over subsequent calls. No position may ever go absent:
+        // a swap replaces contents in place, so physics and edits never see Air.
+        let mut calls = 1usize;
+        while mgr.generation_season() != Season::Winter && calls < 256 {
+            mgr.update_streaming(center, Season::Winter);
+            calls += 1;
+            for pos in &resident {
+                assert!(mgr.is_resident(*pos), "resident chunk {pos:?} went absent");
+            }
+        }
+        assert_eq!(
+            mgr.generation_season(),
+            Season::Winter,
+            "the rollover must settle on the requested season ({calls} calls)"
+        );
+        assert!(mgr.season_rollover_target.is_none());
+        assert!(mgr.season_rollover.is_empty());
+
+        // Steady state: once the wave has fully arrived, a stable season
+        // re-dispatches nothing for resident chunks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while resident.iter().any(|pos| mgr.pending_gen.contains(pos))
+            && std::time::Instant::now() < deadline
+        {
+            mgr.update_streaming(center, Season::Winter);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        mgr.update_streaming(center, Season::Winter);
+        assert!(mgr.season_rollover_target.is_none());
+        assert!(mgr.season_rollover.is_empty());
+        assert!(
+            mgr.pending_gen.iter().all(|pos| !mgr.is_resident(*pos)),
+            "a stable season must never re-dispatch a resident chunk for generation"
+        );
+    }
+
+    /// The first two block positions where Summer and Winter disagree inside one
+    /// chunk, searched over T01's known-land witness region for seed 1.
+    /// Returns `(chunk, witness, second)` with both positions and their Summer
+    /// and Winter block ids.
+    #[allow(clippy::type_complexity)]
+    fn find_seasonal_witness(
+        seed: u32,
+    ) -> (
+        ChunkPos,
+        ((i32, i32, i32), BlockId, BlockId),
+        ((i32, i32, i32), BlockId, BlockId),
+    ) {
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in 0..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let summer = generate_chunk_seeded(pos, seed, Season::Summer);
+                    let winter = generate_chunk_seeded(pos, seed, Season::Winter);
+                    let mut found = Vec::new();
+                    for ly in 0..CHUNK_SIZE {
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                let s = summer.get(lx, ly, lz);
+                                let w = winter.get(lx, ly, lz);
+                                if s != w {
+                                    let world = (
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                    );
+                                    found.push((world, s, w));
+                                    if found.len() == 2 {
+                                        return (pos, found[0], found[1]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("seed {seed} has no seasonal surface change in the witness region");
+    }
+
+    #[test]
+    fn test_seasonal_swap_reapplies_edits_and_replaces_content_in_place() {
+        let _heavy = lock_heavy_streaming();
+        let seed = 1;
+        let (
+            witness_chunk,
+            (edit_pos, summer_at_edit, winter_at_edit),
+            (probe, summer_probe, winter_probe),
+        ) = find_seasonal_witness(seed);
+        assert_ne!(summer_at_edit, winter_at_edit);
+        assert_ne!(summer_probe, winter_probe);
+
+        let mut mgr = WorldManager::with_seed_and_edits(4, seed, ChunkEditMap::default());
+        let mut column = Vec::new();
+        for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+            let pos = ChunkPos::new(witness_chunk.x, cy, witness_chunk.z);
+            mgr.insert_chunk_for_test(pos, generate_chunk_seeded(pos, seed, Season::Summer));
+            column.push(pos);
+        }
+
+        // Mine the witness surface block. The edit is recorded in `chunk_edits`,
+        // which is the only persisted per-chunk state, so the seasonal swap must
+        // re-apply it: edits always win over the season.
+        mgr.set_block_immediate(edit_pos.0, edit_pos.1, edit_pos.2, BlockId::Brick);
+        assert_eq!(
+            mgr.get_block(edit_pos.0, edit_pos.1, edit_pos.2),
+            BlockId::Brick
+        );
+        assert_eq!(
+            mgr.get_block(probe.0, probe.1, probe.2),
+            summer_probe,
+            "the untagged probe still carries Summer content before the wave"
+        );
+
+        let center = ChunkPos::new(witness_chunk.x, 0, witness_chunk.z);
+        mgr.update_streaming(center, Season::Winter);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while mgr.get_block(probe.0, probe.1, probe.2) == summer_probe
+            && std::time::Instant::now() < deadline
+        {
+            mgr.update_streaming(center, Season::Winter);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            for pos in &column {
+                assert!(
+                    mgr.is_resident(*pos),
+                    "the wave removed {pos:?} instead of swapping it in place"
+                );
+            }
+        }
+
+        assert_eq!(
+            mgr.get_block(probe.0, probe.1, probe.2),
+            winter_probe,
+            "the swapped chunk did not carry Winter content at ({}, {}, {})",
+            probe.0,
+            probe.1,
+            probe.2
+        );
+        assert_eq!(
+            mgr.get_block(edit_pos.0, edit_pos.1, edit_pos.2),
+            BlockId::Brick,
+            "a seasonal swap must never discard a mined block"
+        );
+
+        // Byte-level pin: the swapped chunk is exactly the Winter generation
+        // with the single persisted edit layered back on top.
+        let winter_chunk = generate_chunk_seeded(witness_chunk, seed, Season::Winter);
+        let (_, edit_local) = world_to_chunk_and_local(edit_pos.0, edit_pos.1, edit_pos.2);
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let (wx, wy, wz) = (
+                        witness_chunk.x * CHUNK_SIZE as i32 + lx as i32,
+                        witness_chunk.y * CHUNK_SIZE as i32 + ly as i32,
+                        witness_chunk.z * CHUNK_SIZE as i32 + lz as i32,
+                    );
+                    let expected = if (lx, ly, lz) == edit_local {
+                        BlockId::Brick
+                    } else {
+                        winter_chunk.get(lx, ly, lz)
+                    };
+                    assert_eq!(
+                        mgr.get_block(wx, wy, wz),
+                        expected,
+                        "seasonal swap content at ({wx}, {wy}, {wz})"
+                    );
+                }
+            }
+        }
+
+        // Light must be rebuilt for the swapped column. Grids are dropped first
+        // because the column-ready trigger early-returns while they exist; the
+        // per-column sequence guard makes the post-swap job win over any
+        // pre-swap snapshot that is still in flight.
+        let key = (witness_chunk.x, witness_chunk.z);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !(mgr.has_column_light(key.0, key.1)
+            && !mgr.light_inflight.contains(&key)
+            && !mgr.queued_light.contains(&key))
+            && std::time::Instant::now() < deadline
+        {
+            mgr.update_streaming(center, Season::Winter);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            mgr.has_column_light(key.0, key.1),
+            "the swapped column never relit: its grids were not dropped before the trigger"
+        );
+    }
+
+    #[test]
+    fn test_forced_column_light_outranks_an_older_in_flight_snapshot() {
+        let _heavy = lock_heavy_streaming();
+        let mut mgr = WorldManager::new(4);
+        insert_3x3_columns(&mut mgr, false, None);
+
+        // An older light job for the column is already in flight, carrying a
+        // grid computed from pre-swap blocks.
+        let old_seq = 7u64;
+        mgr.next_light_seq = old_seq;
+        mgr.light_inflight.insert((0, 0));
+        let stale = LightJobResult {
+            trigger: (0, 0),
+            seq: old_seq,
+            epoch: mgr.light_epoch,
+            grids: grids_for_column(0, 0, &LightGrid::new()),
+            complete_columns: [(0, 0)].into_iter().collect(),
+        };
+
+        // The seasonal swap drops the column's grids and forces a fresh job.
+        mgr.force_enqueue_light_column(0, 0);
+        assert!(!mgr.has_column_light(0, 0));
+        assert_eq!(
+            mgr.pending_light.back().map(|&(_, _, seq)| seq),
+            Some(old_seq + 1),
+            "a forced column job must bypass the in-flight de-dupe"
+        );
+
+        // The stale snapshot arrives: it must be rejected, not stored.
+        mgr.apply_light_result(stale);
+        assert!(
+            !mgr.has_column_light(0, 0),
+            "a pre-swap light snapshot must never be stored"
+        );
+        assert_eq!(mgr.light_at_world(5, 5, 5), light::MAX_SKY_LIGHT);
+        assert_eq!(
+            mgr.light_applied_seq.get(&(0, 0)).copied(),
+            Some(old_seq + 1),
+            "the applied-sequence floor must survive the stale arrival"
+        );
+
+        // The forced job then lands on a worker and relights the column.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !mgr.has_column_light(0, 0) && std::time::Instant::now() < deadline {
+            mgr.dispatch_light_jobs();
+            mgr.drain_light_results();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            mgr.has_column_light(0, 0),
+            "the forced column job must relight the swapped column"
+        );
     }
 
     /// Insert every chunk of the 3x3 column neighborhood around (0,0), all as
@@ -1303,7 +1802,7 @@ mod tests {
         assert!(mgr.dirty_mesh_queue.contains(&center));
 
         // Not dispatched while one halo column has no light.
-        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        mgr.update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
         assert!(
             mgr.dirty_mesh_queue.contains(&center),
             "a chunk with an unlit halo column must stay queued"
@@ -1317,7 +1816,7 @@ mod tests {
         );
         mgr.recompute_light_for_test();
         assert!(mgr.has_column_light(1, 0));
-        mgr.update_streaming(ChunkPos::new(0, 0, 0));
+        mgr.update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
         assert!(!mgr.dirty_mesh_queue.contains(&center));
         assert!(mgr.pending_mesh.contains(&center));
     }
@@ -1371,7 +1870,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut pump = 0usize;
         while !mgr.has_column_light(0, 0) && pump < 20_000 && std::time::Instant::now() < deadline {
-            mgr.update_streaming(center);
+            mgr.update_streaming(center, Season::Summer);
             pump += 1;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1775,7 +2274,7 @@ mod tests {
         assert!(direct.water_quad_count() > 0, "water faces are emitted");
 
         mgr.queue_all_loaded_for_test();
-        mgr.update_streaming(center);
+        mgr.update_streaming(center, Season::Summer);
         assert!(
             mgr.pending_mesh.contains(&center),
             "the water-only chunk must not be dropped by the no-solid fast skip"
@@ -1788,7 +2287,7 @@ mod tests {
         let mut result = None;
         let mut pump = 0usize;
         while result.is_none() && pump < 10_000 && std::time::Instant::now() < deadline {
-            let (completed, _) = mgr.update_streaming(center);
+            let (completed, _) = mgr.update_streaming(center, Season::Summer);
             if let Some((_, mesh)) = completed.iter().find(|(pos, _)| *pos == center) {
                 result = Some(mesh.clone());
             }
@@ -1823,7 +2322,7 @@ mod tests {
         }
         // Air twin: the fast clear marks it meshed without a worker dispatch.
         mgr.queue_all_loaded_for_test();
-        mgr.update_streaming(center);
+        mgr.update_streaming(center, Season::Summer);
         assert!(
             mgr.meshed_chunks.contains(&center),
             "a uniform-Air chunk is still fast-cleared"
@@ -1851,7 +2350,7 @@ mod tests {
         }
         water_mgr.recompute_light_for_test();
         water_mgr.queue_all_loaded_for_test();
-        water_mgr.update_streaming(center);
+        water_mgr.update_streaming(center, Season::Summer);
         assert!(
             water_mgr.pending_mesh.contains(&center),
             "a uniform-Water chunk is dispatched, not fast-cleared"
@@ -2004,7 +2503,7 @@ mod tests {
                  update_streaming polls ({} chunks loaded)",
                 mgr.loaded_chunk_count()
             );
-            mgr.update_streaming(start_chunk);
+            mgr.update_streaming(start_chunk, Season::Summer);
             warmup_polls += 1;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2061,7 +2560,7 @@ mod tests {
                         self.frames,
                         self.player.position
                     );
-                    self.mgr.update_streaming(center);
+                    self.mgr.update_streaming(center, Season::Summer);
                     polls += 1;
                     self.gate_polls += 1;
                     std::thread::sleep(Duration::from_millis(1));
@@ -2080,7 +2579,7 @@ mod tests {
                     self.player.position.y.floor() as i32,
                     self.player.position.z.floor() as i32,
                 );
-                self.mgr.update_streaming(center);
+                self.mgr.update_streaming(center, Season::Summer);
                 self.frames += 1;
             }
         }
@@ -2373,7 +2872,7 @@ mod tests {
         let mut warmup_calls = 0usize;
         let mut idle_polls = 0usize;
         for _ in 0..2000 {
-            mgr.update_streaming(start);
+            mgr.update_streaming(start, Season::Summer);
             warmup_calls += 1;
             if mgr.pending_gen.is_empty()
                 && mgr.pending_mesh.is_empty()
@@ -2397,7 +2896,7 @@ mod tests {
         for step in 1..=STEPS {
             let center = ChunkPos::new(start.x + step as i32, start.y, start.z);
             let t0 = Instant::now();
-            let (meshes, _unloaded) = mgr.update_streaming(center);
+            let (meshes, _unloaded) = mgr.update_streaming(center, Season::Summer);
             samples.push(t0.elapsed());
             meshes_completed += meshes.len();
             // Roughly one frame of slack so background workers keep feeding the
@@ -2408,8 +2907,10 @@ mod tests {
         // crossing. These calls are not timed; they only make the "pipeline
         // actually ran" negative control count the work the crossing started.
         for _ in 0..400 {
-            let (meshes, _) =
-                mgr.update_streaming(ChunkPos::new(start.x + STEPS as i32, 0, start.z));
+            let (meshes, _) = mgr.update_streaming(
+                ChunkPos::new(start.x + STEPS as i32, 0, start.z),
+                Season::Summer,
+            );
             meshes_completed += meshes.len();
             if mgr.pending_light.is_empty()
                 && mgr.light_inflight.is_empty()
