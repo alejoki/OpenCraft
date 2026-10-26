@@ -651,7 +651,7 @@ pub fn screen_labels(
         });
     }
     labels.push(InventoryLabel {
-        text: "Left click moves a stack".to_string(),
+        text: "Left click moves a stack, right click splits or places one".to_string(),
         left: footer_x,
         top: footer_top + LABEL_LINE_HEIGHT,
     });
@@ -1111,7 +1111,7 @@ mod tests {
             "player result preview"
         );
         assert!(texts.contains(&"Holding: Stone x5"));
-        assert!(texts.contains(&"Left click moves a stack"));
+        assert!(texts.contains(&"Left click moves a stack, right click splits or places one"));
         assert!(texts.contains(&status));
 
         for label in &labels {

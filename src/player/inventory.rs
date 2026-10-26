@@ -432,6 +432,46 @@ impl Item {
         Self::new(self.id, count)
     }
 
+    /// Splits off half the stack, rounded up, for a "pick up half" gesture.
+    ///
+    /// Returns `(moved, remainder)`. A single item (including every tool)
+    /// moves whole, and `remainder` is `None` when the source is emptied, so
+    /// callers can never construct a zero-count item. Counts are conserved by
+    /// construction: `moved.count + remainder.count == self.count`.
+    pub fn split_half(self) -> (Item, Option<Item>) {
+        if self.count <= 1 {
+            return (self, None);
+        }
+        let moved = self.count / 2 + self.count % 2;
+        let remainder = self.count - moved;
+        (
+            self.with_count(moved).expect("half stays within the limit"),
+            Some(
+                self.with_count(remainder)
+                    .expect("remainder stays within the limit"),
+            ),
+        )
+    }
+
+    /// Splits off exactly one unit for a "place one" gesture.
+    ///
+    /// Returns `(moved, remainder)`. A single item or a non-stackable tool
+    /// moves whole, and `remainder` is `None` when the source is emptied, so
+    /// callers can never construct a zero-count item. Counts are conserved by
+    /// construction: `moved.count + remainder.count == self.count`.
+    pub fn split_one(self) -> (Item, Option<Item>) {
+        if self.count <= 1 || !self.is_stackable() {
+            return (self, None);
+        }
+        (
+            self.with_count(1).expect("one stays within the limit"),
+            Some(
+                self.with_count(self.count - 1)
+                    .expect("remainder stays within the limit"),
+            ),
+        )
+    }
+
     /// Consumes one durability point.
     ///
     /// Returns `Ok(None)` when the tool broke (callers remove the slot) and
@@ -474,6 +514,8 @@ pub enum InventoryError {
     EmptyCursor,
     /// Cursor holds a different identity and cannot receive the slot stack.
     CursorOccupied,
+    /// A "place one" right-click hit a slot holding a different identity.
+    SlotOccupied,
     /// Cursor stack is already at its limit.
     CursorFull,
     /// Slot stack is already at its limit, so the cursor cannot merge into it.
@@ -786,6 +828,70 @@ impl Inventory {
         }
     }
 
+    /// Picks up half the slot stack (rounded up) onto an empty cursor.
+    ///
+    /// A single item or tool moves whole. An occupied cursor is
+    /// [`InventoryError::CursorOccupied`] with no mutation, so a right-click
+    /// can never merge into or replace an existing hand stack.
+    pub fn pick_up_half(&mut self, index: usize) -> Result<(), InventoryError> {
+        let slot_item = self
+            .slots
+            .get(index)
+            .copied()
+            .ok_or(InventoryError::OutOfBounds)?
+            .ok_or(InventoryError::EmptySlot)?;
+        if self.cursor.is_some() {
+            return Err(InventoryError::CursorOccupied);
+        }
+
+        let (moved, remainder) = slot_item.split_half();
+        self.slots[index] = remainder;
+        self.cursor = Some(moved);
+        Ok(())
+    }
+
+    /// Puts exactly one unit from the cursor into a slot.
+    ///
+    /// An empty slot accepts one item (a whole tool moves in), and a matching
+    /// stackable slot receives one item up to its limit. A different identity
+    /// is [`InventoryError::SlotOccupied`], a full matching stack is
+    /// [`InventoryError::SlotFull`], and both leave the inventory unchanged.
+    /// Every success conserves the combined item count.
+    pub fn place_one(&mut self, index: usize) -> Result<(), InventoryError> {
+        let cursor = self.cursor.ok_or(InventoryError::EmptyCursor)?;
+        let slot_item = self
+            .slots
+            .get(index)
+            .copied()
+            .ok_or(InventoryError::OutOfBounds)?;
+
+        match slot_item {
+            None => {
+                let (moved, remainder) = cursor.split_one();
+                self.slots[index] = Some(moved);
+                self.cursor = remainder;
+                Ok(())
+            }
+            Some(slot_item) => {
+                if !cursor.mergeable_with(&slot_item) {
+                    return Err(InventoryError::SlotOccupied);
+                }
+                let limit = slot_item.id.stack_limit();
+                if slot_item.count >= limit {
+                    return Err(InventoryError::SlotFull);
+                }
+                let (moved, remainder) = cursor.split_one();
+                self.slots[index] = Some(
+                    slot_item
+                        .with_count(slot_item.count + moved.count)
+                        .expect("merge stays within the stack limit"),
+                );
+                self.cursor = remainder;
+                Ok(())
+            }
+        }
+    }
+
     /// Puts the cursor stack down into a slot.
     ///
     /// - Empty slot: the cursor moves in.
@@ -950,6 +1056,11 @@ pub enum CraftError {
     InactiveCell,
     /// The current grid contents match no recipe.
     NoRecipe,
+    /// A "place one" right-click hit an occupied cell holding a different
+    /// identity.
+    CellOccupied,
+    /// A "place one" right-click hit a cell already at its stack limit.
+    CellFull,
     /// The destination inventory cannot hold the recipe output right now.
     DestinationFull,
 }
@@ -1912,6 +2023,139 @@ mod tests {
         let before = full_cursor.clone();
         assert_eq!(full_cursor.pick_up(1), Err(InventoryError::CursorFull));
         assert_eq!(full_cursor, before);
+    }
+
+    #[test]
+    fn pick_up_half_rounds_up_and_conserves_items() {
+        for count in [1_u16, 2, 3, 4, 5, 9, 64] {
+            let mut inventory = Inventory::empty();
+            inventory.slots[0] = Some(block(BlockId::OakPlanks, count));
+
+            inventory
+                .pick_up_half(0)
+                .expect("empty cursor splits the stack");
+
+            let expected_half = count / 2 + count % 2;
+            assert_eq!(
+                inventory.cursor().map(|item| item.count()),
+                Some(expected_half),
+                "half rounds up for {count}"
+            );
+            assert_eq!(
+                inventory.hotbar(0).map(|item| item.count()),
+                (count > expected_half).then_some(count - expected_half),
+                "the remainder stays in the slot for {count}"
+            );
+            assert_eq!(
+                total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+                u32::from(count),
+                "picking half conserves every unit"
+            );
+        }
+
+        // A tool is a single item: half of one is the whole tool.
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(tool(ToolKind::Pickaxe, ToolTier::Wood));
+        inventory.pick_up_half(0).expect("a tool moves whole");
+        assert_eq!(
+            inventory.cursor().map(|item| item.id()),
+            Some(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            })
+        );
+        assert_eq!(inventory.hotbar(0), None);
+    }
+
+    #[test]
+    fn pick_up_half_error_paths_preserve_state() {
+        let mut inventory = Inventory::empty();
+        assert_eq!(inventory.pick_up_half(0), Err(InventoryError::EmptySlot));
+        assert_eq!(
+            inventory.pick_up_half(INVENTORY_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+
+        inventory.slots[0] = Some(block(BlockId::Stone, 4));
+        inventory.pick_up(0).expect("cursor now holds the stack");
+        inventory.slots[0] = Some(block(BlockId::Stone, 2));
+        let before = inventory.clone();
+        assert_eq!(
+            inventory.pick_up_half(0),
+            Err(InventoryError::CursorOccupied),
+            "right-clicking never merges into an occupied cursor"
+        );
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn place_one_moves_exactly_one_unit_and_handles_edge_cases() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::OakPlanks, 5));
+        inventory.pick_up(0).expect("cursor holds five planks");
+
+        inventory.place_one(1).expect("empty slot accepts one");
+        assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(1));
+        assert_eq!(inventory.cursor().map(|item| item.count()), Some(4));
+
+        inventory.slots[2] = Some(block(BlockId::OakPlanks, 2));
+        inventory.place_one(2).expect("matching slot accepts one");
+        assert_eq!(inventory.hotbar(2).map(|item| item.count()), Some(3));
+        assert_eq!(inventory.cursor().map(|item| item.count()), Some(3));
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            7,
+            "place-one conserves the combined count"
+        );
+
+        // Full matching slot: rejected without moving anything.
+        inventory.slots[3] = Some(block(BlockId::OakPlanks, MAX_STACK_COUNT));
+        let before = inventory.clone();
+        assert_eq!(inventory.place_one(3), Err(InventoryError::SlotFull));
+        assert_eq!(inventory, before);
+
+        // Different identity: rejected without swapping or merging.
+        inventory.slots[4] = Some(block(BlockId::Stone, 1));
+        let before = inventory.clone();
+        assert_eq!(inventory.place_one(4), Err(InventoryError::SlotOccupied));
+        assert_eq!(inventory, before);
+
+        assert_eq!(
+            inventory.place_one(INVENTORY_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(inventory, before);
+
+        // A one-item hand drops the whole item and empties the cursor.
+        let mut last = Inventory::empty();
+        last.slots[0] = Some(block(BlockId::OakPlanks, 1));
+        last.pick_up(0).expect("cursor holds one plank");
+        last.place_one(5).expect("place the last item");
+        assert_eq!(last.cursor(), None);
+        assert_eq!(last.hotbar(5).map(|item| item.count()), Some(1));
+
+        // Empty cursor: explicit error, no mutation.
+        let before = last.clone();
+        assert_eq!(last.place_one(6), Err(InventoryError::EmptyCursor));
+        assert_eq!(last, before);
+    }
+
+    #[test]
+    fn place_one_moves_a_whole_tool_into_an_empty_slot() {
+        let mut inventory = Inventory::empty();
+        let pickaxe = tool(ToolKind::Pickaxe, ToolTier::Stone);
+        inventory.cursor = Some(pickaxe);
+
+        inventory.place_one(7).expect("a tool moves whole");
+        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.hotbar(7), Some(pickaxe));
+
+        // An occupied tool slot is not mergeable: rejected, not swapped.
+        inventory.pick_up(7).expect("pick the tool back up");
+        inventory.slots[8] = Some(tool(ToolKind::Axe, ToolTier::Iron));
+        let before = inventory.clone();
+        assert_eq!(inventory.place_one(8), Err(InventoryError::SlotOccupied));
+        assert_eq!(inventory, before);
     }
 
     #[test]

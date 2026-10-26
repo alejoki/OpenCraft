@@ -273,6 +273,20 @@ impl Player {
         }
     }
 
+    /// Right-click slot command: split-half or place-one.
+    ///
+    /// An empty cursor picks up half the slot stack, rounded up
+    /// ([`Inventory::pick_up_half`]); an occupied cursor puts exactly one unit
+    /// into the slot ([`Inventory::place_one`]). Rejected commands leave the
+    /// slot and cursor unchanged.
+    pub fn click_inventory_slot_right(&mut self, index: usize) -> Result<(), InventoryError> {
+        if self.inventory.cursor().is_some() {
+            self.inventory.place_one(index)
+        } else {
+            self.inventory.pick_up_half(index)
+        }
+    }
+
     /// Moves a whole stack between one crafting-grid cell and the cursor.
     ///
     /// `kind` selects the grid; a player-grid command can never read or write
@@ -343,6 +357,80 @@ impl Player {
                 self.inventory
                     .put_cursor(cell_item)
                     .map_err(InventoryCommandError::Inventory)
+            }
+        }
+    }
+
+    /// Right-click grid-cell command: split-half or place-one.
+    ///
+    /// An empty cursor takes half (rounded up) of the cell stack onto the
+    /// hand, leaving the remainder in the cell. An occupied cursor places
+    /// exactly one unit into an empty or matching cell. A different identity
+    /// is [`CraftError::CellOccupied`] and a full cell is
+    /// [`CraftError::CellFull`]; both leave the grid and cursor unchanged.
+    pub fn click_grid_cell_right(
+        &mut self,
+        kind: GridKind,
+        index: usize,
+    ) -> Result<(), InventoryCommandError> {
+        if index >= kind.slot_count() {
+            return Err(CraftError::OutOfBounds.into());
+        }
+
+        let grid = match kind {
+            GridKind::Player => &mut self.player_grid,
+            GridKind::Table => &mut self.table_grid,
+        };
+        let cell = grid.slot(index);
+
+        match (self.inventory.cursor(), cell) {
+            (None, None) => Ok(()),
+            (None, Some(cell_item)) => {
+                // Cell to hand, split half. The index is in range, so the set
+                // cannot fail; the cursor is empty, so put_cursor cannot fail.
+                let (moved, remainder) = cell_item.split_half();
+                grid.set(index, remainder)?;
+                self.inventory.put_cursor(moved)?;
+                Ok(())
+            }
+            (Some(_), None) => {
+                // Hand to empty cell, one unit. Take the hand first so a
+                // rejected set can restore the exact pre-command cursor.
+                let hand = self.inventory.take_cursor()?;
+                let (moved, remainder) = hand.split_one();
+                if let Err(error) = grid.set(index, Some(moved)) {
+                    let _ = self.inventory.put_cursor(hand);
+                    return Err(InventoryCommandError::Craft(error));
+                }
+                if let Some(remainder) = remainder {
+                    self.inventory.put_cursor(remainder)?;
+                }
+                Ok(())
+            }
+            (Some(_), Some(cell_item)) => {
+                // Hand to matching cell, one unit up to the cell's limit.
+                let hand = self.inventory.take_cursor()?;
+                if !hand.mergeable_with(&cell_item) {
+                    let _ = self.inventory.put_cursor(hand);
+                    return Err(CraftError::CellOccupied.into());
+                }
+                let limit = cell_item.id().stack_limit();
+                if cell_item.count() >= limit {
+                    let _ = self.inventory.put_cursor(hand);
+                    return Err(CraftError::CellFull.into());
+                }
+                let (moved, remainder) = hand.split_one();
+                let merged = cell_item
+                    .with_count(cell_item.count() + moved.count())
+                    .expect("right-click merge stays within the stack limit");
+                if let Err(error) = grid.set(index, Some(merged)) {
+                    let _ = self.inventory.put_cursor(hand);
+                    return Err(InventoryCommandError::Craft(error));
+                }
+                if let Some(remainder) = remainder {
+                    self.inventory.put_cursor(remainder)?;
+                }
+                Ok(())
             }
         }
     }
@@ -839,7 +927,7 @@ mod tests {
 
     // -- Inventory-screen command façade -------------------------------------
 
-    use crate::player::inventory::{ItemId, Material, RecipeId, INVENTORY_SLOTS};
+    use crate::player::inventory::{ItemId, Material, RecipeId, INVENTORY_SLOTS, MAX_STACK_COUNT};
 
     fn block_item(block: BlockId, count: u16) -> Item {
         Item::new(ItemId::Block(block), count).expect("valid test block stack")
@@ -870,7 +958,7 @@ mod tests {
         slots + cursor + grid_units(player.player_grid()) + grid_units(player.table_grid())
     }
 
-    fn player_with_slots(slots: [(usize, Item); 2]) -> Player {
+    fn player_with_slots<const N: usize>(slots: [(usize, Item); N]) -> Player {
         let mut all = [None; INVENTORY_SLOTS];
         for (index, item) in slots {
             all[index] = Some(item);
@@ -1033,6 +1121,170 @@ mod tests {
             .expect("empty/empty is a no-op");
         assert_eq!(player.player_grid().slot(3), None);
         assert_eq!(player_units(&player), units);
+    }
+
+    #[test]
+    fn right_click_slot_splits_a_stack_and_places_single_units() {
+        let mut player = player_with_slots([
+            (0, block_item(BlockId::OakPlanks, 5)),
+            (1, block_item(BlockId::OakPlanks, 2)),
+            (2, block_item(BlockId::Stone, 1)),
+        ]);
+        let units = player_units(&player);
+
+        // Empty cursor + right click: take half (rounded up).
+        player
+            .click_inventory_slot_right(0)
+            .expect("split half of five planks");
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(3)
+        );
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(player_units(&player), units);
+
+        // Occupied cursor + right click on a matching stack: place exactly one.
+        player
+            .click_inventory_slot_right(1)
+            .expect("place one plank into the matching stack");
+        assert_eq!(
+            player.inventory().hotbar(1).map(|item| item.count()),
+            Some(3)
+        );
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(player_units(&player), units);
+
+        // Occupied cursor + right click on an empty slot: place exactly one.
+        player
+            .click_inventory_slot_right(3)
+            .expect("place one plank into an empty slot");
+        assert_eq!(
+            player.inventory().hotbar(3).map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(player_units(&player), units);
+
+        // Different identity is rejected without a swap.
+        let before = player.inventory().clone();
+        assert_eq!(
+            player.click_inventory_slot_right(2),
+            Err(InventoryError::SlotOccupied)
+        );
+        assert_eq!(player.inventory(), &before);
+    }
+
+    #[test]
+    fn right_click_grid_places_one_into_a_cell_and_splits_from_a_cell() {
+        let mut player = player_with_slots([(0, block_item(BlockId::OakPlanks, 7))]);
+        let units = player_units(&player);
+
+        // Pick up half the stack onto the hand, then right-click a grid cell:
+        // exactly one plank enters the cell so a shaped recipe can be built.
+        player
+            .click_inventory_slot_right(0)
+            .expect("hand holds four planks");
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(4)
+        );
+
+        player
+            .click_grid_cell_right(GridKind::Player, 0)
+            .expect("place one into the grid");
+        assert_eq!(
+            player.player_grid().slot(0).map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(3)
+        );
+
+        // Right-clicking the same cell again tops it up by one.
+        player
+            .click_grid_cell_right(GridKind::Player, 0)
+            .expect("top the cell up by one");
+        assert_eq!(
+            player.player_grid().slot(0).map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(player_units(&player), units);
+
+        // Empty hand + right click a cell: take half, leaving the remainder.
+        player
+            .click_grid_cell(GridKind::Player, 0)
+            .expect("a left click still takes the whole cell");
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+        player
+            .click_grid_cell_right(GridKind::Player, 1)
+            .expect("place one in the second cell");
+        assert_eq!(
+            player.player_grid().slot(1).map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(1)
+        );
+
+        player.click_inventory_slot(4).expect("park the last plank");
+        player
+            .click_grid_cell_right(GridKind::Player, 1)
+            .expect("empty hand splits the cell");
+        assert_eq!(
+            player.inventory().cursor().map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(player.player_grid().slot(1), None);
+        assert_eq!(player_units(&player), units);
+    }
+
+    #[test]
+    fn right_click_grid_rejects_different_or_full_cells_without_mutation() {
+        let mut player = player_with_slots([(0, block_item(BlockId::OakPlanks, 2))]);
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::Stone, 1)))
+            .expect("stone cell");
+        player_grid
+            .set(1, Some(block_item(BlockId::OakPlanks, MAX_STACK_COUNT)))
+            .expect("full plank cell");
+        player.player_grid = player_grid;
+        player
+            .click_inventory_slot(0)
+            .expect("hand holds two planks");
+
+        let before_inventory = player.inventory().clone();
+        let before_grid = player.player_grid().clone();
+        for (index, error) in [
+            (0, CraftError::CellOccupied),
+            (1, CraftError::CellFull),
+            (4, CraftError::OutOfBounds),
+        ] {
+            assert_eq!(
+                player.click_grid_cell_right(GridKind::Player, index),
+                Err(InventoryCommandError::Craft(error))
+            );
+            assert_eq!(player.inventory(), &before_inventory);
+            assert_eq!(player.player_grid(), &before_grid);
+        }
     }
 
     #[test]

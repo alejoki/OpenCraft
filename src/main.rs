@@ -436,17 +436,53 @@ fn close_inventory(
     set_cursor_grab(window, true);
 }
 
+/// Which mouse button issued an inventory command.
+///
+/// Left is whole-stack movement; right is the split-half / place-one
+/// gesture. Keeping the button explicit in the adapter means the domain
+/// never has to guess intent from cursor state alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InventoryClickButton {
+    Left,
+    Right,
+}
+
 /// Translates one clicked target into exactly one `Player` inventory command.
 ///
 /// Table targets are rejected unless this frame's mode is `Table` (an attached
 /// screen alone is never enough — the live table must still exist), and every
 /// other target routes to the kind-specific façade method. No branch reads or
-/// computes stack counts.
+/// computes stack counts. This is the left-click entry point; right-click
+/// gestures go through [`apply_inventory_click_button`].
 pub fn apply_inventory_click(
     player: &mut Player,
     screen: &InventoryScreen,
     table_open: Option<IVec3>,
     target: InventoryTarget,
+) -> Result<InventoryClickOutcome, InventoryCommandError> {
+    apply_inventory_click_button(
+        player,
+        screen,
+        table_open,
+        target,
+        InventoryClickButton::Left,
+    )
+}
+
+/// Translates one clicked target and mouse button into exactly one `Player`
+/// inventory command.
+///
+/// Left clicks move whole stacks; right clicks split half out of a source or
+/// place exactly one unit into a destination. Result slots craft once for
+/// either button (there is no half-craft), so a right-click on the output can
+/// never mint a partial item. Rejected commands propagate the domain error
+/// unchanged, which keeps the conservation guarantees in one place.
+pub fn apply_inventory_click_button(
+    player: &mut Player,
+    screen: &InventoryScreen,
+    table_open: Option<IVec3>,
+    target: InventoryTarget,
+    button: InventoryClickButton,
 ) -> Result<InventoryClickOutcome, InventoryCommandError> {
     let mode = screen.mode(table_open);
     let table_target = matches!(
@@ -459,28 +495,56 @@ pub fn apply_inventory_click(
     if table_target && mode != InventoryMode::Table {
         return Err(InventoryCommandError::TableUnavailable);
     }
-    match target {
-        InventoryTarget::Slot(index) => player
+    match (button, target) {
+        (InventoryClickButton::Left, InventoryTarget::Slot(index)) => player
             .click_inventory_slot(index)
             .map(|()| InventoryClickOutcome::Moved)
             .map_err(InventoryCommandError::from),
-        InventoryTarget::GridCell {
-            kind: GridKind::Player,
-            index,
-        } => player
+        (InventoryClickButton::Right, InventoryTarget::Slot(index)) => player
+            .click_inventory_slot_right(index)
+            .map(|()| InventoryClickOutcome::Moved)
+            .map_err(InventoryCommandError::from),
+        (
+            InventoryClickButton::Left,
+            InventoryTarget::GridCell {
+                kind: GridKind::Player,
+                index,
+            },
+        ) => player
             .click_grid_cell(GridKind::Player, index)
             .map(|()| InventoryClickOutcome::Moved),
-        InventoryTarget::GridCell {
-            kind: GridKind::Table,
-            index,
-        } => player
+        (
+            InventoryClickButton::Right,
+            InventoryTarget::GridCell {
+                kind: GridKind::Player,
+                index,
+            },
+        ) => player
+            .click_grid_cell_right(GridKind::Player, index)
+            .map(|()| InventoryClickOutcome::Moved),
+        (
+            InventoryClickButton::Left,
+            InventoryTarget::GridCell {
+                kind: GridKind::Table,
+                index,
+            },
+        ) => player
             .click_grid_cell(GridKind::Table, index)
             .map(|()| InventoryClickOutcome::Moved),
-        InventoryTarget::ResultSlot(GridKind::Player) => player
+        (
+            InventoryClickButton::Right,
+            InventoryTarget::GridCell {
+                kind: GridKind::Table,
+                index,
+            },
+        ) => player
+            .click_grid_cell_right(GridKind::Table, index)
+            .map(|()| InventoryClickOutcome::Moved),
+        (_, InventoryTarget::ResultSlot(GridKind::Player)) => player
             .take_craft_result(GridKind::Player)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
-        InventoryTarget::ResultSlot(GridKind::Table) => player
+        (_, InventoryTarget::ResultSlot(GridKind::Table)) => player
             .take_craft_result(GridKind::Table)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
@@ -2573,7 +2637,8 @@ impl ApplicationHandler for GameApp {
                 // Inventory panel (S03-T03): while open it owns every click.
                 // Left press issues exactly one whole-stack command; a press
                 // that picked a stack arms a possible drag, while a place,
-                // swap, or craft ends the gesture. Right press is consumed.
+                // swap, or craft ends the gesture. Right press issues one
+                // split-half or place-one command and never arms a drag.
                 // Returning here keeps the click away from the re-grab branch,
                 // table interaction, placement, and hold-to-mine arming.
                 if self.inventory.is_open() {
@@ -2624,7 +2689,25 @@ impl ApplicationHandler for GameApp {
                                 self.inventory_drag = None;
                             }
                         }
-                        MouseButton::Right => {}
+                        MouseButton::Right => {
+                            // Right click never moves a whole stack, so it can
+                            // never begin a press-drag-release gesture.
+                            let layout = layout(surface_w, surface_h, mode);
+                            let target = self
+                                .cursor_pos
+                                .and_then(|cursor| hit_test(mode, &layout, cursor));
+                            if let Some(target) = target {
+                                let result = apply_inventory_click_button(
+                                    &mut self.session.player,
+                                    &self.inventory,
+                                    table_open,
+                                    target,
+                                    InventoryClickButton::Right,
+                                );
+                                self.inventory_status = Some(inventory_status_text(result));
+                            }
+                            self.inventory_drag = None;
+                        }
                         _ => {}
                     }
                     return;
@@ -5440,6 +5523,71 @@ mod tests {
     }
 
     #[test]
+    fn apply_inventory_right_click_splits_a_stack_and_places_one_in_the_grid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(35, dir.path().join("right-click.mcvx"));
+        for _ in 0..5 {
+            session.player.collect_block(BlockId::OakPlanks);
+        }
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        let units_before = inventory_units(&session.player);
+
+        // Right click on the stack separates half (rounded up) onto the hand.
+        let outcome = apply_inventory_click_button(
+            &mut session.player,
+            &screen,
+            None,
+            InventoryTarget::Slot(0),
+            InventoryClickButton::Right,
+        )
+        .expect("right click splits the plank stack");
+        assert_eq!(outcome, InventoryClickOutcome::Moved);
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(3)
+        );
+        assert_eq!(
+            session
+                .player
+                .inventory()
+                .hotbar(0)
+                .map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(inventory_units(&session.player), units_before);
+
+        // A right click on a grid cell places exactly one, which is the
+        // gesture the player needs for a single-item recipe slot.
+        let cell = InventoryTarget::GridCell {
+            kind: GridKind::Player,
+            index: 0,
+        };
+        let outcome = apply_inventory_click_button(
+            &mut session.player,
+            &screen,
+            None,
+            cell,
+            InventoryClickButton::Right,
+        )
+        .expect("right click places one plank in the grid");
+        assert_eq!(outcome, InventoryClickOutcome::Moved);
+        assert_eq!(
+            session
+                .player
+                .player_grid()
+                .slot(0)
+                .map(|item| item.count()),
+            Some(1)
+        );
+        assert_eq!(
+            session.player.inventory().cursor().map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(inventory_units(&session.player), units_before);
+    }
+
+    #[test]
     fn apply_inventory_click_crafts_once_and_the_second_click_is_no_recipe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(34, dir.path().join("craft-click.mcvx"));
@@ -5921,7 +6069,7 @@ mod tests {
             "the 2x2 result preview is named"
         );
         assert!(texts.contains(&"Holding: Stone x7"));
-        assert!(texts.contains(&"Left click moves a stack"));
+        assert!(texts.contains(&"Left click moves a stack, right click splits or places one"));
         assert!(texts.contains(&"Crafted Crafting Table"));
         assert!(labels.len() <= MAX_LABELS);
 
