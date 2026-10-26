@@ -124,6 +124,11 @@ fn compute_light_region_snapshot(
 const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
 const LIGHT_DISPATCH_BUDGET: usize = 4;
 
+/// Per-frame ceiling for completed meshes handed back to the renderer. Public
+/// to the tests through the module so the bounded-wave proof pins the real
+/// budget instead of a copy of its literal.
+const MESH_DRAIN_BUDGET: usize = 32;
+
 /// Cap on generation jobs in flight (player-driven loads and seasonal rollover
 /// replacements share it, so a wave can never flood the pool).
 const PENDING_GEN_CAP: usize = 96;
@@ -1156,7 +1161,7 @@ impl WorldManager {
         self.drain_light_results();
 
         // 3. Drain up to 32 completed meshes per frame
-        for _ in 0..32 {
+        for _ in 0..MESH_DRAIN_BUDGET {
             let Ok((pos, mesh)) = self.mesh_rx.try_recv() else {
                 break;
             };
@@ -1711,6 +1716,330 @@ mod tests {
             mgr.has_column_light(key.0, key.1),
             "the swapped column never relit: its grids were not dropped before the trigger"
         );
+    }
+
+    /// First non-beach Plains/Forest column near the origin: a seasonal
+    /// snow-blanket witness that can be streamed inside a small rd=4 ring.
+    fn find_non_beach_land_column(seed: u32) -> (i32, i32, i32) {
+        use crate::world::terrain::{
+            biome_at_seeded, terrain_height_at_seeded, Biome, BEACH_BAND, SEA_LEVEL,
+        };
+        for wz in -128..=128 {
+            for wx in -128..=128 {
+                let biome = biome_at_seeded(wx, wz, seed);
+                if !matches!(biome, Biome::Plains | Biome::Forest) {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h > SEA_LEVEL + BEACH_BAND {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("seed {seed} has no non-beach plains/forest column inside +-128 blocks");
+    }
+
+    /// The streaming pipeline is idle when no generation, meshing, or light
+    /// work is in flight. Mirrors the release `streaming_budget` warm-up
+    /// predicate (deliberately excludes `dirty_mesh_queue`, which keeps
+    /// chunks outside render distance queued forever by design).
+    fn streaming_is_idle(mgr: &WorldManager) -> bool {
+        mgr.pending_gen.is_empty()
+            && mgr.pending_mesh.is_empty()
+            && mgr.pending_light.is_empty()
+            && mgr.light_inflight.is_empty()
+            && mgr.light_rx.is_empty()
+    }
+
+    /// Fill every x/z column a rd=4 manager's spiral could generate with a
+    /// uniform-air chunk (never the witness column), so later pumps in the
+    /// day-boundary test dispatch no new terrain and leave no large background
+    /// backlog on the process-wide rayon pool. A fixture seam, like the
+    /// uniform test chunks the mining/placement tests use.
+    fn prefill_streaming_ring_with_air(world: &mut WorldManager, center: ChunkPos) {
+        // rd=4 -> the manager's spiral reaches rd + 2 = 6 columns out.
+        for dx in -6..=6 {
+            for dz in -6..=6 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(center.x + dx, cy, center.z + dz);
+                    if !world.is_resident(pos) {
+                        world.insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accelerated day-boundary worldgen proof (M007/S05): a real
+    /// [`WorldSession`] clock crossing `DAY_BOUNDARY_TICK` flips
+    /// [`WorldSession::season`] — the exact derivation the Playing frame loop
+    /// calls — and the following `update_streaming` call (the same one the
+    /// Playing arm makes) rolls the resident witness surface into Winter.
+    ///
+    /// The pipeline is drained to idle before returning: the global rayon pool
+    /// is shared by the whole lib test binary, so a test that leaves seasonal
+    /// light/mesh work behind can starve sibling streaming tests.
+    #[test]
+    fn test_accelerated_day_boundary_rolls_the_live_session_into_winter() {
+        use crate::world::daycycle;
+        use crate::world::session::WorldSession;
+
+        let _heavy = lock_heavy_streaming();
+        let seed = 1;
+        let (wx, wz, h) = find_non_beach_land_column(seed);
+        let center = ChunkPos::new(
+            wx.div_euclid(CHUNK_SIZE as i32),
+            0,
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Seed 1 starts in Spring; one-day seasons make day 3 Winter.
+        let mut session = WorldSession::new_session(
+            seed,
+            std::path::PathBuf::from("/tmp/m007-day-boundary.mcvx"),
+            1,
+        );
+        session.world.set_render_distance(4);
+        session.player.position = glam::Vec3::new(wx as f32 + 0.5, (h + 4) as f32, wz as f32 + 0.5);
+        session.sync_camera();
+
+        // Day 2 is Autumn for seed 1. Start just before the day boundary.
+        session.clock = daycycle::GameClock::from_day_and_time(2, daycycle::DAY_TICKS - 10);
+        let start = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+
+        // Warm the resident world in Autumn through the same derivation and
+        // streaming call the frame loop uses.
+        while std::time::Instant::now() < deadline
+            && !(session.season() == Season::Autumn
+                && session.world.get_block(wx, h, wz) == BlockId::Grass)
+        {
+            let season = session.season();
+            session.world.update_streaming(center, season);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(session.season(), Season::Autumn);
+        assert_eq!(
+            session.world.generation_season(),
+            Season::Autumn,
+            "the Autumn warm-up never settled on the session's derived season"
+        );
+        assert_eq!(
+            session.world.get_block(wx, h, wz),
+            BlockId::Grass,
+            "test premise: the witness surface is Grass on day 2 (Autumn)"
+        );
+
+        // Two accelerated Playing frames: the first arms the marker, the second
+        // advances 1,200 ticks and crosses DAY_BOUNDARY_TICK.
+        session.clock.tick(true, start, 60.0);
+        session
+            .clock
+            .tick(true, start + std::time::Duration::from_secs(1), 60.0);
+        assert_eq!(
+            session.clock.day_index,
+            crate::world::season::FIRST_WINTER_DAY,
+            "test premise: seed 1 at one-day seasons reaches Winter on day 3"
+        );
+        assert_eq!(
+            session.season(),
+            Season::Winter,
+            "the real clock crossing must derive Winter"
+        );
+
+        // The first frame-loop call snapshots the warmed resident set as the
+        // rollover queue. Only then is the rest of the spiral prefilled, so
+        // later pumps dispatch no new terrain.
+        let mut wave_calls = 0usize;
+        let season = session.season();
+        session.world.update_streaming(center, season);
+        wave_calls += 1;
+        prefill_streaming_ring_with_air(&mut session.world, center);
+
+        while std::time::Instant::now() < deadline
+            && session.world.get_block(wx, h, wz) != BlockId::Snow
+        {
+            let season = session.season();
+            session.world.update_streaming(center, season);
+            wave_calls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            session.world.get_block(wx, h, wz),
+            BlockId::Snow,
+            "Winter worldgen never arrived at the player's stationary chunk \
+             ({wx}, {h}, {wz}) after {wave_calls} frame-loop pumps"
+        );
+
+        // Drain so the wave settles and no background light/mesh work leaks
+        // into sibling tests on the shared rayon pool.
+        while std::time::Instant::now() < deadline && !streaming_is_idle(&session.world) {
+            let season = session.season();
+            session.world.update_streaming(center, season);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            streaming_is_idle(&session.world),
+            "the day-boundary wave never settled after {wave_calls} frame-loop pumps"
+        );
+        assert_eq!(
+            session.world.generation_season(),
+            Season::Winter,
+            "the settled world must be keyed on Winter"
+        );
+        assert_eq!(session.season(), Season::Winter);
+        assert_eq!(session.world.get_block(wx, h, wz), BlockId::Snow);
+        assert!(
+            session.world.chunk_edits().is_empty(),
+            "the seasonal rollover wrote chunk edits: season is derived data, never a save edit"
+        );
+    }
+
+    /// Count-based bounded-wave proof (M007/S05): a live season change must
+    /// arrive through the existing per-frame caps as a multi-frame wave, never
+    /// as a one-frame full-world remesh, and it must never write a seasonal
+    /// chunk edit.
+    ///
+    /// Count-based rather than timing-based so debug-mode CI is meaningful. The
+    /// per-call ceiling is structural (the mesh drain budget) while the total
+    /// across the wave exceeds it, which together make single-frame completion
+    /// impossible. The end state is pinned on real generated content: the
+    /// witness column's Grass surface becomes Snow, a pre-placed edit survives,
+    /// and `chunk_edits` is byte-identical before and after the wave.
+    #[test]
+    fn test_season_change_rolls_as_a_bounded_multi_frame_wave() {
+        let _heavy = lock_heavy_streaming();
+        let seed = 1;
+        let (wx, wz, h) = find_non_beach_land_column(seed);
+        let center = ChunkPos::new(
+            wx.div_euclid(CHUNK_SIZE as i32),
+            0,
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        let mut mgr = WorldManager::with_seed_and_edits(4, seed, ChunkEditMap::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+
+        // Warm up at the plan's Spring baseline until the whole small ring is
+        // resident and the pipeline is idle.
+        let mut warmup_calls = 0usize;
+        let mut idle_polls = 0usize;
+        while std::time::Instant::now() < deadline {
+            mgr.update_streaming(center, Season::Spring);
+            warmup_calls += 1;
+            if streaming_is_idle(&mgr) {
+                idle_polls += 1;
+                if idle_polls >= 4 {
+                    break;
+                }
+            } else {
+                idle_polls = 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            streaming_is_idle(&mgr),
+            "warm-up never settled after {warmup_calls} pumps: generation, meshing, or light work is still in flight"
+        );
+        assert_eq!(mgr.generation_season(), Season::Spring);
+        assert!(
+            mgr.is_resident(ChunkPos::new(
+                center.x,
+                h.div_euclid(CHUNK_SIZE as i32),
+                center.z
+            )),
+            "the warm-up streamed no witness chunk at {center:?}"
+        );
+        assert_eq!(
+            mgr.get_block(wx, h, wz),
+            BlockId::Grass,
+            "test premise: the non-beach witness surface is Grass in Spring"
+        );
+
+        // Pre-place an edit on the air block directly above the surface: it
+        // must survive the seasonal swap (edits always win).
+        assert_eq!(mgr.get_block(wx, h + 1, wz), BlockId::Air);
+        mgr.set_block_immediate(wx, h + 1, wz, BlockId::Brick);
+        assert_eq!(mgr.get_block(wx, h + 1, wz), BlockId::Brick);
+        let edits_before = mgr.chunk_edits().clone();
+
+        // Ride the wave with the same call the frame loop makes. No call may
+        // complete more than the mesh drain budget; the total must exceed it
+        // across multiple calls.
+        let mut wave_calls = 0usize;
+        let mut total_completed_meshes = 0usize;
+        let mut calls_with_meshes = 0usize;
+        while std::time::Instant::now() < deadline {
+            let (meshes, _unloaded) = mgr.update_streaming(center, Season::Winter);
+            wave_calls += 1;
+            assert!(
+                meshes.len() <= MESH_DRAIN_BUDGET,
+                "one frame completed {} meshes, above the {MESH_DRAIN_BUDGET}-mesh drain budget: the rollover regressed to a one-frame remesh",
+                meshes.len()
+            );
+            total_completed_meshes += meshes.len();
+            if !meshes.is_empty() {
+                calls_with_meshes += 1;
+            }
+            if streaming_is_idle(&mgr) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(
+            streaming_is_idle(&mgr),
+            "the rollover wave never settled after {wave_calls} pumps ({total_completed_meshes} meshes so far)"
+        );
+        assert_eq!(
+            mgr.generation_season(),
+            Season::Winter,
+            "the wave must settle on the requested season"
+        );
+        assert!(mgr.season_rollover_target.is_none());
+        assert!(mgr.season_rollover.is_empty());
+        assert!(
+            wave_calls >= 2 && total_completed_meshes > MESH_DRAIN_BUDGET && calls_with_meshes >= 2,
+            "the change completed {total_completed_meshes} meshes in {wave_calls} pumps \
+             ({calls_with_meshes} with work): not a bounded multi-frame wave"
+        );
+        eprintln!(
+            "season_wave: warmup_calls={warmup_calls} wave_calls={wave_calls} \
+             completed_meshes={total_completed_meshes} calls_with_meshes={calls_with_meshes}"
+        );
+
+        // The swapped world is real Winter content, in place.
+        assert_eq!(
+            mgr.get_block(wx, h, wz),
+            BlockId::Snow,
+            "the witness surface at ({wx}, {h}, {wz}) did not become Winter blanket Snow"
+        );
+        assert_eq!(
+            mgr.get_block(wx, h + 1, wz),
+            BlockId::Brick,
+            "the seasonal swap discarded a pre-placed edit"
+        );
+
+        // The invariant: seasonal regeneration is derived data only. It must
+        // never add a chunk edit (water already cannot be one by construction).
+        assert_eq!(
+            mgr.chunk_edits(),
+            &edits_before,
+            "the rollover wave wrote seasonal chunk edits; edits must be player-driven only"
+        );
+
+        // Steady state: a settled Winter manager re-dispatches nothing.
+        let (steady_meshes, _) = mgr.update_streaming(center, Season::Winter);
+        assert!(
+            steady_meshes.is_empty(),
+            "a settled season completed {} meshes instead of staying steady",
+            steady_meshes.len()
+        );
+        assert_eq!(mgr.generation_season(), Season::Winter);
+        assert!(mgr.season_rollover_target.is_none());
     }
 
     #[test]

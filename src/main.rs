@@ -62,7 +62,6 @@ use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
-use opencraft::world::season::season_of;
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
@@ -2913,14 +2912,12 @@ impl ApplicationHandler for GameApp {
                     );
                     // Live season (M007/S05): derived from the persisted
                     // calendar every frame, so a day rollover starts the
-                    // manager's bounded seasonal rollover wave. Pure function
-                    // of (day_index, season_length_days, seed) — never the
-                    // wall clock.
-                    let season = season_of(
-                        self.session.clock.day_index,
-                        self.session.season_length_days,
-                        self.session.world.seed(),
-                    );
+                    // manager's bounded seasonal rollover wave. `WorldSession::season`
+                    // is the single home for the derivation (and the seam the
+                    // day-boundary test drives): a pure function of
+                    // (day_index, season_length_days, seed), never the wall
+                    // clock.
+                    let season = self.session.season();
                     let (new_meshes, unloaded) =
                         self.session.world.update_streaming(player_chunk, season);
                     if !unloaded.is_empty()
@@ -4250,6 +4247,53 @@ mod tests {
         let relaunched = WorldSession::session_from_save(loaded, save_path.clone());
         assert_eq!(relaunched.clock.day_index, 1);
         assert_eq!(relaunched.season_length_days, 4);
+    }
+
+    /// Accelerated day-boundary clock proof (M007/S05): a real `GameApp`
+    /// session whose `GameClock` crosses `DAY_BOUNDARY_TICK` at the
+    /// `--time-scale` seam derives Winter through `WorldSession::season`, the
+    /// exact method the Playing frame loop calls. The resident worldgen that
+    /// follows the season is proven separately in the lib-side
+    /// `world::manager` day-boundary test, where the global rayon pool can be
+    /// serialised and drained without starving sibling bin tests.
+    #[test]
+    fn accelerated_day_boundary_flips_the_session_season_to_winter() {
+        use opencraft::world::season::FIRST_WINTER_DAY;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("day-boundary.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        // Seed 1 starts in Spring, so day 3 is Winter at one-day seasons.
+        let mut app = GameApp::new(cli, WorldSession::new_session(1, save_path, 1));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        app.time_scale = 60.0;
+
+        // Day 2 is Autumn for seed 1. Start just before the day boundary so a
+        // single accelerated frame crosses it.
+        app.session.clock =
+            opencraft::world::daycycle::GameClock::from_day_and_time(2, daycycle::DAY_TICKS - 10);
+        assert_eq!(app.session.season(), Season::Autumn);
+
+        let start = Instant::now();
+        // Arm the clock marker; the next accelerated frame advances 1,200 ticks
+        // (1 real second at 60x), crossing DAY_BOUNDARY_TICK.
+        tick_app_clock(&mut app, start);
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+
+        assert_eq!(
+            app.session.clock.day_index, FIRST_WINTER_DAY,
+            "test premise: seed 1 at one-day seasons reaches Winter on day 3"
+        );
+        assert_eq!(
+            app.session.clock.time_of_day,
+            (daycycle::DAY_TICKS - 10 + 1_200) % daycycle::DAY_TICKS
+        );
+        assert_eq!(
+            app.session.season(),
+            Season::Winter,
+            "the real clock crossing must feed Winter into the session's season derivation"
+        );
     }
 
     #[test]
@@ -7448,8 +7492,11 @@ mod tests {
 
         // The persisted edit re-applies when the chunk regenerates (the
         // same bounded streaming pump the WorldManager
-        // unload/regeneration test uses — headless, rayon-driven).
-        for _ in 0..40 {
+        // unload/regeneration test uses — headless, rayon-driven). The retry
+        // window is deliberately generous: this binary runs other streaming
+        // tests in parallel on the shared rayon pool, so a 200 ms window can
+        // miss an otherwise healthy generation result.
+        for _ in 0..400 {
             app.session.world.update_streaming(cpos, Season::Summer);
             if app.session.world.get_block(0, 40, 5) == BlockId::Brick {
                 break;

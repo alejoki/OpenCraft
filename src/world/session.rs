@@ -17,6 +17,7 @@ use crate::player::raycast::raycast_voxels;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
+use crate::world::season::{season_of, Season};
 use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
@@ -112,6 +113,21 @@ impl WorldSession {
         };
         session.sync_camera();
         session
+    }
+
+    /// The live season of this session, derived from its persisted calendar.
+    ///
+    /// The Playing frame loop calls this once per frame so a day rollover starts
+    /// the world manager's bounded seasonal rollover wave. Pure function of
+    /// `(day_index, season_length_days, seed)` — never the wall clock — and the
+    /// day-boundary acceptance test drives this exact method, so the seam the
+    /// test proves is the seam production runs.
+    pub fn season(&self) -> Season {
+        season_of(
+            self.clock.day_index,
+            self.season_length_days,
+            self.world.seed(),
+        )
     }
 
     /// Sync the camera from the player: eye position plus yaw/pitch. Called
