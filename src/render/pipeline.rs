@@ -1416,15 +1416,22 @@ mod tests {
     fn vista_sky_params_use_the_pinned_golden_hour() {
         // Source pin: the vista arm must pass VISTA_GOLDEN_HOUR (S02's single
         // home for the constant) rather than the world clock, and the session
-        // arm must pass the live clock. Both go through `sky_params`.
+        // arm must pass the live clock. Both go through `sky_params`, whose
+        // third argument is the S04-T03 underwater flag: the vista panorama
+        // anchors over land so it pins `false`, while the session arm feeds the
+        // per-frame eye-submersion lookup through.
         let src = include_str!("../main.rs");
         assert!(
-            src.contains("sky_params(palette, daycycle::VISTA_GOLDEN_HOUR)"),
-            "vista frames must pin the sky time to golden hour"
+            src.contains("sky_params(palette, daycycle::VISTA_GOLDEN_HOUR, false)"),
+            "vista frames must pin the sky time to golden hour and stay dry"
         );
         assert!(
-            src.contains("sky_params(palette, self.session.clock.time_of_day)"),
-            "session frames must follow the live clock"
+            src.contains("sky_params(palette, self.session.clock.time_of_day, underwater)"),
+            "session frames must follow the live clock and the submersion lookup"
+        );
+        assert!(
+            src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),
+            "the session arm must derive the flag from the live eye position"
         );
     }
 

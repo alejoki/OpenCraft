@@ -698,12 +698,10 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
 /// only drives camera drift). Passing the constant here is what makes the
 /// golden-hour sun appear: `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above
 /// the eastern horizon.
-fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
+fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32, underwater: bool) -> SkyParams {
     SkyParams {
         time_of_day,
-        // The per-frame eye-submersion lookup lands in S04-T03; until then the
-        // air palette is always used (the water pass itself already ships).
-        underwater: false,
+        underwater,
         day_factor: palette.day_factor,
         fog_color: [
             palette.fog_color[0],
@@ -718,6 +716,24 @@ fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
             a: 1.0,
         },
     }
+}
+
+/// True when the camera's eye sits inside a liquid block.
+///
+/// One bounded block lookup per frame (never a scan), mirroring
+/// [`WorldSession::sync_open_table`]: the eye position is floored to its block
+/// and the liquid predicate on that id decides submersion. [`WorldManager::get_block`]
+/// answers [`BlockId::Air`] for unloaded chunks and above the world top, so an
+/// unloaded column can never report false water; below the world floor it
+/// answers bedrock, which is likewise not a liquid.
+fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
+    world
+        .get_block(
+            eye.x.floor() as i32,
+            eye.y.floor() as i32,
+            eye.z.floor() as i32,
+        )
+        .is_liquid()
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -3366,13 +3382,22 @@ impl ApplicationHandler for GameApp {
                         None,
                         self.session.player.selected_slot(),
                         false,
-                        sky_params(palette, daycycle::VISTA_GOLDEN_HOUR),
+                        // Vista frames render the panorama from its own world,
+                        // whose camera anchors over land: never submerged.
+                        sky_params(palette, daycycle::VISTA_GOLDEN_HOUR, false),
                         ui_pass,
                     )
                 } else {
                     // Per-frame palette from the live session clock (pure math,
                     // cheap — same rationale as the per-frame vista camera).
                     let palette = daycycle::sky_palette(self.session.clock.time_of_day);
+                    // Eye submersion (S04-T03): one bounded block lookup per
+                    // session frame against the live eye position (synced from
+                    // `player.eye_position()` above), never a scan. It flips the
+                    // world-pass fog to the deep-water shift while the camera is
+                    // inside an ocean.
+                    let underwater =
+                        eye_is_submerged(&self.session.world, self.session.camera.position);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
@@ -3381,7 +3406,7 @@ impl ApplicationHandler for GameApp {
                         target_block,
                         self.session.player.selected_slot(),
                         playing,
-                        sky_params(palette, self.session.clock.time_of_day),
+                        sky_params(palette, self.session.clock.time_of_day, underwater),
                         ui_pass,
                     )
                 };
@@ -3410,13 +3435,14 @@ impl ApplicationHandler for GameApp {
                                 ""
                             };
                             window.set_title(&format!(
-                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
+                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} | Water: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
                                 screen_title_tag(self.lifecycle.screen()),
                                 fps,
                                 ms,
                                 visible_chunks,
                                 self.session.world.loaded_chunk_count(),
                                 gpu.render_store.total_quads,
+                                gpu.render_store.total_water_quads,
                                 vram_kb,
                                 self.session.player.position.x,
                                 self.session.player.position.y,
@@ -8617,7 +8643,7 @@ mod tests {
             (0u32, [0.96f32, 0.66, 0.42], [0.92f32, 0.68, 0.48]),
         ];
         for (tick, sky, fog) in cases {
-            let params = sky_params(daycycle::sky_palette(tick), tick);
+            let params = sky_params(daycycle::sky_palette(tick), tick, false);
             assert_eq!(params.time_of_day, tick);
             assert_eq!(params.clear_color.r, sky[0] as f64);
             assert_eq!(params.clear_color.g, sky[1] as f64);
@@ -8627,7 +8653,7 @@ mod tests {
         }
 
         // The midnight clear/fog must equal the NIGHT keyframe exactly.
-        let midnight = sky_params(daycycle::sky_palette(18_000), 18_000);
+        let midnight = sky_params(daycycle::sky_palette(18_000), 18_000, false);
         let night = daycycle::sky_palette(18_000);
         assert_eq!(midnight.clear_color.r, night.sky_color[0] as f64);
         assert_eq!(midnight.clear_color.g, night.sky_color[1] as f64);
@@ -8643,6 +8669,116 @@ mod tests {
         );
         assert_eq!(midnight.day_factor, night.day_factor);
         assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
+    /// S04-T03: submersion is one floored block lookup against the live world.
+    /// Exercised on a real generated ocean column (seed 12345: ocean at the
+    /// origin with a land spawn nearby) so the water id, sea level, and seabed
+    /// all come from terrain generation rather than a synthetic uniform chunk.
+    #[test]
+    fn eye_is_submerged_reads_the_live_block_at_the_floored_eye() {
+        use opencraft::world::chunk::CHUNK_SIZE;
+        use opencraft::world::terrain::SEA_LEVEL;
+
+        const SEED: u32 = 12345;
+        let mut world = WorldManager::with_seed_and_edits(4, SEED, ChunkEditMap::default());
+
+        // Find and insert one real chunk whose surface at sea level is ocean.
+        let mut ocean = None;
+        'scan: for cx in -4..=4 {
+            for cz in -4..=4 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let chunk = generate_chunk_seeded(pos, SEED);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if chunk.get(lx, SEA_LEVEL as usize, lz) == BlockId::Water {
+                            ocean = Some((pos, lx, lz));
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        let (pos, lx, lz) = ocean.expect("seed 12345 must generate ocean near the origin");
+        let chunk = generate_chunk_seeded(pos, SEED);
+        world.insert_chunk_for_test(pos, chunk.clone());
+        let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+        let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+
+        // Inside the ocean: the generated block is water, the eye is submerged.
+        assert_eq!(world.get_block(wx, SEA_LEVEL, wz), BlockId::Water);
+        let wet_eye = Vec3::new(wx as f32 + 0.5, SEA_LEVEL as f32 + 0.5, wz as f32 + 0.5);
+        assert!(
+            eye_is_submerged(&world, wet_eye),
+            "an eye inside a generated ocean block reports submersion"
+        );
+        // The lookup floors rather than rounds: a fractional eye still lands
+        // in the same water block.
+        assert!(eye_is_submerged(
+            &world,
+            wet_eye + Vec3::new(0.0, 0.49, 0.0)
+        ));
+
+        // One block above the top-most water in the column is air: dry.
+        let mut top = SEA_LEVEL;
+        while top + 1 < CHUNK_SIZE as i32 && chunk.get(lx, (top + 1) as usize, lz) == BlockId::Water
+        {
+            top += 1;
+        }
+        assert_eq!(world.get_block(wx, top + 1, wz), BlockId::Air);
+        let dry_eye = Vec3::new(wx as f32 + 0.5, top as f32 + 1.5, wz as f32 + 0.5);
+        assert!(
+            !eye_is_submerged(&world, dry_eye),
+            "an eye in the air above the ocean surface is not submerged"
+        );
+
+        // Inside the seabed's stone: solid, never reported as liquid.
+        let mut stone = None;
+        'stone: for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    if chunk.get(x, y, z) == BlockId::Stone {
+                        stone = Some((x, y, z));
+                        break 'stone;
+                    }
+                }
+            }
+        }
+        let (sx, sy, sz) = stone.expect("a real ocean chunk must contain stone");
+        let stone_eye = Vec3::new(
+            (pos.x * CHUNK_SIZE as i32) as f32 + sx as f32 + 0.5,
+            (pos.y * CHUNK_SIZE as i32) as f32 + sy as f32 + 0.5,
+            (pos.z * CHUNK_SIZE as i32) as f32 + sz as f32 + 0.5,
+        );
+        assert!(!eye_is_submerged(&world, stone_eye), "stone is not liquid");
+
+        // Unloaded chunks and above the world top answer Air, so the lookup can
+        // never invent water where nothing is loaded.
+        assert!(!eye_is_submerged(
+            &world,
+            Vec3::new(wx as f32 + 0.5, 400.0, wz as f32 + 0.5)
+        ));
+        assert!(!eye_is_submerged(
+            &world,
+            Vec3::new(9999.0, SEA_LEVEL as f32 + 0.5, 9999.0)
+        ));
+    }
+
+    /// S04-T03: the title-bar stats line carries the water quad counter next to
+    /// the opaque quad count and sources it from the render store's separate
+    /// water tally. The window itself is not headless-provable, so this pins the
+    /// observability contract at its single construction site.
+    #[test]
+    fn title_bar_stats_line_carries_the_water_quad_count() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("| Quads: {} | Water: {} ({} KB VRAM) |"),
+            "the stats line must expose water quads alongside the opaque quads"
+        );
+        assert!(
+            src.contains("gpu.render_store.total_water_quads,"),
+            "the water field must come from ChunkRenderStore::total_water_quads"
+        );
     }
 
     // -----------------------------------------------------------------------
