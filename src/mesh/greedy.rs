@@ -548,6 +548,7 @@ mod tests {
     #[test]
     fn real_ocean_chunk_emits_water_surface_quads_above_real_seabed_faces() {
         use crate::world::chunk::ChunkPos;
+        use crate::world::season::Season;
         use crate::world::terrain::{generate_chunk_seeded, SEA_LEVEL};
 
         const SEED: u32 = 1337;
@@ -555,7 +556,7 @@ mod tests {
         'scan: for cx in -4..=4 {
             for cz in -4..=4 {
                 let pos = ChunkPos::new(cx, 0, cz);
-                let chunk = generate_chunk_seeded(pos, SEED);
+                let chunk = generate_chunk_seeded(pos, SEED, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
                         // Chunk layer 0 starts at wy 0, so local y == world y

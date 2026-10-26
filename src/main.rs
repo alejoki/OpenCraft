@@ -3600,6 +3600,7 @@ mod tests {
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::season::Season;
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
@@ -6926,7 +6927,7 @@ mod tests {
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -6979,7 +6980,7 @@ mod tests {
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -7021,7 +7022,7 @@ mod tests {
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -7075,7 +7076,7 @@ mod tests {
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -7358,9 +7359,10 @@ mod tests {
         // unsaved changes), and move the player / pick a hotbar slot so
         // the edited-time player state must survive the round trip.
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
-        app.session
-            .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, expected_seed));
+        app.session.world.insert_chunk_for_test(
+            cpos,
+            generate_chunk_seeded(cpos, expected_seed, Season::Summer),
+        );
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -8688,7 +8690,7 @@ mod tests {
         'scan: for cx in -4..=4 {
             for cz in -4..=4 {
                 let pos = ChunkPos::new(cx, 0, cz);
-                let chunk = generate_chunk_seeded(pos, SEED);
+                let chunk = generate_chunk_seeded(pos, SEED, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
                         if chunk.get(lx, SEA_LEVEL as usize, lz) == BlockId::Water {
@@ -8700,7 +8702,7 @@ mod tests {
             }
         }
         let (pos, lx, lz) = ocean.expect("seed 12345 must generate ocean near the origin");
-        let chunk = generate_chunk_seeded(pos, SEED);
+        let chunk = generate_chunk_seeded(pos, SEED, Season::Summer);
         world.insert_chunk_for_test(pos, chunk.clone());
         let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
         let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;

@@ -1,5 +1,6 @@
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::season::Season;
 
 #[inline]
 fn hash2d(x: i32, z: i32, seed: u32) -> u32 {
@@ -667,11 +668,44 @@ fn find_spawn_column_within(seed: u32, max_radius: i32) -> (i32, i32) {
     );
 }
 
+/// Generates `pos` with the default world seed and [`Season::Summer`].
+///
+/// Season-independent callers (tooling, small unit tests, previews) use this
+/// wrapper: Summer is the blanket-absent baseline, so a caller that never
+/// thinks about the calendar still sees the pre-seasonal surface.
 pub fn generate_chunk(pos: ChunkPos) -> Chunk {
-    generate_chunk_seeded(pos, DEFAULT_WORLD_SEED)
+    generate_chunk_seeded(pos, DEFAULT_WORLD_SEED, Season::Summer)
 }
 
-pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
+/// Surface block of a non-beach plains/forest column in `season`.
+///
+/// Winter paints the seasonal snow blanket; every other season keeps Grass.
+/// Beach Sand, Ocean Sand and the Mountains altitude rule never call this, so
+/// the seasonal blanket and the season-blind altitude snow cap stay
+/// distinguishable by construction.
+#[inline]
+fn seasonal_land_surface(season: Season) -> BlockId {
+    match season {
+        Season::Winter => BlockId::Snow,
+        Season::Spring | Season::Summer | Season::Autumn => BlockId::Grass,
+    }
+}
+
+/// Generates `pos` for `seed` under the given calendar `season`.
+///
+/// `season` is a plain value parameter — no manager state, no clock reads — so
+/// generation stays a pure function of `(pos, seed, season)`. It changes
+/// exactly two things:
+///
+/// 1. the surface skin of non-beach plains/forest land (`Snow` in Winter,
+///    `Grass` otherwise), and
+/// 2. the oak leaf canopy (Autumn sheds it while keeping the trunks; every
+///    other season keeps the full canopy).
+///
+/// Heights, biomes, subsurface skin, caves, ores, bedrock, water fill and the
+/// season-blind Mountain altitude snow cap are untouched, so a seasonal
+/// blanket can never be confused with the altitude cap.
+pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
@@ -748,9 +782,11 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
                         Biome::Ocean => BlockId::Sand,
                         Biome::Plains | Biome::Forest => {
                             if beach {
+                                // Beaches stay Sand in every season: the
+                                // seasonal blanket is land-only.
                                 BlockId::Sand
                             } else {
-                                BlockId::Grass
+                                seasonal_land_surface(season)
                             }
                         }
                     }
@@ -784,6 +820,11 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
             // per biome — dense forest, sparse plains. The placement rule
             // itself lives in `tree_trunk_height`, shared with the spawn
             // search so a spawn can never land inside a generated tree.
+            //
+            // The gate is deliberately season-blind: in Winter the blanket
+            // turns plains/forest land into Snow, so winter trees are
+            // suppressed *emergently* by the surface they would grow out of.
+            // `test_seasonal_winter_blanket_suppresses_trees` pins that.
             let surface_ly = h - base_wy;
             if (0..CHUNK_SIZE as i32).contains(&surface_ly)
                 && chunk.get(lx, surface_ly as usize, lz) == BlockId::Grass
@@ -795,26 +836,31 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
                             chunk.set(lx, ly_tree as usize, lz, BlockId::OakLog);
                         }
                     }
-                    let canopy_base = h + trunk_h - 1;
-                    let canopy_top = h + trunk_h + 1;
-                    for cy in canopy_base..=canopy_top {
-                        let ly_c = cy - base_wy;
-                        if !(0..CHUNK_SIZE as i32).contains(&ly_c) {
-                            continue;
-                        }
-                        let radius: i32 = if cy == canopy_top { 1 } else { 2 };
-                        for dz in -radius..=radius {
-                            for dx in -radius..=radius {
-                                if dx == 0 && dz == 0 && cy <= h + trunk_h {
-                                    continue;
-                                }
-                                if dx.abs() == 2 && dz.abs() == 2 && cy == canopy_base {
-                                    continue;
-                                }
-                                let tlx = (lx as i32 + dx) as usize;
-                                let tlz = (lz as i32 + dz) as usize;
-                                if chunk.get(tlx, ly_c as usize, tlz) == BlockId::Air {
-                                    chunk.set(tlx, ly_c as usize, tlz, BlockId::OakLeaves);
+                    // Autumn sheds the leaves but keeps the trunks (a
+                    // deterministic "leaves have fallen" read). Spring,
+                    // Summer and Winter keep the full canopy.
+                    if season != Season::Autumn {
+                        let canopy_base = h + trunk_h - 1;
+                        let canopy_top = h + trunk_h + 1;
+                        for cy in canopy_base..=canopy_top {
+                            let ly_c = cy - base_wy;
+                            if !(0..CHUNK_SIZE as i32).contains(&ly_c) {
+                                continue;
+                            }
+                            let radius: i32 = if cy == canopy_top { 1 } else { 2 };
+                            for dz in -radius..=radius {
+                                for dx in -radius..=radius {
+                                    if dx == 0 && dz == 0 && cy <= h + trunk_h {
+                                        continue;
+                                    }
+                                    if dx.abs() == 2 && dz.abs() == 2 && cy == canopy_base {
+                                        continue;
+                                    }
+                                    let tlx = (lx as i32 + dx) as usize;
+                                    let tlz = (lz as i32 + dz) as usize;
+                                    if chunk.get(tlx, ly_c as usize, tlz) == BlockId::Air {
+                                        chunk.set(tlx, ly_c as usize, tlz, BlockId::OakLeaves);
+                                    }
                                 }
                             }
                         }
@@ -833,14 +879,18 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
 mod tests {
     use super::*;
     use crate::world::block::BlockId;
+    use crate::world::season::{
+        season_of, DEFAULT_SEASON_LENGTH_DAYS, FIRST_AUTUMN_DAY, FIRST_SPRING_DAY,
+        FIRST_SUMMER_DAY, FIRST_WINTER_DAY,
+    };
 
     #[test]
     fn test_cave_generation_deterministic_full_chunks() {
         for seed in [DEFAULT_WORLD_SEED, 424_242] {
             for cy in -1..=1 {
                 let pos = ChunkPos::new(0, cy, 0);
-                let first = generate_chunk_seeded(pos, seed);
-                let second = generate_chunk_seeded(pos, seed);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for ly in 0..CHUNK_SIZE {
                         for lx in 0..CHUNK_SIZE {
@@ -863,7 +913,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in -1..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -915,7 +966,7 @@ mod tests {
             h.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
         );
-        let chunk = generate_chunk_seeded(pos, seed);
+        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
         let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
         let ly = h.rem_euclid(CHUNK_SIZE as i32) as usize;
         let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
@@ -928,7 +979,8 @@ mod tests {
 
     #[test]
     fn test_bedrock_floor_preserved_in_deep_chunk() {
-        let chunk = generate_chunk_seeded(ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED);
+        let chunk =
+            generate_chunk_seeded(ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 assert_eq!(
@@ -946,7 +998,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in 0..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -1056,8 +1109,8 @@ mod tests {
                 for cz in -1..=1 {
                     for cx in -1..=1 {
                         let pos = ChunkPos::new(cx, cy, cz);
-                        let first = generate_chunk_seeded(pos, seed);
-                        let second = generate_chunk_seeded(pos, seed);
+                        let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                        let second = generate_chunk_seeded(pos, seed, Season::Summer);
                         for lz in 0..CHUNK_SIZE {
                             for ly in 0..CHUNK_SIZE {
                                 for lx in 0..CHUNK_SIZE {
@@ -1091,7 +1144,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in -1..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     for lz in 0..CHUNK_SIZE {
                         for ly in 0..CHUNK_SIZE {
                             for lx in 0..CHUNK_SIZE {
@@ -1118,7 +1172,7 @@ mod tests {
             for cz in -2..=2 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -1171,7 +1225,7 @@ mod tests {
             for cz in -2..=2 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     for lz in 0..CHUNK_SIZE {
                         for ly in 0..CHUNK_SIZE {
                             for lx in 0..CHUNK_SIZE {
@@ -1217,7 +1271,7 @@ mod tests {
                 for cx in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
                     for (seed, layout) in [(1337u32, &mut layout_a), (424_242u32, &mut layout_b)] {
-                        let chunk = generate_chunk_seeded(pos, seed);
+                        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                         for lz in 0..CHUNK_SIZE {
                             for ly in 0..CHUNK_SIZE {
                                 for lx in 0..CHUNK_SIZE {
@@ -1316,8 +1370,8 @@ mod tests {
 
         for seed in [DEFAULT_WORLD_SEED, 424_242] {
             for &pos in &positions {
-                let first = generate_chunk_seeded(pos, seed);
-                let second = generate_chunk_seeded(pos, seed);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
                 let heights = chunk_heights(pos, seed);
                 let base_wy = pos.y * CHUNK_SIZE as i32;
                 for (lz, row) in heights.iter().enumerate() {
@@ -1344,8 +1398,8 @@ mod tests {
 
         let mut seed_changed_any_block = false;
         for &pos in &positions {
-            let first = generate_chunk_seeded(pos, DEFAULT_WORLD_SEED);
-            let second = generate_chunk_seeded(pos, 424_242);
+            let first = generate_chunk_seeded(pos, DEFAULT_WORLD_SEED, Season::Summer);
+            let second = generate_chunk_seeded(pos, 424_242, Season::Summer);
             for lz in 0..CHUNK_SIZE {
                 for ly in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
@@ -1386,7 +1440,7 @@ mod tests {
             for cz in -4..=4 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let heights = chunk_heights(pos, seed);
                     let base_wy = pos.y * CHUNK_SIZE as i32;
                     let mut has_carved_air = false;
@@ -1498,7 +1552,7 @@ mod tests {
             for cz in -4..=4 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -1560,7 +1614,7 @@ mod tests {
                 let base_wz = cz * CHUNK_SIZE as i32;
                 for cy in -1..=2 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let top_wy = base_wy + CHUNK_SIZE as i32 - 1;
                     for (lz, row) in heights.iter().enumerate() {
@@ -1652,7 +1706,7 @@ mod tests {
                 h.div_euclid(CHUNK_SIZE as i32),
                 wz.div_euclid(CHUNK_SIZE as i32),
             );
-            let chunk = generate_chunk_seeded(pos, seed);
+            let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
             let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
             let ly = h.rem_euclid(CHUNK_SIZE as i32) as usize;
             let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
@@ -1695,13 +1749,15 @@ mod tests {
         found
     }
 
-    fn generated_block_at(wx: i32, wy: i32, wz: i32, seed: u32) -> BlockId {
+    /// Block at a world position for an explicit `season`; the chunk is
+    /// regenerated per call, so callers sample a handful of blocks at most.
+    fn generated_block_at(wx: i32, wy: i32, wz: i32, seed: u32, season: Season) -> BlockId {
         let pos = ChunkPos::new(
             wx.div_euclid(CHUNK_SIZE as i32),
             wy.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
         );
-        let chunk = generate_chunk_seeded(pos, seed);
+        let chunk = generate_chunk_seeded(pos, seed, season);
         chunk.get(
             wx.rem_euclid(CHUNK_SIZE as i32) as usize,
             wy.rem_euclid(CHUNK_SIZE as i32) as usize,
@@ -1868,7 +1924,7 @@ mod tests {
             for dy in 1..=4 {
                 let wy = h + dy;
                 let pos = ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
-                let chunk = generate_chunk_seeded(pos, seed);
+                let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                 let block = chunk.get(
                     wx.rem_euclid(ch) as usize,
                     wy.rem_euclid(ch) as usize,
@@ -1945,7 +2001,7 @@ mod tests {
         for (idx, column) in found.iter().enumerate() {
             let (wx, wz, h) = column.unwrap_or_else(|| panic!("missing biome index {idx}"));
             let biome = biome_at_seeded(wx, wz, seed);
-            let surface = generated_block_at(wx, h, wz, seed);
+            let surface = generated_block_at(wx, h, wz, seed, Season::Summer);
             let expected = match biome {
                 Biome::Ocean => BlockId::Sand,
                 Biome::Mountains if h >= SNOW_CAP_HEIGHT => BlockId::Snow,
@@ -1959,7 +2015,7 @@ mod tests {
             );
             for wy in (h - 3)..h {
                 assert_ne!(
-                    generated_block_at(wx, wy, wz, seed),
+                    generated_block_at(wx, wy, wz, seed, Season::Summer),
                     BlockId::Air,
                     "subsurface skin at ({wx}, {wy}, {wz}) is Air"
                 );
@@ -1981,7 +2037,7 @@ mod tests {
             for cz in -2..=2 {
                 for cy in -1..=0 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -2059,7 +2115,7 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 let pos = ChunkPos::new(cx, 0, cz);
-                let chunk = generate_chunk_seeded(pos, seed);
+                let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                 let base_wx = cx * CHUNK_SIZE as i32;
                 let base_wy = 0;
                 let base_wz = cz * CHUNK_SIZE as i32;
@@ -2105,8 +2161,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 let pos = ChunkPos::new(cx, 0, cz);
-                let first = generate_chunk_seeded(pos, seed);
-                let second = generate_chunk_seeded(pos, seed);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for ly in 0..CHUNK_SIZE {
                         for lx in 0..CHUNK_SIZE {
@@ -2156,7 +2212,11 @@ mod tests {
         for dz in -radius..=radius {
             for dx in -radius..=radius {
                 for cy in 0..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx + dx, cy, cz + dz), seed);
+                    let chunk = generate_chunk_seeded(
+                        ChunkPos::new(cx + dx, cy, cz + dz),
+                        seed,
+                        Season::Summer,
+                    );
                     let base_wy = cy * CHUNK_SIZE as i32;
                     for lz in 0..CHUNK_SIZE {
                         for ly in 0..CHUNK_SIZE {
@@ -2198,7 +2258,7 @@ mod tests {
             // already proves the height/biome gate, this re-checks the block.
             if surface_checked < 40 {
                 assert_eq!(
-                    generated_block_at(wx, h, wz, seed),
+                    generated_block_at(wx, h, wz, seed, Season::Summer),
                     BlockId::Grass,
                     "oak log grows out of a non-Grass surface at ({wx}, {h}, {wz})"
                 );
@@ -2253,7 +2313,7 @@ mod tests {
             (ocean.0, ocean.2, ocean.1, Biome::Ocean),
             (mountains.0, mountains.2, mountains.1, Biome::Mountains),
         ] {
-            let surface = generated_block_at(wx, h, wz, seed);
+            let surface = generated_block_at(wx, h, wz, seed, Season::Summer);
             assert_ne!(
                 surface,
                 BlockId::Grass,
@@ -2283,8 +2343,8 @@ mod tests {
         }
 
         for pos in positions {
-            let first = generate_chunk_seeded(pos, seed);
-            let second = generate_chunk_seeded(pos, seed);
+            let first = generate_chunk_seeded(pos, seed, Season::Summer);
+            let second = generate_chunk_seeded(pos, seed, Season::Summer);
             for lz in 0..CHUNK_SIZE {
                 for ly in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
@@ -2297,5 +2357,502 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Seasonal surfacing (S05) -------------------------------------------
+
+    /// Season for each named calendar boundary day at the default length,
+    /// derived exactly as the live session will (pure `season_of`). The paper
+    /// value is asserted too, so the test can never quietly run the wrong
+    /// season if the calendar math drifts.
+    fn four_seasons_from_days(seed: u32) -> [(u32, Season); 4] {
+        [
+            (FIRST_SPRING_DAY, Season::Spring),
+            (FIRST_SUMMER_DAY, Season::Summer),
+            (FIRST_AUTUMN_DAY, Season::Autumn),
+            (FIRST_WINTER_DAY, Season::Winter),
+        ]
+        .map(|(day, expected)| {
+            let season = season_of(day, DEFAULT_SEASON_LENGTH_DAYS, seed);
+            assert_eq!(
+                season, expected,
+                "day {day} derived {season:?}, wanted {expected:?}"
+            );
+            (day, season)
+        })
+    }
+
+    /// Chunk positions spanning all four biomes for `seed` (plus the sky layer
+    /// and a fixed off-origin column), mirroring the existing byte-identity
+    /// precedent so the four-season acceptance is not sampled on one biome.
+    fn biome_spanning_chunk_positions(seed: u32) -> Vec<ChunkPos> {
+        let mut positions = vec![
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-3, 0, 7),
+        ];
+        for (wx, wz, _) in first_column_per_biome(seed).into_iter().flatten() {
+            let cx = wx.div_euclid(CHUNK_SIZE as i32);
+            let cz = wz.div_euclid(CHUNK_SIZE as i32);
+            for cy in 0..=1 {
+                positions.push(ChunkPos::new(cx, cy, cz));
+            }
+        }
+        positions
+    }
+
+    /// First `(wx, wz, h)` column of `biome` with `h` inside `min_h..=max_h`,
+    /// used to pin seasonal surfaces away from the beach band.
+    fn first_column_in_height_band(
+        seed: u32,
+        biome: Biome,
+        min_h: i32,
+        max_h: i32,
+    ) -> (i32, i32, i32) {
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                if biome_at_seeded(wx, wz, seed) != biome {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if (min_h..=max_h).contains(&h) {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no {biome:?} column with h in {min_h}..={max_h} in the acceptance region");
+    }
+
+    /// First `(wx, wz, h)` Mountain column at or above the altitude snow cap.
+    ///
+    /// The cap only exists in the continental highlands, far outside the ±512
+    /// four-biome acceptance region, so this scans a wider coarse grid (step
+    /// 32). Cap regions span dozens of blocks, so a 32-block lattice cannot
+    /// step over one.
+    fn first_snow_cap_column(seed: u32) -> (i32, i32, i32) {
+        for wz in (-8192..=8192).step_by(32) {
+            for wx in (-8192..=8192).step_by(32) {
+                if biome_at_seeded(wx, wz, seed) != Biome::Mountains {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h >= SNOW_CAP_HEIGHT {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no mountain column at or above the altitude snow cap in the wide region");
+    }
+
+    /// First `(wx, wz, h)` beach column: plains/forest land inside the Sand
+    /// beach band (`SEA_LEVEL..=SEA_LEVEL + BEACH_BAND`).
+    fn first_beach_column(seed: u32) -> (i32, i32, i32) {
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                let biome = biome_at_seeded(wx, wz, seed);
+                if !matches!(biome, Biome::Plains | Biome::Forest) {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h <= SEA_LEVEL + BEACH_BAND {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no beach column in the acceptance region");
+    }
+
+    /// First `(wx, wz, h, trunk_h)` column that actually grows an oak for
+    /// `seed`: the same pure gate the generator uses, so the test never picks
+    /// a bare column. Bounded to a region dense enough with forest.
+    fn first_actual_tree_column(seed: u32) -> (i32, i32, i32, i32) {
+        for wz in -128..=128 {
+            for wx in -128..=128 {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                if let Some(trunk_h) = tree_trunk_height(wx, wz, h, biome, seed) {
+                    return (wx, wz, h, trunk_h);
+                }
+            }
+        }
+        panic!("no oak column inside the bounded acceptance region");
+    }
+
+    /// Count `block` across every chunk layer of one chunk column. Trees stay
+    /// inside a chunk's interior, so this captures a full oak (and every other
+    /// oak in the same column).
+    fn count_blocks_in_chunk_column(
+        cx: i32,
+        cz: i32,
+        seed: u32,
+        season: Season,
+        block: BlockId,
+    ) -> usize {
+        let mut count = 0;
+        for cy in -1..=2 {
+            let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, season);
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if chunk.get(lx, ly, lz) == block {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Acceptance: the same seed generated at the four boundary game-times (one
+    /// per season) is byte-identical across repeat runs.
+    #[test]
+    fn test_acceptance_four_season_generation_is_byte_identical_across_repeats() {
+        // SPRING_START_SEED precedent: seed 1 starts in Spring, so the named
+        // FIRST_*_DAY consts land exactly on the four seasons.
+        let seed = 1;
+        let positions = biome_spanning_chunk_positions(seed);
+        let seasons = four_seasons_from_days(seed);
+
+        for &pos in &positions {
+            for (day, season) in seasons {
+                let first = generate_chunk_seeded(pos, seed, season);
+                let second = generate_chunk_seeded(pos, seed, season);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            assert_eq!(
+                                first.get(lx, ly, lz),
+                                second.get(lx, ly, lz),
+                                "seed {seed} day {day} ({season:?}) chunk {pos:?} \
+                                 differs at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // The four derived seasons must be distinct or the loop above was
+        // vacuous.
+        for (i, (_, a)) in seasons.iter().enumerate() {
+            for (_, b) in &seasons[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "season derivation collapsed two boundary days onto {a:?}"
+                );
+            }
+        }
+    }
+
+    /// Acceptance: winter turns every non-beach plains/forest land surface into
+    /// Snow, and summer carries none of it — the seasonal snow blanket is
+    /// present in winter and absent in summer for the same seed.
+    #[test]
+    fn test_acceptance_winter_snow_blanket_present_and_summer_absent() {
+        let seed = 1;
+        let seasons = four_seasons_from_days(seed);
+        let winter = seasons[3].1;
+        let summer = seasons[1].1;
+        assert_eq!(winter, Season::Winter);
+        assert_eq!(summer, Season::Summer);
+
+        let mut winter_blanket = 0usize;
+        let mut summer_blanket = 0usize;
+        let mut summer_grass = 0usize;
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                for cy in 0..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let winter_chunk = generate_chunk_seeded(pos, seed, winter);
+                    let summer_chunk = generate_chunk_seeded(pos, seed, summer);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let wx = base_wx + lx as i32;
+                            let wz = base_wz + lz as i32;
+                            let biome = biome_at_seeded(wx, wz, seed);
+                            if !matches!(biome, Biome::Plains | Biome::Forest) {
+                                continue;
+                            }
+                            let h = terrain_height_at_seeded(wx, wz, seed);
+                            if h <= SEA_LEVEL + BEACH_BAND {
+                                // Beaches are season-blind Sand.
+                                continue;
+                            }
+                            let ly = h - base_wy;
+                            if !(0..CHUNK_SIZE as i32).contains(&ly) {
+                                continue;
+                            }
+                            let ly = ly as usize;
+                            assert_eq!(
+                                winter_chunk.get(lx, ly, lz),
+                                BlockId::Snow,
+                                "winter land surface at ({wx}, {h}, {wz}) is not blanket Snow"
+                            );
+                            winter_blanket += 1;
+                            match summer_chunk.get(lx, ly, lz) {
+                                BlockId::Grass => summer_grass += 1,
+                                BlockId::Snow => summer_blanket += 1,
+                                other => panic!(
+                                    "summer land surface at ({wx}, {h}, {wz}) is {other:?}, not Grass"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(winter_blanket > 0, "winter region produced no snow blanket");
+        assert_eq!(
+            summer_blanket, 0,
+            "summer land surface still carried the seasonal blanket"
+        );
+        assert_eq!(
+            winter_blanket, summer_grass,
+            "winter blanket must cover exactly the summer grass land columns"
+        );
+    }
+
+    /// Semantic pins: the blanket is land-only (beaches/ocean stay Sand), the
+    /// Mountain altitude cap exists in every season, and plains/forest are
+    /// Grass in the three non-winter seasons.
+    #[test]
+    fn test_seasonal_surfaces_are_pinned_per_biome() {
+        let seed = DEFAULT_WORLD_SEED;
+        let all = [
+            Season::Spring,
+            Season::Summer,
+            Season::Autumn,
+            Season::Winter,
+        ];
+
+        let non_beach = SEA_LEVEL + BEACH_BAND + 1;
+        let plains = first_column_in_height_band(seed, Biome::Plains, non_beach, TREE_MAX_HEIGHT);
+        let forest = first_column_in_height_band(seed, Biome::Forest, non_beach, TREE_MAX_HEIGHT);
+        for (wx, wz, h) in [plains, forest] {
+            for season in all {
+                let expected = if season == Season::Winter {
+                    BlockId::Snow
+                } else {
+                    BlockId::Grass
+                };
+                assert_eq!(
+                    generated_block_at(wx, h, wz, seed, season),
+                    expected,
+                    "{season:?} surface at ({wx}, {h}, {wz}) must be {expected:?}"
+                );
+            }
+        }
+
+        // The altitude snow cap is season-blind: it must exist in summer.
+        let mountain = first_snow_cap_column(seed);
+        for season in all {
+            assert_eq!(
+                generated_block_at(mountain.0, mountain.2, mountain.1, seed, season),
+                BlockId::Snow,
+                "{season:?} lost the season-blind altitude cap at ({}, {}, {})",
+                mountain.0,
+                mountain.2,
+                mountain.1
+            );
+        }
+
+        // Beaches and the ocean seabed stay Sand in every season.
+        let beach = first_beach_column(seed);
+        let ocean =
+            first_column_per_biome(seed)[biome_index(Biome::Ocean)].expect("seed must have ocean");
+        for season in all {
+            assert_eq!(
+                generated_block_at(beach.0, beach.2, beach.1, seed, season),
+                BlockId::Sand,
+                "{season:?} painted the beach at ({}, {}, {})",
+                beach.0,
+                beach.2,
+                beach.1
+            );
+            assert_eq!(
+                generated_block_at(ocean.0, ocean.2, ocean.1, seed, season),
+                BlockId::Sand,
+                "{season:?} painted the ocean seabed at ({}, {}, {})",
+                ocean.0,
+                ocean.2,
+                ocean.1
+            );
+        }
+    }
+
+    /// Autumn sheds the oak canopy but keeps every trunk; Spring/Summer keep
+    /// both. Deterministic, so "leaves have fallen" reads consistently.
+    #[test]
+    fn test_autumn_sheds_oak_leaves_and_keeps_trunks() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, trunk_h) = first_actual_tree_column(seed);
+        let (cx, cz) = (
+            wx.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+        // A leaf squarely in the canopy, one block out from the trunk at the
+        // lowest canopy layer (never overwritten by the trunk itself).
+        let leaf_wy = h + trunk_h - 1;
+
+        for season in [Season::Spring, Season::Summer] {
+            assert_eq!(
+                generated_block_at(wx, h + 1, wz, seed, season),
+                BlockId::OakLog,
+                "{season:?} lost the trunk at ({wx}, {}, {wz})",
+                h + 1
+            );
+            assert_eq!(
+                generated_block_at(wx + 1, leaf_wy, wz, seed, season),
+                BlockId::OakLeaves,
+                "{season:?} has no canopy leaf at ({}, {leaf_wy}, {wz})",
+                wx + 1
+            );
+            assert!(
+                count_blocks_in_chunk_column(cx, cz, seed, season, BlockId::OakLeaves) > 0,
+                "{season:?} chunk column has no oak leaves at all"
+            );
+        }
+
+        for ty in (h + 1)..=(h + trunk_h) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Autumn),
+                BlockId::OakLog,
+                "autumn removed the trunk block at ({wx}, {ty}, {wz})"
+            );
+        }
+        assert_eq!(
+            generated_block_at(wx + 1, leaf_wy, wz, seed, Season::Autumn),
+            BlockId::Air,
+            "autumn kept a canopy leaf at ({}, {leaf_wy}, {wz})",
+            wx + 1
+        );
+        assert_eq!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLeaves),
+            0,
+            "autumn chunk column still contains oak leaves"
+        );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLog) > 0,
+            "autumn chunk column lost every oak trunk"
+        );
+    }
+
+    /// Winter trees are suppressed *emergently*: the blanket makes the surface
+    /// Snow, and the season-blind `Grass` tree gate refuses it. Pinned as a
+    /// decision, not an accident.
+    #[test]
+    fn test_seasonal_winter_blanket_suppresses_trees() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, _trunk_h) = first_actual_tree_column(seed);
+        let (cx, cz) = (
+            wx.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        assert_eq!(
+            generated_block_at(wx, h, wz, seed, Season::Spring),
+            BlockId::Grass
+        );
+        assert_eq!(
+            generated_block_at(wx, h + 1, wz, seed, Season::Spring),
+            BlockId::OakLog
+        );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Spring, BlockId::OakLog) > 0,
+            "spring chunk column must contain oak trunks for this pin to mean anything"
+        );
+
+        assert_eq!(
+            generated_block_at(wx, h, wz, seed, Season::Winter),
+            BlockId::Snow,
+            "the same column must carry the winter blanket"
+        );
+        assert_eq!(
+            generated_block_at(wx, h + 1, wz, seed, Season::Winter),
+            BlockId::Air,
+            "winter grew a trunk out of a Snow surface"
+        );
+        assert_eq!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLog),
+            0,
+            "winter chunk column still contains oak trunks"
+        );
+        assert_eq!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLeaves),
+            0,
+            "winter chunk column still contains oak leaves"
+        );
+    }
+
+    /// Negative/structural: season changes only two things — the non-beach
+    /// plains/forest surface block (Grass -> Snow) and the oak canopy (logs and
+    /// leaves -> Air). Heights, biomes, subsurface skin, caves, ores, bedrock,
+    /// water and the Mountain cap are byte-identical across seasons (R001/R005
+    /// survivors).
+    #[test]
+    fn test_season_changes_only_surface_skin_and_oak_canopy() {
+        let seed = DEFAULT_WORLD_SEED;
+        let positions = [
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-3, 0, 7),
+            ChunkPos::new(3, 0, -2),
+        ];
+
+        let mut surface_swaps = 0usize;
+        let mut tree_blocks_gone = 0usize;
+        for pos in positions {
+            let summer = generate_chunk_seeded(pos, seed, Season::Summer);
+            let winter = generate_chunk_seeded(pos, seed, Season::Winter);
+            let base_wx = pos.x * CHUNK_SIZE as i32;
+            let base_wy = pos.y * CHUNK_SIZE as i32;
+            let base_wz = pos.z * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let a = summer.get(lx, ly, lz);
+                        let b = winter.get(lx, ly, lz);
+                        if a == b {
+                            continue;
+                        }
+                        let wx = base_wx + lx as i32;
+                        let wy = base_wy + ly as i32;
+                        let wz = base_wz + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let biome = biome_at_seeded(wx, wz, seed);
+
+                        let surface_swap = wy == h
+                            && h > SEA_LEVEL + BEACH_BAND
+                            && matches!(biome, Biome::Plains | Biome::Forest)
+                            && a == BlockId::Grass
+                            && b == BlockId::Snow;
+                        let shed_tree =
+                            matches!(a, BlockId::OakLog | BlockId::OakLeaves) && b == BlockId::Air;
+                        assert!(
+                            surface_swap || shed_tree,
+                            "unexpected winter change at ({wx}, {wy}, {wz}) in {pos:?}: \
+                             {a:?} -> {b:?} (h {h}, biome {biome:?})"
+                        );
+                        if surface_swap {
+                            surface_swaps += 1;
+                        } else {
+                            tree_blocks_gone += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            surface_swaps > 0,
+            "the scan found no winter blanket surface swap (test is vacuous)"
+        );
+        assert!(
+            tree_blocks_gone > 0,
+            "the scan found no tree blocks removed in winter (test is vacuous)"
+        );
     }
 }

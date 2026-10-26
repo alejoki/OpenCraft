@@ -9,6 +9,7 @@ use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE};
 use crate::world::light::{self, LightGrid};
 use crate::world::persistence::ChunkEditMap;
+use crate::world::season::Season;
 use crate::world::terrain::{generate_chunk_seeded, DEFAULT_WORLD_SEED};
 
 pub const MIN_CHUNK_Y: i32 = -1;
@@ -1035,7 +1036,10 @@ impl WorldManager {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
                     rayon::spawn(move || {
-                        let chunk = generate_chunk_seeded(pos, seed);
+                        // Interim placeholder: T02 threads the manager's real
+                        // generation season through this closure. Summer keeps
+                        // the blanket-absent baseline for now.
+                        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -1201,7 +1205,7 @@ mod tests {
             for dy in 0..=2 {
                 for dz in -1..=1 {
                     let p = ChunkPos::new(dx, dy, dz);
-                    mgr.insert_chunk_for_test(p, generate_chunk_seeded(p, 1337));
+                    mgr.insert_chunk_for_test(p, generate_chunk_seeded(p, 1337, Season::Summer));
                 }
             }
         }
@@ -1670,7 +1674,10 @@ mod tests {
             for cz in -RADIUS - HALO..=RADIUS + HALO {
                 for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    mgr.insert_chunk_for_test(pos, generate_chunk_seeded(pos, SEED));
+                    mgr.insert_chunk_for_test(
+                        pos,
+                        generate_chunk_seeded(pos, SEED, Season::Summer),
+                    );
                 }
             }
         }
@@ -1862,7 +1869,7 @@ mod tests {
             for cz in -3..=3 {
                 for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, 1337);
+                    let chunk = generate_chunk_seeded(pos, 1337, Season::Summer);
                     for ly in 0..CHUNK_SIZE {
                         for lz in 0..CHUNK_SIZE {
                             for lx in 0..CHUNK_SIZE {
