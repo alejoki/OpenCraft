@@ -6637,6 +6637,773 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // S04-T01: named-world crafting continuity (Final Integrated Acceptance)
+    // -----------------------------------------------------------------------
+
+    /// One inventory click through the production adapter: the session's live
+    /// table station is the mode authority, exactly as the event-loop arms
+    /// pass `session.open_table_position()`.
+    fn click_inventory(
+        app: &mut GameApp,
+        screen: &InventoryScreen,
+        target: InventoryTarget,
+    ) -> Result<InventoryClickOutcome, InventoryCommandError> {
+        let table_open = app.session.open_table_position();
+        apply_inventory_click(&mut app.session.player, screen, table_open, target)
+    }
+
+    /// Asserts a click was one accepted whole-stack move.
+    fn expect_moved(app: &mut GameApp, screen: &InventoryScreen, target: InventoryTarget) {
+        assert_eq!(
+            click_inventory(app, screen, target),
+            Ok(InventoryClickOutcome::Moved),
+            "expected a whole-stack move for {target:?}"
+        );
+    }
+
+    /// Asserts a result-slot click crafted exactly `id` and returns the item.
+    fn expect_crafted(
+        app: &mut GameApp,
+        screen: &InventoryScreen,
+        kind: GridKind,
+        id: ItemId,
+    ) -> Item {
+        match click_inventory(app, screen, InventoryTarget::ResultSlot(kind)) {
+            Ok(InventoryClickOutcome::Crafted(item)) => {
+                assert_eq!(item.id(), id, "unexpected crafted item");
+                item
+            }
+            other => panic!("expected a craft of {id:?} from {kind:?}, got {other:?}"),
+        }
+    }
+
+    /// Total count of one identity across the slots, the cursor, and both
+    /// grids: the conservation invariant every click path must preserve.
+    fn inventory_count_of(app: &GameApp, id: ItemId) -> u32 {
+        let mut total = 0u32;
+        for item in app.session.player.inventory().slots().iter().flatten() {
+            if item.id() == id {
+                total += u32::from(item.count());
+            }
+        }
+        if let Some(cursor) = app.session.player.inventory().cursor() {
+            if cursor.id() == id {
+                total += u32::from(cursor.count());
+            }
+        }
+        for grid in [
+            app.session.player.player_grid(),
+            app.session.player.table_grid(),
+        ] {
+            for index in 0..grid.kind().slot_count() {
+                if let Some(item) = grid.slot(index) {
+                    if item.id() == id {
+                        total += u32::from(item.count());
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// S04-T01 — the milestone's Final Integrated Acceptance in executable
+    /// form. A named world is created from the real form, played through the
+    /// real material chain (logs -> planks -> sticks -> table item -> wood
+    /// pickaxe), the table is placed and opened through the production
+    /// right-click path, a high 4x4 cell (15), the 2x2 grid, a worn tool, and
+    /// a held cursor stack are all left unfinished, then Save-and-Quit writes
+    /// the world and Load Game -> Play restores it through the real catalog.
+    /// Every piece of inventory/grid/durability/world state must come back
+    /// exactly, the table edit must re-apply when its chunk regenerates, a
+    /// restore-then-save must be byte-identical, and the restored tool must
+    /// break on its last point and be recrafted from the restored materials.
+    ///
+    /// Seeding note: two fixtures are injected, and both are called out inline
+    /// below. (a) The flat test chunk plus its face halo — the same headless
+    /// seam every mining/placement test uses, because terrain streaming cannot
+    /// run without a live loop. (b) A one-time redistribution of the sixteen
+    /// crafted planks into four stacks: the panel moves whole stacks and has no
+    /// split gesture, so the 2x2 table recipe's four same-identity cells are
+    /// unreachable through clicks. Conservation is asserted across that seam;
+    /// gathering, every craft, placement, wear point, save, restore, tool
+    /// breakage, and recraft below runs through production code.
+    #[test]
+    fn named_world_continuity_restores_inventory_grids_durability_and_placed_table() {
+        use opencraft::player::inventory::{
+            Material, RecipeId, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+        use opencraft::world::chunk::linear_index;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+
+        // 1. Create the named world through the real form + Create flow.
+        app.new_game
+            .apply(TextInputAction::InsertText("continuity".into()));
+        app.new_game.cycle_focus();
+        app.new_game
+            .apply(TextInputAction::InsertText("4242".into()));
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let save_path = dir.path().join("continuity.mcvx");
+        assert_eq!(app.session.save_path, save_path);
+        assert_eq!(app.session.world.seed(), resolve_seed_or("4242", 0));
+
+        // 2. Gather six oak logs through the real break path.
+        insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+        let log_positions: Vec<IVec3> = (1..=6).map(|x| IVec3::new(x, 10, 0)).collect();
+        for pos in &log_positions {
+            app.session
+                .world
+                .set_block_immediate(pos.x, pos.y, pos.z, BlockId::OakLog);
+        }
+        for pos in &log_positions {
+            let (remeshed, wear) =
+                applied_break(break_mined_block(&mut app.session, *pos, BlockId::OakLog));
+            assert!(!remeshed.is_empty(), "a real log break remeshes its chunk");
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Nothing,
+                "bare hands cost no durability"
+            );
+        }
+        assert_eq!(
+            app.session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::OakLog,
+                count: 6,
+            }),
+            "the real gather path collected every log into the hotbar"
+        );
+
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        let player_cell = |index: usize| InventoryTarget::GridCell {
+            kind: GridKind::Player,
+            index,
+        };
+        let table_cell = |index: usize| InventoryTarget::GridCell {
+            kind: GridKind::Table,
+            index,
+        };
+
+        // 3a. Logs -> planks through real clicks. The 1x1 log recipe requires
+        // the grid to hold the log stack alone, so all four crafts deposit
+        // their four-plank results into the inventory, where insertion merges
+        // them into one stack exactly as specified.
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(0));
+        expect_moved(&mut app, &screen, player_cell(0));
+        for _ in 0..4 {
+            let planks = expect_crafted(
+                &mut app,
+                &screen,
+                GridKind::Player,
+                ItemId::Block(BlockId::OakPlanks),
+            );
+            assert_eq!(planks.count(), 4);
+        }
+        assert_eq!(
+            inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+            16,
+            "four real log crafts produce sixteen planks"
+        );
+
+        // Park the two leftover logs in main storage.
+        expect_moved(&mut app, &screen, player_cell(0));
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(5));
+
+        // Documented fixture seam — the one place the click surface cannot
+        // express the domain: the panel moves whole stacks and exposes no
+        // split gesture, so the four separate plank stacks the 2x2 table
+        // recipe requires are seeded here through the same validated
+        // constructor session restore uses. Conservation is asserted before
+        // and after; every craft, placement, wear point, save, and load below
+        // still runs through production code.
+        let planks_before = inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks));
+        let logs_before = inventory_count_of(&app, ItemId::Block(BlockId::OakLog));
+        assert_eq!((planks_before, logs_before), (16, 2));
+        let mut seeded_slots = [None; INVENTORY_SLOTS];
+        for slot in seeded_slots.iter_mut().take(4) {
+            *slot = Some(Item::new(ItemId::Block(BlockId::OakPlanks), 4).expect("plank stack"));
+        }
+        seeded_slots[5] = Some(Item::new(ItemId::Block(BlockId::OakLog), 2).expect("log stack"));
+        let position = app.session.player.position;
+        let player_grid = app.session.player.player_grid().clone();
+        let table_grid = app.session.player.table_grid().clone();
+        app.session.player = Player::with_inventory(
+            position,
+            Inventory::from_parts(seeded_slots, None),
+            player_grid,
+            table_grid,
+        );
+        app.session.player.restore_selected_slot(0);
+        assert_eq!(
+            inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+            planks_before,
+            "seeding redistributed the crafted planks without changing totals"
+        );
+        assert_eq!(
+            inventory_count_of(&app, ItemId::Block(BlockId::OakLog)),
+            logs_before
+        );
+
+        // 3b. Four plank stacks make the crafting-table item in the 2x2 grid.
+        for cell in 0..4 {
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(cell));
+            expect_moved(&mut app, &screen, player_cell(cell));
+        }
+        let table_item = expect_crafted(
+            &mut app,
+            &screen,
+            GridKind::Player,
+            ItemId::Block(BlockId::CraftingTable),
+        );
+        assert_eq!(table_item.count(), 1);
+        assert_eq!(
+            inventory_count_of(&app, ItemId::Block(BlockId::OakPlanks)),
+            12,
+            "the table recipe consumed exactly four planks"
+        );
+
+        // 4. Place the table through the production right-click path and open
+        // it through the same path (the screen attach mirrors `open_inventory`,
+        // which needs a live Window for the cursor grab).
+        assert!(app.session.player.select_slot(0));
+        app.session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        app.session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut app.session);
+        match right_click_interaction(&mut app.session) {
+            RightClickOutcome::Placed(remeshed) => {
+                assert!(!remeshed.is_empty(), "placement remeshes its chunk")
+            }
+            _ => panic!("the targeted stone face must accept the table placement"),
+        }
+        let table_pos = IVec3::new(0, 6, 0);
+        assert_eq!(
+            app.session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z),
+            BlockId::CraftingTable,
+            "the placed table is a real world block"
+        );
+        assert!(
+            app.session.player.hotbar_stack(0).is_none(),
+            "placement consumed the crafted table"
+        );
+        aim_table_interaction_at(&mut app.session, table_pos);
+        assert!(
+            matches!(
+                right_click_interaction(&mut app.session),
+                RightClickOutcome::TableOpened
+            ),
+            "the real right-click path opens the placed table"
+        );
+        assert_eq!(app.session.open_table_position(), Some(table_pos));
+        screen.close();
+        screen.open_table();
+        assert_eq!(
+            screen.mode(app.session.open_table_position()),
+            InventoryMode::Table
+        );
+
+        // 3c. Complete the pickaxe head row and two separate stick stacks in
+        // the 4x4 grid. Cells 1 and 3 leave the 2x2 grid so the vertical stick
+        // recipe is the only match there; the first stick batch is parked in
+        // the table grid so the second craft cannot merge with it.
+        for (from, to) in [(1usize, 0usize), (3, 1)] {
+            expect_moved(&mut app, &screen, player_cell(from));
+            expect_moved(&mut app, &screen, table_cell(to));
+        }
+        for cell in [5usize, 9usize] {
+            let sticks = expect_crafted(
+                &mut app,
+                &screen,
+                GridKind::Player,
+                ItemId::Material(Material::Stick),
+            );
+            assert_eq!(sticks.count(), 4);
+            expect_moved(&mut app, &screen, InventoryTarget::Slot(0));
+            expect_moved(&mut app, &screen, table_cell(cell));
+        }
+        expect_moved(&mut app, &screen, player_cell(0));
+        expect_moved(&mut app, &screen, table_cell(2));
+
+        let pickaxe = expect_crafted(
+            &mut app,
+            &screen,
+            GridKind::Table,
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+        );
+        assert_eq!(pickaxe.durability(), Some(59));
+        assert!(app.session.player.select_slot(0));
+
+        // 5. Leave the 4x4 grid with unfinished materials, including cell 15
+        // (index >= 9) to prove the full 4x4 extent persists. The remaining
+        // plank stack from the 2x2 grid lands in cell 2 as its own unfinished
+        // cell.
+        expect_moved(&mut app, &screen, table_cell(0));
+        expect_moved(&mut app, &screen, table_cell(15));
+        expect_moved(&mut app, &screen, player_cell(2));
+        expect_moved(&mut app, &screen, table_cell(2));
+
+        // 7 (late batch). Craft the parked log's planks and leave two
+        // unfinished cells in the 2x2 grid.
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(5));
+        expect_moved(&mut app, &screen, player_cell(0));
+        let planks = expect_crafted(
+            &mut app,
+            &screen,
+            GridKind::Player,
+            ItemId::Block(BlockId::OakPlanks),
+        );
+        assert_eq!(planks.count(), 4);
+        // The fresh planks land in the first empty slot (slot 1): the pickaxe
+        // owns slot 0 and the log slot was just emptied by the pick-up.
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(1));
+        expect_moved(&mut app, &screen, player_cell(3));
+
+        // 6. Wear the selected tool through the real break path (edit -> remesh
+        // proof -> exactly one wear -> collect) down to its last point. The
+        // quarry reuses one cell; the headless chunk's column is incomplete, so
+        // no light recompute runs and each point costs one remesh.
+        let wear_pos = IVec3::new(2, 8, 0);
+        let mut remaining = 59u16;
+        while remaining > 1 {
+            let placed = app.session.world.set_block_immediate(
+                wear_pos.x,
+                wear_pos.y,
+                wear_pos.z,
+                BlockId::Stone,
+            );
+            assert!(!placed.is_empty(), "the quarry edit remeshes");
+            let (remeshed, wear) = applied_break(break_mined_block(
+                &mut app.session,
+                wear_pos,
+                BlockId::Stone,
+            ));
+            assert!(!remeshed.is_empty(), "the wear break remeshes");
+            remaining -= 1;
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Worn { remaining },
+                "exactly one durability point per applied break"
+            );
+        }
+        assert_eq!(
+            app.session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(1),
+            "the worn tool is recorded at its last point"
+        );
+        assert_eq!(
+            app.session
+                .player
+                .inventory()
+                .slot(1)
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 58)),
+            "every break folded its drop into the first free hotbar slot"
+        );
+
+        // 7. Leave a held cursor stack: pick the stone up and do not place it.
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(1));
+        assert_eq!(
+            app.session
+                .player
+                .inventory()
+                .cursor()
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 58)),
+            "the stack rides the cursor"
+        );
+
+        // The saved aim points straight down at the table from three blocks up.
+        // Persist an air shaft so the raycast stays clear once the chunk
+        // regenerates from terrain seed data on reload.
+        for y in 7..=10 {
+            app.session.world.set_block_immediate(0, y, 0, BlockId::Air);
+        }
+
+        // 8. Close the panel the way `close_inventory` does (it needs a live
+        // Window for the cursor grab), pause, and Save-and-Quit.
+        screen.close();
+        app.session.close_table();
+        assert_eq!(
+            screen.mode(app.session.open_table_position()),
+            InventoryMode::Closed
+        );
+        assert_eq!(app.session.open_table_position(), None);
+
+        let expected_inventory = app.session.player.inventory().clone();
+        let expected_player_grid = app.session.player.player_grid().clone();
+        let expected_table_grid = app.session.player.table_grid().clone();
+        let expected_units = inventory_units(&app.session.player);
+        let expected_edits = app.session.world.chunk_edits().clone();
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none(), "the save succeeded");
+        assert!(!app.session.world.has_unsaved_changes());
+        let first_bytes = std::fs::read(&save_path).expect("the save file exists");
+        assert!(!first_bytes.is_empty());
+
+        // The file itself carries the exact state and the table edit.
+        let persisted = load_world_from_path(&save_path).expect("the save decodes");
+        assert_eq!(persisted.player.inventory, expected_inventory);
+        assert_eq!(persisted.player.player_grid, expected_player_grid);
+        assert_eq!(persisted.player.table_grid, expected_table_grid);
+        assert_eq!(persisted.player.selected_slot, 0);
+        let (edit_cpos, (lx, ly, lz)) =
+            world_to_chunk_and_local(table_pos.x, table_pos.y, table_pos.z);
+        assert_eq!(
+            persisted.chunk_edits[&edit_cpos][&(linear_index(lx, ly, lz) as u16)],
+            BlockId::CraftingTable,
+            "the placed table is persisted as a chunk edit"
+        );
+
+        // 9. Reload through the real catalog: Load Game refreshes rows from
+        // the tempdir catalog, Play rebuilds the session from the file.
+        app.enter_screen(LifecycleScreen::LoadGame);
+        let index = app
+            .load
+            .rows()
+            .iter()
+            .position(|row| row.name == "continuity")
+            .expect("the continuity row is listed");
+        app.play_row(index);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_path, save_path);
+
+        // 10. Exact restoration: slots, cursor, durability, selection, both
+        // grids cell-by-cell, and the played position.
+        assert_eq!(
+            app.session.player.inventory(),
+            &expected_inventory,
+            "every slot, the cursor, and tool durability are restored exactly"
+        );
+        assert_eq!(
+            app.session.player.player_grid(),
+            &expected_player_grid,
+            "the 2x2 grid is restored cell-by-cell"
+        );
+        assert_eq!(
+            app.session.player.table_grid(),
+            &expected_table_grid,
+            "the 4x4 grid is restored cell-by-cell"
+        );
+        assert_eq!(
+            inventory_units(&app.session.player),
+            expected_units,
+            "no item was lost or duplicated across the round trip"
+        );
+        assert_eq!(app.session.player.selected_slot(), 0);
+        let restored_tool = app
+            .session
+            .player
+            .inventory()
+            .slot(0)
+            .expect("the tool is restored in its slot");
+        assert_eq!(
+            restored_tool.id(),
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(
+            restored_tool.durability(),
+            Some(1),
+            "the remaining durability point survives exactly"
+        );
+        assert_eq!(
+            app.session
+                .player
+                .inventory()
+                .cursor()
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 58)),
+            "the held cursor stack is restored"
+        );
+        assert_eq!(
+            app.session
+                .player
+                .table_grid()
+                .slot(15)
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::OakPlanks), 2)),
+            "high table cell 15 persists"
+        );
+        assert_eq!(
+            app.session
+                .player
+                .table_grid()
+                .slot(9)
+                .map(|item| item.id()),
+            Some(ItemId::Material(Material::Stick))
+        );
+        assert_eq!(
+            app.session
+                .player
+                .player_grid()
+                .slot(0)
+                .map(|item| item.id()),
+            Some(ItemId::Block(BlockId::OakLog))
+        );
+        assert_eq!(
+            app.session
+                .player
+                .player_grid()
+                .slot(3)
+                .map(|item| item.id()),
+            Some(ItemId::Block(BlockId::OakPlanks))
+        );
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(0.5, 9.0, 0.5),
+            "the played position round-trips"
+        );
+        // The station is intentionally ephemeral (S02 design): a restart always
+        // starts with no table open, which is a positive assertion here.
+        assert_eq!(app.session.open_table_position(), None);
+        assert_eq!(
+            InventoryScreen::new().mode(app.session.open_table_position()),
+            InventoryMode::Closed
+        );
+
+        // 13. Negative: a table-grid click without a live station is rejected
+        // in Player mode and mutates nothing.
+        let inventory_before = app.session.player.inventory().clone();
+        let player_grid_before = app.session.player.player_grid().clone();
+        let table_grid_before = app.session.player.table_grid().clone();
+        let mut player_screen = InventoryScreen::new();
+        player_screen.open_player();
+        assert_eq!(
+            apply_inventory_click(
+                &mut app.session.player,
+                &player_screen,
+                None,
+                InventoryTarget::GridCell {
+                    kind: GridKind::Table,
+                    index: 15,
+                },
+            ),
+            Err(InventoryCommandError::TableUnavailable)
+        );
+        assert_eq!(app.session.player.inventory(), &inventory_before);
+        assert_eq!(app.session.player.player_grid(), &player_grid_before);
+        assert_eq!(app.session.player.table_grid(), &table_grid_before);
+
+        // 11. The table edit re-applies when its chunk regenerates from the
+        // seed plus the persisted edits (the reloaded session is unstreamed).
+        assert_ne!(
+            app.session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z),
+            BlockId::CraftingTable,
+            "nothing is resident before the streaming pump runs"
+        );
+        for _ in 0..120 {
+            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            if app
+                .session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z)
+                == BlockId::CraftingTable
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z),
+            BlockId::CraftingTable,
+            "the placed table edit survives chunk regeneration"
+        );
+        for _ in 0..120 {
+            if app
+                .session
+                .world
+                .has_all_face_neighbors(ChunkPos::new(0, 0, 0))
+            {
+                break;
+            }
+            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.session
+                .world
+                .has_all_face_neighbors(ChunkPos::new(0, 0, 0)),
+            "the regenerated chunk has its face halo resident for edits"
+        );
+        assert_eq!(
+            app.session.world.chunk_edits(),
+            &expected_edits,
+            "streaming applies edits without rewriting the edit map"
+        );
+
+        // 12a. A restore followed by a save with no intervening play is
+        // byte-identical to the original file.
+        let second_path = dir.path().join("continuity-again.mcvx");
+        app.session.save_path = second_path.clone();
+        save_current_world(&mut app.session).expect("the restored session re-saves");
+        assert_eq!(
+            std::fs::read(&save_path).expect("read first save"),
+            std::fs::read(&second_path).expect("read second save"),
+            "session restore followed by save is byte-identical"
+        );
+        app.session.save_path = save_path.clone();
+
+        // 12b. The restored tool is spent on its last point through the real
+        // break path, then a replacement is recrafted from the restored
+        // materials. The held stack is put down first.
+        screen.open_player();
+        expect_moved(&mut app, &screen, InventoryTarget::Slot(20));
+        assert!(app.session.player.inventory().cursor().is_none());
+
+        app.session
+            .world
+            .set_block_immediate(wear_pos.x, wear_pos.y, wear_pos.z, BlockId::Stone);
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut app.session,
+            wear_pos,
+            BlockId::Stone,
+        ));
+        assert!(!remeshed.is_empty(), "the last wear break remeshes");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Broke,
+            "the restored last point breaks the tool"
+        );
+        assert!(
+            app.session.player.inventory().slot(0).is_none(),
+            "the last use freed the selected slot before collection (MEM195 ordering)"
+        );
+        assert!(
+            app.session
+                .player
+                .inventory()
+                .slots()
+                .iter()
+                .flatten()
+                .all(|item| !item.is_tool()),
+            "the broken tool is gone from every slot"
+        );
+
+        // Re-open the restored table through the production right-click path
+        // using the restored aim, then recraft from the restored grid.
+        assert!(
+            matches!(
+                right_click_interaction(&mut app.session),
+                RightClickOutcome::TableOpened
+            ),
+            "the restored table is targetable again"
+        );
+        assert_eq!(app.session.open_table_position(), Some(table_pos));
+        screen.close();
+        screen.open_table();
+        expect_moved(&mut app, &screen, table_cell(15));
+        expect_moved(&mut app, &screen, table_cell(0));
+        assert_eq!(
+            app.session
+                .player
+                .table_grid()
+                .preview()
+                .map(|preview| preview.recipe),
+            Some(RecipeId::WoodPickaxe),
+            "the restored materials complete the pickaxe recipe"
+        );
+        let recrafted = expect_crafted(
+            &mut app,
+            &screen,
+            GridKind::Table,
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+        );
+        assert_eq!(recrafted.durability(), Some(59), "a recrafted tool is full");
+        assert!(app.session.player.select_slot(0));
+        assert_eq!(
+            app.session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59)
+        );
+
+        // Re-save the played-forward world through the real save site and read
+        // the file back: the state legitimately changed, so this is a fresh
+        // save that must decode with the recrafted tool and consumed grids.
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none());
+        let final_bytes = std::fs::read(&save_path).expect("the final save exists");
+        assert_ne!(
+            final_bytes, first_bytes,
+            "play legitimately changed the persisted state"
+        );
+        let final_data = load_world_from_path(&save_path).expect("the final save decodes");
+        assert_eq!(
+            final_data.player.inventory.slot(0).map(|item| item.id()),
+            Some(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            })
+        );
+        assert_eq!(
+            final_data
+                .player
+                .inventory
+                .slot(0)
+                .and_then(|item| item.durability()),
+            Some(59),
+            "the recrafted tool is persisted at full durability"
+        );
+        assert_eq!(
+            final_data
+                .player
+                .inventory
+                .slots()
+                .iter()
+                .flatten()
+                .filter(|item| item.is_tool())
+                .count(),
+            1,
+            "exactly the recrafted tool remains"
+        );
+        assert_eq!(
+            final_data
+                .player
+                .inventory
+                .slot(20)
+                .map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 59)),
+            "the restored held stack plus the last drop are conserved"
+        );
+        assert_eq!(
+            final_data
+                .player
+                .table_grid
+                .slot(5)
+                .map(|item| item.count()),
+            Some(2),
+            "the restored stick stack supplied the recipe and kept its remainder"
+        );
+    }
+
     /// S03-T04 startup regression: a world-intent CLI (the three-flag
     /// disjunction both smoke scripts' launches rely on) starts a session
     /// that owns `cli.save_path` and GameApp::new enters Playing directly
