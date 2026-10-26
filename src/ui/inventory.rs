@@ -377,8 +377,8 @@ pub fn target_rect(
 /// Deterministic opaque palette per item identity. No art files: the UI can
 /// draw recognizable stacks from pure data.
 ///
-/// Air and bedrock are uncarryable, so their shared fallback color can never
-/// appear as an item.
+/// Air, bedrock, and water are uncarryable, so their shared fallback color can
+/// never appear as an item.
 pub fn item_color(item: Item) -> [f32; 4] {
     match item.id() {
         ItemId::Block(block) => block_color(block),
@@ -402,6 +402,10 @@ fn block_color(block: BlockId) -> [f32; 4] {
         BlockId::CoalOre => [0.28, 0.28, 0.30, 1.0],
         BlockId::IronOre => [0.60, 0.52, 0.45, 1.0],
         BlockId::CraftingTable => [0.58, 0.34, 0.18, 1.0],
+        // Water is uncarryable, so this palette entry is unreachable through
+        // the item UI; it exists so the block color map stays total and a
+        // future HUD/debug readout has a canonical tint.
+        BlockId::Water => [0.20, 0.42, 0.78, 1.0],
         BlockId::Air | BlockId::Bedrock => [0.16, 0.16, 0.18, 1.0],
     }
 }
@@ -1208,5 +1212,23 @@ mod tests {
         let a = item(ItemId::Block(BlockId::Stone), 3);
         let b = item(ItemId::Block(BlockId::Stone), 64);
         assert_eq!(item_color(a), item_color(b));
+    }
+
+    #[test]
+    fn water_block_color_is_defined_distinct_from_the_fallback() {
+        // Water is uncarryable, so `item_color` can never reach it, but the
+        // block palette stays total. It must not silently alias the shared
+        // Air/Bedrock fallback.
+        let water = block_color(BlockId::Water);
+        let fallback = block_color(BlockId::Air);
+        assert_eq!(water[3], 1.0, "water color must be opaque");
+        assert_ne!(water, fallback, "water needs its own tint");
+        assert_eq!(block_color(BlockId::Bedrock), fallback);
+        for channel in &water[..3] {
+            assert!(
+                (0.0..=1.0).contains(channel),
+                "water channel {channel} out of range"
+            );
+        }
     }
 }

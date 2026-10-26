@@ -248,6 +248,17 @@ pub fn save_world_to_bytes(
         return Err(PersistenceError::InvalidCraftingState);
     }
 
+    // Water is worldgen-only. A liquid in a chunk edit would round-trip a
+    // value this schema deliberately refuses to load, so refuse to write it
+    // (still before the first byte, keeping the atomic-write contract).
+    for edits in data.chunk_edits.values() {
+        for &block in edits.values() {
+            if block.is_liquid() {
+                return Err(PersistenceError::InvalidBlockId(block as u8));
+            }
+        }
+    }
+
     out.extend_from_slice(SAVE_MAGIC);
     out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
     out.extend_from_slice(&data.seed.to_le_bytes());
@@ -531,6 +542,13 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             let Some(block) = BlockId::from_u8(block_raw) else {
                 return Err(PersistenceError::InvalidBlockId(block_raw));
             };
+            // v4 validation keeps rejecting id 15 even though `from_u8` now
+            // accepts it: water is generated only by the terrain pass and must
+            // never round-trip through a persisted chunk edit. Treating a
+            // forged water edit as an unknown id fails the whole save closed.
+            if block.is_liquid() {
+                return Err(PersistenceError::InvalidBlockId(block_raw));
+            }
             edits.insert(local_idx, block);
         }
         chunk_edits.insert(ChunkPos::new(cx, cy, cz), edits);
@@ -596,7 +614,7 @@ fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
         let Some(block) = BlockId::from_u8(block_raw) else {
             return Err(PersistenceError::InvalidBlockId(block_raw));
         };
-        if matches!(block, BlockId::Air | BlockId::Bedrock) {
+        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) {
             return Err(PersistenceError::InvalidPlayerState);
         }
         let Some(stack) = ItemStack::new(block, count) else {
@@ -847,6 +865,57 @@ mod tests {
         assert!(matches!(
             load_world_from_bytes(&valid),
             Err(PersistenceError::InvalidLocalIndex(40000))
+        ));
+    }
+
+    #[test]
+    fn test_water_chunk_edit_is_rejected_on_load_and_save() {
+        // Load side: a well-formed save whose only edit byte is water must
+        // fail closed even though `BlockId::from_u8(15)` now decodes. Saving
+        // legit stone first keeps the payload byte-for-byte valid apart from
+        // the patched block id.
+        let mut edits = ChunkEditMap::default();
+        let mut c0 = rustc_hash::FxHashMap::default();
+        c0.insert(10, BlockId::Stone);
+        edits.insert(ChunkPos::new(0, 0, 0), c0);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = edits;
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("stone edit must be saveable");
+        // One chunk, one edit: the block byte follows chunk_count, the 12-byte
+        // chunk position, edit_count, and the u16 local index.
+        const FIRST_EDIT_BLOCK_OFFSET: usize = 89;
+        assert_eq!(bytes[FIRST_EDIT_BLOCK_OFFSET], BlockId::Stone as u8);
+        bytes[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Water as u8;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidBlockId(15))
+        ));
+
+        // Save side: an in-memory water edit is refused before any byte is
+        // written, so a worldgen leak cannot reach disk.
+        let mut water_edits = ChunkEditMap::default();
+        let mut w0 = rustc_hash::FxHashMap::default();
+        w0.insert(10, BlockId::Water);
+        water_edits.insert(ChunkPos::new(0, 0, 0), w0);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = water_edits;
+        let mut out = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut out, &data),
+            Err(PersistenceError::InvalidBlockId(15))
+        ));
+        assert!(out.is_empty(), "a rejected save must not emit bytes");
+    }
+
+    #[test]
+    fn test_v2_hotbar_rejects_water() {
+        let mut bytes = valid_v3_bytes();
+        set_v2_slot(&mut bytes, 0, BlockId::Water as u8, 1);
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidPlayerState)
         ));
     }
 
@@ -1387,6 +1456,15 @@ mod tests {
 
         let mut bytes = block_record.clone();
         bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Air as u8;
+        bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::UncarryableBlock))
+        ));
+
+        let mut bytes = block_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Water as u8;
         bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(matches!(

@@ -62,7 +62,9 @@ impl ItemStack {
     /// Builds a stack, rejecting blocks that cannot be carried and counts
     /// outside `1..=MAX_STACK_COUNT`.
     pub fn new(block: BlockId, count: u16) -> Option<Self> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock) || count == 0 || count > MAX_STACK_COUNT
+        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water)
+            || count == 0
+            || count > MAX_STACK_COUNT
         {
             return None;
         }
@@ -101,7 +103,7 @@ impl Hotbar {
     /// slot is capped at `MAX_STACK_COUNT`. Returns the first slot written, or
     /// `None` when the block/amount is invalid or nothing can be accepted.
     pub fn collect(&mut self, block: BlockId, amount: u16) -> Option<usize> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock) || amount == 0 {
+        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
             return None;
         }
 
@@ -294,7 +296,7 @@ pub enum ItemError {
     EmptyStack,
     /// Count exceeded the identity's stack limit.
     StackOverflow,
-    /// Air and bedrock cannot be carried.
+    /// Air, bedrock, and water cannot be carried.
     UncarryableBlock,
     /// Tools are non-stackable and must have count one.
     StackableTool,
@@ -320,12 +322,14 @@ pub struct Item {
 impl Item {
     /// Builds a fully-repaired instance of `id` with `count` items.
     ///
-    /// Blocks reject air/bedrock, materials enforce
+    /// Blocks reject air/bedrock/water, materials enforce
     /// [`MATERIAL_STACK_LIMIT`], blocks enforce [`MAX_STACK_COUNT`], and tools
     /// must be count one (they start at full durability).
     pub fn new(id: ItemId, count: u16) -> Result<Self, ItemError> {
         match id {
-            ItemId::Block(BlockId::Air | BlockId::Bedrock) => Err(ItemError::UncarryableBlock),
+            ItemId::Block(BlockId::Air | BlockId::Bedrock | BlockId::Water) => {
+                Err(ItemError::UncarryableBlock)
+            }
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
             ItemId::Tool { tier, .. } => {
@@ -719,7 +723,7 @@ impl Inventory {
     /// the remainder. Returns `None` (no mutation) when nothing was accepted
     /// or the block cannot be carried.
     pub fn collect_block(&mut self, block: BlockId, amount: u16) -> Option<CollectOutcome> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock) || amount == 0 {
+        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
             return None;
         }
 
@@ -1496,6 +1500,7 @@ mod tests {
     fn item_stack_rejects_invalid_blocks_and_counts() {
         assert!(ItemStack::new(BlockId::Air, 1).is_none());
         assert!(ItemStack::new(BlockId::Bedrock, 1).is_none());
+        assert!(ItemStack::new(BlockId::Water, 1).is_none());
         assert!(ItemStack::new(BlockId::Grass, 0).is_none());
         assert!(ItemStack::new(BlockId::Grass, MAX_STACK_COUNT + 1).is_none());
 
@@ -1637,6 +1642,7 @@ mod tests {
 
         assert_eq!(hotbar.collect(BlockId::Air, 1), None);
         assert_eq!(hotbar.collect(BlockId::Bedrock, 1), None);
+        assert_eq!(hotbar.collect(BlockId::Water, 1), None);
         assert_eq!(hotbar.collect(BlockId::Grass, 0), None);
         assert_eq!(hotbar, Hotbar::empty());
     }
@@ -1682,6 +1688,15 @@ mod tests {
         assert_eq!(
             Item::new(ItemId::Block(BlockId::Bedrock), 1),
             Err(ItemError::UncarryableBlock)
+        );
+        assert_eq!(
+            Item::new(ItemId::Block(BlockId::Water), 1),
+            Err(ItemError::UncarryableBlock)
+        );
+        assert_eq!(
+            Item::new(ItemId::Block(BlockId::Water), MAX_STACK_COUNT),
+            Err(ItemError::UncarryableBlock),
+            "the uncarryable check must win over the count check"
         );
         assert_eq!(
             Item::new(ItemId::Block(BlockId::Stone), 0),
@@ -1924,6 +1939,7 @@ mod tests {
         let mut inventory = Inventory::empty();
         assert_eq!(inventory.collect_block(BlockId::Air, 1), None);
         assert_eq!(inventory.collect_block(BlockId::Bedrock, 1), None);
+        assert_eq!(inventory.collect_block(BlockId::Water, 1), None);
         assert_eq!(inventory.collect_block(BlockId::Stone, 0), None);
         assert_eq!(inventory, Inventory::empty());
     }
