@@ -23,6 +23,16 @@ pub const DAY_SECONDS: f32 = 1_200.0;
 /// Default time of day: noon.
 pub const DEFAULT_TIME_OF_DAY: u32 = 6_000;
 
+/// Tick at which one day rolls over into the next.
+///
+/// Derivation: [`DAY_TICKS`] documents `0 = dawn`, and
+/// [`GameClock::advance_secs`] wraps `time_of_day` modulo `DAY_TICKS` with no
+/// phase offset. The natural wrap point is therefore tick 0: tick 23,999 (the
+/// last tick of day N) is followed by tick 0, the first tick of day N + 1.
+/// Pinned as a named const so S05's season rollover and S08's accelerated year
+/// share one boundary rather than re-deriving it.
+pub const DAY_BOUNDARY_TICK: u32 = 0;
+
 /// Dimmest the world gets at midnight, roughly one third of full daylight.
 pub const MOONLIT_FLOOR: f32 = 0.34;
 
@@ -71,6 +81,13 @@ pub const VISTA_GOLDEN_HOUR: u32 = 1_000;
 pub struct GameClock {
     /// Whole ticks since dawn, always in `0..DAY_TICKS`.
     pub time_of_day: u32,
+    /// Whole days elapsed since day 0, which starts at dawn (tick 0).
+    ///
+    /// A day ends exactly when [`GameClock::advance_secs`] wraps `time_of_day`
+    /// past `DAY_TICKS` back to [`DAY_BOUNDARY_TICK`]; there is no phase
+    /// offset. The field is `u32` and saturates rather than wrapping on
+    /// astronomically large advances.
+    pub day_index: u32,
     fractional_ticks: f32,
     frame_marker: Option<Instant>,
 }
@@ -84,10 +101,21 @@ impl GameClock {
     /// A clock starting at `time_of_day`, clamped into the valid cycle.
     ///
     /// `DAY_TICKS` itself wraps to dawn, so it clamps to the final tick of the
-    /// day rather than producing an out-of-range stored value.
+    /// day rather than producing an out-of-range stored value. Day 0 starts at
+    /// the first dawn, so the day index is always zero here.
     pub fn from_time(time_of_day: u32) -> Self {
+        Self::from_day_and_time(0, time_of_day)
+    }
+
+    /// A clock restored at an exact day index and time of day.
+    ///
+    /// `day_index` is unbounded and stored as given; `time_of_day` follows the
+    /// [`GameClock::from_time`] clamp so a corrupted persisted tick cannot
+    /// produce an out-of-range value. Used by save restore (S08).
+    pub fn from_day_and_time(day_index: u32, time_of_day: u32) -> Self {
         Self {
             time_of_day: time_of_day.min(DAY_TICKS - 1),
+            day_index,
             fractional_ticks: 0.0,
             frame_marker: None,
         }
@@ -127,12 +155,27 @@ impl GameClock {
 
         self.fractional_ticks += delta_secs * time_scale * (DAY_TICKS as f32 / DAY_SECONDS);
 
+        // An overflowing product can reach infinity; reset instead of letting
+        // `inf - inf` turn the accumulator into a sticky NaN.
+        if !self.fractional_ticks.is_finite() {
+            self.fractional_ticks = 0.0;
+        }
+
         // Keep the sub-tick remainder; a 60 fps frame is only ~0.33 ticks, so
         // truncating each frame would freeze the clock.
         let whole_ticks = self.fractional_ticks.trunc();
         self.fractional_ticks -= whole_ticks;
-        let advance = (whole_ticks as u64 % DAY_TICKS as u64) as u32;
-        self.time_of_day = (self.time_of_day + advance) % DAY_TICKS;
+
+        // Count the carries the old `% DAY_TICKS` silently discarded. The
+        // absolute progress is accumulated in u64 so a multi-day advance (or
+        // an f32-to-u64 saturating cast) cannot overflow; the day index
+        // saturates instead of wrapping.
+        let total_ticks = (whole_ticks as u64).saturating_add(self.time_of_day as u64);
+        let whole_days = total_ticks / DAY_TICKS as u64;
+        self.day_index = self
+            .day_index
+            .saturating_add(u32::try_from(whole_days).unwrap_or(u32::MAX));
+        self.time_of_day = (total_ticks % DAY_TICKS as u64) as u32;
     }
 }
 
@@ -459,6 +502,71 @@ mod tests {
         let mut clock = GameClock::from_time(DAY_TICKS - 10);
         clock.advance_secs(1.0, 1.0);
         assert_eq!(clock.time_of_day, 10);
+    }
+
+    #[test]
+    fn day_boundary_is_dawn_tick_zero() {
+        // Derivation: `DAY_TICKS` documents 0 = dawn, and `advance_secs` wraps
+        // modulo DAY_TICKS with no phase offset, so the last tick of day N
+        // (23,999) is followed by tick 0 — the first tick of day N + 1.
+        assert_eq!(DAY_BOUNDARY_TICK, 0);
+        assert_eq!(DAY_TICKS - 1, 23_999);
+    }
+
+    #[test]
+    fn new_and_from_time_clocks_start_on_day_zero() {
+        assert_eq!(GameClock::new().day_index, 0);
+        assert_eq!(GameClock::from_time(12_345).day_index, 0);
+        assert_eq!(GameClock::default().day_index, 0);
+    }
+
+    #[test]
+    fn advancing_past_the_day_boundary_increments_day_index_once() {
+        let mut clock = GameClock::from_time(DAY_TICKS - 10);
+        clock.advance_secs(1.0, 1.0);
+        assert_eq!(clock.time_of_day, 10);
+        assert_eq!(clock.day_index, 1);
+    }
+
+    #[test]
+    fn day_boundary_is_the_first_tick_of_the_next_day() {
+        let mut clock = GameClock::from_time(DAY_TICKS - 20);
+        // Exactly 20 ticks at scale 1.0: the last tick of day 0 lands on dawn.
+        clock.advance_secs(1.0, 1.0);
+        assert_eq!(clock.time_of_day, DAY_BOUNDARY_TICK);
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.fractional_ticks, 0.0);
+    }
+
+    #[test]
+    fn multi_day_advance_counts_every_wrap_and_keeps_the_residual() {
+        let mut clock = GameClock::from_time(DEFAULT_TIME_OF_DAY);
+        // 2.5 days = 60,000 ticks = 3,000 s at scale 1.0.
+        clock.advance_secs(3_000.0, 1.0);
+        // 6,000 + 60,000 = 66,000 = 2 whole days + 18,000 ticks.
+        assert_eq!(clock.day_index, 2);
+        assert_eq!(clock.time_of_day, 18_000);
+    }
+
+    #[test]
+    fn from_day_and_time_restores_day_and_clamps_time() {
+        let clock = GameClock::from_day_and_time(42, 12_345);
+        assert_eq!(clock.day_index, 42);
+        assert_eq!(clock.time_of_day, 12_345);
+        assert_eq!(clock.fractional_ticks, 0.0);
+        assert!(clock.frame_marker.is_none());
+
+        let clamped = GameClock::from_day_and_time(u32::MAX, u32::MAX);
+        assert_eq!(clamped.day_index, u32::MAX);
+        assert_eq!(clamped.time_of_day, DAY_TICKS - 1);
+    }
+
+    #[test]
+    fn u32_max_scale_advance_does_not_panic_and_counts_days() {
+        let mut clock = GameClock::from_time(0);
+        clock.advance_secs(u32::MAX as f32 / 20.0, 1.0);
+        assert!(clock.day_index > 0);
+        assert!(clock.time_of_day < DAY_TICKS);
     }
 
     #[test]
