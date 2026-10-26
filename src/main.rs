@@ -3560,7 +3560,7 @@ mod tests {
 
     use opencraft::player::camera::Camera;
     use opencraft::world::persistence::ChunkEditMap;
-    use opencraft::world::terrain::terrain_height_at_seeded;
+    use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
     use glam::IVec3;
 
@@ -6479,10 +6479,15 @@ mod tests {
         assert_eq!(app.session.world.seed(), expected_seed);
         // The session owns the catalog-validated saves/<Name>.mcvx path.
         assert_eq!(app.session.save_path, dir.path().join("Deep Dark.mcvx"));
-        // The player spawns on the resolved seed's terrain (the session
-        // was built via session::new_session, not the old one).
-        let expected_y = (terrain_height_at_seeded(0, 0, expected_seed) + 4) as f32;
-        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        // The player spawns on the resolved seed's land-search column (the
+        // session was built via session::new_session, not the old one), 4
+        // blocks above the surface.
+        let (spawn_x, spawn_z) = find_spawn_column(expected_seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, expected_seed) + 4) as f32;
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
         // Playing semantics: cursor grabbed, no form message.
         assert!(app.cursor_grabbed);
         assert!(app.new_game.message().is_none());
@@ -6506,8 +6511,12 @@ mod tests {
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.save_path, dir.path().join("Blank Seed.mcvx"));
         let seed = app.session.world.seed();
-        let expected_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
     }
 
     #[test]
@@ -6863,11 +6872,12 @@ mod tests {
             PathBuf::from("/nonexistent/replacement.mcvx"),
             "save path swapped"
         );
-        let expected_y = (terrain_height_at_seeded(0, 0, 42) + 4) as f32;
+        let (spawn_x, spawn_z) = find_spawn_column(42);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 42) + 4) as f32;
         assert_eq!(
             app.session.player.position,
-            Vec3::new(0.5, expected_y, 0.5),
-            "player swapped to the new world's spawn"
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5),
+            "player swapped to the new world's land-search spawn"
         );
         assert_eq!(
             app.session.camera.position,
@@ -6985,10 +6995,11 @@ mod tests {
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), 777);
         assert_eq!(session.save_path, missing);
-        let expected_y = (terrain_height_at_seeded(0, 0, 777) + 4) as f32;
+        let (spawn_x, spawn_z) = find_spawn_column(777);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 777) + 4) as f32;
         assert_eq!(
             session.player.position,
-            Vec3::new(0.5, expected_y, 0.5),
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5),
             "spawn mirrors main()'s fresh branch"
         );
 
@@ -7006,10 +7017,11 @@ mod tests {
         let cli = CliConfig::parse_args(["--save", corrupt.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
+        let (default_x, default_z) = find_spawn_column(DEFAULT_WORLD_SEED);
         assert_eq!(
             session.player.position.y,
-            (terrain_height_at_seeded(0, 0, DEFAULT_WORLD_SEED) + 4) as f32,
-            "corrupt save falls back to the default-seed spawn"
+            (terrain_height_at_seeded(default_x, default_z, DEFAULT_WORLD_SEED) + 4) as f32,
+            "corrupt save falls back to the default-seed land-search spawn"
         );
 
         // --new forces a fresh session even when a save file exists
@@ -7024,8 +7036,12 @@ mod tests {
             5,
             "force_new ignores the existing save"
         );
-        let expected_y = (terrain_height_at_seeded(0, 0, 5) + 4) as f32;
-        assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let (spawn_x, spawn_z) = find_spawn_column(5);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 5) + 4) as f32;
+        assert_eq!(
+            session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
         assert_eq!(session.save_path, existing);
     }
 

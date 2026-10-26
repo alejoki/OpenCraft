@@ -17,7 +17,7 @@ use crate::player::raycast::raycast_voxels;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
-use crate::world::terrain::terrain_height_at_seeded;
+use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
 /// reachable. Shared with the placement/mining ray length so every world
@@ -44,12 +44,18 @@ pub struct WorldSession {
 impl WorldSession {
     /// A fresh world, exactly mirroring main()'s fresh-world branch:
     /// render distance 16, the given seed, no chunk edits, and the player
-    /// spawned 4 blocks above the seeded terrain at column (0, 0).
+    /// spawned 4 blocks above the deterministic land-search column (D071: the
+    /// old fixed (0, 0) column can be open ocean after the biome rewrite).
     pub fn new_session(seed: u32, save_path: PathBuf) -> WorldSession {
-        let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let spawn_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-            player: Player::new(Vec3::new(0.5, spawn_y, 0.5)),
+            player: Player::new(Vec3::new(
+                spawn_x as f32 + 0.5,
+                spawn_y,
+                spawn_z as f32 + 0.5,
+            )),
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
             save_path,
@@ -230,11 +236,32 @@ mod tests {
     }
 
     #[test]
-    fn new_session_spawns_player_on_the_seeded_terrain() {
+    fn new_session_spawns_player_on_the_searched_land_column() {
+        // Seed 12345's (0, 0) column is open ocean after the T03 biome rewrite,
+        // so this seed proves the session really moved instead of spawning on
+        // the seabed.
         let seed = 12345u32;
         let session = WorldSession::new_session(seed, PathBuf::from("/tmp/fresh.mcvx"));
-        let expected_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-        assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        assert_eq!(
+            session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
+        assert!(
+            terrain_height_at_seeded(0, 0, seed) < crate::world::terrain::SEA_LEVEL,
+            "test premise: seed {seed} must have an ocean at (0, 0)"
+        );
+        assert!(
+            (spawn_x, spawn_z) != (0, 0),
+            "the session must spawn away from the ocean column"
+        );
+        let h = terrain_height_at_seeded(spawn_x, spawn_z, seed);
+        assert!(h >= crate::world::terrain::SPAWN_MIN_HEIGHT);
+        assert_ne!(
+            crate::world::terrain::biome_at_seeded(spawn_x, spawn_z, seed),
+            crate::world::terrain::Biome::Ocean
+        );
     }
 
     #[test]
