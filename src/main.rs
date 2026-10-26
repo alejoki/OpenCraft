@@ -502,6 +502,29 @@ fn inventory_should_close(screen: &InventoryScreen, table_open: Option<IVec3>) -
     screen.table_lost(table_open)
 }
 
+/// Re-validates the attached crafting-table station at an inventory click
+/// boundary and closes a panel whose station disappeared (S04-T02).
+///
+/// The redraw path already syncs once per playing frame, but gameplay state is
+/// not frozen for chunk streaming: a streamed chunk can unload (or the player
+/// can step out of reach) between two redraws, and a mouse press/release can be
+/// delivered before the next one. Without a sync here the click would still see
+/// the stale station, so a table-grid press would mutate the 4x4 grid as if the
+/// table were live. Syncing first makes the press and release arms
+/// self-defending: a removed/replaced/out-of-reach table closes the panel (and
+/// its station) before any command is interpreted, so the click is dropped.
+///
+/// Returns `true` when the panel was closed because the station was lost.
+fn revalidate_inventory_station(screen: &mut InventoryScreen, session: &mut WorldSession) -> bool {
+    let table_open = session.sync_open_table();
+    if !inventory_should_close(screen, table_open) {
+        return false;
+    }
+    screen.close();
+    session.close_table();
+    true
+}
+
 /// Where a press-drag-release ends: only a different cell than the press origin
 /// receives the held stack. A same-cell release (the click-to-pick style) and a
 /// release off the panel are inert, leaving the stack on the cursor.
@@ -2412,6 +2435,20 @@ impl ApplicationHandler for GameApp {
                 // leaves the stack on the cursor (click-to-pick style).
                 if self.inventory.is_open() {
                     let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    // Click-boundary revalidation (S04-T02): a station can be
+                    // invalidated between redraws (chunk streaming keeps
+                    // running), so sync before the release is routed. A lost
+                    // station closes the panel and ends the gesture instead of
+                    // dropping into a stale 4x4 grid.
+                    if revalidate_inventory_station(&mut self.inventory, &mut self.session) {
+                        self.inventory_status = Some("Crafting Table closed".to_string());
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.mining.reset();
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                        return;
+                    }
                     let table_open = self.session.open_table_position();
                     let mode = self.inventory.mode(table_open);
                     let layout = layout(surface_w, surface_h, mode);
@@ -2516,6 +2553,18 @@ impl ApplicationHandler for GameApp {
                 // table interaction, placement, and hold-to-mine arming.
                 if self.inventory.is_open() {
                     let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    // Click-boundary revalidation (S04-T02): see the release
+                    // arm. A press must never route into a station that a
+                    // between-redraw stream update already invalidated.
+                    if revalidate_inventory_station(&mut self.inventory, &mut self.session) {
+                        self.inventory_status = Some("Crafting Table closed".to_string());
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.mining.reset();
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                        return;
+                    }
                     let table_open = self.session.open_table_position();
                     let mode = self.inventory.mode(table_open);
                     match button {
@@ -5888,6 +5937,161 @@ mod tests {
             BlockId::CraftingTable,
             "the UI click touched no world block"
         );
+    }
+
+    #[test]
+    fn station_invalidated_between_redraws_rejects_or_closes_the_panel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(47, dir.path().join("stale-station.mcvx"));
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let table_pos = IVec3::new(0, 5, 0);
+        session.world.set_block_immediate(
+            table_pos.x,
+            table_pos.y,
+            table_pos.z,
+            BlockId::CraftingTable,
+        );
+        aim_table_interaction_at(&mut session, table_pos);
+        assert!(
+            matches!(
+                right_click_interaction(&mut session),
+                RightClickOutcome::TableOpened
+            ),
+            "a real targeted table opens its station"
+        );
+
+        // The screen half of the table-open path (`open_inventory`); the cursor
+        // grab needs a live Window and is not part of this seam.
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        assert_eq!(
+            screen.mode(session.open_table_position()),
+            InventoryMode::Table
+        );
+
+        // Park a stack in the high 4x4 cell so a stale click is observable as a
+        // grid mutation (the pickup would take it back onto the cursor).
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+        let table_target = InventoryTarget::GridCell {
+            kind: GridKind::Table,
+            index: 15,
+        };
+        let table_open = session.open_table_position();
+        assert_eq!(
+            apply_inventory_click(
+                &mut session.player,
+                &screen,
+                table_open,
+                InventoryTarget::Slot(0)
+            ),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, table_open, table_target),
+            Ok(InventoryClickOutcome::Moved)
+        );
+        assert_eq!(
+            session.player.table_grid().slot(15).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Stone))
+        );
+
+        // Invalidate the station WITHOUT a redraw: remove the table block
+        // directly. Chunk streaming can do the same while the panel is open.
+        session
+            .world
+            .set_block_immediate(table_pos.x, table_pos.y, table_pos.z, BlockId::Air);
+        assert_eq!(
+            session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z),
+            BlockId::Air
+        );
+        assert_eq!(
+            session.open_table_position(),
+            Some(table_pos),
+            "until the click boundary syncs, the session still reports the stale station"
+        );
+
+        // The exact pixel a press on table cell 15 uses, from the real layout.
+        let table_layout = layout(1280, 720, InventoryMode::Table);
+        let (cell_x, cell_y, cell_w, cell_h) = table_layout.table_grid[15];
+        let cell_cursor = (cell_x + cell_w * 0.5, cell_y + cell_h * 0.5);
+        assert_eq!(
+            hit_test(InventoryMode::Table, &table_layout, cell_cursor),
+            Some(table_target),
+            "the pixel really routes to the 4x4 grid's high cell"
+        );
+
+        let grid_before = session.player.table_grid().clone();
+        let units_before = inventory_units(&session.player);
+
+        // The click boundary's first step (both mouse arms call this): the lost
+        // station closes the panel and its session station before any command.
+        assert!(
+            revalidate_inventory_station(&mut screen, &mut session),
+            "the invalidated station closes the panel at the click boundary"
+        );
+        assert!(!screen.is_open(), "the panel is closed");
+        assert_eq!(
+            session.open_table_position(),
+            None,
+            "the stale station is closed too"
+        );
+
+        // The production adapter therefore rejects the same click, and nothing
+        // in either grid, the slots, or the cursor moved.
+        let closed_table = session.open_table_position();
+        assert_eq!(
+            apply_inventory_click(&mut session.player, &screen, closed_table, table_target),
+            Err(InventoryCommandError::TableUnavailable)
+        );
+        assert_eq!(session.player.table_grid(), &grid_before);
+        assert!(session.player.inventory().cursor().is_none());
+        assert_eq!(inventory_units(&session.player), units_before);
+        assert_eq!(
+            session
+                .world
+                .get_block(table_pos.x, table_pos.y, table_pos.z),
+            BlockId::Air,
+            "the boundary sync touched no world block"
+        );
+
+        // A Player-mode panel has no attachable station: revalidation never
+        // closes it, so the E-opened 2x2 screen keeps working.
+        let mut player_screen = InventoryScreen::new();
+        player_screen.open_player();
+        assert!(!revalidate_inventory_station(
+            &mut player_screen,
+            &mut session
+        ));
+        assert!(player_screen.is_open());
+        assert_eq!(player_screen.mode(None), InventoryMode::Player);
+
+        // Out-of-reach is the other realistic between-redraw invalidation: the
+        // same boundary sync closes a station the player walked away from.
+        session.world.set_block_immediate(
+            table_pos.x,
+            table_pos.y,
+            table_pos.z,
+            BlockId::CraftingTable,
+        );
+        aim_table_interaction_at(&mut session, table_pos);
+        assert!(
+            session.open_table_at(table_pos),
+            "the restored table reopens within reach"
+        );
+        let mut walked_screen = InventoryScreen::new();
+        walked_screen.open_table();
+        session.player.position = Vec3::new(60.5, 10.0, 60.5);
+        session.sync_camera();
+        assert!(
+            revalidate_inventory_station(&mut walked_screen, &mut session),
+            "walking out of reach between redraws closes the panel"
+        );
+        assert!(!walked_screen.is_open());
+        assert_eq!(session.open_table_position(), None);
     }
 
     #[test]
