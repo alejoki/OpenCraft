@@ -21,7 +21,7 @@
 use winit::keyboard::KeyCode;
 
 use super::lifecycle::LifecycleScreen;
-use super::menu::{hit_test, Rect, MenuMessage, MENU_PAD, MENU_TOP, MESSAGE_TICKS};
+use super::menu::{hit_test, MenuMessage, Rect, MENU_PAD, MENU_TOP, MESSAGE_TICKS};
 use super::text_input::{TextInput, TextInputAction, TextInputOutcome};
 use super::LINE_HEIGHT;
 use crate::world::catalog::{
@@ -88,11 +88,7 @@ pub enum PauseRow {
 }
 
 /// All pause rows, top-to-bottom in display order.
-pub const PAUSE_ROWS: [PauseRow; 3] = [
-    PauseRow::Resume,
-    PauseRow::Settings,
-    PauseRow::SaveAndQuit,
-];
+pub const PAUSE_ROWS: [PauseRow; 3] = [PauseRow::Resume, PauseRow::Settings, PauseRow::SaveAndQuit];
 
 /// Total number of pause rows.
 pub const PAUSE_ROW_COUNT: usize = PAUSE_ROWS.len();
@@ -128,7 +124,12 @@ fn row_y(index: usize) -> f32 {
 
 /// Rect of row `index` in a fixed-width, fixed-count screen.
 fn fixed_row_rect(surface_w: u32, index: usize, width: f32) -> Rect {
-    (centered_x(surface_w, width), row_y(index), width, LINE_HEIGHT)
+    (
+        centered_x(surface_w, width),
+        row_y(index),
+        width,
+        LINE_HEIGHT,
+    )
 }
 
 /// Panel rect behind `row_count` fixed-width rows (rows plus
@@ -361,7 +362,8 @@ pub fn hovered_load_target(
         if hit_test(cursor, load_delete_rect(surface_w, index)) {
             return Some(LoadTarget::Delete(index));
         }
-        if load_row_rect(surface_w, surface_h, index, row_count).is_some_and(|r| hit_test(cursor, r))
+        if load_row_rect(surface_w, surface_h, index, row_count)
+            .is_some_and(|r| hit_test(cursor, r))
         {
             return Some(LoadTarget::Row(index));
         }
@@ -598,10 +600,7 @@ pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
         format!("  World Name: {name}")
     };
     let seed_line = if screen.focus() == FocusField::Seed {
-        format!(
-            "> Seed: {}",
-            insert_caret(seed, screen.seed().cursor())
-        )
+        format!("> Seed: {}", insert_caret(seed, screen.seed().cursor()))
     } else if seed.trim().is_empty() {
         "  Seed: (random)".to_string()
     } else {
@@ -836,9 +835,9 @@ pub fn screen_key_action(
             KeyCode::Escape => ScreenKeyAction::Back,
             _ => ScreenKeyAction::None,
         },
-        LifecycleScreen::MainMenu
-        | LifecycleScreen::Playing
-        | LifecycleScreen::Settings(_) => ScreenKeyAction::None,
+        LifecycleScreen::MainMenu | LifecycleScreen::Playing | LifecycleScreen::Settings(_) => {
+            ScreenKeyAction::None
+        }
     }
 }
 
@@ -902,7 +901,10 @@ mod tests {
         ] {
             assert!(!target.label().unwrap().is_empty());
         }
-        assert!(LoadTarget::Row(0).label().is_none(), "rows compose their own text");
+        assert!(
+            LoadTarget::Row(0).label().is_none(),
+            "rows compose their own text"
+        );
     }
 
     // --- layout ---
@@ -910,9 +912,21 @@ mod tests {
     #[test]
     fn fixed_screens_stack_centered_line_height_rows_deterministically() {
         for (rect_at, count, width) in [
-            (main_menu_row_rect as fn(u32, u32, usize) -> Option<Rect>, MAIN_MENU_ROW_COUNT, SCREEN_WIDTH),
-            (pause_row_rect as fn(u32, u32, usize) -> Option<Rect>, PAUSE_ROW_COUNT, SCREEN_WIDTH),
-            (new_game_row_rect as fn(u32, u32, usize) -> Option<Rect>, NEW_GAME_ROW_COUNT, SCREEN_WIDTH),
+            (
+                main_menu_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                MAIN_MENU_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
+            (
+                pause_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                PAUSE_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
+            (
+                new_game_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                NEW_GAME_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
         ] {
             let (x0, y0, w0, h0) = rect_at(SW, SH, 0).unwrap();
             assert_eq!(x0, (SW as f32 - width) / 2.0, "rows are centered");
@@ -952,7 +966,14 @@ mod tests {
         let (bx, by, bw, bh) = load_back_rect(SW, row_count);
         let (cx, cy, cw, ch) = load_confirm_rect(SW, row_count);
         let (x_x, x_y, w_x, h_x) = load_cancel_rect(SW, row_count);
-        assert_eq!((bx, bw, bh), ((SW as f32 - LOAD_SCREEN_WIDTH) / 2.0, LOAD_SCREEN_WIDTH, LINE_HEIGHT));
+        assert_eq!(
+            (bx, bw, bh),
+            (
+                (SW as f32 - LOAD_SCREEN_WIDTH) / 2.0,
+                LOAD_SCREEN_WIDTH,
+                LINE_HEIGHT
+            )
+        );
         assert_eq!(by, MENU_TOP + MENU_PAD + row_count as f32 * LINE_HEIGHT);
         assert_eq!((cx, cw, ch), (bx, bw, bh));
         assert_eq!(cy, by + LINE_HEIGHT);
@@ -975,15 +996,36 @@ mod tests {
     #[test]
     fn panels_cover_every_row_plus_symmetric_padding() {
         for (panel, rect_at, count, width) in [
-            (main_menu_panel_rect as fn(u32, u32) -> Rect, main_menu_row_rect as fn(u32, u32, usize) -> Option<Rect>, MAIN_MENU_ROW_COUNT, SCREEN_WIDTH),
-            (pause_panel_rect as fn(u32, u32) -> Rect, pause_row_rect as fn(u32, u32, usize) -> Option<Rect>, PAUSE_ROW_COUNT, SCREEN_WIDTH),
-            (new_game_panel_rect as fn(u32, u32) -> Rect, new_game_row_rect as fn(u32, u32, usize) -> Option<Rect>, NEW_GAME_ROW_COUNT, SCREEN_WIDTH),
+            (
+                main_menu_panel_rect as fn(u32, u32) -> Rect,
+                main_menu_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                MAIN_MENU_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
+            (
+                pause_panel_rect as fn(u32, u32) -> Rect,
+                pause_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                PAUSE_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
+            (
+                new_game_panel_rect as fn(u32, u32) -> Rect,
+                new_game_row_rect as fn(u32, u32, usize) -> Option<Rect>,
+                NEW_GAME_ROW_COUNT,
+                SCREEN_WIDTH,
+            ),
         ] {
             let (px, py, pw, ph) = panel(SW, SH);
             for index in 0..count {
                 let (x, y, w, h) = rect_at(SW, SH, index).unwrap();
-                assert!(px <= x && x + w <= px + pw, "row {index} inside panel horizontally");
-                assert!(py <= y && y + h <= py + ph, "row {index} inside panel vertically");
+                assert!(
+                    px <= x && x + w <= px + pw,
+                    "row {index} inside panel horizontally"
+                );
+                assert!(
+                    py <= y && y + h <= py + ph,
+                    "row {index} inside panel vertically"
+                );
             }
             let (x0, y0, ..) = rect_at(SW, SH, 0).unwrap();
             let (_, _, _, h_last) = rect_at(SW, SH, count - 1).unwrap();
@@ -1005,8 +1047,14 @@ mod tests {
                     load_cancel_rect(SW, row_count),
                 ]);
             for (i, (x, y, w, h)) in rects.enumerate() {
-                assert!(px <= x && x + w <= px + pw, "slot {i} inside panel horizontally");
-                assert!(py <= y && y + h <= py + ph, "slot {i} inside panel vertically");
+                assert!(
+                    px <= x && x + w <= px + pw,
+                    "slot {i} inside panel horizontally"
+                );
+                assert!(
+                    py <= y && y + h <= py + ph,
+                    "slot {i} inside panel vertically"
+                );
             }
             let (_, first_y, ..) = if row_count > 0 {
                 load_row_rect(SW, SH, 0, row_count).unwrap()
@@ -1065,7 +1113,11 @@ mod tests {
             hovered_main_menu_row((x + w / 2.0, y0 + h / 2.0), SW, SH),
             Some(MainMenuRow::Settings)
         );
-        assert_eq!(hovered_main_menu_row((0.0, 0.0), SW, SH), None, "above the panel");
+        assert_eq!(
+            hovered_main_menu_row((0.0, 0.0), SW, SH),
+            None,
+            "above the panel"
+        );
         assert_eq!(
             hovered_main_menu_row((SW as f32 - 1.0, SH as f32 - 1.0), SW, SH),
             None,
@@ -1230,10 +1282,17 @@ mod tests {
         screen.cycle_focus();
         screen.apply(TextInputAction::InsertText("glacier 7".into()));
         assert_eq!(screen.seed().value(), "glacier 7");
-        assert_eq!(screen.name().value().chars().take(8).collect::<String>(), "My World");
+        assert_eq!(
+            screen.name().value().chars().take(8).collect::<String>(),
+            "My World"
+        );
         let long_seed = "s".repeat(SEED_MAX_CHARS + 5);
         screen.apply(TextInputAction::InsertText(long_seed));
-        assert_eq!(screen.seed().len(), SEED_MAX_CHARS, "the seed field is bounded");
+        assert_eq!(
+            screen.seed().len(),
+            SEED_MAX_CHARS,
+            "the seed field is bounded"
+        );
     }
 
     #[test]
@@ -1307,10 +1366,9 @@ mod tests {
         // InvalidCharacter (path separator) at its exact index
         assert_eq!(
             validate_create("bad/name", &rows),
-            Err(NewGameFormError::InvalidName(WorldNameError::InvalidCharacter {
-                ch: '/',
-                index: 3
-            }))
+            Err(NewGameFormError::InvalidName(
+                WorldNameError::InvalidCharacter { ch: '/', index: 3 }
+            ))
         );
     }
 
@@ -1320,9 +1378,18 @@ mod tests {
             CatalogRow::loadable("Overworld".into(), "Overworld.mcvx".into(), Some(10)),
             CatalogRow::loadable("Second".into(), "second.mcvx".into(), Some(20)),
         ];
-        assert_eq!(validate_create("Overworld", &rows), Err(NewGameFormError::DuplicateName));
-        assert_eq!(validate_create(" overworld ", &rows), Err(NewGameFormError::DuplicateName));
-        assert_eq!(validate_create("SECOND", &rows), Err(NewGameFormError::DuplicateName));
+        assert_eq!(
+            validate_create("Overworld", &rows),
+            Err(NewGameFormError::DuplicateName)
+        );
+        assert_eq!(
+            validate_create(" overworld ", &rows),
+            Err(NewGameFormError::DuplicateName)
+        );
+        assert_eq!(
+            validate_create("SECOND", &rows),
+            Err(NewGameFormError::DuplicateName)
+        );
         // a fresh valid name passes
         assert_eq!(validate_create("Fresh World", &rows), Ok(()));
         // no rows at all: any valid name passes
@@ -1335,10 +1402,8 @@ mod tests {
         assert_eq!(empty.to_string(), "World name cannot be empty.");
         let dup = NewGameFormError::DuplicateName;
         assert_eq!(dup.to_string(), "A world with that name already exists.");
-        let bad_char = NewGameFormError::InvalidName(WorldNameError::InvalidCharacter {
-            ch: '/',
-            index: 3,
-        });
+        let bad_char =
+            NewGameFormError::InvalidName(WorldNameError::InvalidCharacter { ch: '/', index: 3 });
         assert!(bad_char.to_string().contains('/'), "names the character");
     }
 
@@ -1421,7 +1486,10 @@ mod tests {
         )]);
         assert_eq!(screen.row_count(), 1);
         assert_eq!(screen.rows()[0].name, "only");
-        assert!(!screen.is_delete_pending(), "a refresh cancels stale pending state");
+        assert!(
+            !screen.is_delete_pending(),
+            "a refresh cancels stale pending state"
+        );
         assert_eq!(screen.pending_row(), None);
         assert!(screen.confirm_delete().is_none());
     }
@@ -1462,8 +1530,11 @@ mod tests {
         let undated = CatalogRow::loadable("beta".into(), "beta.mcvx".into(), None);
         assert_eq!(format_row_line(&undated), "beta — unknown");
 
-        for problem in [RowProblem::InvalidName, RowProblem::Unreadable, RowProblem::InvalidFormat]
-        {
+        for problem in [
+            RowProblem::InvalidName,
+            RowProblem::Unreadable,
+            RowProblem::InvalidFormat,
+        ] {
             let corrupt =
                 CatalogRow::corrupt("bad".into(), "bad.mcvx".into(), Some(86_400), problem);
             assert_eq!(

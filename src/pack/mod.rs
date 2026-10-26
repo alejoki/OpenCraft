@@ -22,22 +22,22 @@ pub mod sound;
 /// `BlockId::face_tex_layer` (layers 0..16). These names are the authoring
 /// contract for packs; do not reorder.
 pub const LAYER_FILES: [&str; 16] = [
-    "grass_top.png", // 0
-    "grass_side.png", // 1
-    "dirt.png",      // 2
-    "stone.png",     // 3
+    "grass_top.png",   // 0
+    "grass_side.png",  // 1
+    "dirt.png",        // 2
+    "stone.png",       // 3
     "cobblestone.png", // 4
-    "sand.png",      // 5
-    "log_top.png",   // 6
-    "log_side.png",  // 7
-    "leaves.png",    // 8
-    "planks.png",    // 9
-    "brick.png",     // 10
-    "snow_top.png",  // 11
-    "bedrock.png",   // 12
-    "snow_side.png", // 13
-    "coal_ore.png",  // 14
-    "iron_ore.png",  // 15
+    "sand.png",        // 5
+    "log_top.png",     // 6
+    "log_side.png",    // 7
+    "leaves.png",      // 8
+    "planks.png",      // 9
+    "brick.png",       // 10
+    "snow_top.png",    // 11
+    "bedrock.png",     // 12
+    "snow_side.png",   // 13
+    "coal_ore.png",    // 14
+    "iron_ore.png",    // 15
 ];
 
 /// Directory-name convention for packs, resolved relative to the process

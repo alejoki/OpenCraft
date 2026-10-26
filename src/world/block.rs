@@ -15,12 +15,25 @@ pub enum BlockId {
     Bedrock = 11,
     CoalOre = 12,
     IronOre = 13,
+    /// Durable, placeable crafting station produced by the 2x2 plank recipe.
+    CraftingTable = 14,
 }
 
 impl BlockId {
     #[inline]
     pub const fn is_solid(self) -> bool {
         !matches!(self, BlockId::Air)
+    }
+
+    /// Whether right-clicking this block opens a crafting station interface.
+    ///
+    /// Deliberately narrow: the crafting table is the only interactive
+    /// station today, so every other block (including Air and unbreakable
+    /// terrain) falls through to the placement/interaction-free path. Solid,
+    /// breakable, and texture behavior are untouched by this classification.
+    #[inline]
+    pub const fn is_table_interactable(self) -> bool {
+        matches!(self, BlockId::CraftingTable)
     }
 
     #[inline]
@@ -40,6 +53,7 @@ impl BlockId {
             11 => Some(BlockId::Bedrock),
             12 => Some(BlockId::CoalOre),
             13 => Some(BlockId::IronOre),
+            14 => Some(BlockId::CraftingTable),
             _ => None,
         }
     }
@@ -74,6 +88,9 @@ impl BlockId {
             BlockId::Bedrock => 12,
             BlockId::CoalOre => 14,
             BlockId::IronOre => 15,
+            // No dedicated crafting-table texture exists yet; reuse the oak
+            // plank layer so the block reads as wood until pack art arrives.
+            BlockId::CraftingTable => 9,
         }
     }
 
@@ -93,6 +110,7 @@ impl BlockId {
             BlockId::Bedrock => "Bedrock",
             BlockId::CoalOre => "Coal Ore",
             BlockId::IronOre => "Iron Ore",
+            BlockId::CraftingTable => "Crafting Table",
         }
     }
 
@@ -116,6 +134,24 @@ impl BlockId {
             BlockId::Bedrock => None,
             BlockId::CoalOre => Some(1.6),
             BlockId::IronOre => Some(2.2),
+            BlockId::CraftingTable => Some(0.8),
+        }
+    }
+
+    /// The block item produced when this block is broken.
+    ///
+    /// Stone yields Cobblestone so the stone-tier tool recipes (whose head
+    /// material is [`BlockId::Cobblestone`]) are reachable through real
+    /// gameplay. Every other block drops itself. This is block metadata, not
+    /// tool behavior: the mining loop and durability rules are untouched.
+    ///
+    /// Drops are inventory state only and are never persisted, and the wire
+    /// format keeps Cobblestone's id 4 unchanged, so save compatibility is
+    /// unaffected.
+    pub const fn mined_drop(self) -> BlockId {
+        match self {
+            BlockId::Stone => BlockId::Cobblestone,
+            _ => self,
         }
     }
 }
@@ -138,11 +174,11 @@ mod tests {
 
     #[test]
     fn test_block_ids_roundtrip_and_ore_metadata() {
-        for id in 0u8..=13 {
+        for id in 0u8..=14 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(block as u8, id, "block id {id} must round-trip");
         }
-        assert_eq!(BlockId::from_u8(14), None);
+        assert_eq!(BlockId::from_u8(15), None);
         assert_eq!(BlockId::from_u8(99), None);
 
         assert_eq!(BlockId::CoalOre.name(), "Coal Ore");
@@ -154,11 +190,39 @@ mod tests {
             assert_eq!(BlockId::CoalOre.face_tex_layer(face_dir), 14);
             assert_eq!(BlockId::IronOre.face_tex_layer(face_dir), 15);
         }
+
+        // Crafting table identity is durable block data for the item domain.
+        assert_eq!(BlockId::CraftingTable as u8, 14);
+        assert_eq!(BlockId::CraftingTable.name(), "Crafting Table");
+        assert!(BlockId::CraftingTable.is_solid());
+        assert_eq!(BlockId::CraftingTable.break_duration_secs(), Some(0.8));
+        for face_dir in 0u8..6 {
+            assert_eq!(BlockId::CraftingTable.face_tex_layer(face_dir), 9);
+        }
+    }
+
+    #[test]
+    fn test_only_the_crafting_table_is_table_interactable() {
+        for id in 0u8..=14 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(
+                block.is_table_interactable(),
+                block == BlockId::CraftingTable,
+                "{block:?} interaction classification drifted"
+            );
+        }
+        assert!(!BlockId::Air.is_table_interactable());
+        assert!(!BlockId::Bedrock.is_table_interactable());
+        assert!(!BlockId::OakPlanks.is_table_interactable());
+        // The classification is additive: table blocks keep their existing
+        // solid/breakable behavior.
+        assert!(BlockId::CraftingTable.is_solid());
+        assert!(BlockId::CraftingTable.break_duration_secs().is_some());
     }
 
     #[test]
     fn test_break_durations_cover_every_breakable_block() {
-        for id in 0u8..=13 {
+        for id in 0u8..=14 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             match block {
                 BlockId::Air | BlockId::Bedrock => {
@@ -176,6 +240,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_mined_drop_is_identity_except_stone_yields_cobblestone() {
+        for id in 0u8..=14 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            let expected = if block == BlockId::Stone {
+                BlockId::Cobblestone
+            } else {
+                block
+            };
+            assert_eq!(block.mined_drop(), expected, "{block:?} mined drop drifted");
+        }
+        // Explicit anchors for the two interesting cases.
+        assert_eq!(BlockId::Stone.mined_drop(), BlockId::Cobblestone);
+        assert_eq!(BlockId::Cobblestone.mined_drop(), BlockId::Cobblestone);
     }
 
     #[test]

@@ -992,7 +992,10 @@ vsync = false
         assert!(text.contains("vsync = false"));
         // Default pack means no [packs] section at all: byte-identical to
         // the pre-S03 format (settings_smoke.sh unchanged-file invariant).
-        assert!(!text.contains("[packs]"), "default save must omit [packs]:\n{text}");
+        assert!(
+            !text.contains("[packs]"),
+            "default save must omit [packs]:\n{text}"
+        );
         assert!(!text.contains("texture_pack"));
         // Default volume means no [audio] section at all, keeping the default
         // save byte-identical to the pre-audio format.
@@ -1008,7 +1011,10 @@ vsync = false
         };
         with_pack.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[packs]"), "named pack must emit [packs]:\n{text}");
+        assert!(
+            text.contains("[packs]"),
+            "named pack must emit [packs]:\n{text}"
+        );
         assert!(text.contains("texture_pack = \"dungeon\""));
 
         let with_volume = Settings {

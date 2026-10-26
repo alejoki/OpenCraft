@@ -355,7 +355,13 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 2,
                 render_distance: 16,
-                hotbar: crate::player::inventory::Hotbar::empty(),
+                inventory: crate::player::inventory::Inventory::empty(),
+                player_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Player,
+                ),
+                table_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Table,
+                ),
             },
             chunk_edits: edits,
         }

@@ -322,14 +322,13 @@ pub fn star_visibility(time_of_day: u32) -> f32 {
     if t <= STAR_DUSK_CLEAR_TICK {
         0.0
     } else if t < NIGHTFALL_TICK {
-        let fraction = (t - STAR_DUSK_CLEAR_TICK) as f32
-            / (NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK) as f32;
+        let fraction =
+            (t - STAR_DUSK_CLEAR_TICK) as f32 / (NIGHTFALL_TICK - STAR_DUSK_CLEAR_TICK) as f32;
         smoothstep(fraction)
     } else if t <= PRE_DAWN_TICK {
         1.0
     } else if t <= STAR_DAWN_CLEAR_TICK {
-        let fraction = (t - PRE_DAWN_TICK) as f32
-            / (STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK) as f32;
+        let fraction = (t - PRE_DAWN_TICK) as f32 / (STAR_DAWN_CLEAR_TICK - PRE_DAWN_TICK) as f32;
         smoothstep(1.0 - fraction)
     } else {
         0.0
@@ -400,7 +399,10 @@ mod tests {
 
     fn assert_color_close(actual: [f32; 3], expected: [f32; 3]) {
         for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!((a - e).abs() < 1e-6, "expected {expected:?}, got {actual:?}");
+            assert!(
+                (a - e).abs() < 1e-6,
+                "expected {expected:?}, got {actual:?}"
+            );
         }
     }
 
@@ -413,9 +415,7 @@ mod tests {
             (0.3..0.4).contains(&MOONLIT_FLOOR),
             "moonlit floor must be roughly one third, got {MOONLIT_FLOOR}"
         );
-        const {
-            assert!(VISTA_GOLDEN_HOUR > 0 && VISTA_GOLDEN_HOUR < DEFAULT_TIME_OF_DAY)
-        };
+        const { assert!(VISTA_GOLDEN_HOUR > 0 && VISTA_GOLDEN_HOUR < DEFAULT_TIME_OF_DAY) };
     }
 
     #[test]
@@ -430,14 +430,8 @@ mod tests {
     fn from_time_clamps_out_of_range_input() {
         assert_eq!(GameClock::from_time(0).time_of_day, 0);
         assert_eq!(GameClock::from_time(12_345).time_of_day, 12_345);
-        assert_eq!(
-            GameClock::from_time(DAY_TICKS).time_of_day,
-            DAY_TICKS - 1
-        );
-        assert_eq!(
-            GameClock::from_time(u32::MAX).time_of_day,
-            DAY_TICKS - 1
-        );
+        assert_eq!(GameClock::from_time(DAY_TICKS).time_of_day, DAY_TICKS - 1);
+        assert_eq!(GameClock::from_time(u32::MAX).time_of_day, DAY_TICKS - 1);
     }
 
     #[test]
@@ -527,9 +521,13 @@ mod tests {
         assert_eq!(clock.fractional_ticks, paused_fraction);
 
         // The next real frame advances only one normal frame's worth.
-        clock.tick(true, a + Duration::from_secs(600) + Duration::from_millis(16), 1.0);
-        let advanced = clock.fractional_ticks - paused_fraction
-            + (clock.time_of_day - paused_time) as f32;
+        clock.tick(
+            true,
+            a + Duration::from_secs(600) + Duration::from_millis(16),
+            1.0,
+        );
+        let advanced =
+            clock.fractional_ticks - paused_fraction + (clock.time_of_day - paused_time) as f32;
         assert!(advanced > 0.0);
         assert!(advanced < 1.0, "advanced {advanced} ticks across resume");
     }
@@ -679,7 +677,10 @@ mod tests {
 
     #[test]
     fn sky_palette_wraps_out_of_range_time() {
-        assert_eq!(sky_palette(DAY_TICKS + DEFAULT_TIME_OF_DAY), sky_palette(DEFAULT_TIME_OF_DAY));
+        assert_eq!(
+            sky_palette(DAY_TICKS + DEFAULT_TIME_OF_DAY),
+            sky_palette(DEFAULT_TIME_OF_DAY)
+        );
         assert_eq!(sky_palette(u32::MAX), sky_palette(u32::MAX % DAY_TICKS));
     }
 
@@ -739,17 +740,17 @@ mod tests {
         assert!(sun_brightness(150) < sun_brightness(300));
         for t in (0..DAY_TICKS).step_by(250) {
             let brightness = sun_brightness(t);
-            assert!((0.0..=1.0).contains(&brightness), "sun at {t}: {brightness}");
+            assert!(
+                (0.0..=1.0).contains(&brightness),
+                "sun at {t}: {brightness}"
+            );
         }
     }
 
     #[test]
     fn moon_brightness_is_the_opposite_phase() {
         for t in (0..DAY_TICKS).step_by(500) {
-            assert_close(
-                moon_brightness(t),
-                sun_brightness((t + 12_000) % DAY_TICKS),
-            );
+            assert_close(moon_brightness(t), sun_brightness((t + 12_000) % DAY_TICKS));
         }
         assert!(moon_brightness(18_000) > 0.99);
         assert_eq!(moon_brightness(6_000), 0.0);

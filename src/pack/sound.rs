@@ -77,8 +77,7 @@ fn read_and_decode(path: &Path) -> Result<SoundBuffer, String> {
         return Err(oversized_reason(metadata.len()));
     }
 
-    let bytes =
-        std::fs::read(path).map_err(|err| format!("failed to read sound file: {err}"))?;
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read sound file: {err}"))?;
     if bytes.len() as u64 > SOUND_BYTE_CAP {
         return Err(oversized_reason(bytes.len() as u64));
     }
@@ -220,7 +219,11 @@ mod tests {
         let (buffers, warnings) = load_sound_overrides(&dir);
         assert!(warnings.is_empty(), "{warnings:?}");
         for (index, (_, channels, rate)) in cases.iter().enumerate() {
-            assert_eq!(buffers[index].channels(), *channels, "slot {index} channels");
+            assert_eq!(
+                buffers[index].channels(),
+                *channels,
+                "slot {index} channels"
+            );
             assert_eq!(
                 buffers[index].sample_rate(),
                 *rate,
@@ -318,8 +321,7 @@ mod tests {
         assert_eq!(buffers, default_buffers());
 
         // A missing pack folder is equally legal.
-        let (missing_buffers, missing_warnings) =
-            load_sound_overrides(&root.path().join("absent"));
+        let (missing_buffers, missing_warnings) = load_sound_overrides(&root.path().join("absent"));
         assert!(missing_warnings.is_empty());
         assert_eq!(missing_buffers, default_buffers());
     }

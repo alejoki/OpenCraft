@@ -1,7 +1,37 @@
 use glam::Vec3;
 
-use crate::player::inventory::Hotbar;
+use crate::player::inventory::{
+    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack,
+    RecipePreview, ToolWear, HOTBAR_SLOTS,
+};
 use crate::world::block::BlockId;
+
+/// Errors from the narrow inventory-screen command façade.
+///
+/// Every variant is a rejected command whose pre-state (slots, cursor, both
+/// grids) is unchanged, so the UI can report the failure and retry without
+/// ever losing or duplicating an item.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InventoryCommandError {
+    /// A slot click was rejected by the inventory aggregate.
+    Inventory(InventoryError),
+    /// A grid/result command was rejected by the crafting domain.
+    Craft(CraftError),
+    /// A table target was used without a live placed table (adapter layer).
+    TableUnavailable,
+}
+
+impl From<InventoryError> for InventoryCommandError {
+    fn from(error: InventoryError) -> Self {
+        Self::Inventory(error)
+    }
+}
+
+impl From<CraftError> for InventoryCommandError {
+    fn from(error: CraftError) -> Self {
+        Self::Craft(error)
+    }
+}
 
 pub const PLAYER_HALF_WIDTH: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.8;
@@ -68,8 +98,16 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub fly_mode: bool,
-    pub selected_slot: usize,
-    pub hotbar: Hotbar,
+    /// Selected hotbar slot, always in `0..HOTBAR_SLOTS`. Private so the only
+    /// ways to change it are the bounds-checked methods below; session restore
+    /// cannot publish an out-of-range selection.
+    selected_slot: usize,
+    /// The one authoritative item aggregate (9 hotbar + 27 main + cursor).
+    inventory: Inventory,
+    /// Unfinished 2x2 inventory crafting grid carried with the player.
+    player_grid: CraftingGrid,
+    /// Unfinished 4x4 crafting-table grid carried with the player.
+    table_grid: CraftingGrid,
 }
 
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
@@ -103,7 +141,229 @@ impl Player {
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
             selected_slot: 0,
-            hotbar: Hotbar::empty(),
+            inventory: Inventory::empty(),
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
+        }
+    }
+
+    /// Rebuilds a player from a persisted aggregate (session restore).
+    ///
+    /// The inventory is already validated by its own constructors; the grids
+    /// are kind-checked here so a mismatched persisted grid safely defaults to
+    /// the empty grid of the position's kind instead of putting 4x4 contents
+    /// into the 2x2 player grid.
+    pub fn with_inventory(
+        position: Vec3,
+        inventory: Inventory,
+        player_grid: CraftingGrid,
+        table_grid: CraftingGrid,
+    ) -> Self {
+        let mut player = Self::new(position);
+        player.inventory = inventory;
+        player.player_grid = if player_grid.kind() == GridKind::Player {
+            player_grid
+        } else {
+            CraftingGrid::new(GridKind::Player)
+        };
+        player.table_grid = if table_grid.kind() == GridKind::Table {
+            table_grid
+        } else {
+            CraftingGrid::new(GridKind::Table)
+        };
+        player
+    }
+
+    /// Selected hotbar index, guaranteed to be in `0..HOTBAR_SLOTS`.
+    pub const fn selected_slot(&self) -> usize {
+        self.selected_slot
+    }
+
+    /// Selects a hotbar slot. Returns `false` (and keeps the previous slot)
+    /// when `slot` is outside the nine-slot hotbar.
+    pub fn select_slot(&mut self, slot: usize) -> bool {
+        if slot >= HOTBAR_SLOTS {
+            return false;
+        }
+        self.selected_slot = slot;
+        true
+    }
+
+    /// Cycles the selection by `step`, wrapping inside the nine hotbar slots.
+    pub fn select_relative(&mut self, step: isize) {
+        let slots = HOTBAR_SLOTS as isize;
+        self.selected_slot = ((self.selected_slot as isize + step).rem_euclid(slots)) as usize;
+    }
+
+    /// Restores a persisted selection, clamping into the hotbar. Used only at
+    /// the save/load boundary; it never leaves `selected_slot` out of range.
+    pub fn restore_selected_slot(&mut self, slot: usize) {
+        self.selected_slot = slot.min(HOTBAR_SLOTS - 1);
+    }
+
+    /// Read-only view of the durable inventory aggregate.
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
+    }
+
+    pub fn player_grid(&self) -> &CraftingGrid {
+        &self.player_grid
+    }
+
+    pub fn table_grid(&self) -> &CraftingGrid {
+        &self.table_grid
+    }
+
+    /// Legacy block-only read of a hotbar slot (`None` for tools/out of range).
+    pub fn hotbar_stack(&self, slot: usize) -> Option<ItemStack> {
+        self.inventory.hotbar_stack(slot)
+    }
+
+    /// The selected hotbar item, if any.
+    pub fn selected_item(&self) -> Option<Item> {
+        self.inventory.hotbar(self.selected_slot)
+    }
+
+    /// The selected hotbar item's block identity, for placement.
+    pub fn selected_block(&self) -> Option<BlockId> {
+        self.selected_item()?.block_stack().map(|stack| stack.block)
+    }
+
+    /// Collects one broken block into the inventory (hotbar first, then main).
+    pub fn collect_block(&mut self, block: BlockId) -> Option<CollectOutcome> {
+        self.inventory.collect_block(block, 1)
+    }
+
+    /// Consumes exactly one item from the selected hotbar slot.
+    pub fn consume_selected(&mut self) -> Option<Item> {
+        self.inventory.consume_one(self.selected_slot)
+    }
+
+    /// Spends exactly one durability point on the selected hotbar tool.
+    ///
+    /// This is the narrow forwarder the world-edit path uses so the inventory
+    /// aggregate itself stays private. An empty slot, an out-of-range
+    /// selection, or a non-tool is an [`InventoryError`] with no mutation, so
+    /// a bare-hand break can never fabricate or consume a tool.
+    pub fn wear_selected_tool(&mut self) -> Result<ToolWear, InventoryError> {
+        self.inventory.use_tool(self.selected_slot)
+    }
+
+    // -----------------------------------------------------------------------
+    // Inventory-screen command façade
+    //
+    // These are the only mutation entry points a UI click may use. They never
+    // compute stack arithmetic: every transfer goes through the aggregate's
+    // conservation-checked primitives, whole-stack semantics stay in the
+    // domain, and a rejected command leaves slots, cursor, and both grids in
+    // their pre-command state.
+    // -----------------------------------------------------------------------
+
+    /// Moves a whole stack between one of the 36 inventory slots and the
+    /// cursor, using the aggregate's merge/swap rules.
+    ///
+    /// An empty cursor picks the slot stack up ([`Inventory::pick_up`]); an
+    /// occupied cursor puts/down-merges/swaps via [`Inventory::put_down`].
+    /// Full targets and out-of-bounds indexes are rejected without mutation.
+    pub fn click_inventory_slot(&mut self, index: usize) -> Result<(), InventoryError> {
+        if self.inventory.cursor().is_some() {
+            self.inventory.put_down(index)
+        } else {
+            self.inventory.pick_up(index)
+        }
+    }
+
+    /// Moves a whole stack between one crafting-grid cell and the cursor.
+    ///
+    /// `kind` selects the grid; a player-grid command can never read or write
+    /// the table grid (and vice versa). Four transitions exist:
+    /// empty/empty is an inert no-op, cell-to-hand takes the cell, hand-to-cell
+    /// places it, and occupied/occupied swaps both whole stacks. The bounds
+    /// precheck runs before the cursor is touched, so an out-of-range index is
+    /// [`CraftError::OutOfBounds`] with everything unchanged.
+    pub fn click_grid_cell(
+        &mut self,
+        kind: GridKind,
+        index: usize,
+    ) -> Result<(), InventoryCommandError> {
+        if index >= kind.slot_count() {
+            return Err(CraftError::OutOfBounds.into());
+        }
+
+        let grid = match kind {
+            GridKind::Player => &mut self.player_grid,
+            GridKind::Table => &mut self.table_grid,
+        };
+        let cell = grid.slot(index);
+        let cursor = self.inventory.cursor();
+
+        match (cursor, cell) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => {
+                // Cell to hand. The index is in range, so `take` cannot fail.
+                let item = grid
+                    .take(index)
+                    .map_err(InventoryCommandError::Craft)?
+                    .expect("occupied cell taken");
+                // The cursor was empty, so `put_cursor` cannot fail.
+                self.inventory
+                    .put_cursor(item)
+                    .map_err(InventoryCommandError::Inventory)
+            }
+            (Some(_), None) => {
+                // Hand to cell. Restore the cursor if the set ever rejected.
+                let item = self.inventory.take_cursor()?;
+                if let Err(error) = grid.set(index, Some(item)) {
+                    let _ = self.inventory.put_cursor(item);
+                    return Err(InventoryCommandError::Craft(error));
+                }
+                Ok(())
+            }
+            (Some(_), Some(_)) => {
+                // Swap both whole stacks. After the bounds precheck no step can
+                // fail, but every failure path restores the original cursor and
+                // leaves the grid cell unchanged where possible.
+                let hand = self.inventory.take_cursor()?;
+                let cell_item = match grid.take(index) {
+                    Ok(Some(item)) => item,
+                    Ok(None) => {
+                        let _ = self.inventory.put_cursor(hand);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = self.inventory.put_cursor(hand);
+                        return Err(InventoryCommandError::Craft(error));
+                    }
+                };
+                if let Err(error) = grid.set(index, Some(hand)) {
+                    let _ = grid.set(index, Some(cell_item));
+                    let _ = self.inventory.put_cursor(hand);
+                    return Err(InventoryCommandError::Craft(error));
+                }
+                self.inventory
+                    .put_cursor(cell_item)
+                    .map_err(InventoryCommandError::Inventory)
+            }
+        }
+    }
+
+    /// Crafts the matching grid's recipe exactly once.
+    ///
+    /// Delegates to [`CraftingGrid::take_result`], so recipe revalidation and
+    /// one-unit-per-cell consumption stay atomic in the domain: no recipe or a
+    /// full destination is an error with nothing consumed.
+    pub fn take_craft_result(&mut self, kind: GridKind) -> Result<Item, CraftError> {
+        match kind {
+            GridKind::Player => self.player_grid.take_result(&mut self.inventory),
+            GridKind::Table => self.table_grid.take_result(&mut self.inventory),
+        }
+    }
+
+    /// Read-only recipe preview for the matching grid. Never mutates.
+    pub fn craft_preview(&self, kind: GridKind) -> Option<RecipePreview> {
+        match kind {
+            GridKind::Player => self.player_grid.preview(),
+            GridKind::Table => self.table_grid.preview(),
         }
     }
 
@@ -305,6 +565,263 @@ mod tests {
     }
 
     #[test]
+    fn player_starts_with_empty_inventory_grids_and_selection() {
+        let player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert_eq!(player.selected_slot(), 0);
+        assert!(player.inventory().slots().iter().all(Option::is_none));
+        assert!(player.inventory().cursor().is_none());
+        assert!(player.player_grid().is_empty());
+        assert!(player.table_grid().is_empty());
+        assert_eq!(player.selected_item(), None);
+        assert_eq!(player.selected_block(), None);
+    }
+
+    #[test]
+    fn select_slot_rejects_out_of_range_without_changing_selection() {
+        let mut player = Player::new(Vec3::ZERO);
+        assert!(player.select_slot(4));
+        assert_eq!(player.selected_slot(), 4);
+
+        assert!(!player.select_slot(HOTBAR_SLOTS));
+        assert!(!player.select_slot(usize::MAX));
+        assert_eq!(
+            player.selected_slot(),
+            4,
+            "a rejected selection leaves the previous slot intact"
+        );
+    }
+
+    #[test]
+    fn select_relative_wraps_within_the_nine_slot_hotbar() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.select_relative(-1);
+        assert_eq!(player.selected_slot(), HOTBAR_SLOTS - 1);
+        player.select_relative(1);
+        assert_eq!(player.selected_slot(), 0);
+        player.select_relative(4);
+        player.select_relative(-9);
+        assert_eq!(player.selected_slot(), 4);
+    }
+
+    #[test]
+    fn restore_selected_slot_clamps_into_the_hotbar() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.restore_selected_slot(200);
+        assert_eq!(player.selected_slot(), HOTBAR_SLOTS - 1);
+        player.restore_selected_slot(3);
+        assert_eq!(player.selected_slot(), 3);
+    }
+
+    #[test]
+    fn collect_block_fills_the_hotbar_then_spills_into_main_storage() {
+        let mut player = Player::new(Vec3::ZERO);
+        let hotbar_blocks = [
+            BlockId::Stone,
+            BlockId::Dirt,
+            BlockId::Grass,
+            BlockId::Sand,
+            BlockId::OakLog,
+            BlockId::OakLeaves,
+            BlockId::Brick,
+            BlockId::CoalOre,
+            BlockId::IronOre,
+        ];
+        for block in hotbar_blocks {
+            let outcome = player.collect_block(block).expect("block collects");
+            assert!(outcome.first_slot < HOTBAR_SLOTS);
+            assert_eq!(outcome.accepted, 1);
+        }
+        assert!(
+            player.inventory().main(0).is_none(),
+            "nine distinct blocks fill exactly the hotbar"
+        );
+        assert!(
+            player.collect_block(BlockId::Bedrock).is_none(),
+            "uncarryable blocks are rejected without mutation"
+        );
+    }
+
+    #[test]
+    fn collect_block_spills_into_main_storage_when_the_hotbar_is_full() {
+        let mut player = Player::new(Vec3::ZERO);
+        for block in [
+            BlockId::Stone,
+            BlockId::Dirt,
+            BlockId::Grass,
+            BlockId::Sand,
+            BlockId::OakLog,
+            BlockId::OakLeaves,
+            BlockId::Brick,
+            BlockId::CoalOre,
+            BlockId::IronOre,
+        ] {
+            player.collect_block(block).expect("block collects");
+        }
+
+        let outcome = player
+            .collect_block(BlockId::CraftingTable)
+            .expect("a tenth identity has room in main storage");
+        assert_eq!(outcome.first_slot, HOTBAR_SLOTS);
+        assert_eq!(
+            player.inventory().main(0).map(|item| item.id()),
+            Some(crate::player::inventory::ItemId::Block(
+                BlockId::CraftingTable
+            ))
+        );
+    }
+
+    #[test]
+    fn consume_selected_takes_exactly_one_and_clears_the_slot_at_zero() {
+        let mut player = Player::new(Vec3::ZERO);
+        player.collect_block(BlockId::Stone).expect("collect");
+        player.collect_block(BlockId::Stone).expect("collect");
+        player.select_slot(0);
+
+        assert_eq!(player.selected_item().map(|item| item.count()), Some(2));
+        let consumed = player.consume_selected().expect("one item consumed");
+        assert_eq!(consumed.count(), 1);
+        assert_eq!(player.selected_item().map(|item| item.count()), Some(1));
+
+        let consumed = player.consume_selected().expect("second item consumed");
+        assert_eq!(consumed.count(), 1);
+        assert_eq!(player.selected_item(), None);
+        assert_eq!(player.consume_selected(), None, "empty slot is a no-op");
+    }
+
+    #[test]
+    fn wear_selected_tool_forwarder_targets_only_the_selected_slot() {
+        use crate::player::inventory::{
+            Inventory, InventoryError, Item, ToolKind, ToolTier, ToolWear, INVENTORY_SLOTS,
+        };
+
+        let mut player = Player::new(Vec3::ZERO);
+        player
+            .collect_block(BlockId::Stone)
+            .expect("selected non-tool block");
+        assert!(player.select_slot(0));
+
+        assert_eq!(
+            player.wear_selected_tool(),
+            Err(InventoryError::NotATool),
+            "a non-tool selection spends nothing"
+        );
+        assert_eq!(
+            player.selected_item().map(|item| item.count()),
+            Some(1),
+            "the rejected wear left the block stack intact"
+        );
+
+        // A tool in a later hotbar slot can only be worn by selecting it.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[3] =
+            Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 3).expect("worn axe"));
+        player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(player.select_slot(3));
+
+        match player.wear_selected_tool() {
+            Ok(ToolWear::Worn(item)) => assert_eq!(item.durability(), Some(2)),
+            other => panic!("expected one point of wear, got {other:?}"),
+        }
+        assert_eq!(
+            player.selected_item().and_then(|item| item.durability()),
+            Some(2)
+        );
+
+        // Final durability breaks the tool through the same narrow forwarder.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[3] =
+            Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 1).expect("last use"));
+        player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(player.select_slot(3));
+        assert_eq!(player.wear_selected_tool(), Ok(ToolWear::Broke));
+        assert_eq!(player.selected_item(), None, "a broken tool frees its slot");
+        assert_eq!(
+            player.wear_selected_tool(),
+            Err(InventoryError::EmptySlot),
+            "the cleared slot is an explicit no-op"
+        );
+    }
+
+    #[test]
+    fn with_inventory_preserves_cursor_tool_and_unfinished_grids() {
+        use crate::player::inventory::{
+            Item, ItemId, Material, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 3).expect("stone"));
+        slots[HOTBAR_SLOTS + 2] =
+            Some(Item::new(ItemId::Material(Material::Stick), 12).expect("sticks"));
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
+        let inventory = Inventory::from_parts(slots, Some(pickaxe));
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("stick")),
+            )
+            .expect("grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                8,
+                Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
+            )
+            .expect("grid cell");
+
+        let player = Player::with_inventory(
+            Vec3::new(1.0, 2.0, 3.0),
+            inventory.clone(),
+            player_grid.clone(),
+            table_grid.clone(),
+        );
+        assert_eq!(player.inventory(), &inventory);
+        assert_eq!(player.player_grid(), &player_grid);
+        assert_eq!(player.table_grid(), &table_grid);
+        assert_eq!(
+            player
+                .inventory()
+                .main(2)
+                .map(|item| (item.count(), item.id())),
+            Some((12, ItemId::Material(Material::Stick)))
+        );
+        assert_eq!(
+            player
+                .inventory()
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(137),
+            "tool durability survives the player boundary"
+        );
+    }
+
+    #[test]
+    fn with_inventory_defaults_mismatched_grid_kinds_safely() {
+        let player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Table),
+            CraftingGrid::new(GridKind::Player),
+        );
+        assert_eq!(player.player_grid().kind(), GridKind::Player);
+        assert_eq!(player.table_grid().kind(), GridKind::Table);
+        assert!(player.player_grid().is_empty());
+        assert!(player.table_grid().is_empty());
+    }
+
+    #[test]
     fn test_focus_loss_resets_input_state() {
         let mut input = InputState {
             forward: true,
@@ -318,5 +835,413 @@ mod tests {
         input.reset();
         assert!(!input.forward && !input.backward && !input.left && !input.right);
         assert!(!input.jump_or_up && !input.crouch_or_down && !input.sprint);
+    }
+
+    // -- Inventory-screen command façade -------------------------------------
+
+    use crate::player::inventory::{ItemId, Material, RecipeId, INVENTORY_SLOTS};
+
+    fn block_item(block: BlockId, count: u16) -> Item {
+        Item::new(ItemId::Block(block), count).expect("valid test block stack")
+    }
+
+    fn stick_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Stick), count).expect("valid test sticks")
+    }
+
+    fn grid_units(grid: &CraftingGrid) -> u32 {
+        (0..grid.kind().slot_count())
+            .filter_map(|index| grid.slot(index))
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    /// Total item units across the 36 slots, the cursor, and both grids.
+    /// Any command that changes this number has duplicated or destroyed items.
+    fn player_units(player: &Player) -> u32 {
+        let inventory = player.inventory();
+        let slots = inventory
+            .slots()
+            .iter()
+            .flatten()
+            .map(|item| u32::from(item.count()))
+            .sum::<u32>();
+        let cursor = inventory.cursor().map_or(0, |item| u32::from(item.count()));
+        slots + cursor + grid_units(player.player_grid()) + grid_units(player.table_grid())
+    }
+
+    fn player_with_slots(slots: [(usize, Item); 2]) -> Player {
+        let mut all = [None; INVENTORY_SLOTS];
+        for (index, item) in slots {
+            all[index] = Some(item);
+        }
+        Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(all, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        )
+    }
+
+    #[test]
+    fn slot_click_picks_up_then_places_the_whole_stack() {
+        let mut player =
+            player_with_slots([(3, stick_item(5)), (7, block_item(BlockId::Stone, 2))]);
+        let units = player_units(&player);
+
+        player
+            .click_inventory_slot(3)
+            .expect("empty cursor picks up");
+        assert_eq!(player.inventory().cursor(), Some(stick_item(5)));
+        assert_eq!(player.inventory().slot(3), None);
+        assert_eq!(player_units(&player), units, "pick-up conserves items");
+
+        player
+            .click_inventory_slot(7)
+            .expect("occupied cursor places a different identity by swapping");
+        assert_eq!(player.inventory().slot(7), Some(stick_item(5)));
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 2))
+        );
+        assert_eq!(player.inventory().slot(3), None);
+        assert_eq!(player_units(&player), units, "swap conserves items");
+
+        // Placing on an empty slot empties the cursor.
+        player
+            .click_inventory_slot(3)
+            .expect("place into empty slot");
+        assert_eq!(
+            player.inventory().slot(3),
+            Some(block_item(BlockId::Stone, 2))
+        );
+        assert_eq!(player.inventory().cursor(), None);
+        assert_eq!(player_units(&player), units);
+    }
+
+    #[test]
+    fn slot_click_swaps_different_identities() {
+        let mut player =
+            player_with_slots([(0, block_item(BlockId::Stone, 3)), (1, stick_item(2))]);
+        let units = player_units(&player);
+
+        player.click_inventory_slot(0).expect("pick up stone");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 3))
+        );
+
+        player
+            .click_inventory_slot(1)
+            .expect("swap stone for sticks");
+        assert_eq!(
+            player.inventory().slot(1),
+            Some(block_item(BlockId::Stone, 3))
+        );
+        assert_eq!(player.inventory().cursor(), Some(stick_item(2)));
+        assert_eq!(player.inventory().slot(0), None);
+        assert_eq!(player_units(&player), units);
+    }
+
+    #[test]
+    fn slot_click_out_of_bounds_preserves_inventory_and_cursor() {
+        let mut player =
+            player_with_slots([(0, block_item(BlockId::Stone, 4)), (1, stick_item(1))]);
+        let before = player.inventory().clone();
+
+        assert_eq!(
+            player.click_inventory_slot(INVENTORY_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(
+            player.click_inventory_slot(usize::MAX),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(player.inventory(), &before);
+
+        player.click_inventory_slot(0).expect("pick up stone");
+        let after_pick_up = player.inventory().clone();
+        assert_eq!(
+            player.click_inventory_slot(INVENTORY_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(
+            player.inventory(),
+            &after_pick_up,
+            "an out-of-range put-down keeps the cursor stack"
+        );
+    }
+
+    #[test]
+    fn grid_click_takes_places_and_swaps_while_conserving_items() {
+        let mut player =
+            player_with_slots([(0, block_item(BlockId::Stone, 4)), (1, stick_item(1))]);
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::OakPlanks, 5)))
+            .expect("cell 0");
+        player.player_grid = player_grid;
+
+        let units = player_units(&player);
+
+        // 1. Cell to hand.
+        player
+            .click_grid_cell(GridKind::Player, 0)
+            .expect("cell to hand");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::OakPlanks, 5))
+        );
+        assert_eq!(player.player_grid().slot(0), None);
+        assert_eq!(player_units(&player), units, "cell -> hand conserves");
+
+        // 2. Hand to empty cell.
+        player
+            .click_grid_cell(GridKind::Player, 1)
+            .expect("hand to cell");
+        assert_eq!(player.inventory().cursor(), None);
+        assert_eq!(
+            player.player_grid().slot(1),
+            Some(block_item(BlockId::OakPlanks, 5))
+        );
+        assert_eq!(player.player_grid().slot(0), None);
+        assert_eq!(player_units(&player), units, "hand -> cell conserves");
+
+        // 3. Whole-stack swap with an occupied cell.
+        player.click_inventory_slot(0).expect("pick up stone");
+        assert_eq!(player_units(&player), units);
+        player
+            .click_grid_cell(GridKind::Player, 1)
+            .expect("swap hand with cell");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::OakPlanks, 5))
+        );
+        assert_eq!(
+            player.player_grid().slot(1),
+            Some(block_item(BlockId::Stone, 4))
+        );
+        assert_eq!(player_units(&player), units, "grid swap conserves");
+
+        // Empty cursor + empty cell is an inert no-op.
+        player
+            .click_inventory_slot(0)
+            .expect("empty slot zero receives the planks back");
+        assert_eq!(player.inventory().cursor(), None);
+        player
+            .click_grid_cell(GridKind::Player, 3)
+            .expect("empty/empty is a no-op");
+        assert_eq!(player.player_grid().slot(3), None);
+        assert_eq!(player_units(&player), units);
+    }
+
+    #[test]
+    fn grid_click_out_of_bounds_preserves_cursor_and_grid() {
+        let mut player =
+            player_with_slots([(0, block_item(BlockId::Stone, 2)), (1, stick_item(1))]);
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::IronOre, 3)))
+            .expect("cell 15");
+        player.table_grid = table_grid;
+        player.click_inventory_slot(0).expect("cursor holds stone");
+
+        let before = player.inventory().clone();
+        let player_grid_before = player.player_grid().clone();
+        let table_grid_before = player.table_grid().clone();
+
+        assert_eq!(
+            player.click_grid_cell(GridKind::Player, 4),
+            Err(InventoryCommandError::Craft(CraftError::OutOfBounds)),
+            "the 2x2 grid has no index 4"
+        );
+        assert_eq!(
+            player.click_grid_cell(GridKind::Table, 16),
+            Err(InventoryCommandError::Craft(CraftError::OutOfBounds)),
+            "the 4x4 grid has no index 16"
+        );
+        assert_eq!(
+            player.click_grid_cell(GridKind::Player, usize::MAX),
+            Err(InventoryCommandError::Craft(CraftError::OutOfBounds))
+        );
+
+        assert_eq!(player.inventory(), &before);
+        assert_eq!(player.player_grid(), &player_grid_before);
+        assert_eq!(player.table_grid(), &table_grid_before);
+    }
+
+    #[test]
+    fn grid_click_cannot_move_items_between_the_two_grids() {
+        let mut player = Player::new(Vec3::ZERO);
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(3, Some(block_item(BlockId::OakPlanks, 2)))
+            .expect("player cell 3");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(3, Some(stick_item(1)))
+            .expect("table cell 3");
+        player.player_grid = player_grid;
+        player.table_grid = table_grid;
+
+        // Index 3 exists in both grids; `kind` alone decides which one moves.
+        player
+            .click_grid_cell(GridKind::Player, 3)
+            .expect("player cell to hand");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::OakPlanks, 2))
+        );
+        assert_eq!(player.player_grid().slot(3), None);
+        assert_eq!(
+            player.table_grid().slot(3),
+            Some(stick_item(1)),
+            "a player-grid command never reads the table grid"
+        );
+
+        player
+            .click_grid_cell(GridKind::Table, 3)
+            .expect("table cell swaps with hand");
+        assert_eq!(player.inventory().cursor(), Some(stick_item(1)));
+        assert_eq!(
+            player.table_grid().slot(3),
+            Some(block_item(BlockId::OakPlanks, 2))
+        );
+        assert_eq!(
+            player.player_grid().slot(3),
+            None,
+            "a table-grid command never writes the player grid"
+        );
+    }
+
+    #[test]
+    fn take_craft_result_consumes_inputs_exactly_once() {
+        let mut player = Player::new(Vec3::ZERO);
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for cell in 0..4 {
+            player_grid
+                .set(cell, Some(block_item(BlockId::OakPlanks, 1)))
+                .expect("plank cell");
+        }
+        player.player_grid = player_grid;
+        assert_eq!(
+            player.craft_preview(GridKind::Player).map(|p| p.recipe),
+            Some(RecipeId::CraftingTable)
+        );
+
+        let crafted = player
+            .take_craft_result(GridKind::Player)
+            .expect("2x2 planks craft one table");
+        assert_eq!(crafted, block_item(BlockId::CraftingTable, 1));
+        assert_eq!(player.player_grid().slot(0), None);
+        assert_eq!(player.player_grid().slot(1), None);
+        assert_eq!(player.player_grid().slot(2), None);
+        assert_eq!(player.player_grid().slot(3), None);
+        assert!(player.player_grid().is_empty());
+        assert_eq!(
+            player
+                .inventory()
+                .slots()
+                .iter()
+                .flatten()
+                .filter(|item| item.id() == ItemId::Block(BlockId::CraftingTable))
+                .count(),
+            1,
+            "exactly one output item is produced"
+        );
+
+        let after = player.inventory().clone();
+        let grid_after = player.player_grid().clone();
+        assert_eq!(
+            player.take_craft_result(GridKind::Player),
+            Err(CraftError::NoRecipe),
+            "a second click cannot mint a second table"
+        );
+        assert_eq!(player.inventory(), &after);
+        assert_eq!(player.player_grid(), &grid_after);
+    }
+
+    #[test]
+    fn take_craft_result_without_a_recipe_or_full_destination_preserves_everything() {
+        let mut player = Player::new(Vec3::ZERO);
+        let empty = player.inventory().clone();
+        assert_eq!(
+            player.take_craft_result(GridKind::Player),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(
+            player.take_craft_result(GridKind::Table),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(player.inventory(), &empty);
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::OakLog, 1)))
+            .expect("log cell");
+        player.player_grid = player_grid;
+
+        // A completely full inventory cannot receive the output.
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(block_item(BlockId::Brick, 1));
+        }
+        player.inventory = Inventory::from_parts(slots, Some(stick_item(1)));
+        let full_inventory = player.inventory().clone();
+        let grid_before = player.player_grid().clone();
+
+        assert_eq!(
+            player.take_craft_result(GridKind::Player),
+            Err(CraftError::DestinationFull)
+        );
+        assert_eq!(player.inventory(), &full_inventory);
+        assert_eq!(
+            player.player_grid(),
+            &grid_before,
+            "a rejected craft consumes no inputs"
+        );
+    }
+
+    #[test]
+    fn craft_preview_reads_only_and_matches_the_grid() {
+        let mut player = Player::new(Vec3::ZERO);
+        assert_eq!(player.craft_preview(GridKind::Player), None);
+        assert_eq!(player.craft_preview(GridKind::Table), None);
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::OakLog, 1)))
+            .expect("log cell");
+        player.player_grid = player_grid;
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(0, Some(block_item(BlockId::OakPlanks, 2)))
+            .expect("planks column");
+        table_grid
+            .set(4, Some(block_item(BlockId::OakPlanks, 2)))
+            .expect("planks column");
+        player.table_grid = table_grid;
+
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        let preview = player
+            .craft_preview(GridKind::Player)
+            .expect("one log previews planks");
+        assert_eq!(preview.recipe, RecipeId::Planks);
+        assert_eq!(preview.output, ItemId::Block(BlockId::OakPlanks));
+        assert_eq!(preview.output_count, 4);
+
+        let table_preview = player
+            .craft_preview(GridKind::Table)
+            .expect("a 2x1 plank column previews sticks");
+        assert_eq!(table_preview.recipe, RecipeId::Sticks);
+        assert_eq!(table_preview.output, ItemId::Material(Material::Stick));
+        assert_eq!(table_preview.output_count, 4);
+
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(player.table_grid(), &before_table_grid);
     }
 }

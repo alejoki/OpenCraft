@@ -9,14 +9,20 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::player::camera::Camera;
 use crate::player::physics::Player;
+use crate::player::raycast::raycast_voxels;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
 use crate::world::terrain::terrain_height_at_seeded;
+
+/// Maximum eye-to-block distance (blocks) at which a placed crafting table is
+/// reachable. Shared with the placement/mining ray length so every world
+/// interaction uses one reach budget.
+pub const TABLE_INTERACT_REACH: f32 = 8.0;
 
 /// The active world session GameApp holds (S03-T02). One always-present
 /// session is swapped atomically at the `start_world_session` boundary.
@@ -28,6 +34,11 @@ pub struct WorldSession {
     /// from persisted game time, never from the wall clock.
     pub clock: GameClock,
     pub save_path: PathBuf,
+    /// Ephemeral crafting-station state: the position of the table whose
+    /// interface is open, if any. Deliberately not persisted (`SAVE_VERSION`
+    /// unchanged) and reset by both constructors, so a restart always starts
+    /// with no table open.
+    open_table: Option<IVec3>,
 }
 
 impl WorldSession {
@@ -42,23 +53,33 @@ impl WorldSession {
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
             save_path,
+            open_table: None,
         };
         session.sync_camera();
         session
     }
 
     /// Reconstruct a session from persisted save data, exactly mirroring
-    /// main()'s load branch: player position/yaw/pitch/fly_mode copied,
+    /// main()'s load branch: player position/yaw/pitch/fly_mode copied, the
+    /// validated inventory aggregate and both crafting grids restored, and
     /// `selected_slot` clamped to the 9-slot hotbar, and the world rebuilt
     /// with the saved render distance, seed, and chunk edits.
+    ///
+    /// `Player::with_inventory` and `restore_selected_slot` are the only
+    /// restore entry points, so a save can never publish an out-of-range
+    /// selection or a grid stored under the wrong kind.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
         let clock = GameClock::from_time(data.time_of_day);
-        let mut player = Player::new(Vec3::from_array(data.player.position));
+        let mut player = Player::with_inventory(
+            Vec3::from_array(data.player.position),
+            data.player.inventory,
+            data.player.player_grid,
+            data.player.table_grid,
+        );
         player.yaw = data.player.yaw;
         player.pitch = data.player.pitch;
         player.fly_mode = data.player.fly_mode;
-        player.selected_slot = (data.player.selected_slot as usize).min(8);
-        player.hotbar = data.player.hotbar;
+        player.restore_selected_slot(data.player.selected_slot as usize);
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 data.player.render_distance as i32,
@@ -69,6 +90,7 @@ impl WorldSession {
             camera: Camera::new(Vec3::ZERO),
             clock,
             save_path,
+            open_table: None,
         };
         session.sync_camera();
         session
@@ -80,6 +102,92 @@ impl WorldSession {
         self.camera.position = self.player.eye_position();
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
+    }
+
+    /// The position of the crafting table whose interface is open, if any.
+    ///
+    /// Read-only accessor: validity is re-established by
+    /// [`Self::sync_open_table`] and [`Self::open_table_at`], never by the
+    /// reader. The state is ephemeral and never part of a save.
+    pub const fn open_table_position(&self) -> Option<IVec3> {
+        self.open_table
+    }
+
+    /// Opens the crafting table at `pos` only when the *live* world block
+    /// there is a crafting table and the player's eye is within
+    /// [`TABLE_INTERACT_REACH`].
+    ///
+    /// `pos` is treated as untrusted (it comes from a raycast or any caller),
+    /// so the world is re-read at interaction time. A missing/wrong/replaced/
+    /// out-of-reach coordinate returns `false` and mutates nothing: a failed
+    /// interaction must not silently close a table that is already open.
+    pub fn open_table_at(&mut self, pos: IVec3) -> bool {
+        if !self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_table_interactable()
+        {
+            return false;
+        }
+        if !self.table_within_reach(pos) {
+            return false;
+        }
+        self.open_table = Some(pos);
+        true
+    }
+
+    /// Raycasts one bounded step from the session camera and opens the targeted
+    /// crafting table.
+    ///
+    /// Returns the opened position, or `None` when the ray misses, hits a
+    /// non-table block, or the hit is out of reach. The caller then falls
+    /// through to its normal placement/interaction path, so a non-table click
+    /// behaves exactly as it did before table stations existed.
+    pub fn try_open_targeted_table(&mut self) -> Option<IVec3> {
+        let hit = raycast_voxels(
+            self.camera.position,
+            self.camera.forward(),
+            TABLE_INTERACT_REACH,
+            |x, y, z| self.world.get_block(x, y, z),
+        )?;
+        if self.open_table_at(hit.block_pos) {
+            Some(hit.block_pos)
+        } else {
+            None
+        }
+    }
+
+    /// Re-validates the open table against the current world and reach,
+    /// closing it when the block was removed/replaced or the player walked
+    /// away. Returns the still-open position. One bounded block lookup.
+    pub fn sync_open_table(&mut self) -> Option<IVec3> {
+        let pos = self.open_table?;
+        if self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_table_interactable()
+            && self.table_within_reach(pos)
+        {
+            Some(pos)
+        } else {
+            self.open_table = None;
+            None
+        }
+    }
+
+    /// Closes the open table, if any. Idempotent.
+    pub fn close_table(&mut self) {
+        self.open_table = None;
+    }
+
+    /// Reach check against the block's axis-aligned box: the player may
+    /// interact when the nearest point of the table block is within
+    /// [`TABLE_INTERACT_REACH`] of the eye.
+    fn table_within_reach(&self, pos: IVec3) -> bool {
+        let eye = self.player.eye_position();
+        let min = pos.as_vec3();
+        let closest = eye.clamp(min, min + Vec3::ONE);
+        eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
     }
 }
 
@@ -109,7 +217,13 @@ mod tests {
                 fly_mode: false,
                 selected_slot: 3,
                 render_distance: 12,
-                hotbar: crate::player::inventory::Hotbar::empty(),
+                inventory: crate::player::inventory::Inventory::empty(),
+                player_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Player,
+                ),
+                table_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Table,
+                ),
             },
             chunk_edits: ChunkEditMap::default(),
         }
@@ -165,7 +279,7 @@ mod tests {
         assert_eq!(session.player.yaw, 0.75);
         assert_eq!(session.player.pitch, -0.15);
         assert!(!session.player.fly_mode);
-        assert_eq!(session.player.selected_slot, 3);
+        assert_eq!(session.player.selected_slot(), 3);
     }
 
     #[test]
@@ -173,7 +287,7 @@ mod tests {
         let mut data = make_save(5u32);
         data.player.selected_slot = 200;
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
-        assert_eq!(session.player.selected_slot, 8);
+        assert_eq!(session.player.selected_slot(), 8);
     }
 
     #[test]
@@ -212,7 +326,13 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 0,
                 render_distance: 16,
-                hotbar: crate::player::inventory::Hotbar::empty(),
+                inventory: crate::player::inventory::Inventory::empty(),
+                player_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Player,
+                ),
+                table_grid: crate::player::inventory::CraftingGrid::new(
+                    crate::player::inventory::GridKind::Table,
+                ),
             },
             chunk_edits: edits.clone(),
         };
@@ -238,19 +358,186 @@ mod tests {
             Some(ItemStack::new(BlockId::Brick, 1).unwrap()),
         ]);
         let mut data = make_save(11u32);
-        data.player.hotbar = hotbar.clone();
+        data.player.inventory = crate::player::inventory::Inventory::from_legacy_hotbar(&hotbar);
 
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
-        assert_eq!(session.player.hotbar, hotbar);
+        for slot in 0..crate::player::inventory::HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar_stack(slot), hotbar.stack(slot));
+        }
+        assert!(
+            session.player.inventory().main(0).is_none(),
+            "legacy saves default main storage to empty"
+        );
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
     }
 
     #[test]
-    fn new_session_starts_with_an_empty_hotbar() {
-        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+    fn session_from_save_preserves_tool_durability_cursor_main_slots_and_grids() {
+        use crate::player::inventory::{
+            CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
+        };
+        use crate::world::block::BlockId;
+
+        let mut slots = [None; crate::player::inventory::INVENTORY_SLOTS];
+        slots[2] = Some(Item::new(ItemId::Block(BlockId::Stone), 7).expect("stone"));
+        slots[crate::player::inventory::HOTBAR_SLOTS + 5] =
+            Some(Item::new(ItemId::Material(Material::Stick), 4).expect("sticks"));
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
+        let inventory = Inventory::from_parts(slots, Some(pickaxe));
+
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                3,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("stick")),
+            )
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                15,
+                Some(Item::new(ItemId::Block(BlockId::IronOre), 2).expect("ore")),
+            )
+            .expect("4x4 table grid cell above index 8");
+
+        let mut data = make_save(21u32);
+        data.player.selected_slot = 2;
+        data.player.inventory = inventory.clone();
+        data.player.player_grid = player_grid.clone();
+        data.player.table_grid = table_grid.clone();
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(session.player.selected_slot(), 2);
+        assert_eq!(session.player.inventory(), &inventory);
         assert_eq!(
-            session.player.hotbar,
-            crate::player::inventory::Hotbar::empty()
+            session
+                .player
+                .inventory()
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(137),
+            "cursor tool durability round-trips through the session"
         );
+        assert_eq!(
+            session.player.inventory().main(5).map(|item| item.count()),
+            Some(4)
+        );
+        assert_eq!(session.player.player_grid(), &player_grid);
+        assert_eq!(session.player.table_grid(), &table_grid);
+    }
+
+    #[test]
+    fn session_from_save_defaults_mismatched_grid_kinds() {
+        use crate::player::inventory::{CraftingGrid, GridKind, Inventory, Item, ItemId};
+        use crate::world::block::BlockId;
+
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone")),
+            )
+            .expect("table grid cell");
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::Dirt), 1).expect("dirt")),
+            )
+            .expect("player grid cell");
+
+        let mut data = make_save(22u32);
+        data.player.inventory = Inventory::empty();
+        data.player.player_grid = table_grid;
+        data.player.table_grid = player_grid;
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(
+            session.player.player_grid().kind(),
+            GridKind::Player,
+            "a 4x4 grid in the player position defaults to an empty 2x2 grid"
+        );
+        assert!(session.player.player_grid().is_empty());
+        assert_eq!(session.player.table_grid().kind(), GridKind::Table);
+        assert!(session.player.table_grid().is_empty());
+    }
+
+    #[test]
+    fn new_session_starts_with_an_empty_inventory_and_grids() {
+        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        assert!(session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .all(Option::is_none));
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
+        assert_eq!(session.player.selected_slot(), 0);
+    }
+
+    #[test]
+    fn session_from_a_hand_built_v3_save_migrates_the_hotbar_and_defaults_new_state() {
+        use crate::player::inventory::{Hotbar, ItemStack};
+        use crate::world::block::BlockId;
+        use crate::world::persistence::{load_world_from_bytes, SAVE_MAGIC, TIME_OF_DAY_VERSION};
+
+        let hotbar = Hotbar::from_slots([
+            Some(ItemStack::new(BlockId::Stone, 12).expect("stone")),
+            None,
+            None,
+            Some(ItemStack::new(BlockId::CoalOre, 1).expect("coal")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+
+        // A real version-3 payload: header, 27-byte hotbar, time, no chunks.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SAVE_MAGIC);
+        bytes.extend_from_slice(&TIME_OF_DAY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2024u32.to_le_bytes());
+        for c in [1.0f32, 64.0, -2.0] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&(-0.25f32).to_le_bytes());
+        bytes.push(1); // fly_mode
+        bytes.push(4); // selected_slot
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        for stack in hotbar.stacks() {
+            match stack {
+                Some(stack) => {
+                    bytes.push(stack.block as u8);
+                    bytes.extend_from_slice(&stack.count.to_le_bytes());
+                }
+                None => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
+        }
+        bytes.extend_from_slice(&4321u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // chunk_count
+
+        let data = load_world_from_bytes(&bytes).expect("v3 save must migrate");
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/legacy.mcvx"));
+
+        assert_eq!(session.player.selected_slot(), 4);
+        for slot in 0..crate::player::inventory::HOTBAR_SLOTS {
+            assert_eq!(session.player.hotbar_stack(slot), hotbar.stack(slot));
+        }
+        assert!(session.player.inventory().main(0).is_none());
+        assert!(session.player.inventory().cursor().is_none());
+        assert!(session.player.player_grid().is_empty());
+        assert!(session.player.table_grid().is_empty());
+        assert_eq!(session.clock.time_of_day, 4321);
     }
 
     #[test]
@@ -284,5 +571,224 @@ mod tests {
         let path = PathBuf::from("saves/beta.mcvx");
         let session = WorldSession::session_from_save(make_save(2u32), path.clone());
         assert_eq!(session.save_path, path);
+    }
+
+    /// A session with a deterministic all-air chunk at the origin, so table
+    /// placement and raycasts never depend on generated terrain.
+    fn table_session() -> WorldSession {
+        use crate::world::block::BlockId;
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = WorldSession::new_session(31u32, PathBuf::from("/tmp/table.mcvx"));
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+    }
+
+    /// Aim the player's eyes straight down from three blocks above `pos`.
+    fn aim_down_at(session: &mut WorldSession, pos: IVec3) {
+        session.player.position =
+            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 3.0, pos.z as f32 + 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = -std::f32::consts::FRAC_PI_2;
+        session.sync_camera();
+    }
+
+    #[test]
+    fn targeting_a_placed_table_opens_it() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.open_table_position(), None);
+
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+        assert_eq!(session.open_table_position(), Some(pos));
+        // A still-valid table survives re-validation.
+        assert_eq!(session.sync_open_table(), Some(pos));
+        assert_eq!(session.open_table_position(), Some(pos));
+    }
+
+    #[test]
+    fn targeting_a_non_table_block_does_not_open() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_down_at(&mut session, pos);
+
+        assert_eq!(session.try_open_targeted_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn targeting_air_does_not_open() {
+        let mut session = table_session();
+        aim_down_at(&mut session, IVec3::new(0, 5, 0));
+
+        assert_eq!(session.try_open_targeted_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_replaced_table_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+        assert!(session.try_open_targeted_table().is_none());
+    }
+
+    #[test]
+    fn a_removed_table_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn walking_out_of_reach_closes_the_open_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session.player.position = Vec3::new(20.5, 8.0, 0.5);
+        session.sync_camera();
+
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn an_out_of_reach_table_is_rejected_even_when_valid() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let far = IVec3::new(20, 5, 0);
+        session
+            .world
+            .set_block_immediate(far.x, far.y, far.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, IVec3::new(0, 5, 0));
+
+        assert!(
+            !session.open_table_at(far),
+            "a table beyond the reach budget must not open"
+        );
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn missing_chunk_and_air_coordinates_are_rejected() {
+        let mut session = table_session();
+
+        assert!(
+            !session.open_table_at(IVec3::new(0, 5, 0)),
+            "air is not a table"
+        );
+        assert!(
+            !session.open_table_at(IVec3::new(500, 5, 500)),
+            "unloaded chunk"
+        );
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_rejected_target_does_not_close_an_already_open_table() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let open = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(open.x, open.y, open.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, open);
+        assert_eq!(session.try_open_targeted_table(), Some(open));
+
+        // Failed interactions are side-effect free: they must not silently
+        // close a table that is still valid.
+        assert!(!session.open_table_at(IVec3::new(0, 6, 0)));
+        assert!(!session.open_table_at(IVec3::new(500, 5, 500)));
+        assert_eq!(session.open_table_position(), Some(open));
+    }
+
+    #[test]
+    fn close_table_clears_the_open_state_idempotently() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_table(), Some(pos));
+
+        session.close_table();
+        assert_eq!(session.open_table_position(), None);
+        session.close_table();
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn table_open_state_is_never_restored_from_a_save() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_down_at(&mut session, pos);
+        assert!(session.try_open_targeted_table().is_some());
+
+        // Ephemeral by construction: the save schema has no table-open field,
+        // and both constructors start closed.
+        let restored =
+            WorldSession::session_from_save(make_save(31u32), PathBuf::from("/tmp/table.mcvx"));
+        assert_eq!(restored.open_table_position(), None);
+        assert_eq!(
+            WorldSession::new_session(31u32, PathBuf::from("/tmp/fresh.mcvx"))
+                .open_table_position(),
+            None
+        );
     }
 }

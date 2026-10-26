@@ -57,12 +57,14 @@ pub fn parse_manifest(text: &str) -> (PackManifest, Vec<SettingsWarning>) {
         match menu_value.as_table() {
             Some(menu) => {
                 manifest.logo = read_string(menu_value, "logo", "menu.logo", &mut warnings);
-                manifest.overlay_tint =
-                    read_overlay_tint(menu.get("overlay_tint"), &mut warnings);
+                manifest.overlay_tint = read_overlay_tint(menu.get("overlay_tint"), &mut warnings);
             }
             None => warnings.push(SettingsWarning {
                 field: "pack.toml".to_string(),
-                reason: format!("expected `menu` to be a table, found {}", menu_value.type_str()),
+                reason: format!(
+                    "expected `menu` to be a table, found {}",
+                    menu_value.type_str()
+                ),
             }),
         }
     }
@@ -83,7 +85,10 @@ fn read_string(
         None => {
             warnings.push(SettingsWarning {
                 field: "pack.toml".to_string(),
-                reason: format!("expected `{field}` to be a string, found {}", value.type_str()),
+                reason: format!(
+                    "expected `{field}` to be a string, found {}",
+                    value.type_str()
+                ),
             });
             None
         }
@@ -173,7 +178,10 @@ overlay_tint = [180, 200, 255, 96]
         let (manifest, warnings) = parse_manifest(text);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(manifest.name.as_deref(), Some("Stonecraft"));
-        assert_eq!(manifest.description.as_deref(), Some("Gritty default textures"));
+        assert_eq!(
+            manifest.description.as_deref(),
+            Some("Gritty default textures")
+        );
         assert_eq!(manifest.logo.as_deref(), Some("logo.png"));
         assert_eq!(manifest.overlay_tint, Some([180, 200, 255, 96]));
     }

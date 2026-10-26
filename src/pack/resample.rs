@@ -100,12 +100,7 @@ mod tests {
         let mut data = Vec::with_capacity(24 * 24 * 4);
         for y in 0..24u32 {
             for x in 0..24u32 {
-                data.extend_from_slice(&[
-                    (x * 10) as u8,
-                    (y * 10) as u8,
-                    ((x + y) * 5) as u8,
-                    255,
-                ]);
+                data.extend_from_slice(&[(x * 10) as u8, (y * 10) as u8, ((x + y) * 5) as u8, 255]);
             }
         }
         data
@@ -129,20 +124,20 @@ mod tests {
         let src = solid_rgba(32, [40, 90, 200, 255]);
         let out = resample_to_16(&src, 32);
         assert_eq!(out.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
-        assert!(out.as_chunks::<4>().0.iter().all(|px| px == &[40, 90, 200, 255]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| px == &[40, 90, 200, 255]));
     }
 
     #[test]
     fn pot_32_matches_repeated_downsample_helper_chain() {
         let src32: Vec<u8> = (0..32u32)
-            .flat_map(|y| (0..32u32).flat_map(move |x| {
-                [
-                    (x * 7) as u8,
-                    (y * 7) as u8,
-                    ((x + y) * 3) as u8,
-                    200,
-                ]
-            }))
+            .flat_map(|y| {
+                (0..32u32)
+                    .flat_map(move |x| [(x * 7) as u8, (y * 7) as u8, ((x + y) * 3) as u8, 200])
+            })
             .collect();
         let direct = downsample_rgba_2x(&src32, 32);
         assert_eq!(resample_to_16(&src32, 32), direct);
@@ -161,7 +156,11 @@ mod tests {
         }
         let out = resample_to_16(&src64, 64);
         assert_eq!(out.len(), 16 * 16 * 4);
-        assert!(out.as_chunks::<4>().0.iter().all(|px| px == &[10, 20, 30, 255]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| px == &[10, 20, 30, 255]));
         assert_eq!(pixel(&out, 16, 0, 0), [10, 20, 30, 255]);
         assert_eq!(pixel(&out, 16, 15, 15), [10, 20, 30, 255]);
     }
@@ -188,7 +187,11 @@ mod tests {
         let src = solid_rgba(48, [7, 9, 11, 13]);
         let out = resample_to_16(&src, 48);
         assert_eq!(out.len(), 16 * 16 * 4);
-        assert!(out.as_chunks::<4>().0.iter().all(|px| px == &[7, 9, 11, 13]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| px == &[7, 9, 11, 13]));
     }
 
     #[test]

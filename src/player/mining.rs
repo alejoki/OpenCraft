@@ -1,6 +1,63 @@
 use glam::IVec3;
 
+use crate::player::inventory::Item;
+use crate::player::tools;
 use crate::world::block::BlockId;
+
+/// A validated block-breaking target.
+///
+/// The effective duration is carried *with* the target instead of being
+/// re-derived from the block, so tool rules live in [`crate::player::tools`]
+/// and the accumulator only integrates what it was handed. Construction is
+/// fallible on purpose: unbreakable blocks and non-finite/non-positive
+/// durations can never become a target, so no caller can mine Air or Bedrock
+/// by inventing a duration.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MiningTarget {
+    pos: IVec3,
+    block: BlockId,
+    duration: f32,
+}
+
+impl MiningTarget {
+    /// Validates an explicit duration for `block` at `pos`.
+    ///
+    /// Returns `None` when the block is structurally unbreakable or the
+    /// duration is not a finite positive number.
+    pub fn new(pos: IVec3, block: BlockId, duration: f32) -> Option<Self> {
+        if !duration.is_finite() || duration <= 0.0 {
+            return None;
+        }
+        // Internal catalog hardness guard: the block's own hardness is the
+        // authority on breakability, never the caller-supplied duration.
+        block.break_duration_secs()?;
+        Some(Self {
+            pos,
+            block,
+            duration,
+        })
+    }
+
+    /// Derives a target from the block's base hardness and the selected item.
+    ///
+    /// This is the production entry point: the item's tool class and tier
+    /// decide the effective duration via [`tools::break_duration`].
+    pub fn from_block(pos: IVec3, block: BlockId, selected_item: Option<Item>) -> Option<Self> {
+        Self::new(pos, block, tools::break_duration(block, selected_item)?)
+    }
+
+    pub const fn pos(self) -> IVec3 {
+        self.pos
+    }
+
+    pub const fn block(self) -> BlockId {
+        self.block
+    }
+
+    pub const fn duration(self) -> f32 {
+        self.duration
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum MiningTick {
@@ -43,33 +100,46 @@ impl MiningState {
         }
     }
 
-    pub fn tick(&mut self, dt: f32, candidate: Option<(IVec3, BlockId)>) -> MiningTick {
+    pub fn tick(&mut self, dt: f32, candidate: Option<MiningTarget>) -> MiningTick {
         let dt = if !dt.is_finite() || dt <= 0.0 {
             0.0
         } else {
             dt.min(0.1)
         };
 
-        let Some((pos, block)) = candidate else {
+        let Some(target) = candidate else {
             self.reset();
             return MiningTick::Idle;
         };
-        // Unbreakable blocks (Air, Bedrock) behave exactly like no candidate.
-        let Some(duration) = block.break_duration_secs() else {
+        // Fail closed even though `MiningTarget::new` already validated: the
+        // catalog hardness guard stays the authority on breakability, and a
+        // degenerate duration must never accumulate progress.
+        if target.block.break_duration_secs().is_none()
+            || !target.duration.is_finite()
+            || target.duration <= 0.0
+        {
             self.reset();
             return MiningTick::Idle;
-        };
+        }
 
-        if self.target != Some(pos) || self.block != Some(block) {
-            self.target = Some(pos);
-            self.block = Some(block);
+        // Position, block, and effective duration are all part of the reset
+        // key: switching tools mid-mine must not inherit progress.
+        if self.target != Some(target.pos)
+            || self.block != Some(target.block)
+            || self.duration != target.duration
+        {
+            self.target = Some(target.pos);
+            self.block = Some(target.block);
             self.elapsed = 0.0;
-            self.duration = duration;
+            self.duration = target.duration;
         }
 
         self.elapsed += dt;
         if self.elapsed >= self.duration {
-            let broke = MiningTick::Broke { pos, block };
+            let broke = MiningTick::Broke {
+                pos: target.pos,
+                block: target.block,
+            };
             self.reset();
             return broke;
         }
@@ -89,15 +159,44 @@ impl Default for MiningState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::inventory::{ItemId, ToolKind, ToolTier};
 
     const POS: IVec3 = IVec3::new(0, 40, 0);
+
+    fn bare(block: BlockId) -> MiningTarget {
+        MiningTarget::from_block(POS, block, None).expect("breakable block is a valid target")
+    }
+
+    fn at(pos: IVec3, block: BlockId) -> MiningTarget {
+        MiningTarget::from_block(pos, block, None).expect("breakable block is a valid target")
+    }
+
+    fn tooled(pos: IVec3, block: BlockId, kind: ToolKind, tier: ToolTier) -> MiningTarget {
+        let item = Item::new(ItemId::Tool { kind, tier }, 1).expect("valid tool");
+        MiningTarget::from_block(pos, block, Some(item)).expect("breakable block is a valid target")
+    }
 
     fn tick_stone(mining: &mut MiningState, ticks: u32) -> MiningTick {
         let mut last = MiningTick::Idle;
         for _ in 0..ticks {
-            last = mining.tick(0.1, Some((POS, BlockId::Stone)));
+            last = mining.tick(0.1, Some(bare(BlockId::Stone)));
         }
         last
+    }
+
+    fn hold_until_broke(mining: &mut MiningState, target: MiningTarget) -> u32 {
+        for tick in 1..=200 {
+            match mining.tick(0.1, Some(target)) {
+                MiningTick::Broke { pos, block } => {
+                    assert_eq!(pos, target.pos());
+                    assert_eq!(block, target.block());
+                    return tick;
+                }
+                MiningTick::Mining { .. } => {}
+                MiningTick::Idle => panic!("a held, breakable target must not go Idle"),
+            }
+        }
+        panic!("target never broke");
     }
 
     #[test]
@@ -108,19 +207,51 @@ mod tests {
     }
 
     #[test]
-    fn unbreakable_candidate_is_idle_and_never_accumulates() {
-        let mut mining = MiningState::new();
-        for _ in 0..100 {
-            assert_eq!(
-                mining.tick(0.1, Some((POS, BlockId::Bedrock))),
-                MiningTick::Idle
+    fn unbreakable_blocks_never_become_targets() {
+        for block in [BlockId::Air, BlockId::Bedrock] {
+            assert!(
+                MiningTarget::new(POS, block, 0.1).is_none(),
+                "{block:?} must reject even an explicit duration"
             );
+            assert!(MiningTarget::from_block(POS, block, None).is_none());
+            let pickaxe = Item::new(
+                ItemId::Tool {
+                    kind: ToolKind::Pickaxe,
+                    tier: ToolTier::Iron,
+                },
+                1,
+            )
+            .expect("valid tool");
+            assert!(
+                MiningTarget::from_block(POS, block, Some(pickaxe)).is_none(),
+                "{block:?} must stay unbreakable with an iron pickaxe"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_durations_are_rejected() {
+        for duration in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                MiningTarget::new(POS, BlockId::Stone, duration).is_none(),
+                "duration {duration} must be rejected"
+            );
+        }
+        assert!(MiningTarget::new(POS, BlockId::Stone, 0.001).is_some());
+    }
+
+    #[test]
+    fn unbreakable_or_missing_candidate_resets_without_progress() {
+        let mut mining = MiningState::new();
+        // No candidate at all: exactly the Idle/reset contract.
+        for _ in 0..100 {
+            assert_eq!(mining.tick(0.1, None), MiningTick::Idle);
             assert!(mining.progress().is_none());
         }
-        assert_eq!(
-            mining.tick(0.1, Some((POS, BlockId::Air))),
-            MiningTick::Idle
-        );
+        // A candidate that a caller could not validate (Air/Bedrock) has no
+        // constructor path, so the observable equivalent is `None`.
+        assert!(MiningTarget::new(POS, BlockId::Bedrock, 0.1).is_none());
+        assert!(MiningTarget::new(POS, BlockId::Air, 0.1).is_none());
     }
 
     #[test]
@@ -136,7 +267,7 @@ mod tests {
         // frame of hold; the important contract is exactly one Broke.
         let mut broke = false;
         for _ in 0..10 {
-            match mining.tick(0.1, Some((POS, BlockId::Stone))) {
+            match mining.tick(0.1, Some(bare(BlockId::Stone))) {
                 MiningTick::Broke { pos, block } => {
                     assert_eq!((pos, block), (POS, BlockId::Stone));
                     assert!(!broke, "Broke must be emitted exactly once");
@@ -154,9 +285,24 @@ mod tests {
     }
 
     #[test]
+    fn repeated_ticks_after_a_break_restart_instead_of_rebreaking() {
+        let mut mining = MiningState::new();
+        let target = bare(BlockId::Stone);
+        hold_until_broke(&mut mining, target);
+        // The same target held again starts a fresh cycle: the first tick is
+        // Mining (tiny progress), never a second immediate Broke.
+        match mining.tick(0.1, Some(target)) {
+            MiningTick::Mining { progress } => {
+                assert!(progress <= 0.1 / 1.2 + 1e-4, "progress was {progress}");
+            }
+            other => panic!("expected a fresh Mining cycle, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn huge_dt_is_clamped_to_a_tenth_of_a_second() {
         let mut mining = MiningState::new();
-        match mining.tick(5.0, Some((POS, BlockId::Stone))) {
+        match mining.tick(5.0, Some(bare(BlockId::Stone))) {
             MiningTick::Mining { progress } => {
                 assert!(progress <= 0.084, "clamped progress was {progress}");
             }
@@ -167,9 +313,9 @@ mod tests {
     #[test]
     fn changing_position_restarts_progress() {
         let mut mining = MiningState::new();
-        mining.tick(0.6, Some((POS, BlockId::Stone)));
+        mining.tick(0.6, Some(bare(BlockId::Stone)));
         let moved = IVec3::new(1, 40, 0);
-        match mining.tick(0.1, Some((moved, BlockId::Stone))) {
+        match mining.tick(0.1, Some(at(moved, BlockId::Stone))) {
             MiningTick::Mining { progress } => {
                 assert!(progress <= 0.1 / 1.2 + 1e-4, "progress was {progress}");
             }
@@ -182,13 +328,13 @@ mod tests {
         let mut mining = MiningState::new();
         let mut before = 0.0;
         for _ in 0..3 {
-            before = match mining.tick(0.1, Some((POS, BlockId::Dirt))) {
+            before = match mining.tick(0.1, Some(bare(BlockId::Dirt))) {
                 MiningTick::Mining { progress } => progress,
                 other => panic!("expected Mining, got {other:?}"),
             };
         }
         // Dirt and Sand both take 0.45s: only the block identity can reset progress.
-        match mining.tick(0.1, Some((POS, BlockId::Sand))) {
+        match mining.tick(0.1, Some(bare(BlockId::Sand))) {
             MiningTick::Mining { progress } => {
                 assert!(progress <= 0.1 / 0.45 + 1e-4, "progress was {progress}");
                 assert!(progress < before, "progress must restart, was {progress}");
@@ -198,17 +344,77 @@ mod tests {
     }
 
     #[test]
+    fn changing_effective_duration_restarts_progress() {
+        let mut mining = MiningState::new();
+        for _ in 0..5 {
+            mining.tick(0.1, Some(bare(BlockId::Stone)));
+        }
+        let before = mining.progress().expect("partial bare-hand progress");
+        assert!((before - 0.5 / 1.2).abs() < 1e-3, "progress was {before}");
+
+        // Same position and block, but a wood pickaxe halves the duration.
+        // The reset key includes duration, so progress cannot be inherited.
+        let wood = tooled(POS, BlockId::Stone, ToolKind::Pickaxe, ToolTier::Wood);
+        assert_eq!(wood.duration(), 0.6);
+        match mining.tick(0.1, Some(wood)) {
+            MiningTick::Mining { progress } => {
+                assert!(progress <= 0.1 / 0.6 + 1e-4, "progress was {progress}");
+                assert!(progress < before, "progress must restart, was {progress}");
+            }
+            other => panic!("expected Mining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matching_tools_break_at_their_exact_adjusted_time() {
+        // Stone base 1.2s: wood 0.6s = 6 ticks, stone 0.3s = 3 ticks,
+        // iron 0.2s = 2 ticks at 0.1s per tick.
+        for (tier, expected_ticks) in [
+            (ToolTier::Wood, 6),
+            (ToolTier::Stone, 3),
+            (ToolTier::Iron, 2),
+        ] {
+            let mut mining = MiningState::new();
+            let target = tooled(POS, BlockId::Stone, ToolKind::Pickaxe, tier);
+            let ticks = hold_until_broke(&mut mining, target);
+            assert!(
+                ticks.abs_diff(expected_ticks) <= 1,
+                "{tier:?} broke after {ticks} ticks, expected {expected_ticks}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_tool_keeps_base_timing_and_does_not_reset_progress() {
+        let mut mining = MiningState::new();
+        for _ in 0..5 {
+            mining.tick(0.1, Some(bare(BlockId::Stone)));
+        }
+        let before = mining.progress().expect("partial progress");
+        // An axe on stone has the same effective duration as a bare hand, so
+        // the accumulator keeps integrating rather than restarting.
+        let axe = tooled(POS, BlockId::Stone, ToolKind::Axe, ToolTier::Iron);
+        assert_eq!(axe.duration(), 1.2);
+        match mining.tick(0.1, Some(axe)) {
+            MiningTick::Mining { progress } => {
+                assert!(progress > before, "progress must continue, was {progress}");
+            }
+            other => panic!("expected Mining, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn nan_and_negative_dt_add_nothing() {
         let mut mining = MiningState::new();
-        match mining.tick(f32::NAN, Some((POS, BlockId::Stone))) {
+        match mining.tick(f32::NAN, Some(bare(BlockId::Stone))) {
             MiningTick::Mining { progress } => assert_eq!(progress, 0.0),
             other => panic!("expected Mining, got {other:?}"),
         }
-        match mining.tick(-1.0, Some((POS, BlockId::Stone))) {
+        match mining.tick(-1.0, Some(bare(BlockId::Stone))) {
             MiningTick::Mining { progress } => assert_eq!(progress, 0.0),
             other => panic!("expected Mining, got {other:?}"),
         }
-        match mining.tick(f32::INFINITY, Some((POS, BlockId::Stone))) {
+        match mining.tick(f32::INFINITY, Some(bare(BlockId::Stone))) {
             MiningTick::Mining { progress } => {
                 assert!(progress <= 0.084, "clamped progress was {progress}");
             }
@@ -219,7 +425,7 @@ mod tests {
     #[test]
     fn release_after_partial_progress_resets() {
         let mut mining = MiningState::new();
-        mining.tick(0.5, Some((POS, BlockId::Stone)));
+        mining.tick(0.5, Some(bare(BlockId::Stone)));
         assert!(mining.progress().is_some());
         assert_eq!(mining.tick(0.1, None), MiningTick::Idle);
         assert!(mining.progress().is_none());

@@ -5,18 +5,43 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
-use crate::player::inventory::{Hotbar, ItemStack};
+use crate::player::inventory::{
+    CraftingGrid, GridKind, Hotbar, Inventory, Item, ItemError, ItemId, ItemStack, Material,
+    ToolKind, ToolTier, HOTBAR_SLOTS, INVENTORY_SLOTS, MAX_GRID_SLOTS,
+};
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
 use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
 
 pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 3;
+pub const SAVE_VERSION: u32 = 4;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
 pub const TIME_OF_DAY_VERSION: u32 = 3;
+/// First save version that carries the inventory extension after the chunk
+/// section (full 9 + 27 slots, cursor, and unfinished crafting grids).
+pub const INVENTORY_EXTENSION_VERSION: u32 = 4;
+
+// Stable wire discriminants for the version-4 inventory extension. These are
+// part of the on-disk format; changing the in-memory enum order without
+// updating these constants would silently corrupt saves.
+const ITEM_TAG_EMPTY: u8 = 0;
+const ITEM_TAG_BLOCK: u8 = 1;
+const ITEM_TAG_MATERIAL: u8 = 2;
+const ITEM_TAG_TOOL: u8 = 3;
+
+const MATERIAL_STICK: u8 = 0;
+const TOOL_KIND_PICKAXE: u8 = 0;
+const TOOL_KIND_AXE: u8 = 1;
+const TOOL_KIND_SHOVEL: u8 = 2;
+const TOOL_TIER_WOOD: u8 = 0;
+const TOOL_TIER_STONE: u8 = 1;
+const TOOL_TIER_IRON: u8 = 2;
+
+const GRID_KIND_PLAYER: u8 = 0;
+const GRID_KIND_TABLE: u8 = 1;
 
 /// Default acceleration scale for the game clock: 1.0 is the real 20-real-minute
 /// cycle. `--time-scale` overrides it (a test seam for observing a full cycle in
@@ -98,7 +123,31 @@ pub struct SavedPlayerState {
     pub fly_mode: bool,
     pub selected_slot: u8,
     pub render_distance: u16,
-    pub hotbar: Hotbar,
+    /// The full validated inventory aggregate: nine hotbar slots, 27 main
+    /// slots, and the optional cursor stack.
+    pub inventory: Inventory,
+    /// Unfinished player-inventory crafting grid (2x2 active cells).
+    pub player_grid: CraftingGrid,
+    /// Unfinished crafting-table grid (4x4 active cells).
+    pub table_grid: CraftingGrid,
+}
+
+impl SavedPlayerState {
+    /// Legacy block-only hotbar projection used by the v2/v3 wire header and
+    /// by pre-inventory consumers. Non-block hotbar items (tools) are not
+    /// representable here and project to empty slots; the v4 extension keeps
+    /// their authoritative state.
+    pub fn legacy_hotbar(&self) -> Hotbar {
+        legacy_hotbar_projection(&self.inventory)
+    }
+}
+
+fn legacy_hotbar_projection(inventory: &Inventory) -> Hotbar {
+    let mut slots = [None; HOTBAR_SLOTS];
+    for (slot, projected) in slots.iter_mut().enumerate() {
+        *projected = inventory.hotbar_stack(slot);
+    }
+    Hotbar::from_slots(slots)
 }
 
 pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
@@ -123,6 +172,20 @@ pub enum PersistenceError {
     InvalidBlockId(u8),
     InvalidLocalIndex(u16),
     InvalidPlayerState,
+    /// Version-4 inventory extension carried an unknown item tag.
+    InvalidItemTag(u8),
+    /// Version-4 inventory extension carried an unknown material discriminant.
+    InvalidMaterial(u8),
+    /// Version-4 inventory extension carried an unknown tool kind.
+    InvalidToolKind(u8),
+    /// Version-4 inventory extension carried an unknown tool tier.
+    InvalidToolTier(u8),
+    /// Version-4 crafting-grid record carried an unknown grid kind.
+    InvalidGridKind(u8),
+    /// A decoded item failed domain validation (count, block, durability).
+    InvalidItem(ItemError),
+    /// Crafting-grid state was inconsistent with its persisted kind/position.
+    InvalidCraftingState,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -147,6 +210,25 @@ impl fmt::Display for PersistenceError {
                 write!(f, "invalid block index {i} in save")
             }
             PersistenceError::InvalidPlayerState => write!(f, "invalid player state in save"),
+            PersistenceError::InvalidItemTag(tag) => {
+                write!(f, "unknown item tag {tag} in save")
+            }
+            PersistenceError::InvalidMaterial(id) => {
+                write!(f, "unknown material id {id} in save")
+            }
+            PersistenceError::InvalidToolKind(kind) => {
+                write!(f, "unknown tool kind {kind} in save")
+            }
+            PersistenceError::InvalidToolTier(tier) => {
+                write!(f, "unknown tool tier {tier} in save")
+            }
+            PersistenceError::InvalidGridKind(kind) => {
+                write!(f, "unknown crafting grid kind {kind} in save")
+            }
+            PersistenceError::InvalidItem(e) => write!(f, "invalid item in save: {e:?}"),
+            PersistenceError::InvalidCraftingState => {
+                write!(f, "invalid crafting state in save")
+            }
         }
     }
 }
@@ -157,6 +239,15 @@ pub fn save_world_to_bytes(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
 ) -> Result<(), PersistenceError> {
+    // The two persisted grid positions are fixed, so a grid whose kind
+    // disagrees with its slot would be unloadable. Validate before writing a
+    // single byte so a rejected save leaves `out` untouched.
+    if data.player.player_grid.kind() != GridKind::Player
+        || data.player.table_grid.kind() != GridKind::Table
+    {
+        return Err(PersistenceError::InvalidCraftingState);
+    }
+
     out.extend_from_slice(SAVE_MAGIC);
     out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
     out.extend_from_slice(&data.seed.to_le_bytes());
@@ -171,7 +262,10 @@ pub fn save_world_to_bytes(
 
     // v2 hotbar header: 9 slots of `block_id: u8` + `count: u16` LE.
     // `block_id == 0` (Air) is the empty-slot sentinel and carries count 0.
-    for stack in data.player.hotbar.stacks() {
+    // This header is a block-only projection; non-block hotbar items are
+    // authoritative in the v4 extension below.
+    let legacy_hotbar = legacy_hotbar_projection(&data.player.inventory);
+    for stack in legacy_hotbar.stacks() {
         match stack {
             Some(stack) => {
                 out.push(stack.block as u8);
@@ -212,7 +306,125 @@ pub fn save_world_to_bytes(
         }
     }
 
+    // v4 inventory extension, after every v3-known field: 36 validated slot
+    // records, the cursor record, then the two unfinished crafting grids.
+    write_inventory_extension(
+        out,
+        &data.player.inventory,
+        &data.player.player_grid,
+        &data.player.table_grid,
+    );
+
     Ok(())
+}
+
+fn grid_kind_tag(kind: GridKind) -> u8 {
+    match kind {
+        GridKind::Player => GRID_KIND_PLAYER,
+        GridKind::Table => GRID_KIND_TABLE,
+    }
+}
+
+fn grid_kind_from_tag(tag: u8) -> Option<GridKind> {
+    match tag {
+        GRID_KIND_PLAYER => Some(GridKind::Player),
+        GRID_KIND_TABLE => Some(GridKind::Table),
+        _ => None,
+    }
+}
+
+fn material_tag(material: Material) -> u8 {
+    match material {
+        Material::Stick => MATERIAL_STICK,
+    }
+}
+
+fn material_from_tag(tag: u8) -> Option<Material> {
+    match tag {
+        MATERIAL_STICK => Some(Material::Stick),
+        _ => None,
+    }
+}
+
+fn tool_kind_tag(kind: ToolKind) -> u8 {
+    match kind {
+        ToolKind::Pickaxe => TOOL_KIND_PICKAXE,
+        ToolKind::Axe => TOOL_KIND_AXE,
+        ToolKind::Shovel => TOOL_KIND_SHOVEL,
+    }
+}
+
+fn tool_kind_from_tag(tag: u8) -> Option<ToolKind> {
+    match tag {
+        TOOL_KIND_PICKAXE => Some(ToolKind::Pickaxe),
+        TOOL_KIND_AXE => Some(ToolKind::Axe),
+        TOOL_KIND_SHOVEL => Some(ToolKind::Shovel),
+        _ => None,
+    }
+}
+
+fn tool_tier_tag(tier: ToolTier) -> u8 {
+    match tier {
+        ToolTier::Wood => TOOL_TIER_WOOD,
+        ToolTier::Stone => TOOL_TIER_STONE,
+        ToolTier::Iron => TOOL_TIER_IRON,
+    }
+}
+
+fn tool_tier_from_tag(tag: u8) -> Option<ToolTier> {
+    match tag {
+        TOOL_TIER_WOOD => Some(ToolTier::Wood),
+        TOOL_TIER_STONE => Some(ToolTier::Stone),
+        TOOL_TIER_IRON => Some(ToolTier::Iron),
+        _ => None,
+    }
+}
+
+/// Appends one fixed-size item record: `tag` then a tag-specific payload.
+/// Items are already validated, so encoding cannot fail.
+fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
+    match item {
+        None => out.push(ITEM_TAG_EMPTY),
+        Some(item) => match item.id() {
+            ItemId::Block(block) => {
+                out.push(ITEM_TAG_BLOCK);
+                out.push(block as u8);
+                out.extend_from_slice(&item.count().to_le_bytes());
+            }
+            ItemId::Material(material) => {
+                out.push(ITEM_TAG_MATERIAL);
+                out.push(material_tag(material));
+                out.extend_from_slice(&item.count().to_le_bytes());
+            }
+            ItemId::Tool { kind, tier } => {
+                out.push(ITEM_TAG_TOOL);
+                out.push(tool_kind_tag(kind));
+                out.push(tool_tier_tag(tier));
+                out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
+            }
+        },
+    }
+}
+
+fn write_grid(out: &mut Vec<u8>, grid: &CraftingGrid) {
+    out.push(grid_kind_tag(grid.kind()));
+    for index in 0..grid.kind().slot_count() {
+        write_item(out, grid.slot(index));
+    }
+}
+
+fn write_inventory_extension(
+    out: &mut Vec<u8>,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+) {
+    for item in inventory.slots() {
+        write_item(out, *item);
+    }
+    write_item(out, inventory.cursor());
+    write_grid(out, player_grid);
+    write_grid(out, table_grid);
 }
 
 fn read_u8<R: Read>(r: &mut R) -> Result<u8, PersistenceError> {
@@ -324,6 +536,25 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         chunk_edits.insert(ChunkPos::new(cx, cy, cz), edits);
     }
 
+    // v4 appends the validated inventory aggregate after every v3-known
+    // field. Missing bytes are a truncated record; extra bytes mean the
+    // payload does not match the declared version.
+    let (inventory, player_grid, table_grid) = if version >= INVENTORY_EXTENSION_VERSION {
+        let extension = read_inventory_extension(&mut cur)?;
+        if cur.position() != bytes.len() as u64 {
+            return Err(PersistenceError::InvalidPlayerState);
+        }
+        extension
+    } else {
+        // v1-v3 stored only the hotbar. Migrate it losslessly into the same
+        // nine hotbar slots and leave all new state empty/default.
+        (
+            Inventory::from_legacy_hotbar(&hotbar),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        )
+    };
+
     Ok(WorldSaveData {
         seed,
         time_of_day,
@@ -334,7 +565,9 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             fly_mode: fly_raw != 0,
             selected_slot,
             render_distance,
-            hotbar,
+            inventory,
+            player_grid,
+            table_grid,
         },
         chunk_edits,
     })
@@ -375,6 +608,83 @@ fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
     Ok(Hotbar::from_slots(slots))
 }
 
+/// Reads one validated item record from the v4 extension.
+///
+/// Every payload is bounded and fixed-size: a block/material record is
+/// `tag + id + u16 count`, a tool record is `tag + kind + tier + u16
+/// durability` (count is implicit one). All construction funnels through
+/// [`Item`]'s checked constructors, so forged counts/durability never enter
+/// the domain.
+fn read_item<R: Read>(r: &mut R) -> Result<Option<Item>, PersistenceError> {
+    let tag = read_u8(r)?;
+    match tag {
+        ITEM_TAG_EMPTY => Ok(None),
+        ITEM_TAG_BLOCK => {
+            let block_raw = read_u8(r)?;
+            let count = read_u16(r)?;
+            let Some(block) = BlockId::from_u8(block_raw) else {
+                return Err(PersistenceError::InvalidBlockId(block_raw));
+            };
+            Item::new(ItemId::Block(block), count)
+                .map(Some)
+                .map_err(PersistenceError::InvalidItem)
+        }
+        ITEM_TAG_MATERIAL => {
+            let material_raw = read_u8(r)?;
+            let count = read_u16(r)?;
+            let material = material_from_tag(material_raw)
+                .ok_or(PersistenceError::InvalidMaterial(material_raw))?;
+            Item::new(ItemId::Material(material), count)
+                .map(Some)
+                .map_err(PersistenceError::InvalidItem)
+        }
+        ITEM_TAG_TOOL => {
+            let kind_raw = read_u8(r)?;
+            let tier_raw = read_u8(r)?;
+            let durability = read_u16(r)?;
+            let kind =
+                tool_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidToolKind(kind_raw))?;
+            let tier =
+                tool_tier_from_tag(tier_raw).ok_or(PersistenceError::InvalidToolTier(tier_raw))?;
+            Item::tool_with_durability(kind, tier, durability)
+                .map(Some)
+                .map_err(PersistenceError::InvalidItem)
+        }
+        other => Err(PersistenceError::InvalidItemTag(other)),
+    }
+}
+
+fn read_grid<R: Read>(r: &mut R, expected: GridKind) -> Result<CraftingGrid, PersistenceError> {
+    let kind_raw = read_u8(r)?;
+    let kind = grid_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidGridKind(kind_raw))?;
+    if kind != expected {
+        return Err(PersistenceError::InvalidCraftingState);
+    }
+
+    let mut slots = [None; MAX_GRID_SLOTS];
+    for slot in slots.iter_mut().take(kind.slot_count()) {
+        *slot = read_item(r)?;
+    }
+    CraftingGrid::from_slots(kind, slots).map_err(|_| PersistenceError::InvalidCraftingState)
+}
+
+fn read_inventory_extension<R: Read>(
+    r: &mut R,
+) -> Result<(Inventory, CraftingGrid, CraftingGrid), PersistenceError> {
+    let mut slots = [None; INVENTORY_SLOTS];
+    for slot in slots.iter_mut() {
+        *slot = read_item(r)?;
+    }
+    let cursor = read_item(r)?;
+    let player_grid = read_grid(r, GridKind::Player)?;
+    let table_grid = read_grid(r, GridKind::Table)?;
+    Ok((
+        Inventory::from_parts(slots, cursor),
+        player_grid,
+        table_grid,
+    ))
+}
+
 pub fn save_world_to_path(path: &Path, data: &WorldSaveData) -> Result<(), PersistenceError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -405,7 +715,7 @@ pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::MAX_STACK_COUNT;
+    use crate::player::inventory::{MAIN_SLOTS, MAX_STACK_COUNT};
     use crate::world::block::BlockId;
     use crate::world::chunk::{linear_index, ChunkPos};
 
@@ -428,7 +738,9 @@ mod tests {
                 fly_mode: false,
                 selected_slot: 4,
                 render_distance: 20,
-                hotbar: Hotbar::empty(),
+                inventory: Inventory::empty(),
+                player_grid: CraftingGrid::new(GridKind::Player),
+                table_grid: CraftingGrid::new(GridKind::Table),
             },
             chunk_edits: edits,
         };
@@ -467,12 +779,14 @@ mod tests {
                 fly_mode: false,
                 selected_slot: 0,
                 render_distance: 16,
-                hotbar: Hotbar::empty(),
+                inventory: Inventory::empty(),
+                player_grid: CraftingGrid::new(GridKind::Player),
+                table_grid: CraftingGrid::new(GridKind::Table),
             },
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, 3);
+        assert_eq!(SAVE_VERSION, INVENTORY_EXTENSION_VERSION);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -508,23 +822,28 @@ mod tests {
                 fly_mode: true,
                 selected_slot: 0,
                 render_distance: 16,
-                hotbar: Hotbar::empty(),
+                inventory: Inventory::empty(),
+                player_grid: CraftingGrid::new(GridKind::Player),
+                table_grid: CraftingGrid::new(GridKind::Table),
             },
             chunk_edits: edits,
         };
         save_world_to_bytes(&mut valid, &data).unwrap();
 
-        let last = valid.len() - 1;
-        valid[last] = 99;
+        // One chunk, one edit: the block byte sits after chunk_count (71),
+        // the 12-byte chunk position, edit_count, and the u16 local index.
+        const FIRST_EDIT_INDEX_OFFSET: usize = 87;
+        const FIRST_EDIT_BLOCK_OFFSET: usize = 89;
+
+        valid[FIRST_EDIT_BLOCK_OFFSET] = 99;
         assert!(matches!(
             load_world_from_bytes(&valid),
             Err(PersistenceError::InvalidBlockId(99))
         ));
 
-        valid[last] = BlockId::Stone as u8;
-        let idx_bytes = 40000u16.to_le_bytes();
-        valid[last - 2] = idx_bytes[0];
-        valid[last - 1] = idx_bytes[1];
+        valid[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Stone as u8;
+        valid[FIRST_EDIT_INDEX_OFFSET..FIRST_EDIT_INDEX_OFFSET + 2]
+            .copy_from_slice(&40000u16.to_le_bytes());
         assert!(matches!(
             load_world_from_bytes(&valid),
             Err(PersistenceError::InvalidLocalIndex(40000))
@@ -545,46 +864,77 @@ mod tests {
         ])
     }
 
-    fn sample_v3_data(hotbar: Hotbar) -> WorldSaveData {
+    fn sample_player() -> SavedPlayerState {
+        SavedPlayerState {
+            position: [1.0, 64.0, -2.0],
+            yaw: 0.5,
+            pitch: -0.25,
+            fly_mode: true,
+            selected_slot: 4,
+            render_distance: 16,
+            inventory: Inventory::empty(),
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
+        }
+    }
+
+    fn sample_data(player: SavedPlayerState) -> WorldSaveData {
         WorldSaveData {
             seed: 2024,
             time_of_day: DEFAULT_TIME_OF_DAY,
-            player: SavedPlayerState {
-                position: [1.0, 64.0, -2.0],
-                yaw: 0.5,
-                pitch: -0.25,
-                fly_mode: true,
-                selected_slot: 4,
-                render_distance: 16,
-                hotbar,
-            },
+            player,
             chunk_edits: ChunkEditMap::default(),
         }
     }
 
     #[test]
-    fn test_v2_hotbar_roundtrips_exactly() {
+    fn test_legacy_hotbar_header_projects_block_hotbar_exactly() {
         let hotbar = hotbar_sample();
-        let data = sample_v3_data(hotbar.clone());
+        let mut player = sample_player();
+        player.inventory = Inventory::from_legacy_hotbar(&hotbar);
+        let data = sample_data(player);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
 
         // Header layout: 36 bytes through render_distance, then 9 * 3
-        // hotbar bytes, then the v3 time u32, then chunk_count. No edits
-        // means 4 more bytes.
-        assert_eq!(bytes.len(), 36 + 27 + 4 + 4);
+        // hotbar bytes, then the v3 time u32, then chunk_count (4 bytes),
+        // then the v4 inventory extension. The sample has four block hotbar
+        // slots, each expanding its 1-byte empty record to a 4-byte block
+        // record (+3 bytes each).
+        assert_eq!(bytes.len(), V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + 4 * 3);
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
 
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
         assert_eq!(loaded.player, data.player);
         assert_eq!(loaded.player.selected_slot, 4);
-        for slot in 0..crate::player::inventory::HOTBAR_SLOTS {
+        for slot in 0..HOTBAR_SLOTS {
             assert_eq!(
-                loaded.player.hotbar.stack(slot),
+                loaded.player.legacy_hotbar().stack(slot),
                 hotbar.stack(slot),
                 "slot {slot} must round-trip"
             );
         }
+    }
+
+    #[test]
+    fn test_write_rejects_mismatched_grid_kinds() {
+        let mut player = sample_player();
+        player.player_grid = CraftingGrid::new(GridKind::Table);
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut bytes, &sample_data(player)),
+            Err(PersistenceError::InvalidCraftingState)
+        ));
+        assert!(bytes.is_empty(), "a rejected save must not emit bytes");
+
+        let mut player = sample_player();
+        player.table_grid = CraftingGrid::new(GridKind::Player);
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut bytes, &sample_data(player)),
+            Err(PersistenceError::InvalidCraftingState)
+        ));
+        assert!(bytes.is_empty(), "a rejected save must not emit bytes");
     }
 
     #[test]
@@ -629,7 +979,9 @@ mod tests {
         assert!(loaded.player.fly_mode);
         assert_eq!(loaded.player.selected_slot, 6);
         assert_eq!(loaded.player.render_distance, 18);
-        assert_eq!(loaded.player.hotbar, Hotbar::empty());
+        assert_eq!(loaded.player.inventory, Inventory::empty());
+        assert!(loaded.player.player_grid.is_empty());
+        assert!(loaded.player.table_grid.is_empty());
 
         let chunk = loaded
             .chunk_edits
@@ -639,11 +991,17 @@ mod tests {
         assert_eq!(chunk[&iron_index], BlockId::IronOre);
     }
 
-    /// Byte offset of the first hotbar slot in a v2/v3 save.
+    /// Byte offset of the first hotbar slot in a v2/v3/v4 save.
     const V2_HOTBAR_OFFSET: usize = 36;
     /// Byte offset of the v3 time-of-day u32 (after magic, version, seed,
     /// 12 position, 4 yaw, 4 pitch, fly, slot, render_distance, 27 hotbar).
     const V3_TIME_OFFSET: usize = 63;
+    /// Byte offset of the v4 inventory extension with no chunk edits
+    /// (36 header + 27 hotbar + 4 time + 4 chunk_count).
+    const V4_EXTENSION_OFFSET: usize = 71;
+    /// Extension size for an empty inventory: 36 slot records + cursor +
+    /// player grid (kind + 4 cells) + table grid (kind + 16 cells).
+    const V4_EXTENSION_LEN: usize = INVENTORY_SLOTS + 1 + (1 + 4) + (1 + 16);
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -651,10 +1009,38 @@ mod tests {
         bytes[off + 1..off + 3].copy_from_slice(&count.to_le_bytes());
     }
 
-    fn valid_v3_bytes() -> Vec<u8> {
+    fn hand_built_v3_bytes(hotbar: &Hotbar) -> Vec<u8> {
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &sample_v3_data(Hotbar::empty())).unwrap();
+        bytes.extend_from_slice(SAVE_MAGIC);
+        bytes.extend_from_slice(&TIME_OF_DAY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2024u32.to_le_bytes());
+        for c in [1.0f32, 64.0, -2.0] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0.5f32.to_le_bytes()); // yaw
+        bytes.extend_from_slice(&(-0.25f32).to_le_bytes()); // pitch
+        bytes.push(1); // fly_mode
+        bytes.push(4); // selected_slot
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // render_distance
+        for stack in hotbar.stacks() {
+            match stack {
+                Some(stack) => {
+                    bytes.push(stack.block as u8);
+                    bytes.extend_from_slice(&stack.count.to_le_bytes());
+                }
+                None => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
+        }
+        bytes.extend_from_slice(&4321u32.to_le_bytes()); // time_of_day
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // chunk_count
         bytes
+    }
+
+    fn valid_v3_bytes() -> Vec<u8> {
+        hand_built_v3_bytes(&Hotbar::empty())
     }
 
     /// Hand-build a real v2 save: hotbar header present, no time-of-day.
@@ -682,7 +1068,9 @@ mod tests {
     #[test]
     fn test_v2_save_migrates_to_default_time_of_day() {
         let loaded = load_world_from_bytes(&valid_v2_bytes()).expect("v2 must migrate, not fail");
-        assert_eq!(loaded.player.hotbar, Hotbar::empty());
+        assert_eq!(loaded.player.inventory, Inventory::empty());
+        assert!(loaded.player.player_grid.is_empty());
+        assert!(loaded.player.table_grid.is_empty());
         assert_eq!(
             loaded.time_of_day, DEFAULT_TIME_OF_DAY,
             "v2 predates game time and migrates to noon"
@@ -690,8 +1078,39 @@ mod tests {
     }
 
     #[test]
+    fn test_v3_save_migrates_hotbar_into_inventory_and_defaults_new_state() {
+        let hotbar = hotbar_sample();
+        let bytes = hand_built_v3_bytes(&hotbar);
+        let loaded = load_world_from_bytes(&bytes).expect("v3 must migrate, not fail");
+
+        assert_eq!(loaded.time_of_day, 4321);
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(
+                loaded
+                    .player
+                    .inventory
+                    .hotbar(slot)
+                    .and_then(|item| item.block_stack()),
+                hotbar.stack(slot),
+                "legacy hotbar slot {slot} must migrate losslessly"
+            );
+        }
+        for slot in 0..MAIN_SLOTS {
+            assert!(
+                loaded.player.inventory.main(slot).is_none(),
+                "v3 main slot {slot} must default to empty"
+            );
+        }
+        assert!(loaded.player.inventory.cursor().is_none());
+        assert!(loaded.player.player_grid.is_empty());
+        assert!(loaded.player.table_grid.is_empty());
+        assert_eq!(loaded.player.player_grid.kind(), GridKind::Player);
+        assert_eq!(loaded.player.table_grid.kind(), GridKind::Table);
+    }
+
+    #[test]
     fn test_v3_time_of_day_roundtrips_exactly() {
-        let mut data = sample_v3_data(Hotbar::empty());
+        let mut data = sample_data(sample_player());
         data.time_of_day = 12_345;
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
@@ -785,10 +1204,297 @@ mod tests {
         ));
 
         let mut future = valid_v3_bytes();
-        future[4..8].copy_from_slice(&4u32.to_le_bytes());
+        future[4..8].copy_from_slice(&(SAVE_VERSION + 1).to_le_bytes());
         assert!(matches!(
             load_world_from_bytes(&future),
-            Err(PersistenceError::UnsupportedVersion(4))
+            Err(PersistenceError::UnsupportedVersion(5))
+        ));
+    }
+
+    fn rich_player() -> SavedPlayerState {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 37).unwrap());
+        slots[1] =
+            Some(Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).unwrap());
+        slots[2] = Some(Item::new(ItemId::Material(Material::Stick), 12).unwrap());
+        slots[HOTBAR_SLOTS] = Some(Item::new(ItemId::Block(BlockId::OakPlanks), 5).unwrap());
+        let cursor = Some(Item::tool_with_durability(ToolKind::Axe, ToolTier::Stone, 1).unwrap());
+
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, cursor);
+        player
+            .player_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::OakPlanks), 2).unwrap()),
+            )
+            .unwrap();
+        player
+            .player_grid
+            .set(
+                3,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).unwrap()),
+            )
+            .unwrap();
+        player
+            .table_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Block(BlockId::OakLog), 1).unwrap()),
+            )
+            .unwrap();
+        player
+            .table_grid
+            .set(
+                4,
+                Some(Item::new(ItemId::Material(Material::Stick), 2).unwrap()),
+            )
+            .unwrap();
+        // A cell above the old 3x3 limit proves the 4x4 active region is what
+        // gets persisted, not just the first nine slots.
+        player
+            .table_grid
+            .set(
+                15,
+                Some(Item::new(ItemId::Block(BlockId::OakPlanks), 1).unwrap()),
+            )
+            .unwrap();
+        player
+    }
+
+    #[test]
+    fn test_v4_roundtrips_tool_durability_cursor_and_unfinished_grids() {
+        let data = sample_data(rich_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+
+        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+        assert_eq!(loaded.player, data.player);
+
+        let tool = loaded.player.inventory.hotbar(1).expect("hotbar tool");
+        assert_eq!(tool.durability(), Some(137));
+        assert_eq!(
+            tool.id(),
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron
+            }
+        );
+        assert_eq!(
+            loaded
+                .player
+                .inventory
+                .cursor()
+                .and_then(|item| item.durability()),
+            Some(1),
+            "cursor tool durability must survive exactly"
+        );
+        assert_eq!(
+            loaded.player.inventory.main(0).map(|item| item.count()),
+            Some(5)
+        );
+        assert!(!loaded.player.player_grid.is_empty());
+        assert!(!loaded.player.table_grid.is_empty());
+        assert_eq!(loaded.player.player_grid.kind(), GridKind::Player);
+        assert_eq!(loaded.player.table_grid.kind(), GridKind::Table);
+        assert_eq!(
+            loaded.player.table_grid.slot(15).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::OakPlanks)),
+            "4x4 table cell above index 8 must survive load"
+        );
+
+        // The legacy block-only header cannot express the tool: it stays the
+        // empty sentinel while the v4 extension is authoritative.
+        let header_slot = V2_HOTBAR_OFFSET + 3;
+        assert_eq!(bytes[header_slot], BlockId::Air as u8);
+        assert_eq!(
+            &bytes[header_slot + 1..header_slot + 3],
+            &0u16.to_le_bytes()
+        );
+
+        // Exact byte stability: load -> save reproduces the same file.
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).expect("re-save should succeed");
+        assert_eq!(again, bytes);
+    }
+
+    #[test]
+    fn test_v4_truncated_extension_is_typed_io_error() {
+        let data = sample_data(rich_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+
+        // Cut inside the slot records.
+        let truncated = &bytes[..V4_EXTENSION_OFFSET + 5];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+
+        // Drop the final table-grid cell.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_v4_rejects_trailing_bytes() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidPlayerState)
+        ));
+    }
+
+    fn v4_bytes_with_slot0(item: Item) -> Vec<u8> {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item);
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &sample_data(player)).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn test_v4_rejects_unknown_item_tag() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        bytes[V4_EXTENSION_OFFSET] = 200;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItemTag(200))
+        ));
+    }
+
+    #[test]
+    fn test_v4_rejects_invalid_block_and_material_records() {
+        let block_record =
+            v4_bytes_with_slot0(Item::new(ItemId::Block(BlockId::CoalOre), 8).unwrap());
+        // Slot-0 layout: tag, block id, count u16.
+        let mut bytes = block_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 1] = 99;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidBlockId(99))
+        ));
+
+        let mut bytes = block_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Air as u8;
+        bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::UncarryableBlock))
+        ));
+
+        let mut bytes = block_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
+            .copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::EmptyStack))
+        ));
+
+        let mut bytes = block_record;
+        bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
+            .copy_from_slice(&(MAX_STACK_COUNT + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::StackOverflow))
+        ));
+
+        let material_record =
+            v4_bytes_with_slot0(Item::new(ItemId::Material(Material::Stick), 4).unwrap());
+        let mut bytes = material_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 1] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMaterial(9))
+        ));
+
+        // Materials cap at MATERIAL_STACK_LIMIT (64).
+        let mut bytes = material_record;
+        bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
+            .copy_from_slice(&65u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::StackOverflow))
+        ));
+    }
+
+    #[test]
+    fn test_v4_rejects_invalid_tool_records() {
+        let tool_record = v4_bytes_with_slot0(
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 200).unwrap(),
+        );
+        // Slot-0 layout: tag, kind, tier, durability u16.
+        let mut bytes = tool_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 1] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidToolKind(9))
+        ));
+
+        let mut bytes = tool_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 2] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidToolTier(9))
+        ));
+
+        let mut bytes = tool_record.clone();
+        bytes[V4_EXTENSION_OFFSET + 3..V4_EXTENSION_OFFSET + 5]
+            .copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
+        ));
+
+        // Iron caps at 250 durability.
+        let mut bytes = tool_record;
+        bytes[V4_EXTENSION_OFFSET + 3..V4_EXTENSION_OFFSET + 5]
+            .copy_from_slice(&251u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
+        ));
+    }
+
+    #[test]
+    fn test_v4_rejects_bad_grid_records() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+
+        const PLAYER_GRID_KIND_OFFSET: usize = V4_EXTENSION_OFFSET + INVENTORY_SLOTS + 1;
+        const TABLE_GRID_KIND_OFFSET: usize = PLAYER_GRID_KIND_OFFSET + 1 + 4;
+
+        let mut unknown = bytes.clone();
+        unknown[PLAYER_GRID_KIND_OFFSET] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&unknown),
+            Err(PersistenceError::InvalidGridKind(9))
+        ));
+
+        let mut mismatched = bytes.clone();
+        mismatched[PLAYER_GRID_KIND_OFFSET] = GRID_KIND_TABLE;
+        assert!(matches!(
+            load_world_from_bytes(&mismatched),
+            Err(PersistenceError::InvalidCraftingState)
+        ));
+
+        let mut mismatched = bytes;
+        mismatched[TABLE_GRID_KIND_OFFSET] = GRID_KIND_PLAYER;
+        assert!(matches!(
+            load_world_from_bytes(&mismatched),
+            Err(PersistenceError::InvalidCraftingState)
         ));
     }
 

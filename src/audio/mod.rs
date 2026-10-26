@@ -402,10 +402,7 @@ mod tests {
                 SAMPLE_RATE,
                 "slot {index} sample rate"
             );
-            assert!(
-                !buffer.samples().is_empty(),
-                "slot {index} has no samples"
-            );
+            assert!(!buffer.samples().is_empty(), "slot {index} has no samples");
             assert_eq!(
                 buffer.samples().len() % buffer.channels() as usize,
                 0,
@@ -453,7 +450,10 @@ mod tests {
         assert_eq!(engine.buffer(SoundSlot::Break).channels(), 1);
         assert_eq!(engine.buffer(SoundSlot::Break).sample_rate(), 22_050);
         assert_eq!(engine.buffer(SoundSlot::Place).sample_rate(), 48_000);
-        assert!(engine.is_silent(), "swapping buffers must not open a device");
+        assert!(
+            engine.is_silent(),
+            "swapping buffers must not open a device"
+        );
     }
 
     #[test]
