@@ -1118,6 +1118,21 @@ mod tests {
     use super::*;
     use crate::world::block::BlockId;
 
+    /// Serialises the tests that depend on the shared global rayon pool. The
+    /// ocean-crossing acceptance test deliberately saturates that pool (a full
+    /// rd=4 ring of debug-mode light jobs), and the streaming tests below prove
+    /// worker results land inside bounded retry windows. Holding this lock keeps
+    /// those windows meaningful instead of racing a load-generating sibling.
+    static HEAVY_STREAMING_POOL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the heavy-streaming lock, ignoring poisoning: a panic in a
+    /// sibling test is reported by that test, not by every later tenant.
+    fn lock_heavy_streaming() -> std::sync::MutexGuard<'static, ()> {
+        HEAVY_STREAMING_POOL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_boundary_block_edit_marks_neighbor_dirty() {
         let mut mgr = WorldManager::new(2);
@@ -1178,6 +1193,7 @@ mod tests {
 
     #[test]
     fn test_chunk_edits_persist_across_unload_and_regeneration() {
+        let _heavy = lock_heavy_streaming();
         let mut mgr = WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
         let c0 = ChunkPos::new(0, 1, 0);
         let c_neg_x = ChunkPos::new(-1, 1, 0);
@@ -1200,15 +1216,27 @@ mod tests {
         assert!(unloaded.contains(&c0));
         assert_eq!(mgr.get_block(0, 40, 5), BlockId::Air);
 
-        // Move back to (0, 1, 0) and pump streaming until (0, 1, 0) regenerates
-        for _ in 0..40 {
+        // Move back to (0, 1, 0) and pump streaming until (0, 1, 0) regenerates.
+        // The pump is deadline-based because the debug lib suite runs ~600 tests
+        // in parallel and the shared rayon pool can take far longer than the
+        // isolated round-trip; the iteration cap keeps it finite if a real
+        // regression ever stops the chunk from arriving.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut pump = 0usize;
+        while mgr.get_block(0, 40, 5) != BlockId::Brick
+            && pump < 10_000
+            && std::time::Instant::now() < deadline
+        {
             mgr.update_streaming(c0);
-            if mgr.get_block(0, 40, 5) == BlockId::Brick {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            pump += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert_eq!(mgr.get_block(0, 40, 5), BlockId::Brick);
+        assert_eq!(
+            mgr.get_block(0, 40, 5),
+            BlockId::Brick,
+            "the edited chunk must regenerate with its edit applied inside the bounded pump \
+             window ({pump} polls)"
+        );
         let _ = c_neg_x;
     }
 
@@ -1313,6 +1341,7 @@ mod tests {
 
     #[test]
     fn test_completed_column_light_is_deferred_to_worker() {
+        let _heavy = lock_heavy_streaming();
         let mut mgr = WorldManager::new(4);
         prefill_spiral_with_air(&mut mgr);
         // Make the centre column opaque enough that its light is not simply
@@ -1329,18 +1358,22 @@ mod tests {
         assert_eq!(mgr.pending_light.len(), 1, "the column must be queued");
 
         // A later update dispatches the job to rayon; the grids land on a
-        // subsequent update once the worker finishes.
+        // subsequent update once the worker finishes. Deadline-based because a
+        // single debug-mode 3x3 light region takes about a second in isolation
+        // and the debug lib suite shares the rayon pool across ~600 parallel
+        // tests, so a fixed 3 s iteration window is too tight; the iteration cap
+        // still bounds the wait.
         let center = ChunkPos::new(0, 0, 0);
-        for _ in 0..3000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut pump = 0usize;
+        while !mgr.has_column_light(0, 0) && pump < 20_000 && std::time::Instant::now() < deadline {
             mgr.update_streaming(center);
-            if mgr.has_column_light(0, 0) {
-                break;
-            }
+            pump += 1;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
             mgr.has_column_light(0, 0),
-            "the worker light result must be applied eventually"
+            "the worker light result must be applied eventually ({pump} bounded polls)"
         );
         assert!(mgr.has_light_neighborhood(0, 0));
         assert!(mgr.pending_light.is_empty());
@@ -1702,6 +1735,7 @@ mod tests {
     /// the mesher: the `!has_any_solid` fast skip used to drop it silently.
     #[test]
     fn test_water_only_chunk_is_dispatched_and_meshes_water_quads() {
+        let _heavy = lock_heavy_streaming();
         let center = ChunkPos::new(0, 0, 0);
         let mut mgr = WorldManager::new(4);
         for dx in -1..=1 {
@@ -1740,16 +1774,23 @@ mod tests {
             "the water-only chunk must not be dropped by the no-solid fast skip"
         );
 
+        // Deadline-based for the same reason as the persistence pump: the debug
+        // suite's parallel load can delay a shared-pool worker well past the
+        // isolated cost. The iteration cap keeps the wait finite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut result = None;
-        for _ in 0..200 {
+        let mut pump = 0usize;
+        while result.is_none() && pump < 10_000 && std::time::Instant::now() < deadline {
             let (completed, _) = mgr.update_streaming(center);
             if let Some((_, mesh)) = completed.iter().find(|(pos, _)| *pos == center) {
                 result = Some(mesh.clone());
-                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            pump += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let mesh = result.expect("the water-only chunk must publish a mesh");
+        let mesh = result.unwrap_or_else(|| {
+            panic!("the water-only chunk must publish a mesh inside the bounded pump window ({pump} polls)")
+        });
         assert!(!mesh.is_empty(), "the published water mesh is not empty");
         assert_eq!(mesh.total_quads(), 0, "the opaque path stays untouched");
         assert!(
@@ -1839,6 +1880,439 @@ mod tests {
         assert!(
             mgr.chunk_edits().is_empty(),
             "worldgen water must never create an edit entry"
+        );
+    }
+
+    /// Headless ocean-crossing acceptance test (M007/S03-T02).
+    ///
+    /// Drives the exact production physics seam and per-frame order from the
+    /// playing frame in `src/main.rs`: `Player::update` first, then
+    /// `WorldManager::update_streaming` around the player's new chunk. The
+    /// player falls into a generated ocean, floats near the surface, rises with
+    /// `jump_or_up`, and swims across to the far shore, where it finishes
+    /// standing on land above `SEA_LEVEL`.
+    ///
+    /// Before the run, the crossing is bounded by a pure, chunk-free scan: seed
+    /// 12345 has an Ocean column at (0, 0) with h = 14 (S01), and the first
+    /// column at or above `SEA_LEVEL` along the +Z axis is the far shore. The
+    /// whole route is then known to be Ocean, so no assertion chases a moving
+    /// target and no chunk has to exist to compute the bounds.
+    ///
+    /// This is the slice's highest-risk proof because it couples three things:
+    /// the T01 swim constants, worldgen Water residency, and streaming ahead of
+    /// the player. `WorldManager::get_block` returns Air for a non-resident
+    /// chunk, so a lagging pipeline silently removes buoyancy; every frame runs
+    /// behind a bounded residency gate, and the float/rise assertions fail
+    /// loudly if the body approaches the seabed instead of the surface.
+    ///
+    /// Determinism and bounds: fixed `dt = 1/60`, an explicit frame budget per
+    /// phase, and bounded polling for both the warm-up and the per-frame gate,
+    /// so the test can never hang. Every panic names the stage (bounds,
+    /// warm-up, entry, float, rise, crossing, streaming-gate), the seed, the
+    /// axis, the crossing distance and the relevant frame/poll budget, so a
+    /// regression pinpoints which stage stalled.
+    ///
+    /// Honesty note: no fall-damage or health claim is made here — no
+    /// health/fall/damage system exists in `src/`; fall damage and drowning are
+    /// deferred to M008 per MEM227. The assertions are mechanics only:
+    /// positions, buoyancy and `on_ground`.
+    #[test]
+    fn test_acceptance_swim_ocean_crossing() {
+        let _heavy = lock_heavy_streaming();
+        use crate::player::physics::{InputState, Player};
+        use crate::world::terrain::{biome_at_seeded, terrain_height_at_seeded, Biome, SEA_LEVEL};
+        use std::time::Duration;
+
+        const SEED: u32 = 12345;
+        /// Forward axis for the crossing: +Z (`CROSSING_AXIS`).
+        const AXIS_STEP: i32 = 1;
+        const CROSSING_AXIS: &str = "+Z";
+        const RENDER_DISTANCE: i32 = 4;
+        const DT: f32 = 1.0 / 60.0;
+        const WARMUP_POLL_CAP: usize = 20_000;
+        const GATE_POLL_CAP: usize = 20_000;
+        const ENTRY_FRAME_CAP: usize = 600;
+        const FLOAT_FRAMES: usize = 180;
+        const RISE_FRAME_CAP: usize = 120;
+        const CROSSING_FRAME_CAP: usize = 9_000;
+        const SEABED_MARGIN: f32 = 2.0;
+
+        // ---- 1. Bound the crossing before any chunk exists (pure scan) ----
+        let ocean_start = (0..512)
+            .find(|&d| {
+                let (wx, wz) = (0, AXIS_STEP * d);
+                biome_at_seeded(wx, wz, SEED) == Biome::Ocean
+                    && terrain_height_at_seeded(wx, wz, SEED) < SEA_LEVEL
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "test_acceptance_swim_ocean_crossing stage 'bounds': seed {SEED} axis \
+                     {CROSSING_AXIS}: no Ocean column (h < SEA_LEVEL {SEA_LEVEL}) within 512 \
+                     blocks of (0, 0)"
+                )
+            });
+        let far_shore = (ocean_start + 1..4096)
+            .find(|&d| {
+                let (wx, wz) = (0, AXIS_STEP * d);
+                terrain_height_at_seeded(wx, wz, SEED) >= SEA_LEVEL
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "test_acceptance_swim_ocean_crossing stage 'bounds': seed {SEED} axis \
+                     {CROSSING_AXIS}: no far shore (h >= SEA_LEVEL {SEA_LEVEL}) within 4096 \
+                     blocks after ocean column {ocean_start}"
+                )
+            });
+        assert!(
+            far_shore > ocean_start + 1,
+            "test_acceptance_swim_ocean_crossing stage 'bounds': seed {SEED} axis \
+             {CROSSING_AXIS} needs a multi-column ocean, got ocean_start={ocean_start} \
+             far_shore={far_shore} ({} columns)",
+            far_shore - ocean_start
+        );
+        let crossing_distance = far_shore - ocean_start;
+        let spawn_column_x = 0;
+        let spawn_column_z = AXIS_STEP * ocean_start;
+        let far_shore_axis = (AXIS_STEP * far_shore) as f32;
+        let seabed_height = terrain_height_at_seeded(spawn_column_x, spawn_column_z, SEED);
+        assert!(
+            seabed_height < SEA_LEVEL,
+            "test_acceptance_swim_ocean_crossing stage 'bounds': seed {SEED} axis \
+             {CROSSING_AXIS}: spawn column ({spawn_column_x}, {spawn_column_z}) has h={seabed_height}, \
+             not below SEA_LEVEL {SEA_LEVEL}"
+        );
+
+        // ---- 2. Warm the spawn column through the real streaming seam ----
+        let mut mgr =
+            WorldManager::with_seed_and_edits(RENDER_DISTANCE, SEED, ChunkEditMap::default());
+        let start_chunk = ChunkPos::new(0, 0, 0);
+        let mut warmup_polls = 0usize;
+        while mgr.get_block(spawn_column_x, SEA_LEVEL, spawn_column_z) != BlockId::Water {
+            assert!(
+                warmup_polls < WARMUP_POLL_CAP,
+                "test_acceptance_swim_ocean_crossing stage 'warm-up': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, budget \
+                 {WARMUP_POLL_CAP} polls: spawn-column Water at ({spawn_column_x}, {SEA_LEVEL}, \
+                 {spawn_column_z}) was still non-resident after {warmup_polls} bounded \
+                 update_streaming polls ({} chunks loaded)",
+                mgr.loaded_chunk_count()
+            );
+            mgr.update_streaming(start_chunk);
+            warmup_polls += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        /// Production-seam harness: `step` is one playing frame (physics first,
+        /// then streaming), preceded by a bounded stream-ahead residency gate.
+        struct Harness {
+            player: Player,
+            mgr: WorldManager,
+            frames: usize,
+            gate_polls: usize,
+            gate_worst_polls: usize,
+        }
+
+        impl Harness {
+            fn feet_block(&self) -> BlockId {
+                self.mgr.get_block(
+                    self.player.position.x.floor() as i32,
+                    (self.player.position.y + 1e-4).floor() as i32,
+                    self.player.position.z.floor() as i32,
+                )
+            }
+
+            fn axis_position(&self) -> f32 {
+                self.player.position.z * AXIS_STEP as f32
+            }
+
+            /// Bounded streaming-ahead gate. The real game gives the pipeline
+            /// about 16 ms of wall time per frame while the player swims at
+            /// roughly 2.5 m/s, and rd=4 keeps the chunk under the player
+            /// resident well before arrival. A headless loop advances sim-time
+            /// far faster than wall time, so the test waits (1 ms polls, bounded
+            /// cap) until the water column the player occupies is actually
+            /// resident instead of silently reading Air for a non-resident
+            /// chunk. This never changes the per-frame order: it is a
+            /// precondition wait before the frame's physics step.
+            fn ensure_water_resident(&mut self, cap: usize, crossing_distance: i32) {
+                let col_x = self.player.position.x.floor() as i32;
+                let col_z = self.player.position.z.floor() as i32;
+                if terrain_height_at_seeded(col_x, col_z, SEED) >= SEA_LEVEL {
+                    // Dry land: buoyancy is not at stake, so nothing to gate.
+                    return;
+                }
+                let (center, _) = world_to_chunk_and_local(col_x, SEA_LEVEL, col_z);
+                let mut polls = 0usize;
+                while self.mgr.get_block(col_x, SEA_LEVEL, col_z) != BlockId::Water {
+                    assert!(
+                        polls < cap,
+                        "test_acceptance_swim_ocean_crossing stage 'streaming-gate': seed \
+                         {SEED} axis {CROSSING_AXIS} distance {crossing_distance} blocks, frame \
+                         {}, position {:?}: Water at column ({col_x}, {col_z}) was still \
+                         non-resident after {polls} bounded update_streaming polls (cap {cap}); a \
+                         non-resident chunk reads as Air, which silently removes buoyancy",
+                        self.frames,
+                        self.player.position
+                    );
+                    self.mgr.update_streaming(center);
+                    polls += 1;
+                    self.gate_polls += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.gate_worst_polls = self.gate_worst_polls.max(polls);
+            }
+
+            fn step(&mut self, input: &InputState, crossing_distance: i32) {
+                self.ensure_water_resident(GATE_POLL_CAP, crossing_distance);
+                // Production order (src/main.rs playing frame): physics first,
+                // then streaming around the player's new chunk.
+                self.player
+                    .update(DT, input, |x, y, z| self.mgr.get_block(x, y, z));
+                let (center, _) = world_to_chunk_and_local(
+                    self.player.position.x.floor() as i32,
+                    self.player.position.y.floor() as i32,
+                    self.player.position.z.floor() as i32,
+                );
+                self.mgr.update_streaming(center);
+                self.frames += 1;
+            }
+        }
+
+        let mut harness = Harness {
+            player: Player::new(glam::Vec3::new(
+                spawn_column_x as f32 + 0.5,
+                SEA_LEVEL as f32 + 3.0,
+                spawn_column_z as f32 + 0.5,
+            )),
+            mgr,
+            frames: 0,
+            gate_polls: 0,
+            gate_worst_polls: 0,
+        };
+        harness.player.fly_mode = false;
+        harness.player.yaw = if AXIS_STEP > 0 {
+            std::f32::consts::FRAC_PI_2
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        };
+        let (sin_yaw, cos_yaw) = harness.player.yaw.sin_cos();
+        assert!(
+            (sin_yaw - AXIS_STEP as f32).abs() < 1e-3 && cos_yaw.abs() < 1e-3,
+            "test_acceptance_swim_ocean_crossing stage 'setup': yaw fixture must put forward \
+             along {CROSSING_AXIS}, got sin(yaw)={sin_yaw} cos(yaw)={cos_yaw}"
+        );
+
+        // ---- 3. Phase 1: entry — fall from above into the water column ----
+        let idle_input = InputState::default();
+        let mut entry_frame = None;
+        for frame in 0..ENTRY_FRAME_CAP {
+            harness.step(&idle_input, crossing_distance);
+            if harness.feet_block() == BlockId::Water {
+                entry_frame = Some(frame);
+                break;
+            }
+            assert!(
+                harness.player.position.y > seabed_height as f32 + SEABED_MARGIN,
+                "test_acceptance_swim_ocean_crossing stage 'entry': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame budget \
+                 {ENTRY_FRAME_CAP}: fell to y={} at frame {frame} before the feet block became \
+                 Water (seabed h={seabed_height}, margin {SEABED_MARGIN})",
+                harness.player.position.y
+            );
+        }
+        let entry_frame = entry_frame.unwrap_or_else(|| {
+            panic!(
+                "test_acceptance_swim_ocean_crossing stage 'entry': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame budget \
+                 {ENTRY_FRAME_CAP}: the feet block never became Water (final position {:?})",
+                harness.player.position
+            )
+        });
+        assert!(
+            harness.player.position.y > SEA_LEVEL as f32 - 1.0,
+            "test_acceptance_swim_ocean_crossing stage 'entry': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: entered water at y={} on frame \
+             {entry_frame}, far below the surface (SEA_LEVEL {SEA_LEVEL}); the body fell through \
+             the surface instead of stopping in it",
+            harness.player.position.y
+        );
+
+        // ---- 4. Phase 2: float — settle in a band near the sea surface ----
+        let mut float_min_y = f32::MAX;
+        let mut float_max_y = f32::MIN;
+        let mut float_water_frames = 0usize;
+        for frame in 0..FLOAT_FRAMES {
+            harness.step(&idle_input, crossing_distance);
+            let y = harness.player.position.y;
+            float_min_y = float_min_y.min(y);
+            float_max_y = float_max_y.max(y);
+            if harness.feet_block() == BlockId::Water {
+                float_water_frames += 1;
+            }
+            assert!(
+                !harness.player.on_ground,
+                "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/{FLOAT_FRAMES} \
+                 (global frame {}): a floating body touched ground at y={y} (seabed \
+                 h={seabed_height}); the pre-swim bug walks the seabed",
+                harness.frames
+            );
+        }
+        assert!(
+            float_min_y > seabed_height as f32 + SEABED_MARGIN,
+            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks, {FLOAT_FRAMES}-frame budget: \
+             the body sank to y={float_min_y} (seabed h={seabed_height}, margin {SEABED_MARGIN}) \
+             instead of floating near the surface"
+        );
+        assert!(
+            float_min_y >= SEA_LEVEL as f32 - 1.5 && float_max_y <= SEA_LEVEL as f32 + 2.0,
+            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: band {float_min_y}..{float_max_y} \
+             is not near SEA_LEVEL {SEA_LEVEL} (expected within {}..{})",
+            SEA_LEVEL as f32 - 1.5,
+            SEA_LEVEL as f32 + 2.0
+        );
+        assert!(
+            float_max_y - float_min_y < 1.5,
+            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: band width {} is not a gentle \
+             float (oscillation or teleport)",
+            float_max_y - float_min_y
+        );
+        assert!(
+            float_water_frames > FLOAT_FRAMES / 4,
+            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: only {float_water_frames}/\
+             {FLOAT_FRAMES} frames had Water at the feet, so buoyancy was never engaged and the \
+             water column was not resident through the streaming seam"
+        );
+
+        // ---- 5. Phase 3: rise — jump_or_up climbs and clears the surface ----
+        let rise_input = InputState {
+            jump_or_up: true,
+            ..InputState::default()
+        };
+        let rise_start_y = harness.player.position.y;
+        let mut rise_max_y = rise_start_y;
+        let mut rise_submerged_frames = 0usize;
+        for frame in 0..RISE_FRAME_CAP {
+            harness.step(&rise_input, crossing_distance);
+            rise_max_y = rise_max_y.max(harness.player.position.y);
+            if harness.feet_block() == BlockId::Water {
+                rise_submerged_frames += 1;
+            }
+            assert!(
+                !harness.player.on_ground,
+                "test_acceptance_swim_ocean_crossing stage 'rise': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/\
+                 {RISE_FRAME_CAP}: a swimming body touched ground at y={}",
+                harness.player.position.y
+            );
+        }
+        assert!(
+            rise_submerged_frames > 0,
+            "test_acceptance_swim_ocean_crossing stage 'rise': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks, {RISE_FRAME_CAP}-frame budget: \
+             jump_or_up never acted on a submerged body ({rise_submerged_frames} submerged frames)"
+        );
+        let water_top = SEA_LEVEL as f32 + 1.0;
+        assert!(
+            rise_max_y > water_top,
+            "test_acceptance_swim_ocean_crossing stage 'rise': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks, frame budget \
+             {RISE_FRAME_CAP}: holding jump_or_up rose from y={rise_start_y} to only \
+             y={rise_max_y}, never clearing the top of the water column (y > {water_top})"
+        );
+        assert!(
+            rise_max_y > rise_start_y + 0.1,
+            "test_acceptance_swim_ocean_crossing stage 'rise': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: holding jump_or_up did not raise \
+             the body (start {rise_start_y}, max {rise_max_y})"
+        );
+
+        // ---- 6. Phase 4: crossing — forward to the far shore ----
+        let crossing_input = InputState {
+            forward: true,
+            ..InputState::default()
+        };
+        let gate_polls_before_crossing = harness.gate_polls;
+        let crossing_start_axis = harness.axis_position();
+        let mut crossing_min_y = f32::MAX;
+        let mut crossing_water_frames = 0usize;
+        let mut landed = None;
+        for frame in 0..CROSSING_FRAME_CAP {
+            harness.step(&crossing_input, crossing_distance);
+            crossing_min_y = crossing_min_y.min(harness.player.position.y);
+            if harness.feet_block() == BlockId::Water {
+                crossing_water_frames += 1;
+            }
+            assert!(
+                harness.player.position.y > seabed_height as f32 + SEABED_MARGIN,
+                "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/\
+                 {CROSSING_FRAME_CAP}: sank to y={} at axis position {:.1} (seabed \
+                 h={seabed_height}); the body walked the seabed instead of swimming",
+                harness.player.position.y,
+                harness.axis_position()
+            );
+            if harness.axis_position() >= far_shore_axis
+                && harness.player.on_ground
+                && harness.player.position.y > SEA_LEVEL as f32
+            {
+                landed = Some(frame);
+                break;
+            }
+        }
+        let landed = landed.unwrap_or_else(|| {
+            panic!(
+                "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame budget \
+                 {CROSSING_FRAME_CAP}: never reached the far shore at axis position \
+                 {far_shore_axis} standing on land above SEA_LEVEL {SEA_LEVEL} (final position \
+                 {:?}, on_ground {}, started at axis position {crossing_start_axis})",
+                harness.player.position, harness.player.on_ground
+            )
+        });
+        assert!(
+            crossing_water_frames > 500,
+            "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: only {crossing_water_frames}/\
+             {CROSSING_FRAME_CAP} frames had Water at the feet, so the body did not swim the ocean"
+        );
+        assert!(
+            crossing_min_y > seabed_height as f32 + SEABED_MARGIN,
+            "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: the body reached y={crossing_min_y} \
+             at its lowest (seabed h={seabed_height}, margin {SEABED_MARGIN})"
+        );
+        let support = harness.mgr.get_block(
+            harness.player.position.x.floor() as i32,
+            (harness.player.position.y - 1.0).floor() as i32,
+            harness.player.position.z.floor() as i32,
+        );
+        assert!(
+            support.is_solid(),
+            "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: finished on_ground at {:?} but \
+             the supporting block is {support:?}, not solid land",
+            harness.player.position
+        );
+        let crossing_gate_polls = harness.gate_polls - gate_polls_before_crossing;
+        assert!(
+            crossing_gate_polls > 0,
+            "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+             {CROSSING_AXIS}: the streaming gate never waited during the {crossing_distance}-block \
+             crossing, so streaming-ahead-of-the-player was not exercised"
+        );
+
+        eprintln!(
+            "test_acceptance_swim_ocean_crossing: seed={SEED} axis={CROSSING_AXIS} \
+             distance={crossing_distance} blocks frames={} (entry={entry_frame}, landed={landed}) \
+             float_band={float_min_y:.3}..{float_max_y:.3} float_water_frames={float_water_frames} \
+             rise={rise_start_y:.3}->{rise_max_y:.3} rise_submerged_frames={rise_submerged_frames} \
+             crossing_water_frames={crossing_water_frames} gate_polls={} (worst {} polls)",
+            harness.frames, harness.gate_polls, harness.gate_worst_polls
         );
     }
 
