@@ -538,6 +538,28 @@ fn drag_release_target(
     }
 }
 
+/// Whether a left panel press on `target` arms a press-drag-release gesture.
+///
+/// Only a pure pick-up arms a drag: the cursor must have been empty *before*
+/// the press (so the press lifted a stack) and occupied *after* it, and the
+/// command must have been an accepted `Moved`. A swap, place, partial merge, or
+/// craft result leaves a different stack on the cursor, so it ends the gesture
+/// — otherwise the release over another cell would issue a second, unintended
+/// whole-stack move (S04-T03). This is a one-armed-when rule only: the domain
+/// arithmetic in `apply_inventory_click` is untouched (MEM203).
+fn drag_origin_after_press(
+    cursor_empty_before: bool,
+    result: Result<InventoryClickOutcome, InventoryCommandError>,
+    cursor_occupied_after: bool,
+    target: InventoryTarget,
+) -> Option<InventoryTarget> {
+    if cursor_empty_before && cursor_occupied_after && result == Ok(InventoryClickOutcome::Moved) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
 fn on_off(value: bool) -> &'static str {
     if value {
         "On"
@@ -2574,6 +2596,11 @@ impl ApplicationHandler for GameApp {
                                 .cursor_pos
                                 .and_then(|cursor| hit_test(mode, &layout, cursor));
                             if let Some(target) = target {
+                                // Capture the pre-press cursor state: a drag may
+                                // only arm when this press picked a stack UP
+                                // from an empty cursor (S04-T03).
+                                let cursor_empty_before =
+                                    self.session.player.inventory().cursor().is_none();
                                 let result = apply_inventory_click(
                                     &mut self.session.player,
                                     &self.inventory,
@@ -2581,15 +2608,14 @@ impl ApplicationHandler for GameApp {
                                     target,
                                 );
                                 self.inventory_status = Some(inventory_status_text(result));
-                                // A pick-up press (cursor now holding a stack)
-                                // begins a drag; every other accepted click ends it.
-                                self.inventory_drag = if result == Ok(InventoryClickOutcome::Moved)
-                                    && self.session.player.inventory().cursor().is_some()
-                                {
-                                    Some(target)
-                                } else {
-                                    None
-                                };
+                                // Only a pure pick-up begins a drag; a swap,
+                                // place, merge, or craft ends it.
+                                self.inventory_drag = drag_origin_after_press(
+                                    cursor_empty_before,
+                                    result,
+                                    self.session.player.inventory().cursor().is_some(),
+                                    target,
+                                );
                             } else {
                                 // Empty panel space: no command, no drag origin.
                                 self.inventory_drag = None;
@@ -5617,6 +5643,132 @@ mod tests {
             Some(2),
             "the rejected drop leaves the stack on the cursor"
         );
+    }
+
+    #[test]
+    fn drag_arms_only_when_the_cursor_was_empty_before_the_press() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(38, dir.path().join("drag-arm.mcvx"));
+        // Two different block ids sit in slots 0 and 1, so a press on slot 1
+        // while holding slot 0's stack is a genuine swap (not a merge).
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Dirt);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+        assert_eq!(
+            session.player.inventory().hotbar(0).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Stone))
+        );
+        assert_eq!(
+            session.player.inventory().hotbar(1).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Dirt))
+        );
+        let total_before = inventory_units(&session.player);
+
+        // Gesture 1: a pure pick-up from an empty cursor DOES arm a drag.
+        let origin = InventoryTarget::Slot(0);
+        let cursor_empty_before = session.player.inventory().cursor().is_none();
+        assert!(cursor_empty_before, "the cursor starts empty");
+        let result = apply_inventory_click(&mut session.player, &screen, None, origin);
+        assert_eq!(result, Ok(InventoryClickOutcome::Moved));
+        assert_eq!(
+            drag_origin_after_press(
+                cursor_empty_before,
+                result,
+                session.player.inventory().cursor().is_some(),
+                origin,
+            ),
+            Some(origin),
+            "a pick-up press arms the drag"
+        );
+
+        // Swap path: pressing slot 1 while holding slot 0's stack swaps the
+        // two whole stacks. The command is `Moved` and the cursor is occupied
+        // afterwards, so the old rule armed a drag here; the S04-T03 rule must
+        // not, because the press did not pick anything UP.
+        let swapped = InventoryTarget::Slot(1);
+        let cursor_empty_before = session.player.inventory().cursor().is_none();
+        assert!(!cursor_empty_before, "the cursor still holds the stone");
+        let result = apply_inventory_click(&mut session.player, &screen, None, swapped);
+        assert_eq!(result, Ok(InventoryClickOutcome::Moved));
+        assert!(session.player.inventory().cursor().is_some());
+        let armed = drag_origin_after_press(
+            cursor_empty_before,
+            result,
+            session.player.inventory().cursor().is_some(),
+            swapped,
+        );
+        assert_eq!(armed, None, "a swap does not arm a drag");
+        assert_eq!(
+            session.player.inventory().hotbar(1).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Stone)),
+            "the swap really happened"
+        );
+
+        // The release over slot 2 therefore routes nowhere: no second move and
+        // no mutation of the release target.
+        let slot_two_before = session.player.inventory().hotbar(2);
+        let release_target = Some(InventoryTarget::Slot(2));
+        assert_eq!(drag_release_target(armed, release_target), None);
+        if let Some(destination) = drag_release_target(armed, release_target) {
+            apply_inventory_click(&mut session.player, &screen, None, destination)
+                .expect("the release would drop the stack");
+        }
+        assert_eq!(
+            session.player.inventory().hotbar(2),
+            slot_two_before,
+            "the unintended release leaves slot 2 untouched"
+        );
+        assert_eq!(
+            inventory_units(&session.player),
+            total_before,
+            "items stay conserved across the swap gesture"
+        );
+
+        // Positive control: place the held stack down first (a place is not a
+        // pick-up either), then a fresh empty-cursor pick-up arms a drag and a
+        // release on a different slot issues exactly one move.
+        let place = InventoryTarget::Slot(2);
+        let cursor_empty_before = session.player.inventory().cursor().is_none();
+        assert!(!cursor_empty_before);
+        let result = apply_inventory_click(&mut session.player, &screen, None, place);
+        assert_eq!(
+            drag_origin_after_press(
+                cursor_empty_before,
+                result,
+                session.player.inventory().cursor().is_some(),
+                place,
+            ),
+            None,
+            "a place does not arm a drag"
+        );
+        assert!(session.player.inventory().cursor().is_none());
+
+        let pick_up = InventoryTarget::Slot(1);
+        let cursor_empty_before = session.player.inventory().cursor().is_none();
+        assert!(cursor_empty_before);
+        let result = apply_inventory_click(&mut session.player, &screen, None, pick_up);
+        assert_eq!(result, Ok(InventoryClickOutcome::Moved));
+        let armed = drag_origin_after_press(
+            cursor_empty_before,
+            result,
+            session.player.inventory().cursor().is_some(),
+            pick_up,
+        );
+        assert_eq!(armed, Some(pick_up), "a pick-up press still arms a drag");
+        let destination = drag_release_target(armed, Some(InventoryTarget::Slot(3)))
+            .expect("a different slot receives the drop");
+        let outcome = apply_inventory_click(&mut session.player, &screen, None, destination)
+            .expect("drop the whole stack");
+        assert_eq!(outcome, InventoryClickOutcome::Moved);
+        assert_eq!(
+            session.player.inventory().hotbar(3).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Stone)),
+            "the drag moved the stack exactly once"
+        );
+        assert!(session.player.inventory().hotbar(1).is_none());
+        assert!(session.player.inventory().cursor().is_none());
+        assert_eq!(inventory_units(&session.player), total_before);
     }
 
     // -----------------------------------------------------------------------
