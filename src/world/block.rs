@@ -300,7 +300,11 @@ mod tests {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected_solid = !matches!(block, BlockId::Air | BlockId::Water);
             assert_eq!(block.is_solid(), expected_solid, "{block:?} solidity");
-            assert_eq!(block.is_liquid(), block == BlockId::Water, "{block:?} liquid");
+            assert_eq!(
+                block.is_liquid(),
+                block == BlockId::Water,
+                "{block:?} liquid"
+            );
             if block.is_liquid() {
                 assert!(!block.is_solid(), "a liquid cannot also be solid");
             }
@@ -320,7 +324,10 @@ mod tests {
         assert_eq!(BlockId::Water.mined_drop(), BlockId::Water);
         for face_dir in 0u8..6 {
             let layer = BlockId::Water.face_tex_layer(face_dir);
-            assert!(layer <= 15, "water layer {layer} must index the 16-layer array");
+            assert!(
+                layer <= 15,
+                "water layer {layer} must index the 16-layer array"
+            );
         }
         assert!(!BlockId::Water.is_table_interactable());
     }

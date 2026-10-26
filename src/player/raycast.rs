@@ -135,4 +135,50 @@ mod tests {
         assert_eq!(hit.adjacent_pos, glam::IVec3::new(2, 4, 2));
         assert_eq!(hit.normal, glam::IVec3::new(0, 1, 0));
     }
+
+    /// Water is passable, so the reach raycast must travel through it and stop
+    /// on the first solid block underneath (the seabed), never treating the
+    /// liquid as a target. This is the raycast site of the S03 water mobility
+    /// matrix: water is passable-not-walkable here because `is_solid()` is the
+    /// only hit predicate and `BlockId::Water` is not solid.
+    #[test]
+    fn raycast_skips_water_and_hits_the_stone_seabed() {
+        // Stone seabed at y == 0, an 10-block water column above it (1..=10),
+        // open air above the surface.
+        let world = |_x: i32, y: i32, _z: i32| {
+            if y == 0 {
+                BlockId::Stone
+            } else if (1..=10).contains(&y) {
+                BlockId::Water
+            } else {
+                BlockId::Air
+            }
+        };
+
+        // Straight down from above the surface: water cells are skipped and the
+        // hit is the seabed, with the entry face at the water block above it.
+        let hit = raycast_voxels(
+            glam::Vec3::new(2.5, 20.2, 2.5),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+            30.0,
+            world,
+        )
+        .expect("the ray must reach the seabed through the water column");
+        assert_eq!(hit.block_pos, glam::IVec3::new(2, 0, 2));
+        assert_eq!(hit.adjacent_pos, glam::IVec3::new(2, 1, 2));
+        assert_eq!(hit.normal, glam::IVec3::new(0, 1, 0));
+
+        // A short ray that ends inside the water column finds nothing: water is
+        // never a raycast target even when it is the only block in range.
+        let short = raycast_voxels(
+            glam::Vec3::new(2.5, 20.2, 2.5),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+            8.0,
+            world,
+        );
+        assert!(
+            short.is_none(),
+            "a ray ending in the water must not hit the liquid, got {short:?}"
+        );
+    }
 }

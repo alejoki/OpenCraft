@@ -4215,13 +4215,7 @@ mod tests {
         let path_str = fresh_path.to_str().expect("utf8 path");
 
         // Fresh branch: the CLI seam overrides the default season length.
-        let cli = CliConfig::parse_args([
-            "--new",
-            "--save",
-            path_str,
-            "--season-length",
-            "4",
-        ]);
+        let cli = CliConfig::parse_args(["--new", "--save", path_str, "--season-length", "4"]);
         let session = startup_session(&cli);
         assert_eq!(session.season_length_days, 4);
         assert_eq!(session.clock.day_index, 0, "fresh worlds start on day 0");
@@ -4238,8 +4232,7 @@ mod tests {
         data.day_index = 3;
         data.season_length_days = 8;
         save_world_to_path(&fresh_path, &data).expect("write calendar save");
-        let load_cli =
-            CliConfig::parse_args(["--save", path_str, "--season-length", "2"]);
+        let load_cli = CliConfig::parse_args(["--save", path_str, "--season-length", "2"]);
         let loaded = startup_session(&load_cli);
         assert_eq!(loaded.clock.day_index, 3, "persisted day index wins");
         assert_eq!(

@@ -1777,4 +1777,89 @@ mod tests {
         );
         assert!(swimmer.velocity.y > 0.0);
     }
+
+    /// Physics site of the S03 water mobility matrix: water is passable (no
+    /// collision stop) but not walkable (no standing on the surface, no walking
+    /// the seabed).
+    ///
+    /// The four `is_solid` consumer sites and their named proof:
+    /// 1. Physics collision (`collides_with_world` in this module) — asserted here.
+    /// 2. Voxel raycast (`src/player/raycast.rs`) —
+    ///    `raycast_skips_water_and_hits_the_stone_seabed`.
+    /// 3. Greedy mesh (`src/mesh/greedy.rs`, `water_quads`) — already pinned by
+    ///    `water_only_padded_chunk_emits_water_quads_and_no_opaque_quads` and
+    ///    `water_does_not_cull_stone_faces`, cited rather than duplicated.
+    /// 4. Sky light (`src/world/light.rs`) —
+    ///    `water_column_is_sky_lit_like_air_and_never_occludes_like_a_solid_roof`.
+    ///
+    /// The `BlockId` solid/liquid matrix itself is pinned by
+    /// `test_solid_and_liquid_matrix_over_every_block_id` in `src/world/block.rs`.
+    ///
+    /// Honesty note: no fall-damage or health claim is made anywhere in S03. No
+    /// health/fall/damage system exists in `src/` (grep-verified during
+    /// research); fall damage and drowning are deferred to M008 (MEM227). Swim
+    /// assertions cover mechanics only (positions, buoyancy, `on_ground`).
+    #[test]
+    fn water_is_passable_but_never_walkable_at_the_physics_consumer() {
+        assert!(!BlockId::Water.is_solid(), "water must stay passable");
+        assert!(
+            BlockId::Water.is_liquid(),
+            "water is the liquid block this matrix is about"
+        );
+
+        // Passable: a walk-mode player moves horizontally through the water
+        // column at the reduced swim speed with no collision stop. `update`
+        // resolves X/Z against `collides_with_world`, which only sees solid
+        // blocks, so the water cells cannot block the body.
+        let mut swimmer = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        swimmer.fly_mode = false;
+        swimmer.yaw = 0.0;
+        let forward = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        let start_x = swimmer.position.x;
+        for _ in 0..60 {
+            swimmer.update(1.0 / 60.0, &forward, water_column);
+        }
+        assert!(
+            swimmer.position.x > start_x + 2.0,
+            "water must not stop horizontal movement: x {} -> {}",
+            start_x,
+            swimmer.position.x
+        );
+        assert!(
+            swimmer.position.x < start_x + 4.6,
+            "swimming must stay slower than the 4.6 m/s land walk: x {} -> {}",
+            start_x,
+            swimmer.position.x
+        );
+
+        // Not walkable: released exactly at the surface with no input, buoyancy
+        // keeps the body floating in the surface band; it never stands on the
+        // liquid and never settles onto the seabed (the pre-S03 failure: gravity
+        // walked the body down through the passable water and onto the seabed).
+        let mut floater = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32, 0.5));
+        floater.fly_mode = false;
+        let idle = InputState::default();
+        let mut lowest = floater.position.y;
+        for _ in 0..600 {
+            floater.update(1.0 / 60.0, &idle, water_column);
+            lowest = lowest.min(floater.position.y);
+            assert!(
+                !floater.on_ground,
+                "water is not walkable: on_ground became true at y={}",
+                floater.position.y
+            );
+        }
+        assert!(
+            lowest > 1.0,
+            "buoyancy must keep the body off the seabed (lowest y {lowest})"
+        );
+        assert!(
+            (floater.position.y - TEST_SEA_LEVEL as f32).abs() < 0.5,
+            "the body must float in the surface band around y={TEST_SEA_LEVEL}, got {}",
+            floater.position.y
+        );
+    }
 }

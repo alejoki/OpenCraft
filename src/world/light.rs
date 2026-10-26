@@ -7,9 +7,10 @@
 //! manager owns when it runs, where the grids live, and how they reach the
 //! mesher.
 //!
-//! S01 opacity rule: every non-air `BlockId` is opaque (`BlockId::is_solid`).
-//! There is no water or glass yet; when transparency lands in a later
-//! milestone this is the single place that needs an opacity predicate.
+//! S01 opacity rule: a block is opaque exactly when `BlockId::is_solid()`; Water
+//! and Air are transparent, so a water column never stops the sky shaft. (A
+//! dedicated water/glass opacity predicate was not needed: the solid/liquid
+//! split already lives in `BlockId`.)
 
 use std::collections::VecDeque;
 
@@ -422,6 +423,63 @@ mod tests {
         assert_eq!(full.get(31, 31, 31), MAX_SKY_LIGHT);
         assert!(grids_differ(&full, &LightGrid::new()));
         assert_eq!(full, full_light_grid());
+    }
+
+    /// Sky-light site of the S03 water mobility matrix: `compute_region_light`
+    /// treats a non-solid block as transparent, so a Water column must stay
+    /// fully sky lit instead of occluding like a solid roof. Water is
+    /// passable-not-walkable here because `BlockId::is_solid()` (the opacity
+    /// predicate used by this module) excludes Water.
+    #[test]
+    fn water_column_is_sky_lit_like_air_and_never_occludes_like_a_solid_roof() {
+        // Air control: seabed at y <= 0, open sky above.
+        let air_control = world(|_, y, _| y <= 0);
+
+        // Water column: Stone seabed at y <= 0, Water at 1..=10, Air above the
+        // surface at y == 11.
+        let water_column = |_x: i32, y: i32, _z: i32| {
+            if y <= 0 {
+                BlockId::Stone
+            } else if (1..=10).contains(&y) {
+                BlockId::Water
+            } else {
+                BlockId::Air
+            }
+        };
+
+        let air_grids = compute_region_light(&air_control, 0, 0, 0, 0);
+        let water_grids = compute_region_light(water_column, 0, 0, 0, 0);
+        let air = chunk_grid(&air_grids, 0, 0, 0);
+        let water = chunk_grid(&water_grids, 0, 0, 0);
+
+        // Every water cell keeps the full open-sky light: the vertical shaft is
+        // not stopped at the water surface, and nothing dims laterally.
+        for y in 1..=10 {
+            assert_eq!(
+                water.get(5, y, 5),
+                MAX_SKY_LIGHT,
+                "water at y={y} must be fully sky lit"
+            );
+            assert_eq!(
+                water.get(5, y, 5),
+                air.get(5, y, 5),
+                "water must not dim sky light relative to air at y={y}"
+            );
+        }
+
+        // Negative control: a Stone roof at the same top level DOES occlude, so
+        // the assertion above is discriminating rather than an artifact of an
+        // all-open test world.
+        let stone_roof = world(|_, y, _| y <= 0 || y == 11);
+        let roof_grids = compute_region_light(&stone_roof, 0, 0, 0, 0);
+        let roof = chunk_grid(&roof_grids, 0, 0, 0);
+        assert_eq!(roof.get(5, 11, 5), 0, "a solid roof stops the sky shaft");
+        assert_eq!(roof.get(5, 10, 5), 0, "cells below a solid roof are dark");
+        assert_eq!(
+            water.get(5, 10, 5),
+            MAX_SKY_LIGHT,
+            "water at the same level stays lit"
+        );
     }
 
     #[test]

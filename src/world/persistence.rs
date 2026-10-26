@@ -845,7 +845,10 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_path);
 
         assert_eq!(loaded.seed, 424242);
-        assert_eq!(loaded.day_index, 3, "day index survives the file round-trip");
+        assert_eq!(
+            loaded.day_index, 3,
+            "day index survives the file round-trip"
+        );
         assert_eq!(
             loaded.season_length_days, 2,
             "season length survives the file round-trip"

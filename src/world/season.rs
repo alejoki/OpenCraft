@@ -226,10 +226,22 @@ mod tests {
         assert_eq!(FIRST_WINTER_DAY, 3);
         assert_eq!(DAYS_PER_YEAR, 4);
 
-        assert_eq!(season_of(FIRST_SPRING_DAY, 1, SPRING_START_SEED), Season::Spring);
-        assert_eq!(season_of(FIRST_SUMMER_DAY, 1, SPRING_START_SEED), Season::Summer);
-        assert_eq!(season_of(FIRST_AUTUMN_DAY, 1, SPRING_START_SEED), Season::Autumn);
-        assert_eq!(season_of(FIRST_WINTER_DAY, 1, SPRING_START_SEED), Season::Winter);
+        assert_eq!(
+            season_of(FIRST_SPRING_DAY, 1, SPRING_START_SEED),
+            Season::Spring
+        );
+        assert_eq!(
+            season_of(FIRST_SUMMER_DAY, 1, SPRING_START_SEED),
+            Season::Summer
+        );
+        assert_eq!(
+            season_of(FIRST_AUTUMN_DAY, 1, SPRING_START_SEED),
+            Season::Autumn
+        );
+        assert_eq!(
+            season_of(FIRST_WINTER_DAY, 1, SPRING_START_SEED),
+            Season::Winter
+        );
         assert_eq!(
             season_of(DAYS_PER_YEAR, 1, SPRING_START_SEED),
             Season::Spring,
