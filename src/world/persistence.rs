@@ -12,10 +12,11 @@ use crate::player::inventory::{
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
 use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
+use crate::world::season::{DEFAULT_SEASON_LENGTH_DAYS, MAX_SEASON_LENGTH_DAYS};
 
 pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 4;
+pub const SAVE_VERSION: u32 = 5;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
@@ -23,6 +24,10 @@ pub const TIME_OF_DAY_VERSION: u32 = 3;
 /// First save version that carries the inventory extension after the chunk
 /// section (full 9 + 27 slots, cursor, and unfinished crafting grids).
 pub const INVENTORY_EXTENSION_VERSION: u32 = 4;
+/// First save version that carries the world calendar after the inventory
+/// extension: `day_index` then `season_length_days`, both `u32` LE. Older
+/// saves migrate to day 0 and [`DEFAULT_SEASON_LENGTH_DAYS`].
+pub const SEASON_VERSION: u32 = 5;
 
 // Stable wire discriminants for the version-4 inventory extension. These are
 // part of the on-disk format; changing the in-memory enum order without
@@ -160,6 +165,14 @@ pub struct WorldSaveData {
     /// clock. World state, so it sits next to `seed` rather than in
     /// `player`.
     pub time_of_day: u32,
+    /// Whole game days elapsed since world creation, counted at the dawn
+    /// boundary by [`crate::world::daycycle::GameClock`]. World state, so it
+    /// sits next to `time_of_day`.
+    pub day_index: u32,
+    /// Length of one season in game days; drives the pure
+    /// [`crate::world::season`] calendar. World state, so it sits next to
+    /// `day_index`.
+    pub season_length_days: u32,
     pub player: SavedPlayerState,
     pub chunk_edits: ChunkEditMap,
 }
@@ -324,6 +337,19 @@ pub fn save_world_to_bytes(
         &data.player.inventory,
         &data.player.player_grid,
         &data.player.table_grid,
+    );
+
+    // v5 world calendar tail: `day_index` then `season_length_days`, both
+    // `u32` LE, immediately after the v4 extension. The season length is
+    // normalised the same way the loader clamps it, so a save/load round-trip
+    // is byte-stable for every in-memory value (0 and absurd lengths become
+    // the default) instead of silently changing on the next load.
+    out.extend_from_slice(&data.day_index.to_le_bytes());
+    out.extend_from_slice(
+        &data
+            .season_length_days
+            .clamp(1, MAX_SEASON_LENGTH_DAYS)
+            .to_le_bytes(),
     );
 
     Ok(())
@@ -555,14 +581,11 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
     }
 
     // v4 appends the validated inventory aggregate after every v3-known
-    // field. Missing bytes are a truncated record; extra bytes mean the
-    // payload does not match the declared version.
+    // field. v5 then appends the world calendar tail (day_index +
+    // season_length_days). Missing bytes are a truncated record; extra bytes
+    // mean the payload does not match the declared version.
     let (inventory, player_grid, table_grid) = if version >= INVENTORY_EXTENSION_VERSION {
-        let extension = read_inventory_extension(&mut cur)?;
-        if cur.position() != bytes.len() as u64 {
-            return Err(PersistenceError::InvalidPlayerState);
-        }
-        extension
+        read_inventory_extension(&mut cur)?
     } else {
         // v1-v3 stored only the hotbar. Migrate it losslessly into the same
         // nine hotbar slots and leave all new state empty/default.
@@ -573,9 +596,36 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         )
     };
 
+    // v1-v4 predate the calendar and migrate to day 0 with the default
+    // season length. A v5 season length of 0 or beyond the sane upper bound
+    // is a corrupt scalar: clamp it to the default rather than bricking the
+    // save, mirroring the time_of_day clamp precedent. Fail-closed strictness
+    // stays with the exact-length check below.
+    let (day_index, season_length_days) = if version >= SEASON_VERSION {
+        let day_index = read_u32(&mut cur)?;
+        let raw_length = read_u32(&mut cur)?;
+        let season_length_days = if (1..=MAX_SEASON_LENGTH_DAYS).contains(&raw_length) {
+            raw_length
+        } else {
+            DEFAULT_SEASON_LENGTH_DAYS
+        };
+        (day_index, season_length_days)
+    } else {
+        (0, DEFAULT_SEASON_LENGTH_DAYS)
+    };
+
+    // Exact-length check AFTER the newest known tail so v5 saves load while
+    // trailing bytes still fail closed. v1-v3 never had the check (their
+    // payload is the whole file by construction).
+    if version >= INVENTORY_EXTENSION_VERSION && cur.position() != bytes.len() as u64 {
+        return Err(PersistenceError::InvalidPlayerState);
+    }
+
     Ok(WorldSaveData {
         seed,
         time_of_day,
+        day_index,
+        season_length_days,
         player: SavedPlayerState {
             position: [px, py, pz],
             yaw,
@@ -749,6 +799,8 @@ mod tests {
         let data = WorldSaveData {
             seed: 424242,
             time_of_day: 4321,
+            day_index: 3,
+            season_length_days: 2,
             player: SavedPlayerState {
                 position: [-12.5, 64.25, 108.0],
                 yaw: 1.25,
@@ -769,6 +821,11 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_path);
 
         assert_eq!(loaded.seed, 424242);
+        assert_eq!(loaded.day_index, 3, "day index survives the file round-trip");
+        assert_eq!(
+            loaded.season_length_days, 2,
+            "season length survives the file round-trip"
+        );
         assert_eq!(loaded.player, data.player);
         assert_eq!(loaded.chunk_edits.len(), 1);
         assert_eq!(
@@ -790,6 +847,8 @@ mod tests {
         let data = WorldSaveData {
             seed: 1337,
             time_of_day: 12345,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [1.0, 2.0, 3.0],
                 yaw: 0.0,
@@ -804,7 +863,8 @@ mod tests {
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, INVENTORY_EXTENSION_VERSION);
+        assert_eq!(SAVE_VERSION, SEASON_VERSION);
+        assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -833,6 +893,8 @@ mod tests {
         let data = WorldSaveData {
             seed: 1,
             time_of_day: DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [0.0, 50.0, 0.0],
                 yaw: 0.0,
@@ -951,6 +1013,8 @@ mod tests {
         WorldSaveData {
             seed: 2024,
             time_of_day: DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player,
             chunk_edits: ChunkEditMap::default(),
         }
@@ -970,7 +1034,10 @@ mod tests {
         // then the v4 inventory extension. The sample has four block hotbar
         // slots, each expanding its 1-byte empty record to a 4-byte block
         // record (+3 bytes each).
-        assert_eq!(bytes.len(), V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + 4 * 3);
+        assert_eq!(
+            bytes.len(),
+            V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + V5_SEASON_LEN + 4 * 3
+        );
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
 
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -1042,6 +1109,11 @@ mod tests {
             loaded.time_of_day, DEFAULT_TIME_OF_DAY,
             "v1 predates game time and migrates to noon"
         );
+        assert_eq!(loaded.day_index, 0, "v1 predates the calendar");
+        assert_eq!(
+            loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
+            "v1 predates season lengths"
+        );
         assert_eq!(loaded.player.position, [-4.5, 70.25, 9.0]);
         assert_eq!(loaded.player.yaw, 1.5);
         assert_eq!(loaded.player.pitch, -0.25);
@@ -1071,6 +1143,11 @@ mod tests {
     /// Extension size for an empty inventory: 36 slot records + cursor +
     /// player grid (kind + 4 cells) + table grid (kind + 16 cells).
     const V4_EXTENSION_LEN: usize = INVENTORY_SLOTS + 1 + (1 + 4) + (1 + 16);
+    /// Byte offset of the v5 calendar tail with no chunk edits: right after
+    /// the v4 extension ends (71 + 59 = 130).
+    const V5_SEASON_OFFSET: usize = V4_EXTENSION_OFFSET + V4_EXTENSION_LEN;
+    /// Calendar tail size: `day_index` u32 + `season_length_days` u32.
+    const V5_SEASON_LEN: usize = 8;
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -1144,6 +1221,11 @@ mod tests {
             loaded.time_of_day, DEFAULT_TIME_OF_DAY,
             "v2 predates game time and migrates to noon"
         );
+        assert_eq!(loaded.day_index, 0, "v2 predates the calendar");
+        assert_eq!(
+            loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
+            "v2 predates season lengths"
+        );
     }
 
     #[test]
@@ -1153,6 +1235,11 @@ mod tests {
         let loaded = load_world_from_bytes(&bytes).expect("v3 must migrate, not fail");
 
         assert_eq!(loaded.time_of_day, 4321);
+        assert_eq!(loaded.day_index, 0, "v3 predates the calendar");
+        assert_eq!(
+            loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
+            "v3 predates season lengths"
+        );
         for slot in 0..HOTBAR_SLOTS {
             assert_eq!(
                 loaded
@@ -1276,7 +1363,7 @@ mod tests {
         future[4..8].copy_from_slice(&(SAVE_VERSION + 1).to_le_bytes());
         assert!(matches!(
             load_world_from_bytes(&future),
-            Err(PersistenceError::UnsupportedVersion(5))
+            Err(PersistenceError::UnsupportedVersion(version)) if version == SAVE_VERSION + 1
         ));
     }
 
@@ -1408,8 +1495,84 @@ mod tests {
         ));
     }
 
+    /// Build a byte-valid v4 save: the current writer's payload with the
+    /// version field patched back to 4 and the v5 calendar tail removed.
+    fn v4_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, data).unwrap();
+        bytes.truncate(bytes.len() - V5_SEASON_LEN);
+        bytes[4..8].copy_from_slice(&INVENTORY_EXTENSION_VERSION.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn test_v5_roundtrips_day_index_and_season_length() {
+        // Pin the absolute layout the smoke script reads: the tail starts
+        // immediately after the fixed v4 extension.
+        assert_eq!(V5_SEASON_OFFSET, 130);
+        assert_eq!(V5_SEASON_LEN, 8);
+
+        let mut data = sample_data(sample_player());
+        data.day_index = 17;
+        data.season_length_days = 4;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+
+        assert_eq!(
+            &bytes[V5_SEASON_OFFSET..V5_SEASON_OFFSET + 4],
+            &17u32.to_le_bytes(),
+            "day_index sits immediately after the v4 extension"
+        );
+        assert_eq!(
+            &bytes[V5_SEASON_OFFSET + 4..V5_SEASON_OFFSET + V5_SEASON_LEN],
+            &4u32.to_le_bytes(),
+            "season_length_days follows day_index"
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+        assert_eq!(loaded.day_index, 17);
+        assert_eq!(loaded.season_length_days, 4);
+        assert_eq!(loaded, data);
+
+        // Unbounded day index: u32::MAX is a valid scalar, not corruption.
+        let mut extreme = sample_data(sample_player());
+        extreme.day_index = u32::MAX;
+        let mut extreme_bytes = Vec::new();
+        save_world_to_bytes(&mut extreme_bytes, &extreme).unwrap();
+        let loaded = load_world_from_bytes(&extreme_bytes).expect("day index must be unbounded");
+        assert_eq!(loaded.day_index, u32::MAX);
+    }
+
+    #[test]
+    fn test_v4_save_migrates_to_day_zero_and_default_season_length() {
+        let mut data = sample_data(sample_player());
+        data.day_index = 99;
+        data.season_length_days = 8;
+        let bytes = v4_bytes_from_current(&data);
+
+        let loaded = load_world_from_bytes(&bytes).expect("v4 must migrate, not fail");
+        assert_eq!(
+            loaded.day_index, 0,
+            "v4 predates the calendar and migrates to day 0"
+        );
+        assert_eq!(
+            loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
+            "v4 predates season lengths and migrates to the default"
+        );
+    }
+
     #[test]
     fn test_v4_rejects_trailing_bytes() {
+        let mut bytes = v4_bytes_from_current(&sample_data(sample_player()));
+        bytes.push(0);
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidPlayerState)
+        ));
+    }
+
+    #[test]
+    fn test_v5_rejects_trailing_bytes() {
         let data = sample_data(sample_player());
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).unwrap();
@@ -1418,6 +1581,51 @@ mod tests {
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
         ));
+    }
+
+    #[test]
+    fn test_v5_truncated_calendar_tail_is_typed_io_error() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+
+        // Drop the final season-length byte entirely.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+
+        // Drop the whole season-length field but keep day_index.
+        let truncated = &bytes[..V5_SEASON_OFFSET + 4];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_v5_out_of_range_season_length_clamps_to_default() {
+        for garbage in [0u32, MAX_SEASON_LENGTH_DAYS + 1, u32::MAX] {
+            let data = sample_data(sample_player());
+            let mut bytes = Vec::new();
+            save_world_to_bytes(&mut bytes, &data).unwrap();
+            bytes[V5_SEASON_OFFSET + 4..V5_SEASON_OFFSET + V5_SEASON_LEN]
+                .copy_from_slice(&garbage.to_le_bytes());
+            let loaded = load_world_from_bytes(&bytes).expect("clamp, not error");
+            assert_eq!(
+                loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
+                "garbage season length {garbage} must clamp to the default"
+            );
+        }
+
+        // The writer normalises the same way, keeping round-trips byte-stable.
+        let mut data = sample_data(sample_player());
+        data.season_length_days = 0;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+        assert_eq!(loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS);
     }
 
     fn v4_bytes_with_slot0(item: Item) -> Vec<u8> {

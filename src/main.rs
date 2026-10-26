@@ -62,6 +62,7 @@ use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
+use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -189,6 +190,8 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
     let data = WorldSaveData {
         seed: session.world.seed(),
         time_of_day: session.clock.time_of_day,
+        day_index: session.clock.day_index,
+        season_length_days: session.season_length_days,
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -741,7 +744,9 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
         }
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
-    WorldSession::new_session(seed, cli.save_path.clone())
+    // Fresh worlds start at the default season length; the New Game row and
+    // the `--season-length` CLI seam override it on this branch only.
+    WorldSession::new_session(seed, cli.save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS)
 }
 
 /// Apply a S01-confirmed pending delete through the live catalog and
@@ -1932,7 +1937,8 @@ impl GameApp {
                 return;
             }
         };
-        let session = WorldSession::new_session(seed, save_path);
+        // The New Game row owns the season length (S02-T04).
+        let session = WorldSession::new_session(seed, save_path, DEFAULT_SEASON_LENGTH_DAYS);
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
         if let Ok(LifecycleDecision::StartNewGame) = self
@@ -3878,7 +3884,7 @@ mod tests {
         ])));
         let scaled = GameApp::new(
             CliConfig::parse_args(["--time-scale", "60"]),
-            WorldSession::new_session(9, PathBuf::from("unused.mcvx")),
+            WorldSession::new_session(9, PathBuf::from("unused.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
         );
         assert_eq!(scaled.lifecycle.screen(), LifecycleScreen::MainMenu);
         assert_eq!(
@@ -3907,7 +3913,10 @@ mod tests {
         let save_path = dir.join(name);
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
-        let app = GameApp::new(cli, WorldSession::new_session(11, save_path));
+        let app = GameApp::new(
+            cli,
+            WorldSession::new_session(11, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+        );
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         app
     }
@@ -4140,7 +4149,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
@@ -4631,7 +4644,8 @@ mod tests {
     #[test]
     fn mining_collects_broken_blocks_into_the_hotbar() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(7, dir.path().join("mined.mcvx"));
+        let mut session =
+            WorldSession::new_session(7, dir.path().join("mined.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
         let (first, wear) = applied_break(break_mined_block(
@@ -4671,7 +4685,8 @@ mod tests {
     #[test]
     fn mining_collects_the_pre_break_block_not_the_now_air_cell() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
+        let mut session =
+            WorldSession::new_session(8, dir.path().join("ore.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         session
             .world
@@ -4697,7 +4712,11 @@ mod tests {
     #[test]
     fn mining_an_unloaded_chunk_collects_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(9, dir.path().join("missing.mcvx"));
+        let mut session = WorldSession::new_session(
+            9,
+            dir.path().join("missing.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
 
         let outcome = break_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
 
@@ -4716,7 +4735,8 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(11, dir.path().join("loop.mcvx"));
+        let mut session =
+            WorldSession::new_session(11, dir.path().join("loop.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(0.5, 10.0, 0.5);
@@ -4876,7 +4896,11 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        let mut session = WorldSession::new_session(
+            12,
+            dir.path().join("reject.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
         let mut slots = [None; INVENTORY_SLOTS];
@@ -4940,7 +4964,11 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(13, dir.path().join("last-use.mcvx"));
+        let mut session = WorldSession::new_session(
+            13,
+            dir.path().join("last-use.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -4995,7 +5023,8 @@ mod tests {
     fn hotbar_stacks_survive_save_and_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("stacks.mcvx");
-        let mut session = WorldSession::new_session(4242, save_path.clone());
+        let mut session =
+            WorldSession::new_session(4242, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         session.player.collect_block(BlockId::CoalOre);
         session.player.collect_block(BlockId::IronOre);
         assert!(session.player.select_slot(1));
@@ -5024,7 +5053,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("full.mcvx");
-        let mut session = WorldSession::new_session(909, save_path.clone());
+        let mut session =
+            WorldSession::new_session(909, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
 
         let mut slots = [None; INVENTORY_SLOTS];
         slots[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"));
@@ -5095,7 +5125,11 @@ mod tests {
     #[test]
     fn placing_the_selected_stack_consumes_exactly_one_item() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(10, dir.path().join("place.mcvx"));
+        let mut session = WorldSession::new_session(
+            10,
+            dir.path().join("place.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
@@ -5120,7 +5154,11 @@ mod tests {
     #[test]
     fn placement_rejects_empty_slots_and_player_overlap_without_consuming() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        let mut session = WorldSession::new_session(
+            12,
+            dir.path().join("reject.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
@@ -5174,7 +5212,11 @@ mod tests {
     #[test]
     fn right_click_on_a_placed_table_opens_without_placing_or_consuming() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(20, dir.path().join("table.mcvx"));
+        let mut session = WorldSession::new_session(
+            20,
+            dir.path().join("table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5213,7 +5255,11 @@ mod tests {
     #[test]
     fn right_click_on_a_table_opens_even_with_an_empty_selected_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(21, dir.path().join("table-empty.mcvx"));
+        let mut session = WorldSession::new_session(
+            21,
+            dir.path().join("table-empty.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5234,7 +5280,11 @@ mod tests {
     #[test]
     fn right_click_on_a_non_table_falls_through_to_placement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(22, dir.path().join("fallback.mcvx"));
+        let mut session = WorldSession::new_session(
+            22,
+            dir.path().join("fallback.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5267,7 +5317,11 @@ mod tests {
     #[test]
     fn right_click_on_air_opens_and_places_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(23, dir.path().join("air-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            23,
+            dir.path().join("air-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
         session.player.collect_block(BlockId::Stone);
@@ -5291,7 +5345,11 @@ mod tests {
     #[test]
     fn right_click_placement_fallback_with_an_empty_slot_mutates_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(24, dir.path().join("empty-slot.mcvx"));
+        let mut session = WorldSession::new_session(
+            24,
+            dir.path().join("empty-slot.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5312,7 +5370,11 @@ mod tests {
     #[test]
     fn a_replaced_table_closes_the_open_state_and_falls_through_to_placement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(25, dir.path().join("replaced.mcvx"));
+        let mut session = WorldSession::new_session(
+            25,
+            dir.path().join("replaced.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5346,7 +5408,11 @@ mod tests {
     #[test]
     fn a_placed_crafting_table_can_then_be_targeted_and_opened() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(26, dir.path().join("place-then-open.mcvx"));
+        let mut session = WorldSession::new_session(
+            26,
+            dir.path().join("place-then-open.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5436,7 +5502,11 @@ mod tests {
     #[test]
     fn a_targeted_table_click_opens_table_mode_and_is_cleared_on_close() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(31, dir.path().join("ui-table.mcvx"));
+        let mut session = WorldSession::new_session(
+            31,
+            dir.path().join("ui-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5470,7 +5540,11 @@ mod tests {
     #[test]
     fn table_targets_are_rejected_without_a_live_table() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(32, dir.path().join("stale-table.mcvx"));
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("stale-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
         // Attached, but the session has no live table: mode falls back to Player.
@@ -5499,7 +5573,11 @@ mod tests {
     #[test]
     fn apply_inventory_click_moves_a_slot_stack_without_touching_world_or_selection() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(33, dir.path().join("slot-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("slot-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
@@ -5525,7 +5603,11 @@ mod tests {
     #[test]
     fn apply_inventory_right_click_splits_a_stack_and_places_one_in_the_grid() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(35, dir.path().join("right-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            35,
+            dir.path().join("right-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         for _ in 0..5 {
             session.player.collect_block(BlockId::OakPlanks);
         }
@@ -5590,7 +5672,11 @@ mod tests {
     #[test]
     fn apply_inventory_click_crafts_once_and_the_second_click_is_no_recipe() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(34, dir.path().join("craft-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            34,
+            dir.path().join("craft-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::OakLog);
         let mut screen = InventoryScreen::new();
         screen.open_player();
@@ -5707,7 +5793,11 @@ mod tests {
     #[test]
     fn a_press_release_on_the_same_slot_leaves_the_stack_on_the_cursor() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(35, dir.path().join("same-cell.mcvx"));
+        let mut session = WorldSession::new_session(
+            35,
+            dir.path().join("same-cell.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
         screen.open_player();
@@ -5727,7 +5817,8 @@ mod tests {
     #[test]
     fn a_press_drag_release_between_slots_moves_and_conserves_the_whole_stack() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(36, dir.path().join("drag.mcvx"));
+        let mut session =
+            WorldSession::new_session(36, dir.path().join("drag.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
@@ -5763,7 +5854,11 @@ mod tests {
     #[test]
     fn dragging_into_a_table_cell_without_a_live_table_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(37, dir.path().join("table-drag.mcvx"));
+        let mut session = WorldSession::new_session(
+            37,
+            dir.path().join("table-drag.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
@@ -5800,7 +5895,11 @@ mod tests {
     #[test]
     fn drag_arms_only_when_the_cursor_was_empty_before_the_press() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(38, dir.path().join("drag-arm.mcvx"));
+        let mut session = WorldSession::new_session(
+            38,
+            dir.path().join("drag-arm.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         // Two different block ids sit in slots 0 and 1, so a press on slot 1
         // while holding slot 0's stack is a genuine swap (not a merge).
         session.player.collect_block(BlockId::Stone);
@@ -6177,7 +6276,11 @@ mod tests {
     #[test]
     fn placed_table_mode_reaches_cell_fifteen_through_clicks() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(41, dir.path().join("table-4x4.mcvx"));
+        let mut session = WorldSession::new_session(
+            41,
+            dir.path().join("table-4x4.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -6246,7 +6349,11 @@ mod tests {
     #[test]
     fn station_invalidated_between_redraws_rejects_or_closes_the_panel() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(47, dir.path().join("stale-station.mcvx"));
+        let mut session = WorldSession::new_session(
+            47,
+            dir.path().join("stale-station.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         let table_pos = IVec3::new(0, 5, 0);
         session.world.set_block_immediate(
@@ -6404,7 +6511,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("ui-inert.mcvx");
-        let mut session = WorldSession::new_session(42, save_path.clone());
+        let mut session =
+            WorldSession::new_session(42, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         // Two separate stacks: slot 0 is selected and must never be touched by
         // a click on the unrelated slot 1.
@@ -6658,7 +6766,10 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, blocker.join("deep.mcvx")));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, blocker.join("deep.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         // An unsaved chunk edit: the flag the failure must preserve.
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
@@ -6709,7 +6820,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("kept.mcvx");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
@@ -6748,7 +6862,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("menu-return.mcvx");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+        );
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
@@ -6793,7 +6910,10 @@ mod tests {
         // Bare CliConfig: GameApp::new starts at the main menu over the
         // loaded default session (the same S03 test pattern as the
         // SaveAndQuit tests).
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
         // Inject the settings save path AFTER construction (runtime keeps
         // DEFAULT_SETTINGS_PATH; the test points it at the tempdir).
@@ -6845,7 +6965,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         assert_eq!(app.session.world.seed(), 1);
         assert_eq!(
@@ -6864,6 +6988,7 @@ mod tests {
         app.start_world_session(WorldSession::new_session(
             42,
             PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
         ));
 
         assert_eq!(app.session.world.seed(), 42, "seed swapped");
@@ -6905,7 +7030,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.left_mouse_held = true;
         app.mining.tick(
@@ -6933,7 +7062,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.left_mouse_held = true;
         app.mining.tick(
@@ -6945,6 +7078,7 @@ mod tests {
         app.start_world_session(WorldSession::new_session(
             42,
             PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
         ));
 
         assert!(!app.left_mouse_held, "held latch cleared on session swap");
@@ -8247,6 +8381,8 @@ mod tests {
         WorldSaveData {
             seed,
             time_of_day: opencraft::world::daycycle::DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,

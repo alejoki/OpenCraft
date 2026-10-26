@@ -16,6 +16,13 @@
 /// longer options.
 pub const DEFAULT_SEASON_LENGTH_DAYS: u32 = 1;
 
+/// Upper bound for a persisted or CLI-provided season length, in game days.
+///
+/// The New Game cycler tops out at 8 days; a value beyond a full real-length
+/// year (365 days) is corruption rather than a choice, so persistence clamps
+/// it back to [`DEFAULT_SEASON_LENGTH_DAYS`].
+pub const MAX_SEASON_LENGTH_DAYS: u32 = 365;
+
 /// Seasons in one year, in cycle order.
 pub const SEASONS_PER_YEAR: u32 = 4;
 

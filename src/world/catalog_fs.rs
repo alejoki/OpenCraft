@@ -348,6 +348,8 @@ mod tests {
         WorldSaveData {
             seed,
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: crate::world::season::DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
