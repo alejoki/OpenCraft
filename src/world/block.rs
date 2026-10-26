@@ -137,6 +137,23 @@ impl BlockId {
             BlockId::CraftingTable => Some(0.8),
         }
     }
+
+    /// The block item produced when this block is broken.
+    ///
+    /// Stone yields Cobblestone so the stone-tier tool recipes (whose head
+    /// material is [`BlockId::Cobblestone`]) are reachable through real
+    /// gameplay. Every other block drops itself. This is block metadata, not
+    /// tool behavior: the mining loop and durability rules are untouched.
+    ///
+    /// Drops are inventory state only and are never persisted, and the wire
+    /// format keeps Cobblestone's id 4 unchanged, so save compatibility is
+    /// unaffected.
+    pub const fn mined_drop(self) -> BlockId {
+        match self {
+            BlockId::Stone => BlockId::Cobblestone,
+            _ => self,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +240,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_mined_drop_is_identity_except_stone_yields_cobblestone() {
+        for id in 0u8..=14 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            let expected = if block == BlockId::Stone {
+                BlockId::Cobblestone
+            } else {
+                block
+            };
+            assert_eq!(block.mined_drop(), expected, "{block:?} mined drop drifted");
+        }
+        // Explicit anchors for the two interesting cases.
+        assert_eq!(BlockId::Stone.mined_drop(), BlockId::Cobblestone);
+        assert_eq!(BlockId::Cobblestone.mined_drop(), BlockId::Cobblestone);
     }
 
     #[test]

@@ -295,7 +295,10 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         // Empty slot / non-tool / out-of-range selection: no mutation.
         Err(_) => ToolWearOutcome::Nothing,
     };
-    session.player.collect_block(block);
+    // Drop mapping is block metadata (Stone -> Cobblestone); the item identity
+    // is the only thing that differs, and the drop is still collected last so
+    // MEM195 ordering is preserved.
+    session.player.collect_block(block.mined_drop());
 
     BreakOutcome::Applied { remeshed, wear }
 }
@@ -4572,10 +4575,11 @@ mod tests {
         assert!(!second.is_empty());
 
         assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        // Stone's mined drop is Cobblestone (the stone-tier tool head material).
         assert_eq!(
             session.player.hotbar_stack(0),
             Some(ItemStack {
-                block: BlockId::Stone,
+                block: BlockId::Cobblestone,
                 count: 2,
             })
         );
