@@ -701,6 +701,9 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
 fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
     SkyParams {
         time_of_day,
+        // The per-frame eye-submersion lookup lands in S04-T03; until then the
+        // air palette is always used (the water pass itself already ships).
+        underwater: false,
         day_factor: palette.day_factor,
         fog_color: [
             palette.fog_color[0],
