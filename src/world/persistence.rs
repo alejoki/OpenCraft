@@ -65,6 +65,14 @@ pub struct CliConfig {
     /// after exactly one day cycle, so completion is a health signal rather
     /// than an external timeout kill.
     pub time_scale: f32,
+    /// Season length in game days from `--season-length` (a fresh-world
+    /// parameter like `time_scale`, so it never affects
+    /// `cli_has_world_intent`). Only the fresh-world branch of startup
+    /// consumes it: loading an existing save must restore the persisted
+    /// calendar instead of a launch flag. Values are clamped to
+    /// `1..=MAX_SEASON_LENGTH_DAYS`; zero and non-numeric input keep the
+    /// default [`DEFAULT_SEASON_LENGTH_DAYS`].
+    pub season_length: u32,
 }
 
 impl CliConfig {
@@ -77,6 +85,7 @@ impl CliConfig {
         let mut seed_override = None;
         let mut force_new_world = false;
         let mut time_scale = DEFAULT_TIME_SCALE;
+        let mut season_length = DEFAULT_SEASON_LENGTH_DAYS;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -104,6 +113,20 @@ impl CliConfig {
                         }
                     }
                 }
+                "--season-length" => {
+                    // Lenient like `--time-scale`: a missing, non-numeric, or
+                    // zero value keeps the default length. A value above the
+                    // persisted bound is clamped rather than rejected, since
+                    // `season_of` is defensive and persistence clamps the
+                    // same range on load.
+                    if let Some(val) = iter.next() {
+                        if let Ok(parsed) = val.as_ref().parse::<u32>() {
+                            if parsed > 0 {
+                                season_length = parsed.min(MAX_SEASON_LENGTH_DAYS);
+                            }
+                        }
+                    }
+                }
                 "--new" | "--new-world" => {
                     force_new_world = true;
                 }
@@ -116,6 +139,7 @@ impl CliConfig {
             seed_override,
             force_new_world,
             time_scale,
+            season_length,
         }
     }
 }
@@ -1827,6 +1851,38 @@ mod tests {
         // A fractional scale is accepted verbatim.
         let fractional = CliConfig::parse_args(["--time-scale", "2.5"]);
         assert_eq!(fractional.time_scale, 2.5);
+    }
+
+    #[test]
+    fn test_season_length_parses_and_rejects_bad_values() {
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.season_length, DEFAULT_SEASON_LENGTH_DAYS);
+
+        // Happy path: a positive length is accepted verbatim.
+        let chosen = CliConfig::parse_args(["--season-length", "4"]);
+        assert_eq!(chosen.season_length, 4);
+
+        // Missing value at end of argv, non-numeric, zero, negative, and an
+        // overflowing token all keep the default (lenient parse, no panic).
+        for args in [
+            vec!["--season-length"],
+            vec!["--season-length", "fast"],
+            vec!["--season-length", "0"],
+            vec!["--season-length", "-4"],
+            vec!["--season-length", "4294967296"],
+        ] {
+            let cfg = CliConfig::parse_args(args.iter().copied());
+            assert_eq!(
+                cfg.season_length, DEFAULT_SEASON_LENGTH_DAYS,
+                "bad value {:?} must keep the default",
+                args
+            );
+        }
+
+        // An absurd length clamps to the persisted bound instead of being
+        // rejected, so a typo never yields an unloadable calendar.
+        let absurd = CliConfig::parse_args(["--season-length", "100000"]);
+        assert_eq!(absurd.season_length, MAX_SEASON_LENGTH_DAYS);
     }
 
     #[test]

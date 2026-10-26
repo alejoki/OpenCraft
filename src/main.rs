@@ -62,6 +62,7 @@ use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
+#[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::vista;
@@ -745,8 +746,10 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
     // Fresh worlds start at the default season length; the New Game row and
-    // the `--season-length` CLI seam override it on this branch only.
-    WorldSession::new_session(seed, cli.save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS)
+    // the `--season-length` CLI seam override it on this branch only. A load
+    // branch above never reaches here, so a persisted calendar always wins
+    // over a launch flag.
+    WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length)
 }
 
 /// Apply a S01-confirmed pending delete through the live catalog and
@@ -3899,6 +3902,13 @@ mod tests {
             scaled.time_scale, 60.0,
             "the CLI scale reaches the app but never forces gameplay"
         );
+        // `--season-length` is a fresh-world parameter, NOT a world intent:
+        // on its own it must not bypass the main menu (same rule as
+        // `--time-scale`).
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--season-length",
+            "4"
+        ])));
         // Every flag together still bypasses (the smoke scripts' launches).
         assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--new",
@@ -4148,6 +4158,94 @@ mod tests {
 
         assert_eq!(relaunched.clock.time_of_day, 17_432);
         assert_eq!(relaunched.save_path, save_path);
+    }
+
+    #[test]
+    fn accelerated_demo_cycle_saves_and_reloads_day_index_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("calendar.mcvx");
+        let mut app = playing_app(dir.path(), "calendar.mcvx");
+        app.time_scale = 60.0;
+        app.session.season_length_days = 4;
+        let start = Instant::now();
+
+        // The same frame loop the bounded demo runs: one full cycle at 60x
+        // takes 20 simulated seconds (24,000 ticks / 1,200 per second).
+        tick_app_clock(&mut app, start);
+        assert!(!observe_demo_cycle(
+            &mut app.demo_cycle,
+            app.time_scale,
+            true,
+            app.session.clock.time_of_day
+        ));
+        let mut finished = false;
+        let mut frames = 0;
+        while frames < 25 && !finished {
+            frames += 1;
+            tick_app_clock(&mut app, start + Duration::from_secs(frames));
+            finished = observe_demo_cycle(
+                &mut app.demo_cycle,
+                app.time_scale,
+                true,
+                app.session.clock.time_of_day,
+            );
+        }
+        assert!(finished, "the accelerated demo must complete one cycle");
+
+        // From the default noon start, one full cycle returns the clock to
+        // noon and crosses dawn (tick 0) exactly once: day index 1.
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+        assert_eq!(app.session.clock.day_index, 1);
+
+        // The demo's shutdown save persists the calendar tail; the reload
+        // restores both fields byte-exactly.
+        save_current_world(&mut app.session).expect("demo shutdown save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.day_index, 1);
+        assert_eq!(loaded.season_length_days, 4);
+        let relaunched = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(relaunched.clock.day_index, 1);
+        assert_eq!(relaunched.season_length_days, 4);
+    }
+
+    #[test]
+    fn startup_session_honors_season_length_on_the_fresh_world_branch_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh_path = dir.path().join("fresh.mcvx");
+        let path_str = fresh_path.to_str().expect("utf8 path");
+
+        // Fresh branch: the CLI seam overrides the default season length.
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--save",
+            path_str,
+            "--season-length",
+            "4",
+        ]);
+        let session = startup_session(&cli);
+        assert_eq!(session.season_length_days, 4);
+        assert_eq!(session.clock.day_index, 0, "fresh worlds start on day 0");
+
+        // ...and the default applies when the flag is absent.
+        let bare_fresh = CliConfig::parse_args(["--new", "--save", path_str]);
+        assert_eq!(
+            startup_session(&bare_fresh).season_length_days,
+            DEFAULT_SEASON_LENGTH_DAYS
+        );
+
+        // Load branch: a persisted calendar wins over the launch flag.
+        let mut data = sample_save(42);
+        data.day_index = 3;
+        data.season_length_days = 8;
+        save_world_to_path(&fresh_path, &data).expect("write calendar save");
+        let load_cli =
+            CliConfig::parse_args(["--save", path_str, "--season-length", "2"]);
+        let loaded = startup_session(&load_cli);
+        assert_eq!(loaded.clock.day_index, 3, "persisted day index wins");
+        assert_eq!(
+            loaded.season_length_days, 8,
+            "a load ignores --season-length"
+        );
     }
 
     /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,
