@@ -1250,6 +1250,133 @@ fn observe_demo_cycle(
     }
 }
 
+/// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
+/// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
+/// under this; the cap only guarantees bounded memory if a run is left going.
+const FRAME_BUDGET_SAMPLE_CAP: usize = 120_000;
+
+/// The operational frame-time target quoted in the digest (MEM229): a bounded
+/// release run must hold p95 wall frame time at or under one 60 Hz frame.
+const FRAME_BUDGET_TARGET_MS: f64 = 16.6;
+
+/// Percentiles over a bounded per-frame duration sample (S08-T01).
+///
+/// The math mirrors the `streaming_budget` harness in
+/// `world::manager` exactly — sort ascending, then index with
+/// `round((len - 1) * p)` — so the two evidence surfaces cannot disagree
+/// about what "p95" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameBudgetStats {
+    samples: usize,
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+}
+
+/// Pure percentile helper: `None` for an empty sample so callers never print
+/// a digest full of zeros (and never divide by zero).
+fn frame_budget_stats(samples: &[Duration]) -> Option<FrameBudgetStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    let pct = |p: f64| -> Duration {
+        let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+        sorted[idx]
+    };
+    Some(FrameBudgetStats {
+        samples: sorted.len(),
+        p50: pct(0.50),
+        p95: pct(0.95),
+        max: *sorted.last().expect("non-empty sample"),
+    })
+}
+
+/// Pure formatter for the one digest line printed on demo-seam shutdown
+/// (D086). `None` for an empty sample: a demo that never saw a frame has no
+/// budget to report and must not print a misleading all-zero line.
+fn format_frame_budget_digest(samples: &[Duration]) -> Option<String> {
+    let stats = frame_budget_stats(samples)?;
+    Some(format!(
+        "frame_budget: samples={} p50={:.3}ms p95={:.3}ms max={:.3}ms target: p95<={:.1}ms",
+        stats.samples,
+        stats.p50.as_secs_f64() * 1000.0,
+        stats.p95.as_secs_f64() * 1000.0,
+        stats.max.as_secs_f64() * 1000.0,
+        FRAME_BUDGET_TARGET_MS,
+    ))
+}
+
+/// Bounded per-frame wall-time sampler for the demo-shutdown digest.
+///
+/// HONESTY NOTE (S08-T01): the samples are real wall dt from the frame loop.
+/// Default settings run `vsync = false`, which requests the uncapped
+/// `Immediate` present mode (`render::context::preferred_present_mode`), so a
+/// frame's dt measures the work of that frame rather than a display refresh
+/// wait. The p95 <= 16.6 ms claim is therefore only meaningful at default
+/// settings; a vsync-on run is paced by the compositor and would report the
+/// refresh interval, not the render cost.
+#[derive(Debug, Default)]
+struct FrameBudgetSampler {
+    samples: Vec<Duration>,
+}
+
+impl FrameBudgetSampler {
+    fn new() -> Self {
+        Self {
+            samples: Vec::with_capacity(FRAME_BUDGET_SAMPLE_CAP),
+        }
+    }
+
+    /// Record one frame's wall dt. Silently drops samples past the cap: the
+    /// digest is a percentile summary, so a longer run only loses tail
+    /// resolution, never accuracy for the already-recorded window.
+    fn push(&mut self, dt: Duration) {
+        if self.samples.len() < FRAME_BUDGET_SAMPLE_CAP {
+            self.samples.push(dt);
+        }
+    }
+
+    /// Drop the sample window — called at session transitions so one digest
+    /// covers exactly one run/world.
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    /// Test-only accessor: production code reads the sample count through the
+    /// digest itself.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn digest(&self) -> Option<String> {
+        format_frame_budget_digest(&self.samples)
+    }
+}
+
+/// Sample one frame: only Playing frames are recorded (menu/settings/pause
+/// frames are not gameplay work and must not pad the milestone claim).
+fn sample_frame_budget(sampler: &mut FrameBudgetSampler, playing: bool, dt: Duration) {
+    if playing {
+        sampler.push(dt);
+    }
+}
+
+/// The shutdown digest is gated on a demo seam having run (D086) and on a
+/// non-empty sample window — the crate stays log-free (D006/MEM009) outside
+/// that one bounded diagnostic seam.
+fn frame_budget_digest_for_shutdown(
+    demo_seam_ran: bool,
+    sampler: &FrameBudgetSampler,
+) -> Option<String> {
+    if !demo_seam_ran {
+        return None;
+    }
+    sampler.digest()
+}
+
 /// Extra wall-clock allowance on top of one accelerated cycle before the
 /// bounded demo shuts down even if no redraws are being delivered.
 const DEMO_SHUTDOWN_GRACE_SECS: f32 = 5.0;
@@ -1410,6 +1537,13 @@ struct GameApp {
     /// armed only when the launch starts directly in Playing with an
     /// accelerated scale. `None` for every normal run.
     demo_shutdown_deadline: Option<Instant>,
+    /// Bounded Playing-frame wall-time window (S08-T01), reset at every
+    /// session transition. Its one consumer is the demo-shutdown digest.
+    frame_budget: FrameBudgetSampler,
+    /// Whether a bounded demo seam ran in this session (accelerated demo now,
+    /// scripted demo seams as they are added). Gates the one shutdown digest
+    /// line so a normal run stays log-free (D086, D006/MEM009).
+    demo_seam_ran: bool,
 }
 
 impl GameApp {
@@ -1530,6 +1664,8 @@ impl GameApp {
             demo_finished: false,
             demo_days: cli.demo_days,
             demo_shutdown_deadline,
+            frame_budget: FrameBudgetSampler::new(),
+            demo_seam_ran: false,
         }
     }
 
@@ -1823,6 +1959,10 @@ impl GameApp {
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        // A new session owns a fresh frame-budget window (S08-T01): one
+        // digest covers exactly one run, never a blend of two worlds.
+        self.frame_budget.reset();
+        self.demo_seam_ran = false;
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -2902,7 +3042,8 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last_frame).as_secs_f32();
+                let frame_dt = now - self.last_frame;
+                let dt = frame_dt.as_secs_f32();
                 self.last_frame = now;
 
                 // Message expiry at a bounded ~60 ticks/s (see
@@ -2931,6 +3072,10 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Frame-budget evidence (S08-T01): only Playing frames are
+                // real gameplay work; the digest is printed once on demo
+                // shutdown (see `about_to_wait`).
+                sample_frame_budget(&mut self.frame_budget, playing, frame_dt);
                 // Gameplay vs. world-liveness (S03-T03): the inventory panel
                 // freezes player movement, camera aim, the target raycast, and
                 // hold-to-mine, but NOT the world: time, table revalidation,
@@ -2953,17 +3098,21 @@ impl ApplicationHandler for GameApp {
                 // is deferred to `about_to_wait` because `gpu`/`window`
                 // borrows span this region; only plain fields are touched
                 // here.
-                if !self.demo_finished
-                    && observe_demo_cycle(
+                if !self.demo_finished {
+                    let finished = observe_demo_cycle(
                         &mut self.demo_cycle,
                         self.time_scale,
                         self.demo_days,
                         playing,
                         self.session.clock.time_of_day,
-                    )
-                {
-                    self.demo_cycle = None;
-                    self.demo_finished = true;
+                    );
+                    // A watch armed (or just completed) means a demo seam ran;
+                    // only then does shutdown print the frame-budget digest.
+                    self.demo_seam_ran |= self.demo_cycle.is_some() || finished;
+                    if finished {
+                        self.demo_cycle = None;
+                        self.demo_finished = true;
+                    }
                 }
                 // Vista discriminator (M004/S02): the single `vista_visible`
                 // truth source — true only for the main-menu cluster. Pause,
@@ -3651,6 +3800,20 @@ impl ApplicationHandler for GameApp {
         // holds disjoint `gpu`/`window` borrows and a whole-`self` shutdown
         // call cannot coexist with them.
         if self.demo_finished {
+            // One digest line, only for a bounded demo seam (D086), honoring
+            // the crate's no-logs convention (D006/MEM009). HONESTY NOTE:
+            // default settings request the uncapped `Immediate` present mode
+            // (vsync off), so wall dt measures frame work and the 16.6 ms p95
+            // claim only means what it says at default settings.
+            if let Some(line) =
+                frame_budget_digest_for_shutdown(self.demo_seam_ran, &self.frame_budget)
+            {
+                // Best-effort write: this diagnostic exists for harnesses that
+                // redirect stdout. A consumer that already closed the pipe must
+                // not panic the process out of its clean demo shutdown.
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stdout().lock(), "{line}");
+            }
             self.shutdown(event_loop);
             return;
         }
@@ -4370,6 +4533,132 @@ mod tests {
         // is still what grants direct gameplay entry).
         let with_new = CliConfig::parse_args(["--new", "--demo-days", "4"]);
         assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn frame_budget_percentiles_handle_empty_single_and_many_samples() {
+        // Empty: no percentiles, and no misleading all-zero digest line.
+        assert!(frame_budget_stats(&[]).is_none());
+        assert!(format_frame_budget_digest(&[]).is_none());
+
+        // One sample: p50, p95, and max all collapse to that sample.
+        let one = frame_budget_stats(&[Duration::from_millis(7)]).expect("one sample");
+        assert_eq!(one.samples, 1);
+        assert_eq!(one.p50, Duration::from_millis(7));
+        assert_eq!(one.p95, Duration::from_millis(7));
+        assert_eq!(one.max, Duration::from_millis(7));
+
+        // Twenty ordered samples mirror the streaming_budget index math:
+        // round((len - 1) * p).
+        let samples: Vec<Duration> = (1..=20).map(Duration::from_millis).collect();
+        let stats = frame_budget_stats(&samples).expect("twenty samples");
+        assert_eq!(stats.samples, 20);
+        assert_eq!(stats.p50, Duration::from_millis(11), "round(19 * 0.5) = 10");
+        assert_eq!(
+            stats.p95,
+            Duration::from_millis(19),
+            "round(19 * 0.95) = 18"
+        );
+        assert_eq!(stats.max, Duration::from_millis(20));
+
+        // Input order must never change the answer: the helper sorts first.
+        let unsorted = [
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ];
+        let stats = frame_budget_stats(&unsorted).expect("three samples");
+        assert_eq!(stats.p50, Duration::from_millis(2));
+        assert_eq!(stats.max, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn frame_budget_digest_line_is_pinned() {
+        // The format is a contract for scripts/swim_smoke.sh and the milestone
+        // evidence record: changing it must be a deliberate test edit.
+        let samples = [
+            Duration::from_micros(1_234),
+            Duration::from_millis(4),
+            Duration::from_millis(9),
+        ];
+        let line = format_frame_budget_digest(&samples).expect("non-empty sample");
+        assert_eq!(
+            line,
+            "frame_budget: samples=3 p50=4.000ms p95=9.000ms max=9.000ms target: p95<=16.6ms"
+        );
+    }
+
+    #[test]
+    fn frame_budget_sampler_is_capped_and_playing_only() {
+        let mut sampler = FrameBudgetSampler::new();
+        for _ in 0..FRAME_BUDGET_SAMPLE_CAP + 5 {
+            sampler.push(Duration::from_millis(1));
+        }
+        assert_eq!(
+            sampler.len(),
+            FRAME_BUDGET_SAMPLE_CAP,
+            "the sample window is capped so a run left going stays bounded"
+        );
+        let line = sampler.digest().expect("capped sample still summarizes");
+        assert!(
+            line.starts_with(&format!("frame_budget: samples={FRAME_BUDGET_SAMPLE_CAP} ")),
+            "digest reports the retained window: {line}"
+        );
+
+        // Only Playing frames are gameplay work; menu/settings/pause frames
+        // must not pad the milestone claim.
+        let mut sampler = FrameBudgetSampler::new();
+        sample_frame_budget(&mut sampler, false, Duration::from_millis(5));
+        assert_eq!(sampler.len(), 0);
+        sample_frame_budget(&mut sampler, true, Duration::from_millis(5));
+        assert_eq!(sampler.len(), 1);
+    }
+
+    #[test]
+    fn frame_budget_digest_is_gated_on_a_demo_seam() {
+        let mut sampler = FrameBudgetSampler::new();
+        sampler.push(Duration::from_millis(3));
+
+        // A normal run stays log-free (D086/D006/MEM009).
+        assert!(frame_budget_digest_for_shutdown(false, &sampler).is_none());
+        assert!(frame_budget_digest_for_shutdown(true, &sampler).is_some());
+
+        // A demo seam that never rendered a Playing frame has no budget to
+        // report and prints nothing.
+        let empty = FrameBudgetSampler::new();
+        assert!(frame_budget_digest_for_shutdown(true, &empty).is_none());
+    }
+
+    #[test]
+    fn frame_budget_window_resets_on_session_transitions() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/frame-budget-a.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.frame_budget.push(Duration::from_millis(4));
+        app.demo_seam_ran = true;
+        assert_eq!(app.frame_budget.len(), 1);
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/frame-budget-b.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+
+        assert_eq!(
+            app.frame_budget.len(),
+            0,
+            "one digest covers exactly one run/world"
+        );
+        assert!(
+            !app.demo_seam_ran,
+            "the seam flag belongs to the outgoing run"
+        );
     }
 
     #[test]
