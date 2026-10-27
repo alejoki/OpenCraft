@@ -1304,7 +1304,12 @@ const SWIM_SEABED_MARGIN: f32 = 2.0;
 const SWIM_ENTRY_SECS: f32 = 10.0;
 const SWIM_FLOAT_SECS: f32 = 3.0;
 const SWIM_RISE_SECS: f32 = 2.0;
-const SWIM_CROSSING_SECS: f32 = 150.0;
+/// The S03 crossing cap (9000 frames at 1/60 s) plus a production margin: the
+/// real binary's frame rate is unbounded, so the same simulated crossing is
+/// fewer wall seconds and a single long hitch must not eat the budget. The
+/// 360 s wall-clock deadline, not this cap, remains the hard bound on a stalled
+/// run, and gated (non-resident) frames never charge this budget.
+const SWIM_CROSSING_SECS: f32 = 180.0;
 
 /// Mirrors `Player::update`'s per-step clamp, so the watcher's simulated-time
 /// budget advances exactly as far as the physics did.
@@ -1780,6 +1785,20 @@ fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool 
         .watch
         .as_mut()
         .expect("watch is armed immediately above");
+    // Streaming gate, mirroring the S03 harness's per-step residency gate: a
+    // non-resident chunk reads as Air, which silently removes buoyancy and
+    // drops the scripted body out of the crossing (it then falls into terrain
+    // and can spend the rest of the budget escaping). Wait for the column under
+    // the body to stream in before feeding any scripted input. The wall-clock
+    // deadline bounds the wait, and a gated frame is not a crossing frame: no
+    // physics runs and no simulated time is charged to the stage budget.
+    let col_x = session.player.position.x.floor() as i32;
+    let col_z = session.player.position.z.floor() as i32;
+    if terrain_height_at_seeded(col_x, col_z, route.seed) < SEA_LEVEL
+        && session.world.get_block(col_x, SEA_LEVEL, col_z) != BlockId::Water
+    {
+        return false;
+    }
     let input = watch.input();
     session
         .player
@@ -5619,7 +5638,7 @@ mod tests {
         }
         watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
         let mut progress = SwimProgress::Continue;
-        for _ in 0..151 {
+        for _ in 0..(SWIM_CROSSING_SECS as usize + 1) {
             progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 40.5), false, true);
         }
         match progress {
@@ -5636,9 +5655,10 @@ mod tests {
     }
 
     /// The panic-free `swim_frame` plumbing: with no world chunks resident the
-    /// seam must WAIT (no scripted input, no premature fall), and once a
-    /// watcher is armed the real player physics runs and the abort digest is
-    /// latched with the seam flagged as failed.
+    /// seam must WAIT (no scripted input, no premature fall, no stage time
+    /// charged), and once the ocean column streams in it runs the real player
+    /// physics and arms the watcher. `SwimDemo::abort` keeps the self-describing
+    /// digest contract (the stage-level cases are pinned separately).
     #[test]
     fn swim_frame_waits_for_the_ocean_then_latches_a_self_describing_abort() {
         let route = test_swim_route();
@@ -5648,27 +5668,48 @@ mod tests {
         let mut demo = SwimDemo::new(12345, Some(route), None);
 
         // Nothing is resident yet: `get_block` answers Air, so the seam holds
-        // the player at the teleport instead of falling through the gap.
-        assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        // the player at the teleport instead of falling through the gap. This
+        // is the fix for the stalled-crossing failure: a mid-run streaming gap
+        // must wait, never silently drop buoyancy.
+        for _ in 0..10 {
+            assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        }
         assert!(
             demo.watch.is_none(),
             "the watcher arms only over real water"
         );
         assert_eq!(session.player.position, route.start);
+        assert!(!demo.failed, "waiting for a chunk is not a failure");
 
-        // Pre-arm the watcher to exercise the physics/observation plumbing over
-        // Air: the body free-falls and the entry guard names the stage instead
-        // of waiting for a chunk that will never arrive.
-        demo.watch = Some(SwimWatch::new(route));
-        let mut frames = 0usize;
-        while !swim_frame(&mut demo, &mut session, 1.0 / 60.0) {
-            frames += 1;
-            assert!(frames < 200, "the entry guard must abort within its budget");
+        // Pump the headless streaming queue (same bounded pump the manager's
+        // regeneration tests use) until the spawn column is resident.
+        let origin = ChunkPos::new(0, 0, 0);
+        for _ in 0..400 {
+            if session.world.get_block(0, SEA_LEVEL, route.ocean_start_z) == BlockId::Water {
+                break;
+            }
+            session.world.update_streaming(origin, Season::Summer);
+            std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(
+            session.world.get_block(0, SEA_LEVEL, route.ocean_start_z),
+            BlockId::Water,
+            "the spawn column's ocean must stream in for this test to be meaningful"
+        );
+
+        // With water resident the seam runs the production physics: the body
+        // falls from above the surface and the watcher arms over the ocean.
+        assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        assert!(demo.watch.is_some(), "the watcher arms over real water");
         assert!(
             session.player.position.y < route.start.y,
             "the seam moved the real player"
         );
+
+        // The digest contract: a latched abort names the seed/axis/route and
+        // flags the run as failed so `main` exits non-zero.
+        demo.watch = Some(SwimWatch::new(route));
+        demo.abort("entry", "synthetic abort for the digest contract");
         assert!(demo.failed, "a self-describing abort is a failure");
         let digest = demo.digest.as_deref().expect("abort digest latched");
         assert!(
