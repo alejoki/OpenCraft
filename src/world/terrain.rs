@@ -852,6 +852,43 @@ fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
     wall_height + i32::from(corner)
 }
 
+/// One prospective reward a ruin can yield.
+///
+/// Deliberately a placeholder: M007 ships the seam, not the content. Worldgen
+/// owns no item vocabulary (that belongs to the `player::inventory` layer), so
+/// an entry is only a stable identifier plus an inclusive count range. When the
+/// M008 survival loot tables land they resolve `item_id` to a real item; the
+/// seam's signature does not change when they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LootEntry {
+    /// Stable identifier for the yielded item, interpreted by the M008 loot
+    /// layer. No identifier space exists in M007 — nothing constructs one.
+    pub item_id: u16,
+    /// Inclusive lower bound on the stack size of one roll.
+    pub min_count: u16,
+    /// Inclusive upper bound on the stack size of one roll.
+    pub max_count: u16,
+}
+
+/// Loot yielded by one ruin — **present but empty** in M007.
+///
+/// This is the M008 survival-content hook, mirroring the M006 stubbed-hook
+/// pattern: the seam is named, typed and callable at every generated ruin, and
+/// it is honestly empty rather than pretending to be content. M008 fills it;
+/// until then the only observable property is that no entry is ever produced.
+///
+/// Pure by construction — a function of `(seed, ruin)` only. It reads no clock,
+/// no RNG state, no season/day index and no chunk, so loot can never make
+/// worldgen season-dependent (the cross-slice season-purity invariant) and two
+/// callers asking about the same ruin always get the same answer. The generator
+/// does not call it: as a no-op returning an empty `Vec` (which does not
+/// allocate) that call would be pure ceremony. The acceptance scan in the tests
+/// is what proves the seam is callable at every placed ruin.
+pub fn ruin_loot(_seed: u32, _ruin: &RuinSpec) -> Vec<LootEntry> {
+    // Empty in M007 — M008 fills this from the survival loot tables.
+    Vec::new()
+}
+
 /// Minimum surface height of a spawnable column: two blocks above the named sea
 /// level, so the player always starts on dry land above the water line rather
 /// than on the seabed. The Sand beach band can still reach `SEA_LEVEL +
@@ -2634,6 +2671,16 @@ mod tests {
     /// flaky.
     const RUIN_SCAN_RADIUS: i32 = 3;
 
+    /// Lower bound on the distinct ruins the loot-seam acceptance scan must
+    /// find before "every ruin returns no loot" means anything.
+    ///
+    /// Derived from the same envelope: `RUIN_SCAN_RADIUS` covers 49 chunks, ~784
+    /// interior anchors each, so the 1/512 gate passes ~75 anchors and roughly
+    /// half of those sit in the Plains/Forest band — tens of candidates before
+    /// tree overlaps and interlocking shells. 8 is comfortably below the
+    /// observed count yet far above vacuous.
+    const RUIN_LOOT_MIN_RUINS: usize = 8;
+
     /// Every ruin anchor the placement rule yields inside a chunk region,
     /// derived from `ruin_at` exactly as `place_surface_ruins` does.
     fn ruin_anchors_in_region(radius: i32, seed: u32) -> Vec<RuinSpec> {
@@ -3065,6 +3112,80 @@ mod tests {
             candidate.anchor_x,
             candidate.anchor_z
         );
+    }
+
+    /// Acceptance: the empty loot seam is callable at *every* ruin the generator
+    /// actually places, not merely declared.
+    ///
+    /// The region is regenerated and its Cobblestone/Brick cells (worldgen paints
+    /// those only for ruins) are attributed back to a covering anchor from
+    /// `ruin_at`. Each distinct ruin found then gets one `ruin_loot` call and
+    /// every answer must be an empty `Vec`. Both non-vacuity bounds are explicit:
+    /// the scan must find ruin cells at all *and* at least [`RUIN_LOOT_MIN_RUINS`]
+    /// distinct ruins, plus every ruin cell must have a covering anchor (a
+    /// generator/placement-rule disagreement fails loudly instead of silently
+    /// shrinking the checked set).
+    #[test]
+    fn test_ruin_loot_seam_is_empty_at_every_generated_ruin() {
+        use std::collections::BTreeSet;
+
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        let blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
+        assert!(
+            !blocks.is_empty(),
+            "acceptance scan found no ruin cells, so the empty-seam assertion would be vacuous"
+        );
+
+        let mut ruins: BTreeSet<(i32, i32)> = BTreeSet::new();
+        let mut loot_calls = 0usize;
+        for (bx, by, bz, block) in &blocks {
+            let Some(spec) = anchors.iter().find(|spec| {
+                (bx - spec.anchor_x).abs() <= RUIN_FOOTPRINT_HALF
+                    && (bz - spec.anchor_z).abs() <= RUIN_FOOTPRINT_HALF
+            }) else {
+                panic!(
+                    "generated ruin block {block:?} at ({bx}, {by}, {bz}) has no covering anchor — \
+                     the generator and ruin_at disagree"
+                );
+            };
+            if !ruins.insert((spec.anchor_x, spec.anchor_z)) {
+                continue;
+            }
+            let loot = ruin_loot(seed, spec);
+            assert!(
+                loot.is_empty(),
+                "ruin_loot returned {} entries for ruin ({}, {}) — the M007 seam must stay empty",
+                loot.len(),
+                spec.anchor_x,
+                spec.anchor_z
+            );
+            loot_calls += 1;
+        }
+
+        assert!(
+            ruins.len() >= RUIN_LOOT_MIN_RUINS,
+            "acceptance scan found only {} distinct ruins (need >= {RUIN_LOOT_MIN_RUINS}) — \
+             the empty-seam assertion would be near-vacuous",
+            ruins.len()
+        );
+        assert_eq!(loot_calls, ruins.len());
+
+        // Negative: the seam is empty for *any* (seed, ruin) pair, including a
+        // synthetic spec the generator would never produce and seeds with no
+        // ruins at all. There is no hidden content path keyed off the inputs.
+        let synthetic = RuinSpec {
+            anchor_x: 0,
+            anchor_z: 0,
+            surface: RUIN_MIN_HEIGHT,
+            wall_height: RUIN_WALL_MAX_HEIGHT,
+        };
+        for probe_seed in [0, 1, seed, u32::MAX] {
+            assert!(
+                ruin_loot(probe_seed, &synthetic).is_empty(),
+                "ruin_loot produced content for seed {probe_seed}"
+            );
+        }
     }
 
     /// Negative: a fixed set of chunk positions spanning all four biomes
