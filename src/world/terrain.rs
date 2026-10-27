@@ -133,6 +133,48 @@ pub const TREE_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
 /// fast path is derived from this so it can never clip a tree.
 const TREE_CANOPY_HEADROOM: i32 = 7;
 
+// ---- Surface ruins (S07) ----------------------------------------------------
+
+/// Horizontal half-extent of a surface ruin's square footprint, in blocks.
+///
+/// A 5x5 shell (`2 * RUIN_FOOTPRINT_HALF + 1`) is small enough to read as one
+/// landmark and still fits inside a 32-block chunk once the anchor stays
+/// `RUIN_ANCHOR_MARGIN` away from each edge.
+const RUIN_FOOTPRINT_HALF: i32 = 2;
+
+/// Anchor margin from each chunk edge, derived from the footprint: an anchor at
+/// `RUIN_ANCHOR_MARGIN` reaches exactly chunk column 0 (and `CHUNK_SIZE - 1` on
+/// the far side), so every ruin cell is written by the chunk that generated it.
+/// That chunk confinement is what lets the loot seam (T02) stay registry- and
+/// persistence-free: one chunk owns each ruin, exactly like one chunk owns a
+/// tree.
+const RUIN_ANCHOR_MARGIN: i32 = RUIN_FOOTPRINT_HALF;
+
+/// Wall height band above the anchor column's surface, in blocks. Corner
+/// pillars are one taller, so the tallest ruin cell sits `surface +
+/// RUIN_WALL_MAX_HEIGHT + 1` = `surface + 4`, which is exactly the top block of
+/// the `surface + 1..=surface + 4` spawn body. `is_spawn_safe` therefore
+/// rejects every column inside a footprint rather than only wall cells.
+const RUIN_WALL_MIN_HEIGHT: i32 = 1;
+const RUIN_WALL_MAX_HEIGHT: i32 = 3;
+
+/// Surface-height band a ruin may stand on: exactly the Grass band above the
+/// Sand beach shelf and below Mountain stone (the same window trees use, so
+/// both structures agree on what counts as buildable land).
+const RUIN_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
+const RUIN_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
+
+/// Hash salt for the ruin gate, kept distinct from the tree (`777`) and ore
+/// salts so ruin placement cannot correlate with those passes.
+const RUIN_SALT: u32 = 0x5EED_9A11;
+
+/// Sparse per-anchor gate: `1 / (RUIN_GATE_MASK + 1)` = 1/512 of eligible
+/// interior anchors carry a ruin. Sized so a 32x32 chunk (~28x28 interior
+/// anchors, roughly half of them Plains/Forest land) yields a ruin now and then
+/// instead of in every chunk, while a 5x5 chunk headless scan still guarantees
+/// several (the acceptance scan asserts a non-zero lower bound).
+const RUIN_GATE_MASK: u32 = 0x1FF;
+
 /// Coarse worldgen biome for a column.
 ///
 /// Classification reads the same continental/ridge sample as the height
@@ -412,6 +454,119 @@ fn place_ore_veins(
     }
 }
 
+/// Place the deterministic surface ruins whose anchors fall inside this chunk.
+///
+/// Modeled on `place_ore_veins`: one linear scan over the chunk's 32x32
+/// columns, then a tiny bounded write per ruin. Placement is confined to the
+/// chunk that owns the anchor (see `RUIN_ANCHOR_MARGIN`), so the pass never
+/// writes into a neighbouring chunk and needs no neighbour heights.
+///
+/// The surface-block gate is the authoritative one, exactly like the tree
+/// pass: the column must still hold `BlockId::Grass` after the terrain, cave,
+/// tree and ore passes. That single check is what keeps ruins off Sand beaches,
+/// seabed, mountain Stone, the altitude Snow cap and the seasonal Winter
+/// blanket (which turns Plains/Forest land into Snow emergently).
+fn place_surface_ruins(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    biomes: &[[Biome; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+    seed: u32,
+) {
+    let base_wx = pos.x * CHUNK_SIZE as i32;
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+    let base_wz = pos.z * CHUNK_SIZE as i32;
+
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let h = heights[lz][lx];
+            let surface_ly = h - base_wy;
+            if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                continue;
+            }
+            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+                continue;
+            }
+            let wx = base_wx + lx as i32;
+            let wz = base_wz + lz as i32;
+            let biome = biomes[lz][lx];
+            let Some(spec) = ruin_at(wx, wz, h, biome, seed) else {
+                continue;
+            };
+            place_ruin_at(chunk, heights, base_wy, spec);
+        }
+    }
+}
+
+/// Write one ruin shell into `chunk`.
+///
+/// `ruin_at`'s chunk-interior anchor margin guarantees the whole footprint lies
+/// inside this chunk, so every `lx`/`lz` below is a plain offset (no wrapping).
+///
+/// Two policies are pinned here, both deterministic and independent of
+/// iteration order:
+///
+/// 1. Tree-overlap: if any footprint column already holds `OakLog`, the anchor
+///    is skipped entirely — a ruin never carves through a tree.
+/// 2. Only-into-Air: each shell cell is written only where the chunk currently
+///    holds `BlockId::Air`, so trees, leaves, the Grass surface skin, Snow and
+///    Water are never overwritten. Footprint columns whose own surface is not
+///    Grass are skipped too, so a shell cannot stand on a Sand/Stone neighbour.
+fn place_ruin_at(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    base_wy: i32,
+    spec: RuinSpec,
+) {
+    let anchor_lx = spec.anchor_x.rem_euclid(CHUNK_SIZE as i32);
+    let anchor_lz = spec.anchor_z.rem_euclid(CHUNK_SIZE as i32);
+
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            let lx = (anchor_lx + dx) as usize;
+            let lz = (anchor_lz + dz) as usize;
+            if (0..CHUNK_SIZE).any(|ly| chunk.get(lx, ly, lz) == BlockId::OakLog) {
+                return;
+            }
+        }
+    }
+
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            // Shell only: the footprint interior stays open Air.
+            if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
+                continue;
+            }
+            let lx = (anchor_lx + dx) as usize;
+            let lz = (anchor_lz + dz) as usize;
+            let h = heights[lz][lx];
+            let surface_ly = h - base_wy;
+            if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                continue;
+            }
+            // Per-footprint-column surface gate: the shell stands on Grass
+            // only, so a footprint straddling a beach or a mountain stone
+            // column simply loses those cells.
+            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+                continue;
+            }
+            let block = ruin_wall_block(dx, dz);
+            let bottom = ruin_cell_bottom(dx, dz);
+            let top = ruin_cell_top(dx, dz, spec.wall_height);
+            for level in bottom..=top {
+                let ly = h + level - base_wy;
+                if !(0..CHUNK_SIZE as i32).contains(&ly) {
+                    continue;
+                }
+                let ly = ly as usize;
+                if chunk.get(lx, ly, lz) == BlockId::Air {
+                    chunk.set(lx, ly, lz, block);
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 pub fn terrain_height_at(wx: i32, wz: i32) -> i32 {
     terrain_height_at_seeded(wx, wz, DEFAULT_WORLD_SEED)
@@ -561,6 +716,142 @@ fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Optio
     gate.then(|| 4 + ((tree_hash >> 8) & 1) as i32)
 }
 
+/// A deterministic surface ruin: a small Cobblestone shell with Brick corner
+/// pillars and a doorway, standing on one Plains/Forest Grass column.
+///
+/// Produced by [`ruin_at`], which is the single placement rule shared by the
+/// generator, the spawn search and the tests. The struct carries the anchor
+/// column plus the surface it was derived from, so consumers never have to
+/// re-derive the footprint or re-sample the terrain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuinSpec {
+    /// World x of the footprint centre column. The shell spans
+    /// `anchor_x - RUIN_FOOTPRINT_HALF..=anchor_x + RUIN_FOOTPRINT_HALF`.
+    pub anchor_x: i32,
+    /// World z of the footprint centre column.
+    pub anchor_z: i32,
+    /// Anchor column surface height; the shell starts at `surface + 1`.
+    pub surface: i32,
+    /// Wall height above `surface`; corner pillars are one block taller.
+    pub wall_height: i32,
+}
+
+/// Position-only half of the ruin gate: the chunk-interior anchor margin plus
+/// the sparse per-anchor hash.
+///
+/// Split out so callers that only need "could a ruin stand here at all" (the
+/// spawn search) skip the terrain samples for the 511/512 anchors the hash
+/// rejects. [`ruin_at`] remains the authoritative rule; this is its cheap
+/// prefix, so the gate cannot drift between the two.
+fn ruin_anchor_hash(wx: i32, wz: i32, seed: u32) -> Option<u32> {
+    let half = CHUNK_SIZE as i32 - 1 - RUIN_ANCHOR_MARGIN;
+    let lx = wx.rem_euclid(CHUNK_SIZE as i32);
+    let lz = wz.rem_euclid(CHUNK_SIZE as i32);
+    if !(RUIN_ANCHOR_MARGIN..=half).contains(&lx) || !(RUIN_ANCHOR_MARGIN..=half).contains(&lz) {
+        return None;
+    }
+    let ruin_hash = hash2d(wx, wz, RUIN_SALT ^ seed);
+    ((ruin_hash & RUIN_GATE_MASK) == 0).then_some(ruin_hash)
+}
+
+/// Whether a surface ruin is anchored at this world column, and which one.
+///
+/// Single source of truth shared by `generate_chunk_seeded`,
+/// `find_spawn_column` and the tests, mirroring the `tree_trunk_height` shape:
+/// the chunk-interior anchor margin, the land height band, the Plains/Forest
+/// gate and the sparse hash gate all live here, so no caller can disagree with
+/// the generator about where a ruin stands. The generator additionally checks
+/// the actual generated surface block (`Grass`), which is the authoritative
+/// gate for beaches, seabed, mountain stone and the seasonal Winter blanket.
+///
+/// Deliberately season-blind: ruins are a function of `(pos, seed)` only, so
+/// the same ruins exist in every season (in Winter the snow surface suppresses
+/// them emergently, exactly like trees).
+fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec> {
+    let ruin_hash = ruin_anchor_hash(wx, wz, seed)?;
+    // The band is the Grass window: above the Sand beach shelf and below the
+    // Mountain stone threshold. Combined with the Plains/Forest gate below,
+    // a ruin can never stand on Sand, Stone, Snow or a water column.
+    if !(RUIN_MIN_HEIGHT..=RUIN_MAX_HEIGHT).contains(&h) {
+        return None;
+    }
+    if !matches!(biome, Biome::Plains | Biome::Forest) {
+        return None;
+    }
+    let span = (RUIN_WALL_MAX_HEIGHT - RUIN_WALL_MIN_HEIGHT + 1) as u32;
+    Some(RuinSpec {
+        anchor_x: wx,
+        anchor_z: wz,
+        surface: h,
+        wall_height: RUIN_WALL_MIN_HEIGHT + ((ruin_hash >> 9) % span) as i32,
+    })
+}
+
+/// The ruin whose footprint contains `(wx, wz)`, if any.
+///
+/// A footprint is `RUIN_FOOTPRINT_HALF` wide around its anchor, so the anchor
+/// of any covering ruin must lie within that Chebyshev radius. Deriving the
+/// answer from [`ruin_at`] keeps the footprint size, gate and height band in
+/// one place: the spawn search (MEM242/MEM246 precedent) must not re-derive
+/// them, or a `surface + 4` spawn could end up inside a ruin shell exactly
+/// like an OakLog trunk.
+///
+/// Conservative by construction: it does not check the generated surface block
+/// (that needs a chunk), so a column can be rejected for a ruin the Winter
+/// blanket would suppress — the same over-rejection the tree clearance already
+/// accepts, and it keeps the spawn purely a function of `seed`.
+fn ruin_covering(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            let ax = wx + dx;
+            let az = wz + dz;
+            // Cheap position gate first: only hash-passing anchors pay for the
+            // terrain + forest samples below.
+            if ruin_anchor_hash(ax, az, seed).is_none() {
+                continue;
+            }
+            let h = terrain_height_at_seeded(ax, az, seed);
+            let biome = biome_for_height(h, forest_noise(ax, az, seed));
+            if let Some(spec) = ruin_at(ax, az, h, biome, seed) {
+                return Some(spec);
+            }
+        }
+    }
+    None
+}
+
+/// Wall material for a footprint offset: Brick on the four corner pillars,
+/// Cobblestone on the wall runs between them. Both are already complete,
+/// legal-edit opaque blocks, so ruins add no block ids and no registry rows.
+#[inline]
+fn ruin_wall_block(dx: i32, dz: i32) -> BlockId {
+    if dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF {
+        BlockId::Brick
+    } else {
+        BlockId::Cobblestone
+    }
+}
+
+/// Lowest wall level (above the column surface) at which this footprint cell
+/// starts. The centre of the +z wall is a doorway: it is left open for the
+/// whole wall height so the ruin reads as an entrance, not a sealed box.
+#[inline]
+fn ruin_cell_bottom(dx: i32, dz: i32) -> i32 {
+    if dx == 0 && dz == RUIN_FOOTPRINT_HALF {
+        2
+    } else {
+        1
+    }
+}
+
+/// Highest wall level of this footprint cell: corner pillars stand one block
+/// above the wall runs between them.
+#[inline]
+fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
+    let corner = dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF;
+    wall_height + i32::from(corner)
+}
+
 /// Minimum surface height of a spawnable column: two blocks above the named sea
 /// level, so the player always starts on dry land above the water line rather
 /// than on the seabed. The Sand beach band can still reach `SEA_LEVEL +
@@ -607,6 +898,14 @@ fn is_spawn_safe(wx: i32, wz: i32, seed: u32) -> bool {
                 return false;
             }
         }
+    }
+    // Ruin clearance (S07): a footprint column is unsafe because the tallest
+    // ruin cell is `surface + 4` — the top of the spawn body — so a spawn here
+    // would be buried inside a wall or corner pillar. `ruin_covering` shares
+    // the placement rule with the generator, so the footprint shape and gate
+    // are never duplicated here.
+    if ruin_covering(wx, wz, seed).is_some() {
+        return false;
     }
     true
 }
@@ -871,6 +1170,10 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk 
     }
 
     place_ore_veins(&mut chunk, &heights, pos, seed);
+    // Third structure pass (S07): after ores, so a ruin can never be carved by
+    // the ore pass, and after trees, so the tree-overlap policy can see the
+    // actual OakLog cells it refuses to overwrite.
+    place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed);
     chunk.try_compress();
     chunk
 }
@@ -2320,6 +2623,448 @@ mod tests {
                 "{biome:?} column ({wx}, {h}, {wz}) has a Grass surface"
             );
         }
+    }
+
+    // ---- Surface ruins (S07) ------------------------------------------------
+
+    /// Chunk radius of the ruin acceptance region (7x7 chunks, three vertical
+    /// layers so every ruin cell up to `surface + 4` is covered). Sized from
+    /// the 1/512 per-anchor gate: ~784 interior anchors per chunk, so this
+    /// region yields dozens of ruins and the non-zero bounds below are not
+    /// flaky.
+    const RUIN_SCAN_RADIUS: i32 = 3;
+
+    /// Every ruin anchor the placement rule yields inside a chunk region,
+    /// derived from `ruin_at` exactly as `place_surface_ruins` does.
+    fn ruin_anchors_in_region(radius: i32, seed: u32) -> Vec<RuinSpec> {
+        let mut anchors = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = cx * CHUNK_SIZE as i32 + lx as i32;
+                        let wz = cz * CHUNK_SIZE as i32 + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let biome = biome_for_height(h, forest_noise(wx, wz, seed));
+                        if let Some(spec) = ruin_at(wx, wz, h, biome, seed) {
+                            anchors.push(spec);
+                        }
+                    }
+                }
+            }
+        }
+        anchors
+    }
+
+    /// Every Cobblestone/Brick cell in a chunk region (`cy 0..=2`, enough for
+    /// `surface + 4` up to the top of the ruin band). Worldgen paints exactly
+    /// those two blocks for ruins — ores are CoalOre/IronOre, trees are
+    /// OakLog/OakLeaves — so this set is the placed ruin shells.
+    fn ruin_blocks_in_region(radius: i32, seed: u32, season: Season) -> Vec<(i32, i32, i32, u8)> {
+        let mut blocks = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for cy in 0..=2 {
+                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, season);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                let block = chunk.get(lx, ly, lz);
+                                if matches!(block, BlockId::Cobblestone | BlockId::Brick) {
+                                    blocks.push((
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                        block as u8,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Gating: ruins stand only on Grass-surface Plains/Forest columns inside
+    /// the land band — never on Sand beaches, seabed, mountain Stone, the
+    /// altitude/seasonal Snow cap or a Water column — and every painted cell is
+    /// on the perimeter of a valid anchor's shell, strictly above the surface
+    /// (so the surface skin is never replaced).
+    #[test]
+    fn test_surface_ruins_stand_only_on_grass_land() {
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        assert!(!anchors.is_empty(), "region has no ruin anchors");
+        let blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
+        assert!(
+            blocks.len() >= 16,
+            "region produced {} ruin cells — expected several 5x5 shells",
+            blocks.len()
+        );
+        let brick_cells = blocks
+            .iter()
+            .filter(|b| b.3 == BlockId::Brick as u8)
+            .count();
+        assert!(
+            brick_cells >= 4,
+            "region produced {brick_cells} Brick cells, expected corner accents"
+        );
+
+        let mut surface_checked = 0usize;
+        for &(wx, wy, wz, id) in &blocks {
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            let biome = biome_at_seeded(wx, wz, seed);
+            assert!(
+                matches!(biome, Biome::Plains | Biome::Forest),
+                "ruin cell at ({wx}, {wy}, {wz}) stands in {biome:?}"
+            );
+            assert!(
+                (RUIN_MIN_HEIGHT..=RUIN_MAX_HEIGHT).contains(&h),
+                "ruin column ({wx}, {wz}) has h {h} outside the ruin band"
+            );
+            assert!(
+                (h + 1..=h + RUIN_WALL_MAX_HEIGHT + 1).contains(&wy),
+                "ruin cell at ({wx}, {wy}, {wz}) outside surface+1..=surface+{} (h = {h})",
+                RUIN_WALL_MAX_HEIGHT + 1
+            );
+            // Attribute the cell to the anchors whose footprint contains it.
+            // Overlapping ruins are legal (two anchors may sit within 4
+            // blocks), so a cell only has to be a shell cell of *some*
+            // covering anchor, with that anchor's wall material.
+            let covering: Vec<&RuinSpec> = anchors
+                .iter()
+                .filter(|spec| {
+                    (spec.anchor_x - wx).abs() <= RUIN_FOOTPRINT_HALF
+                        && (spec.anchor_z - wz).abs() <= RUIN_FOOTPRINT_HALF
+                })
+                .collect();
+            assert!(
+                !covering.is_empty(),
+                "ruin cell at ({wx}, {wy}, {wz}) belongs to no anchor footprint"
+            );
+            let on_shell = covering.iter().any(|spec| {
+                let dx = wx - spec.anchor_x;
+                let dz = wz - spec.anchor_z;
+                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF && ruin_wall_block(dx, dz) as u8 == id
+            });
+            assert!(
+                on_shell,
+                "ruin cell at ({wx}, {wy}, {wz}) is not a shell cell of any covering anchor"
+            );
+            // Bound the per-column regeneration sample: the biome/band checks
+            // above already pin the rule, this re-checks the generated block.
+            if surface_checked < 40 {
+                assert_eq!(
+                    generated_block_at(wx, h, wz, seed, Season::Summer),
+                    BlockId::Grass,
+                    "ruin cell column ({wx}, {h}, {wz}) has a non-Grass surface"
+                );
+                surface_checked += 1;
+            }
+        }
+
+        // The seasonal Winter blanket turns Plains/Forest land into Snow, so the
+        // authoritative Grass gate suppresses every ruin: the same chunks that
+        // carried shells in Summer must carry none in Winter.
+        let mut ruin_chunks: Vec<(i32, i32)> = blocks
+            .iter()
+            .map(|&(wx, _, wz, _)| {
+                (
+                    wx.div_euclid(CHUNK_SIZE as i32),
+                    wz.div_euclid(CHUNK_SIZE as i32),
+                )
+            })
+            .collect();
+        ruin_chunks.sort_unstable();
+        ruin_chunks.dedup();
+        assert!(!ruin_chunks.is_empty(), "no ruin chunks to re-check");
+        for &(cx, cz) in ruin_chunks.iter().take(8) {
+            for cy in 0..=2 {
+                let winter = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Winter);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let block = winter.get(lx, ly, lz);
+                            assert!(
+                                !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                                "winter Snow surface should suppress ruins, but ({cx}, {cy}, {cz}) has {block:?} at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ocean and mountain chunks carry no ruin at all: Sand and Stone
+        // surfaces fail the same Grass gate as Snow.
+        let found = first_column_per_biome(seed);
+        for biome in [Biome::Ocean, Biome::Mountains] {
+            let (wx, _, wz) = found[biome_index(biome)].expect("seed must have both biomes");
+            let (cx, cz) = (
+                wx.div_euclid(CHUNK_SIZE as i32),
+                wz.div_euclid(CHUNK_SIZE as i32),
+            );
+            for cy in 0..=2 {
+                let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let block = chunk.get(lx, ly, lz);
+                            assert!(
+                                !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                                "{biome:?} chunk ({cx}, {cy}, {cz}) has ruin block {block:?} at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Determinism and seed sensitivity: the same seed regenerates the same ruin
+    /// set, distinct seeds move it. Mirrors `test_different_seeds_change_ore_layout`.
+    #[test]
+    fn test_surface_ruins_are_deterministic_and_seed_dependent() {
+        let radius = 2;
+        let first = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
+        let repeat = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
+        let other = ruin_blocks_in_region(radius, 424_242, Season::Summer);
+        assert!(!first.is_empty(), "seed 1337 produced no ruins");
+        assert!(!other.is_empty(), "seed 424242 produced no ruins");
+        assert_eq!(first, repeat, "same seed produced different ruin layouts");
+        assert_ne!(
+            first, other,
+            "different seeds produced identical ruin layouts"
+        );
+    }
+
+    /// Only-into-Air pinned directly on the pass: a shell cell that already
+    /// holds a non-Air block (OakLeaves from a neighbouring canopy, Water, the
+    /// Grass surface skin) is left untouched, and an anchor whose footprint
+    /// holds an OakLog is skipped entirely. Inline fixture chunk, real
+    /// `place_ruin_at` — no mocks.
+    #[test]
+    fn test_place_ruin_only_writes_into_air() {
+        let heights = [[40i32; CHUNK_SIZE]; CHUNK_SIZE];
+        let base_wy = 32;
+        let spec = RuinSpec {
+            anchor_x: 16,
+            anchor_z: 16,
+            surface: 40,
+            wall_height: 2,
+        };
+
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                chunk.set(lx, 8, lz, BlockId::Grass);
+            }
+        }
+        // (18, 16) is a +x wall-run cell at level 1 and (14, 14) a corner at
+        // level 2: non-Air blocks there must survive the pass.
+        chunk.set(18, 9, 16, BlockId::OakLeaves);
+        chunk.set(14, 10, 14, BlockId::Water);
+
+        place_ruin_at(&mut chunk, &heights, base_wy, spec);
+
+        assert_eq!(
+            chunk.get(18, 9, 16),
+            BlockId::OakLeaves,
+            "ruin overwrote OakLeaves"
+        );
+        assert_eq!(
+            chunk.get(14, 10, 14),
+            BlockId::Water,
+            "ruin overwrote Water"
+        );
+        // Free shell cells did get their wall material (level 1 Cobblestone on
+        // the wall run, level 2 Brick on the corner pillar).
+        assert_eq!(chunk.get(18, 9, 17), BlockId::Cobblestone);
+        assert_eq!(chunk.get(18, 10, 18), BlockId::Brick);
+        // The doorway and the footprint interior stay open.
+        assert_eq!(chunk.get(16, 9, 18), BlockId::Air, "doorway was walled up");
+        assert_eq!(
+            chunk.get(16, 9, 16),
+            BlockId::Air,
+            "ruin interior is not hollow"
+        );
+        // The Grass surface skin itself is never a shell target.
+        assert_eq!(chunk.get(18, 8, 16), BlockId::Grass);
+
+        // Tree-overlap policy: an OakLog anywhere in the footprint skips the
+        // whole anchor, even where the shell cell itself is still Air.
+        let mut tree_chunk = Chunk::new_uniform(BlockId::Air);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                tree_chunk.set(lx, 8, lz, BlockId::Grass);
+            }
+        }
+        tree_chunk.set(17, 9, 17, BlockId::OakLog);
+        place_ruin_at(&mut tree_chunk, &heights, base_wy, spec);
+        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for ly in 0..CHUNK_SIZE {
+                    let block = tree_chunk.get((16 + dx) as usize, ly, (16 + dz) as usize);
+                    assert!(
+                        !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                        "anchor overlapping an OakLog still placed {block:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(tree_chunk.get(17, 9, 17), BlockId::OakLog);
+    }
+
+    /// Tree-overlap policy pinned: an anchor whose footprint already holds an
+    /// OakLog is skipped entirely, so a ruin never carves through a tree.
+    #[test]
+    fn test_surface_ruins_skip_tree_overlaps() {
+        use std::collections::HashMap;
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        assert!(!anchors.is_empty(), "region has no ruin anchors to check");
+        let ch = CHUNK_SIZE as i32;
+        let mut cache: HashMap<(i32, i32, i32), Chunk> = HashMap::new();
+        let mut checked = 0usize;
+
+        for spec in &anchors {
+            // Only unambiguous anchors: when another ruin anchor sits within 4
+            // blocks its shell may legally paint inside this footprint, which
+            // would blur the "this anchor was skipped" assertion.
+            let overlapped_by_ruin = anchors.iter().any(|other| {
+                other != spec
+                    && (other.anchor_x - spec.anchor_x).abs() <= 2 * RUIN_FOOTPRINT_HALF
+                    && (other.anchor_z - spec.anchor_z).abs() <= 2 * RUIN_FOOTPRINT_HALF
+            });
+            if overlapped_by_ruin {
+                continue;
+            }
+
+            let mut has_log = false;
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    let wx = spec.anchor_x + dx;
+                    let wz = spec.anchor_z + dz;
+                    for wy in (spec.surface + 1)..=(spec.surface + TREE_CANOPY_HEADROOM) {
+                        let pos =
+                            ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                        let chunk = cache
+                            .entry((pos.x, pos.y, pos.z))
+                            .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
+                        let block = chunk.get(
+                            wx.rem_euclid(ch) as usize,
+                            wy.rem_euclid(ch) as usize,
+                            wz.rem_euclid(ch) as usize,
+                        );
+                        if block == BlockId::OakLog {
+                            has_log = true;
+                        }
+                    }
+                }
+            }
+            if !has_log {
+                continue;
+            }
+            checked += 1;
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
+                        continue;
+                    }
+                    let wx = spec.anchor_x + dx;
+                    let wz = spec.anchor_z + dz;
+                    let top = ruin_cell_top(dx, dz, spec.wall_height);
+                    for level in ruin_cell_bottom(dx, dz)..=top {
+                        let wy = spec.surface + level;
+                        let pos =
+                            ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                        let chunk = cache
+                            .entry((pos.x, pos.y, pos.z))
+                            .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
+                        let block = chunk.get(
+                            wx.rem_euclid(ch) as usize,
+                            wy.rem_euclid(ch) as usize,
+                            wz.rem_euclid(ch) as usize,
+                        );
+                        assert!(
+                            !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                            "anchor ({}, {}) overlaps a tree but still placed {block:?} at ({wx}, {wy}, {wz})",
+                            spec.anchor_x,
+                            spec.anchor_z
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 1,
+            "no ruin anchor overlapped a tree, so the skip policy was never exercised"
+        );
+    }
+
+    /// Spawn clearance: the row of ruin tests the spawn search shares the ruin
+    /// rule, so no spawn column is inside a footprint, and the generated spawn
+    /// body stays Air.
+    #[test]
+    fn test_find_spawn_column_avoids_ruin_footprints() {
+        for seed in [DEFAULT_WORLD_SEED, 12345, 9, 4, 0x5EED_4A11] {
+            let (wx, wz) = find_spawn_column(seed);
+            assert_eq!(
+                ruin_covering(wx, wz, seed),
+                None,
+                "seed {seed} spawn ({wx}, {wz}) is inside a ruin footprint"
+            );
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            let ch = CHUNK_SIZE as i32;
+            let chunk = generate_chunk_seeded(
+                ChunkPos::new(wx.div_euclid(ch), (h + 1).div_euclid(ch), wz.div_euclid(ch)),
+                seed,
+                Season::Summer,
+            );
+            for dy in 1..=4 {
+                let wy = h + dy;
+                let block = chunk.get(
+                    wx.rem_euclid(ch) as usize,
+                    wy.rem_euclid(ch) as usize,
+                    wz.rem_euclid(ch) as usize,
+                );
+                assert!(
+                    !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                    "seed {seed} spawn body at ({wx}, {wy}, {wz}) holds ruin block {block:?}"
+                );
+            }
+        }
+
+        // Non-vacuity: a Plains ruin column that is otherwise spawn-eligible
+        // (dry land, no oak within the tree clearance) must still be rejected.
+        let seed = DEFAULT_WORLD_SEED;
+        let candidate = ruin_anchors_in_region(2, seed)
+            .into_iter()
+            .find(|spec| {
+                let (wx, wz) = (spec.anchor_x, spec.anchor_z);
+                if biome_at_seeded(wx, wz, seed) != Biome::Plains {
+                    return false;
+                }
+                for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                    for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                        let nh = terrain_height_at_seeded(wx + dx, wz + dz, seed);
+                        let nb = biome_for_height(nh, forest_noise(wx + dx, wz + dz, seed));
+                        if tree_trunk_height(wx + dx, wz + dz, nh, nb, seed).is_some() {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .expect("no tree-free Plains ruin anchor in the scan region");
+        assert!(
+            !is_spawn_safe(candidate.anchor_x, candidate.anchor_z, seed),
+            "is_spawn_safe accepted ruin anchor ({}, {})",
+            candidate.anchor_x,
+            candidate.anchor_z
+        );
     }
 
     /// Negative: a fixed set of chunk positions spanning all four biomes
