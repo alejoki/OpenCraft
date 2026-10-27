@@ -1546,9 +1546,8 @@ mod tests {
             "an empty static buffer must skip the draw, not record an empty one"
         );
         assert!(
-            src[..weather_at].contains(
-                "if let Some((stage, (base_vertex, vertex_count))) = weather_draw"
-            ),
+            src[..weather_at]
+                .contains("if let Some((stage, (base_vertex, vertex_count))) = weather_draw"),
             "the precip draw must be guarded by the pure weather gating decision"
         );
 
@@ -1680,20 +1679,28 @@ mod tests {
 
     #[test]
     fn vista_sky_params_use_the_pinned_golden_hour() {
-        // Source pin: the vista arm must pass VISTA_GOLDEN_HOUR (S02's single
-        // home for the constant) rather than the world clock, and the session
-        // arm must pass the live clock. Both go through `sky_params`, whose
-        // third argument is the S04-T03 underwater flag: the vista panorama
-        // anchors over land so it pins `false`, while the session arm feeds the
-        // per-frame eye-submersion lookup through.
+        // Source pin: the vista arm must go through `vista_sky_params`
+        // (VISTA_GOLDEN_HOUR's single home for the constant) rather than the
+        // world clock, and the session arm must pass the live clock plus the
+        // per-frame weather derivation. The vista arm pins weather Clear and
+        // the identity fog factor inside the helper, so the panorama is
+        // byte-identical to pre-S06 output and never draws precipitation.
         let src = include_str!("../main.rs");
         assert!(
-            src.contains("sky_params(palette, daycycle::VISTA_GOLDEN_HOUR, false)"),
+            src.contains("vista_sky_params(palette)"),
             "vista frames must pin the sky time to golden hour and stay dry"
         );
         assert!(
-            src.contains("sky_params(palette, self.session.clock.time_of_day, underwater)"),
-            "session frames must follow the live clock and the submersion lookup"
+            src.contains("let weather = session_weather(&self.session);"),
+            "session frames must derive weather per frame from the calendar"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "the session arm must exercise the empty ambient-audio seam"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the weather phase must follow the live game clock"
         );
         assert!(
             src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),

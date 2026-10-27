@@ -64,7 +64,7 @@ use opencraft::world::persistence::{
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-use opencraft::world::season::Weather;
+use opencraft::world::season::{season_of, weather_of, Weather};
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -690,27 +690,71 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
     lines.join("\n")
 }
 
+/// The live weather of a session, derived purely from its persisted calendar.
+///
+/// `weather_of(season_of(day_index, season_length_days, seed), day_index,
+/// seed)` — the same three persisted scalars S05's season derivation reads,
+/// never the wall clock and never anything the player did. Deliberately *not*
+/// cached: the slice's anti-goal is that no `Weather` value lives outside the
+/// per-frame derivation, and the cost is one small FNV hash plus a match.
+///
+/// A free function over `&WorldSession` rather than a `WorldSession` method:
+/// the Playing render arm runs with the `gpu` and `window` field borrows live
+/// (P005), so only plain-field reads and free-function calls are usable there.
+fn session_weather(session: &WorldSession) -> Weather {
+    let day_index = session.clock.day_index;
+    let seed = session.world.seed();
+    weather_of(
+        season_of(day_index, session.season_length_days, seed),
+        day_index,
+        seed,
+    )
+}
+
+/// Weather ambient-audio seam — deliberately empty in M007.
+///
+/// There is no looped-ambient engine in `src/audio` (MEM227): [`AudioEngine`]
+/// only plays one-shot [`SoundBuffer`]/[`SoundSlot`] samples, and every
+/// playback call in this file lives in the three input arms (place, break,
+/// UI), never in a render path (MEM168/MEM169/MEM171). Adding weather audio
+/// would mean a new looping engine plus per-frame gain management, which is
+/// explicitly out of M007's scope.
+///
+/// The hook exists so the frame where a weather state is derived has a named
+/// seam instead of a comment, and so M008+ has exactly one place to wire
+/// ambient sound. It stays internal and is NOT pack-overridable: packs ship
+/// sample buffers, not callbacks. It contains no playback call and owns no
+/// engine handle. Called once per session frame; as a no-op the call is free.
+fn weather_ambient_hook(_weather: Weather) {}
+
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
-/// Session frames use the live clock's palette *and* its
+/// Session frames use the live clock's weather-tinted palette *and* its
 /// `clock.time_of_day`; vista frames use the pinned
-/// [`daycycle::VISTA_GOLDEN_HOUR`] palette and that same constant as the sky
-/// time, never deriving either from the world clock or `vista_epoch` (that
-/// only drives camera drift). Passing the constant here is what makes the
-/// golden-hour sun appear: `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above
-/// the eastern horizon.
-fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32, underwater: bool) -> SkyParams {
+/// [`daycycle::VISTA_GOLDEN_HOUR`] palette (see [`vista_sky_params`]) and that
+/// same constant as the sky time, never deriving either from the world clock
+/// or `vista_epoch` (that only drives camera drift). Passing the constant here
+/// is what makes the golden-hour sun appear:
+/// `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above the eastern horizon.
+fn sky_params(
+    palette: daycycle::SkyPalette,
+    time_of_day: u32,
+    underwater: bool,
+    weather: Weather,
+    fog_range_factor: f32,
+    weather_phase: f32,
+) -> SkyParams {
     SkyParams {
         time_of_day,
         underwater,
         day_factor: palette.day_factor,
-        // Weather fields are pipelined through `SkyParams` here with the
-        // identity defaults (Clear / 1.0 / 0.0) so the renderer compiles and
-        // the dry path stays byte-identical. The session arm that derives the
-        // live weather from the persisted calendar feeds them next.
-        weather: Weather::Clear,
-        fog_range_factor: 1.0,
-        weather_phase: 0.0,
+        // Weather travels through the same grouped struct so render_frame's
+        // 10-argument signature did not grow. Only the session arm feeds live
+        // values; the vista arm pins Clear / 1.0 / 0.0 so the panorama stays
+        // byte-identical to pre-S06 output and never draws precipitation.
+        weather,
+        fog_range_factor,
+        weather_phase,
         fog_color: [
             palette.fog_color[0],
             palette.fog_color[1],
@@ -724,6 +768,24 @@ fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32, underwater: bool)
             a: 1.0,
         },
     }
+}
+
+/// Sky inputs for the pinned golden-hour vista panorama.
+///
+/// The panorama is the menu backdrop rendered from its own static world (see
+/// [`vista::vista_camera`]) and never reads the session calendar, so it also
+/// never derives weather. Clear + the exact identity fog factor + phase 0.0
+/// keep vista frames byte-identical to pre-S06 output and mean the precip draw
+/// is skipped on every menu frame.
+fn vista_sky_params(palette: daycycle::SkyPalette) -> SkyParams {
+    sky_params(
+        palette,
+        daycycle::VISTA_GOLDEN_HOUR,
+        false,
+        Weather::Clear,
+        daycycle::CLEAR_FOG_RANGE_FACTOR,
+        0.0,
+    )
 }
 
 /// True when the camera's eye sits inside a liquid block.
@@ -3392,6 +3454,8 @@ impl ApplicationHandler for GameApp {
                 let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
                     // Vista sky is pinned at golden hour: never the world clock
                     // and never `vista_epoch` (that only drifts the camera).
+                    // Weather is pinned Clear inside `vista_sky_params`, so the
+                    // panorama stays byte-identical and never draws precip.
                     let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
@@ -3403,18 +3467,29 @@ impl ApplicationHandler for GameApp {
                         false,
                         // Vista frames render the panorama from its own world,
                         // whose camera anchors over land: never submerged.
-                        sky_params(palette, daycycle::VISTA_GOLDEN_HOUR, false),
+                        vista_sky_params(palette),
                         ui_pass,
                     )
                 } else {
                     // Per-frame palette from the live session clock (pure math,
                     // cheap — same rationale as the per-frame vista camera).
                     let palette = daycycle::sky_palette(self.session.clock.time_of_day);
+                    // Per-frame weather, derived from the persisted calendar
+                    // only: no `Weather` value is cached anywhere, so the
+                    // calendar remains the sole home of the weather state. A
+                    // paused frame renders a frozen clock and therefore frozen
+                    // weather — consistent, with no special case.
+                    let weather = session_weather(&self.session);
+                    // The ambient-audio seam is exercised on every session
+                    // frame and is a deliberate no-op in M007 (MEM227).
+                    weather_ambient_hook(weather);
+                    let palette = daycycle::weather_palette(palette, weather);
                     // Eye submersion (S04-T03): one bounded block lookup per
                     // session frame against the live eye position (synced from
                     // `player.eye_position()` above), never a scan. It flips the
                     // world-pass fog to the deep-water shift while the camera is
-                    // inside an ocean.
+                    // inside an ocean, and it takes precedence over the weather
+                    // fog compression inside `effective_fog`.
                     let underwater =
                         eye_is_submerged(&self.session.world, self.session.camera.position);
                     gpu.renderer.render_frame(
@@ -3425,7 +3500,14 @@ impl ApplicationHandler for GameApp {
                         target_block,
                         self.session.player.selected_slot(),
                         playing,
-                        sky_params(palette, self.session.clock.time_of_day, underwater),
+                        sky_params(
+                            palette,
+                            self.session.clock.time_of_day,
+                            underwater,
+                            weather,
+                            daycycle::weather_fog_range_factor(weather),
+                            self.session.clock.cycle_phase(),
+                        ),
                         ui_pass,
                     )
                 };
@@ -8718,17 +8800,35 @@ mod tests {
             (0u32, [0.96f32, 0.66, 0.42], [0.92f32, 0.68, 0.48]),
         ];
         for (tick, sky, fog) in cases {
-            let params = sky_params(daycycle::sky_palette(tick), tick, false);
+            let params = sky_params(
+                daycycle::sky_palette(tick),
+                tick,
+                false,
+                Weather::Clear,
+                daycycle::CLEAR_FOG_RANGE_FACTOR,
+                0.0,
+            );
             assert_eq!(params.time_of_day, tick);
             assert_eq!(params.clear_color.r, sky[0] as f64);
             assert_eq!(params.clear_color.g, sky[1] as f64);
             assert_eq!(params.clear_color.b, sky[2] as f64);
             assert_eq!(params.clear_color.a, 1.0);
             assert_eq!(params.fog_color, [fog[0], fog[1], fog[2], 1.0]);
+            // The Clear identity keeps the pre-S06 dry path unchanged.
+            assert_eq!(params.weather, Weather::Clear);
+            assert_eq!(params.fog_range_factor, 1.0);
+            assert_eq!(params.weather_phase, 0.0);
         }
 
         // The midnight clear/fog must equal the NIGHT keyframe exactly.
-        let midnight = sky_params(daycycle::sky_palette(18_000), 18_000, false);
+        let midnight = sky_params(
+            daycycle::sky_palette(18_000),
+            18_000,
+            false,
+            Weather::Clear,
+            daycycle::CLEAR_FOG_RANGE_FACTOR,
+            0.0,
+        );
         let night = daycycle::sky_palette(18_000);
         assert_eq!(midnight.clear_color.r, night.sky_color[0] as f64);
         assert_eq!(midnight.clear_color.g, night.sky_color[1] as f64);
@@ -8744,6 +8844,185 @@ mod tests {
         );
         assert_eq!(midnight.day_factor, night.day_factor);
         assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
+    /// S06-T04: session weather is exactly the pure calendar derivation over
+    /// the persisted scalars, never a cache. The seed-1 year at one-day
+    /// seasons is the slice's demo calendar (Rain -> Clear -> Rain ->
+    /// Snowfall), driven across four real `advance_secs` day boundaries.
+    #[test]
+    fn session_weather_derives_the_seed_one_year_from_the_persisted_calendar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("weather-year.mcvx");
+        let mut session = WorldSession::new_session(1, save_path, 1);
+        assert_eq!(session.clock.day_index, 0);
+        assert_eq!(session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+
+        // Hand-derived rolls for seed 1: day 0 Spring roll 18 (< 30) -> Rain;
+        // day 1 Summer roll 25 (>= 20) -> Clear; day 2 Autumn roll 32 (< 35)
+        // -> Rain; day 3 Winter roll 23 (< 40) -> Snowfall.
+        let expected = [
+            Weather::Rain,
+            Weather::Clear,
+            Weather::Rain,
+            Weather::Snowfall,
+        ];
+        for (day, want) in expected.into_iter().enumerate() {
+            let day = day as u32;
+            assert_eq!(
+                session.clock.day_index, day,
+                "test premise: the previous boundary crossed exactly one day"
+            );
+            let derived = session_weather(&session);
+            assert_eq!(derived, want, "day {day} of the seed-1 year");
+            // The session seam must equal the pure derivation exactly: this is
+            // the no-cache invariant, not merely a same-shaped helper.
+            assert_eq!(
+                derived,
+                weather_of(
+                    season_of(
+                        session.clock.day_index,
+                        session.season_length_days,
+                        session.world.seed(),
+                    ),
+                    session.clock.day_index,
+                    session.world.seed(),
+                )
+            );
+            // Cross the next day through the real clock seam: 1,200 real
+            // seconds at scale 1.0 is exactly DAY_TICKS, so the clock lands on
+            // the same time-of-day one day later.
+            session.clock.advance_secs(daycycle::DAY_SECONDS, 1.0);
+        }
+
+        // Day 4 wraps the year back to Spring, so the pattern repeats.
+        assert_eq!(session.clock.day_index, 4);
+        assert_eq!(session_weather(&session), Weather::Rain);
+    }
+
+    /// S06-T04: fixed (seed, season_length, day) calendars all round-trip
+    /// through the session seam. Includes `season_length_days == 0`, which
+    /// persistence clamps but the pure calendar defensively treats as one day.
+    #[test]
+    fn session_weather_matches_the_pure_calendar_for_fixed_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (0u32, 1u32, 0u32),
+            (42, 2, 3),
+            (12_345, 4, 9),
+            (0xDEAD_BEEF, 8, 30),
+            (7, 0, 5),
+        ];
+        for (seed, length, day) in cases {
+            let save_path = dir.path().join(format!("cal-{seed}-{length}-{day}.mcvx"));
+            let mut session = WorldSession::new_session(seed, save_path, length);
+            session.clock =
+                daycycle::GameClock::from_day_and_time(day, daycycle::DEFAULT_TIME_OF_DAY);
+            assert_eq!(
+                session_weather(&session),
+                weather_of(season_of(day, length, seed), day, seed),
+                "seed {seed}, season length {length}, day {day}"
+            );
+        }
+    }
+
+    /// S06-T04: weather reaches the render inputs, and the vista arm is pinned
+    /// to the Clear identity so the menu panorama stays byte-identical and
+    /// never draws precipitation.
+    #[test]
+    fn weather_reaches_sky_params_and_the_vista_arm_stays_clear() {
+        let base = daycycle::sky_palette(daycycle::DEFAULT_TIME_OF_DAY);
+        let tinted = daycycle::weather_palette(base, Weather::Rain);
+        let params = sky_params(
+            tinted,
+            daycycle::DEFAULT_TIME_OF_DAY,
+            false,
+            Weather::Rain,
+            daycycle::weather_fog_range_factor(Weather::Rain),
+            12_345.5,
+        );
+        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.fog_range_factor, 0.75);
+        assert_eq!(params.weather_phase, 12_345.5);
+        assert_eq!(params.clear_color.r, tinted.sky_color[0] as f64);
+        assert_eq!(params.fog_color[0], tinted.fog_color[0]);
+        assert_ne!(tinted, base, "rain must tint the palette before upload");
+
+        // Vista frames construct Clear + identity, so the panorama is
+        // byte-identical to pre-S06 and the precip draw is skipped.
+        let vista = vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR));
+        assert_eq!(vista.time_of_day, daycycle::VISTA_GOLDEN_HOUR);
+        assert_eq!(vista.weather, Weather::Clear);
+        assert_eq!(vista.fog_range_factor, 1.0);
+        assert_eq!(vista.weather_phase, 0.0);
+        assert!(!vista.underwater);
+
+        // Source pin: the vista render arm actually calls the helper above, so
+        // those pinned values are the production vista path, not dead code.
+        let src = include_str!("main.rs");
+        let vista_arm = src
+            .split("let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);")
+            .nth(1)
+            .and_then(|rest| rest.split("} else {").next())
+            .expect("the vista render arm must be present");
+        assert!(
+            vista_arm.contains("vista_sky_params(palette)"),
+            "vista frames must render through the pinned Clear-weather sky inputs"
+        );
+    }
+
+    /// S06-T04: the playing render arm derives weather per frame (no cache) and
+    /// exercises the ambient-audio seam on every session frame. Source-pinned
+    /// because the arm itself needs a live GPU and window.
+    #[test]
+    fn session_render_arm_derives_weather_per_frame_and_calls_the_audio_seam() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let weather = session_weather(&self.session);"),
+            "the session arm must derive weather per frame, not cache it"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "every session frame must exercise the audio seam"
+        );
+        assert!(
+            src.contains("let palette = daycycle::weather_palette(palette, weather);"),
+            "the session palette must be weather-tinted before upload"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the fall animation phase must come from the persisted game clock"
+        );
+    }
+
+    /// S06-T04: the audio hook is a named seam only. Calling it is free (the
+    /// unit return type is compile-time proof), and a source pin keeps the
+    /// M007 body empty: no playback call and no engine handle may appear
+    /// inside the seam (MEM168/MEM169/MEM171, MEM227).
+    #[test]
+    fn weather_ambient_hook_is_an_honestly_empty_noop_seam() {
+        weather_ambient_hook(Weather::Clear);
+        weather_ambient_hook(Weather::Rain);
+        weather_ambient_hook(Weather::Snowfall);
+
+        let src = include_str!("main.rs");
+        let line = src
+            .lines()
+            .find(|line| line.contains("fn weather_ambient_hook("))
+            .expect("the weather ambient hook seam must exist");
+        assert_eq!(
+            line.trim(),
+            "fn weather_ambient_hook(_weather: Weather) {}",
+            "the M007 seam must stay a genuinely empty single-line body"
+        );
+        assert!(
+            !line.contains("play("),
+            "M007 weather audio is a stub: the seam must not play anything"
+        );
+        assert!(
+            !line.contains("AudioEngine"),
+            "the seam must own no audio engine in M007"
+        );
     }
 
     /// S04-T03: submersion is one floored block lookup against the live world.
