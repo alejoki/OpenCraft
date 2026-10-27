@@ -65,7 +65,9 @@ use opencraft::world::persistence::{
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Weather};
-use opencraft::world::terrain::DEFAULT_WORLD_SEED;
+use opencraft::world::terrain::{
+    biome_at_seeded, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
+};
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
 
@@ -838,7 +840,16 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // the `--season-length` CLI seam override it on this branch only. A load
     // branch above never reaches here, so a persisted calendar always wins
     // over a launch flag.
-    WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length)
+    let mut session = WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length);
+    // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
+    // onto the pinned route. The load branch above returns before this, so a
+    // resumed save is never moved — its own position is the contract there.
+    if cli.demo_swim {
+        if let Some(route) = swim_route(seed) {
+            arm_swim_route(&mut session, route);
+        }
+    }
+    session
 }
 
 /// Apply a S01-confirmed pending delete through the live catalog and
@@ -1250,11 +1261,560 @@ fn observe_demo_cycle(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted ocean-crossing demo (`--demo-swim`, S08-T02)
+// ---------------------------------------------------------------------------
+
+/// Forward axis of the scripted swim. S03 proved the crossing on +Z from the
+/// origin for seed 12345; the seam deliberately pins the same axis so the
+/// headless proof and the real-binary seam describe one route.
+const SWIM_AXIS: &str = "+Z";
+
+/// Yaw whose flat forward vector is exactly +Z (`(cos yaw, 0, sin yaw)`).
+const SWIM_YAW: f32 = std::f32::consts::FRAC_PI_2;
+
+/// Spawn height above the sea level plane (S03 drops the body from here into
+/// the ocean column; 3 blocks clears the water surface at `SEA_LEVEL + 1`).
+const SWIM_START_ABOVE_SEA: f32 = 3.0;
+
+/// Bounded scan windows for the route: an ocean column within 512 blocks of
+/// the origin along +Z, and the first land column within 4096 blocks after it.
+/// Identical to the S03 acceptance proof's scan, so the route the demo swims
+/// is the route the headless test bounds.
+const SWIM_OCEAN_SCAN_BLOCKS: i32 = 512;
+const SWIM_SHORE_SCAN_BLOCKS: i32 = 4096;
+
+/// Top face of the water column (`SEA_LEVEL` is the last water block).
+const SWIM_WATER_TOP: f32 = SEA_LEVEL as f32 + 1.0;
+
+/// How far above the spawn column's seabed a floating body must stay. Mirrors
+/// the S03 `SEABED_MARGIN`, so "the body sank" means the same thing in both
+/// surfaces.
+const SWIM_SEABED_MARGIN: f32 = 2.0;
+
+/// Stage budgets mirrored from the S03 harness's frame caps at its fixed
+/// 1/60 s step (600 entry / 180 float / 120 rise / 9000 crossing frames).
+///
+/// They are expressed in seconds of simulated time rather than frames because
+/// the production frame loop is uncapped: a frame budget that is safe at 60 Hz
+/// would cut a 300 fps run off after a fraction of the same simulated motion.
+/// The watcher accumulates the same `dt` the player update consumes (clamped
+/// exactly like `Player::update` clamps it), so the bound is frame-rate
+/// independent and still frames the S03 phase boundaries.
+const SWIM_ENTRY_SECS: f32 = 10.0;
+const SWIM_FLOAT_SECS: f32 = 3.0;
+const SWIM_RISE_SECS: f32 = 2.0;
+const SWIM_CROSSING_SECS: f32 = 150.0;
+
+/// Mirrors `Player::update`'s per-step clamp, so the watcher's simulated-time
+/// budget advances exactly as far as the physics did.
+const SWIM_STEP_CAP: f32 = 0.1;
+
+/// Wall-clock safety net for the scripted swim, independent of `time_scale`:
+/// the accelerated-demo deadline only arms above 1x, and the swim deliberately
+/// runs at the default scale (no seasonal terrain rollover mid-crossing).
+const SWIM_DEADLINE_SECS: u64 = 360;
+
+/// The scripted crossing's pinned geometry, resolved once at startup from the
+/// same pure terrain functions the chunk generator uses.
+///
+/// For seed 12345 this is the S03 route: an Ocean column at the world origin
+/// (`h = 14`) and the first land column at or above `SEA_LEVEL` along +Z.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SwimRoute {
+    seed: u32,
+    /// Feet position the fresh-world launch teleports to (column centre, above
+    /// the water surface, facing +Z).
+    start: Vec3,
+    /// Column index along +Z where the ocean starts (the route's near end).
+    ocean_start_z: i32,
+    /// Column index along +Z of the first land at or above `SEA_LEVEL` (the
+    /// far shore the demo must reach).
+    land_z: i32,
+    /// Terrain height of the spawn column, below `SEA_LEVEL`; the sink guard's
+    /// reference.
+    seabed_height: i32,
+}
+
+impl SwimRoute {
+    /// Crossing length in blocks: ocean start column to far-shore column.
+    fn distance(&self) -> i32 {
+        self.land_z - self.ocean_start_z
+    }
+}
+
+/// Resolve the scripted crossing for `seed` with no chunks allocated: scan +Z
+/// from the origin for an Ocean column below `SEA_LEVEL`, then for the first
+/// column at or above `SEA_LEVEL` (the far shore). `None` when either bound is
+/// missing, so a seed without a usable crossing produces an honest abort
+/// digest instead of swimming at nothing.
+fn swim_route(seed: u32) -> Option<SwimRoute> {
+    let ocean_start_z = (0..SWIM_OCEAN_SCAN_BLOCKS).find(|&d| {
+        biome_at_seeded(0, d, seed) == Biome::Ocean
+            && terrain_height_at_seeded(0, d, seed) < SEA_LEVEL
+    })?;
+    let land_z = (ocean_start_z + 1..SWIM_SHORE_SCAN_BLOCKS)
+        .find(|&d| terrain_height_at_seeded(0, d, seed) >= SEA_LEVEL)?;
+    let seabed_height = terrain_height_at_seeded(0, ocean_start_z, seed);
+    Some(SwimRoute {
+        seed,
+        start: Vec3::new(
+            0.5,
+            SEA_LEVEL as f32 + SWIM_START_ABOVE_SEA,
+            ocean_start_z as f32 + 0.5,
+        ),
+        ocean_start_z,
+        land_z,
+        seabed_height,
+    })
+}
+
+/// Teleport a freshly constructed session onto the scripted route: column
+/// centre, above the water surface, facing +Z, walk mode on (a flying body
+/// would never enter the water). Loaded saves never call this — the fresh-world
+/// startup branch is the only caller.
+fn arm_swim_route(session: &mut WorldSession, route: SwimRoute) {
+    session.player.position = route.start;
+    session.player.velocity = Vec3::ZERO;
+    session.player.yaw = SWIM_YAW;
+    session.player.pitch = 0.0;
+    session.player.on_ground = false;
+    session.player.fly_mode = false;
+    session.sync_camera();
+}
+
+/// The four S03 phases plus the terminal landed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwimStage {
+    Entry,
+    Float,
+    Rise,
+    Crossing,
+    Landed,
+}
+
+impl SwimStage {
+    /// The stage name used in abort diagnostics and by the headless stage
+    /// tests, so a failure names the same phase S03 names.
+    #[cfg(test)]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Float => "float",
+            Self::Rise => "rise",
+            Self::Crossing => "crossing",
+            Self::Landed => "landed",
+        }
+    }
+}
+
+/// One frame's verdict from the stage watcher.
+#[derive(Debug, PartialEq, Eq)]
+enum SwimProgress {
+    Continue,
+    Landed,
+    Aborted {
+        stage: &'static str,
+        observed: String,
+    },
+}
+
+/// The scripted input for a stage, as a constructed copy.
+///
+/// The seam never mutates `GameApp::input`: the real input path stays
+/// byte-identical, and this copy is what a bounded phase supplies instead.
+/// Entry and float are idle (buoyancy must float the body unaided), rise holds
+/// `jump_or_up` (the S03 rise phase), and crossing holds `forward` (the S03
+/// crossing phase). The stage itself is the bounded cadence: each phase has a
+/// budget, so the keys can never be held past their window.
+fn swim_scripted_input(stage: SwimStage) -> InputState {
+    match stage {
+        SwimStage::Rise => InputState {
+            jump_or_up: true,
+            ..InputState::default()
+        },
+        SwimStage::Crossing => InputState {
+            forward: true,
+            ..InputState::default()
+        },
+        SwimStage::Entry | SwimStage::Float | SwimStage::Landed => InputState::default(),
+    }
+}
+
+/// Bounded, stage-naming watcher for the scripted crossing — the swim twin of
+/// [`DemoCycleWatch`].
+///
+/// It observes the production player after every scripted `Player::update`
+/// call and advances through S03's phases: entry (the feet block becomes
+/// water), float (a band near the sea surface, never `on_ground`), rise
+/// (`jump_or_up` clears the water surface), crossing (reach the land target
+/// standing on land above `SEA_LEVEL`). Every abort names the stage and the
+/// observed values, so a stalled run is diagnosable from its one digest line.
+#[derive(Debug)]
+struct SwimWatch {
+    route: SwimRoute,
+    stage: SwimStage,
+    /// Scripted frames stepped (the digest's `frames` value). Warm-up frames
+    /// spent waiting for the spawn column to stream in are deliberately not
+    /// counted: they are not frames of the crossing.
+    frames: usize,
+    /// Simulated seconds spent in the current stage.
+    stage_elapsed: f32,
+    float_min_y: f32,
+    float_max_y: f32,
+    rise_max_y: f32,
+    rise_submerged_frames: usize,
+    crossing_water_frames: usize,
+}
+
+impl SwimWatch {
+    fn new(route: SwimRoute) -> Self {
+        Self {
+            route,
+            stage: SwimStage::Entry,
+            frames: 0,
+            stage_elapsed: 0.0,
+            float_min_y: f32::MAX,
+            float_max_y: f32::MIN,
+            rise_max_y: f32::MIN,
+            rise_submerged_frames: 0,
+            crossing_water_frames: 0,
+        }
+    }
+
+    fn input(&self) -> InputState {
+        swim_scripted_input(self.stage)
+    }
+
+    fn advance(&mut self, stage: SwimStage) {
+        self.stage = stage;
+        self.stage_elapsed = 0.0;
+    }
+
+    /// `float_band` cell: `min..max` once the float phase ran, `none` before.
+    fn float_band(&self) -> String {
+        if self.float_min_y <= self.float_max_y {
+            format!("{:.3}..{:.3}", self.float_min_y, self.float_max_y)
+        } else {
+            "none".to_string()
+        }
+    }
+
+    /// `rise` cell: the highest feet position reached while rising, if any.
+    fn rise_peak(&self) -> String {
+        if self.rise_max_y > f32::MIN {
+            format!("{:.3}", self.rise_max_y)
+        } else {
+            "none".to_string()
+        }
+    }
+
+    fn head(&self) -> String {
+        format!(
+            "swim_demo: seed={} axis={} distance={} frames={} float_band={} rise={}",
+            self.route.seed,
+            SWIM_AXIS,
+            self.route.distance(),
+            self.frames,
+            self.float_band(),
+            self.rise_peak(),
+        )
+    }
+
+    /// The success digest, printed once on the demo-shutdown path.
+    fn digest(&self) -> String {
+        format!("{} landed=true", self.head())
+    }
+
+    /// The self-describing abort digest: same fields plus the stage and the
+    /// values observed at the failure.
+    fn abort_digest(&self, stage: &'static str, observed: &str) -> String {
+        format!(
+            "{} landed=false stage={} observed={}",
+            self.head(),
+            stage,
+            observed
+        )
+    }
+
+    /// A compact "what the player was doing" cell for abort messages.
+    fn observed(position: Vec3, on_ground: bool, feet_liquid: bool) -> String {
+        format!(
+            "y={:.3} z={:.3} on_ground={} feet_liquid={}",
+            position.y, position.z, on_ground, feet_liquid
+        )
+    }
+
+    /// Feed one scripted frame's post-physics state. `step` is the simulated
+    /// seconds the player update consumed (already clamped like the physics).
+    fn observe(
+        &mut self,
+        step: f32,
+        position: Vec3,
+        on_ground: bool,
+        feet_liquid: bool,
+    ) -> SwimProgress {
+        self.frames += 1;
+        self.stage_elapsed += step;
+        let seabed_floor = self.route.seabed_height as f32 + SWIM_SEABED_MARGIN;
+        let observed = Self::observed(position, on_ground, feet_liquid);
+        match self.stage {
+            SwimStage::Entry => {
+                if feet_liquid {
+                    self.advance(SwimStage::Float);
+                    return SwimProgress::Continue;
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "entry",
+                        observed: format!(
+                            "sank below the seabed margin before the feet block became water; \
+                             {observed} seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if self.stage_elapsed >= SWIM_ENTRY_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "entry",
+                        observed: format!(
+                            "feet block never became water within {SWIM_ENTRY_SECS:.1}s; {observed}"
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Float => {
+                self.float_min_y = self.float_min_y.min(position.y);
+                self.float_max_y = self.float_max_y.max(position.y);
+                if on_ground {
+                    return SwimProgress::Aborted {
+                        stage: "float",
+                        observed: format!(
+                            "a floating body touched ground (it walked the seabed); {observed}"
+                        ),
+                    };
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "float",
+                        observed: format!(
+                            "sank below the seabed margin while floating; {observed} \
+                             seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if self.stage_elapsed >= SWIM_FLOAT_SECS {
+                    let near_surface = self.float_min_y >= SEA_LEVEL as f32 - 1.5
+                        && self.float_max_y <= SEA_LEVEL as f32 + 2.0;
+                    if !near_surface {
+                        return SwimProgress::Aborted {
+                            stage: "float",
+                            observed: format!(
+                                "band {} is not near SEA_LEVEL {SEA_LEVEL} (expected within \
+                                 {:.1}..{:.1})",
+                                self.float_band(),
+                                SEA_LEVEL as f32 - 1.5,
+                                SEA_LEVEL as f32 + 2.0
+                            ),
+                        };
+                    }
+                    self.advance(SwimStage::Rise);
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Rise => {
+                self.rise_max_y = self.rise_max_y.max(position.y);
+                if feet_liquid {
+                    self.rise_submerged_frames += 1;
+                }
+                if on_ground {
+                    return SwimProgress::Aborted {
+                        stage: "rise",
+                        observed: format!("a rising body touched ground; {observed}"),
+                    };
+                }
+                if position.y > SWIM_WATER_TOP {
+                    self.advance(SwimStage::Crossing);
+                    return SwimProgress::Continue;
+                }
+                if self.stage_elapsed >= SWIM_RISE_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "rise",
+                        observed: format!(
+                            "jump_or_up never cleared the water surface y>{SWIM_WATER_TOP:.3} \
+                             within {SWIM_RISE_SECS:.1}s; {observed} peak={:.3} submerged_frames={}",
+                            self.rise_max_y, self.rise_submerged_frames
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Crossing => {
+                if feet_liquid {
+                    self.crossing_water_frames += 1;
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "sank below the seabed margin while crossing; {observed} \
+                             seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if position.z >= self.route.land_z as f32
+                    && on_ground
+                    && position.y > SEA_LEVEL as f32
+                {
+                    self.advance(SwimStage::Landed);
+                    return SwimProgress::Landed;
+                }
+                if self.stage_elapsed >= SWIM_CROSSING_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "never stood on the far shore z>={} above SEA_LEVEL {SEA_LEVEL} \
+                             within {SWIM_CROSSING_SECS:.1}s; {observed} water_frames={}",
+                            self.route.land_z, self.crossing_water_frames
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Landed => SwimProgress::Landed,
+        }
+    }
+}
+
+/// The `--demo-swim` seam's whole state: the resolved route, the armed watcher,
+/// the one latched digest, and the wall-clock deadline.
+#[derive(Debug)]
+struct SwimDemo {
+    seed: u32,
+    route: Option<SwimRoute>,
+    watch: Option<SwimWatch>,
+    /// The digest latched when the run ends (landing or abort). `about_to_wait`
+    /// prints it together with the frame-budget line, so the crate stays
+    /// log-free between demo seams (D006/MEM009, D086).
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status, so a bounded smoke can tell "ran and failed"
+    /// from "was killed by the harness timeout".
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+}
+
+impl SwimDemo {
+    fn new(seed: u32, route: Option<SwimRoute>, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            route,
+            watch: None,
+            digest: None,
+            failed: false,
+            deadline,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    fn finish_landed(&mut self) {
+        if self.finished() {
+            return;
+        }
+        if let Some(watch) = &self.watch {
+            self.digest = Some(watch.digest());
+        }
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins, so a
+    /// deadline that fires on the same frame as a stage abort cannot overwrite
+    /// the more specific message.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(match &self.watch {
+            Some(watch) => watch.abort_digest(stage, observed),
+            None => format!(
+                "swim_demo: seed={} axis={} distance=0 frames=0 float_band=none rise=none \
+                 landed=false stage={} observed={}",
+                self.seed, SWIM_AXIS, stage, observed
+            ),
+        });
+        self.failed = true;
+    }
+}
+
+/// Drive one Playing frame of the scripted swim through the production player
+/// update seam. Returns true when this frame ended the run (landed or
+/// aborted), so the caller latches the bounded-demo shutdown.
+///
+/// The first call waits (bounded by the swim deadline) for the spawn column's
+/// water block to stream in before arming the watcher. This is the production
+/// analogue of S03's warm-up gate: `get_block` answers Air for a non-resident
+/// chunk, and falling through that Air would look like a body that sank
+/// through the ocean. No scripted input is fed while waiting.
+fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    let Some(route) = demo.route else {
+        demo.abort("route", "no_ocean_crossing_for_this_seed");
+        return true;
+    };
+    if demo.watch.is_none() {
+        let water = session.world.get_block(0, SEA_LEVEL, route.ocean_start_z);
+        if water != BlockId::Water {
+            return false;
+        }
+        demo.watch = Some(SwimWatch::new(route));
+    }
+    let watch = demo
+        .watch
+        .as_mut()
+        .expect("watch is armed immediately above");
+    let input = watch.input();
+    session
+        .player
+        .update(dt, &input, |x, y, z| session.world.get_block(x, y, z));
+    let feet_liquid = session
+        .world
+        .get_block(
+            session.player.position.x.floor() as i32,
+            (session.player.position.y + 1e-4).floor() as i32,
+            session.player.position.z.floor() as i32,
+        )
+        .is_liquid();
+    let progress = watch.observe(
+        dt.clamp(0.0, SWIM_STEP_CAP),
+        session.player.position,
+        session.player.on_ground,
+        feet_liquid,
+    );
+    match progress {
+        SwimProgress::Continue => false,
+        SwimProgress::Landed => {
+            demo.finish_landed();
+            true
+        }
+        SwimProgress::Aborted { stage, observed } => {
+            demo.abort(stage, &observed);
+            true
+        }
+    }
+}
+
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
 /// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
 /// under this; the cap only guarantees bounded memory if a run is left going.
 const FRAME_BUDGET_SAMPLE_CAP: usize = 120_000;
-
 /// The operational frame-time target quoted in the digest (MEM229): a bounded
 /// release run must hold p95 wall frame time at or under one 60 Hz frame.
 const FRAME_BUDGET_TARGET_MS: f64 = 16.6;
@@ -1544,6 +2104,14 @@ struct GameApp {
     /// scripted demo seams as they are added). Gates the one shutdown digest
     /// line so a normal run stays log-free (D086, D006/MEM009).
     demo_seam_ran: bool,
+    /// Scripted ocean-crossing seam (`--demo-swim`, S08-T02). `None` for every
+    /// normal run; a launch flag arms it and the fresh-world branch has already
+    /// teleported the player onto the route.
+    swim: Option<SwimDemo>,
+    /// Whether a failed demo seam requests a non-zero process status. Set by a
+    /// self-describing swim abort; `main` reads it after the event loop exits
+    /// (the shutdown path itself cannot set a process status).
+    exit_failure: bool,
 }
 
 impl GameApp {
@@ -1602,6 +2170,22 @@ impl GameApp {
         // frame-driven cycle watch still completes them).
         let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
             demo_shutdown_deadline(cli.time_scale, cli.demo_days)
+        } else {
+            None
+        };
+        // Scripted ocean-crossing seam (S08-T02): armed by `--demo-swim`. The
+        // route is resolved from the SESSION's seed (the world actually being
+        // played) with the same pure scan S03 bounds, and the wall-clock
+        // deadline is independent of `time_scale` because the accelerated-demo
+        // deadline above never arms at the default scale the swim runs at.
+        let swim = if cli.demo_swim {
+            let seed = session.world.seed();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(SWIM_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(SwimDemo::new(seed, swim_route(seed), deadline))
         } else {
             None
         };
@@ -1666,6 +2250,8 @@ impl GameApp {
             demo_shutdown_deadline,
             frame_budget: FrameBudgetSampler::new(),
             demo_seam_ran: false,
+            swim,
+            exit_failure: false,
         }
     }
 
@@ -1963,6 +2549,10 @@ impl GameApp {
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
         self.demo_seam_ran = false;
+        // The scripted swim belongs to the LAUNCH (the fresh-world startup
+        // branch that teleported the player), never to a session created from
+        // the menu: swapping worlds retires the seam with the old world.
+        self.swim = None;
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -3121,9 +3711,27 @@ impl ApplicationHandler for GameApp {
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
                     if gameplay {
-                        self.session.player.update(dt, &self.input, |x, y, z| {
-                            self.session.world.get_block(x, y, z)
-                        });
+                        // Scripted swim seam (S08-T02): while armed it feeds a
+                        // constructed `InputState` copy through the SAME
+                        // `Player::update` call the real input path uses.
+                        // `self.input` is never mutated, and the seam never runs
+                        // on menu/pause/inventory frames. A finished frame
+                        // latches the bounded-demo shutdown below.
+                        let swim_finished = match self.swim.as_mut() {
+                            Some(demo) => swim_frame(demo, &mut self.session, dt),
+                            None => {
+                                self.session.player.update(dt, &self.input, |x, y, z| {
+                                    self.session.world.get_block(x, y, z)
+                                });
+                                false
+                            }
+                        };
+                        if swim_finished {
+                            self.demo_seam_ran = true;
+                            self.demo_finished = true;
+                            self.exit_failure |=
+                                self.swim.as_ref().map(|demo| demo.failed).unwrap_or(false);
+                        }
                         self.session.camera.position = self.session.player.eye_position();
                         self.session.camera.yaw = self.session.player.yaw;
                         self.session.camera.pitch = self.session.player.pitch;
@@ -3794,26 +4402,55 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Scripted swim wall-clock safety net (S08-T02): armed only for a
+        // direct-to-gameplay `--demo-swim` launch and deliberately independent
+        // of `time_scale` (the swim runs at the default scale so no seasonal
+        // rollover regenerates terrain mid-crossing). A stalled run latches a
+        // self-describing abort digest and shuts down instead of hanging, so an
+        // external `timeout` kill stays an explicit harness failure rather
+        // than the expected completion path.
+        if !self.demo_finished {
+            if let Some(deadline) = self.swim.as_ref().and_then(|demo| demo.deadline) {
+                if Instant::now() >= deadline {
+                    if let Some(demo) = self.swim.as_mut() {
+                        demo.abort(
+                            "deadline",
+                            &format!("bounded swim run exceeded {SWIM_DEADLINE_SECS}s"),
+                        );
+                    }
+                    self.demo_seam_ran = true;
+                    self.demo_finished = true;
+                    self.exit_failure |=
+                        self.swim.as_ref().map(|demo| demo.failed).unwrap_or(false);
+                }
+            }
+        }
+
         // Bounded accelerated demo completed: the last frame latched
         // `demo_finished`; persist and leave the loop with status 0. Checked
         // here rather than in RedrawRequested because the render region
         // holds disjoint `gpu`/`window` borrows and a whole-`self` shutdown
         // call cannot coexist with them.
         if self.demo_finished {
-            // One digest line, only for a bounded demo seam (D086), honoring
+            // Two digest lines, only for a bounded demo seam (D086), honoring
             // the crate's no-logs convention (D006/MEM009). HONESTY NOTE:
             // default settings request the uncapped `Immediate` present mode
             // (vsync off), so wall dt measures frame work and the 16.6 ms p95
             // claim only means what it says at default settings.
+            // Best-effort writes: these diagnostics exist for harnesses that
+            // redirect stdout. A consumer that already closed the pipe must
+            // not panic the process out of its clean demo shutdown.
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
             if let Some(line) =
                 frame_budget_digest_for_shutdown(self.demo_seam_ran, &self.frame_budget)
             {
-                // Best-effort write: this diagnostic exists for harnesses that
-                // redirect stdout. A consumer that already closed the pipe must
-                // not panic the process out of its clean demo shutdown.
-                use std::io::Write as _;
-                let _ = writeln!(std::io::stdout().lock(), "{line}");
+                let _ = writeln!(stdout, "{line}");
             }
+            if let Some(line) = self.swim.as_ref().and_then(|demo| demo.digest.as_deref()) {
+                let _ = writeln!(stdout, "{line}");
+            }
+            drop(stdout);
             self.shutdown(event_loop);
             return;
         }
@@ -3874,6 +4511,12 @@ fn main() {
 
     let mut app = GameApp::new(cli, session);
     event_loop.run_app(&mut app).expect("Event loop error");
+    // A failed scripted demo seam (a self-describing swim abort) exits non-zero
+    // so a bounded smoke can distinguish "ran to a verdict and failed" from
+    // "was killed by the harness timeout" (status 124).
+    if app.exit_failure {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -4659,6 +5302,435 @@ mod tests {
             !app.demo_seam_ran,
             "the seam flag belongs to the outgoing run"
         );
+    }
+
+    // ---- Scripted ocean-crossing seam (S08-T02) ----
+
+    /// The pinned route for the smoke seed: seed 12345 starts in an Ocean
+    /// column at the origin and the first land at or above SEA_LEVEL along +Z
+    /// is the far shore S03 swims to.
+    #[test]
+    fn swim_route_pins_the_s03_ocean_crossing() {
+        let route = swim_route(12345).expect("seed 12345 has an ocean crossing on +Z");
+        assert_eq!(route.seed, 12345);
+        assert_eq!(route.ocean_start_z, 0, "the ocean starts at the origin");
+        assert_eq!(route.seabed_height, 14, "pinned by the S01 terrain proof");
+        assert_eq!(route.land_z, 321, "pinned by the S03 crossing proof");
+        assert_eq!(route.distance(), 321);
+        assert_eq!(
+            route.start,
+            Vec3::new(0.5, SEA_LEVEL as f32 + 3.0, 0.5),
+            "the teleport drops the body above the centre of the ocean column"
+        );
+
+        // The route is re-derived from the same pure terrain functions the
+        // generator uses, not from a table.
+        assert_eq!(biome_at_seeded(0, 0, 12345), Biome::Ocean);
+        assert!(terrain_height_at_seeded(0, 321, 12345) >= SEA_LEVEL);
+
+        // Determinism: a second resolution is the same route.
+        assert_eq!(swim_route(12345), Some(route));
+    }
+
+    /// Every resolved route is a real ocean crossing: the start column is
+    /// Ocean below sea level, the land target is the FIRST column at or above
+    /// sea level, and every column in between is still water. A seed without
+    /// one resolves to `None` (the seam's abort path) rather than a route that
+    /// swims at land.
+    #[test]
+    fn swim_route_is_a_valid_ocean_crossing_for_every_seed_it_resolves() {
+        for seed in [0u32, 1, 2, 3, 7, 42, 777, 4242, 12345, 31337, 99_999] {
+            let Some(route) = swim_route(seed) else {
+                continue;
+            };
+            assert_eq!(route.seed, seed);
+            assert_eq!(swim_route(seed), Some(route), "deterministic for {seed}");
+            assert_eq!(
+                biome_at_seeded(0, route.ocean_start_z, seed),
+                Biome::Ocean,
+                "seed {seed}: start column must be Ocean"
+            );
+            assert!(
+                route.seabed_height < SEA_LEVEL,
+                "seed {seed}: seabed {} must be below SEA_LEVEL {SEA_LEVEL}",
+                route.seabed_height
+            );
+            assert!(
+                terrain_height_at_seeded(0, route.land_z, seed) >= SEA_LEVEL,
+                "seed {seed}: land target {} must be at or above SEA_LEVEL",
+                route.land_z
+            );
+            assert!(
+                route.land_z > route.ocean_start_z + 1,
+                "seed {seed}: a crossing needs a multi-column ocean, got {}..{}",
+                route.ocean_start_z,
+                route.land_z
+            );
+            for z in route.ocean_start_z..route.land_z {
+                assert!(
+                    terrain_height_at_seeded(0, z, seed) < SEA_LEVEL,
+                    "seed {seed}: column z={z} inside the route is not water"
+                );
+            }
+        }
+    }
+
+    /// `--demo-swim` teleports the FRESH branch only. A normal fresh launch
+    /// keeps the deterministic spawn rule, and a loaded save is never moved —
+    /// its persisted position is the contract there.
+    #[test]
+    fn swim_cli_flag_teleports_only_the_fresh_world_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swim.mcvx");
+        let path_str = save_path.to_str().expect("utf8 path");
+        let route = swim_route(12345).expect("seed 12345 route");
+
+        // Fresh + flag: teleported onto the route, facing +Z, walking.
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--demo-swim",
+            "--save",
+            path_str,
+        ]);
+        let session = startup_session(&cli);
+        assert_eq!(session.player.position, route.start);
+        assert_eq!(session.player.velocity, Vec3::ZERO);
+        assert_eq!(session.player.yaw, SWIM_YAW);
+        assert_eq!(session.player.pitch, 0.0);
+        assert!(
+            !session.player.fly_mode,
+            "a flying body would never enter the water"
+        );
+        assert!(!session.player.on_ground);
+        assert_eq!(
+            session.camera.position,
+            session.player.eye_position(),
+            "the teleport re-syncs the camera"
+        );
+
+        // Fresh without the flag: the ordinary spawn rule is untouched.
+        let plain = CliConfig::parse_args(["--new", "--seed", "12345", "--save", path_str]);
+        let plain_session = startup_session(&plain);
+        let (spawn_x, spawn_z) = find_spawn_column(12345);
+        assert_eq!(
+            plain_session.player.position,
+            Vec3::new(
+                spawn_x as f32 + 0.5,
+                (terrain_height_at_seeded(spawn_x, spawn_z, 12345) + 4) as f32,
+                spawn_z as f32 + 0.5
+            )
+        );
+        assert!(plain_session.player.fly_mode);
+
+        // Load branch + flag: the persisted position wins, never the teleport.
+        let mut data = sample_save(12345);
+        data.player.position = [100.0, 40.0, -7.0];
+        save_world_to_path(&save_path, &data).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args(["--save", path_str, "--demo-swim"]));
+        assert_eq!(loaded.player.position, Vec3::new(100.0, 40.0, -7.0));
+    }
+
+    /// A synthetic route for the stage-watcher tests (the same pinned geometry
+    /// as seed 12345, without allocating a world).
+    fn test_swim_route() -> SwimRoute {
+        SwimRoute {
+            seed: 12345,
+            start: Vec3::new(0.5, SEA_LEVEL as f32 + 3.0, 0.5),
+            ocean_start_z: 0,
+            land_z: 321,
+            seabed_height: 14,
+        }
+    }
+
+    /// Asserts a scripted input copy is the idle default (no key held).
+    fn assert_swim_idle(input: InputState, why: &str) {
+        assert!(
+            !input.forward
+                && !input.backward
+                && !input.left
+                && !input.right
+                && !input.jump_or_up
+                && !input.crouch_or_down
+                && !input.sprint,
+            "expected an idle scripted input: {why}"
+        );
+    }
+
+    /// The stage watcher walks S03's four phases in order, refuses to skip a
+    /// phase, and reports each stage's own budget as its abort stage.
+    #[test]
+    fn swim_watch_advances_through_the_four_stages_in_order() {
+        let route = test_swim_route();
+        let mut watch = SwimWatch::new(route);
+        assert_eq!(watch.stage.name(), "entry");
+        assert_swim_idle(watch.input(), "entry is idle");
+
+        // Entry: above the water and not in it. It cannot advance by itself.
+        for _ in 0..30 {
+            assert_eq!(
+                watch.observe(1.0 / 60.0, Vec3::new(0.5, 24.5, 0.5), false, false),
+                SwimProgress::Continue
+            );
+        }
+        assert_eq!(watch.stage.name(), "entry");
+
+        // Feet in water -> float (idle input, so buoyancy is the only lift).
+        assert_eq!(
+            watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true),
+            SwimProgress::Continue
+        );
+        assert_eq!(watch.stage.name(), "float");
+        assert_swim_idle(watch.input(), "float is idle so buoyancy is the only lift");
+
+        // Float band near the surface for its whole budget.
+        for _ in 0..3 {
+            assert_eq!(
+                watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true),
+                SwimProgress::Continue
+            );
+        }
+        assert_eq!(watch.stage.name(), "rise");
+        let rise_input = watch.input();
+        assert!(rise_input.jump_or_up, "rise holds jump_or_up");
+        assert!(!rise_input.forward, "rise does not swim forward yet");
+
+        // Rise clears the water surface.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false),
+            SwimProgress::Continue
+        );
+        assert_eq!(watch.stage.name(), "crossing");
+        let crossing_input = watch.input();
+        assert!(crossing_input.forward, "crossing swims forward");
+        assert!(!crossing_input.jump_or_up, "the rise is over");
+
+        // Crossing: short of the shore is not a landing; reaching the far-shore
+        // column standing above SEA_LEVEL is.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 22.9, 300.5), false, true),
+            SwimProgress::Continue
+        );
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 22.9, 321.5), false, true),
+            SwimProgress::Continue,
+            "standing in water at the shore column is not a landing"
+        );
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 23.0, 321.5), true, false),
+            SwimProgress::Landed
+        );
+        assert_eq!(watch.stage.name(), "landed");
+        assert_eq!(
+            watch.digest(),
+            "swim_demo: seed=12345 axis=+Z distance=321 frames=38 float_band=22.800..22.800 \
+             rise=23.400 landed=true"
+        );
+    }
+
+    /// Every stage budget is a hard abort that names its own stage and the
+    /// values observed there, instead of waiting forever.
+    #[test]
+    fn swim_watch_aborts_name_the_stage_that_stalled() {
+        let route = test_swim_route();
+
+        // Entry: never becomes water.
+        let mut watch = SwimWatch::new(route);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..11 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 24.5, 0.5), false, false);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "entry");
+                assert!(
+                    observed.contains("feet block never became water"),
+                    "{observed}"
+                );
+                assert!(observed.contains("y=24.500"), "{observed}");
+            }
+            other => panic!("expected an entry abort, got {other:?}"),
+        }
+
+        // Entry: sinks through the seabed margin (the pre-swim bug).
+        let mut watch = SwimWatch::new(route);
+        let progress = watch.observe(1.0 / 60.0, Vec3::new(0.5, 15.5, 0.5), false, false);
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "entry");
+                assert!(observed.contains("seabed"), "{observed}");
+            }
+            other => panic!("expected an entry seabed abort, got {other:?}"),
+        }
+
+        // Float: touching ground is the seabed-walking bug.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        match watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), true, true) {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "float");
+                assert!(observed.contains("touched ground"), "{observed}");
+            }
+            other => panic!("expected a float abort, got {other:?}"),
+        }
+
+        // Float: a band far below the surface is not a float.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..3 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 17.0, 0.5), false, true);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "float");
+                assert!(observed.contains("not near SEA_LEVEL"), "{observed}");
+            }
+            other => panic!("expected a float band abort, got {other:?}"),
+        }
+
+        // Rise: jump_or_up never clears the surface.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        for _ in 0..3 {
+            watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true);
+        }
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..3 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 0.5), false, true);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "rise");
+                assert!(
+                    observed.contains("never cleared the water surface"),
+                    "{observed}"
+                );
+            }
+            other => panic!("expected a rise abort, got {other:?}"),
+        }
+
+        // Crossing: never reaches the far shore.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        for _ in 0..3 {
+            watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true);
+        }
+        watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..151 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 40.5), false, true);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "crossing");
+                assert!(
+                    observed.contains("never stood on the far shore"),
+                    "{observed}"
+                );
+                assert!(observed.contains("z>=321"), "{observed}");
+            }
+            other => panic!("expected a crossing abort, got {other:?}"),
+        }
+    }
+
+    /// The panic-free `swim_frame` plumbing: with no world chunks resident the
+    /// seam must WAIT (no scripted input, no premature fall), and once a
+    /// watcher is armed the real player physics runs and the abort digest is
+    /// latched with the seam flagged as failed.
+    #[test]
+    fn swim_frame_waits_for_the_ocean_then_latches_a_self_describing_abort() {
+        let route = test_swim_route();
+        let save_path = PathBuf::from("/nonexistent/swim-plumbing.mcvx");
+        let mut session = WorldSession::new_session(12345, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        arm_swim_route(&mut session, route);
+        let mut demo = SwimDemo::new(12345, Some(route), None);
+
+        // Nothing is resident yet: `get_block` answers Air, so the seam holds
+        // the player at the teleport instead of falling through the gap.
+        assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        assert!(
+            demo.watch.is_none(),
+            "the watcher arms only over real water"
+        );
+        assert_eq!(session.player.position, route.start);
+
+        // Pre-arm the watcher to exercise the physics/observation plumbing over
+        // Air: the body free-falls and the entry guard names the stage instead
+        // of waiting for a chunk that will never arrive.
+        demo.watch = Some(SwimWatch::new(route));
+        let mut frames = 0usize;
+        while !swim_frame(&mut demo, &mut session, 1.0 / 60.0) {
+            frames += 1;
+            assert!(frames < 200, "the entry guard must abort within its budget");
+        }
+        assert!(
+            session.player.position.y < route.start.y,
+            "the seam moved the real player"
+        );
+        assert!(demo.failed, "a self-describing abort is a failure");
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(
+            digest.starts_with("swim_demo: seed=12345 axis=+Z distance=321"),
+            "{digest}"
+        );
+        assert!(digest.contains("landed=false"), "{digest}");
+        assert!(digest.contains("stage=entry"), "{digest}");
+    }
+
+    /// The seam is launch state, not session state: swapping worlds from the
+    /// menu retires it (and a menu-first launch arms no wall-clock deadline).
+    #[test]
+    fn swim_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swim-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--demo-swim",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        let demo = app.swim.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 12345);
+        assert!(demo.route.is_some());
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay swim carries its 360s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.swim.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // A menu-first launch (`--demo-swim` alone) arms the seam without a
+        // deadline: the swim only bounds once gameplay actually owns frames.
+        let menu_cli = CliConfig::parse_args(["--demo-swim"]);
+        let menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                12345,
+                PathBuf::from("/nonexistent/menu-swim.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(menu_app
+            .swim
+            .as_ref()
+            .expect("seam armed")
+            .deadline
+            .is_none());
     }
 
     #[test]

@@ -92,6 +92,13 @@ pub struct CliConfig {
     /// default [`DEFAULT_DEMO_DAYS`] (one cycle — the long-standing bounded
     /// demo contract that `scripts/season_smoke.sh` depends on).
     pub demo_days: u32,
+    /// Whether the bounded scripted ocean-crossing demo (`--demo-swim`, S08-T02)
+    /// is requested. A bare launch switch like `--new`: it takes no value, is
+    /// deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. The fresh-world startup
+    /// branch owns its effect (teleporting the player to the pinned route
+    /// start); a loaded save is never teleported.
+    pub demo_swim: bool,
 }
 
 impl CliConfig {
@@ -106,6 +113,7 @@ impl CliConfig {
         let mut time_scale = DEFAULT_TIME_SCALE;
         let mut season_length = DEFAULT_SEASON_LENGTH_DAYS;
         let mut demo_days = DEFAULT_DEMO_DAYS;
+        let mut demo_swim = false;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -160,6 +168,11 @@ impl CliConfig {
                         }
                     }
                 }
+                "--demo-swim" => {
+                    // Bare switch (no value to consume), mirroring `--new`:
+                    // a stray following token stays an independent argument.
+                    demo_swim = true;
+                }
                 "--new" | "--new-world" => {
                     force_new_world = true;
                 }
@@ -174,6 +187,7 @@ impl CliConfig {
             time_scale,
             season_length,
             demo_days,
+            demo_swim,
         }
     }
 }
@@ -1957,6 +1971,37 @@ mod tests {
         let absurd = CliConfig::parse_args(["--demo-days", "100000"]);
         assert_eq!(absurd.demo_days, MAX_DEMO_DAYS);
         assert_eq!(absurd.demo_days, 365);
+    }
+
+    #[test]
+    fn test_demo_swim_parses_as_a_bare_switch() {
+        // Absent keeps the default: a normal launch is byte-identical.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_swim);
+
+        // Present sets the seam and consumes no value, so the next token still
+        // parses as its own flag.
+        let swim = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--demo-swim",
+            "--save",
+            "swim.mcvx",
+        ]);
+        assert!(swim.demo_swim);
+        assert!(swim.force_new_world);
+        assert_eq!(swim.seed_override, Some(12345));
+        assert_eq!(swim.save_path, std::path::PathBuf::from("swim.mcvx"));
+
+        // The flag is a launch parameter, not a world intent: on its own it
+        // must not force a direct-to-gameplay start. (The effect belongs to the
+        // fresh-world startup branch only.)
+        let loner = CliConfig::parse_args(["--demo-swim"]);
+        assert!(loner.demo_swim);
+        assert!(!loner.force_new_world);
+        assert_eq!(loner.seed_override, None);
+        assert_eq!(loner.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
     }
 
     #[test]
