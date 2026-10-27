@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use glam::Vec3;
 
+use super::season::Weather;
+
 /// Ticks in one full day/night cycle.
 ///
 /// 24,000 ticks over the 20-real-minute (1,200 s) cycle is 20 ticks per
@@ -177,6 +179,26 @@ impl GameClock {
             .saturating_add(u32::try_from(whole_days).unwrap_or(u32::MAX));
         self.time_of_day = (total_ticks % DAY_TICKS as u64) as u32;
     }
+
+    /// Continuous, clock-derived phase in whole ticks since day 0 dawn.
+    ///
+    /// `day_index * DAY_TICKS + time_of_day + fractional_ticks`. This is the
+    /// only time input the precipitation animation may use: falling speed and
+    /// the billboard pattern offset are then a pure function of game time, so
+    /// two runs with the same calendar render identically and a paused game
+    /// freezes the weather instead of letting wall-clock time drift it.
+    ///
+    /// The value is monotonic across the dawn wrap because `advance_secs`
+    /// increments `day_index` exactly when `time_of_day` wraps. At the wrap
+    /// the phase can step by up to ~0.01 tick relative to the ideal real
+    /// number (whole-tick carry plus the f32 sub-tick remainder); that seam is
+    /// far below one rendered frame of fall and is irrelevant to a falling
+    /// animation. The f32 cast means precision also degrades after extremely
+    /// many days, but the result stays finite for every representable
+    /// `day_index`.
+    pub fn cycle_phase(&self) -> f32 {
+        self.day_index as f32 * DAY_TICKS as f32 + self.time_of_day as f32 + self.fractional_ticks
+    }
 }
 
 impl Default for GameClock {
@@ -296,6 +318,115 @@ fn lerp_color(start: [f32; 3], end: [f32; 3], fraction: f32) -> [f32; 3] {
         lerp(start[1], end[1], fraction),
         lerp(start[2], end[2], fraction),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Weather presentation (S06)
+//
+// These are pure, value-level transforms over the already-derived [`Weather`]
+// and [`SkyPalette`]. Nothing here stores a weather state, touches blocks, or
+// imports the renderer: the renderer asks for a tinted palette every frame from
+// the same persisted calendar the world already has.
+// ---------------------------------------------------------------------------
+
+/// Linear RGB the sky/fog leans toward under rain, expressed as the base
+/// palette's own luminance scaled down: cool grey without repainting a
+/// midnight sky with a fixed bright slab.
+const RAIN_GREY_SCALE: f32 = 0.70;
+
+/// Linear RGB the sky/fog leans toward under snowfall, as a multiple of the
+/// base palette's luminance: a flat pale grey-white that still respects how
+/// dark the hour already is.
+const SNOW_GREY_SCALE: f32 = 1.18;
+
+/// Blend weight toward the rain grey. Conservative so rain reads as overcast
+/// rather than a hard colour cut; visual tuning happens in the windowed UAT.
+const RAIN_SKY_LERP: f32 = 0.45;
+
+/// Blend weight toward the snow grey-white. Snow's flat bright overcast is a
+/// little more decisive than rain's grey so the two states stay distinguishable.
+const SNOW_SKY_LERP: f32 = 0.55;
+
+/// Multiplier applied to `day_factor` under rain (dim, overcast light).
+const RAIN_DAY_FACTOR: f32 = 0.78;
+
+/// Multiplier applied to `day_factor` under snowfall.
+///
+/// The sky/fog brightens, but a snow-bearing overcast still blocks a little
+/// direct light, so the terrain light dims slightly rather than blowing out.
+const SNOW_DAY_FACTOR: f32 = 0.92;
+
+/// Fog-range multiplier for clear weather; exactly `1.0` so the dry path is
+/// bit-identical to pre-weather rendering.
+pub const CLEAR_FOG_RANGE_FACTOR: f32 = 1.0;
+
+/// Fog-range multiplier for rain; pulls the fog closer than clear weather.
+pub const RAIN_FOG_RANGE_FACTOR: f32 = 0.75;
+
+/// Fog-range multiplier for snowfall; between clear and rain.
+pub const SNOW_FOG_RANGE_FACTOR: f32 = 0.85;
+
+/// Rec. 709 luminance of a linear RGB triple.
+///
+/// Used only to anchor the precipitation grey to the base palette so rain
+/// always lowers and snow always raises perceived brightness, regardless of
+/// whether it is noon or midnight.
+fn color_luminance(color: [f32; 3]) -> f32 {
+    0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+}
+
+/// Neutral grey at `scale` times the base color's luminance.
+fn grey_at(color: [f32; 3], scale: f32) -> [f32; 3] {
+    let grey = color_luminance(color) * scale;
+    [grey, grey, grey]
+}
+
+/// Tint a time-of-day palette for the day's weather.
+///
+/// [`Weather::Clear`] returns `base` untouched (the dry path stays
+/// bit-identical). Rain lerps the sky and fog toward a grey darker than the
+/// base and dims `day_factor`; snowfall lerps toward a flat pale grey-white
+/// brighter than the base. The targets are anchored to each color's own
+/// luminance, so the transforms hold at every hour. Only the day factor is
+/// scaled — no field is clamped or re-derived, so a caller that ignores
+/// weather keeps today's exact colors. Colors are RGB `[f32; 3]`; no alpha
+/// channel exists to disturb.
+pub fn weather_palette(base: SkyPalette, weather: Weather) -> SkyPalette {
+    match weather {
+        Weather::Clear => base,
+        Weather::Rain => {
+            let target = grey_at(base.sky_color, RAIN_GREY_SCALE);
+            let fog_target = grey_at(base.fog_color, RAIN_GREY_SCALE);
+            SkyPalette {
+                day_factor: base.day_factor * RAIN_DAY_FACTOR,
+                sky_color: lerp_color(base.sky_color, target, RAIN_SKY_LERP),
+                fog_color: lerp_color(base.fog_color, fog_target, RAIN_SKY_LERP),
+            }
+        }
+        Weather::Snowfall => {
+            let target = grey_at(base.sky_color, SNOW_GREY_SCALE);
+            let fog_target = grey_at(base.fog_color, SNOW_GREY_SCALE);
+            SkyPalette {
+                day_factor: base.day_factor * SNOW_DAY_FACTOR,
+                sky_color: lerp_color(base.sky_color, target, SNOW_SKY_LERP),
+                fog_color: lerp_color(base.fog_color, fog_target, SNOW_SKY_LERP),
+            }
+        }
+    }
+}
+
+/// Multiplier applied Rust-side to the fog range (or its far plane) for the
+/// day's weather.
+///
+/// Clear is exactly `1.0`; both precipitation states pull fog closer, with
+/// rain (`0.75`) more enclosing than snowfall (`0.85`). This value is computed
+/// CPU-side and must not be smuggled through `CameraUniform`'s spare lane.
+pub fn weather_fog_range_factor(weather: Weather) -> f32 {
+    match weather {
+        Weather::Clear => CLEAR_FOG_RANGE_FACTOR,
+        Weather::Rain => RAIN_FOG_RANGE_FACTOR,
+        Weather::Snowfall => SNOW_FOG_RANGE_FACTOR,
+    }
 }
 
 /// Angle of a celestial body's orbit for a time of day, in radians.
@@ -1003,5 +1134,221 @@ mod tests {
             assert!(MOON_ANGULAR_SIZE < SUN_ANGULAR_SIZE);
             assert!(SUN_ANGULAR_SIZE < std::f32::consts::FRAC_PI_4);
         };
+    }
+
+    // -----------------------------------------------------------------
+    // S06: pure weather presentation
+    // -----------------------------------------------------------------
+
+    fn assert_between(value: f32, a: f32, b: f32) {
+        let low = a.min(b) - 1e-6;
+        let high = a.max(b) + 1e-6;
+        assert!(
+            (low..=high).contains(&value),
+            "{value} is outside the lerp range {a}..={b}"
+        );
+    }
+
+    fn assert_color_between(actual: [f32; 3], base: [f32; 3], target: [f32; 3]) {
+        for channel in 0..3 {
+            assert_between(actual[channel], base[channel], target[channel]);
+        }
+    }
+
+    fn color_spread(color: [f32; 3]) -> f32 {
+        let max = color[0].max(color[1]).max(color[2]);
+        let min = color[0].min(color[1]).min(color[2]);
+        max - min
+    }
+
+    /// Clear is the identity at every hour, bit for bit: the dry path is
+    /// exactly the pre-weather rendering, so a player who never sees
+    /// precipitation sees no colour drift at all.
+    #[test]
+    fn clear_weather_leaves_the_palette_bit_identical() {
+        for tick in (0..DAY_TICKS).step_by(250).chain([DAY_TICKS, u32::MAX]) {
+            let base = sky_palette(tick);
+            let tinted = weather_palette(base, Weather::Clear);
+            assert_eq!(tinted.day_factor.to_bits(), base.day_factor.to_bits());
+            for channel in 0..3 {
+                assert_eq!(
+                    tinted.sky_color[channel].to_bits(),
+                    base.sky_color[channel].to_bits()
+                );
+                assert_eq!(
+                    tinted.fog_color[channel].to_bits(),
+                    base.fog_color[channel].to_bits()
+                );
+            }
+        }
+    }
+
+    /// Rain lands strictly between the base colour and its darker grey target:
+    /// no channel inverts, and both sky and fog lose luminance at every hour
+    /// (including midnight, where the target is anchored to the base instead
+    /// of a fixed bright grey).
+    #[test]
+    fn rain_darkens_sky_and_fog_toward_a_grey() {
+        for tick in [0u32, 1_000, 6_000, 12_000, 12_400, 18_000, 23_000] {
+            let base = sky_palette(tick);
+            let tinted = weather_palette(base, Weather::Rain);
+            let sky_target = grey_at(base.sky_color, RAIN_GREY_SCALE);
+            let fog_target = grey_at(base.fog_color, RAIN_GREY_SCALE);
+
+            assert_color_between(tinted.sky_color, base.sky_color, sky_target);
+            assert_color_between(tinted.fog_color, base.fog_color, fog_target);
+            assert!(
+                color_luminance(tinted.sky_color) < color_luminance(base.sky_color),
+                "rain brightened the sky at tick {tick}"
+            );
+            assert!(
+                color_luminance(tinted.fog_color) < color_luminance(base.fog_color),
+                "rain brightened the fog at tick {tick}"
+            );
+            assert!(
+                color_spread(tinted.sky_color) < color_spread(base.sky_color) + 1e-6,
+                "rain did not desaturate the sky at tick {tick}"
+            );
+            assert!(
+                tinted.day_factor < base.day_factor && tinted.day_factor > 0.0,
+                "rain day factor out of range at tick {tick}: {}",
+                tinted.day_factor
+            );
+        }
+    }
+
+    /// Snowfall lands between the base colour and a brighter pale grey-white:
+    /// perceived brightness rises while the colour desaturates toward flat
+    /// grey, and the terrain day factor only dims slightly under the overcast.
+    #[test]
+    fn snowfall_brightens_sky_and_fog_toward_a_pale_grey_white() {
+        for tick in [0u32, 1_000, 6_000, 12_000, 18_000, 23_000] {
+            let base = sky_palette(tick);
+            let tinted = weather_palette(base, Weather::Snowfall);
+            let sky_target = grey_at(base.sky_color, SNOW_GREY_SCALE);
+            let fog_target = grey_at(base.fog_color, SNOW_GREY_SCALE);
+
+            assert_color_between(tinted.sky_color, base.sky_color, sky_target);
+            assert_color_between(tinted.fog_color, base.fog_color, fog_target);
+            assert!(
+                color_luminance(tinted.sky_color) > color_luminance(base.sky_color),
+                "snowfall did not brighten the sky at tick {tick}"
+            );
+            assert!(
+                color_luminance(tinted.fog_color) > color_luminance(base.fog_color),
+                "snowfall did not brighten the fog at tick {tick}"
+            );
+            assert!(
+                color_spread(tinted.sky_color) < color_spread(base.sky_color) + 1e-6,
+                "snowfall did not flatten the sky at tick {tick}"
+            );
+            assert!(
+                tinted.day_factor < base.day_factor && tinted.day_factor > 0.0,
+                "snowfall day factor out of range at tick {tick}: {}",
+                tinted.day_factor
+            );
+        }
+    }
+
+    /// Rain and snowfall must be visually distinguishable states, not two names
+    /// for the same tint.
+    #[test]
+    fn rain_and_snowfall_produce_different_palettes() {
+        let base = sky_palette(DEFAULT_TIME_OF_DAY);
+        let rain = weather_palette(base, Weather::Rain);
+        let snow = weather_palette(base, Weather::Snowfall);
+        assert_ne!(rain, snow);
+        assert!(color_luminance(snow.sky_color) > color_luminance(rain.sky_color));
+        assert!(rain.day_factor < snow.day_factor);
+    }
+
+    #[test]
+    fn weather_palette_is_pure_and_deterministic() {
+        let base = sky_palette(DEFAULT_TIME_OF_DAY);
+        for weather in [Weather::Clear, Weather::Rain, Weather::Snowfall] {
+            let first = weather_palette(base, weather);
+            for _ in 0..4 {
+                assert_eq!(weather_palette(base, weather), first);
+            }
+        }
+        // `base` is `Copy`; the call cannot have mutated the caller's palette.
+        assert_eq!(base, sky_palette(DEFAULT_TIME_OF_DAY));
+    }
+
+    #[test]
+    fn fog_range_factors_compress_only_for_precipitation() {
+        assert_eq!(weather_fog_range_factor(Weather::Clear), 1.0);
+        assert_eq!(CLEAR_FOG_RANGE_FACTOR, 1.0);
+
+        for weather in [Weather::Rain, Weather::Snowfall] {
+            let factor = weather_fog_range_factor(weather);
+            assert!(
+                factor > 0.0 && factor < 1.0,
+                "{weather:?} fog factor must be in (0, 1), got {factor}"
+            );
+        }
+        assert!(
+            weather_fog_range_factor(Weather::Rain) < weather_fog_range_factor(Weather::Snowfall),
+            "rain should enclose the view more than snowfall"
+        );
+        assert_eq!(weather_fog_range_factor(Weather::Rain), 0.75);
+        assert_eq!(weather_fog_range_factor(Weather::Snowfall), 0.85);
+    }
+
+    #[test]
+    fn cycle_phase_starts_at_day_zero_dawn_and_tracks_fields() {
+        assert_eq!(GameClock::from_day_and_time(0, 0).cycle_phase(), 0.0);
+        let clock = GameClock::from_day_and_time(3, 12_000);
+        assert_close(clock.cycle_phase(), 3.0 * DAY_TICKS as f32 + 12_000.0);
+    }
+
+    #[test]
+    fn cycle_phase_includes_fractional_ticks() {
+        let mut clock = GameClock::from_time(1_000);
+        // 0.0125 s at scale 1.0 is exactly 0.25 ticks.
+        clock.advance_secs(0.0125, 1.0);
+        assert!(clock.fractional_ticks > 0.2 && clock.fractional_ticks < 0.3);
+        assert_close(clock.cycle_phase(), 1_000.25);
+    }
+
+    /// The phase is what the falling-precipitation animation reads, so it must
+    /// never go backwards across the dawn wrap: day_index carries the day while
+    /// time_of_day restarts at zero.
+    #[test]
+    fn cycle_phase_is_monotonic_across_a_dawn_wrap_driven_by_advance_secs() {
+        let mut clock = GameClock::from_time(DAY_TICKS - 10);
+        let mut previous = clock.cycle_phase();
+        assert_close(previous, DAY_TICKS as f32 - 10.0);
+
+        let mut saw_wrap = false;
+        for _ in 0..20 {
+            // 0.25 s at scale 1.0 is exactly 5 ticks.
+            clock.advance_secs(0.25, 1.0);
+            let phase = clock.cycle_phase();
+            assert!(
+                phase >= previous,
+                "cycle phase regressed across the wrap: {previous} -> {phase}"
+            );
+            assert_close(phase - previous, 5.0);
+            saw_wrap |= clock.day_index == 1;
+            previous = phase;
+        }
+
+        assert!(saw_wrap, "the loop must cross the dawn wrap");
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.time_of_day, 90);
+        assert_close(previous, DAY_TICKS as f32 + 90.0);
+    }
+
+    #[test]
+    fn cycle_phase_is_finite_for_an_extreme_day_index() {
+        let clock = GameClock::from_day_and_time(u32::MAX, DAY_TICKS - 1);
+        let phase = clock.cycle_phase();
+        assert!(phase.is_finite(), "extreme cycle phase overflowed: {phase}");
+        assert!(phase > 0.0);
+        assert_eq!(
+            phase,
+            u32::MAX as f32 * DAY_TICKS as f32 + (DAY_TICKS - 1) as f32
+        );
     }
 }
