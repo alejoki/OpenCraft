@@ -53,6 +53,17 @@ const GRID_KIND_TABLE: u8 = 1;
 /// a bounded run, MEM146).
 pub const DEFAULT_TIME_SCALE: f32 = 1.0;
 
+/// Default number of day cycles a bounded accelerated demo runs before saving
+/// and exiting: exactly one, which is the behavior every pre-S06 accelerated
+/// run already had (and what `scripts/season_smoke.sh` asserts when it checks
+/// `day_index == 1` after one accelerated run).
+pub const DEFAULT_DEMO_DAYS: u32 = 1;
+
+/// Upper bound on `--demo-days`, mirroring [`MAX_SEASON_LENGTH_DAYS`]: a demo
+/// spanning more than a full year (4 seasons of 365 days) is never useful for
+/// a bounded smoke run, and the bound keeps the tick budget trivially in range.
+pub const MAX_DEMO_DAYS: u32 = 365;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CliConfig {
     pub save_path: PathBuf,
@@ -73,6 +84,14 @@ pub struct CliConfig {
     /// `1..=MAX_SEASON_LENGTH_DAYS`; zero and non-numeric input keep the
     /// default [`DEFAULT_SEASON_LENGTH_DAYS`].
     pub season_length: u32,
+    /// Number of whole day cycles a bounded accelerated run observes before
+    /// saving and exiting, from `--demo-days` (S06-T05). A test-seam launch
+    /// parameter like `time_scale`/`season_length`, so it never affects
+    /// `cli_has_world_intent`. Values are clamped to
+    /// `1..=MAX_DEMO_DAYS`; missing, zero, and non-numeric input keep the
+    /// default [`DEFAULT_DEMO_DAYS`] (one cycle — the long-standing bounded
+    /// demo contract that `scripts/season_smoke.sh` depends on).
+    pub demo_days: u32,
 }
 
 impl CliConfig {
@@ -86,6 +105,7 @@ impl CliConfig {
         let mut force_new_world = false;
         let mut time_scale = DEFAULT_TIME_SCALE;
         let mut season_length = DEFAULT_SEASON_LENGTH_DAYS;
+        let mut demo_days = DEFAULT_DEMO_DAYS;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -127,6 +147,19 @@ impl CliConfig {
                         }
                     }
                 }
+                "--demo-days" => {
+                    // Lenient like `--season-length`: a missing, non-numeric, or
+                    // zero value keeps the one-cycle default, and an absurd
+                    // value clamps to the bounded maximum instead of running
+                    // an effectively unbounded demo.
+                    if let Some(val) = iter.next() {
+                        if let Ok(parsed) = val.as_ref().parse::<u32>() {
+                            if parsed > 0 {
+                                demo_days = parsed.min(MAX_DEMO_DAYS);
+                            }
+                        }
+                    }
+                }
                 "--new" | "--new-world" => {
                     force_new_world = true;
                 }
@@ -140,6 +173,7 @@ impl CliConfig {
             force_new_world,
             time_scale,
             season_length,
+            demo_days,
         }
     }
 }
@@ -1886,6 +1920,43 @@ mod tests {
         // rejected, so a typo never yields an unloadable calendar.
         let absurd = CliConfig::parse_args(["--season-length", "100000"]);
         assert_eq!(absurd.season_length, MAX_SEASON_LENGTH_DAYS);
+    }
+
+    #[test]
+    fn test_demo_days_parses_and_defaults_to_one_cycle() {
+        // No flag keeps the long-standing one-cycle bounded demo, which is
+        // the contract `scripts/season_smoke.sh` relies on for day_index == 1.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.demo_days, DEFAULT_DEMO_DAYS);
+        assert_eq!(bare.demo_days, 1);
+
+        // Happy path: an explicit multi-day demo is accepted verbatim, so one
+        // accelerated session can span a full four-day year.
+        let chosen = CliConfig::parse_args(["--demo-days", "4"]);
+        assert_eq!(chosen.demo_days, 4);
+
+        // Missing value at end of argv, non-numeric, zero, negative, and an
+        // overflowing token all keep the default (lenient parse, no panic).
+        for args in [
+            vec!["--demo-days"],
+            vec!["--demo-days", "four"],
+            vec!["--demo-days", "0"],
+            vec!["--demo-days", "-4"],
+            vec!["--demo-days", "4294967296"],
+        ] {
+            let cfg = CliConfig::parse_args(args.iter().copied());
+            assert_eq!(
+                cfg.demo_days, DEFAULT_DEMO_DAYS,
+                "bad value {:?} must keep the one-cycle default",
+                args
+            );
+        }
+
+        // An absurd day count clamps to the bounded maximum instead of
+        // yielding a demo that never terminates in practice.
+        let absurd = CliConfig::parse_args(["--demo-days", "100000"]);
+        assert_eq!(absurd.demo_days, MAX_DEMO_DAYS);
+        assert_eq!(absurd.demo_days, 365);
     }
 
     #[test]

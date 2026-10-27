@@ -1186,11 +1186,17 @@ struct Ready {
     inventory_labels: Vec<StatsOverlay>,
 }
 
-/// Bounded accelerated-demo watch (S02-T04): `--time-scale` is a test seam
-/// for observing a full day cycle. Sums the game-time ticks actually
-/// advanced by the frame loop and reports completion once one whole
-/// `DAY_TICKS` cycle has elapsed. Frame-rate independent because it reads
-/// the clock, not the wall time.
+/// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
+/// S06-T05): `--time-scale` is a test seam for observing whole day cycles.
+/// Sums the game-time ticks actually advanced by the frame loop and reports
+/// completion once `demo_days` whole `DAY_TICKS` cycles have elapsed.
+/// Frame-rate independent because it reads the clock, not the wall time.
+///
+/// The budget is a single summed tick counter rather than a per-cycle latch:
+/// the watch completes exactly when `DAY_TICKS * days` ticks have been
+/// observed, so a `days = 4` demo cannot finish early on an integer number of
+/// wrapped cycles and a `days = 1` demo is byte-identical to the pre-S06
+/// behavior that `scripts/season_smoke.sh` asserts.
 #[derive(Debug)]
 struct DemoCycleWatch {
     remaining_ticks: u32,
@@ -1198,15 +1204,18 @@ struct DemoCycleWatch {
 }
 
 impl DemoCycleWatch {
-    fn new(time_of_day: u32) -> Self {
+    fn new(time_of_day: u32, days: u32) -> Self {
         Self {
-            remaining_ticks: daycycle::DAY_TICKS,
+            // `days` is already clamped by `CliConfig`, but `.max(1)` keeps a
+            // zero from arming a watch that completes on the first frame.
+            remaining_ticks: daycycle::DAY_TICKS.saturating_mul(days.max(1)),
             last_time_of_day: time_of_day % daycycle::DAY_TICKS,
         }
     }
 
     /// Feed one frame's time of day. Returns true exactly when the summed
-    /// advance reaches a full cycle (wrap-safe at the cycle boundary).
+    /// advance reaches the configured number of cycles (wrap-safe at every
+    /// cycle boundary).
     fn observe(&mut self, time_of_day: u32) -> bool {
         let time_of_day = time_of_day % daycycle::DAY_TICKS;
         let delta =
@@ -1220,10 +1229,12 @@ impl DemoCycleWatch {
 /// Arm/observe the bounded accelerated demo in one place, shared by the
 /// RedrawRequested pass and its headless tests. Never arms at the default
 /// 1.0 scale (a normal run is unbounded) and never counts paused frames
-/// (the clock itself is frozen there).
+/// (the clock itself is frozen there). `demo_days` is the app's `--demo-days`
+/// value; it only matters when the accelerated watch is armed.
 fn observe_demo_cycle(
     watch: &mut Option<DemoCycleWatch>,
     time_scale: f32,
+    demo_days: u32,
     playing: bool,
     time_of_day: u32,
 ) -> bool {
@@ -1233,7 +1244,7 @@ fn observe_demo_cycle(
     match watch {
         Some(watch) => watch.observe(time_of_day),
         None => {
-            *watch = Some(DemoCycleWatch::new(time_of_day));
+            *watch = Some(DemoCycleWatch::new(time_of_day, demo_days));
             false
         }
     }
@@ -1243,17 +1254,18 @@ fn observe_demo_cycle(
 /// bounded demo shuts down even if no redraws are being delivered.
 const DEMO_SHUTDOWN_GRACE_SECS: f32 = 5.0;
 
-/// Wall-clock safety net for a bounded accelerated run: one full cycle at
-/// the given scale plus a small grace for startup. The frame-driven
+/// Wall-clock safety net for a bounded accelerated run: `demo_days` full
+/// cycles at the given scale plus a small grace for startup. The frame-driven
 /// [`DemoCycleWatch`] is the primary completion signal; this deadline keeps
 /// the run bounded even if the compositor stops delivering redraws.
 /// `None` at the default scale (a normal run is unbounded).
-fn demo_shutdown_deadline(time_scale: f32) -> Option<Instant> {
+fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     if time_scale <= DEFAULT_TIME_SCALE {
         return None;
     }
     let cycle_secs = daycycle::DAY_SECONDS / time_scale;
-    Some(Instant::now() + Duration::from_secs_f32(cycle_secs + DEMO_SHUTDOWN_GRACE_SECS))
+    let demo_secs = cycle_secs * demo_days.max(1) as f32;
+    Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
 struct GameApp {
@@ -1381,12 +1393,19 @@ struct GameApp {
     /// `GameClock::tick`, so the clock itself stays config-free.
     time_scale: f32,
     /// Bounded accelerated-demo watch (S02-T04): armed on the first Playing
-    /// frame of an accelerated run, cleared when one full cycle has been
-    /// observed. `demo_finished` is then latched so `about_to_wait` can
-    /// perform the shutdown (the RedrawRequested region already holds
-    /// disjoint `gpu`/`window` borrows).
+    /// frame of an accelerated run, cleared when the configured number of
+    /// cycles (`demo_days`) has been observed. `demo_finished` is then
+    /// latched so `about_to_wait` can perform the shutdown (the
+    /// RedrawRequested region already holds disjoint `gpu`/`window` borrows).
     demo_cycle: Option<DemoCycleWatch>,
     demo_finished: bool,
+    /// Number of whole day cycles the bounded accelerated demo observes
+    /// before saving and exiting, from `--demo-days` (S06-T05). An app-level
+    /// test-seam parameter like `time_scale` — never world state, never
+    /// persisted, and it never affects `cli_has_world_intent`. Defaults to
+    /// one cycle, so a launch without the flag is bit-for-bit the pre-S06
+    /// bounded demo.
+    demo_days: u32,
     /// Wall-clock safety net for the bounded accelerated demo (S02-T04):
     /// armed only when the launch starts directly in Playing with an
     /// accelerated scale. `None` for every normal run.
@@ -1448,7 +1467,7 @@ impl GameApp {
         // net. Menu-first launches stay unbounded until gameplay begins (the
         // frame-driven cycle watch still completes them).
         let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
-            demo_shutdown_deadline(cli.time_scale)
+            demo_shutdown_deadline(cli.time_scale, cli.demo_days)
         } else {
             None
         };
@@ -1509,6 +1528,7 @@ impl GameApp {
             time_scale: cli.time_scale,
             demo_cycle: None,
             demo_finished: false,
+            demo_days: cli.demo_days,
             demo_shutdown_deadline,
         }
     }
@@ -2924,18 +2944,20 @@ impl ApplicationHandler for GameApp {
                 // `window` already hold disjoint `self` borrows across this
                 // region, so a `&mut self` method call cannot be used.
                 self.session.clock.tick(playing, now, self.time_scale);
-                // Bounded accelerated demo (S02-T04): `--time-scale` is a
-                // test seam, so an accelerated run self-terminates after
-                // exactly one full day cycle and exits cleanly (status 0).
-                // That makes completion a health signal the harness can read
-                // directly, instead of inferring it from an external
-                // timeout kill. The exit itself is deferred to
-                // `about_to_wait` because `gpu`/`window` borrows span this
-                // region; only plain fields are touched here.
+                // Bounded accelerated demo (S02-T04; N cycles since S06-T05):
+                // `--time-scale` is a test seam, so an accelerated run
+                // self-terminates after `--demo-days` (default 1) full day
+                // cycles and exits cleanly (status 0). That makes completion a
+                // health signal the harness can read directly, instead of
+                // inferring it from an external timeout kill. The exit itself
+                // is deferred to `about_to_wait` because `gpu`/`window`
+                // borrows span this region; only plain fields are touched
+                // here.
                 if !self.demo_finished
                     && observe_demo_cycle(
                         &mut self.demo_cycle,
                         self.time_scale,
+                        self.demo_days,
                         playing,
                         self.session.clock.time_of_day,
                     )
@@ -3634,8 +3656,8 @@ impl ApplicationHandler for GameApp {
         }
 
         // Wall-clock safety net: if redraws stall, the accelerated run still
-        // ends after one cycle plus grace instead of relying on an external
-        // timeout kill.
+        // ends after its configured number of cycles plus grace instead of
+        // relying on an external timeout kill.
         if self
             .demo_shutdown_deadline
             .map(|deadline| Instant::now() >= deadline)
@@ -4160,12 +4182,14 @@ mod tests {
 
     #[test]
     fn demo_cycle_watch_completes_after_one_full_day_and_never_arms_at_default_scale() {
-        // A normal (1.0x) run is unbounded: the bounded-demo seam never arms.
+        // A normal (1.0x) run is unbounded: the bounded-demo seam never arms,
+        // regardless of the configured demo day count.
         let mut watch = None;
         for time in [0, 6_000, 12_000, 18_000, 23_999] {
             assert!(!observe_demo_cycle(
                 &mut watch,
                 DEFAULT_TIME_SCALE,
+                4,
                 true,
                 time
             ));
@@ -4173,43 +4197,83 @@ mod tests {
         assert!(watch.is_none(), "default scale never starts a demo watch");
 
         // An accelerated run arms on the first Playing frame and completes
-        // only once a full 24,000-tick cycle has been observed.
+        // only once a full 24,000-tick cycle has been observed (the default
+        // one-cycle budget, which `scripts/season_smoke.sh` depends on).
         let mut watch = None;
         let start = daycycle::DEFAULT_TIME_OF_DAY;
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start));
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start + 12_000));
+        assert!(!observe_demo_cycle(&mut watch, 60.0, 1, true, start));
         assert!(!observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
+            true,
+            start + 12_000
+        ));
+        assert!(!observe_demo_cycle(
+            &mut watch,
+            60.0,
+            1,
             true,
             (start + daycycle::DAY_TICKS - 1) % daycycle::DAY_TICKS
         ));
         assert!(observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             true,
             (start + daycycle::DAY_TICKS) % daycycle::DAY_TICKS
         ));
     }
 
     #[test]
+    fn demo_cycle_watch_multi_day_completes_only_on_the_last_cycle() {
+        // Four days = four summed cycles. `observe` reads `time_of_day`, which
+        // is modulo `DAY_TICKS`, so a frame always contributes a sub-cycle
+        // delta — that is exactly what the real frame loop feeds it. Advance
+        // in quarter-cycle steps and require completion only on the 16th.
+        let start = daycycle::DEFAULT_TIME_OF_DAY;
+        let step = daycycle::DAY_TICKS / 4;
+        let mut watch = DemoCycleWatch::new(start, 4);
+        for quarter in 1..=15 {
+            let time = (start + quarter * step) % daycycle::DAY_TICKS;
+            assert!(
+                !watch.observe(time),
+                "quarter-cycle {quarter} of 16 must not complete a 4-day demo"
+            );
+        }
+        assert!(
+            watch.observe((start + 16 * step) % daycycle::DAY_TICKS),
+            "the fourth full cycle completes a --demo-days 4 demo"
+        );
+
+        // A zero day count can never arm an instantly-complete watch: the
+        // constructor floors the budget at one cycle (CliConfig already
+        // rejects zero, this is the defensive second layer).
+        let mut zero = DemoCycleWatch::new(start, 0);
+        assert!(!zero.observe((start + daycycle::DAY_TICKS - 1) % daycycle::DAY_TICKS));
+        assert!(zero.observe(start));
+    }
+
+    #[test]
     fn demo_cycle_watch_is_wrap_safe_and_ignores_paused_frames() {
-        let mut watch = Some(DemoCycleWatch::new(daycycle::DAY_TICKS - 10));
+        let mut watch = Some(DemoCycleWatch::new(daycycle::DAY_TICKS - 10, 1));
 
         // Paused frames contribute nothing: the real clock is frozen there.
         assert!(!observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             false,
             daycycle::DAY_TICKS - 10
         ));
 
         // 15 ticks across the cycle boundary...
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, 5));
+        assert!(!observe_demo_cycle(&mut watch, 60.0, 1, true, 5));
         // ...and exactly the remaining ticks complete the full cycle.
         assert!(observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             true,
             (5 + daycycle::DAY_TICKS - 15) % daycycle::DAY_TICKS
         ));
@@ -4220,6 +4284,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = playing_app(dir.path(), "demo.mcvx");
         app.time_scale = 60.0;
+        assert_eq!(app.demo_days, 1, "no --demo-days keeps the one-cycle demo");
         let start = Instant::now();
 
         // First Playing frame arms both the clock marker and the demo watch.
@@ -4227,6 +4292,7 @@ mod tests {
         assert!(!observe_demo_cycle(
             &mut app.demo_cycle,
             app.time_scale,
+            app.demo_days,
             true,
             app.session.clock.time_of_day
         ));
@@ -4240,6 +4306,7 @@ mod tests {
             finished = observe_demo_cycle(
                 &mut app.demo_cycle,
                 app.time_scale,
+                app.demo_days,
                 true,
                 app.session.clock.time_of_day,
             );
@@ -4254,16 +4321,55 @@ mod tests {
 
     #[test]
     fn accelerated_runs_get_a_bounded_wall_clock_shutdown_deadline() {
-        // Default and slower-than-real scales are unbounded normal runs.
-        assert!(demo_shutdown_deadline(DEFAULT_TIME_SCALE).is_none());
-        assert!(demo_shutdown_deadline(0.5).is_none());
+        // Default and slower-than-real scales are unbounded normal runs, at
+        // every day count.
+        assert!(demo_shutdown_deadline(DEFAULT_TIME_SCALE, 1).is_none());
+        assert!(demo_shutdown_deadline(0.5, 4).is_none());
 
         // 60x: a 20 s cycle plus the 5 s redraw-stall grace.
         let before = Instant::now();
-        let deadline = demo_shutdown_deadline(60.0).expect("accelerated deadline");
+        let deadline = demo_shutdown_deadline(60.0, 1).expect("accelerated deadline");
         let after = Instant::now();
         assert!(deadline >= before + Duration::from_secs(24));
         assert!(deadline <= after + Duration::from_secs(26));
+    }
+
+    #[test]
+    fn demo_shutdown_deadline_scales_with_the_demo_day_count() {
+        // 60x: 20 s per cycle, so 4 days is ~80 s of cycles plus the same 5 s
+        // grace. Measured as a delta from the one-cycle deadline taken first,
+        // so Instant::now() jitter between calls cannot skew the comparison.
+        let one = demo_shutdown_deadline(60.0, 1).expect("one-cycle deadline");
+        let four = demo_shutdown_deadline(60.0, 4).expect("four-cycle deadline");
+        let delta = four.duration_since(one);
+        assert!(
+            delta >= Duration::from_secs(59) && delta <= Duration::from_secs(61),
+            "4 days must add 3 cycles (60 s) to the deadline, got {delta:?}"
+        );
+
+        // Zero never shortens the deadline below one cycle (the constructor
+        // floors it), matching DemoCycleWatch's defensive floor.
+        let zero = demo_shutdown_deadline(60.0, 0).expect("floored deadline");
+        let zero_delta = zero.duration_since(one).as_millis() as i64;
+        assert!(zero_delta.abs() < 100, "zero must behave as one cycle");
+    }
+
+    #[test]
+    fn demo_days_is_a_test_seam_and_never_a_world_intent() {
+        // `--demo-days` alone is not a world intent: a bare launch plus the
+        // flag still opens the main menu over the loaded world, exactly like
+        // a bare launch (so the bounded demo stays a test seam, never a way
+        // to bypass menus).
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let demo = CliConfig::parse_args(["--demo-days", "4"]);
+        assert_eq!(demo.demo_days, 4);
+        assert!(!cli_has_world_intent(&demo));
+        assert_eq!(cli_has_world_intent(&demo), cli_has_world_intent(&bare));
+
+        // Combined with a real world flag the intent is unchanged (the flag
+        // is still what grants direct gameplay entry).
+        let with_new = CliConfig::parse_args(["--new", "--demo-days", "4"]);
+        assert!(cli_has_world_intent(&with_new));
     }
 
     #[test]
@@ -4306,6 +4412,7 @@ mod tests {
         assert!(!observe_demo_cycle(
             &mut app.demo_cycle,
             app.time_scale,
+            app.demo_days,
             true,
             app.session.clock.time_of_day
         ));
@@ -4317,6 +4424,7 @@ mod tests {
             finished = observe_demo_cycle(
                 &mut app.demo_cycle,
                 app.time_scale,
+                app.demo_days,
                 true,
                 app.session.clock.time_of_day,
             );
@@ -4337,6 +4445,104 @@ mod tests {
         let relaunched = WorldSession::session_from_save(loaded, save_path.clone());
         assert_eq!(relaunched.clock.day_index, 1);
         assert_eq!(relaunched.season_length_days, 4);
+    }
+
+    /// S06-T05: the demo seam itself. One accelerated session with
+    /// `--demo-days 4` spans the whole seed-1 year (Rain -> Clear -> Rain ->
+    /// Snowfall), proving the multi-cycle budget delivers what the slice demo
+    /// claims: warm-season rain and winter snowfall in a single run, with the
+    /// default one-cycle bound untouched (see
+    /// `accelerated_demo_cycle_saves_and_reloads_day_index_one`).
+    #[test]
+    fn four_day_demo_spans_the_seed_one_year_in_one_accelerated_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("year.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-days",
+            "4",
+            "--time-scale",
+            "60",
+        ]);
+        // Seed 1 at one-day seasons is the slice's demo calendar.
+        let session = WorldSession::new_session(1, save_path.clone(), 1);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.demo_days, 4, "the flag reaches the app");
+        assert_eq!(app.time_scale, 60.0);
+        let start = Instant::now();
+
+        // 4 days x 20 simulated seconds at 60x = 80 real seconds. The season
+        // packet must be re-derived per frame from the persisted calendar, so
+        // sampling it after each day boundary is the honest presentation path.
+        tick_app_clock(&mut app, start);
+        assert!(!observe_demo_cycle(
+            &mut app.demo_cycle,
+            app.time_scale,
+            app.demo_days,
+            true,
+            app.session.clock.time_of_day
+        ));
+
+        let expected = [
+            Weather::Rain,
+            Weather::Clear,
+            Weather::Rain,
+            Weather::Snowfall,
+        ];
+        let mut seen = vec![(app.session.clock.day_index, session_weather(&app.session))];
+        let mut finished = false;
+        let mut frames = 0;
+        while frames < 85 && !finished {
+            frames += 1;
+            tick_app_clock(&mut app, start + Duration::from_secs(frames));
+            finished = observe_demo_cycle(
+                &mut app.demo_cycle,
+                app.time_scale,
+                app.demo_days,
+                true,
+                app.session.clock.time_of_day,
+            );
+            let sample = (app.session.clock.day_index, session_weather(&app.session));
+            if seen.last() != Some(&sample) {
+                seen.push(sample);
+            }
+            // The watch must not latch before the fourth cycle completes.
+            if frames < 80 {
+                assert!(
+                    !finished,
+                    "a 4-day demo must not finish after {frames} simulated seconds"
+                );
+            }
+        }
+
+        assert!(finished, "the 4-day demo must complete");
+        assert_eq!(frames, 80, "4 days x 20 simulated seconds at 60x");
+        assert_eq!(app.session.clock.day_index, 4);
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+
+        // Each day of the seed-1 year was presented, in order, exactly once
+        // (day 4 wraps back to Spring's Rain, so it closes the pattern).
+        let days: Vec<(u32, Weather)> = seen.clone();
+        assert_eq!(
+            days,
+            vec![
+                (0, expected[0]),
+                (1, expected[1]),
+                (2, expected[2]),
+                (3, expected[3]),
+                (4, expected[0]),
+            ],
+            "one session must present the whole seed-1 year"
+        );
+
+        // The shutdown save persists the four-day calendar tail, so an
+        // accelerated year is resumable like any other session.
+        save_current_world(&mut app.session).expect("demo shutdown save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.day_index, 4);
+        assert_eq!(loaded.season_length_days, 1);
     }
 
     /// Accelerated day-boundary clock proof (M007/S05): a real `GameApp`
