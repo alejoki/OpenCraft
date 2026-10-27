@@ -64,6 +64,7 @@ use opencraft::world::persistence::{
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
+use opencraft::world::season::Weather;
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -703,6 +704,13 @@ fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32, underwater: bool)
         time_of_day,
         underwater,
         day_factor: palette.day_factor,
+        // Weather fields are pipelined through `SkyParams` here with the
+        // identity defaults (Clear / 1.0 / 0.0) so the renderer compiles and
+        // the dry path stays byte-identical. The session arm that derives the
+        // live weather from the persisted calendar feeds them next.
+        weather: Weather::Clear,
+        fog_range_factor: 1.0,
+        weather_phase: 0.0,
         fog_color: [
             palette.fog_color[0],
             palette.fog_color[1],

@@ -11,8 +11,10 @@ use crate::render::sky;
 use crate::render::texture::{
     block_layers_match_shape, create_block_texture_array, upload_block_layers,
 };
+use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::daycycle;
+use crate::world::season::Weather;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -49,6 +51,19 @@ pub struct SkyParams {
     /// is a plain flag so `SkyParams` stays `Copy` and `render_frame`'s
     /// signature does not grow.
     pub underwater: bool,
+    /// The day's weather, derived purely from the persisted calendar. It
+    /// selects the precipitation pattern in [`weather::WeatherUniform`] and
+    /// gates the precip *draw* (never a pass). `Clear` disables that draw and
+    /// is the identity everywhere else.
+    pub weather: Weather,
+    /// Rust-side multiplier applied to the fog start/end range
+    /// ([`daycycle::weather_fog_range_factor`]). Exactly `1.0` for Clear, so
+    /// the dry path stays byte-identical; precipitation pulls fog closer.
+    /// Submersion takes precedence and ignores this factor entirely.
+    pub fog_range_factor: f32,
+    /// Continuous day-cycle phase from [`daycycle::GameClock::cycle_phase`]
+    /// (game time, never wall clock) that drives the fall animation.
+    pub weather_phase: f32,
 }
 
 /// Deep-water fog color while the camera's eye is submerged. Uses the same
@@ -72,16 +87,57 @@ pub fn effective_fog(
     fog_color: [f32; 4],
     fog_start: f32,
     fog_end: f32,
+    fog_range_factor: f32,
 ) -> ([f32; 4], f32, f32) {
     if underwater {
+        // Submersion is a fixed deep-water shift and takes precedence: the
+        // weather factor never overrides it.
         (
             UNDERWATER_FOG_COLOR,
             UNDERWATER_FOG_START,
             UNDERWATER_FOG_END,
         )
     } else {
-        (fog_color, fog_start, fog_end)
+        // Weather only compresses the range, so the factor is clamped to
+        // `0.0..=1.0`; a non-finite input falls back to the identity. A factor
+        // of exactly `1.0` returns the caller's values bit-for-bit
+        // (`x * 1.0 == x`), keeping Clear weather byte-identical.
+        let factor = if fog_range_factor.is_finite() {
+            fog_range_factor.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        (fog_color, fog_start * factor, fog_end * factor)
     }
+}
+
+/// True when the precipitation *draw* should be recorded for this frame.
+///
+/// The precipitation stage is fail-soft by construction: an absent stage
+/// (`None`, e.g. a future headless/limited renderer) or Clear weather skips
+/// the draw, leaving the opaque world, water and overlay rendering exactly as
+/// before. Skipping this draw is the only weather-conditional path in
+/// `render_frame` — no render pass is ever conditional on weather.
+///
+/// `stage_present` is passed explicitly (rather than `&self`) so the decision
+/// stays pure and testable without a `wgpu::Device`.
+pub fn weather_draw_visible(weather: Weather, stage_present: bool) -> bool {
+    stage_present && !matches!(weather, Weather::Clear)
+}
+
+/// GPU resources for the precipitation stage, built once at renderer
+/// construction.
+///
+/// Weather owns a static fixed-seed vertex buffer (both the rain and snowfall
+/// segments), one 32-byte per-frame uniform, and an alpha-blended,
+/// depth-write-disabled pipeline. Holding the whole stage in one `Option`
+/// makes the fail-soft contract explicit: no stage means no draw.
+struct WeatherStage {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
 }
 
 #[repr(C)]
@@ -654,6 +710,10 @@ pub struct VoxelRenderer {
     /// Static sun/moon/star billboard vertices, uploaded once at construction.
     pub sky_vertex_buffer: wgpu::Buffer,
     pub sky_vertex_count: u32,
+    /// Precipitation stage (static fixed-seed billboard buffer, 32-byte
+    /// per-frame uniform, alpha-blended pipeline). `Option` makes the
+    /// fail-soft contract explicit: `None` simply skips the precip draw.
+    weather_stage: Option<WeatherStage>,
 }
 
 impl VoxelRenderer {
@@ -756,6 +816,26 @@ impl VoxelRenderer {
         let sky_pipeline = sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
         let (sky_vertex_buffer, sky_vertex_count) =
             sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
+
+        // Precipitation stage (M007/S06): static camera-relative rain and
+        // snowfall billboards plus one 32-byte per-frame uniform. Built from
+        // the weather.rs factories, exactly like the sky stage above; the
+        // stage is drawn inside the existing main pass, so no new pass and no
+        // CameraUniform layout change.
+        let weather_bgl = weather::create_weather_bind_group_layout(&ctx.device);
+        let weather_uniform_buffer = weather::create_weather_uniform_buffer(&ctx.device);
+        let weather_bind_group =
+            weather::create_weather_bind_group(&ctx.device, &weather_bgl, &weather_uniform_buffer);
+        let weather_pipeline = weather::create_weather_pipeline(ctx, &camera_bgl, &weather_bgl);
+        let (weather_vertex_buffer, weather_vertex_count) =
+            weather::create_weather_vertex_buffer(&ctx.device);
+        let weather_stage = Some(WeatherStage {
+            pipeline: weather_pipeline,
+            uniform_buffer: weather_uniform_buffer,
+            bind_group: weather_bind_group,
+            vertex_buffer: weather_vertex_buffer,
+            vertex_count: weather_vertex_count,
+        });
 
         let voxel_shader = ctx
             .device
@@ -933,6 +1013,7 @@ impl VoxelRenderer {
             sky_bind_group,
             sky_vertex_buffer,
             sky_vertex_count,
+            weather_stage,
         }
     }
 
@@ -982,8 +1063,13 @@ impl VoxelRenderer {
         // Submersion swaps the palette fog color and the render-distance range
         // for the fixed deep-water shift. Only values change; the 112-byte
         // CameraUniform layout (and day_factor in fog_start_end.z) is intact.
-        let (fog_color, fog_start, fog_end) =
-            effective_fog(sky.underwater, sky.fog_color, max_dist * 0.65, max_dist);
+        let (fog_color, fog_start, fog_end) = effective_fog(
+            sky.underwater,
+            sky.fog_color,
+            max_dist * 0.65,
+            max_dist,
+            sky.fog_range_factor,
+        );
         let cam_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 1.0],
@@ -1052,6 +1138,25 @@ impl VoxelRenderer {
             sky_rpass.set_bind_group(1, &self.sky_bind_group, &[]);
             sky_rpass.set_vertex_buffer(0, self.sky_vertex_buffer.slice(..));
             sky_rpass.draw(0..self.sky_vertex_count, 0..1);
+        }
+
+        // Precipitation is the only weather-conditional path, and it is a
+        // *draw*, never a pass. Derive the draw range and write the 32-byte
+        // per-frame uniform only when something will actually be drawn: an
+        // absent stage, an empty static buffer, or Clear weather all skip
+        // both. `weather_vertex_range` selects the live pattern segment
+        // (rain first, snowfall second) so the inactive half is never
+        // processed. Queue writes are ordered ahead of the submit below.
+        let weather_draw = self.weather_stage.as_ref().and_then(|stage| {
+            if stage.vertex_count == 0 {
+                return None;
+            }
+            weather::weather_vertex_range(sky.weather).map(|range| (stage, range))
+        });
+        if let Some((stage, _)) = weather_draw {
+            let uniform = weather::WeatherUniform::from_weather(sky.weather, sky.weather_phase);
+            ctx.queue
+                .write_buffer(&stage.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         }
 
         {
@@ -1153,6 +1258,21 @@ impl VoxelRenderer {
                 // Six vertices per instance (PackedQuad step mode), one
                 // instance per water quad in the contiguous water buffer.
                 rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.water_quad_count as u32);
+            }
+
+            // Precipitation stage: strictly AFTER the water loop (rain and
+            // snowfall render over the liquid surface, and the box never reads
+            // blocks) and BEFORE the overlay (the selection wireframe,
+            // crosshair and hotbar stay crisp on top). The pipeline writes no
+            // depth, so drops never occlude later draws. `weather_draw` is
+            // `None` for Clear weather or an absent/empty stage — the draw is
+            // skipped, not the pass.
+            if let Some((stage, (base_vertex, vertex_count))) = weather_draw {
+                rpass.set_pipeline(&stage.pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                rpass.set_bind_group(1, &stage.bind_group, &[]);
+                rpass.set_vertex_buffer(0, stage.vertex_buffer.slice(..));
+                rpass.draw(base_vertex..base_vertex + vertex_count, 0..1);
             }
 
             if !overlay_verts.is_empty() {
@@ -1257,10 +1377,16 @@ mod tests {
             },
             time_of_day: 18_000,
             underwater: false,
+            weather: Weather::Rain,
+            fog_range_factor: 0.75,
+            weather_phase: 12_000.0,
         };
         assert_eq!(params.time_of_day, 18_000);
         assert_eq!(params.day_factor, 0.35);
         assert!(!params.underwater);
+        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.fog_range_factor, 0.75);
+        assert_eq!(params.weather_phase, 12_000.0);
 
         // Midnight: moon up, stars out, sun below the horizon.
         let uniform = sky::SkyUniform::from_time(params.time_of_day);
@@ -1273,11 +1399,11 @@ mod tests {
     #[test]
     fn underwater_fog_shift_round_trips_and_keeps_the_dry_path_identical() {
         let palette_fog = [0.53, 0.76, 0.96, 1.0];
-        let dry = effective_fog(false, palette_fog, 300.0, 512.0);
+        let dry = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
         assert_eq!(dry.0, palette_fog, "dry fog color passes through");
         assert_eq!((dry.1, dry.2), (300.0, 512.0), "dry range is untouched");
 
-        let wet = effective_fog(true, palette_fog, 300.0, 512.0);
+        let wet = effective_fog(true, palette_fog, 300.0, 512.0, 0.75);
         assert_eq!(wet.0, UNDERWATER_FOG_COLOR);
         assert_eq!((wet.1, wet.2), (UNDERWATER_FOG_START, UNDERWATER_FOG_END));
         assert!(
@@ -1298,8 +1424,148 @@ mod tests {
             clear_color: wgpu::Color::BLACK,
             time_of_day: 6_000,
             underwater: true,
+            weather: Weather::Clear,
+            fog_range_factor: daycycle::weather_fog_range_factor(Weather::Clear),
+            weather_phase: 0.0,
         };
         assert!(params.underwater);
+    }
+
+    #[test]
+    fn clear_weather_fog_factor_is_the_identity() {
+        // Clear is pinned to exactly 1.0 in daycycle, and `x * 1.0 == x`, so
+        // the dry path must remain bit-identical.
+        assert_eq!(daycycle::weather_fog_range_factor(Weather::Clear), 1.0);
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
+        assert_eq!(color, palette_fog);
+        assert_eq!((start, end), (300.0, 512.0));
+    }
+
+    #[test]
+    fn rain_and_snow_fog_factors_shrink_the_range() {
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        for weather in [Weather::Rain, Weather::Snowfall] {
+            let factor = daycycle::weather_fog_range_factor(weather);
+            let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, factor);
+            assert_eq!(color, palette_fog, "weather never recolors fog here");
+            assert_eq!(start, 300.0 * factor);
+            assert_eq!(end, 512.0 * factor);
+            assert!(
+                start < 300.0 && end < 512.0,
+                "{weather:?} must compress the fog range"
+            );
+            assert!(start < end, "compressed range must stay ordered");
+        }
+        assert!(
+            daycycle::weather_fog_range_factor(Weather::Rain)
+                < daycycle::weather_fog_range_factor(Weather::Snowfall),
+            "rain is the more enclosing state"
+        );
+    }
+
+    #[test]
+    fn underwater_fog_precedence_ignores_the_weather_factor() {
+        // Submersion is a fixed deep-water shift: it wins over any weather
+        // factor, including a malformed one.
+        for factor in [0.0, 0.75, 1.0, f32::NAN, -3.0] {
+            let (color, start, end) =
+                effective_fog(true, [0.53, 0.76, 0.96, 1.0], 300.0, 512.0, factor);
+            assert_eq!(color, UNDERWATER_FOG_COLOR);
+            assert_eq!((start, end), (UNDERWATER_FOG_START, UNDERWATER_FOG_END));
+        }
+    }
+
+    #[test]
+    fn malformed_fog_factors_cannot_invert_or_explode_the_range() {
+        // Non-finite falls back to the identity; out-of-range values are
+        // clamped to compression only (fog may get closer, never further).
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        assert_eq!(
+            effective_fog(false, palette_fog, 300.0, 512.0, f32::NAN),
+            (palette_fog, 300.0, 512.0)
+        );
+        assert_eq!(
+            effective_fog(false, palette_fog, 300.0, 512.0, f32::INFINITY),
+            (palette_fog, 300.0, 512.0)
+        );
+        let (_, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 4.0);
+        assert_eq!((start, end), (300.0, 512.0), "factor > 1 cannot expand");
+        let (_, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, -2.0);
+        assert_eq!((start, end), (0.0, 0.0), "negative clamps to zero");
+    }
+
+    #[test]
+    fn weather_draw_gating_table() {
+        // Clear never draws; both precip states draw only with a stage.
+        assert!(!weather_draw_visible(Weather::Clear, false));
+        assert!(!weather_draw_visible(Weather::Clear, true));
+        for weather in [Weather::Rain, Weather::Snowfall] {
+            assert!(
+                weather_draw_visible(weather, true),
+                "{weather:?} with a stage must draw"
+            );
+            assert!(
+                !weather_draw_visible(weather, false),
+                "{weather:?} without a stage must skip the draw"
+            );
+        }
+        // The stage's static buffer is authoritative about which segment to
+        // draw; Clear yields no range at all.
+        assert_eq!(weather::weather_vertex_range(Weather::Clear), None);
+    }
+
+    #[test]
+    fn weather_draw_sits_between_the_water_loop_and_the_overlay() {
+        // Source pin on main_pass stage order: opaque -> water -> precip ->
+        // overlay. The precip block must draw the selected segment range,
+        // bind the stage uniform, and be guarded by `weather_draw` (which is
+        // None for Clear or an absent/empty stage) rather than conditioning a
+        // pass.
+        let src = include_str!("pipeline.rs");
+        let water_at = src
+            .find("set_pipeline(&self.water_pipeline)")
+            .expect("water draw exists");
+        let weather_at = src
+            .find("set_pipeline(&stage.pipeline)")
+            .expect("weather draw exists");
+        let overlay_at = src
+            .find("set_pipeline(&self.overlay_pipeline)")
+            .expect("overlay draw exists");
+        assert!(
+            water_at < weather_at && weather_at < overlay_at,
+            "stage order must be water draw -> precip draw -> overlay"
+        );
+
+        let weather_block = &src[weather_at..overlay_at];
+        assert!(weather_block.contains("base_vertex..base_vertex + vertex_count"));
+        assert!(weather_block.contains("stage.bind_group"));
+        assert!(weather_block.contains("stage.vertex_buffer"));
+        assert!(
+            src[..weather_at].contains("if stage.vertex_count == 0"),
+            "an empty static buffer must skip the draw, not record an empty one"
+        );
+        assert!(
+            src[..weather_at].contains(
+                "if let Some((stage, (base_vertex, vertex_count))) = weather_draw"
+            ),
+            "the precip draw must be guarded by the pure weather gating decision"
+        );
+
+        // The per-frame uniform write is guarded too: no write for Clear or an
+        // absent/empty stage. It lands once per frame, before the main pass.
+        let write_at = src
+            .find("write_buffer(&stage.uniform_buffer")
+            .expect("weather uniform write exists");
+        assert!(write_at < weather_at, "write the uniform before the draw");
+        let main_at = src
+            .find("label: Some(\"main_pass\")")
+            .expect("main pass exists");
+        assert!(
+            write_at < main_at,
+            "the uniform write belongs before the main pass opens"
+        );
+        assert!(src[..write_at].contains("weather_draw"));
     }
 
     #[test]
