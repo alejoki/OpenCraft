@@ -2718,13 +2718,15 @@ mod tests {
         );
     }
 
-    /// Headless ocean-crossing acceptance test (M007/S03-T02).
+    /// Headless ocean-crossing acceptance test (M007/S03-T02, reworked for
+    /// D087 in M007/S08-T07).
     ///
     /// Drives the exact production physics seam and per-frame order from the
     /// playing frame in `src/main.rs`: `Player::update` first, then
     /// `WorldManager::update_streaming` around the player's new chunk. The
-    /// player falls into a generated ocean, floats near the surface, rises with
-    /// `jump_or_up`, and swims across to the far shore, where it finishes
+    /// player falls into a generated ocean, idles down away from the surface
+    /// (D087: water sinks an idle body), rises with `jump_or_up`, then swims
+    /// across with a bounded jump cadence to the far shore, where it finishes
     /// standing on land above `SEA_LEVEL`.
     ///
     /// Before the run, the crossing is bounded by a pure, chunk-free scan: seed
@@ -2734,27 +2736,27 @@ mod tests {
     /// target and no chunk has to exist to compute the bounds.
     ///
     /// This is the slice's highest-risk proof because it couples three things:
-    /// the T01 swim constants, worldgen Water residency, and streaming ahead of
-    /// the player. `WorldManager::get_block` returns Air for a non-resident
-    /// chunk, so a lagging pipeline silently removes buoyancy; every frame runs
-    /// behind a bounded residency gate, and the float/rise assertions fail
+    /// the swim constants, worldgen Water residency, and streaming ahead of the
+    /// player. `WorldManager::get_block` returns Air for a non-resident chunk,
+    /// so a lagging pipeline silently removes the water branch; every frame runs
+    /// behind a bounded residency gate, and the sink/rise assertions fail
     /// loudly if the body approaches the seabed instead of the surface.
     ///
     /// Determinism and bounds: fixed `dt = 1/60`, an explicit frame budget per
     /// phase, and bounded polling for both the warm-up and the per-frame gate,
     /// so the test can never hang. Every panic names the stage (bounds,
-    /// warm-up, entry, float, rise, crossing, streaming-gate), the seed, the
+    /// warm-up, entry, sink, rise, crossing, streaming-gate), the seed, the
     /// axis, the crossing distance and the relevant frame/poll budget, so a
     /// regression pinpoints which stage stalled.
     ///
-    /// Honesty note: no fall-damage or health claim is made here — no
+    /// Honesty note: no fall-damage, health, or drowning claim is made here — no
     /// health/fall/damage system exists in `src/`; fall damage and drowning are
     /// deferred to M008 per MEM227. The assertions are mechanics only:
-    /// positions, buoyancy and `on_ground`.
+    /// positions, sink/rise and `on_ground`.
     #[test]
     fn test_acceptance_swim_ocean_crossing() {
         let _heavy = lock_heavy_streaming();
-        use crate::player::physics::{InputState, Player};
+        use crate::player::physics::{InputState, Player, PLAYER_HALF_WIDTH};
         use crate::world::terrain::{biome_at_seeded, terrain_height_at_seeded, Biome, SEA_LEVEL};
         use std::time::Duration;
 
@@ -2767,10 +2769,16 @@ mod tests {
         const WARMUP_POLL_CAP: usize = 20_000;
         const GATE_POLL_CAP: usize = 20_000;
         const ENTRY_FRAME_CAP: usize = 600;
-        const FLOAT_FRAMES: usize = 180;
+        const SINK_FRAMES: usize = 60;
         const RISE_FRAME_CAP: usize = 120;
         const CROSSING_FRAME_CAP: usize = 9_000;
         const SEABED_MARGIN: f32 = 2.0;
+        /// D087 crossing cadence: with no buoyancy, a forward-only swimmer
+        /// sinks the whole crossing. Jump engages whenever the body is at or
+        /// below the top face of the water column and releases as soon as the
+        /// body rises above it, so the swim band stays near the surface without
+        /// ever holding the body there.
+        const SWIM_JUMP_AT_OR_BELOW: f32 = SEA_LEVEL as f32 + 1.0;
 
         // ---- 1. Bound the crossing before any chunk exists (pure scan) ----
         let ocean_start = (0..512)
@@ -2873,7 +2881,7 @@ mod tests {
                 let col_x = self.player.position.x.floor() as i32;
                 let col_z = self.player.position.z.floor() as i32;
                 if terrain_height_at_seeded(col_x, col_z, SEED) >= SEA_LEVEL {
-                    // Dry land: buoyancy is not at stake, so nothing to gate.
+                    // Dry land: the water branch is not at stake, so nothing to gate.
                     return;
                 }
                 let (center, _) = world_to_chunk_and_local(col_x, SEA_LEVEL, col_z);
@@ -2885,7 +2893,7 @@ mod tests {
                          {SEED} axis {CROSSING_AXIS} distance {crossing_distance} blocks, frame \
                          {}, position {:?}: Water at column ({col_x}, {col_z}) was still \
                          non-resident after {polls} bounded update_streaming polls (cap {cap}); a \
-                         non-resident chunk reads as Air, which silently removes buoyancy",
+                         non-resident chunk reads as Air, which silently removes the water branch",
                         self.frames,
                         self.player.position
                     );
@@ -2972,55 +2980,53 @@ mod tests {
             harness.player.position.y
         );
 
-        // ---- 4. Phase 2: float — settle in a band near the sea surface ----
-        let mut float_min_y = f32::MAX;
-        let mut float_max_y = f32::MIN;
-        let mut float_water_frames = 0usize;
-        for frame in 0..FLOAT_FRAMES {
+        // ---- 4. Phase 2: sink — released idle, the body descends away from
+        // the surface (D087: water drags + applies gravity; no surface lock) ----
+        let sink_start_y = harness.player.position.y;
+        let mut sink_min_y = sink_start_y;
+        let mut sink_water_frames = 0usize;
+        for frame in 0..SINK_FRAMES {
             harness.step(&idle_input, crossing_distance);
             let y = harness.player.position.y;
-            float_min_y = float_min_y.min(y);
-            float_max_y = float_max_y.max(y);
+            sink_min_y = sink_min_y.min(y);
             if harness.feet_block() == BlockId::Water {
-                float_water_frames += 1;
+                sink_water_frames += 1;
             }
             assert!(
                 !harness.player.on_ground,
-                "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
-                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/{FLOAT_FRAMES} \
-                 (global frame {}): a floating body touched ground at y={y} (seabed \
-                 h={seabed_height}); the pre-swim bug walks the seabed",
+                "test_acceptance_swim_ocean_crossing stage 'sink': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/{SINK_FRAMES} \
+                 (global frame {}): an idle sinking body touched ground at y={y} (seabed \
+                 h={seabed_height}); water must not hold the body at the surface",
                 harness.frames
+            );
+            assert!(
+                y > seabed_height as f32 + SEABED_MARGIN,
+                "test_acceptance_swim_ocean_crossing stage 'sink': seed {SEED} axis \
+                 {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/{SINK_FRAMES}: \
+                 the body sank to y={y} (seabed h={seabed_height}, margin {SEABED_MARGIN}) before \
+                 the idle-sink proof completed",
             );
         }
         assert!(
-            float_min_y > seabed_height as f32 + SEABED_MARGIN,
-            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
-             {CROSSING_AXIS} distance {crossing_distance} blocks, {FLOAT_FRAMES}-frame budget: \
-             the body sank to y={float_min_y} (seabed h={seabed_height}, margin {SEABED_MARGIN}) \
-             instead of floating near the surface"
+            sink_start_y - sink_min_y > 2.0,
+            "test_acceptance_swim_ocean_crossing stage 'sink': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks, {SINK_FRAMES}-frame budget: an \
+             idle submerged body only dropped from y={sink_start_y} to y={sink_min_y}; D087 \
+             requires it to sink away from the surface"
         );
         assert!(
-            float_min_y >= SEA_LEVEL as f32 - 1.5 && float_max_y <= SEA_LEVEL as f32 + 2.0,
-            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
-             {CROSSING_AXIS} distance {crossing_distance} blocks: band {float_min_y}..{float_max_y} \
-             is not near SEA_LEVEL {SEA_LEVEL} (expected within {}..{})",
-            SEA_LEVEL as f32 - 1.5,
-            SEA_LEVEL as f32 + 2.0
+            sink_min_y > seabed_height as f32 + SEABED_MARGIN,
+            "test_acceptance_swim_ocean_crossing stage 'sink': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: the body reached y={sink_min_y} \
+             at its lowest (seabed h={seabed_height}, margin {SEABED_MARGIN})"
         );
         assert!(
-            float_max_y - float_min_y < 1.5,
-            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
-             {CROSSING_AXIS} distance {crossing_distance} blocks: band width {} is not a gentle \
-             float (oscillation or teleport)",
-            float_max_y - float_min_y
-        );
-        assert!(
-            float_water_frames > FLOAT_FRAMES / 4,
-            "test_acceptance_swim_ocean_crossing stage 'float': seed {SEED} axis \
-             {CROSSING_AXIS} distance {crossing_distance} blocks: only {float_water_frames}/\
-             {FLOAT_FRAMES} frames had Water at the feet, so buoyancy was never engaged and the \
-             water column was not resident through the streaming seam"
+            sink_water_frames > SINK_FRAMES / 2,
+            "test_acceptance_swim_ocean_crossing stage 'sink': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: only {sink_water_frames}/\
+             {SINK_FRAMES} frames had Water at the feet, so the idle sink was not in the water \
+             column"
         );
 
         // ---- 5. Phase 3: rise — jump_or_up climbs and clears the surface ----
@@ -3066,17 +3072,26 @@ mod tests {
              the body (start {rise_start_y}, max {rise_max_y})"
         );
 
-        // ---- 6. Phase 4: crossing — forward to the far shore ----
-        let crossing_input = InputState {
-            forward: true,
-            ..InputState::default()
-        };
+        // ---- 6. Phase 4: crossing — forward plus a bounded jump cadence ----
         let gate_polls_before_crossing = harness.gate_polls;
         let crossing_start_axis = harness.axis_position();
         let mut crossing_min_y = f32::MAX;
         let mut crossing_water_frames = 0usize;
+        let mut crossing_jump_frames = 0usize;
         let mut landed = None;
         for frame in 0..CROSSING_FRAME_CAP {
+            // D087 cadence: tap Jump whenever the body is at or below the water
+            // top; release as soon as it rises above. This holds a swim band
+            // near the surface instead of sinking to the seabed or locking at
+            // the surface.
+            let crossing_input = InputState {
+                forward: true,
+                jump_or_up: harness.player.position.y <= SWIM_JUMP_AT_OR_BELOW,
+                ..InputState::default()
+            };
+            if crossing_input.jump_or_up {
+                crossing_jump_frames += 1;
+            }
             harness.step(&crossing_input, crossing_distance);
             crossing_min_y = crossing_min_y.min(harness.player.position.y);
             if harness.feet_block() == BlockId::Water {
@@ -3091,6 +3106,20 @@ mod tests {
                 harness.player.position.y,
                 harness.axis_position()
             );
+            if harness.player.on_ground
+                && harness.player.position.y <= SEA_LEVEL as f32
+                && harness.axis_position() + PLAYER_HALF_WIDTH < far_shore_axis
+            {
+                panic!(
+                    "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+                     {CROSSING_AXIS} distance {crossing_distance} blocks, frame {frame}/\
+                     {CROSSING_FRAME_CAP}: touched ground at y={} axis position {:.1} while its \
+                     body box was still short of the far-shore column {far_shore_axis}; the body \
+                     walked the seabed instead of swimming",
+                    harness.player.position.y,
+                    harness.axis_position()
+                );
+            }
             if harness.axis_position() >= far_shore_axis
                 && harness.player.on_ground
                 && harness.player.position.y > SEA_LEVEL as f32
@@ -3114,6 +3143,12 @@ mod tests {
             "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
              {CROSSING_AXIS} distance {crossing_distance} blocks: only {crossing_water_frames}/\
              {CROSSING_FRAME_CAP} frames had Water at the feet, so the body did not swim the ocean"
+        );
+        assert!(
+            crossing_jump_frames > 0,
+            "test_acceptance_swim_ocean_crossing stage 'crossing': seed {SEED} axis \
+             {CROSSING_AXIS} distance {crossing_distance} blocks: the bounded jump cadence never \
+             engaged, so the body could not hold a swim band above the seabed"
         );
         assert!(
             crossing_min_y > seabed_height as f32 + SEABED_MARGIN,
@@ -3144,9 +3179,10 @@ mod tests {
         eprintln!(
             "test_acceptance_swim_ocean_crossing: seed={SEED} axis={CROSSING_AXIS} \
              distance={crossing_distance} blocks frames={} (entry={entry_frame}, landed={landed}) \
-             float_band={float_min_y:.3}..{float_max_y:.3} float_water_frames={float_water_frames} \
+             sink={sink_start_y:.3}->{sink_min_y:.3} sink_water_frames={sink_water_frames} \
              rise={rise_start_y:.3}->{rise_max_y:.3} rise_submerged_frames={rise_submerged_frames} \
-             crossing_water_frames={crossing_water_frames} gate_polls={} (worst {} polls)",
+             crossing_water_frames={crossing_water_frames} crossing_jump_frames={crossing_jump_frames} \
+             gate_polls={} (worst {} polls)",
             harness.frames, harness.gate_polls, harness.gate_worst_polls
         );
     }

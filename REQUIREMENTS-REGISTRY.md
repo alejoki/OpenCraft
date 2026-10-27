@@ -287,15 +287,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: None
 - Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::season; cargo test --locked --lib -- world::daycycle; bash scripts/season_smoke.sh
 
-### R029 — Buoyant swim mechanics with the water mobility matrix
+### R029 — Deliberate swim mechanics: idle sink, Jump rise, no surface lock
 - Class: core-capability
 - Status: active
-- Description: The player enters a generated ocean, floats buoyantly at the surface, rises with Space, and crosses to the far shore through the production physics seams, with water passable-but-never-walkable proven at every mobility consumer.
-- Why it matters: Oceans must be traversable mechanics, not decorative geometry; fall damage and drowning are honestly deferred to M008.
-- Source: M007 / S03 swim physics
+- Description: Water applies drag and gravity to an idle submerged body so it sinks away from the surface; holding Jump/Space applies a bounded rise back up, with no automatic surface lock. Water stays passable-but-never-walkable at every mobility consumer, and the body may stand only on the solid seabed (D087).
+- Why it matters: The human sensory pass rejected the old buoyant auto-float (walking onto water only wobbled at the surface; only fly mode could submerge), so crossings must be a deliberate swim: sink when idle, rise with Jump, and traverse generated oceans through the production physics seams. Mechanics only; fall damage and drowning are honestly deferred to M008.
+- Source: M007 / S03 swim physics (reworked by D087 in M007/S08-T07)
 - Primary owning slice: M007/S03
-- Supporting slices: None
-- Validation: cargo test --locked --lib -- swim; cargo test --locked --lib -- player::physics; cargo test --locked --lib -- world::light
+- Supporting slices: M007/S08
+- Validation: cargo test --locked --lib -- swim; cargo test --locked --lib -- player::physics; cargo test --locked --lib -- ocean_crossing; cargo test --locked --bins -- swim
 
 ### R030 — Translucent water render pass and underwater fog shift
 - Class: quality-attribute

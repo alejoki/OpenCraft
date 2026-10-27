@@ -20,7 +20,8 @@
 #         124 and is an explicit FAILURE here, never the expected outcome.
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) stdout contains the `swim_demo:` digest line with `landed=true`
-#         (the watcher walked entry -> float -> rise -> crossing -> landed).
+#         (the watcher walked entry -> sink -> rise -> crossing -> landed, with
+#         the D087 idle-sink and bounded jump-cadence phases).
 #     (d) stdout contains the `frame_budget:` digest line, whose `p95=<n>ms`
 #         field the script parses and asserts <= 16.6 ms.
 #
@@ -124,6 +125,14 @@ fi
 
 if [[ "$SWIM_LINE" != *"landed=true"* ]]; then
     echo "SWIM SMOKE FAIL: swim did not land — observed digest: $SWIM_LINE"
+    exit 1
+fi
+
+# D087: the watcher must have proven an idle sink (not the rejected buoyant
+# float). The digest carries `sink=<start>-><lowest>`; `sink=none` means the
+# phase never ran, which would silently reintroduce a surface-locked swimmer.
+if [[ "$SWIM_LINE" != *"sink="* || "$SWIM_LINE" == *"sink=none"* ]]; then
+    echo "SWIM SMOKE FAIL: swim digest has no idle-sink proof — observed digest: $SWIM_LINE"
     exit 1
 fi
 

@@ -37,13 +37,14 @@ pub const PLAYER_HALF_WIDTH: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.8;
 pub const PLAYER_EYE_HEIGHT: f32 = 1.62;
 
-/// Upward acceleration applied to a submerged player (net positive against the
-/// 28.0 m/s^2 gravity in `Player::update`, so a released body rises).
-pub const SWIM_BUOYANCY_ACCEL: f32 = 41.0;
-/// Per-second exponential drag on vertical velocity while submerged. With
-/// `SWIM_BUOYANCY_ACCEL - gravity` this bounds the natural float at roughly
-/// 2.2 m/s: gentle, never a teleport.
+/// Per-second exponential drag on vertical velocity while submerged (D087).
+/// With gravity this bounds an idle sink at roughly 4.7 m/s: deliberate, never
+/// a teleport.
 pub const SWIM_VERTICAL_DRAG: f32 = 6.0;
+/// Upward acceleration while `jump_or_up` is held underwater (D087). Net of the
+/// 28.0 m/s^2 gravity below this lifts a submerged body; released, gravity plus
+/// drag make it sink. There is no buoyant surface lock in either case.
+pub const SWIM_RISE_ACCEL: f32 = 40.0;
 /// Upward speed while `jump_or_up` is held underwater. Deliberately below the
 /// 9.0 m/s land jump so swimming up reads as a steady rise, not a leap.
 pub const SWIM_RISE_SPEED: f32 = 4.0;
@@ -528,8 +529,9 @@ impl Player {
         // Submersion is derived from the already-in-scope `get_block` closure —
         // no signature change and no new call-site parameter. Sampling the feet
         // block catches a wading body, and the mid-body block keeps a body whose
-        // feet have just cleared the surface buoyant until it is actually out of
-        // the water (a generated ocean fills every column below `SEA_LEVEL`).
+        // feet have just cleared the surface in the water branch until it is
+        // actually out of the water (a generated ocean fills every column below
+        // `SEA_LEVEL`).
         let body_x = self.position.x.floor() as i32;
         let body_z = self.position.z.floor() as i32;
         let feet_block_y = (self.position.y + 1e-4).floor() as i32;
@@ -548,20 +550,29 @@ impl Player {
         self.velocity.x = move_dir.x * walk_speed;
         self.velocity.z = move_dir.z * walk_speed;
 
-        // Swim branch of walk mode. Honesty note: this asserts mechanics only
-        // (positions, buoyancy, on_ground). No fall-damage or health claim is made
-        // anywhere in this slice — no health/fall/damage system exists in `src/`;
-        // fall damage and drowning are deferred to M008 (MEM227).
+        // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
+        // only (positions, sink/rise, on_ground). No fall-damage, health, or
+        // drowning claim is made anywhere in this slice — no health/fall/damage
+        // system exists in `src/`; fall damage and drowning are deferred to M008
+        // (MEM227).
         if submerged {
-            // Water drag on the vertical axis, then net upward buoyancy
-            // (`SWIM_BUOYANCY_ACCEL` exceeds the 28.0 gravity below).
+            // D087: no buoyant surface lock. A submerged walk-mode body is
+            // dragged vertically and then pulled down by gravity while
+            // `jump_or_up` is released; holding it applies the rise acceleration
+            // instead. Both directions clamp to their terminal swim speeds, so an
+            // idle body sinks away from the surface and a held Jump rises back up.
             let drag = (1.0 - SWIM_VERTICAL_DRAG * dt).clamp(0.0, 1.0);
-            self.velocity.y = self.velocity.y * drag + (SWIM_BUOYANCY_ACCEL - 28.0) * dt;
-            if input.jump_or_up {
-                self.velocity.y = self.velocity.y.max(SWIM_RISE_SPEED);
-            }
-            self.velocity.y = self.velocity.y.clamp(-SWIM_MAX_SINK_SPEED, SWIM_RISE_SPEED);
+            self.velocity.y *= drag;
+            let vertical_accel = if input.jump_or_up {
+                SWIM_RISE_ACCEL
+            } else {
+                -28.0
+            };
+            self.velocity.y = (self.velocity.y + vertical_accel * dt)
+                .clamp(-SWIM_MAX_SINK_SPEED, SWIM_RISE_SPEED);
             // A body in water is never standing: no on-ground land jump of 9.0.
+            // The sub-step Y resolution below may still turn this true, but only
+            // on a solid block (the seabed), never on the liquid surface.
             self.on_ground = false;
         } else {
             if self.on_ground && input.jump_or_up {
@@ -1576,30 +1587,37 @@ mod tests {
     }
 
     #[test]
-    fn swim_submerged_player_floats_up_to_the_surface_band() {
-        // Released deep under the surface (3 blocks above the seabed top) with no
-        // input at all: buoyancy must carry the body up to the sea surface and
-        // hold it there instead of letting gravity walk the seabed.
-        let mut player = Player::new(Vec3::new(0.5, 3.0, 0.5));
+    fn swim_idle_submerged_player_sinks_away_from_the_surface() {
+        // D087: no automatic surface lock. Released just under the surface with
+        // no input at all, the body must descend under drag plus gravity instead
+        // of hovering at the surface band.
+        let mut player = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32 - 0.1, 0.5));
         player.fly_mode = false;
         let input = InputState::default();
-        let mut lowest = player.position.y;
-        for _ in 0..600 {
+        let start_y = player.position.y;
+        let mut min_y = start_y;
+        for frame in 0..120 {
             player.update(1.0 / 60.0, &input, water_column);
-            lowest = lowest.min(player.position.y);
+            min_y = min_y.min(player.position.y);
+            assert!(
+                !player.on_ground,
+                "an idle sinking body must not touch ground before the seabed: frame {frame}, y={}",
+                player.position.y
+            );
         }
         assert!(
-            lowest > 1.0,
-            "a submerged player must never sink toward the seabed (lowest y {lowest})"
+            start_y - min_y > 8.0,
+            "an idle submerged body must sink away from the surface, not float: start {start_y}, lowest {min_y}"
         );
         assert!(
-            (player.position.y - TEST_SEA_LEVEL as f32).abs() < 0.5,
-            "expected the body to settle in the surface band around y={TEST_SEA_LEVEL}, got {}",
+            player.position.y < start_y - 8.0,
+            "the body must still be sinking at the end of the window: start {start_y}, end {}",
             player.position.y
         );
         assert!(
-            !player.on_ground,
-            "a floating player is not standing on ground"
+            player.velocity.y < 0.0,
+            "the idle body must carry downward velocity, got {}",
+            player.velocity.y
         );
     }
 
@@ -1621,43 +1639,63 @@ mod tests {
         }
         assert!(
             exited,
-            "holding Space must rise through the column and clear the surface, y={}",
+            "holding Space must rise through the column and clear the water surface, y={}",
             player.position.y
         );
     }
 
     #[test]
-    fn swim_vertical_drag_bounds_the_float_speed() {
-        let mut player = Player::new(Vec3::new(0.5, 2.0, 0.5));
-        player.fly_mode = false;
-        let input = InputState::default();
-        let mut max_step = 0.0f32;
-        let mut settled_min = f32::INFINITY;
-        let mut settled_max = f32::NEG_INFINITY;
-        for frame in 0..1200 {
-            let before = player.position.y;
-            player.update(1.0 / 60.0, &input, water_column);
-            let dy = (player.position.y - before).abs();
-            if before < (TEST_SEA_LEVEL - 2) as f32 {
-                max_step = max_step.max(dy);
-            }
-            if frame >= 900 {
-                settled_min = settled_min.min(player.position.y);
-                settled_max = settled_max.max(player.position.y);
-            }
+    fn swim_vertical_drag_bounds_the_sink_and_rise_speeds() {
+        // Sink: idle just under the surface. The per-frame downward step stays
+        // far below a teleport and the terminal speed is capped by the constant.
+        let mut sinker = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32 - 2.0, 0.5));
+        sinker.fly_mode = false;
+        let idle = InputState::default();
+        let mut max_sink_step = 0.0f32;
+        for _ in 0..60 {
+            let before = sinker.position.y;
+            sinker.update(1.0 / 60.0, &idle, water_column);
+            max_sink_step = max_sink_step.max(before - sinker.position.y);
         }
         assert!(
-            max_step > 0.0,
-            "buoyancy must actually move the body (max per-frame step {max_step})"
+            max_sink_step > 0.0,
+            "the idle body must actually move down (max per-frame sink {max_sink_step})"
         );
         assert!(
-            max_step < 0.1,
-            "vertical drag must bound the float step, got {max_step} blocks/frame (teleport-like)"
+            max_sink_step <= SWIM_MAX_SINK_SPEED * (1.0 / 60.0) + 1e-3,
+            "vertical drag must bound the sink step, got {max_sink_step} blocks/frame (teleport-like)"
         );
         assert!(
-            settled_max - settled_min < 0.4,
-            "the float must be gentle, not oscillating: band {}..{settled_min}..{settled_max}",
-            settled_max
+            -sinker.velocity.y <= SWIM_MAX_SINK_SPEED + 1e-3,
+            "terminal sink speed must stay capped at {SWIM_MAX_SINK_SPEED}, got {}",
+            sinker.velocity.y
+        );
+
+        // Rise: holding Jump accelerates upward but never past the rise cap.
+        let mut riser = Player::new(Vec3::new(0.5, 3.0, 0.5));
+        riser.fly_mode = false;
+        let rise = InputState {
+            jump_or_up: true,
+            ..Default::default()
+        };
+        let mut max_rise_step = 0.0f32;
+        for _ in 0..60 {
+            let before = riser.position.y;
+            riser.update(1.0 / 60.0, &rise, water_column);
+            max_rise_step = max_rise_step.max(riser.position.y - before);
+        }
+        assert!(
+            max_rise_step > 0.0,
+            "holding Jump must actually lift the body (max per-frame rise {max_rise_step})"
+        );
+        assert!(
+            max_rise_step <= SWIM_RISE_SPEED * (1.0 / 60.0) + 1e-3,
+            "vertical drag must bound the rise step, got {max_rise_step} blocks/frame"
+        );
+        assert!(
+            riser.velocity.y > 0.0 && riser.velocity.y <= SWIM_RISE_SPEED + 1e-3,
+            "held Jump must produce a bounded upward speed, got {}",
+            riser.velocity.y
         );
     }
 
@@ -1701,14 +1739,14 @@ mod tests {
     #[test]
     fn swim_does_not_change_fly_mode_behavior() {
         // The fly branch returns before any swim code: a fly-mode player inside a
-        // water column with no input keeps its velocity (no buoyancy, no drag).
+        // water column with no input keeps its velocity (no water drag or gravity).
         let mut flyer = Player::new(Vec3::new(0.5, 5.0, 0.5));
         flyer.fly_mode = true;
         let input = InputState::default();
         for _ in 0..30 {
             flyer.update(1.0 / 60.0, &input, water_column);
         }
-        assert_eq!(flyer.position.y, 5.0, "fly mode ignores water buoyancy");
+        assert_eq!(flyer.position.y, 5.0, "fly mode ignores water physics");
         assert_eq!(flyer.velocity, Vec3::ZERO);
 
         // ...and above water it still rises at the fly speed while Space is held.
@@ -1729,9 +1767,10 @@ mod tests {
 
     #[test]
     fn swim_water_is_never_walkable_on_its_surface() {
-        // Dropped exactly at the surface: the player sinks into the water and is
-        // pushed back up, but can never stand on the liquid (no solid block, so
-        // `on_ground` never becomes true and the water surface is not walkable).
+        // Dropped exactly at the surface: the body falls into the water and then
+        // keeps sinking (D087). Water is not solid, so the surface can never
+        // provide ground contact; over this bounded window the body sinks before
+        // it can reach the seabed.
         assert!(
             !BlockId::Water.is_solid(),
             "water must stay passable-not-walkable"
@@ -1739,14 +1778,21 @@ mod tests {
         let mut player = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32, 0.5));
         player.fly_mode = false;
         let input = InputState::default();
-        for _ in 0..600 {
+        let start_y = player.position.y;
+        let mut min_y = start_y;
+        for frame in 0..120 {
             player.update(1.0 / 60.0, &input, water_column);
+            min_y = min_y.min(player.position.y);
             assert!(
                 !player.on_ground,
-                "a player must never stand on the water surface (y={})",
+                "a player must never stand on the water surface: frame {frame}, y={}",
                 player.position.y
             );
         }
+        assert!(
+            min_y < start_y - 2.0,
+            "dropped at the surface the body must sink before any ground contact: start {start_y}, lowest {min_y}"
+        );
     }
 
     #[test]
@@ -1781,7 +1827,6 @@ mod tests {
     /// Physics site of the S03 water mobility matrix: water is passable (no
     /// collision stop) but not walkable (no standing on the surface, no walking
     /// the seabed).
-    ///
     /// The four `is_solid` consumer sites and their named proof:
     /// 1. Physics collision (`collides_with_world` in this module) — asserted here.
     /// 2. Voxel raycast (`src/player/raycast.rs`) —
@@ -1795,10 +1840,11 @@ mod tests {
     /// The `BlockId` solid/liquid matrix itself is pinned by
     /// `test_solid_and_liquid_matrix_over_every_block_id` in `src/world/block.rs`.
     ///
-    /// Honesty note: no fall-damage or health claim is made anywhere in S03. No
-    /// health/fall/damage system exists in `src/` (grep-verified during
-    /// research); fall damage and drowning are deferred to M008 (MEM227). Swim
-    /// assertions cover mechanics only (positions, buoyancy, `on_ground`).
+    /// Honesty note: no fall-damage, health, or drowning claim is made anywhere
+    /// in S03 (or in the D087 rework). No health/fall/damage system exists in
+    /// `src/` (grep-verified during research); fall damage and drowning are
+    /// deferred to M008 (MEM227). Swim assertions cover mechanics only
+    /// (positions, sink/rise, `on_ground`).
     #[test]
     fn water_is_passable_but_never_walkable_at_the_physics_consumer() {
         assert!(!BlockId::Water.is_solid(), "water must stay passable");
@@ -1835,31 +1881,28 @@ mod tests {
             swimmer.position.x
         );
 
-        // Not walkable: released exactly at the surface with no input, buoyancy
-        // keeps the body floating in the surface band; it never stands on the
-        // liquid and never settles onto the seabed (the pre-S03 failure: gravity
-        // walked the body down through the passable water and onto the seabed).
-        let mut floater = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32, 0.5));
-        floater.fly_mode = false;
+        // Not walkable: released exactly at the surface with no input, the body
+        // sinks under drag plus gravity (D087) instead of floating; it never
+        // stands on the liquid and (over this bounded window) never reaches the
+        // seabed either. Water is not solid, so the surface cannot supply
+        // ground contact.
+        let mut sinker = Player::new(Vec3::new(0.5, TEST_SEA_LEVEL as f32, 0.5));
+        sinker.fly_mode = false;
         let idle = InputState::default();
-        let mut lowest = floater.position.y;
-        for _ in 0..600 {
-            floater.update(1.0 / 60.0, &idle, water_column);
-            lowest = lowest.min(floater.position.y);
+        let start_y = sinker.position.y;
+        let mut lowest = start_y;
+        for _ in 0..120 {
+            sinker.update(1.0 / 60.0, &idle, water_column);
+            lowest = lowest.min(sinker.position.y);
             assert!(
-                !floater.on_ground,
+                !sinker.on_ground,
                 "water is not walkable: on_ground became true at y={}",
-                floater.position.y
+                sinker.position.y
             );
         }
         assert!(
-            lowest > 1.0,
-            "buoyancy must keep the body off the seabed (lowest y {lowest})"
-        );
-        assert!(
-            (floater.position.y - TEST_SEA_LEVEL as f32).abs() < 0.5,
-            "the body must float in the surface band around y={TEST_SEA_LEVEL}, got {}",
-            floater.position.y
+            lowest < start_y - 2.0,
+            "an idle body must sink away from the water surface (start {start_y}, lowest {lowest})"
         );
     }
 }

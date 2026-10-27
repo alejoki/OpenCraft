@@ -17,7 +17,7 @@ use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
-use opencraft::player::physics::{InputState, InventoryCommandError, Player};
+use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
@@ -1287,13 +1287,13 @@ const SWIM_SHORE_SCAN_BLOCKS: i32 = 4096;
 /// Top face of the water column (`SEA_LEVEL` is the last water block).
 const SWIM_WATER_TOP: f32 = SEA_LEVEL as f32 + 1.0;
 
-/// How far above the spawn column's seabed a floating body must stay. Mirrors
-/// the S03 `SEABED_MARGIN`, so "the body sank" means the same thing in both
-/// surfaces.
+/// How far above the spawn column's seabed a sinking or swimming body must
+/// stay. Mirrors the S03 `SEABED_MARGIN`, so "the body sank" means the same
+/// thing in both surfaces.
 const SWIM_SEABED_MARGIN: f32 = 2.0;
 
 /// Stage budgets mirrored from the S03 harness's frame caps at its fixed
-/// 1/60 s step (600 entry / 180 float / 120 rise / 9000 crossing frames).
+/// 1/60 s step (600 entry / 60 sink / 120 rise / 9000 crossing frames).
 ///
 /// They are expressed in seconds of simulated time rather than frames because
 /// the production frame loop is uncapped: a frame budget that is safe at 60 Hz
@@ -1302,7 +1302,11 @@ const SWIM_SEABED_MARGIN: f32 = 2.0;
 /// exactly like `Player::update` clamps it), so the bound is frame-rate
 /// independent and still frames the S03 phase boundaries.
 const SWIM_ENTRY_SECS: f32 = 10.0;
-const SWIM_FLOAT_SECS: f32 = 3.0;
+/// D087 sink proof window: released idle just inside the water, the body must
+/// descend away from the surface rather than being held there.
+const SWIM_SINK_SECS: f32 = 1.0;
+/// Minimum idle descent (blocks) that counts as a real sink inside the window.
+const SWIM_SINK_MIN_DROP: f32 = 1.5;
 const SWIM_RISE_SECS: f32 = 2.0;
 /// The S03 crossing cap (9000 frames at 1/60 s) plus a production margin: the
 /// real binary's frame rate is unbounded, so the same simulated crossing is
@@ -1388,11 +1392,12 @@ fn arm_swim_route(session: &mut WorldSession, route: SwimRoute) {
     session.sync_camera();
 }
 
-/// The four S03 phases plus the terminal landed state.
+/// The S03 phases reworked for D087: entry, idle sink, Jump rise, crossing,
+/// and the terminal landed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwimStage {
     Entry,
-    Float,
+    Sink,
     Rise,
     Crossing,
     Landed,
@@ -1400,12 +1405,12 @@ enum SwimStage {
 
 impl SwimStage {
     /// The stage name used in abort diagnostics and by the headless stage
-    /// tests, so a failure names the same phase S03 names.
+    /// tests, so a failure names the same phase the headless proof names.
     #[cfg(test)]
     const fn name(self) -> &'static str {
         match self {
             Self::Entry => "entry",
-            Self::Float => "float",
+            Self::Sink => "sink",
             Self::Rise => "rise",
             Self::Crossing => "crossing",
             Self::Landed => "landed",
@@ -1428,11 +1433,13 @@ enum SwimProgress {
 ///
 /// The seam never mutates `GameApp::input`: the real input path stays
 /// byte-identical, and this copy is what a bounded phase supplies instead.
-/// Entry and float are idle (buoyancy must float the body unaided), rise holds
-/// `jump_or_up` (the S03 rise phase), and crossing holds `forward` (the S03
-/// crossing phase). The stage itself is the bounded cadence: each phase has a
-/// budget, so the keys can never be held past their window.
-fn swim_scripted_input(stage: SwimStage) -> InputState {
+/// Entry and sink are idle (D087: water must sink the body unaided), rise
+/// holds `jump_or_up`, and crossing holds `forward` plus a bounded jump
+/// cadence: Jump engages while the body's feet are at or below the top face of
+/// the water column and releases as soon as it clears it. The stage itself is
+/// the bounded cadence: each phase has a budget, so no key can be held past its
+/// window.
+fn swim_scripted_input(stage: SwimStage, feet_y: f32) -> InputState {
     match stage {
         SwimStage::Rise => InputState {
             jump_or_up: true,
@@ -1440,9 +1447,10 @@ fn swim_scripted_input(stage: SwimStage) -> InputState {
         },
         SwimStage::Crossing => InputState {
             forward: true,
+            jump_or_up: feet_y <= SWIM_WATER_TOP,
             ..InputState::default()
         },
-        SwimStage::Entry | SwimStage::Float | SwimStage::Landed => InputState::default(),
+        SwimStage::Entry | SwimStage::Sink | SwimStage::Landed => InputState::default(),
     }
 }
 
@@ -1450,11 +1458,12 @@ fn swim_scripted_input(stage: SwimStage) -> InputState {
 /// [`DemoCycleWatch`].
 ///
 /// It observes the production player after every scripted `Player::update`
-/// call and advances through S03's phases: entry (the feet block becomes
-/// water), float (a band near the sea surface, never `on_ground`), rise
+/// call and advances through the D087 phases: entry (the feet block becomes
+/// water), sink (idle descent away from the surface, never `on_ground`), rise
 /// (`jump_or_up` clears the water surface), crossing (reach the land target
-/// standing on land above `SEA_LEVEL`). Every abort names the stage and the
-/// observed values, so a stalled run is diagnosable from its one digest line.
+/// standing on land above `SEA_LEVEL` with a bounded jump cadence). Every abort
+/// names the stage and the observed values, so a stalled run is diagnosable
+/// from its one digest line.
 #[derive(Debug)]
 struct SwimWatch {
     route: SwimRoute,
@@ -1465,8 +1474,8 @@ struct SwimWatch {
     frames: usize,
     /// Simulated seconds spent in the current stage.
     stage_elapsed: f32,
-    float_min_y: f32,
-    float_max_y: f32,
+    sink_start_y: f32,
+    sink_min_y: f32,
     rise_max_y: f32,
     rise_submerged_frames: usize,
     crossing_water_frames: usize,
@@ -1479,16 +1488,16 @@ impl SwimWatch {
             stage: SwimStage::Entry,
             frames: 0,
             stage_elapsed: 0.0,
-            float_min_y: f32::MAX,
-            float_max_y: f32::MIN,
+            sink_start_y: f32::MAX,
+            sink_min_y: f32::MAX,
             rise_max_y: f32::MIN,
             rise_submerged_frames: 0,
             crossing_water_frames: 0,
         }
     }
 
-    fn input(&self) -> InputState {
-        swim_scripted_input(self.stage)
+    fn input(&self, position: Vec3) -> InputState {
+        swim_scripted_input(self.stage, position.y)
     }
 
     fn advance(&mut self, stage: SwimStage) {
@@ -1496,10 +1505,10 @@ impl SwimWatch {
         self.stage_elapsed = 0.0;
     }
 
-    /// `float_band` cell: `min..max` once the float phase ran, `none` before.
-    fn float_band(&self) -> String {
-        if self.float_min_y <= self.float_max_y {
-            format!("{:.3}..{:.3}", self.float_min_y, self.float_max_y)
+    /// `sink` cell: `start->lowest` once the sink phase began, `none` before.
+    fn sink_band(&self) -> String {
+        if self.sink_start_y >= self.sink_min_y && self.sink_start_y < f32::MAX {
+            format!("{:.3}->{:.3}", self.sink_start_y, self.sink_min_y)
         } else {
             "none".to_string()
         }
@@ -1516,12 +1525,12 @@ impl SwimWatch {
 
     fn head(&self) -> String {
         format!(
-            "swim_demo: seed={} axis={} distance={} frames={} float_band={} rise={}",
+            "swim_demo: seed={} axis={} distance={} frames={} sink={} rise={}",
             self.route.seed,
             SWIM_AXIS,
             self.route.distance(),
             self.frames,
-            self.float_band(),
+            self.sink_band(),
             self.rise_peak(),
         )
     }
@@ -1566,7 +1575,9 @@ impl SwimWatch {
         match self.stage {
             SwimStage::Entry => {
                 if feet_liquid {
-                    self.advance(SwimStage::Float);
+                    self.sink_start_y = position.y;
+                    self.sink_min_y = position.y;
+                    self.advance(SwimStage::Sink);
                     return SwimProgress::Continue;
                 }
                 if position.y <= seabed_floor {
@@ -1589,39 +1600,36 @@ impl SwimWatch {
                 }
                 SwimProgress::Continue
             }
-            SwimStage::Float => {
-                self.float_min_y = self.float_min_y.min(position.y);
-                self.float_max_y = self.float_max_y.max(position.y);
+            SwimStage::Sink => {
+                self.sink_min_y = self.sink_min_y.min(position.y);
                 if on_ground {
                     return SwimProgress::Aborted {
-                        stage: "float",
+                        stage: "sink",
                         observed: format!(
-                            "a floating body touched ground (it walked the seabed); {observed}"
+                            "an idle sinking body touched ground (it walked the seabed); {observed}"
                         ),
                     };
                 }
                 if position.y <= seabed_floor {
                     return SwimProgress::Aborted {
-                        stage: "float",
+                        stage: "sink",
                         observed: format!(
-                            "sank below the seabed margin while floating; {observed} \
+                            "sank below the seabed margin while proving the idle sink; {observed} \
                              seabed={} floor={seabed_floor:.3}",
                             self.route.seabed_height
                         ),
                     };
                 }
-                if self.stage_elapsed >= SWIM_FLOAT_SECS {
-                    let near_surface = self.float_min_y >= SEA_LEVEL as f32 - 1.5
-                        && self.float_max_y <= SEA_LEVEL as f32 + 2.0;
-                    if !near_surface {
+                if self.stage_elapsed >= SWIM_SINK_SECS {
+                    let dropped = self.sink_start_y - self.sink_min_y;
+                    if dropped < SWIM_SINK_MIN_DROP {
                         return SwimProgress::Aborted {
-                            stage: "float",
+                            stage: "sink",
                             observed: format!(
-                                "band {} is not near SEA_LEVEL {SEA_LEVEL} (expected within \
-                                 {:.1}..{:.1})",
-                                self.float_band(),
-                                SEA_LEVEL as f32 - 1.5,
-                                SEA_LEVEL as f32 + 2.0
+                                "idle body only dropped {dropped:.3} blocks in \
+                                 {SWIM_SINK_SECS:.1}s (expected at least \
+                                 {SWIM_SINK_MIN_DROP:.1}); D087 requires water to sink it away from \
+                                 the surface; {observed}"
                             ),
                         };
                     }
@@ -1667,6 +1675,19 @@ impl SwimWatch {
                             "sank below the seabed margin while crossing; {observed} \
                              seabed={} floor={seabed_floor:.3}",
                             self.route.seabed_height
+                        ),
+                    };
+                }
+                if on_ground
+                    && position.y <= SEA_LEVEL as f32
+                    && position.z + PLAYER_HALF_WIDTH < self.route.land_z as f32
+                {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "touched ground inside the water column while its body box was still \
+                             short of the far shore (walked the seabed); {observed} land_z={}",
+                            self.route.land_z
                         ),
                     };
                 }
@@ -1748,7 +1769,7 @@ impl SwimDemo {
         self.digest = Some(match &self.watch {
             Some(watch) => watch.abort_digest(stage, observed),
             None => format!(
-                "swim_demo: seed={} axis={} distance=0 frames=0 float_band=none rise=none \
+                "swim_demo: seed={} axis={} distance=0 frames=0 sink=none rise=none \
                  landed=false stage={} observed={}",
                 self.seed, SWIM_AXIS, stage, observed
             ),
@@ -1786,9 +1807,8 @@ fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool 
         .as_mut()
         .expect("watch is armed immediately above");
     // Streaming gate, mirroring the S03 harness's per-step residency gate: a
-    // non-resident chunk reads as Air, which silently removes buoyancy and
-    // drops the scripted body out of the crossing (it then falls into terrain
-    // and can spend the rest of the budget escaping). Wait for the column under
+    // non-resident chunk reads as Air, which silently removes the water branch
+    // (drag, sink, and rise) and drops the scripted body out of the crossing.
     // the body to stream in before feeding any scripted input. The wall-clock
     // deadline bounds the wait, and a gated frame is not a crossing frame: no
     // physics runs and no simulated time is charged to the stage budget.
@@ -1799,7 +1819,7 @@ fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool 
     {
         return false;
     }
-    let input = watch.input();
+    let input = watch.input(session.player.position);
     session
         .player
         .update(dt, &input, |x, y, z| session.world.get_block(x, y, z));
@@ -5477,14 +5497,14 @@ mod tests {
         );
     }
 
-    /// The stage watcher walks S03's four phases in order, refuses to skip a
+    /// The stage watcher walks the D087 phases in order, refuses to skip a
     /// phase, and reports each stage's own budget as its abort stage.
     #[test]
-    fn swim_watch_advances_through_the_four_stages_in_order() {
+    fn swim_watch_advances_through_entry_sink_rise_crossing_and_landing() {
         let route = test_swim_route();
         let mut watch = SwimWatch::new(route);
         assert_eq!(watch.stage.name(), "entry");
-        assert_swim_idle(watch.input(), "entry is idle");
+        assert_swim_idle(watch.input(Vec3::new(0.5, 24.5, 0.5)), "entry is idle");
 
         // Entry: above the water and not in it. It cannot advance by itself.
         for _ in 0..30 {
@@ -5495,23 +5515,24 @@ mod tests {
         }
         assert_eq!(watch.stage.name(), "entry");
 
-        // Feet in water -> float (idle input, so buoyancy is the only lift).
+        // Feet in water -> sink (idle input: D087 water must sink the body).
         assert_eq!(
             watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true),
             SwimProgress::Continue
         );
-        assert_eq!(watch.stage.name(), "float");
-        assert_swim_idle(watch.input(), "float is idle so buoyancy is the only lift");
+        assert_eq!(watch.stage.name(), "sink");
+        assert_swim_idle(
+            watch.input(Vec3::new(0.5, 22.2, 0.5)),
+            "sink is idle so gravity is the only vertical force",
+        );
 
-        // Float band near the surface for its whole budget.
-        for _ in 0..3 {
-            assert_eq!(
-                watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true),
-                SwimProgress::Continue
-            );
-        }
+        // Sink budget: the idle body descends away from the surface.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true),
+            SwimProgress::Continue
+        );
         assert_eq!(watch.stage.name(), "rise");
-        let rise_input = watch.input();
+        let rise_input = watch.input(Vec3::new(0.5, 20.5, 0.5));
         assert!(rise_input.jump_or_up, "rise holds jump_or_up");
         assert!(!rise_input.forward, "rise does not swim forward yet");
 
@@ -5521,9 +5542,16 @@ mod tests {
             SwimProgress::Continue
         );
         assert_eq!(watch.stage.name(), "crossing");
-        let crossing_input = watch.input();
+        let crossing_input = watch.input(Vec3::new(0.5, 23.4, 0.5));
         assert!(crossing_input.forward, "crossing swims forward");
-        assert!(!crossing_input.jump_or_up, "the rise is over");
+        assert!(
+            !crossing_input.jump_or_up,
+            "above the water top the cadence releases Jump"
+        );
+        assert!(
+            watch.input(Vec3::new(0.5, 22.9, 0.5)).jump_or_up,
+            "at or below the water top the cadence engages Jump"
+        );
 
         // Crossing: short of the shore is not a landing; reaching the far-shore
         // column standing above SEA_LEVEL is.
@@ -5543,7 +5571,7 @@ mod tests {
         assert_eq!(watch.stage.name(), "landed");
         assert_eq!(
             watch.digest(),
-            "swim_demo: seed=12345 axis=+Z distance=321 frames=38 float_band=22.800..22.800 \
+            "swim_demo: seed=12345 axis=+Z distance=321 frames=36 sink=22.500->20.500 \
              rise=23.400 landed=true"
         );
     }
@@ -5583,38 +5611,33 @@ mod tests {
             other => panic!("expected an entry seabed abort, got {other:?}"),
         }
 
-        // Float: touching ground is the seabed-walking bug.
+        // Sink: touching ground is the seabed-walking bug.
         let mut watch = SwimWatch::new(route);
         watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
         match watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), true, true) {
             SwimProgress::Aborted { stage, observed } => {
-                assert_eq!(stage, "float");
+                assert_eq!(stage, "sink");
                 assert!(observed.contains("touched ground"), "{observed}");
             }
-            other => panic!("expected a float abort, got {other:?}"),
+            other => panic!("expected a sink abort, got {other:?}"),
         }
 
-        // Float: a band far below the surface is not a float.
+        // Sink: an idle body that barely moves is the rejected surface lock.
         let mut watch = SwimWatch::new(route);
         watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
-        let mut progress = SwimProgress::Continue;
-        for _ in 0..3 {
-            progress = watch.observe(1.0, Vec3::new(0.5, 17.0, 0.5), false, true);
-        }
-        match progress {
+        match watch.observe(1.0, Vec3::new(0.5, 22.2, 0.5), false, true) {
             SwimProgress::Aborted { stage, observed } => {
-                assert_eq!(stage, "float");
-                assert!(observed.contains("not near SEA_LEVEL"), "{observed}");
+                assert_eq!(stage, "sink");
+                assert!(observed.contains("only dropped"), "{observed}");
+                assert!(observed.contains("D087"), "{observed}");
             }
-            other => panic!("expected a float band abort, got {other:?}"),
+            other => panic!("expected a sink drop abort, got {other:?}"),
         }
 
         // Rise: jump_or_up never clears the surface.
         let mut watch = SwimWatch::new(route);
         watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
-        for _ in 0..3 {
-            watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true);
-        }
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
         let mut progress = SwimProgress::Continue;
         for _ in 0..3 {
             progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 0.5), false, true);
@@ -5630,12 +5653,23 @@ mod tests {
             other => panic!("expected a rise abort, got {other:?}"),
         }
 
+        // Crossing: touching ground before the far shore is the seabed-walking bug.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
+        match watch.observe(1.0, Vec3::new(0.5, 20.5, 40.5), true, true) {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "crossing");
+                assert!(observed.contains("inside the water column"), "{observed}");
+            }
+            other => panic!("expected a crossing ground abort, got {other:?}"),
+        }
+
         // Crossing: never reaches the far shore.
         let mut watch = SwimWatch::new(route);
         watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
-        for _ in 0..3 {
-            watch.observe(1.0, Vec3::new(0.5, 22.8, 0.5), false, true);
-        }
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
         watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
         let mut progress = SwimProgress::Continue;
         for _ in 0..(SWIM_CROSSING_SECS as usize + 1) {
@@ -5670,7 +5704,7 @@ mod tests {
         // Nothing is resident yet: `get_block` answers Air, so the seam holds
         // the player at the teleport instead of falling through the gap. This
         // is the fix for the stalled-crossing failure: a mid-run streaming gap
-        // must wait, never silently drop buoyancy.
+        // must wait, never silently drop the water branch.
         for _ in 0..10 {
             assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
         }
