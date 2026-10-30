@@ -6603,6 +6603,37 @@ mod tests {
     }
 
     #[test]
+    fn pause_message_clears_on_every_pause_exit_and_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_background(dir.path());
+        let stale_note = || MenuMessage {
+            text: "stale pause note".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+
+        // Every Pause exit retires the note with the screen: the note must
+        // never leak onto the main menu or a settings visit.
+        for target in [
+            LifecycleScreen::MainMenu,
+            LifecycleScreen::Settings(SettingsCaller::Pause),
+        ] {
+            app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+            app.pause_message = Some(stale_note());
+            app.enter_screen(target);
+            assert!(
+                app.pause_message.is_none(),
+                "{target:?} must not inherit the Pause note"
+            );
+        }
+
+        // Resume clears it as well.
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        app.pause_message = Some(stale_note());
+        app.enter_playing();
+        assert!(app.pause_message.is_none(), "Resume starts clean");
+    }
+
+    #[test]
     fn edit_background_load_failure_stays_on_the_menu() {
         let dir = tempfile::tempdir().expect("tempdir");
         let background_path = dir.path().join("background/background.mcvx");

@@ -339,6 +339,45 @@ mod tests {
     }
 
     #[test]
+    fn edit_background_is_main_menu_only_and_never_changes_the_screen_itself() {
+        // The caller installs the edit session first and only then enters
+        // Playing, so a failed background load leaves the menu untouched.
+        let mut state = LifecycleState::new();
+        assert_eq!(
+            state.dispatch(LifecycleIntent::MainMenu(MainMenuIntent::EditBackground)),
+            Ok(LifecycleDecision::EditBackground)
+        );
+        assert_eq!(
+            state.screen(),
+            Screen::MainMenu,
+            "dispatch must not move to Playing before the session exists"
+        );
+
+        // Every other screen rejects the intent without changing state.
+        for screen in [
+            Screen::NewGame,
+            Screen::LoadGame,
+            Screen::Playing,
+            Screen::Pause,
+            Screen::Settings(SettingsCaller::MainMenu),
+            Screen::Settings(SettingsCaller::Pause),
+        ] {
+            let intent = LifecycleIntent::MainMenu(MainMenuIntent::EditBackground);
+            assert_eq!(
+                decide(screen, intent),
+                Err(LifecycleError::IntentNotAllowed { screen, intent }),
+                "{screen:?} must reject EditBackground"
+            );
+            let mut other = LifecycleState::from_screen(screen);
+            assert_eq!(
+                other.dispatch(intent),
+                Err(LifecycleError::IntentNotAllowed { screen, intent })
+            );
+            assert_eq!(other.screen(), screen, "rejected intent keeps the screen");
+        }
+    }
+
+    #[test]
     fn wrong_screen_intents_are_structured_errors() {
         let error = decide(
             Screen::MainMenu,
