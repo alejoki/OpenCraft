@@ -2730,8 +2730,9 @@ mod tests {
     /// standing on land above `SEA_LEVEL`.
     ///
     /// Before the run, the crossing is bounded by a pure, chunk-free scan: seed
-    /// 12345 has an Ocean column at (0, 0) with h = 14 (S01), and the first
-    /// column at or above `SEA_LEVEL` along the +Z axis is the far shore. The
+    /// 12345 has an Ocean column at (0, 0) with h = 8 (raw h 14 deepened by the
+    /// ocean-depth bonus), and the first column at or above `SEA_LEVEL` along
+    /// the +Z axis is the far shore. The
     /// whole route is then known to be Ocean, so no assertion chases a moving
     /// target and no chunk has to exist to compute the bounds.
     ///

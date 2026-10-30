@@ -1328,7 +1328,8 @@ const SWIM_DEADLINE_SECS: u64 = 360;
 /// same pure terrain functions the chunk generator uses.
 ///
 /// For seed 12345 this is the S03 route: an Ocean column at the world origin
-/// (`h = 14`) and the first land column at or above `SEA_LEVEL` along +Z.
+/// (`h = 8` after the ocean-depth bonus) and the first land column at or
+/// above `SEA_LEVEL` along +Z.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SwimRoute {
     seed: u32,
@@ -5353,7 +5354,10 @@ mod tests {
         let route = swim_route(12345).expect("seed 12345 has an ocean crossing on +Z");
         assert_eq!(route.seed, 12345);
         assert_eq!(route.ocean_start_z, 0, "the ocean starts at the origin");
-        assert_eq!(route.seabed_height, 14, "pinned by the S01 terrain proof");
+        assert_eq!(
+            route.seabed_height, 8,
+            "the origin's raw h 14 is deepened by the 6-block ocean bonus"
+        );
         assert_eq!(route.land_z, 321, "pinned by the S03 crossing proof");
         assert_eq!(route.distance(), 321);
         assert_eq!(
@@ -5479,7 +5483,7 @@ mod tests {
             start: Vec3::new(0.5, SEA_LEVEL as f32 + 3.0, 0.5),
             ocean_start_z: 0,
             land_z: 321,
-            seabed_height: 14,
+            seabed_height: 8,
         }
     }
 
@@ -5602,7 +5606,7 @@ mod tests {
 
         // Entry: sinks through the seabed margin (the pre-swim bug).
         let mut watch = SwimWatch::new(route);
-        let progress = watch.observe(1.0 / 60.0, Vec3::new(0.5, 15.5, 0.5), false, false);
+        let progress = watch.observe(1.0 / 60.0, Vec3::new(0.5, 9.5, 0.5), false, false);
         match progress {
             SwimProgress::Aborted { stage, observed } => {
                 assert_eq!(stage, "entry");

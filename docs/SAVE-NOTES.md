@@ -81,7 +81,7 @@ The generator now builds four biomes from the seed:
 
 - **Plains** and **Forest** share the middle height range, with grass, dirt, and oak trees. Forest is denser.
 - **Mountains** rise above a fixed mountain threshold and show bare stone with snow near their peaks.
-- **Ocean** is every column below the fixed sea level. Ocean basins are filled with water and have a sand seabed.
+- **Ocean** is every column below the fixed sea level. Ocean basins are filled with water and have a sand seabed. Basins deepen away from the shore, so the deepest oceans hold 24 blocks of water.
 
 Sand beaches sit where the land meets the water line. Deterministic surface ruins appear on some plains and forest land. All of this comes from the seed alone.
 

@@ -108,8 +108,10 @@ pub const SEA_LEVEL: i32 = 22;
 pub const MAX_TERRAIN_HEIGHT: i32 = 120;
 
 /// Lowest surface the height function may produce (deep ocean floor).
-/// Comfortably above the bedrock floor at wy -32.
-pub const MIN_TERRAIN_HEIGHT: i32 = 4;
+/// The raw continental curve bottoms out at 4; the ocean deepening pass below
+/// pushes the deepest basins to -2, still 30 blocks above the bedrock floor at
+/// wy -32.
+pub const MIN_TERRAIN_HEIGHT: i32 = -2;
 
 /// At or above this surface height a land column is mountain stone instead of
 /// grass/dirt. Classification and surface skin both key on the same value.
@@ -665,10 +667,11 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 /// Piecewise-linear continental elevation curve. Low continental noise digs
-/// ocean basins (4..15), the mid range builds plains/forest shelves (26..44),
-/// and high continental noise climbs into mountain foothills (58..70). Values
-/// are the column *mean*; hill/detail deviation and the ridge term are added on
-/// top (see `terrain_height_at_seeded`).
+/// ocean basins (4..15 before the [`ocean_depth_bonus`] deepening), the mid
+/// range builds plains/forest shelves (26..44), and high continental noise
+/// climbs into mountain foothills (58..70). Values are the column *mean*;
+/// hill/detail deviation and the ridge term are added on top (see
+/// `terrain_height_at_seeded`).
 const CONTINENTAL_ELEVATION: [(f32, f32); 8] = [
     (0.00, 4.0),
     (0.18, 8.0),
@@ -691,6 +694,34 @@ const MOUNTAIN_NOISE_HIGH: f32 = 0.82;
 const MOUNTAIN_RIDGE_AMPLITUDE: f32 = 30.0;
 const HILL_AMPLITUDE: f32 = 14.0;
 const DETAIL_AMPLITUDE: f32 = 4.0;
+
+/// Extra depth (blocks) added to submerged basins at full strength.
+///
+/// The raw continental curve bottoms out at 4, leaving only 18 blocks of water
+/// over the deepest seabed. This bonus makes oceans and lakes read as genuinely
+/// deep while leaving the waterline and every land column exactly where the
+/// raw height function puts them.
+const OCEAN_DEEPENING: f32 = 6.0;
+
+/// How many blocks below `SEA_LEVEL` the deepening takes to reach full
+/// strength. Ramping it keeps the bonus continuous at the waterline: a
+/// one-block-deep puddle gains only a fraction of a block, so no shoreline
+/// column moves.
+const OCEAN_DEEPENING_RAMP: f32 = 8.0;
+
+/// Depth bonus (blocks) for a raw height: zero at or above sea level, rising
+/// smoothly to `OCEAN_DEEPENING` once a basin is `OCEAN_DEEPENING_RAMP` blocks
+/// deep. Deliberately a pure function of the raw height so the deepening can
+/// never move a land column: the raw height already decides land vs water.
+#[inline]
+fn ocean_depth_bonus(base: f32) -> f32 {
+    let depth = SEA_LEVEL as f32 - base;
+    if depth <= 0.0 {
+        0.0
+    } else {
+        OCEAN_DEEPENING * smoothstep(0.0, OCEAN_DEEPENING_RAMP, depth)
+    }
+}
 
 fn continental_elevation(continental: f32) -> f32 {
     let continental = continental.clamp(0.0, 1.0);
@@ -726,8 +757,10 @@ pub fn terrain_height_at_seeded(wx: i32, wz: i32, seed: u32) -> i32 {
         * MOUNTAIN_RIDGE_AMPLITUDE;
 
     // Worst case: 70 (top of the curve) + 18 (hills + detail) + 30 (ridge)
-    // = 118 <= MAX_TERRAIN_HEIGHT; the basin floor bottoms out at 4.
+    // = 118 <= MAX_TERRAIN_HEIGHT; the raw basin floor bottoms out at 4 and
+    // the deepening takes it to -2 (MIN_TERRAIN_HEIGHT at full bonus).
     let base = continental_elevation(continental) + landness * (hills + detail) + mountain;
+    let base = base - ocean_depth_bonus(base);
     base.round() as i32
 }
 
@@ -2343,13 +2376,94 @@ mod tests {
         }
     }
 
+    /// The deepening is continuous at the waterline and saturates in deep
+    /// water: land columns get no bonus, shallow puddles get only a fraction,
+    /// and anything `OCEAN_DEEPENING_RAMP` blocks deep gets all of it. Because
+    /// the bonus keys off the raw height, it can never move a land column into
+    /// water or a water column onto land.
+    #[test]
+    fn test_ocean_depth_bonus_is_zero_on_land_and_saturates_in_deep_water() {
+        assert_eq!(
+            ocean_depth_bonus(SEA_LEVEL as f32),
+            0.0,
+            "the bonus must be exactly zero at the waterline"
+        );
+        assert_eq!(
+            ocean_depth_bonus(SEA_LEVEL as f32 + 40.0),
+            0.0,
+            "land columns must never be deepened"
+        );
+
+        let shallow = ocean_depth_bonus(SEA_LEVEL as f32 - 1.0);
+        assert!(
+            shallow > 0.0 && shallow < OCEAN_DEEPENING / 2.0,
+            "a one-block-deep puddle should gain only a fraction of the bonus, got {shallow}"
+        );
+
+        let saturated = ocean_depth_bonus(SEA_LEVEL as f32 - OCEAN_DEEPENING_RAMP);
+        assert!(
+            (saturated - OCEAN_DEEPENING).abs() < 1e-5,
+            "the bonus must saturate at {OCEAN_DEEPENING}, got {saturated}"
+        );
+
+        let mut previous = 0.0;
+        for depth in 0..=OCEAN_DEEPENING_RAMP as i32 + 4 {
+            let bonus = ocean_depth_bonus(SEA_LEVEL as f32 - depth as f32);
+            assert!(
+                bonus >= previous,
+                "the bonus must grow monotonically with depth: {depth} -> {bonus} < {previous}"
+            );
+            assert!(bonus <= OCEAN_DEEPENING);
+            previous = bonus;
+        }
+    }
+
+    /// "A bit deeper" acceptance: the deepest sampled basins carry more water
+    /// than the raw continental curve allows. The raw curve bottoms out at 4
+    /// (18 blocks below sea level); the deepening must exceed 20 blocks, and
+    /// every column must stay inside the named envelope.
+    #[test]
+    fn test_acceptance_ocean_basins_are_deepened() {
+        const MIN_DEEP_OCEAN_DEPTH: i32 = 20;
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            let mut min_h = i32::MAX;
+            let mut deep_columns = 0usize;
+            for wz in (-1024..=1024).step_by(8) {
+                for wx in (-1024..=1024).step_by(8) {
+                    let h = terrain_height_at_seeded(wx, wz, seed);
+                    assert!(
+                        (MIN_TERRAIN_HEIGHT..=MAX_TERRAIN_HEIGHT).contains(&h),
+                        "seed {seed} height {h} at ({wx}, {wz}) outside envelope {MIN_TERRAIN_HEIGHT}..={MAX_TERRAIN_HEIGHT}"
+                    );
+                    min_h = min_h.min(h);
+                    if SEA_LEVEL - h >= MIN_DEEP_OCEAN_DEPTH {
+                        deep_columns += 1;
+                    }
+                }
+            }
+            assert!(
+                deep_columns > 0,
+                "seed {seed} has no ocean column at least {MIN_DEEP_OCEAN_DEPTH} blocks deep (min h {min_h})"
+            );
+            assert!(
+                min_h >= MIN_TERRAIN_HEIGHT,
+                "seed {seed} deepened below MIN_TERRAIN_HEIGHT: min {min_h}"
+            );
+            eprintln!(
+                "ocean depth scan seed {seed}: min h {min_h}, deepest depth {}, \
+                 columns >= {MIN_DEEP_OCEAN_DEPTH} deep: {deep_columns}",
+                SEA_LEVEL - min_h
+            );
+        }
+    }
+
     /// Positive + determinism: the spawn column is always land above the water
     /// line, is identical across repeat calls (R001 purity), and has no tree
     /// trunk or neighbour canopy inside the spawn body.
     #[test]
     fn test_find_spawn_column_is_land_above_sea_level_and_deterministic() {
         // Includes seeds whose (0, 0) column is open ocean after the T03
-        // rewrite (12345 -> h 14, 4 -> h 8, VISTA_SEED -> h 4) beside seeds
+        // rewrite (12345 -> h 8, 4 -> h 2, VISTA_SEED -> h -2) beside seeds
         // whose origin is already safe, plus the seed with the widest observed
         // search ring (2400638911 -> 365 blocks).
         for seed in [DEFAULT_WORLD_SEED, 12345, 9, 4, 0x5EED_4A11, 2_400_638_911] {
@@ -2529,8 +2643,12 @@ mod tests {
     /// Water fill invariant: every ocean column is filled with static Water
     /// from just above the seabed up to SEA_LEVEL, no land column ever holds
     /// water, and water never appears below the seabed or above sea level.
+    ///
+    /// Seabeds can now sit below wy 0 after the ocean deepening, so the scan
+    /// covers both chunks of the 64-block vertical band that can hold water.
     #[test]
     fn test_ocean_basins_are_filled_with_water_up_to_sea_level() {
+        const BOTTOM_LAYER: i32 = -1;
         let seed = DEFAULT_WORLD_SEED;
         let mut water_blocks = 0usize;
         let mut ocean_columns = 0usize;
@@ -2538,30 +2656,56 @@ mod tests {
 
         for cx in -2..=2 {
             for cz in -2..=2 {
-                for cy in -1..=0 {
-                    let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
-                    let base_wx = cx * CHUNK_SIZE as i32;
-                    let base_wy = cy * CHUNK_SIZE as i32;
-                    let base_wz = cz * CHUNK_SIZE as i32;
-                    for lz in 0..CHUNK_SIZE {
-                        for lx in 0..CHUNK_SIZE {
-                            let wx = base_wx + lx as i32;
-                            let wz = base_wz + lz as i32;
-                            let h = terrain_height_at_seeded(wx, wz, seed);
-                            let is_ocean = h < SEA_LEVEL;
-                            if is_ocean {
-                                ocean_columns += 1;
-                            } else {
-                                land_columns += 1;
-                            }
+                let chunks: [Chunk; 2] = [BOTTOM_LAYER, 0].map(|cy| {
+                    generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer)
+                });
+                let base_wx = cx * CHUNK_SIZE as i32;
+                let base_wz = cz * CHUNK_SIZE as i32;
+                let block_at = |wy: i32, lx: usize, lz: usize| {
+                    let cy = wy.div_euclid(CHUNK_SIZE as i32);
+                    let ly = wy.rem_euclid(CHUNK_SIZE as i32) as usize;
+                    let layer = (cy - BOTTOM_LAYER) as usize;
+                    chunks[layer].get(lx, ly, lz)
+                };
 
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = base_wx + lx as i32;
+                        let wz = base_wz + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let is_ocean = h < SEA_LEVEL;
+                        if is_ocean {
+                            ocean_columns += 1;
+                        } else {
+                            land_columns += 1;
+                        }
+
+                        // The whole water band is Water, block for block.
+                        for wy in (h + 1)..=SEA_LEVEL {
+                            assert_eq!(
+                                block_at(wy, lx, lz),
+                                BlockId::Water,
+                                "ocean column ({wx}, {wz}) is not filled at wy {wy} (h = {h})"
+                            );
+                            water_blocks += 1;
+                        }
+                        if is_ocean {
+                            assert_eq!(
+                                block_at(SEA_LEVEL + 1, lx, lz),
+                                BlockId::Air,
+                                "ocean column ({wx}, {wz}) has a block above SEA_LEVEL"
+                            );
+                        }
+
+                        // Nothing outside the band may be Water: not below the
+                        // seabed, not inside land, and not above sea level.
+                        for (layer_idx, chunk) in chunks.iter().enumerate() {
+                            let base_wy = (layer_idx as i32 + BOTTOM_LAYER) * CHUNK_SIZE as i32;
                             for ly in 0..CHUNK_SIZE {
                                 let wy = base_wy + ly as i32;
                                 if chunk.get(lx, ly, lz) != BlockId::Water {
                                     continue;
                                 }
-                                water_blocks += 1;
                                 assert!(
                                     is_ocean,
                                     "water in land column ({wx}, {wy}, {wz}) with h = {h}"
@@ -2571,27 +2715,6 @@ mod tests {
                                     "water at ({wx}, {wy}, {wz}) outside seabed..sea band \
                                      (h = {h}, SEA_LEVEL = {SEA_LEVEL})"
                                 );
-                            }
-
-                            if cy == 0 {
-                                // The layer that owns the whole sea band.
-                                for wy in (h + 1)..=SEA_LEVEL {
-                                    let ly = (wy - base_wy) as usize;
-                                    assert_eq!(
-                                        chunk.get(lx, ly, lz),
-                                        BlockId::Water,
-                                        "ocean column ({wx}, {wz}) is not filled at wy {wy} \
-                                         (h = {h})"
-                                    );
-                                }
-                                if is_ocean {
-                                    let ly = (SEA_LEVEL + 1 - base_wy) as usize;
-                                    assert_eq!(
-                                        chunk.get(lx, ly, lz),
-                                        BlockId::Air,
-                                        "ocean column ({wx}, {wz}) has a block above SEA_LEVEL"
-                                    );
-                                }
                             }
                         }
                     }
@@ -2611,16 +2734,20 @@ mod tests {
     /// The seabed seal under a water column: the three-block subsurface skin
     /// and the surface stay Sand. Caves only carve strictly below `h - 3`, so
     /// they can never puncture the skin and drain a basin into a cave.
+    ///
+    /// Deepened basins can have their seabed below wy 0, so the scan checks
+    /// both chunk layers that can own the skin.
     #[test]
     fn test_water_columns_keep_seabed_skin_and_caves_below_it() {
+        const BOTTOM_LAYER: i32 = -1;
         let seed = DEFAULT_WORLD_SEED;
         let mut checked = 0usize;
         for cx in -2..=2 {
             for cz in -2..=2 {
-                let pos = ChunkPos::new(cx, 0, cz);
-                let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+                let chunks: [Chunk; 2] = [BOTTOM_LAYER, 0].map(|cy| {
+                    generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer)
+                });
                 let base_wx = cx * CHUNK_SIZE as i32;
-                let base_wy = 0;
                 let base_wz = cz * CHUNK_SIZE as i32;
                 for lz in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
@@ -2632,13 +2759,15 @@ mod tests {
                         }
                         checked += 1;
                         assert!(
-                            (0..CHUNK_SIZE as i32).contains(&h),
-                            "ocean surface h {h} outside the inspected layer"
+                            (MIN_TERRAIN_HEIGHT..SEA_LEVEL).contains(&h),
+                            "ocean surface h {h} outside the water envelope"
                         );
                         for wy in (h - 3)..=h {
-                            let ly = (wy - base_wy) as usize;
+                            let cy = wy.div_euclid(CHUNK_SIZE as i32);
+                            let ly = wy.rem_euclid(CHUNK_SIZE as i32) as usize;
+                            let layer = (cy - BOTTOM_LAYER) as usize;
                             assert_eq!(
-                                chunk.get(lx, ly, lz),
+                                chunks[layer].get(lx, ly, lz),
                                 BlockId::Sand,
                                 "seabed skin at ({wx}, {wy}, {wz}) is not Sand (h = {h})"
                             );
@@ -2653,6 +2782,80 @@ mod tests {
         }
         assert!(checked > 0, "scan found no water columns to guard");
         eprintln!("seabed skin scan: {checked} water columns kept their three-block seal");
+    }
+
+    /// Deepened basins can put the seabed below wy 0 while the water column
+    /// reaches up to sea level. This is the layer-boundary case: the surface
+    /// and skin live in chunk layer -1, the top of the water in layer 0, and
+    /// the fill must be continuous across the wy 0 seam.
+    #[test]
+    fn test_deep_ocean_column_crosses_the_zero_layer_seam() {
+        const BOTTOM_LAYER: i32 = -1;
+        let seed = DEFAULT_WORLD_SEED;
+
+        // Find a column whose water starts below wy 0, so the seam is really
+        // exercised (the deepening guarantees the deepest basins reach -2).
+        let mut deepest = (0, 0, i32::MAX);
+        for wz in (-1024..=1024).step_by(8) {
+            for wx in (-1024..=1024).step_by(8) {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h < deepest.2 {
+                    deepest = (wx, wz, h);
+                }
+            }
+        }
+        let (wx, wz, h) = deepest;
+        assert!(
+            h + 1 < 0,
+            "seed {seed} has no ocean column whose water starts below wy 0 (deepest h {h})"
+        );
+        assert!(
+            (MIN_TERRAIN_HEIGHT..SEA_LEVEL).contains(&h),
+            "deepest ocean h {h} outside the water envelope"
+        );
+
+        let chunks: [Chunk; 2] = [BOTTOM_LAYER, 0].map(|cy| {
+            generate_chunk_seeded(
+                ChunkPos::new(
+                    wx.div_euclid(CHUNK_SIZE as i32),
+                    cy,
+                    wz.div_euclid(CHUNK_SIZE as i32),
+                ),
+                seed,
+                Season::Summer,
+            )
+        });
+        let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let block_at = |wy: i32| {
+            let cy = wy.div_euclid(CHUNK_SIZE as i32);
+            let ly = wy.rem_euclid(CHUNK_SIZE as i32) as usize;
+            chunks[(cy - BOTTOM_LAYER) as usize].get(lx, ly, lz)
+        };
+
+        for wy in (h - 3)..=h {
+            assert_eq!(
+                block_at(wy),
+                BlockId::Sand,
+                "deep seabed skin at ({wx}, {wy}, {wz}) is not Sand (h = {h})"
+            );
+        }
+        for wy in (h + 1)..=SEA_LEVEL {
+            assert_eq!(
+                block_at(wy),
+                BlockId::Water,
+                "deep ocean column ({wx}, {wz}) is not filled at wy {wy} (h = {h})"
+            );
+        }
+        assert_eq!(
+            block_at(SEA_LEVEL + 1),
+            BlockId::Air,
+            "deep ocean column has a block above SEA_LEVEL"
+        );
+        eprintln!(
+            "deep ocean seam scan: column ({wx}, {wz}) h {h} fills {} water blocks across the wy 0 seam",
+            SEA_LEVEL - h
+        );
     }
 
     /// Water generation is a pure function of position + seed: two repeats of
