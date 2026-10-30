@@ -6471,6 +6471,36 @@ mod tests {
             app.suspended_session.is_some(),
             "the previous session is suspended, not discarded"
         );
+        // The never-customized background starts the editor at the menu's
+        // exact eye anchor and clock, and entering writes nothing yet.
+        assert_eq!(
+            app.session.player.position,
+            app.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
+            "the default editor starts at the menu anchor"
+        );
+        assert_eq!(app.session.camera.position, app.background.anchor);
+        assert_eq!(
+            app.session.clock.time_of_day,
+            app.background.clock.time_of_day
+        );
+        assert_eq!(app.session.clock.day_index, app.background.clock.day_index);
+        assert_eq!(
+            app.session.season_length_days,
+            app.background.season_length_days
+        );
+        assert!(
+            !app.background_path.exists(),
+            "entering the editor must not create the background save"
+        );
+        assert!(
+            !app.begin_background_edit(),
+            "a second edit cannot stack sessions"
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.suspended_session.is_some(),
+            "the refused second edit keeps the suspended session"
+        );
 
         // The editor chooses the menu viewpoint by standing there, and its
         // clock advances while playing; both must persist.
@@ -6492,6 +6522,11 @@ mod tests {
         assert!(
             !playable_path.exists(),
             "editing the background must not write a playable world's save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![app.background_path.clone()],
+            "the edit round-trip writes only the background save"
         );
         assert!(app.background_path.is_file(), "background save created");
         assert!(app.background.persisted);
@@ -6573,6 +6608,11 @@ mod tests {
             background_path.clone(),
         );
         assert!(app.begin_background_edit());
+        // Unsaved editor state that a failed save must preserve.
+        let edited_feet = Vec3::new(12.5, 70.0, -8.0);
+        app.session.player.position = edited_feet;
+        app.session.sync_camera();
+        app.session.clock.time_of_day = 7_000;
 
         app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
         assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
@@ -6585,6 +6625,14 @@ mod tests {
         assert!(app.suspended_session.is_some(), "session remains suspended");
         assert_eq!(app.session.save_path, background_path);
         assert_eq!(app.session.world.seed(), vista::VISTA_SEED);
+        assert_eq!(
+            app.session.player.position, edited_feet,
+            "a failed save keeps the unsaved edit position"
+        );
+        assert_eq!(
+            app.session.clock.time_of_day, 7_000,
+            "a failed save keeps the unsaved clock"
+        );
         let message = app
             .pause_message
             .as_ref()
@@ -6600,6 +6648,46 @@ mod tests {
         app.enter_playing();
         assert!(app.pause_message.is_none(), "Resume starts clean");
         assert!(app.suspended_session.is_some());
+    }
+
+    #[test]
+    fn exit_game_while_editing_saves_the_background_and_leaves_the_playable_world_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_background(dir.path());
+        let playable_path = dir.path().join("playable.mcvx");
+        app.session.save_path = playable_path.clone();
+        assert!(app.begin_background_edit());
+
+        let feet = Vec3::new(5.5, 66.0, -9.5);
+        app.session.player.position = feet;
+        app.session.sync_camera();
+        app.session.clock.time_of_day = 8_500;
+
+        assert!(
+            app.apply_lifecycle_decision(LifecycleDecision::ExitGame),
+            "Exit Game owns the event-loop exit"
+        );
+
+        let persisted =
+            load_world_from_path(&app.background_path).expect("background save decodes");
+        assert_eq!(
+            persisted.player.position,
+            feet.to_array(),
+            "Exit Game saves the edit session's position"
+        );
+        assert_eq!(
+            persisted.time_of_day, 8_500,
+            "Exit Game saves the edit session's clock"
+        );
+        assert!(
+            !playable_path.exists(),
+            "leaving via Exit Game must not save the suspended playable world"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![app.background_path.clone()],
+            "Exit Game while editing writes only the background save"
+        );
     }
 
     #[test]
