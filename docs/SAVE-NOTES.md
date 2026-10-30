@@ -130,8 +130,7 @@ The calendar is a pure function of three things: the day index, the season lengt
 Season boundaries change how the world looks:
 
 - **Winter** turns the grass surface of plains and forest into snow. Trees keep their trunks and branches and stand bare through the winter; they no longer disappear with the green surface.
-- **Autumn** drops the leaves from oak trees and keeps the trunks and branches, so a bare tree still reads as a tree.
-- **Spring** and **Summer** keep the grass surface and the full canopy.
+- **Spring**, **Summer**, and **Autumn** keep the grass surface and the full canopy; trees stay green until Winter arrives.
 - Leaves are the only seasonal part of a tree. Trunks and branches are generated identically in all four seasons.
 - Beaches, ocean seabeds, and the altitude snow caps on mountains look the same all year.
 

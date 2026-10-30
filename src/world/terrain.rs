@@ -1207,7 +1207,7 @@ fn seasonal_land_surface(season: Season) -> BlockId {
 ///
 /// 1. the surface skin of non-beach plains/forest land (`Snow` in Winter,
 ///    `Grass` otherwise), and
-/// 2. the oak leaf canopy (Autumn sheds it while keeping the trunks; every
+/// 2. the oak leaf canopy (Winter sheds it while keeping the trunks; every
 ///    other season keeps the full canopy).
 ///
 /// Heights, biomes, subsurface skin, caves, ores, bedrock, water fill and the
@@ -1349,9 +1349,9 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk 
                     // replace an existing leaf but never terrain, water, Snow or
                     // another structure cell. Admitting leaves keeps the log
                     // skeleton identical in every season regardless of the
-                    // column iteration order (Autumn/Winter have no leaves to
-                    // collide with, so an Air-only rule would make winter trees
-                    // grow extra branches).
+                    // column iteration order (Winter has no leaves to collide
+                    // with, so an Air-only rule would make winter trees grow
+                    // extra branches).
                     for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
                         let ly_b = by - base_wy;
                         if !(0..CHUNK_SIZE as i32).contains(&ly_b) {
@@ -1367,10 +1367,10 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk 
                         }
                     }
 
-                    // Only leaves are seasonal: Spring and Summer keep the
-                    // full canopy, Autumn sheds it, Winter stays bare. The
-                    // trunk and branches above survive every season.
-                    if matches!(season, Season::Spring | Season::Summer) {
+                    // Only leaves are seasonal: Spring, Summer and Autumn keep
+                    // the full canopy, Winter stays bare. The trunk and branches
+                    // above survive every season.
+                    if season != Season::Winter {
                         let trunk_h = tree.trunk_height;
                         let canopy_base = h + trunk_h - 1;
                         let canopy_top = h + trunk_h + 1;
@@ -3852,7 +3852,7 @@ mod tests {
 
         // D088: the four-season pass must contain winter trees, not quietly
         // regenerate a treeless Winter. The trunk and branches survive every
-        // season; only leaves disappear in Autumn/Winter.
+        // season; only leaves disappear in Winter.
         let (twx, twz, th, tree) = find_tree(seed, |wx, wz, h, tree| {
             tree.branch_cells(wx, wz, h)
                 .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
@@ -4015,11 +4015,11 @@ mod tests {
         }
     }
 
-    /// Autumn sheds the oak canopy but keeps every trunk and branch;
-    /// Spring/Summer keep the full canopy. Deterministic, so "leaves have
-    /// fallen" reads consistently and the bare tree still has a silhouette.
+    /// Spring, Summer and Autumn keep the full oak canopy and every trunk and
+    /// branch; only Winter sheds the leaves. Deterministic, so the canopy reads
+    /// consistently and the bare winter tree still has a silhouette.
     #[test]
-    fn test_autumn_sheds_oak_leaves_and_keeps_trunks() {
+    fn test_spring_summer_and_autumn_keep_oak_canopy_and_trunks() {
         let seed = DEFAULT_WORLD_SEED;
         let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
             tree.branch_cells(wx, wz, h)
@@ -4031,11 +4031,11 @@ mod tests {
             wx.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
         );
-        // The canopy top centre is always a leaf in Spring/Summer and is too
-        // high to collide with a branch cell on this tree.
+        // The canopy top centre is always a leaf in the non-winter seasons and
+        // is too high to collide with a branch cell on this tree.
         let leaf_wy = h + trunk_h + 1;
 
-        for season in [Season::Spring, Season::Summer] {
+        for season in [Season::Spring, Season::Summer, Season::Autumn] {
             assert_eq!(
                 generated_block_at(wx, h + 1, wz, seed, season),
                 BlockId::OakLog,
@@ -4060,6 +4060,17 @@ mod tests {
             );
         }
 
+        // Autumn keeps the canopy and the whole skeleton; Winter is the only
+        // season that sheds leaves.
+        assert_eq!(
+            generated_block_at(wx, leaf_wy, wz, seed, Season::Autumn),
+            BlockId::OakLeaves,
+            "autumn dropped a canopy leaf at ({wx}, {leaf_wy}, {wz})"
+        );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLeaves) > 0,
+            "autumn chunk column has no oak leaves"
+        );
         for ty in (h + 1)..=(h + trunk_h) {
             assert_eq!(
                 generated_block_at(wx, ty, wz, seed, Season::Autumn),
@@ -4075,18 +4086,18 @@ mod tests {
             );
         }
         assert_eq!(
-            generated_block_at(wx, leaf_wy, wz, seed, Season::Autumn),
+            generated_block_at(wx, leaf_wy, wz, seed, Season::Winter),
             BlockId::Air,
-            "autumn kept a canopy leaf at ({wx}, {leaf_wy}, {wz})"
+            "winter kept a canopy leaf at ({wx}, {leaf_wy}, {wz})"
         );
         assert_eq!(
-            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLeaves),
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLeaves),
             0,
-            "autumn chunk column still contains oak leaves"
+            "winter chunk column still contains oak leaves"
         );
         assert!(
-            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLog) > 0,
-            "autumn chunk column lost every oak trunk"
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLog) > 0,
+            "winter chunk column lost every oak trunk"
         );
     }
 
