@@ -310,11 +310,11 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 ### R031 — Seasonal worldgen surfaces and the bounded rollover wave
 - Class: core-capability
 - Status: active
-- Description: Worldgen surfaces are pure functions of position, seed, and season (winter snow blanket on land, autumn leaf shed with trunks kept), and a season change arrives through a bounded swap-on-arrival regeneration wave that never removes chunks or writes seasonal block edits.
-- Why it matters: Seasons must visibly change the world without a one-frame full-world remesh or persisted seasonal state.
-- Source: M007 / S05 seasonal worldgen
+- Description: Worldgen surfaces are pure functions of position, seed, and season (winter snow blanket on land, seasonal oak leaves only: Spring/Summer canopy, Autumn shed, Winter bare over persistent trunks and branches), and a season change arrives through a bounded swap-on-arrival regeneration wave that never removes chunks or writes seasonal block edits.
+- Why it matters: Seasons must visibly change the world without a one-frame full-world remesh or persisted seasonal state, and tree lifecycles must stay believable: only leaves are seasonal, while the deterministic trunk and branch skeleton renders in every season and is never clipped at a chunk edge.
+- Source: M007 / S05 seasonal worldgen (tree lifecycle corrected by D088 in M007/S08-T08)
 - Primary owning slice: M007/S05
-- Supporting slices: None
+- Supporting slices: M007/S08
 - Validation: cargo test --locked --lib -- world::terrain; cargo test --locked --lib -- world::manager; bash scripts/season_smoke.sh
 
 ### R032 — Weather states and precipitation presentation

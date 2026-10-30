@@ -122,16 +122,39 @@ pub const SNOW_CAP_HEIGHT: i32 = 96;
 /// surface and subsurface, which reads as a shoreline beach.
 pub const BEACH_BAND: i32 = 3;
 
-/// Trees only grow on Grass columns in this surface-height band. The lower
-/// bound is above the beach band (so never on Sand) and the upper bound stays
-/// below the mountain stone threshold (so never on mountain rock).
+/// Trees only grow on Plains/Forest land in this surface-height band. The
+/// lower bound is above the beach band (so never on Sand) and the upper bound
+/// stays below the mountain stone threshold (so never on mountain rock). The
+/// gate is the pre-season terrain class, not the post-season surface block:
+/// Winter keeps its trees even though the surface becomes Snow (D088).
 pub const TREE_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
 pub const TREE_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
 
-/// Vertical headroom reserved above `MAX_TERRAIN_HEIGHT` for a trunk plus its
-/// canopy (the tallest tree here is 6 blocks over its column). The uniform-Air
-/// fast path is derived from this so it can never clip a tree.
-const TREE_CANOPY_HEADROOM: i32 = 7;
+/// Tallest trunk any oak can generate, in blocks above its column surface.
+/// `oak_tree_at` returns `4..=TREE_MAX_TRUNK_HEIGHT`.
+const TREE_MAX_TRUNK_HEIGHT: i32 = 5;
+
+/// How far the canopy rises above the highest trunk cell.
+const TREE_CANOPY_TOP_OVER_TRUNK: i32 = 1;
+
+/// Tallest emitted oak cell above its column surface. Branches sit on the
+/// upper trunk, so they are strictly below this bound; the canopy top is the
+/// binding cell.
+const TREE_MAX_HEIGHT_OVER_SURFACE: i32 = TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK;
+
+/// Vertical headroom reserved above `MAX_TERRAIN_HEIGHT` for a trunk, its
+/// branches and its canopy. One spare block beyond the tallest emitted cell
+/// keeps the uniform-Air fast path provably above every possible tree cell, so
+/// it can never clip a branch. The derivation is asserted in the tests.
+const TREE_CANOPY_HEADROOM: i32 = TREE_MAX_HEIGHT_OVER_SURFACE + 1;
+
+/// Branch cells are single OakLog blocks one block out from the trunk. Four
+/// cardinal directions keep every branch inside the chunk interior (the trunk
+/// sits at `3..29`, so `2..30` is still strictly interior) and inside the
+/// `SPAWN_TREE_CLEARANCE` clearing radius shared with the trunk.
+const TREE_BRANCH_DIRECTIONS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const TREE_BRANCH_MIN: i32 = 2;
+const TREE_BRANCH_MAX: i32 = 4;
 
 // ---- Surface ruins (S07) ----------------------------------------------------
 
@@ -454,6 +477,62 @@ fn place_ore_veins(
     }
 }
 
+/// Whether any oak log — a trunk cell of a tree rooted in the footprint or a
+/// one-block branch of a tree rooted next to it — falls inside the vertical
+/// window a ruin could occupy (`surface + 1..=surface + TREE_CANOPY_HEADROOM`).
+///
+/// `place_ruin_at`'s in-chunk OakLog scan can only see the chunk layer that owns
+/// the anchor surface, while a D088 tree near a vertical chunk edge keeps cells
+/// in the layer above. This pure model check closes that gap, so the
+/// tree-overlap policy is layer-independent: a ruin never clips a trunk or a
+/// branch, even when the tree's upper cells live in the next chunk layer.
+fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
+    let min_wy = spec.surface + 1;
+    let max_wy = spec.surface + TREE_CANOPY_HEADROOM;
+    let min_x = spec.anchor_x - RUIN_FOOTPRINT_HALF;
+    let max_x = spec.anchor_x + RUIN_FOOTPRINT_HALF;
+    let min_z = spec.anchor_z - RUIN_FOOTPRINT_HALF;
+    let max_z = spec.anchor_z + RUIN_FOOTPRINT_HALF;
+
+    // A branch reaches one block out from its root, so every tree that could
+    // write a log into the footprint is rooted in the footprint expanded by
+    // one. One bounded 7x7 scan covers all of them.
+    for rz in (min_z - 1)..=(max_z + 1) {
+        for rx in (min_x - 1)..=(max_x + 1) {
+            let h = terrain_height_at_seeded(rx, rz, seed);
+            let biome = biome_at_seeded(rx, rz, seed);
+            let Some(tree) = oak_tree_at(rx, rz, h, biome, seed) else {
+                continue;
+            };
+
+            // Trunk cells stay on the root column, so only trees rooted inside
+            // the footprint can intersect it.
+            if (min_x..=max_x).contains(&rx)
+                && (min_z..=max_z).contains(&rz)
+                && h < max_wy
+                && h + tree.trunk_height >= min_wy
+            {
+                return true;
+            }
+
+            // Keep only branch cells that land in the footprint and the
+            // window. The terrain check mirrors the emission pass: a branch is
+            // never written into a ground cell. Branch cells are well above
+            // sea level, so Water cannot occupy them.
+            for (bx, by, bz) in tree.branch_cells(rx, rz, h) {
+                if (min_x..=max_x).contains(&bx)
+                    && (min_z..=max_z).contains(&bz)
+                    && (min_wy..=max_wy).contains(&by)
+                    && terrain_height_at_seeded(bx, bz, seed) < by
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Place the deterministic surface ruins whose anchors fall inside this chunk.
 ///
 /// Modeled on `place_ore_veins`: one linear scan over the chunk's 32x32
@@ -493,6 +572,13 @@ fn place_surface_ruins(
             let Some(spec) = ruin_at(wx, wz, h, biome, seed) else {
                 continue;
             };
+            // The in-chunk log scan inside `place_ruin_at` can only see the
+            // current chunk layer. A D088 tree can straddle a vertical chunk
+            // edge, so also reject anchors whose window intersects any trunk or
+            // branch in the pure tree model (see `tree_logs_intersect_ruin_window`).
+            if tree_logs_intersect_ruin_window(&spec, seed) {
+                continue;
+            }
             place_ruin_at(chunk, heights, base_wy, spec);
         }
     }
@@ -685,16 +771,55 @@ pub fn biome_at_seeded(wx: i32, wz: i32, seed: u32) -> Biome {
     )
 }
 
-/// Trunk height of the oak the chunk generator places at this world column, or
-/// `None` when the column grows no tree.
+/// A deterministic oak's full vertical model: the trunk length plus the bits
+/// that select its branch cells.
+///
+/// Produced by [`oak_tree_at`], the single placement rule shared by the chunk
+/// generator, the spawn search and the tests. The model is a pure function of
+/// `(position, height, biome, seed)` — deliberately season-blind (D088), so a
+/// Winter tree keeps its trunk and branches while only its leaves are omitted
+/// from the emission pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OakTree {
+    /// Trunk length in blocks above the column surface, `4..=TREE_MAX_TRUNK_HEIGHT`.
+    trunk_height: i32,
+    /// Deterministic bits selecting the branch count and rotation.
+    branch_bits: u32,
+}
+
+impl OakTree {
+    /// Deterministic upper-trunk branch cells `(wx, wy, wz)`, `2..=4` of them.
+    ///
+    /// Each branch is a single OakLog one block out from the trunk in a
+    /// distinct cardinal direction, descending from just below the trunk top.
+    /// Directions are rotated by the per-seed hash (never by season), so the
+    /// same tree is identical in every season and across regenerations.
+    fn branch_cells(self, wx: i32, wz: i32, h: i32) -> impl Iterator<Item = (i32, i32, i32)> {
+        let count =
+            TREE_BRANCH_MIN + (self.branch_bits & 1) as i32 + ((self.branch_bits >> 1) & 1) as i32;
+        debug_assert!((TREE_BRANCH_MIN..=TREE_BRANCH_MAX).contains(&count));
+        let rotation = ((self.branch_bits >> 2) & 3) as usize;
+        (0..count).map(move |i| {
+            let (dx, dz) = TREE_BRANCH_DIRECTIONS[(rotation + i as usize) % 4];
+            // Upper trunk: two branches pair at the highest cell, then two at
+            // the cell below it. Always at or below the trunk top.
+            let dy = self.trunk_height - 1 - i / 2;
+            (wx + dx, h + dy, wz + dz)
+        })
+    }
+}
+
+/// The deterministic oak this column grows, or `None` when the column is
+/// ineligible.
 ///
 /// Single source of truth shared by `generate_chunk_seeded` and
 /// `find_spawn_column`: the interior-only placement rule, the tree height band,
-/// the per-biome hash gate, and the trunk height all live here, so the spawn
-/// search can reject a column the generator would fill with OakLog without
-/// duplicating the rule. The generator additionally re-checks the actual
-/// generated surface block, which is the authoritative gate.
-fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<i32> {
+/// the per-biome hash gate and the model (trunk + branches) all live here, so
+/// the spawn search can reject a column the generator would fill with OakLog
+/// without duplicating the rule. The gate is the pre-season terrain class
+/// (Plains/Forest + the Grass height band), never the post-season surface
+/// block, so Winter trees persist (D088).
+fn oak_tree_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<OakTree> {
     // Trees only grow on the chunk interior (3..29) so canopies never cross a
     // chunk border.
     let lx = wx.rem_euclid(CHUNK_SIZE as i32);
@@ -702,8 +827,10 @@ fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Optio
     if !(3..29).contains(&lx) || !(3..29).contains(&lz) {
         return None;
     }
-    // `TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT` is exactly the Grass band: above the
-    // Sand beach shelf and below Mountain stone.
+    // `TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT` is exactly the pre-season Grass
+    // band: above the Sand beach shelf and below Mountain stone. Beaches and
+    // seabeds are below it, mountain stone above it, so both stay tree-free
+    // without consulting a seasonal surface block.
     if !(TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&h) {
         return None;
     }
@@ -713,7 +840,17 @@ fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Optio
         Biome::Plains => (tree_hash & 0xFF) == 0,
         Biome::Mountains | Biome::Ocean => false,
     };
-    gate.then(|| 4 + ((tree_hash >> 8) & 1) as i32)
+    gate.then(|| OakTree {
+        trunk_height: 4 + ((tree_hash >> 8) & 1) as i32,
+        branch_bits: (tree_hash >> 9) & 0x0F,
+    })
+}
+
+/// Trunk height of the oak at this column, or `None` when it grows no tree.
+/// Convenience wrapper used by the spawn search and tests that only need the
+/// trunk; the generator uses [`oak_tree_at`] for the branches too.
+fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<i32> {
+    oak_tree_at(wx, wz, h, biome, seed).map(|tree| tree.trunk_height)
 }
 
 /// A deterministic surface ruin: a small Cobblestone shell with Brick corner
@@ -766,7 +903,9 @@ fn ruin_anchor_hash(wx: i32, wz: i32, seed: u32) -> Option<u32> {
 ///
 /// Deliberately season-blind: ruins are a function of `(pos, seed)` only, so
 /// the same ruins exist in every season (in Winter the snow surface suppresses
-/// them emergently, exactly like trees).
+/// them emergently at the generator's `Grass` gate). Trees are different after
+/// D088: their placement ignores the seasonal surface, so only ruins keep this
+/// emergent Winter suppression.
 fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec> {
     let ruin_hash = ruin_anchor_hash(wx, wz, seed)?;
     // The band is the Grass window: above the Sand beach shelf and below the
@@ -1150,32 +1289,56 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk 
             }
 
             // Deterministic oak trees inside the safe interior (lx, lz in
-            // 3..29) so canopies never cross a chunk border. The gate checks
-            // the actual surface block (Grass) instead of only a height band:
-            // no trees on Sand beaches, seabed, or mountain stone. Density is
-            // per biome — dense forest, sparse plains. The placement rule
-            // itself lives in `tree_trunk_height`, shared with the spawn
-            // search so a spawn can never land inside a generated tree.
+            // 3..29) so canopies never cross a chunk border. The gate is the
+            // pre-season terrain class (`Plains`/`Forest` + the Grass height
+            // band in `oak_tree_at`), never the post-season surface block, so
+            // Winter keeps its trunks and branches and only the leaves are
+            // seasonal (D088). Beaches, seabeds and mountain stone stay out of
+            // the band by construction, exactly as before.
             //
-            // The gate is deliberately season-blind: in Winter the blanket
-            // turns plains/forest land into Snow, so winter trees are
-            // suppressed *emergently* by the surface they would grow out of.
-            // `test_seasonal_winter_blanket_suppresses_trees` pins that.
-            let surface_ly = h - base_wy;
-            if (0..CHUNK_SIZE as i32).contains(&surface_ly)
-                && chunk.get(lx, surface_ly as usize, lz) == BlockId::Grass
-            {
-                if let Some(trunk_h) = tree_trunk_height(wx, wz, h, biome, seed) {
-                    for ty in (h + 1)..=(h + trunk_h) {
+            // Every chunk layer whose vertical span intersects the tree emits
+            // the cells it owns. A tree near the shore can top the first
+            // chunk-Y boundary (wy 32); gating on the surface layer alone used
+            // to clip exactly those trees halfway. `tree_top` is derived from
+            // the same model constants as the emitted cells, so this
+            // intersection test can never skip a branch or canopy top.
+            let tree_top = h + TREE_MAX_HEIGHT_OVER_SURFACE;
+            if tree_top >= base_wy && h + 1 < base_wy + CHUNK_SIZE as i32 {
+                if let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) {
+                    for ty in (h + 1)..=(h + tree.trunk_height) {
                         let ly_tree = ty - base_wy;
                         if (0..CHUNK_SIZE as i32).contains(&ly_tree) {
                             chunk.set(lx, ly_tree as usize, lz, BlockId::OakLog);
                         }
                     }
-                    // Autumn sheds the leaves but keeps the trunks (a
-                    // deterministic "leaves have fallen" read). Spring,
-                    // Summer and Winter keep the full canopy.
-                    if season != Season::Autumn {
+
+                    // Deterministic branches on the upper trunk. A branch may
+                    // replace an existing leaf but never terrain, water, Snow or
+                    // another structure cell. Admitting leaves keeps the log
+                    // skeleton identical in every season regardless of the
+                    // column iteration order (Autumn/Winter have no leaves to
+                    // collide with, so an Air-only rule would make winter trees
+                    // grow extra branches).
+                    for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                        let ly_b = by - base_wy;
+                        if !(0..CHUNK_SIZE as i32).contains(&ly_b) {
+                            continue;
+                        }
+                        let tlx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+                        let tlz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+                        if matches!(
+                            chunk.get(tlx, ly_b as usize, tlz),
+                            BlockId::Air | BlockId::OakLeaves
+                        ) {
+                            chunk.set(tlx, ly_b as usize, tlz, BlockId::OakLog);
+                        }
+                    }
+
+                    // Only leaves are seasonal: Spring and Summer keep the
+                    // full canopy, Autumn sheds it, Winter stays bare. The
+                    // trunk and branches above survive every season.
+                    if matches!(season, Season::Spring | Season::Summer) {
+                        let trunk_h = tree.trunk_height;
                         let canopy_base = h + trunk_h - 1;
                         let canopy_top = h + trunk_h + 1;
                         for cy in canopy_base..=canopy_top {
@@ -2541,9 +2704,13 @@ mod tests {
         panic!("no {biome:?} column inside the tree height band");
     }
 
-    /// Count oak logs around a chunk and assert the per-column gate: every log
-    /// column must be a non-beach plain/forest column, its lowest log must sit
-    /// exactly on `h + 1`, and the surface block must actually be Grass.
+    /// Count oak logs around a chunk and assert the per-column placement rule.
+    ///
+    /// Every log column must be either a valid trunk column (the pure
+    /// `oak_tree_at` gate holds, its lowest log sits exactly on `h + 1`, and its
+    /// Summer surface is Grass) or a one-block branch of an adjacent valid tree
+    /// (D088). No free-floating OakLog is allowed, and no log may grow on a
+    /// column outside the Plains/Forest tree band.
     fn scan_region_for_log_rule(cx: i32, cz: i32, radius: i32, seed: u32) -> usize {
         use std::collections::HashMap;
         let mut logs = 0usize;
@@ -2577,40 +2744,71 @@ mod tests {
             }
         }
 
-        let mut surface_checked = 0usize;
-        for (&(wx, wz), &base_wy) in &log_columns {
+        let mut trunk_columns_checked = 0usize;
+        for (&(wx, wz), &lowest_log) in &log_columns {
             let biome = biome_at_seeded(wx, wz, seed);
             let h = terrain_height_at_seeded(wx, wz, seed);
-            assert!(
-                matches!(biome, Biome::Plains | Biome::Forest),
-                "oak log on a {biome:?} column at ({wx}, {base_wy}, {wz})"
-            );
-            assert!(
-                (TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&h),
-                "oak log column ({wx}, {wz}) has h {h} outside tree band"
-            );
-            assert_eq!(
-                base_wy,
-                h + 1,
-                "lowest oak log at ({wx}, {base_wy}, {wz}) is not the trunk base h+1 (h = {h})"
-            );
-            // Bound the surface-block regeneration sample: the rule above
-            // already proves the height/biome gate, this re-checks the block.
-            if surface_checked < 40 {
+            if oak_tree_at(wx, wz, h, biome, seed).is_some() {
                 assert_eq!(
-                    generated_block_at(wx, h, wz, seed, Season::Summer),
-                    BlockId::Grass,
-                    "oak log grows out of a non-Grass surface at ({wx}, {h}, {wz})"
+                    lowest_log,
+                    h + 1,
+                    "lowest oak log at ({wx}, {lowest_log}, {wz}) is not the trunk base h+1 (h = {h})"
                 );
-                surface_checked += 1;
+                // Bound the surface-block regeneration sample: the pure gate
+                // above already proves the height/biome rule; this re-checks
+                // the actual post-season surface block.
+                if trunk_columns_checked < 40 {
+                    assert_eq!(
+                        generated_block_at(wx, h, wz, seed, Season::Summer),
+                        BlockId::Grass,
+                        "oak log grows out of a non-Grass surface at ({wx}, {h}, {wz})"
+                    );
+                    trunk_columns_checked += 1;
+                }
+                continue;
             }
+
+            // Not a trunk column: the only other legal log is a branch of a
+            // tree rooted in a neighbouring column (branches are one block
+            // out, so dx/dz are in -1..=1).
+            let mut explained = false;
+            'neighbours: for ndz in -1..=1 {
+                for ndx in -1..=1 {
+                    if ndx == 0 && ndz == 0 {
+                        continue;
+                    }
+                    let (sx, sz) = (wx + ndx, wz + ndz);
+                    let sh = terrain_height_at_seeded(sx, sz, seed);
+                    let sb = biome_at_seeded(sx, sz, seed);
+                    let Some(source) = oak_tree_at(sx, sz, sh, sb, seed) else {
+                        continue;
+                    };
+                    if source
+                        .branch_cells(sx, sz, sh)
+                        .any(|(bx, by, bz)| (bx, by, bz) == (wx, lowest_log, wz))
+                    {
+                        explained = true;
+                        break 'neighbours;
+                    }
+                }
+            }
+            assert!(
+                explained,
+                "oak log at ({wx}, {lowest_log}, {wz}) is neither a trunk base nor a branch of an adjacent tree (h {h}, biome {biome:?})"
+            );
+        }
+        if !log_columns.is_empty() {
+            assert!(
+                trunk_columns_checked > 0,
+                "logs were found but no trunk column was sampled, so the log rule was never exercised"
+            );
         }
         logs
     }
 
-    /// Trees follow biome density and only grow on Grass land columns: forest
-    /// is dense, plains sparse, and no log ever appears on sand seabed/beaches
-    /// or mountain stone.
+    /// Trees follow biome density: forest is dense, plains sparse, and no trunk
+    /// ever appears on sand beaches/seabeds or mountain stone. Branches only
+    /// ever extend one block from a valid trunk (D088).
     #[test]
     fn test_tree_density_follows_biome_and_surface_block() {
         let seed = DEFAULT_WORLD_SEED;
@@ -2874,7 +3072,10 @@ mod tests {
     /// set, distinct seeds move it. Mirrors `test_different_seeds_change_ore_layout`.
     #[test]
     fn test_surface_ruins_are_deterministic_and_seed_dependent() {
-        let radius = 2;
+        // Radius 3 matches RUIN_SCAN_RADIUS: the D088 branch-aware overlap
+        // policy rejects more forest anchors, so the smaller radius-2 sample
+        // can legitimately contain zero surviving ruins for a given seed.
+        let radius = RUIN_SCAN_RADIUS;
         let first = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
         let repeat = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
         let other = ruin_blocks_in_region(radius, 424_242, Season::Summer);
@@ -3328,20 +3529,56 @@ mod tests {
         panic!("no beach column in the acceptance region");
     }
 
-    /// First `(wx, wz, h, trunk_h)` column that actually grows an oak for
-    /// `seed`: the same pure gate the generator uses, so the test never picks
-    /// a bare column. Bounded to a region dense enough with forest.
-    fn first_actual_tree_column(seed: u32) -> (i32, i32, i32, i32) {
-        for wz in -128..=128 {
-            for wx in -128..=128 {
+    /// First oak satisfying `predicate`, scanning the reachable region. The
+    /// generator's pure gate is used to find candidates, so the test never has
+    /// to duplicate the placement rule.
+    fn find_tree(
+        seed: u32,
+        mut predicate: impl FnMut(i32, i32, i32, OakTree) -> bool,
+    ) -> Option<(i32, i32, i32, OakTree)> {
+        for wz in -512..=512 {
+            for wx in -512..=512 {
                 let h = terrain_height_at_seeded(wx, wz, seed);
                 let biome = biome_at_seeded(wx, wz, seed);
-                if let Some(trunk_h) = tree_trunk_height(wx, wz, h, biome, seed) {
-                    return (wx, wz, h, trunk_h);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                if predicate(wx, wz, h, tree) {
+                    return Some((wx, wz, h, tree));
                 }
             }
         }
-        panic!("no oak column inside the bounded acceptance region");
+        None
+    }
+
+    /// First oak near the seed's beach whose model crosses the first chunk-Y
+    /// boundary (wy 32) and whose branch cells are all above their neighbour
+    /// columns. This is the D088 shoreline repro: before the fix the tree pass
+    /// ran only in the surface chunk layer, so exactly these near-shore trees
+    /// lost their upper trunk and canopy.
+    fn shoreline_tree_crossing_a_chunk_y_boundary(seed: u32) -> (i32, i32, i32, OakTree) {
+        let (beach_x, beach_z, _) = first_beach_column(seed);
+        let search = 48;
+        for wz in (beach_z - search)..=(beach_z + search) {
+            for wx in (beach_x - search)..=(beach_x + search) {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                let top = h + tree.trunk_height + TREE_CANOPY_TOP_OVER_TRUNK;
+                if top < CHUNK_SIZE as i32 {
+                    continue;
+                }
+                let clear_branches = tree
+                    .branch_cells(wx, wz, h)
+                    .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by);
+                if clear_branches {
+                    return (wx, wz, h, tree);
+                }
+            }
+        }
+        panic!("no shoreline oak crossing a chunk-Y boundary near ({beach_x}, {beach_z})");
     }
 
     /// Count `block` across every chunk layer of one chunk column. Trees stay
@@ -3406,6 +3643,31 @@ mod tests {
                 assert_ne!(
                     a, b,
                     "season derivation collapsed two boundary days onto {a:?}"
+                );
+            }
+        }
+
+        // D088: the four-season pass must contain winter trees, not quietly
+        // regenerate a treeless Winter. The trunk and branches survive every
+        // season; only leaves disappear in Autumn/Winter.
+        let (twx, twz, th, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed 1 must grow at least one oak with clear branch cells");
+        for (day, season) in seasons {
+            for ty in (th + 1)..=(th + tree.trunk_height) {
+                assert_eq!(
+                    generated_block_at(twx, ty, twz, seed, season),
+                    BlockId::OakLog,
+                    "day {day} ({season:?}) lost the trunk block at ({twx}, {ty}, {twz})"
+                );
+            }
+            for (bx, by, bz) in tree.branch_cells(twx, twz, th) {
+                assert_eq!(
+                    generated_block_at(bx, by, bz, seed, season),
+                    BlockId::OakLog,
+                    "day {day} ({season:?}) lost a branch at ({bx}, {by}, {bz})"
                 );
             }
         }
@@ -3550,19 +3812,25 @@ mod tests {
         }
     }
 
-    /// Autumn sheds the oak canopy but keeps every trunk; Spring/Summer keep
-    /// both. Deterministic, so "leaves have fallen" reads consistently.
+    /// Autumn sheds the oak canopy but keeps every trunk and branch;
+    /// Spring/Summer keep the full canopy. Deterministic, so "leaves have
+    /// fallen" reads consistently and the bare tree still has a silhouette.
     #[test]
     fn test_autumn_sheds_oak_leaves_and_keeps_trunks() {
         let seed = DEFAULT_WORLD_SEED;
-        let (wx, wz, h, trunk_h) = first_actual_tree_column(seed);
+        let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed must grow at least one oak with clear branch cells");
+        let trunk_h = tree.trunk_height;
         let (cx, cz) = (
             wx.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
         );
-        // A leaf squarely in the canopy, one block out from the trunk at the
-        // lowest canopy layer (never overwritten by the trunk itself).
-        let leaf_wy = h + trunk_h - 1;
+        // The canopy top centre is always a leaf in Spring/Summer and is too
+        // high to collide with a branch cell on this tree.
+        let leaf_wy = h + trunk_h + 1;
 
         for season in [Season::Spring, Season::Summer] {
             assert_eq!(
@@ -3572,11 +3840,17 @@ mod tests {
                 h + 1
             );
             assert_eq!(
-                generated_block_at(wx + 1, leaf_wy, wz, seed, season),
+                generated_block_at(wx, leaf_wy, wz, seed, season),
                 BlockId::OakLeaves,
-                "{season:?} has no canopy leaf at ({}, {leaf_wy}, {wz})",
-                wx + 1
+                "{season:?} has no canopy leaf at ({wx}, {leaf_wy}, {wz})"
             );
+            for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                assert_eq!(
+                    generated_block_at(bx, by, bz, seed, season),
+                    BlockId::OakLog,
+                    "{season:?} lost the branch at ({bx}, {by}, {bz})"
+                );
+            }
             assert!(
                 count_blocks_in_chunk_column(cx, cz, seed, season, BlockId::OakLeaves) > 0,
                 "{season:?} chunk column has no oak leaves at all"
@@ -3590,11 +3864,17 @@ mod tests {
                 "autumn removed the trunk block at ({wx}, {ty}, {wz})"
             );
         }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Autumn),
+                BlockId::OakLog,
+                "autumn removed the branch at ({bx}, {by}, {bz})"
+            );
+        }
         assert_eq!(
-            generated_block_at(wx + 1, leaf_wy, wz, seed, Season::Autumn),
+            generated_block_at(wx, leaf_wy, wz, seed, Season::Autumn),
             BlockId::Air,
-            "autumn kept a canopy leaf at ({}, {leaf_wy}, {wz})",
-            wx + 1
+            "autumn kept a canopy leaf at ({wx}, {leaf_wy}, {wz})"
         );
         assert_eq!(
             count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLeaves),
@@ -3607,29 +3887,21 @@ mod tests {
         );
     }
 
-    /// Winter trees are suppressed *emergently*: the blanket makes the surface
-    /// Snow, and the season-blind `Grass` tree gate refuses it. Pinned as a
-    /// decision, not an accident.
+    /// D088: Winter turns the grass surface of plains and forest into Snow but
+    /// keeps the whole tree skeleton — every trunk block and every deterministic
+    /// branch — with zero leaves. Only leaves are seasonal.
     #[test]
-    fn test_seasonal_winter_blanket_suppresses_trees() {
+    fn test_seasonal_winter_keeps_trunks_and_branches_without_leaves() {
         let seed = DEFAULT_WORLD_SEED;
-        let (wx, wz, h, _trunk_h) = first_actual_tree_column(seed);
+        let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed must grow at least one oak with clear branch cells");
+        let trunk_h = tree.trunk_height;
         let (cx, cz) = (
             wx.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
-        );
-
-        assert_eq!(
-            generated_block_at(wx, h, wz, seed, Season::Spring),
-            BlockId::Grass
-        );
-        assert_eq!(
-            generated_block_at(wx, h + 1, wz, seed, Season::Spring),
-            BlockId::OakLog
-        );
-        assert!(
-            count_blocks_in_chunk_column(cx, cz, seed, Season::Spring, BlockId::OakLog) > 0,
-            "spring chunk column must contain oak trunks for this pin to mean anything"
         );
 
         assert_eq!(
@@ -3637,28 +3909,52 @@ mod tests {
             BlockId::Snow,
             "the same column must carry the winter blanket"
         );
+        for ty in (h + 1)..=(h + trunk_h) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Winter),
+                BlockId::OakLog,
+                "winter removed the trunk block at ({wx}, {ty}, {wz})"
+            );
+        }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Winter),
+                BlockId::OakLog,
+                "winter removed the branch at ({bx}, {by}, {bz})"
+            );
+        }
+
+        // The same site keeps its full canopy in Spring: only the leaves are
+        // seasonal, and the model itself is unchanged.
         assert_eq!(
-            generated_block_at(wx, h + 1, wz, seed, Season::Winter),
-            BlockId::Air,
-            "winter grew a trunk out of a Snow surface"
+            generated_block_at(wx, h + trunk_h + 1, wz, seed, Season::Spring),
+            BlockId::OakLeaves,
+            "spring lost the canopy top at ({wx}, {}, {wz})",
+            h + trunk_h + 1
         );
         assert_eq!(
-            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLog),
-            0,
-            "winter chunk column still contains oak trunks"
+            generated_block_at(wx, h + trunk_h + 1, wz, seed, Season::Winter),
+            BlockId::Air,
+            "winter kept a canopy leaf at ({wx}, {}, {wz})",
+            h + trunk_h + 1
         );
         assert_eq!(
             count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLeaves),
             0,
             "winter chunk column still contains oak leaves"
         );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLog) > 0,
+            "winter chunk column lost every oak trunk"
+        );
     }
 
-    /// Negative/structural: season changes only two things — the non-beach
-    /// plains/forest surface block (Grass -> Snow) and the oak canopy (logs and
-    /// leaves -> Air). Heights, biomes, subsurface skin, caves, ores, bedrock,
-    /// water and the Mountain cap are byte-identical across seasons (R001/R005
-    /// survivors).
+    /// Negative/structural: a season change alters only two things — the
+    /// non-beach plains/forest surface block (Grass -> Snow) and oak leaves
+    /// (present -> Air). Trunks and branches are season-persistent, so the tree
+    /// skeleton must be byte-identical between Summer and Winter (D088).
+    /// Heights, biomes, subsurface skin, caves, ores, bedrock, water and the
+    /// Mountain cap are also byte-identical (R001/R005 survivors).
     #[test]
     fn test_season_changes_only_surface_skin_and_oak_canopy() {
         let seed = DEFAULT_WORLD_SEED;
@@ -3670,7 +3966,9 @@ mod tests {
         ];
 
         let mut surface_swaps = 0usize;
-        let mut tree_blocks_gone = 0usize;
+        let mut leaves_shed = 0usize;
+        let mut summer_logs = 0usize;
+        let mut winter_logs = 0usize;
         for pos in positions {
             let summer = generate_chunk_seeded(pos, seed, Season::Summer);
             let winter = generate_chunk_seeded(pos, seed, Season::Winter);
@@ -3682,6 +3980,12 @@ mod tests {
                     for lx in 0..CHUNK_SIZE {
                         let a = summer.get(lx, ly, lz);
                         let b = winter.get(lx, ly, lz);
+                        if a == BlockId::OakLog {
+                            summer_logs += 1;
+                        }
+                        if b == BlockId::OakLog {
+                            winter_logs += 1;
+                        }
                         if a == b {
                             continue;
                         }
@@ -3696,17 +4000,17 @@ mod tests {
                             && matches!(biome, Biome::Plains | Biome::Forest)
                             && a == BlockId::Grass
                             && b == BlockId::Snow;
-                        let shed_tree =
-                            matches!(a, BlockId::OakLog | BlockId::OakLeaves) && b == BlockId::Air;
+                        let shed_leaf = a == BlockId::OakLeaves && b == BlockId::Air;
                         assert!(
-                            surface_swap || shed_tree,
+                            surface_swap || shed_leaf,
                             "unexpected winter change at ({wx}, {wy}, {wz}) in {pos:?}: \
-                             {a:?} -> {b:?} (h {h}, biome {biome:?})"
+                             {a:?} -> {b:?} (h {h}, biome {biome:?}); trunks and \
+                             branches must be season-persistent (D088)"
                         );
                         if surface_swap {
                             surface_swaps += 1;
                         } else {
-                            tree_blocks_gone += 1;
+                            leaves_shed += 1;
                         }
                     }
                 }
@@ -3717,8 +4021,114 @@ mod tests {
             "the scan found no winter blanket surface swap (test is vacuous)"
         );
         assert!(
-            tree_blocks_gone > 0,
-            "the scan found no tree blocks removed in winter (test is vacuous)"
+            leaves_shed > 0,
+            "the scan found no leaves shed in winter (test is vacuous)"
+        );
+        assert_eq!(
+            winter_logs, summer_logs,
+            "winter changed the oak log skeleton ({summer_logs} summer logs vs \
+             {winter_logs} winter logs); only leaves may be seasonal (D088)"
+        );
+    }
+
+    /// The model bound used by `TREE_CANOPY_HEADROOM` must cover every emitted
+    /// cell — trunk, branch and canopy — so the uniform-Air fast path can never
+    /// clip a branch. Pins the constants together with a sampled scan.
+    #[test]
+    fn test_tree_model_bounds_fit_the_canopy_headroom() {
+        const {
+            assert!(
+                TREE_MAX_HEIGHT_OVER_SURFACE >= TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK,
+                "the max tree height must cover the tallest trunk plus its canopy top"
+            );
+            assert!(
+                TREE_CANOPY_HEADROOM > TREE_MAX_HEIGHT_OVER_SURFACE,
+                "headroom must leave at least one spare block above the tallest tree cell"
+            );
+            assert!(
+                MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM < 4 * CHUNK_SIZE as i32,
+                "the top chunk layer must stay provably air with tree headroom"
+            );
+        }
+
+        let seed = DEFAULT_WORLD_SEED;
+        let mut sampled = 0usize;
+        for wz in -256..=256 {
+            for wx in -256..=256 {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                sampled += 1;
+                assert!(
+                    (4..=TREE_MAX_TRUNK_HEIGHT).contains(&tree.trunk_height),
+                    "trunk height {} outside the headroom derivation at ({wx}, {wz})",
+                    tree.trunk_height
+                );
+                for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                    assert!(
+                        (1..=TREE_MAX_HEIGHT_OVER_SURFACE).contains(&(by - h)),
+                        "branch cell ({bx}, {by}, {bz}) is outside the headroom derivation"
+                    );
+                    assert!(
+                        (2..=CHUNK_SIZE as i32 - 3).contains(&bx.rem_euclid(CHUNK_SIZE as i32)),
+                        "branch x {bx} left the chunk interior"
+                    );
+                    assert!(
+                        (2..=CHUNK_SIZE as i32 - 3).contains(&bz.rem_euclid(CHUNK_SIZE as i32)),
+                        "branch z {bz} left the chunk interior"
+                    );
+                }
+            }
+        }
+        assert!(
+            sampled > 0,
+            "no oak sampled in the model-bound region (test is vacuous)"
+        );
+    }
+
+    /// D088 shoreline regression: a deterministic oak whose trunk/canopy top
+    /// crosses the first chunk-Y boundary (exactly the near-shore band where the
+    /// surface sits at wy 26..31) must render every trunk and branch cell in
+    /// full. Before the fix, generation only ran the tree pass in the chunk
+    /// layer holding the surface, so these trees were cut off at wy 32.
+    #[test]
+    fn test_shoreline_trees_are_not_clipped_at_the_chunk_y_boundary() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, tree) = shoreline_tree_crossing_a_chunk_y_boundary(seed);
+        let top = h + tree.trunk_height + TREE_CANOPY_TOP_OVER_TRUNK;
+
+        // The repro premise: the tree genuinely straddles a vertical chunk
+        // edge, so a surface-layer-only pass would have dropped its top cells.
+        assert!(
+            top >= CHUNK_SIZE as i32,
+            "the chosen shoreline tree does not cross the first chunk-Y boundary"
+        );
+        assert_ne!(
+            h.div_euclid(CHUNK_SIZE as i32),
+            top.div_euclid(CHUNK_SIZE as i32),
+            "the trunk/top must live in different vertical chunk layers"
+        );
+
+        for ty in (h + 1)..=(h + tree.trunk_height) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Summer),
+                BlockId::OakLog,
+                "shoreline tree at ({wx}, {wz}) lost trunk block ({wx}, {ty}, {wz})"
+            );
+        }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Summer),
+                BlockId::OakLog,
+                "shoreline tree at ({wx}, {wz}) lost branch ({bx}, {by}, {bz})"
+            );
+        }
+        assert_eq!(
+            generated_block_at(wx, top, wz, seed, Season::Summer),
+            BlockId::OakLeaves,
+            "shoreline tree at ({wx}, {wz}) lost its canopy top at ({wx}, {top}, {wz})"
         );
     }
 }

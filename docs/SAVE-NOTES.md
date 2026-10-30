@@ -97,7 +97,7 @@ Water is part of world generation. It is not a normal block you can own or move.
 - Water is never written into a save. The save format rejects water in stored edits, so a tampered file fails to load rather than producing a corrupt world.
 - A generated ocean is recreated from the seed on every load, so it costs nothing in the file. You can fill individual water cells by placing blocks into them, and those placements are saved as normal edits, but there is no way to drain or remove an ocean.
 
-You can swim in it. In walk mode, buoyancy floats you up toward the surface, and holding jump rises faster. Otherwise you bob near the surface; there is no dive key. Movement is slower than on land. Fly mode behaves as it always has; water does not change it.
+You can swim in it. In walk mode, water applies drag and gravity: an idle body sinks away from the surface, and holding Jump rises back up. There is no automatic surface lock and no separate dive key. Movement is slower than on land. Fly mode behaves as it always has; water does not change it.
 
 The water surface is translucent, and the view shifts to underwater fog while your eye is submerged.
 
@@ -129,9 +129,10 @@ The calendar is a pure function of three things: the day index, the season lengt
 
 Season boundaries change how the world looks:
 
-- **Winter** turns the grass surface of plains and forest into snow. Generated trees only grow out of grass, so winter plains and forest lose their trees along with the green surface.
-- **Autumn** drops the leaves from oak trees and keeps the trunks.
+- **Winter** turns the grass surface of plains and forest into snow. Trees keep their trunks and branches and stand bare through the winter; they no longer disappear with the green surface.
+- **Autumn** drops the leaves from oak trees and keeps the trunks and branches, so a bare tree still reads as a tree.
 - **Spring** and **Summer** keep the grass surface and the full canopy.
+- Leaves are the only seasonal part of a tree. Trunks and branches are generated identically in all four seasons.
 - Beaches, ocean seabeds, and the altitude snow caps on mountains look the same all year.
 
 The change is applied to chunks in a bounded wave rather than all at once, so the game keeps running while the world changes around you. Every block you edited still wins over the seasonal surface.
@@ -151,6 +152,7 @@ Season length is stored in the save. A launch flag that sets season length appli
 These guarantees survived the terrain rewrite:
 
 - **The seed still determines everything.** The same build, seed, and calendar always generate the same terrain, trees, ruins, caves, ores, and water.
+- **Trees render in full, including near the shoreline.** A tree whose trunk, branches, or canopy cross a vertical chunk edge keeps every block, so trees are never cut short halfway up a slope. A tree standing on a steep bank can still have its lower leaves hidden by the hillside in front of it, which is ordinary terrain occlusion rather than clipping.
 - **Your edits always win.** They are reapplied over freshly generated terrain when a chunk loads, unloads, or changes season.
 - **Caves still carve stone only below the surface.** They never open the surface or remove the ground you stand on.
 - **Ores still appear only in their depth bands**, in stone, as before.
