@@ -146,6 +146,20 @@ Weather is presentation only. It never changes blocks and is never saved. Becaus
 
 Season length is stored in the save. A launch flag that sets season length applies only when creating a new world; a loaded world always keeps the length it stored.
 
+## The menu background is a save too
+
+The rotating scenery behind the main menu is a real world save, kept separately from your playable worlds at `saves/background/background.mcvx`. It uses the same format as any other save: seed, your block edits, position, inventory, clock, and calendar.
+
+- **Edit Background** on the main menu enters that world as a normal gameplay session. Build, mine, and fly with the usual controls, then use the pause menu's Save and Quit.
+- The menu camera sits at the saved player's eye position, so the menu looks out from the spot where you left the editor. The sideways drift and fixed downward tilt are unchanged; the saved view direction is not used.
+- The menu sky follows that save's time of day, and the menu terrain follows its calendar season. Both are frozen while you sit on the menu; they advance only while you are editing. Weather stays clear on the menu.
+- The file lives in a subdirectory of `saves/`, so it never appears in the Load Game list and cannot be deleted from there. No background path ever writes a playable world's save.
+- If the file is missing, the built-in deterministic scenery appears and nothing is written until your first edit. If the file is unreadable, the built-in scenery appears with a message on the main menu and the file is left untouched; editing the background then saves over that unreadable file the next time you use Save and Quit.
+- To reset the background, delete `saves/background/background.mcvx`. The next launch shows the built-in scenery; the next successful edit creates a fresh file.
+- If a background save fails while editing, the editor stays open with the reason on the pause screen so the work is not silently lost. Closing the window while editing saves the background like any other gameplay session.
+
+Editing uses the normal survival rules. There is no creative inventory just for the background, so bring blocks from a world or mine what is there.
+
 ## What did not change
 
 These guarantees survived the terrain rewrite:
@@ -175,4 +189,5 @@ These guarantees survived the terrain rewrite:
 - Saves that predate the expanded inventory keep their hotbar contents; the newer inventory slots start empty. A save old enough to predate hotbar storage keeps no items.
 - A save with an out-of-range render distance is rejected rather than guessed at.
 - Hand-editing a save file is not supported. Corrupt or unknown data either fails the load with a named error or falls back to a safe default, depending on the field.
+- The menu background's viewpoint is wherever you stood when you last saved the editor. Building across that spot can put geometry in front of or around the camera; move before saving to reframe it.
 - Development flags for demos and smoke tests (`--new`, `--seed`, `--save`, `--time-scale`, `--season-length`, `--demo-days`, `--demo-swim`) are not part of the normal player flow. They change how a launch runs (some demos advance the calendar and save before exiting), not how an existing save file is interpreted.

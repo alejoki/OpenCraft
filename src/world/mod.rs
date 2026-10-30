@@ -1,3 +1,4 @@
+pub mod background;
 pub mod block;
 pub mod catalog;
 pub mod catalog_fs;

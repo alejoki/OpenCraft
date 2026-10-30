@@ -17,9 +17,10 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
 *   **Texture Packs**: Swap block textures and menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
+*   **Customizable Menu Background**: The panorama behind the main menu is its own saved world at `saves/background/background.mcvx`. Choose **Edit Background** on the main menu to build it with the normal controls; the menu resumes your saved vantage point, time of day, and season. A missing or unreadable file falls back to the built-in scenery and never blocks launch.
 *   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. See the [save and release notes](docs/SAVE-NOTES.md).
 *   **Comprehensive UI System**:
-    *   Main Menu, New Game, Load Game, and Pause screens.
+    *   Main Menu (including Edit Background), New Game, Load Game, and Pause screens.
     *   In-game settings menu for live adjustments.
     *   UI logic is decoupled from rendering, built with `glyphon` for text rendering.
 

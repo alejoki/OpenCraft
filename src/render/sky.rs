@@ -652,13 +652,14 @@ mod tests {
     }
 
     #[test]
-    fn vista_golden_hour_never_shows_stars() {
-        // The menu arm renders the pinned golden hour, where the sun is still
-        // up: star visibility (and therefore the materialised mask) is zero.
+    fn default_scene_golden_hour_never_shows_stars() {
+        // The deterministic demo scene renders at the golden hour, where the
+        // sun is still up: star visibility (and therefore the materialised
+        // mask) is zero. A persisted background may render night instead.
         assert_eq!(
             SkyUniform::from_time(daycycle::VISTA_GOLDEN_HOUR).params[2],
             0.0,
-            "the vista never shows stars, so the mask is a no-op there"
+            "the default scene's golden hour never shows stars, so the mask is a no-op there"
         );
     }
 }

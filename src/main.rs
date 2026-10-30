@@ -17,6 +17,7 @@ use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
+use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
@@ -52,6 +53,7 @@ use opencraft::ui::{
     MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
+use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
@@ -59,8 +61,8 @@ use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use opencraft::world::daycycle;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
-    SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
+    WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -732,11 +734,11 @@ fn weather_ambient_hook(_weather: Weather) {}
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
 /// Session frames use the live clock's weather-tinted palette *and* its
-/// `clock.time_of_day`; vista frames use the pinned
-/// [`daycycle::VISTA_GOLDEN_HOUR`] palette (see [`vista_sky_params`]) and that
-/// same constant as the sky time, never deriving either from the world clock
-/// or `vista_epoch` (that only drives camera drift). Passing the constant here
-/// is what makes the golden-hour sun appear:
+/// `clock.time_of_day`; menu frames use the background scene's own persisted
+/// clock for both the palette and the sky time (see [`vista_sky_params`]),
+/// never deriving either from the session clock (D091). `vista_epoch` only
+/// drives camera drift. A never-customized scene's clock is
+/// [`daycycle::VISTA_GOLDEN_HOUR`], which keeps the demo's golden-hour sun:
 /// `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above the eastern horizon.
 fn sky_params(
     palette: daycycle::SkyPalette,
@@ -772,17 +774,17 @@ fn sky_params(
     }
 }
 
-/// Sky inputs for the pinned golden-hour vista panorama.
+/// Sky inputs for the menu background scene.
 ///
-/// The panorama is the menu backdrop rendered from its own static world (see
-/// [`vista::vista_camera`]) and never reads the session calendar, so it also
-/// never derives weather. Clear + the exact identity fog factor + phase 0.0
-/// keep vista frames byte-identical to pre-S06 output and mean the precip draw
-/// is skipped on every menu frame.
-fn vista_sky_params(palette: daycycle::SkyPalette) -> SkyParams {
+/// The panorama renders from its own persisted world and calendar (see
+/// [`BackgroundScene`]) rather than the session, so the caller passes the
+/// scene's saved time of day for the celestial positions. Weather stays Clear
+/// with the exact identity fog factor and phase 0.0, so the precip draw is
+/// skipped on every menu frame and the backdrop never becomes a weather demo.
+fn vista_sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
     sky_params(
         palette,
-        daycycle::VISTA_GOLDEN_HOUR,
+        time_of_day,
         false,
         Weather::Clear,
         daycycle::CLEAR_FOG_RANGE_FACTOR,
@@ -916,13 +918,14 @@ fn tick_transient_message(message: &mut Option<MenuMessage>) -> bool {
 /// missing saves dir — not an error) displays as `(no saved worlds)`. The
 /// main menu appends its transient message (the S03-T03 Save-and-Quit
 /// save-failure note) as its last line when present; with no message it
-/// lists exactly its four rows.
+/// lists exactly its five rows.
 fn compose_screen_text(
     screen: LifecycleScreen,
     new_game: &NewGameScreen,
     load: &LoadScreen,
     load_message: Option<&MenuMessage>,
     main_menu_message: Option<&MenuMessage>,
+    pause_message: Option<&MenuMessage>,
 ) -> String {
     let lines: Vec<String> = match screen {
         LifecycleScreen::MainMenu => {
@@ -935,10 +938,16 @@ fn compose_screen_text(
             }
             lines
         }
-        LifecycleScreen::Pause => PAUSE_ROWS
-            .iter()
-            .map(|row| row.label().to_string())
-            .collect(),
+        LifecycleScreen::Pause => {
+            let mut lines = PAUSE_ROWS
+                .iter()
+                .map(|row| row.label().to_string())
+                .collect::<Vec<_>>();
+            if let Some(message) = pause_message {
+                lines.push(message.text.clone());
+            }
+            lines
+        }
         LifecycleScreen::NewGame => {
             let mut lines = new_game_row_lines(new_game);
             if let Some(message) = new_game.message() {
@@ -2002,11 +2011,15 @@ struct GameApp {
     /// save path every save site writes to. One always-present session,
     /// swapped atomically at `start_world_session`.
     session: WorldSession,
-    /// The menu vista's own demo world (M004/S02): built directly with the
-    /// fixed `vista::VISTA_SEED`, never a `WorldSession`, never saved and
-    /// never swapped through `start_world_session`. Streamed only while
-    /// `vista::vista_visible` reports a main-menu-cluster screen.
-    vista_world: WorldManager,
+    /// The menu background scene (M012): loaded from
+    /// [`DEFAULT_BACKGROUND_SAVE_PATH`] at startup, rendered from its own
+    /// world + render store, and temporarily swapped into the session by
+    /// Edit Background. Never listed in the catalog and never a playable
+    /// world's save path.
+    background: BackgroundScene,
+    /// Path the background scene loads from and edits save to. Injected so
+    /// headless tests can point at a tempdir.
+    background_path: PathBuf,
     /// Construction epoch for the vista's procedural yaw drift: drift is
     /// `elapsed()` from this single Instant, so it survives menu<->game
     /// transitions with no per-frame accumulation or reset bookkeeping.
@@ -2087,8 +2100,19 @@ struct GameApp {
     /// failure surfaces here as a user-readable "could not save world:
     /// ..." line while the session's unsaved-changes flag stays set for
     /// retry; same tick-counter pattern, ticked alongside the other
-    /// message slots by `tick_transient_message`.
+    /// message slots by `tick_transient_message`. A corrupt background save
+    /// at launch also lands here (M012).
     main_menu_message: Option<MenuMessage>,
+    /// The pause screen's transient message (M012): a background edit whose
+    /// Save and Quit write fails stays in Pause with the reason here instead
+    /// of losing the unsaved customization; same tick-counter pattern.
+    pause_message: Option<MenuMessage>,
+    /// The session that was active before Edit Background (M012). `Some`
+    /// exactly while the background edit session is installed, so it also
+    /// answers "am I editing the background?". Restored on a successful
+    /// Save and Quit; dropped on Exit/Close (the edit session is saved first
+    /// by those paths, like any gameplay session).
+    suspended_session: Option<WorldSession>,
     /// Timestamp of the last message-expiry tick (bounded at ~60 Hz; see
     /// `MENU_TICK_INTERVAL`).
     message_tick_timer: Instant,
@@ -2165,11 +2189,29 @@ impl GameApp {
         event_loop.exit();
     }
 
-    fn new(cli: CliConfig, mut session: WorldSession) -> Self {
+    fn new(cli: CliConfig, session: WorldSession) -> Self {
+        Self::new_with_paths(
+            cli,
+            session,
+            Path::new(DEFAULT_SETTINGS_PATH).to_path_buf(),
+            Path::new(DEFAULT_BACKGROUND_SAVE_PATH).to_path_buf(),
+        )
+    }
+
+    /// Constructor with injectable settings and background paths.
+    ///
+    /// Production goes through [`GameApp::new`]; headless tests point both
+    /// paths at a tempdir so a developer's real settings.toml or background
+    /// save can never change a test outcome.
+    fn new_with_paths(
+        cli: CliConfig,
+        mut session: WorldSession,
+        settings_path: PathBuf,
+        background_path: PathBuf,
+    ) -> Self {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
-        let settings_path = Path::new(DEFAULT_SETTINGS_PATH).to_path_buf();
         let (settings, mut startup_warnings) = load_with_warnings(&settings_path);
         // Pack discovery and startup apply (M004/S03): the persisted choice
         // is re-applied on every launch. A missing/deleted pack folder still
@@ -2238,21 +2280,34 @@ impl GameApp {
         // the setting is global and the world save follows it from now on.
         session.camera.fov_y_radians = settings.fov_degrees.to_radians();
         session.world.set_render_distance(settings.render_distance);
-        // The vista is a second, independent world with the same
-        // settings-driven render distance (the session's is a source of
-        // truth; the vista is never a WorldSession). `ChunkEditMap::default()`
-        // matches `WorldManager::new`; the fixed seed is the demo contract.
-        let mut vista_world = WorldManager::with_seed_and_edits(
-            settings.render_distance,
-            vista::VISTA_SEED,
-            ChunkEditMap::default(),
-        );
-        vista_world.set_render_distance(settings.render_distance);
+        // M012: the menu background is its own persisted scene. A missing
+        // file is the deterministic demo; a corrupt file falls back to the
+        // same demo and the reason becomes menu data (D006/MEM009). Loading is
+        // read-only: this path never creates, repairs, or rewrites the file.
+        let (background, background_warning) =
+            match BackgroundScene::load(&background_path, settings.render_distance) {
+                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => (scene, None),
+                BackgroundLoad::Invalid { scene, error } => (
+                    scene,
+                    Some(format!(
+                        "could not load menu background: {error}; showing the default scenery (editing will replace it)"
+                    )),
+                ),
+            };
+        let main_menu_message = if startup_screen == LifecycleScreen::MainMenu {
+            background_warning.map(|text| MenuMessage {
+                text,
+                ticks_left: menu::MESSAGE_TICKS,
+            })
+        } else {
+            None
+        };
         Self {
             window: None,
             gpu: None,
             session,
-            vista_world,
+            background,
+            background_path,
             vista_epoch: Instant::now(),
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
@@ -2277,7 +2332,9 @@ impl GameApp {
             new_game: NewGameScreen::new(),
             load: LoadScreen::new(),
             load_message: None,
-            main_menu_message: None,
+            main_menu_message,
+            pause_message: None,
+            suspended_session: None,
             message_tick_timer: Instant::now(),
             settings_path,
             packs_root,
@@ -2432,7 +2489,8 @@ impl GameApp {
         self.session
             .world
             .set_render_distance(self.settings.render_distance);
-        self.vista_world
+        self.background
+            .world
             .set_render_distance(self.settings.render_distance);
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
@@ -2494,6 +2552,9 @@ impl GameApp {
         if screen != LifecycleScreen::MainMenu {
             self.main_menu_message = None;
         }
+        if screen != LifecycleScreen::Pause {
+            self.pause_message = None;
+        }
         self.input.reset();
         self.left_mouse_held = false;
         self.mining.reset();
@@ -2537,6 +2598,7 @@ impl GameApp {
         // through a menu and back into gameplay.
         self.left_mouse_held = false;
         self.mining.reset();
+        self.pause_message = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, true);
@@ -2576,6 +2638,16 @@ impl GameApp {
             .world
             .set_render_distance(self.settings.render_distance);
         self.session = session;
+        self.on_session_installed();
+    }
+
+    /// Shared reset boundary after `self.session` has been replaced.
+    ///
+    /// Called by [`GameApp::start_world_session`] for normal create/load swaps
+    /// and by Edit Background after moving the previous session aside. Keeping
+    /// one copy means the background edit path cannot forget an input/mining/
+    /// render-store reset that every other swap performs.
+    fn on_session_installed(&mut self) {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
         }
@@ -2595,6 +2667,99 @@ impl GameApp {
         self.swim = None;
     }
 
+    /// Enter the persisted menu background as the active edit session.
+    ///
+    /// The previous session is suspended, not discarded, and restored on a
+    /// successful Save and Quit. A load failure stays on the main menu with a
+    /// readable message; it never overwrites the background file. A missing or
+    /// corrupt background is edited from the deterministic scene, so the first
+    /// successful save replaces whatever was there.
+    fn begin_background_edit(&mut self) -> bool {
+        if self.suspended_session.is_some() {
+            // Already editing (unreachable from the main-menu UI): do not
+            // stack sessions or overwrite the suspended one.
+            return false;
+        }
+        let edit_session = match self.build_background_edit_session() {
+            Ok(session) => session,
+            Err(text) => {
+                self.main_menu_message = Some(MenuMessage {
+                    text,
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                return false;
+            }
+        };
+        // A stale startup/save message described the menu state we are
+        // leaving; the editor starts clean.
+        self.main_menu_message = None;
+        let previous = std::mem::replace(&mut self.session, edit_session);
+        self.suspended_session = Some(previous);
+        self.on_session_installed();
+        self.enter_playing();
+        true
+    }
+
+    /// Build the session Edit Background installs.
+    ///
+    /// A persisted backdrop is re-read from disk, so the editor starts from
+    /// the file the menu is showing (inventory, position, clock included). A
+    /// never-customized (or unreadable) backdrop starts a fresh world at the
+    /// menu anchor, with the scene's clock; saving it creates the file.
+    fn build_background_edit_session(&self) -> Result<WorldSession, String> {
+        let mut session = if self.background.persisted {
+            let data = load_world_from_path(&self.background_path)
+                .map_err(|error| format!("could not open menu background for editing: {error}"))?;
+            WorldSession::session_from_save(data, self.background_path.clone())
+        } else {
+            let position = self.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
+            WorldSession::new_at(
+                self.background.world.seed(),
+                self.background_path.clone(),
+                self.background.season_length_days,
+                position,
+                self.background.clock,
+            )
+        };
+        // Settings win over any stored render distance/FOV, exactly like every
+        // other session installation (GameApp::new / start_world_session).
+        session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+        session
+            .world
+            .set_render_distance(self.settings.render_distance);
+        Ok(session)
+    }
+
+    /// Adopt the just-saved background back into the menu scene.
+    ///
+    /// Reloading from disk (rather than moving the session's WorldManager)
+    /// guarantees a fresh mesh-state world: the vista render store is cleared
+    /// below, and a moved manager whose chunks were already meshed would leave
+    /// an empty store and a blank panorama. Restores the suspended session, so
+    /// the menu returns to the pre-edit session rather than keeping the editor.
+    fn finish_background_edit(&mut self) {
+        let reloaded =
+            match BackgroundScene::load(&self.background_path, self.settings.render_distance) {
+                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => scene,
+                BackgroundLoad::Invalid { scene, error } => {
+                    self.main_menu_message = Some(MenuMessage {
+                        text: format!(
+                            "could not reload menu background: {error}; showing the default scenery"
+                        ),
+                        ticks_left: menu::MESSAGE_TICKS,
+                    });
+                    scene
+                }
+            };
+        self.background = reloaded;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.vista_store.clear();
+        }
+        if let Some(previous) = self.suspended_session.take() {
+            self.session = previous;
+        }
+    }
+
     /// Apply a lifecycle decision from the S01 state machine (navigation,
     /// cursor/input resets, settings-menu sync, save-and-quit, exit save).
     /// Returns whether the caller should exit the event loop: the ExitGame
@@ -2609,20 +2774,41 @@ impl GameApp {
         match decision {
             LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
             LifecycleDecision::ResumeGame => self.enter_playing(),
-            LifecycleDecision::StartNewGame | LifecycleDecision::LoadWorld => {}
+            LifecycleDecision::StartNewGame
+            | LifecycleDecision::LoadWorld
+            | LifecycleDecision::EditBackground => {}
             LifecycleDecision::SaveAndQuit => {
                 // Save the session's world to the session's own save path
                 // (S03-T02: every save site is session-tied), then return
                 // to the main menu. On failure: surface a transient
-                // main-menu message (warnings-as-data, D006/MEM009 — the
-                // crate stays log-free) and KEEP the unsaved-changes flag
-                // set for the next save opportunity (retry, or a later
-                // save/exit path saves it again).
+                // message (warnings-as-data, D006/MEM009 — the crate stays
+                // log-free) and KEEP the unsaved-changes flag set for the
+                // next save opportunity (retry, or a later save/exit path
+                // saves it again).
+                let editing_background = self.suspended_session.is_some();
                 if let Err(err) = save_current_world(&mut self.session) {
+                    if editing_background {
+                        // A failed background write must not discard the
+                        // customization: stay in Pause (dispatch already moved
+                        // the screen to MainMenu) with the error on screen and
+                        // the edit session still active so Save and Quit can
+                        // be retried.
+                        self.pause_message = Some(MenuMessage {
+                            text: format!("could not save menu background: {err}"),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                        self.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+                        return false;
+                    }
                     self.main_menu_message = Some(MenuMessage {
                         text: format!("could not save world: {err}"),
                         ticks_left: menu::MESSAGE_TICKS,
                     });
+                } else if editing_background {
+                    // The background file now holds this session's world and
+                    // clock. Reload the menu scene from it and give the
+                    // previous session back.
+                    self.finish_background_edit();
                 }
                 // Drop every session GPU chunk mesh at menu return (the
                 // same boundary rule as `start_world_session`): the menu
@@ -2926,12 +3112,18 @@ impl GameApp {
                     MainMenuRow::NewGame => LifecycleIntent::MainMenu(MainMenuIntent::NewGame),
                     MainMenuRow::LoadGame => LifecycleIntent::MainMenu(MainMenuIntent::LoadGame),
                     MainMenuRow::Settings => LifecycleIntent::MainMenu(MainMenuIntent::Settings),
+                    MainMenuRow::EditBackground => {
+                        LifecycleIntent::MainMenu(MainMenuIntent::EditBackground)
+                    }
                     // Exit mirrors the CloseRequested path via
                     // dispatch_screen_intent (save world + settings,
                     // exit the loop).
                     MainMenuRow::ExitGame => LifecycleIntent::MainMenu(MainMenuIntent::ExitGame),
                 };
-                self.dispatch_screen_intent(event_loop, intent);
+                let decision = self.dispatch_screen_intent(event_loop, intent);
+                if matches!(decision, Some(LifecycleDecision::EditBackground)) {
+                    self.begin_background_edit();
+                }
                 self.audio.play(SoundSlot::UiClick, self.settings.volume);
             }
             LifecycleScreen::Pause => {
@@ -3688,11 +3880,13 @@ impl ApplicationHandler for GameApp {
                         || self.new_game.message().is_some()
                         || self.load_message.is_some()
                         || self.main_menu_message.is_some()
+                        || self.pause_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
                         tick_transient_message(&mut self.load_message);
                         tick_transient_message(&mut self.main_menu_message);
+                        tick_transient_message(&mut self.pause_message);
                     }
                 }
 
@@ -3832,15 +4026,16 @@ impl ApplicationHandler for GameApp {
                     // and never touches `session`/save paths; paused screens
                     // fail `vista` above, so the frozen paused world stays
                     // frozen with no chunk loads/unloads.
-                    let anchor = vista::vista_anchor();
+                    let anchor = self.background.anchor;
                     let (vista_chunk, _) = world_to_chunk_and_local(
                         anchor.x.floor() as i32,
                         anchor.y.floor() as i32,
                         anchor.z.floor() as i32,
                     );
                     let (new_meshes, unloaded) = self
-                        .vista_world
-                        .update_streaming(vista_chunk, vista::VISTA_SEASON);
+                        .background
+                        .world
+                        .update_streaming(vista_chunk, self.background.season());
                     for upos in unloaded {
                         gpu.vista_store.remove_chunk(upos);
                     }
@@ -4061,6 +4256,7 @@ impl ApplicationHandler for GameApp {
                             &self.load,
                             self.load_message.as_ref(),
                             self.main_menu_message.as_ref(),
+                            self.pause_message.as_ref(),
                         )
                     };
                     gpu.menu_text.update(
@@ -4264,6 +4460,7 @@ impl ApplicationHandler for GameApp {
                 // always None on vista frames (overlays are off anyway).
                 let vista_camera = if vista {
                     Some(vista::vista_camera(
+                        self.background.anchor,
                         self.vista_epoch.elapsed().as_secs_f32(),
                         self.settings.fov_degrees.to_radians(),
                     ))
@@ -4271,22 +4468,23 @@ impl ApplicationHandler for GameApp {
                     None
                 };
                 let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
-                    // Vista sky is pinned at golden hour: never the world clock
-                    // and never `vista_epoch` (that only drifts the camera).
+                    // The menu scene's palette and sky time come from its own
+                    // saved clock (D091); `vista_epoch` only drifts the camera.
                     // Weather is pinned Clear inside `vista_sky_params`, so the
-                    // panorama stays byte-identical and never draws precip.
-                    let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);
+                    // panorama never draws precipitation.
+                    let palette = daycycle::sky_palette(self.background.clock.time_of_day);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.vista_store,
                         vista_camera,
-                        self.vista_world.render_distance(),
+                        self.background.world.render_distance(),
                         None,
                         self.session.player.selected_slot(),
                         false,
-                        // Vista frames render the panorama from its own world,
-                        // whose camera anchors over land: never submerged.
-                        vista_sky_params(palette),
+                        // Menu frames render the scene from its own world, whose
+                        // camera anchors over land (or wherever the player
+                        // chose): never submerged.
+                        vista_sky_params(palette, self.background.clock.time_of_day),
                         ui_pass,
                     )
                 } else {
@@ -6070,13 +6268,18 @@ mod tests {
     /// (LoadGame entry refreshes rows from the tempdir catalog).
     fn app_at_screen(saves_dir: &Path, screen: LifecycleScreen) -> GameApp {
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(
+        // Injectable paths keep every headless test independent of the crate
+        // root's real settings.toml and background save (M012). A missing
+        // background is the deterministic demo scene.
+        let mut app = GameApp::new_with_paths(
             cli,
             WorldSession::new_session(
                 1,
                 PathBuf::from("/nonexistent/initial.mcvx"),
                 DEFAULT_SEASON_LENGTH_DAYS,
             ),
+            Path::new(DEFAULT_SETTINGS_PATH).to_path_buf(),
+            saves_dir.join("background/background.mcvx"),
         );
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
@@ -6107,17 +6310,444 @@ mod tests {
     #[test]
     fn fresh_game_app_has_a_fixed_seed_vista_at_the_settings_render_distance() {
         let app = app_at_screen(Path::new("/nonexistent/saves"), LifecycleScreen::MainMenu);
-        assert_eq!(app.vista_world.seed(), vista::VISTA_SEED);
+        assert_eq!(app.background.world.seed(), vista::VISTA_SEED);
         assert_eq!(
-            app.vista_world.render_distance(),
+            app.background.world.render_distance(),
             app.settings.render_distance,
-            "the vista follows the settings-driven render distance"
+            "the background follows the settings-driven render distance"
         );
-        // The vista is its own world, not a hidden alias of the session.
+        // The background is its own world, not a hidden alias of the session.
         assert_ne!(
-            app.vista_world.seed(),
+            app.background.world.seed(),
             app.session.world.seed(),
-            "vista and session are distinct, independently seeded worlds"
+            "background and session are distinct, independently seeded worlds"
+        );
+    }
+
+    /// Every `.mcvx` file below `root`, recursively: proves a launch wrote no
+    /// playable (or background) save path, not just the one path under test.
+    fn mcvx_files_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "mcvx") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    /// A headless GameApp for background-scene tests: tempdir settings and
+    /// background paths, bare CLI (main menu), and a fixed session.
+    fn app_with_background(saves_dir: &Path) -> GameApp {
+        GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            saves_dir.join("settings.toml"),
+            saves_dir.join("background/background.mcvx"),
+        )
+    }
+
+    #[test]
+    fn missing_background_save_renders_the_demo_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        let app = app_with_background(dir.path());
+
+        assert_eq!(app.background.world.seed(), vista::VISTA_SEED);
+        assert_eq!(
+            app.background.clock.time_of_day,
+            daycycle::VISTA_GOLDEN_HOUR
+        );
+        assert_eq!(app.background.clock.day_index, 0);
+        assert_eq!(app.background.season(), Season::Summer);
+        assert!(!app.background.persisted);
+        assert_eq!(app.background.anchor, vista::vista_anchor());
+        assert_eq!(app.background_path, background_path);
+        assert!(
+            !background_path.exists(),
+            "launch must not create a background save"
+        );
+        assert!(
+            mcvx_files_under(dir.path()).is_empty(),
+            "launch must not write a playable save path"
+        );
+        assert!(
+            app.main_menu_message.is_none(),
+            "a missing background is silent"
+        );
+    }
+
+    #[test]
+    fn valid_background_save_drives_the_menu_scene() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        let mut data = sample_save(777);
+        data.time_of_day = 4_321;
+        data.day_index = 3;
+        data.season_length_days = 2;
+        data.player.position = [-12.5, 64.25, 108.0];
+        save_world_to_path(&background_path, &data).expect("write background save");
+
+        let app = app_with_background(dir.path());
+        assert_eq!(app.background.world.seed(), 777);
+        assert_eq!(app.background.clock.time_of_day, 4_321);
+        assert_eq!(app.background.clock.day_index, 3);
+        assert_eq!(app.background.season_length_days, 2);
+        assert_eq!(
+            app.background.anchor,
+            Vec3::new(
+                -12.5,
+                64.25 + opencraft::player::physics::PLAYER_EYE_HEIGHT,
+                108.0
+            )
+        );
+        assert!(app.background.persisted);
+        assert!(app.main_menu_message.is_none());
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path.clone()],
+            "launch reads the background without writing any other save path"
+        );
+    }
+
+    #[test]
+    fn corrupt_background_save_falls_back_warns_and_is_not_rewritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        std::fs::create_dir_all(background_path.parent().expect("parent"))
+            .expect("create background dir");
+        let junk = b"definitely not a world".to_vec();
+        std::fs::write(&background_path, &junk).expect("write junk background");
+
+        let app = app_with_background(dir.path());
+        assert_eq!(app.background.world.seed(), vista::VISTA_SEED);
+        assert!(!app.background.persisted);
+        let message = app
+            .main_menu_message
+            .as_ref()
+            .expect("corrupt background must surface a menu message");
+        assert!(
+            message.text.contains("could not load menu background"),
+            "message names the background, got: {}",
+            message.text
+        );
+        assert_eq!(
+            std::fs::read(&background_path).expect("read junk back"),
+            junk,
+            "launch must not repair or rewrite an invalid background save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path],
+            "a corrupt background must not make launch write a playable save"
+        );
+    }
+
+    #[test]
+    fn edit_background_round_trips_through_the_menu_scene() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_background(dir.path());
+        let playable_path = dir.path().join("playable.mcvx");
+        app.session.save_path = playable_path.clone();
+
+        assert!(app.begin_background_edit(), "enters the editor");
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_path, app.background_path);
+        assert_eq!(app.session.world.seed(), vista::VISTA_SEED);
+        assert!(
+            app.suspended_session.is_some(),
+            "the previous session is suspended, not discarded"
+        );
+        // The never-customized background starts the editor at the menu's
+        // exact eye anchor and clock, and entering writes nothing yet.
+        assert_eq!(
+            app.session.player.position,
+            app.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
+            "the default editor starts at the menu anchor"
+        );
+        assert_eq!(app.session.camera.position, app.background.anchor);
+        assert_eq!(
+            app.session.clock.time_of_day,
+            app.background.clock.time_of_day
+        );
+        assert_eq!(app.session.clock.day_index, app.background.clock.day_index);
+        assert_eq!(
+            app.session.season_length_days,
+            app.background.season_length_days
+        );
+        assert!(
+            !app.background_path.exists(),
+            "entering the editor must not create the background save"
+        );
+        assert!(
+            !app.begin_background_edit(),
+            "a second edit cannot stack sessions"
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.suspended_session.is_some(),
+            "the refused second edit keeps the suspended session"
+        );
+
+        // The editor chooses the menu viewpoint by standing there, and its
+        // clock advances while playing; both must persist.
+        let feet = Vec3::new(42.5, 70.0, -13.5);
+        app.session.player.position = feet;
+        app.session.sync_camera();
+        app.session.clock.time_of_day = 9_000;
+        app.session.clock.day_index = 2;
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.suspended_session.is_none(), "editor session retired");
+        assert_eq!(
+            app.session.save_path, playable_path,
+            "the pre-edit session is restored"
+        );
+        assert!(
+            !playable_path.exists(),
+            "editing the background must not write a playable world's save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![app.background_path.clone()],
+            "the edit round-trip writes only the background save"
+        );
+        assert!(app.background_path.is_file(), "background save created");
+        assert!(app.background.persisted);
+        assert_eq!(
+            app.background.anchor,
+            feet + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
+            "the menu anchors at the editor's eye position"
+        );
+        assert_eq!(app.background.clock.time_of_day, 9_000);
+        assert_eq!(app.background.clock.day_index, 2);
+
+        // Relaunch: startup loads the file rather than the demo fallback.
+        let relaunched = app_with_background(dir.path());
+        assert!(relaunched.background.persisted);
+        assert_eq!(
+            relaunched.background.anchor,
+            feet + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0)
+        );
+        assert_eq!(relaunched.background.clock.time_of_day, 9_000);
+        assert_eq!(relaunched.background.clock.day_index, 2);
+    }
+
+    #[test]
+    fn edit_background_resumes_the_saved_world_and_settings_win() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        let mut data = sample_save(777);
+        data.time_of_day = 4_321;
+        data.day_index = 3;
+        data.season_length_days = 2;
+        data.player.position = [-12.5, 64.25, 108.0];
+        data.player.render_distance = 8;
+        save_world_to_path(&background_path, &data).expect("write background save");
+
+        let mut app = app_with_background(dir.path());
+        app.settings.render_distance = 22;
+        app.settings.fov_degrees = 90.0;
+        assert!(app.begin_background_edit());
+
+        assert_eq!(app.session.world.seed(), 777);
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(-12.5, 64.25, 108.0),
+            "the editor resumes the saved feet position"
+        );
+        assert_eq!(
+            app.session.camera.position, app.background.anchor,
+            "entering the editor does not move the menu viewpoint"
+        );
+        assert_eq!(app.session.clock.time_of_day, 4_321);
+        assert_eq!(app.session.clock.day_index, 3);
+        assert_eq!(app.session.season_length_days, 2);
+        assert_eq!(
+            app.session.world.render_distance(),
+            app.settings.render_distance,
+            "settings win over the save's stored render distance"
+        );
+        assert_eq!(
+            app.session.camera.fov_y_radians,
+            app.settings.fov_degrees.to_radians()
+        );
+    }
+
+    #[test]
+    fn background_save_failure_keeps_the_editor_and_shows_the_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Make the background path uncreatable: its parent is a regular file.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let background_path = blocker.join("background.mcvx");
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            dir.path().join("settings.toml"),
+            background_path.clone(),
+        );
+        assert!(app.begin_background_edit());
+        // Unsaved editor state that a failed save must preserve.
+        let edited_feet = Vec3::new(12.5, 70.0, -8.0);
+        app.session.player.position = edited_feet;
+        app.session.sync_camera();
+        app.session.clock.time_of_day = 7_000;
+
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+
+        assert_eq!(
+            app.lifecycle.screen(),
+            LifecycleScreen::Pause,
+            "a failed save keeps the editor open"
+        );
+        assert!(app.suspended_session.is_some(), "session remains suspended");
+        assert_eq!(app.session.save_path, background_path);
+        assert_eq!(app.session.world.seed(), vista::VISTA_SEED);
+        assert_eq!(
+            app.session.player.position, edited_feet,
+            "a failed save keeps the unsaved edit position"
+        );
+        assert_eq!(
+            app.session.clock.time_of_day, 7_000,
+            "a failed save keeps the unsaved clock"
+        );
+        let message = app
+            .pause_message
+            .as_ref()
+            .expect("the failure must be visible on Pause");
+        assert!(
+            message.text.contains("could not save menu background"),
+            "unexpected text: {}",
+            message.text
+        );
+        assert!(!background_path.exists());
+
+        // Resuming clears the failure note; the editor keeps its session.
+        app.enter_playing();
+        assert!(app.pause_message.is_none(), "Resume starts clean");
+        assert!(app.suspended_session.is_some());
+    }
+
+    #[test]
+    fn exit_game_while_editing_saves_the_background_and_leaves_the_playable_world_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_background(dir.path());
+        let playable_path = dir.path().join("playable.mcvx");
+        app.session.save_path = playable_path.clone();
+        assert!(app.begin_background_edit());
+
+        let feet = Vec3::new(5.5, 66.0, -9.5);
+        app.session.player.position = feet;
+        app.session.sync_camera();
+        app.session.clock.time_of_day = 8_500;
+
+        assert!(
+            app.apply_lifecycle_decision(LifecycleDecision::ExitGame),
+            "Exit Game owns the event-loop exit"
+        );
+
+        let persisted =
+            load_world_from_path(&app.background_path).expect("background save decodes");
+        assert_eq!(
+            persisted.player.position,
+            feet.to_array(),
+            "Exit Game saves the edit session's position"
+        );
+        assert_eq!(
+            persisted.time_of_day, 8_500,
+            "Exit Game saves the edit session's clock"
+        );
+        assert!(
+            !playable_path.exists(),
+            "leaving via Exit Game must not save the suspended playable world"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![app.background_path.clone()],
+            "Exit Game while editing writes only the background save"
+        );
+    }
+
+    #[test]
+    fn pause_message_clears_on_every_pause_exit_and_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_background(dir.path());
+        let stale_note = || MenuMessage {
+            text: "stale pause note".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+
+        // Every Pause exit retires the note with the screen: the note must
+        // never leak onto the main menu or a settings visit.
+        for target in [
+            LifecycleScreen::MainMenu,
+            LifecycleScreen::Settings(SettingsCaller::Pause),
+        ] {
+            app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+            app.pause_message = Some(stale_note());
+            app.enter_screen(target);
+            assert!(
+                app.pause_message.is_none(),
+                "{target:?} must not inherit the Pause note"
+            );
+        }
+
+        // Resume clears it as well.
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        app.pause_message = Some(stale_note());
+        app.enter_playing();
+        assert!(app.pause_message.is_none(), "Resume starts clean");
+    }
+
+    #[test]
+    fn edit_background_load_failure_stays_on_the_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        save_world_to_path(&background_path, &sample_save(5)).expect("write background save");
+        let mut app = app_with_background(dir.path());
+        assert!(app.background.persisted);
+
+        std::fs::remove_file(&background_path).expect("vanish the background file");
+        assert!(
+            !app.begin_background_edit(),
+            "a load failure must not enter the editor"
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.suspended_session.is_none());
+        assert_eq!(
+            app.session.save_path,
+            PathBuf::from("/nonexistent/initial.mcvx")
+        );
+        let message = app
+            .main_menu_message
+            .as_ref()
+            .expect("the load failure must be visible on the menu");
+        assert!(
+            message.text.contains("could not open menu background"),
+            "unexpected text: {}",
+            message.text
         );
     }
 
@@ -6133,7 +6763,7 @@ mod tests {
         app.settings_path = dir.path().join("settings.toml");
         app.settings.render_distance = 16;
         app.session.world.set_render_distance(16);
-        app.vista_world.set_render_distance(16);
+        app.background.world.set_render_distance(16);
 
         // The exact helper the MenuRow::RenderDistance click arm calls
         // (menu_click itself requires a live ActiveEventLoop/Window; the
@@ -6142,7 +6772,7 @@ mod tests {
 
         assert_eq!(app.settings.render_distance, 18);
         assert_eq!(app.session.world.render_distance(), 18);
-        assert_eq!(app.vista_world.render_distance(), 18);
+        assert_eq!(app.background.world.render_distance(), 18);
         assert!(
             dir.path().join("settings.toml").exists(),
             "the click saves the settings exactly as before"
@@ -6152,11 +6782,11 @@ mod tests {
         // pinned to the same clamped value (negative-path guard).
         app.settings.render_distance = 36;
         app.session.world.set_render_distance(36);
-        app.vista_world.set_render_distance(36);
+        app.background.world.set_render_distance(36);
         app.apply_render_distance_adjust(AdjustDirection::Up);
         assert_eq!(app.settings.render_distance, 36);
         assert_eq!(app.session.world.render_distance(), 36);
-        assert_eq!(app.vista_world.render_distance(), 36);
+        assert_eq!(app.background.world.render_distance(), 36);
     }
 
     // --- texture pack wiring (M004/S03) ---
@@ -6361,7 +6991,8 @@ mod tests {
         );
         assert!(
             app.menu.message.is_none(),
-            "a clean sound pack emits no warning"
+            "a clean sound pack emits no warning, got: {:?}",
+            app.menu.message.as_ref().map(|m| &m.text)
         );
     }
 
@@ -8752,8 +9383,9 @@ mod tests {
             &app.load,
             None,
             app.main_menu_message.as_ref(),
+            None,
         );
-        assert_eq!(text.lines().count(), 4 + 1, "four rows plus the message");
+        assert_eq!(text.lines().count(), 5 + 1, "five rows plus the message");
         assert!(text.ends_with(message.text.as_str()));
 
         // The unsaved-changes flag stays set for the next save opportunity
@@ -8786,16 +9418,17 @@ mod tests {
         assert!(app.main_menu_message.is_none(), "no failure, no message");
         assert!(!app.session.world.has_unsaved_changes(), "flag cleared");
         assert!(save_path.is_file(), "the session's own path was written");
-        // The main menu still lists exactly its four rows with no message.
+        // The main menu still lists exactly its five rows with no message.
         assert_eq!(
             compose_screen_text(
                 LifecycleScreen::MainMenu,
                 &app.new_game,
                 &app.load,
                 None,
+                None,
                 None
             ),
-            "New Game\nLoad Game\nSettings\nExit Game"
+            "New Game\nLoad Game\nSettings\nEdit Background\nExit Game"
         );
     }
 
@@ -10101,14 +10734,21 @@ mod tests {
         let new_game = NewGameScreen::new();
         let load = LoadScreen::new();
         assert_eq!(
-            compose_screen_text(LifecycleScreen::MainMenu, &new_game, &load, None, None),
-            "New Game\nLoad Game\nSettings\nExit Game"
+            compose_screen_text(
+                LifecycleScreen::MainMenu,
+                &new_game,
+                &load,
+                None,
+                None,
+                None
+            ),
+            "New Game\nLoad Game\nSettings\nEdit Background\nExit Game"
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None, None),
+            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None, None, None),
             "Resume\nSettings\nSave and Quit"
         );
-        // With no message the main menu lists exactly its four rows; a
+        // With no message the main menu lists exactly its five rows; a
         // transient main-menu message (the S03-T03 Save-and-Quit save
         // failure note) appends as the main menu's last line when present.
         let message = MenuMessage {
@@ -10121,9 +10761,26 @@ mod tests {
                 &new_game,
                 &load,
                 None,
-                Some(&message)
+                Some(&message),
+                None
             ),
-            "New Game\nLoad Game\nSettings\nExit Game\ncould not save world: blocked"
+            "New Game\nLoad Game\nSettings\nEdit Background\nExit Game\ncould not save world: blocked"
+        );
+
+        let pause_message = MenuMessage {
+            text: "could not save menu background: blocked".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::Pause,
+                &new_game,
+                &load,
+                None,
+                None,
+                Some(&pause_message)
+            ),
+            "Resume\nSettings\nSave and Quit\ncould not save menu background: blocked"
         );
     }
 
@@ -10135,19 +10792,20 @@ mod tests {
         // unfocused blank seed renders the random hint
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
             "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
             "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
-        let text = compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None);
+        let text =
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None);
         assert!(text.ends_with("World name cannot be empty."));
     }
 
@@ -10178,7 +10836,14 @@ mod tests {
         // Empty catalog (fresh install / missing saves dir): not an error —
         // displayed as such, then Back.
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
+            compose_screen_text(
+                LifecycleScreen::LoadGame,
+                &new_game,
+                &load,
+                None,
+                None,
+                None
+            ),
             "(no saved worlds)\nBack"
         );
 
@@ -10194,14 +10859,28 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
+            compose_screen_text(
+                LifecycleScreen::LoadGame,
+                &new_game,
+                &load,
+                None,
+                None,
+                None
+            ),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack"
         );
 
         // A pending delete appends the prompt-naming confirm row and cancel.
         assert!(load.request_delete(1));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::LoadGame, &new_game, &load, None, None),
+            compose_screen_text(
+                LifecycleScreen::LoadGame,
+                &new_game,
+                &load,
+                None,
+                None,
+                None
+            ),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack\nDelete 'broken'?\nCancel"
         );
 
@@ -10216,6 +10895,7 @@ mod tests {
             &load,
             Some(&message),
             None,
+            None,
         );
         assert!(text.ends_with("Could not load world \"alpha\""));
 
@@ -10227,12 +10907,13 @@ mod tests {
                 &new_game,
                 &load,
                 None,
+                None,
                 None
             ),
             String::new()
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None, None),
+            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None, None, None),
             String::new()
         );
     }
@@ -10576,7 +11257,7 @@ mod tests {
     /// to the Clear identity so the menu panorama stays byte-identical and
     /// never draws precipitation.
     #[test]
-    fn weather_reaches_sky_params_and_the_vista_arm_stays_clear() {
+    fn weather_reaches_sky_params_and_the_background_arm_stays_clear() {
         let base = daycycle::sky_palette(daycycle::DEFAULT_TIME_OF_DAY);
         let tinted = daycycle::weather_palette(base, Weather::Rain);
         let params = sky_params(
@@ -10594,26 +11275,31 @@ mod tests {
         assert_eq!(params.fog_color[0], tinted.fog_color[0]);
         assert_ne!(tinted, base, "rain must tint the palette before upload");
 
-        // Vista frames construct Clear + identity, so the panorama is
-        // byte-identical to pre-S06 and the precip draw is skipped.
-        let vista = vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR));
-        assert_eq!(vista.time_of_day, daycycle::VISTA_GOLDEN_HOUR);
+        // Menu frames construct Clear + identity and pass the SCENE clock
+        // through (D091), so the panorama follows its saved time of day while
+        // the precip draw is still skipped.
+        let vista_time = 9_000;
+        let vista = vista_sky_params(daycycle::sky_palette(vista_time), vista_time);
+        assert_eq!(
+            vista.time_of_day, vista_time,
+            "the menu scene clock reaches SkyParams, never a pinned constant"
+        );
         assert_eq!(vista.weather, Weather::Clear);
         assert_eq!(vista.fog_range_factor, 1.0);
         assert_eq!(vista.weather_phase, 0.0);
         assert!(!vista.underwater);
 
-        // Source pin: the vista render arm actually calls the helper above, so
-        // those pinned values are the production vista path, not dead code.
+        // Source pin: the menu render arm actually calls the helper above, so
+        // those Clear values are the production menu path, not dead code.
         let src = include_str!("main.rs");
         let vista_arm = src
-            .split("let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);")
+            .split("let palette = daycycle::sky_palette(self.background.clock.time_of_day);")
             .nth(1)
             .and_then(|rest| rest.split("} else {").next())
-            .expect("the vista render arm must be present");
+            .expect("the menu render arm must be present");
         assert!(
-            vista_arm.contains("vista_sky_params(palette)"),
-            "vista frames must render through the pinned Clear-weather sky inputs"
+            vista_arm.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
+            "menu frames must render through the scene clock and Clear-weather sky inputs"
         );
     }
 

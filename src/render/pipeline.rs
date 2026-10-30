@@ -1678,17 +1678,40 @@ mod tests {
     }
 
     #[test]
-    fn vista_sky_params_use_the_pinned_golden_hour() {
-        // Source pin: the vista arm must go through `vista_sky_params`
-        // (VISTA_GOLDEN_HOUR's single home for the constant) rather than the
-        // world clock, and the session arm must pass the live clock plus the
-        // per-frame weather derivation. The vista arm pins weather Clear and
-        // the identity fog factor inside the helper, so the panorama is
-        // byte-identical to pre-S06 output and never draws precipitation.
+    fn menu_sky_params_follow_the_background_scene_and_stay_dry() {
+        // Source pin: the menu arm must go through `vista_sky_params` with the
+        // background scene's own clock and anchor (D091), while the session arm
+        // passes the live clock plus the per-frame weather derivation. The menu
+        // helper pins weather Clear and the identity fog factor, so the
+        // panorama never draws precipitation.
         let src = include_str!("../main.rs");
         assert!(
-            src.contains("vista_sky_params(palette)"),
-            "vista frames must pin the sky time to golden hour and stay dry"
+            src.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
+            "menu frames must follow the background scene clock and stay dry"
+        );
+        // Whitespace-insensitive copy for chained calls that rustfmt wraps.
+        let compact: String = src.split_whitespace().collect();
+        assert!(
+            src.contains("self.background.anchor"),
+            "the menu camera must anchor at the background scene's saved eye position"
+        );
+        assert!(
+            compact.contains(
+                "self.background.world.update_streaming(vista_chunk,self.background.season())"
+            ),
+            "menu streaming must use the background world and its saved-calendar season"
+        );
+        assert!(
+            src.contains("self.background.world.render_distance(),"),
+            "menu rendering must use the background world's render distance"
+        );
+        assert!(
+            !compact.contains("vista_sky_params(palette,daycycle::VISTA_GOLDEN_HOUR)")
+                && !compact.contains(
+                    "vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR))"
+                )
+                && !compact.contains("update_streaming(vista_chunk,vista::VISTA_SEASON)"),
+            "VISTA_GOLDEN_HOUR / VISTA_SEASON are default-scene values, never render-time menu constants"
         );
         assert!(
             src.contains("let weather = session_weather(&self.session);"),
