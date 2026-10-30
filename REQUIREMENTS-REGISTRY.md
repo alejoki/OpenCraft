@@ -47,13 +47,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R005 — Deterministic 3D caves and coal/iron veins with ores below h-3 and bedrock at wy=-32
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M007/S01
 - Description: Deterministic 3D caves and coal/iron veins with ores below h-3 and bedrock at wy=-32.
 - Why it matters: Cave and ore discovery is the resource-spine foundation.
 - Source: M003 / D022 item 5
 - Primary owning slice: M003/S01
 - Supporting slices: None
 - Validation: cargo test --locked --lib -- world::terrain
+- Note: Deliberately superseded by M007/S01 (four-biome terrain rewrite). What survives and stays pinned by the terrain tests: caves carve Stone only strictly below h-3/h-4, ores stay in their depth bands below h-3, and bedrock stays at wy=-32. Only the implicit single-biome grassland height envelope is replaced, not the cave/ore/bedrock contract.
 
 ### R006 — Per-block hardness hold-to-mine with visible progress and reset on release or retarget
 - Class: primary-user-loop
@@ -265,6 +267,86 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M005/S09
 - Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh (S09 records the UAT-H5 re-test protocol against the packs/uat-sound fixture)
 
+### R027 — Four-biome terrain with sea-level ocean basins and worldgen-only water
+- Class: core-capability
+- Status: active
+- Description: One seeded world generates four distinguishable biomes (plains, forest, mountains, oceans) from a single height function, with ocean basins filled with water below a named sea level, and water exists only as generating world content that is never persisted or editable.
+- Why it matters: The world must change across space as well as time, and water must stay a generating feature rather than saved world state.
+- Source: M007 / S01 terrain rewrite
+- Primary owning slice: M007/S01
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::terrain; cargo test --locked --lib -- world::block; cargo test --locked --lib -- world::manager; cargo test --locked --release --lib -- --ignored streaming_budget --nocapture
+
+### R028 — SAVE_VERSION 5 persisted calendar and the New Game season-length row
+- Class: continuity
+- Status: active
+- Description: Saves carry day_index and season_length_days in a SAVE_VERSION 5 tail with v1-v4 migration defaults (day 0, one-day seasons), the clock advances only while Playing, and New Game exposes a bounded season-length cycler.
+- Why it matters: Seasons must resume exactly across relaunch while older saves keep loading without data loss.
+- Source: M007 / S02 season clock
+- Primary owning slice: M007/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::season; cargo test --locked --lib -- world::daycycle; bash scripts/season_smoke.sh
+
+### R029 — Deliberate swim mechanics: idle sink, Jump rise, no surface lock
+- Class: core-capability
+- Status: active
+- Description: Water applies drag and gravity to an idle submerged body so it sinks away from the surface; holding Jump/Space applies a bounded rise back up, with no automatic surface lock. Water stays passable-but-never-walkable at every mobility consumer, and the body may stand only on the solid seabed (D087).
+- Why it matters: The human sensory pass rejected the old buoyant auto-float (walking onto water only wobbled at the surface; only fly mode could submerge), so crossings must be a deliberate swim: sink when idle, rise with Jump, and traverse generated oceans through the production physics seams. Mechanics only; fall damage and drowning are honestly deferred to M008.
+- Source: M007 / S03 swim physics (reworked by D087 in M007/S08-T07)
+- Primary owning slice: M007/S03
+- Supporting slices: M007/S08
+- Validation: cargo test --locked --lib -- swim; cargo test --locked --lib -- player::physics; cargo test --locked --lib -- ocean_crossing; cargo test --locked --bins -- swim
+
+### R030 — Translucent water render pass and underwater fog shift
+- Class: quality-attribute
+- Status: active
+- Description: Water surfaces render in a separate alpha-blended depth-write-off pass after opaque geometry and before overlays, and the fog palette shifts to an underwater range when the camera eye submerges.
+- Why it matters: The ocean surface must read as translucent at correct depth order while the opaque path stays untouched and fail-soft.
+- Source: M007 / S04 translucent water
+- Primary owning slice: M007/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- render::buffer; cargo test --locked --lib -- render::pipeline; bash scripts/water_smoke.sh
+
+### R031 — Seasonal worldgen surfaces and the bounded rollover wave
+- Class: core-capability
+- Status: active
+- Description: Worldgen surfaces are pure functions of position, seed, and season (winter snow blanket on land, seasonal oak leaves only: Spring/Summer canopy, Autumn shed, Winter bare over persistent trunks and branches), and a season change arrives through a bounded swap-on-arrival regeneration wave that never removes chunks or writes seasonal block edits.
+- Why it matters: Seasons must visibly change the world without a one-frame full-world remesh or persisted seasonal state, and tree lifecycles must stay believable: only leaves are seasonal, while the deterministic trunk and branch skeleton renders in every season and is never clipped at a chunk edge.
+- Source: M007 / S05 seasonal worldgen (tree lifecycle corrected by D088 in M007/S08-T08)
+- Primary owning slice: M007/S05
+- Supporting slices: M007/S08
+- Validation: cargo test --locked --lib -- world::terrain; cargo test --locked --lib -- world::manager; bash scripts/season_smoke.sh
+
+### R032 — Weather states and precipitation presentation
+- Class: quality-attribute
+- Status: active
+- Description: Pure weather derivation yields Clear, Rain, and Snowfall per season and day, with rain in warm seasons, snowfall only in winter, and matching sky, fog, and precipitation presentation that is deterministic for a given seed and identity-clean when clear.
+- Why it matters: Weather is a core sensory channel of the seasonal year and must stay a presentation derivation, never saved state or block interaction.
+- Source: M007 / S06 weather
+- Primary owning slice: M007/S06
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- render::weather; cargo test --locked --lib -- world::daycycle; cargo test --locked --bins -- weather; bash scripts/weather_smoke.sh
+
+### R033 — Deterministic surface ruins with the present-but-empty loot seam
+- Class: core-capability
+- Status: active
+- Description: Small surface ruins generate deterministically per seed on grass plains and forest columns, are cleared from spawn footprints, and expose a named loot seam that is present but deliberately empty in M007.
+- Why it matters: Structures make exploration pay off structurally, and the empty seam lets M008 add survival loot without a worldgen signature change.
+- Source: M007 / S07 surface ruins
+- Primary owning slice: M007/S07
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ruin; cargo test --locked --lib -- ruin_loot
+
+### R034 — Streaming budget proof and the M007 closure surface
+- Class: admin/support
+- Status: active
+- Description: The headless release harness proves per-frame streaming dispatch at p95 at most 8 ms and max at most 16 ms while crossing at least 32 chunks at default render distance, a bounded release run reports p95 frame time at most 16.6 ms, the real binary round-trips a mid-winter save and swims an ocean, and the registry carries the M007 rows and criterion trace with save and release notes.
+- Why it matters: Milestone closure needs measured operational evidence and a traceable capability contract, not prose claims.
+- Source: M007 / S08 closure
+- Primary owning slice: M007/S08
+- Supporting slices: M007/S01, M007/S03, M007/S05, M007/S06, M007/S07
+- Validation: cargo test --locked --release --lib -- --ignored streaming_budget --nocapture; bash scripts/swim_smoke.sh; bash scripts/winter_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -299,3 +381,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 6 | R024 | S04 | injected no-device unit proof && bash scripts/launch_smoke.sh |
 | 7 | R022 | S02, S03 | cargo test --locked --lib -- world::daycycle && vista golden-hour wiring pins |
 | 8 | R026 | S06 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && recorded human UAT |
+
+## M007 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R028, R031, R032 | S02, S05, S06 | cargo test --locked --lib -- world::terrain && cargo test --locked --lib -- world::daycycle && bash scripts/weather_smoke.sh |
+| 2 | R027 | S01 | cargo test --locked --lib -- world::terrain && cargo test --locked --lib -- world::block |
+| 3 | R029 | S03 | cargo test --locked --lib -- swim && cargo test --locked --lib -- player::physics |
+| 4 | R034 | S08 | cargo test --locked --release --lib -- --ignored streaming_budget --nocapture && bash scripts/swim_smoke.sh |
+| 5 | R028 | S02 | cargo test --locked --lib -- world::persistence && bash scripts/season_smoke.sh |
+| 6 | R033 | S07 | cargo test --locked --lib -- ruin && cargo test --locked --lib -- ruin_loot |
+| 7 | R034 | S08 | cargo test --locked --lib -- world::manager && bash scripts/winter_smoke.sh && grep -q SAVE-NOTES README.md |

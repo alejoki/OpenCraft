@@ -32,7 +32,7 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
         BlockId::CoalOre | BlockId::IronOre => Some(ToolKind::Pickaxe),
         BlockId::OakLog | BlockId::OakPlanks | BlockId::CraftingTable => Some(ToolKind::Axe),
         BlockId::Grass | BlockId::Dirt | BlockId::Sand | BlockId::Snow => Some(ToolKind::Shovel),
-        BlockId::Air | BlockId::OakLeaves | BlockId::Bedrock => None,
+        BlockId::Air | BlockId::OakLeaves | BlockId::Bedrock | BlockId::Water => None,
     }
 }
 
@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use crate::player::inventory::{ItemId, Material};
 
-    const ALL_BLOCKS: [BlockId; 15] = [
+    const ALL_BLOCKS: [BlockId; 16] = [
         BlockId::Air,
         BlockId::Grass,
         BlockId::Dirt,
@@ -86,6 +86,7 @@ mod tests {
         BlockId::CoalOre,
         BlockId::IronOre,
         BlockId::CraftingTable,
+        BlockId::Water,
     ];
 
     const ALL_KINDS: [ToolKind; 3] = [ToolKind::Pickaxe, ToolKind::Axe, ToolKind::Shovel];
@@ -107,7 +108,7 @@ mod tests {
         for block in ALL_BLOCKS {
             let class = block_tool_class(block);
             match block {
-                BlockId::Air | BlockId::Bedrock | BlockId::OakLeaves => {
+                BlockId::Air | BlockId::Bedrock | BlockId::OakLeaves | BlockId::Water => {
                     assert_eq!(class, None, "{block:?} must not be accelerated by a tool");
                 }
                 _ => assert!(class.is_some(), "{block:?} must belong to a tool class"),
@@ -143,7 +144,7 @@ mod tests {
 
     #[test]
     fn unbreakable_blocks_return_no_duration_for_any_selection() {
-        for block in [BlockId::Air, BlockId::Bedrock] {
+        for block in [BlockId::Air, BlockId::Bedrock, BlockId::Water] {
             assert_eq!(break_duration(block, None), None);
             for kind in ALL_KINDS {
                 for tier in ALL_TIERS {

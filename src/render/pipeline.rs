@@ -5,14 +5,16 @@ use wgpu::util::DeviceExt;
 use crate::mesh::quad::PackedQuad;
 use crate::player::camera::{visible_face_mask, Camera, Frustum};
 use crate::player::inventory::HOTBAR_SLOTS;
-use crate::render::buffer::ChunkRenderStore;
+use crate::render::buffer::{ChunkRenderStore, QUAD_VERTICES};
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::sky;
 use crate::render::texture::{
     block_layers_match_shape, create_block_texture_array, upload_block_layers,
 };
+use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::daycycle;
+use crate::world::season::Weather;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -44,6 +46,98 @@ pub struct SkyParams {
     /// Game time in day-cycle ticks (`0..DAY_TICKS`), the input the pure
     /// [`daycycle`] helpers turn into sun/moon/star placement.
     pub time_of_day: u32,
+    /// True when the camera's eye is inside a liquid block. The world pass
+    /// then swaps the palette fog for the fixed deep-water shift below. This
+    /// is a plain flag so `SkyParams` stays `Copy` and `render_frame`'s
+    /// signature does not grow.
+    pub underwater: bool,
+    /// The day's weather, derived purely from the persisted calendar. It
+    /// selects the precipitation pattern in [`weather::WeatherUniform`] and
+    /// gates the precip *draw* (never a pass). `Clear` disables that draw and
+    /// is the identity everywhere else.
+    pub weather: Weather,
+    /// Rust-side multiplier applied to the fog start/end range
+    /// ([`daycycle::weather_fog_range_factor`]). Exactly `1.0` for Clear, so
+    /// the dry path stays byte-identical; precipitation pulls fog closer.
+    /// Submersion takes precedence and ignores this factor entirely.
+    pub fog_range_factor: f32,
+    /// Continuous day-cycle phase from [`daycycle::GameClock::cycle_phase`]
+    /// (game time, never wall clock) that drives the fall animation.
+    pub weather_phase: f32,
+}
+
+/// Deep-water fog color while the camera's eye is submerged. Uses the same
+/// sRGB-value convention as [`daycycle::SkyPalette::fog_color`] (plain 0..1
+/// channel values written straight into the camera uniform), just darker and
+/// bluer than any palette keyframe.
+pub const UNDERWATER_FOG_COLOR: [f32; 4] = [0.05, 0.18, 0.32, 1.0];
+/// Fog start distance (blocks) while submerged: visibility collapses fast.
+pub const UNDERWATER_FOG_START: f32 = 8.0;
+/// Fog end distance (blocks) while submerged.
+pub const UNDERWATER_FOG_END: f32 = 48.0;
+
+/// Effective world-pass fog as `(color, start, end)`.
+///
+/// Submersion swaps the palette fog color and the render-distance-derived
+/// range for the fixed deep-water shift; above water the caller's values pass
+/// through untouched, so the dry path stays byte-identical. Pure so headless
+/// tests can pin both branches without a `wgpu::Device`.
+pub fn effective_fog(
+    underwater: bool,
+    fog_color: [f32; 4],
+    fog_start: f32,
+    fog_end: f32,
+    fog_range_factor: f32,
+) -> ([f32; 4], f32, f32) {
+    if underwater {
+        // Submersion is a fixed deep-water shift and takes precedence: the
+        // weather factor never overrides it.
+        (
+            UNDERWATER_FOG_COLOR,
+            UNDERWATER_FOG_START,
+            UNDERWATER_FOG_END,
+        )
+    } else {
+        // Weather only compresses the range, so the factor is clamped to
+        // `0.0..=1.0`; a non-finite input falls back to the identity. A factor
+        // of exactly `1.0` returns the caller's values bit-for-bit
+        // (`x * 1.0 == x`), keeping Clear weather byte-identical.
+        let factor = if fog_range_factor.is_finite() {
+            fog_range_factor.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        (fog_color, fog_start * factor, fog_end * factor)
+    }
+}
+
+/// True when the precipitation *draw* should be recorded for this frame.
+///
+/// The precipitation stage is fail-soft by construction: an absent stage
+/// (`None`, e.g. a future headless/limited renderer) or Clear weather skips
+/// the draw, leaving the opaque world, water and overlay rendering exactly as
+/// before. Skipping this draw is the only weather-conditional path in
+/// `render_frame` — no render pass is ever conditional on weather.
+///
+/// `stage_present` is passed explicitly (rather than `&self`) so the decision
+/// stays pure and testable without a `wgpu::Device`.
+pub fn weather_draw_visible(weather: Weather, stage_present: bool) -> bool {
+    stage_present && !matches!(weather, Weather::Clear)
+}
+
+/// GPU resources for the precipitation stage, built once at renderer
+/// construction.
+///
+/// Weather owns a static fixed-seed vertex buffer (both the rain and snowfall
+/// segments), one 32-byte per-frame uniform, and an alpha-blended,
+/// depth-write-disabled pipeline. Holding the whole stage in one `Option`
+/// makes the fail-soft contract explicit: no stage means no draw.
+struct WeatherStage {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
 }
 
 #[repr(C)]
@@ -51,6 +145,23 @@ pub struct SkyParams {
 pub struct OverlayVertex {
     pub clip_pos: [f32; 4],
     pub color: [f32; 4],
+}
+
+/// Vertex layout shared by the opaque voxel and translucent water pipelines:
+/// one [`PackedQuad`] (two `u32` words) per instance. Keeping it in one place
+/// makes it impossible for the water pass to drift from the opaque decode.
+const PACKED_QUAD_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+    offset: 0,
+    shader_location: 0,
+    format: wgpu::VertexFormat::Uint32x2,
+}];
+
+fn packed_quad_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PackedQuad>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &PACKED_QUAD_ATTRIBUTES,
+    }
 }
 
 const VOXEL_SHADER_WGSL: &str = r#"
@@ -220,6 +331,184 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fog_t = clamp((in.cam_dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
     let final_rgb = mix(lit_rgb, camera.fog_color.rgb, fog_t * fog_t);
     return vec4<f32>(final_rgb, 1.0);
+}
+"#;
+
+/// Translucent water shader.
+///
+/// The vertex stage is a copy of the voxel `vs_main` PackedQuad decode (same
+/// bitfields, same analytic planar backface cull, same day factor carried in
+/// `fog_start_end.z`) so water geometry lands exactly where the opaque mesher
+/// put it. The fragment stage is deliberately texture-free: it outputs a
+/// procedural deep-blue RGBA and never samples the block texture array
+/// (MEM230 shader-colored water; MEM232 all 16 layers are consumed, no 17th
+/// layer). The water quads carry placeholder tex layer 0 (Grass Top) purely
+/// because the packed format requires a byte — it must never be sampled.
+///
+/// Only `group(0) binding(0)` (camera) and `group(1) binding(0)` (chunk
+/// origin) are declared. The pipeline layout still carries the camera bind
+/// group's texture/sampler entries, which is legal for undeclared bindings
+/// (same precedent as `sky::create_sky_pipeline`).
+const WATER_SHADER_WGSL: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_start_end: vec4<f32>,
+};
+
+struct ChunkUniform {
+    origin: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(1) @binding(0) var<uniform> chunk: ChunkUniform;
+
+struct VertexOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) light: f32,
+    @location(1) cam_dist: f32,
+};
+
+fn face_normal(face_dir: u32) -> vec3<f32> {
+    switch face_dir {
+        case 0u: { return vec3<f32>(1.0, 0.0, 0.0); }
+        case 1u: { return vec3<f32>(-1.0, 0.0, 0.0); }
+        case 2u: { return vec3<f32>(0.0, 1.0, 0.0); }
+        case 3u: { return vec3<f32>(0.0, -1.0, 0.0); }
+        case 4u: { return vec3<f32>(0.0, 0.0, 1.0); }
+        default: { return vec3<f32>(0.0, 0.0, -1.0); }
+    }
+}
+
+fn face_sun_factor(face_dir: u32) -> f32 {
+    switch face_dir {
+        case 2u: { return 1.0; }
+        case 0u, 1u: { return 0.82; }
+        case 4u, 5u: { return 0.70; }
+        default: { return 0.50; }
+    }
+}
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vid: u32,
+    @location(0) quad_words: vec2<u32>,
+) -> VertexOutput {
+    let w0 = quad_words.x;
+    let w1 = quad_words.y;
+
+    let qx = f32(w0 & 31u);
+    let qy = f32((w0 >> 5u) & 31u);
+    let qz = f32((w0 >> 10u) & 31u);
+    let qw = f32(((w0 >> 15u) & 31u) + 1u);
+    let qh = f32(((w0 >> 20u) & 31u) + 1u);
+    let face_dir = (w0 >> 25u) & 7u;
+
+    // `w1`'s low byte is the placeholder tex layer; water never reads it.
+    let ao_packed = (w1 >> 8u) & 255u;
+    let light_packed = (w1 >> 16u) & 0xFFFFu;
+
+    let ao00 = ao_packed & 3u;
+    let ao10 = (ao_packed >> 2u) & 3u;
+    let ao01 = (ao_packed >> 4u) & 3u;
+    let ao11 = (ao_packed >> 6u) & 3u;
+
+    let l00 = light_packed & 15u;
+    let l10 = (light_packed >> 4u) & 15u;
+    let l01 = (light_packed >> 8u) & 15u;
+    let l11 = (light_packed >> 12u) & 15u;
+
+    let flip_diag = (ao00 + ao11) > (ao10 + ao01);
+    var corner: u32 = 0u;
+    if !flip_diag {
+        switch vid {
+            case 0u: { corner = 0u; }
+            case 1u: { corner = 1u; }
+            case 2u: { corner = 2u; }
+            case 3u: { corner = 2u; }
+            case 4u: { corner = 1u; }
+            default: { corner = 3u; }
+        }
+    } else {
+        switch vid {
+            case 0u: { corner = 0u; }
+            case 1u: { corner = 1u; }
+            case 2u: { corner = 3u; }
+            case 3u: { corner = 0u; }
+            case 4u: { corner = 3u; }
+            default: { corner = 2u; }
+        }
+    }
+
+    let u_bit = f32(corner & 1u);
+    let v_bit = f32((corner >> 1u) & 1u);
+    let u_off = u_bit * qw;
+    let v_off = v_bit * qh;
+    let d_off = select(0.0, 1.0, (face_dir & 1u) == 0u);
+
+    var local_pos: vec3<f32>;
+    let axis = face_dir >> 1u;
+    if axis == 0u {
+        local_pos = vec3<f32>(qx + d_off, qy + v_off, qz + u_off);
+    } else if axis == 1u {
+        local_pos = vec3<f32>(qx + u_off, qy + d_off, qz + v_off);
+    } else {
+        local_pos = vec3<f32>(qx + u_off, qy + v_off, qz + d_off);
+    }
+
+    let world_pos = chunk.origin.xyz + local_pos;
+    let normal = face_normal(face_dir);
+
+    var out: VertexOutput;
+    // Same exact planar backface check as the opaque shader: hardware culling
+    // stays off and a quad is rejected when the camera is on/behind its plane.
+    if dot(world_pos - camera.camera_pos.xyz, normal) >= 0.0 {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 0.0);
+        out.light = 0.0;
+        out.cam_dist = 0.0;
+        return out;
+    }
+
+    var ao_val: u32 = ao00;
+    var light_val: u32 = l00;
+    if corner == 1u {
+        ao_val = ao10;
+        light_val = l10;
+    } else if corner == 2u {
+        ao_val = ao01;
+        light_val = l01;
+    } else if corner == 3u {
+        ao_val = ao11;
+        light_val = l11;
+    }
+    let ao_factor = 0.45 + (f32(ao_val) / 3.0) * 0.55;
+    let light_factor = f32(light_val) / 15.0;
+
+    // Day factor rides in the unused fog_start_end.z slot (see the opaque
+    // shader); water dims at night with the rest of the world.
+    let day_factor = camera.fog_start_end.z;
+    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.light = face_sun_factor(face_dir) * ao_factor * light_factor * day_factor;
+    out.cam_dist = distance(world_pos, camera.camera_pos.xyz);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Procedural deep-blue water, no texture sample (MEM230/MEM232). The
+    // `light` term already includes the day factor from the vertex stage.
+    let base = vec4<f32>(0.15, 0.35, 0.70, 0.65);
+    let water_rgb = base.rgb * in.light;
+    let fog_start = camera.fog_start_end.x;
+    let fog_end = camera.fog_start_end.y;
+    let fog_t = clamp((in.cam_dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
+    let fog = fog_t * fog_t;
+    let final_rgb = mix(water_rgb, camera.fog_color.rgb, fog);
+    // Fade the translucent surface out with distance too, so far water cannot
+    // sit as a fixed 65%-opaque sheet over the fogged horizon.
+    let final_alpha = base.a * (1.0 - fog);
+    return vec4<f32>(final_rgb, final_alpha);
 }
 "#;
 
@@ -406,6 +695,9 @@ pub struct VoxelRenderer {
     /// bind group above stay valid because only the contents change.
     pub block_texture: wgpu::Texture,
     pub voxel_pipeline: wgpu::RenderPipeline,
+    /// Alpha-blended, depth-write-disabled pipeline for `ChunkMesh::water_quads`.
+    /// Drawn inside the main pass strictly after the opaque chunk loop.
+    pub water_pipeline: wgpu::RenderPipeline,
     pub overlay_pipeline: wgpu::RenderPipeline,
     /// Color-only sky pass pipeline (sun/moon/star billboards).
     pub sky_pipeline: wgpu::RenderPipeline,
@@ -418,6 +710,10 @@ pub struct VoxelRenderer {
     /// Static sun/moon/star billboard vertices, uploaded once at construction.
     pub sky_vertex_buffer: wgpu::Buffer,
     pub sky_vertex_count: u32,
+    /// Precipitation stage (static fixed-seed billboard buffer, 32-byte
+    /// per-frame uniform, alpha-blended pipeline). `Option` makes the
+    /// fail-soft contract explicit: `None` simply skips the precip draw.
+    weather_stage: Option<WeatherStage>,
 }
 
 impl VoxelRenderer {
@@ -521,6 +817,26 @@ impl VoxelRenderer {
         let (sky_vertex_buffer, sky_vertex_count) =
             sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
 
+        // Precipitation stage (M007/S06): static camera-relative rain and
+        // snowfall billboards plus one 32-byte per-frame uniform. Built from
+        // the weather.rs factories, exactly like the sky stage above; the
+        // stage is drawn inside the existing main pass, so no new pass and no
+        // CameraUniform layout change.
+        let weather_bgl = weather::create_weather_bind_group_layout(&ctx.device);
+        let weather_uniform_buffer = weather::create_weather_uniform_buffer(&ctx.device);
+        let weather_bind_group =
+            weather::create_weather_bind_group(&ctx.device, &weather_bgl, &weather_uniform_buffer);
+        let weather_pipeline = weather::create_weather_pipeline(ctx, &camera_bgl, &weather_bgl);
+        let (weather_vertex_buffer, weather_vertex_count) =
+            weather::create_weather_vertex_buffer(&ctx.device);
+        let weather_stage = Some(WeatherStage {
+            pipeline: weather_pipeline,
+            uniform_buffer: weather_uniform_buffer,
+            bind_group: weather_bind_group,
+            vertex_buffer: weather_vertex_buffer,
+            vertex_count: weather_vertex_count,
+        });
+
         let voxel_shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -544,15 +860,7 @@ impl VoxelRenderer {
                 vertex: wgpu::VertexState {
                     module: &voxel_shader,
                     entry_point: "vs_main",
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<PackedQuad>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Uint32x2,
-                        }],
-                    }],
+                    buffers: &[packed_quad_vertex_layout()],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &voxel_shader,
@@ -571,6 +879,55 @@ impl VoxelRenderer {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
+        // Water pass: same PackedQuad vertex layout as the opaque pipeline but
+        // alpha-blended with depth writes disabled, so translucent water is
+        // occluded by opaque geometry (shared depth buffer, LessEqual) without
+        // ever occluding what is drawn after it. The pipeline layout is the
+        // voxel layout: the shader declares only group 0 binding 0 and group 1
+        // binding 0, while the layout may carry the camera bind group's
+        // texture/sampler entries it never uses (sky.rs precedent).
+        let water_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("water_shader"),
+                source: wgpu::ShaderSource::Wgsl(WATER_SHADER_WGSL.into()),
+            });
+
+        let water_pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("water_pipeline"),
+                layout: Some(&voxel_layout),
+                vertex: wgpu::VertexState {
+                    module: &water_shader,
+                    entry_point: "vs_main",
+                    buffers: &[packed_quad_vertex_layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &water_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: ctx.config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None, // analytic planar backface cull in vs_main
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
                     depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -646,6 +1003,7 @@ impl VoxelRenderer {
         Self {
             block_texture,
             voxel_pipeline,
+            water_pipeline,
             overlay_pipeline,
             sky_pipeline,
             camera_buffer,
@@ -655,6 +1013,7 @@ impl VoxelRenderer {
             sky_bind_group,
             sky_vertex_buffer,
             sky_vertex_count,
+            weather_stage,
         }
     }
 
@@ -701,11 +1060,21 @@ impl VoxelRenderer {
         let frustum = Frustum::from_view_proj(&vp);
 
         let max_dist = (render_distance * CHUNK_SIZE as i32) as f32;
+        // Submersion swaps the palette fog color and the render-distance range
+        // for the fixed deep-water shift. Only values change; the 112-byte
+        // CameraUniform layout (and day_factor in fog_start_end.z) is intact.
+        let (fog_color, fog_start, fog_end) = effective_fog(
+            sky.underwater,
+            sky.fog_color,
+            max_dist * 0.65,
+            max_dist,
+            sky.fog_range_factor,
+        );
         let cam_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 1.0],
-            fog_color: sky.fog_color,
-            fog_start_end: [max_dist * 0.65, max_dist, sky.day_factor, 0.0],
+            fog_color,
+            fog_start_end: [fog_start, fog_end, sky.day_factor, 0.0],
         };
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
@@ -771,6 +1140,25 @@ impl VoxelRenderer {
             sky_rpass.draw(0..self.sky_vertex_count, 0..1);
         }
 
+        // Precipitation is the only weather-conditional path, and it is a
+        // *draw*, never a pass. Derive the draw range and write the 32-byte
+        // per-frame uniform only when something will actually be drawn: an
+        // absent stage, an empty static buffer, or Clear weather all skip
+        // both. `weather_vertex_range` selects the live pattern segment
+        // (rain first, snowfall second) so the inactive half is never
+        // processed. Queue writes are ordered ahead of the submit below.
+        let weather_draw = self.weather_stage.as_ref().and_then(|stage| {
+            if stage.vertex_count == 0 {
+                return None;
+            }
+            weather::weather_vertex_range(sky.weather).map(|range| (stage, range))
+        });
+        if let Some((stage, _)) = weather_draw {
+            let uniform = weather::WeatherUniform::from_weather(sky.weather, sky.weather_phase);
+            ctx.queue
+                .write_buffer(&stage.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -829,6 +1217,62 @@ impl VoxelRenderer {
                         }
                     }
                 }
+            }
+
+            // Translucent water stage: strictly AFTER the opaque chunk loop
+            // (so the depth buffer written there occludes water behind
+            // terrain) and BEFORE the overlay block (so the crosshair and
+            // hotbar draw on top). The pipeline writes no depth, so water can
+            // never occlude anything drawn later. Same frustum + face-mask
+            // gating as the opaque loop; chunks without water are skipped
+            // entirely, which makes an absent water stage a no-op. Direct
+            // statements, no closures: wgpu 0.19 RenderPass lifetimes (MEM032).
+            rpass.set_pipeline(&self.water_pipeline);
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for gpu_chunk in store.chunks.values() {
+                let Some(water_buffer) = gpu_chunk.water_vertex_buffer.as_ref() else {
+                    continue;
+                };
+                if gpu_chunk.water_quad_count == 0 {
+                    continue;
+                }
+
+                let min = Vec3::new(
+                    gpu_chunk.pos.x as f32 * cs,
+                    gpu_chunk.pos.y as f32 * cs,
+                    gpu_chunk.pos.z as f32 * cs,
+                );
+                let max = min + Vec3::splat(cs);
+
+                if !frustum.intersects_aabb(min, max) {
+                    continue;
+                }
+
+                let face_mask = visible_face_mask(camera.position, min, max);
+                if face_mask == 0 {
+                    continue;
+                }
+
+                rpass.set_bind_group(1, &gpu_chunk.bind_group, &[]);
+                rpass.set_vertex_buffer(0, water_buffer.slice(..));
+                // Six vertices per instance (PackedQuad step mode), one
+                // instance per water quad in the contiguous water buffer.
+                rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.water_quad_count as u32);
+            }
+
+            // Precipitation stage: strictly AFTER the water loop (rain and
+            // snowfall render over the liquid surface, and the box never reads
+            // blocks) and BEFORE the overlay (the selection wireframe,
+            // crosshair and hotbar stay crisp on top). The pipeline writes no
+            // depth, so drops never occlude later draws. `weather_draw` is
+            // `None` for Clear weather or an absent/empty stage — the draw is
+            // skipped, not the pass.
+            if let Some((stage, (base_vertex, vertex_count))) = weather_draw {
+                rpass.set_pipeline(&stage.pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                rpass.set_bind_group(1, &stage.bind_group, &[]);
+                rpass.set_vertex_buffer(0, stage.vertex_buffer.slice(..));
+                rpass.draw(base_vertex..base_vertex + vertex_count, 0..1);
             }
 
             if !overlay_verts.is_empty() {
@@ -932,9 +1376,17 @@ mod tests {
                 a: 1.0,
             },
             time_of_day: 18_000,
+            underwater: false,
+            weather: Weather::Rain,
+            fog_range_factor: 0.75,
+            weather_phase: 12_000.0,
         };
         assert_eq!(params.time_of_day, 18_000);
         assert_eq!(params.day_factor, 0.35);
+        assert!(!params.underwater);
+        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.fog_range_factor, 0.75);
+        assert_eq!(params.weather_phase, 12_000.0);
 
         // Midnight: moon up, stars out, sun below the horizon.
         let uniform = sky::SkyUniform::from_time(params.time_of_day);
@@ -945,18 +1397,314 @@ mod tests {
     }
 
     #[test]
-    fn vista_sky_params_use_the_pinned_golden_hour() {
-        // Source pin: the vista arm must pass VISTA_GOLDEN_HOUR (S02's single
-        // home for the constant) rather than the world clock, and the session
-        // arm must pass the live clock. Both go through `sky_params`.
-        let src = include_str!("../main.rs");
+    fn underwater_fog_shift_round_trips_and_keeps_the_dry_path_identical() {
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        let dry = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
+        assert_eq!(dry.0, palette_fog, "dry fog color passes through");
+        assert_eq!((dry.1, dry.2), (300.0, 512.0), "dry range is untouched");
+
+        let wet = effective_fog(true, palette_fog, 300.0, 512.0, 0.75);
+        assert_eq!(wet.0, UNDERWATER_FOG_COLOR);
+        assert_eq!((wet.1, wet.2), (UNDERWATER_FOG_START, UNDERWATER_FOG_END));
         assert!(
-            src.contains("sky_params(palette, daycycle::VISTA_GOLDEN_HOUR)"),
-            "vista frames must pin the sky time to golden hour"
+            wet.1 < wet.2 && UNDERWATER_FOG_START < 300.0,
+            "submersion pulls fog in much closer than the render distance"
+        );
+        // Same sRGB-value convention as palette.fog_color: plain 0..1 channel
+        // values, blue-dominant and darker than daytime air fog.
+        assert!(wet.0[2] > wet.0[0] && wet.0[2] > wet.0[1]);
+        assert!(wet.0[0] >= 0.0 && wet.0[2] <= 1.0 && wet.0[3] == 1.0);
+
+        // SkyParams stays Copy so render_frame keeps its flat 10-arg signature.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<SkyParams>();
+        let params = SkyParams {
+            day_factor: 1.0,
+            fog_color: palette_fog,
+            clear_color: wgpu::Color::BLACK,
+            time_of_day: 6_000,
+            underwater: true,
+            weather: Weather::Clear,
+            fog_range_factor: daycycle::weather_fog_range_factor(Weather::Clear),
+            weather_phase: 0.0,
+        };
+        assert!(params.underwater);
+    }
+
+    #[test]
+    fn clear_weather_fog_factor_is_the_identity() {
+        // Clear is pinned to exactly 1.0 in daycycle, and `x * 1.0 == x`, so
+        // the dry path must remain bit-identical.
+        assert_eq!(daycycle::weather_fog_range_factor(Weather::Clear), 1.0);
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
+        assert_eq!(color, palette_fog);
+        assert_eq!((start, end), (300.0, 512.0));
+    }
+
+    #[test]
+    fn rain_and_snow_fog_factors_shrink_the_range() {
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        for weather in [Weather::Rain, Weather::Snowfall] {
+            let factor = daycycle::weather_fog_range_factor(weather);
+            let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, factor);
+            assert_eq!(color, palette_fog, "weather never recolors fog here");
+            assert_eq!(start, 300.0 * factor);
+            assert_eq!(end, 512.0 * factor);
+            assert!(
+                start < 300.0 && end < 512.0,
+                "{weather:?} must compress the fog range"
+            );
+            assert!(start < end, "compressed range must stay ordered");
+        }
+        assert!(
+            daycycle::weather_fog_range_factor(Weather::Rain)
+                < daycycle::weather_fog_range_factor(Weather::Snowfall),
+            "rain is the more enclosing state"
+        );
+    }
+
+    #[test]
+    fn underwater_fog_precedence_ignores_the_weather_factor() {
+        // Submersion is a fixed deep-water shift: it wins over any weather
+        // factor, including a malformed one.
+        for factor in [0.0, 0.75, 1.0, f32::NAN, -3.0] {
+            let (color, start, end) =
+                effective_fog(true, [0.53, 0.76, 0.96, 1.0], 300.0, 512.0, factor);
+            assert_eq!(color, UNDERWATER_FOG_COLOR);
+            assert_eq!((start, end), (UNDERWATER_FOG_START, UNDERWATER_FOG_END));
+        }
+    }
+
+    #[test]
+    fn malformed_fog_factors_cannot_invert_or_explode_the_range() {
+        // Non-finite falls back to the identity; out-of-range values are
+        // clamped to compression only (fog may get closer, never further).
+        let palette_fog = [0.53, 0.76, 0.96, 1.0];
+        assert_eq!(
+            effective_fog(false, palette_fog, 300.0, 512.0, f32::NAN),
+            (palette_fog, 300.0, 512.0)
+        );
+        assert_eq!(
+            effective_fog(false, palette_fog, 300.0, 512.0, f32::INFINITY),
+            (palette_fog, 300.0, 512.0)
+        );
+        let (_, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 4.0);
+        assert_eq!((start, end), (300.0, 512.0), "factor > 1 cannot expand");
+        let (_, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, -2.0);
+        assert_eq!((start, end), (0.0, 0.0), "negative clamps to zero");
+    }
+
+    #[test]
+    fn weather_draw_gating_table() {
+        // Clear never draws; both precip states draw only with a stage.
+        assert!(!weather_draw_visible(Weather::Clear, false));
+        assert!(!weather_draw_visible(Weather::Clear, true));
+        for weather in [Weather::Rain, Weather::Snowfall] {
+            assert!(
+                weather_draw_visible(weather, true),
+                "{weather:?} with a stage must draw"
+            );
+            assert!(
+                !weather_draw_visible(weather, false),
+                "{weather:?} without a stage must skip the draw"
+            );
+        }
+        // The stage's static buffer is authoritative about which segment to
+        // draw; Clear yields no range at all.
+        assert_eq!(weather::weather_vertex_range(Weather::Clear), None);
+    }
+
+    #[test]
+    fn weather_draw_sits_between_the_water_loop_and_the_overlay() {
+        // Source pin on main_pass stage order: opaque -> water -> precip ->
+        // overlay. The precip block must draw the selected segment range,
+        // bind the stage uniform, and be guarded by `weather_draw` (which is
+        // None for Clear or an absent/empty stage) rather than conditioning a
+        // pass.
+        let src = include_str!("pipeline.rs");
+        let water_at = src
+            .find("set_pipeline(&self.water_pipeline)")
+            .expect("water draw exists");
+        let weather_at = src
+            .find("set_pipeline(&stage.pipeline)")
+            .expect("weather draw exists");
+        let overlay_at = src
+            .find("set_pipeline(&self.overlay_pipeline)")
+            .expect("overlay draw exists");
+        assert!(
+            water_at < weather_at && weather_at < overlay_at,
+            "stage order must be water draw -> precip draw -> overlay"
+        );
+
+        let weather_block = &src[weather_at..overlay_at];
+        assert!(weather_block.contains("base_vertex..base_vertex + vertex_count"));
+        assert!(weather_block.contains("stage.bind_group"));
+        assert!(weather_block.contains("stage.vertex_buffer"));
+        assert!(
+            src[..weather_at].contains("if stage.vertex_count == 0"),
+            "an empty static buffer must skip the draw, not record an empty one"
         );
         assert!(
-            src.contains("sky_params(palette, self.session.clock.time_of_day)"),
-            "session frames must follow the live clock"
+            src[..weather_at]
+                .contains("if let Some((stage, (base_vertex, vertex_count))) = weather_draw"),
+            "the precip draw must be guarded by the pure weather gating decision"
+        );
+
+        // The per-frame uniform write is guarded too: no write for Clear or an
+        // absent/empty stage. It lands once per frame, before the main pass.
+        let write_at = src
+            .find("write_buffer(&stage.uniform_buffer")
+            .expect("weather uniform write exists");
+        assert!(write_at < weather_at, "write the uniform before the draw");
+        let main_at = src
+            .find("label: Some(\"main_pass\")")
+            .expect("main pass exists");
+        assert!(
+            write_at < main_at,
+            "the uniform write belongs before the main pass opens"
+        );
+        assert!(src[..write_at].contains("weather_draw"));
+    }
+
+    #[test]
+    fn water_shader_ignores_the_block_texture_and_tex_layer() {
+        // MEM230/MEM232: water is shader-colored. The packed quads carry a
+        // placeholder layer 0 (Grass Top) only because the format has a byte
+        // for it, so the water shader must never sample the block array.
+        assert!(
+            WATER_SHADER_WGSL.contains("vec4<f32>(0.15, 0.35, 0.70, 0.65)"),
+            "water fragment output must be the procedural deep-blue RGBA"
+        );
+        assert!(
+            !WATER_SHADER_WGSL.contains("textureSample")
+                && !WATER_SHADER_WGSL.contains("block_tex")
+                && !WATER_SHADER_WGSL.contains("tex_layer"),
+            "water must not sample the block texture array or read a layer"
+        );
+        // Only group 0 binding 0 (camera) and group 1 binding 0 (chunk origin)
+        // are declared; the pipeline layout may carry unused camera entries.
+        assert!(!WATER_SHADER_WGSL.contains("@binding(1)"));
+        assert!(!WATER_SHADER_WGSL.contains("@binding(2)"));
+
+        // The vertex stage is the voxel decode: same day factor source, same
+        // analytic planar backface cull, same fog formula in the fragment.
+        assert!(WATER_SHADER_WGSL.contains("let day_factor = camera.fog_start_end.z;"));
+        assert!(WATER_SHADER_WGSL.contains("dot(world_pos - camera.camera_pos.xyz, normal) >= 0.0"));
+        assert!(WATER_SHADER_WGSL.contains("let fog_start = camera.fog_start_end.x;"));
+        assert!(WATER_SHADER_WGSL.contains("let fog_end = camera.fog_start_end.y;"));
+    }
+
+    #[test]
+    fn water_pipeline_is_alpha_blended_and_does_not_write_depth() {
+        // Source pin on the water pipeline descriptor: translucent blending,
+        // no depth writes (water never occludes later draws), and LessEqual
+        // against the opaque depth buffer (terrain occludes water).
+        let src = include_str!("pipeline.rs");
+        let water_at = src
+            .find("label: Some(\"water_pipeline\")")
+            .expect("water pipeline exists");
+        let overlay_shader_at = src
+            .find("label: Some(\"overlay_shader\")")
+            .expect("overlay shader follows the water pipeline");
+        assert!(water_at < overlay_shader_at);
+        let water_block = &src[water_at..overlay_shader_at];
+        assert!(
+            water_block.contains("blend: Some(wgpu::BlendState::ALPHA_BLENDING)"),
+            "water must blend translucently"
+        );
+        assert!(
+            water_block.contains("depth_write_enabled: false"),
+            "water must not write depth"
+        );
+        assert!(water_block.contains("depth_compare: wgpu::CompareFunction::LessEqual"));
+        assert!(
+            water_block.contains("packed_quad_vertex_layout()"),
+            "water must share the opaque PackedQuad vertex layout"
+        );
+    }
+
+    #[test]
+    fn water_draw_sits_after_the_opaque_loop_and_before_the_overlay() {
+        // Source pin on main_pass stage order: the opaque chunk loop writes the
+        // depth buffer first, the translucent water draw consumes it second,
+        // and the overlay lines draw last. The water block must reuse the same
+        // frustum + face-mask gating and skip absent/empty water buffers.
+        let src = include_str!("pipeline.rs");
+        let opaque_loop_at = src
+            .find("for gpu_chunk in store.chunks.values()")
+            .expect("opaque chunk loop exists");
+        let water_draw_at = src
+            .find("set_pipeline(&self.water_pipeline)")
+            .expect("water draw exists");
+        let overlay_draw_at = src
+            .find("set_pipeline(&self.overlay_pipeline)")
+            .expect("overlay draw exists");
+        assert!(
+            opaque_loop_at < water_draw_at && water_draw_at < overlay_draw_at,
+            "stage order must be opaque loop -> water draw -> overlay"
+        );
+
+        let water_block = &src[water_draw_at..overlay_draw_at];
+        assert!(water_block.contains("water_vertex_buffer"));
+        assert!(water_block.contains("water_quad_count"));
+        assert!(water_block.contains("frustum.intersects_aabb"));
+        assert!(water_block.contains("visible_face_mask"));
+        assert!(water_block.contains("QUAD_VERTICES"));
+        assert!(
+            water_block.contains("continue"),
+            "absent or empty water buffers must be skipped, not drawn"
+        );
+    }
+
+    #[test]
+    fn main_pass_still_loads_color_and_the_water_stage_never_clears() {
+        let src = include_str!("pipeline.rs");
+        let main_at = src
+            .find("label: Some(\"main_pass\")")
+            .expect("main pass exists");
+        let ui_at = src
+            .find("label: Some(\"ui_pass\")")
+            .expect("ui pass exists");
+        let main_block = &src[main_at..ui_at];
+        assert!(
+            main_block.contains("load: wgpu::LoadOp::Load,"),
+            "the world pass must keep loading the sky pass output"
+        );
+        assert!(
+            !main_block.contains("LoadOp::Clear(sky.clear_color)"),
+            "no stage inside main_pass may clear the color target"
+        );
+    }
+
+    #[test]
+    fn vista_sky_params_use_the_pinned_golden_hour() {
+        // Source pin: the vista arm must go through `vista_sky_params`
+        // (VISTA_GOLDEN_HOUR's single home for the constant) rather than the
+        // world clock, and the session arm must pass the live clock plus the
+        // per-frame weather derivation. The vista arm pins weather Clear and
+        // the identity fog factor inside the helper, so the panorama is
+        // byte-identical to pre-S06 output and never draws precipitation.
+        let src = include_str!("../main.rs");
+        assert!(
+            src.contains("vista_sky_params(palette)"),
+            "vista frames must pin the sky time to golden hour and stay dry"
+        );
+        assert!(
+            src.contains("let weather = session_weather(&self.session);"),
+            "session frames must derive weather per frame from the calendar"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "the session arm must exercise the empty ambient-audio seam"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the weather phase must follow the live game clock"
+        );
+        assert!(
+            src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),
+            "the session arm must derive the flag from the live eye position"
         );
     }
 

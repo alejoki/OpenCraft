@@ -5,16 +5,29 @@
 //! screen discriminator so all of it is headless-testable. Rendering, world
 //! ownership, and streaming stay in the application layer (D008 layering).
 
+use std::sync::OnceLock;
+
 use glam::Vec3;
 
 use crate::player::camera::Camera;
 use crate::ui::lifecycle::{LifecycleScreen, SettingsCaller};
+use crate::world::season::Season;
+use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
 /// Fixed seed for the vista demo world.
 ///
 /// Deliberately stable rather than random: every launch must show the same
 /// terrain, so the vista is reproducible and its camera anchor is meaningful.
 pub const VISTA_SEED: u32 = 0x5EED_4A11;
+
+/// Season the menu panorama always renders in.
+///
+/// Pinned to the blanket-absent baseline rather than derived from the live
+/// clock: the vista is a fixed demo world, so the menu must look identical
+/// across real-time years and across saves. Never replace this with a
+/// clock-derived value -- a season-keyed world manager would then reshuffle the
+/// background on every menu visit.
+pub const VISTA_SEASON: Season = Season::Summer;
 
 /// Slow linear yaw drift, in radians per second. At this rate a full turn
 /// takes roughly three minutes, so the panorama moves without being busy.
@@ -24,26 +37,37 @@ pub const VISTA_DRIFT_RATE_RADIANS_PER_SEC: f32 = 0.035;
 /// frame behind the menu panels.
 pub const VISTA_PITCH_RADIANS: f32 = -0.18;
 
-/// World-space x of the fixed vista camera anchor.
-pub const VISTA_ANCHOR_X: i32 = 0;
-
-/// World-space z of the fixed vista camera anchor.
-pub const VISTA_ANCHOR_Z: i32 = 0;
-
 /// Clearance, in blocks, between the seeded terrain surface and the camera.
 pub const VISTA_ANCHOR_HEIGHT: f32 = 12.0;
 
-/// The camera anchor as a plain position: fixed x/z, y just above the seeded
-/// demo terrain. `main.rs` derives the vista streaming anchor chunk from this
-/// same function so the camera and the streamed world cannot drift apart.
+/// The world column the vista camera is anchored over: the deterministic
+/// land-search column for [`VISTA_SEED`].
+///
+/// D071: the vista used to sit over the fixed (0, 0) column, which is open
+/// ocean for this seed after the four-biome rewrite — the menu camera would
+/// have looked out from under the sea surface. The land search moves it to the
+/// nearest land column above the sea while keeping the anchor a pure function
+/// of the seed.
+pub fn vista_anchor_column() -> (i32, i32) {
+    find_spawn_column(VISTA_SEED)
+}
+
+/// The camera anchor as a plain position: the land-search column's x/z, y just
+/// above the seeded demo terrain. `main.rs` derives the vista streaming anchor
+/// chunk from this same function so the camera and the streamed world cannot
+/// drift apart.
+///
+/// Cached: `main.rs` calls this once per rendered menu frame, and the land
+/// search walks thousands of columns, so the result is computed once. The
+/// cached value is exactly what the pure function returns, so determinism and
+/// the exposed-anchor contract are unchanged.
 pub fn vista_anchor() -> Vec3 {
-    let terrain =
-        crate::world::terrain::terrain_height_at_seeded(VISTA_ANCHOR_X, VISTA_ANCHOR_Z, VISTA_SEED);
-    Vec3::new(
-        VISTA_ANCHOR_X as f32,
-        terrain as f32 + VISTA_ANCHOR_HEIGHT,
-        VISTA_ANCHOR_Z as f32,
-    )
+    static ANCHOR: OnceLock<Vec3> = OnceLock::new();
+    *ANCHOR.get_or_init(|| {
+        let (x, z) = vista_anchor_column();
+        let terrain = terrain_height_at_seeded(x, z, VISTA_SEED);
+        Vec3::new(x as f32, terrain as f32 + VISTA_ANCHOR_HEIGHT, z as f32)
+    })
 }
 
 /// Drifting vista camera as a pure function of elapsed time.
@@ -93,16 +117,46 @@ mod tests {
     }
 
     #[test]
-    fn anchor_floats_fixed_clearance_above_seeded_terrain() {
+    fn vista_season_is_pinned_to_the_blanket_absent_baseline() {
+        // The menu panorama is a fixed demo world: it must never follow the
+        // player's persisted clock, so the season is a named constant pinned
+        // here. Changing this intentionally also changes this assertion.
+        assert_eq!(VISTA_SEASON, Season::Summer);
+    }
+
+    #[test]
+    fn anchor_sits_above_land_at_the_searched_column() {
         let anchor = vista_anchor();
-        let terrain = crate::world::terrain::terrain_height_at_seeded(
-            VISTA_ANCHOR_X,
-            VISTA_ANCHOR_Z,
-            VISTA_SEED,
-        );
-        assert_eq!(anchor.x, VISTA_ANCHOR_X as f32);
-        assert_eq!(anchor.z, VISTA_ANCHOR_Z as f32);
+        let (x, z) = vista_anchor_column();
+        let terrain = crate::world::terrain::terrain_height_at_seeded(x, z, VISTA_SEED);
+        assert_eq!(anchor.x, x as f32);
+        assert_eq!(anchor.z, z as f32);
         assert_eq!(anchor.y, terrain as f32 + VISTA_ANCHOR_HEIGHT);
+
+        // D071: this seed's (0, 0) column is open ocean, so the anchor must
+        // have moved to dry land above the water line.
+        assert!(
+            crate::world::terrain::terrain_height_at_seeded(0, 0, VISTA_SEED)
+                < crate::world::terrain::SEA_LEVEL,
+            "test premise: VISTA_SEED must have an ocean at (0, 0)"
+        );
+        assert_ne!((x, z), (0, 0));
+        assert!(terrain >= crate::world::terrain::SPAWN_MIN_HEIGHT);
+        assert_ne!(
+            crate::world::terrain::biome_at_seeded(x, z, VISTA_SEED),
+            crate::world::terrain::Biome::Ocean
+        );
+        assert!(anchor.y > crate::world::terrain::SEA_LEVEL as f32);
+    }
+
+    #[test]
+    fn anchor_is_stable_across_repeat_calls() {
+        // The cached anchor must equal the pure land-search result every time:
+        // the menu camera may not drift while the main menu is open.
+        let first = vista_anchor();
+        let second = vista_anchor();
+        assert_eq!(first, second);
+        assert_eq!(vista_anchor_column(), vista_anchor_column());
     }
 
     #[test]

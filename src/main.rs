@@ -17,7 +17,7 @@ use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
-use opencraft::player::physics::{InputState, InventoryCommandError, Player};
+use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
@@ -62,7 +62,12 @@ use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, ChunkEditMap, CliConfig, PersistenceError,
     SavedPlayerState, WorldSaveData, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
-use opencraft::world::terrain::DEFAULT_WORLD_SEED;
+#[cfg(test)]
+use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
+use opencraft::world::season::{season_of, weather_of, Weather};
+use opencraft::world::terrain::{
+    biome_at_seeded, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
+};
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
 
@@ -189,6 +194,8 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
     let data = WorldSaveData {
         seed: session.world.seed(),
         time_of_day: session.clock.time_of_day,
+        day_index: session.clock.day_index,
+        season_length_days: session.season_length_days,
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -685,19 +692,71 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
     lines.join("\n")
 }
 
+/// The live weather of a session, derived purely from its persisted calendar.
+///
+/// `weather_of(season_of(day_index, season_length_days, seed), day_index,
+/// seed)` — the same three persisted scalars S05's season derivation reads,
+/// never the wall clock and never anything the player did. Deliberately *not*
+/// cached: the slice's anti-goal is that no `Weather` value lives outside the
+/// per-frame derivation, and the cost is one small FNV hash plus a match.
+///
+/// A free function over `&WorldSession` rather than a `WorldSession` method:
+/// the Playing render arm runs with the `gpu` and `window` field borrows live
+/// (P005), so only plain-field reads and free-function calls are usable there.
+fn session_weather(session: &WorldSession) -> Weather {
+    let day_index = session.clock.day_index;
+    let seed = session.world.seed();
+    weather_of(
+        season_of(day_index, session.season_length_days, seed),
+        day_index,
+        seed,
+    )
+}
+
+/// Weather ambient-audio seam — deliberately empty in M007.
+///
+/// There is no looped-ambient engine in `src/audio` (MEM227): [`AudioEngine`]
+/// only plays one-shot [`SoundBuffer`]/[`SoundSlot`] samples, and every
+/// playback call in this file lives in the three input arms (place, break,
+/// UI), never in a render path (MEM168/MEM169/MEM171). Adding weather audio
+/// would mean a new looping engine plus per-frame gain management, which is
+/// explicitly out of M007's scope.
+///
+/// The hook exists so the frame where a weather state is derived has a named
+/// seam instead of a comment, and so M008+ has exactly one place to wire
+/// ambient sound. It stays internal and is NOT pack-overridable: packs ship
+/// sample buffers, not callbacks. It contains no playback call and owns no
+/// engine handle. Called once per session frame; as a no-op the call is free.
+fn weather_ambient_hook(_weather: Weather) {}
+
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
-/// Session frames use the live clock's palette *and* its
+/// Session frames use the live clock's weather-tinted palette *and* its
 /// `clock.time_of_day`; vista frames use the pinned
-/// [`daycycle::VISTA_GOLDEN_HOUR`] palette and that same constant as the sky
-/// time, never deriving either from the world clock or `vista_epoch` (that
-/// only drives camera drift). Passing the constant here is what makes the
-/// golden-hour sun appear: `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above
-/// the eastern horizon.
-fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
+/// [`daycycle::VISTA_GOLDEN_HOUR`] palette (see [`vista_sky_params`]) and that
+/// same constant as the sky time, never deriving either from the world clock
+/// or `vista_epoch` (that only drives camera drift). Passing the constant here
+/// is what makes the golden-hour sun appear:
+/// `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above the eastern horizon.
+fn sky_params(
+    palette: daycycle::SkyPalette,
+    time_of_day: u32,
+    underwater: bool,
+    weather: Weather,
+    fog_range_factor: f32,
+    weather_phase: f32,
+) -> SkyParams {
     SkyParams {
         time_of_day,
+        underwater,
         day_factor: palette.day_factor,
+        // Weather travels through the same grouped struct so render_frame's
+        // 10-argument signature did not grow. Only the session arm feeds live
+        // values; the vista arm pins Clear / 1.0 / 0.0 so the panorama stays
+        // byte-identical to pre-S06 output and never draws precipitation.
+        weather,
+        fog_range_factor,
+        weather_phase,
         fog_color: [
             palette.fog_color[0],
             palette.fog_color[1],
@@ -711,6 +770,42 @@ fn sky_params(palette: daycycle::SkyPalette, time_of_day: u32) -> SkyParams {
             a: 1.0,
         },
     }
+}
+
+/// Sky inputs for the pinned golden-hour vista panorama.
+///
+/// The panorama is the menu backdrop rendered from its own static world (see
+/// [`vista::vista_camera`]) and never reads the session calendar, so it also
+/// never derives weather. Clear + the exact identity fog factor + phase 0.0
+/// keep vista frames byte-identical to pre-S06 output and mean the precip draw
+/// is skipped on every menu frame.
+fn vista_sky_params(palette: daycycle::SkyPalette) -> SkyParams {
+    sky_params(
+        palette,
+        daycycle::VISTA_GOLDEN_HOUR,
+        false,
+        Weather::Clear,
+        daycycle::CLEAR_FOG_RANGE_FACTOR,
+        0.0,
+    )
+}
+
+/// True when the camera's eye sits inside a liquid block.
+///
+/// One bounded block lookup per frame (never a scan), mirroring
+/// [`WorldSession::sync_open_table`]: the eye position is floored to its block
+/// and the liquid predicate on that id decides submersion. [`WorldManager::get_block`]
+/// answers [`BlockId::Air`] for unloaded chunks and above the world top, so an
+/// unloaded column can never report false water; below the world floor it
+/// answers bedrock, which is likewise not a liquid.
+fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
+    world
+        .get_block(
+            eye.x.floor() as i32,
+            eye.y.floor() as i32,
+            eye.z.floor() as i32,
+        )
+        .is_liquid()
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -741,7 +836,20 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
         }
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
-    WorldSession::new_session(seed, cli.save_path.clone())
+    // Fresh worlds start at the default season length; the New Game row and
+    // the `--season-length` CLI seam override it on this branch only. A load
+    // branch above never reaches here, so a persisted calendar always wins
+    // over a launch flag.
+    let mut session = WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length);
+    // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
+    // onto the pinned route. The load branch above returns before this, so a
+    // resumed save is never moved — its own position is the contract there.
+    if cli.demo_swim {
+        if let Some(route) = swim_route(seed) {
+            arm_swim_route(&mut session, route);
+        }
+    }
+    session
 }
 
 /// Apply a S01-confirmed pending delete through the live catalog and
@@ -1089,11 +1197,17 @@ struct Ready {
     inventory_labels: Vec<StatsOverlay>,
 }
 
-/// Bounded accelerated-demo watch (S02-T04): `--time-scale` is a test seam
-/// for observing a full day cycle. Sums the game-time ticks actually
-/// advanced by the frame loop and reports completion once one whole
-/// `DAY_TICKS` cycle has elapsed. Frame-rate independent because it reads
-/// the clock, not the wall time.
+/// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
+/// S06-T05): `--time-scale` is a test seam for observing whole day cycles.
+/// Sums the game-time ticks actually advanced by the frame loop and reports
+/// completion once `demo_days` whole `DAY_TICKS` cycles have elapsed.
+/// Frame-rate independent because it reads the clock, not the wall time.
+///
+/// The budget is a single summed tick counter rather than a per-cycle latch:
+/// the watch completes exactly when `DAY_TICKS * days` ticks have been
+/// observed, so a `days = 4` demo cannot finish early on an integer number of
+/// wrapped cycles and a `days = 1` demo is byte-identical to the pre-S06
+/// behavior that `scripts/season_smoke.sh` asserts.
 #[derive(Debug)]
 struct DemoCycleWatch {
     remaining_ticks: u32,
@@ -1101,15 +1215,18 @@ struct DemoCycleWatch {
 }
 
 impl DemoCycleWatch {
-    fn new(time_of_day: u32) -> Self {
+    fn new(time_of_day: u32, days: u32) -> Self {
         Self {
-            remaining_ticks: daycycle::DAY_TICKS,
+            // `days` is already clamped by `CliConfig`, but `.max(1)` keeps a
+            // zero from arming a watch that completes on the first frame.
+            remaining_ticks: daycycle::DAY_TICKS.saturating_mul(days.max(1)),
             last_time_of_day: time_of_day % daycycle::DAY_TICKS,
         }
     }
 
     /// Feed one frame's time of day. Returns true exactly when the summed
-    /// advance reaches a full cycle (wrap-safe at the cycle boundary).
+    /// advance reaches the configured number of cycles (wrap-safe at every
+    /// cycle boundary).
     fn observe(&mut self, time_of_day: u32) -> bool {
         let time_of_day = time_of_day % daycycle::DAY_TICKS;
         let delta =
@@ -1123,10 +1240,12 @@ impl DemoCycleWatch {
 /// Arm/observe the bounded accelerated demo in one place, shared by the
 /// RedrawRequested pass and its headless tests. Never arms at the default
 /// 1.0 scale (a normal run is unbounded) and never counts paused frames
-/// (the clock itself is frozen there).
+/// (the clock itself is frozen there). `demo_days` is the app's `--demo-days`
+/// value; it only matters when the accelerated watch is armed.
 fn observe_demo_cycle(
     watch: &mut Option<DemoCycleWatch>,
     time_scale: f32,
+    demo_days: u32,
     playing: bool,
     time_of_day: u32,
 ) -> bool {
@@ -1136,27 +1255,743 @@ fn observe_demo_cycle(
     match watch {
         Some(watch) => watch.observe(time_of_day),
         None => {
-            *watch = Some(DemoCycleWatch::new(time_of_day));
+            *watch = Some(DemoCycleWatch::new(time_of_day, demo_days));
             false
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scripted ocean-crossing demo (`--demo-swim`, S08-T02)
+// ---------------------------------------------------------------------------
+
+/// Forward axis of the scripted swim. S03 proved the crossing on +Z from the
+/// origin for seed 12345; the seam deliberately pins the same axis so the
+/// headless proof and the real-binary seam describe one route.
+const SWIM_AXIS: &str = "+Z";
+
+/// Yaw whose flat forward vector is exactly +Z (`(cos yaw, 0, sin yaw)`).
+const SWIM_YAW: f32 = std::f32::consts::FRAC_PI_2;
+
+/// Spawn height above the sea level plane (S03 drops the body from here into
+/// the ocean column; 3 blocks clears the water surface at `SEA_LEVEL + 1`).
+const SWIM_START_ABOVE_SEA: f32 = 3.0;
+
+/// Bounded scan windows for the route: an ocean column within 512 blocks of
+/// the origin along +Z, and the first land column within 4096 blocks after it.
+/// Identical to the S03 acceptance proof's scan, so the route the demo swims
+/// is the route the headless test bounds.
+const SWIM_OCEAN_SCAN_BLOCKS: i32 = 512;
+const SWIM_SHORE_SCAN_BLOCKS: i32 = 4096;
+
+/// Top face of the water column (`SEA_LEVEL` is the last water block).
+const SWIM_WATER_TOP: f32 = SEA_LEVEL as f32 + 1.0;
+
+/// How far above the spawn column's seabed a sinking or swimming body must
+/// stay. Mirrors the S03 `SEABED_MARGIN`, so "the body sank" means the same
+/// thing in both surfaces.
+const SWIM_SEABED_MARGIN: f32 = 2.0;
+
+/// Stage budgets mirrored from the S03 harness's frame caps at its fixed
+/// 1/60 s step (600 entry / 60 sink / 120 rise / 9000 crossing frames).
+///
+/// They are expressed in seconds of simulated time rather than frames because
+/// the production frame loop is uncapped: a frame budget that is safe at 60 Hz
+/// would cut a 300 fps run off after a fraction of the same simulated motion.
+/// The watcher accumulates the same `dt` the player update consumes (clamped
+/// exactly like `Player::update` clamps it), so the bound is frame-rate
+/// independent and still frames the S03 phase boundaries.
+const SWIM_ENTRY_SECS: f32 = 10.0;
+/// D087 sink proof window: released idle just inside the water, the body must
+/// descend away from the surface rather than being held there.
+const SWIM_SINK_SECS: f32 = 1.0;
+/// Minimum idle descent (blocks) that counts as a real sink inside the window.
+const SWIM_SINK_MIN_DROP: f32 = 1.5;
+const SWIM_RISE_SECS: f32 = 2.0;
+/// The S03 crossing cap (9000 frames at 1/60 s) plus a production margin: the
+/// real binary's frame rate is unbounded, so the same simulated crossing is
+/// fewer wall seconds and a single long hitch must not eat the budget. The
+/// 360 s wall-clock deadline, not this cap, remains the hard bound on a stalled
+/// run, and gated (non-resident) frames never charge this budget.
+const SWIM_CROSSING_SECS: f32 = 180.0;
+
+/// Mirrors `Player::update`'s per-step clamp, so the watcher's simulated-time
+/// budget advances exactly as far as the physics did.
+const SWIM_STEP_CAP: f32 = 0.1;
+
+/// Wall-clock safety net for the scripted swim, independent of `time_scale`:
+/// the accelerated-demo deadline only arms above 1x, and the swim deliberately
+/// runs at the default scale (no seasonal terrain rollover mid-crossing).
+const SWIM_DEADLINE_SECS: u64 = 360;
+
+/// The scripted crossing's pinned geometry, resolved once at startup from the
+/// same pure terrain functions the chunk generator uses.
+///
+/// For seed 12345 this is the S03 route: an Ocean column at the world origin
+/// (`h = 14`) and the first land column at or above `SEA_LEVEL` along +Z.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SwimRoute {
+    seed: u32,
+    /// Feet position the fresh-world launch teleports to (column centre, above
+    /// the water surface, facing +Z).
+    start: Vec3,
+    /// Column index along +Z where the ocean starts (the route's near end).
+    ocean_start_z: i32,
+    /// Column index along +Z of the first land at or above `SEA_LEVEL` (the
+    /// far shore the demo must reach).
+    land_z: i32,
+    /// Terrain height of the spawn column, below `SEA_LEVEL`; the sink guard's
+    /// reference.
+    seabed_height: i32,
+}
+
+impl SwimRoute {
+    /// Crossing length in blocks: ocean start column to far-shore column.
+    fn distance(&self) -> i32 {
+        self.land_z - self.ocean_start_z
+    }
+}
+
+/// Resolve the scripted crossing for `seed` with no chunks allocated: scan +Z
+/// from the origin for an Ocean column below `SEA_LEVEL`, then for the first
+/// column at or above `SEA_LEVEL` (the far shore). `None` when either bound is
+/// missing, so a seed without a usable crossing produces an honest abort
+/// digest instead of swimming at nothing.
+fn swim_route(seed: u32) -> Option<SwimRoute> {
+    let ocean_start_z = (0..SWIM_OCEAN_SCAN_BLOCKS).find(|&d| {
+        biome_at_seeded(0, d, seed) == Biome::Ocean
+            && terrain_height_at_seeded(0, d, seed) < SEA_LEVEL
+    })?;
+    let land_z = (ocean_start_z + 1..SWIM_SHORE_SCAN_BLOCKS)
+        .find(|&d| terrain_height_at_seeded(0, d, seed) >= SEA_LEVEL)?;
+    let seabed_height = terrain_height_at_seeded(0, ocean_start_z, seed);
+    Some(SwimRoute {
+        seed,
+        start: Vec3::new(
+            0.5,
+            SEA_LEVEL as f32 + SWIM_START_ABOVE_SEA,
+            ocean_start_z as f32 + 0.5,
+        ),
+        ocean_start_z,
+        land_z,
+        seabed_height,
+    })
+}
+
+/// Teleport a freshly constructed session onto the scripted route: column
+/// centre, above the water surface, facing +Z, walk mode on (a flying body
+/// would never enter the water). Loaded saves never call this — the fresh-world
+/// startup branch is the only caller.
+fn arm_swim_route(session: &mut WorldSession, route: SwimRoute) {
+    session.player.position = route.start;
+    session.player.velocity = Vec3::ZERO;
+    session.player.yaw = SWIM_YAW;
+    session.player.pitch = 0.0;
+    session.player.on_ground = false;
+    session.player.fly_mode = false;
+    session.sync_camera();
+}
+
+/// The S03 phases reworked for D087: entry, idle sink, Jump rise, crossing,
+/// and the terminal landed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwimStage {
+    Entry,
+    Sink,
+    Rise,
+    Crossing,
+    Landed,
+}
+
+impl SwimStage {
+    /// The stage name used in abort diagnostics and by the headless stage
+    /// tests, so a failure names the same phase the headless proof names.
+    #[cfg(test)]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Sink => "sink",
+            Self::Rise => "rise",
+            Self::Crossing => "crossing",
+            Self::Landed => "landed",
+        }
+    }
+}
+
+/// One frame's verdict from the stage watcher.
+#[derive(Debug, PartialEq, Eq)]
+enum SwimProgress {
+    Continue,
+    Landed,
+    Aborted {
+        stage: &'static str,
+        observed: String,
+    },
+}
+
+/// The scripted input for a stage, as a constructed copy.
+///
+/// The seam never mutates `GameApp::input`: the real input path stays
+/// byte-identical, and this copy is what a bounded phase supplies instead.
+/// Entry and sink are idle (D087: water must sink the body unaided), rise
+/// holds `jump_or_up`, and crossing holds `forward` plus a bounded jump
+/// cadence: Jump engages while the body's feet are at or below the top face of
+/// the water column and releases as soon as it clears it. The stage itself is
+/// the bounded cadence: each phase has a budget, so no key can be held past its
+/// window.
+fn swim_scripted_input(stage: SwimStage, feet_y: f32) -> InputState {
+    match stage {
+        SwimStage::Rise => InputState {
+            jump_or_up: true,
+            ..InputState::default()
+        },
+        SwimStage::Crossing => InputState {
+            forward: true,
+            jump_or_up: feet_y <= SWIM_WATER_TOP,
+            ..InputState::default()
+        },
+        SwimStage::Entry | SwimStage::Sink | SwimStage::Landed => InputState::default(),
+    }
+}
+
+/// Bounded, stage-naming watcher for the scripted crossing — the swim twin of
+/// [`DemoCycleWatch`].
+///
+/// It observes the production player after every scripted `Player::update`
+/// call and advances through the D087 phases: entry (the feet block becomes
+/// water), sink (idle descent away from the surface, never `on_ground`), rise
+/// (`jump_or_up` clears the water surface), crossing (reach the land target
+/// standing on land above `SEA_LEVEL` with a bounded jump cadence). Every abort
+/// names the stage and the observed values, so a stalled run is diagnosable
+/// from its one digest line.
+#[derive(Debug)]
+struct SwimWatch {
+    route: SwimRoute,
+    stage: SwimStage,
+    /// Scripted frames stepped (the digest's `frames` value). Warm-up frames
+    /// spent waiting for the spawn column to stream in are deliberately not
+    /// counted: they are not frames of the crossing.
+    frames: usize,
+    /// Simulated seconds spent in the current stage.
+    stage_elapsed: f32,
+    sink_start_y: f32,
+    sink_min_y: f32,
+    rise_max_y: f32,
+    rise_submerged_frames: usize,
+    crossing_water_frames: usize,
+}
+
+impl SwimWatch {
+    fn new(route: SwimRoute) -> Self {
+        Self {
+            route,
+            stage: SwimStage::Entry,
+            frames: 0,
+            stage_elapsed: 0.0,
+            sink_start_y: f32::MAX,
+            sink_min_y: f32::MAX,
+            rise_max_y: f32::MIN,
+            rise_submerged_frames: 0,
+            crossing_water_frames: 0,
+        }
+    }
+
+    fn input(&self, position: Vec3) -> InputState {
+        swim_scripted_input(self.stage, position.y)
+    }
+
+    fn advance(&mut self, stage: SwimStage) {
+        self.stage = stage;
+        self.stage_elapsed = 0.0;
+    }
+
+    /// `sink` cell: `start->lowest` once the sink phase began, `none` before.
+    fn sink_band(&self) -> String {
+        if self.sink_start_y >= self.sink_min_y && self.sink_start_y < f32::MAX {
+            format!("{:.3}->{:.3}", self.sink_start_y, self.sink_min_y)
+        } else {
+            "none".to_string()
+        }
+    }
+
+    /// `rise` cell: the highest feet position reached while rising, if any.
+    fn rise_peak(&self) -> String {
+        if self.rise_max_y > f32::MIN {
+            format!("{:.3}", self.rise_max_y)
+        } else {
+            "none".to_string()
+        }
+    }
+
+    fn head(&self) -> String {
+        format!(
+            "swim_demo: seed={} axis={} distance={} frames={} sink={} rise={}",
+            self.route.seed,
+            SWIM_AXIS,
+            self.route.distance(),
+            self.frames,
+            self.sink_band(),
+            self.rise_peak(),
+        )
+    }
+
+    /// The success digest, printed once on the demo-shutdown path.
+    fn digest(&self) -> String {
+        format!("{} landed=true", self.head())
+    }
+
+    /// The self-describing abort digest: same fields plus the stage and the
+    /// values observed at the failure.
+    fn abort_digest(&self, stage: &'static str, observed: &str) -> String {
+        format!(
+            "{} landed=false stage={} observed={}",
+            self.head(),
+            stage,
+            observed
+        )
+    }
+
+    /// A compact "what the player was doing" cell for abort messages.
+    fn observed(position: Vec3, on_ground: bool, feet_liquid: bool) -> String {
+        format!(
+            "y={:.3} z={:.3} on_ground={} feet_liquid={}",
+            position.y, position.z, on_ground, feet_liquid
+        )
+    }
+
+    /// Feed one scripted frame's post-physics state. `step` is the simulated
+    /// seconds the player update consumed (already clamped like the physics).
+    fn observe(
+        &mut self,
+        step: f32,
+        position: Vec3,
+        on_ground: bool,
+        feet_liquid: bool,
+    ) -> SwimProgress {
+        self.frames += 1;
+        self.stage_elapsed += step;
+        let seabed_floor = self.route.seabed_height as f32 + SWIM_SEABED_MARGIN;
+        let observed = Self::observed(position, on_ground, feet_liquid);
+        match self.stage {
+            SwimStage::Entry => {
+                if feet_liquid {
+                    self.sink_start_y = position.y;
+                    self.sink_min_y = position.y;
+                    self.advance(SwimStage::Sink);
+                    return SwimProgress::Continue;
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "entry",
+                        observed: format!(
+                            "sank below the seabed margin before the feet block became water; \
+                             {observed} seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if self.stage_elapsed >= SWIM_ENTRY_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "entry",
+                        observed: format!(
+                            "feet block never became water within {SWIM_ENTRY_SECS:.1}s; {observed}"
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Sink => {
+                self.sink_min_y = self.sink_min_y.min(position.y);
+                if on_ground {
+                    return SwimProgress::Aborted {
+                        stage: "sink",
+                        observed: format!(
+                            "an idle sinking body touched ground (it walked the seabed); {observed}"
+                        ),
+                    };
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "sink",
+                        observed: format!(
+                            "sank below the seabed margin while proving the idle sink; {observed} \
+                             seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if self.stage_elapsed >= SWIM_SINK_SECS {
+                    let dropped = self.sink_start_y - self.sink_min_y;
+                    if dropped < SWIM_SINK_MIN_DROP {
+                        return SwimProgress::Aborted {
+                            stage: "sink",
+                            observed: format!(
+                                "idle body only dropped {dropped:.3} blocks in \
+                                 {SWIM_SINK_SECS:.1}s (expected at least \
+                                 {SWIM_SINK_MIN_DROP:.1}); D087 requires water to sink it away from \
+                                 the surface; {observed}"
+                            ),
+                        };
+                    }
+                    self.advance(SwimStage::Rise);
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Rise => {
+                self.rise_max_y = self.rise_max_y.max(position.y);
+                if feet_liquid {
+                    self.rise_submerged_frames += 1;
+                }
+                if on_ground {
+                    return SwimProgress::Aborted {
+                        stage: "rise",
+                        observed: format!("a rising body touched ground; {observed}"),
+                    };
+                }
+                if position.y > SWIM_WATER_TOP {
+                    self.advance(SwimStage::Crossing);
+                    return SwimProgress::Continue;
+                }
+                if self.stage_elapsed >= SWIM_RISE_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "rise",
+                        observed: format!(
+                            "jump_or_up never cleared the water surface y>{SWIM_WATER_TOP:.3} \
+                             within {SWIM_RISE_SECS:.1}s; {observed} peak={:.3} submerged_frames={}",
+                            self.rise_max_y, self.rise_submerged_frames
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Crossing => {
+                if feet_liquid {
+                    self.crossing_water_frames += 1;
+                }
+                if position.y <= seabed_floor {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "sank below the seabed margin while crossing; {observed} \
+                             seabed={} floor={seabed_floor:.3}",
+                            self.route.seabed_height
+                        ),
+                    };
+                }
+                if on_ground
+                    && position.y <= SEA_LEVEL as f32
+                    && position.z + PLAYER_HALF_WIDTH < self.route.land_z as f32
+                {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "touched ground inside the water column while its body box was still \
+                             short of the far shore (walked the seabed); {observed} land_z={}",
+                            self.route.land_z
+                        ),
+                    };
+                }
+                if position.z >= self.route.land_z as f32
+                    && on_ground
+                    && position.y > SEA_LEVEL as f32
+                {
+                    self.advance(SwimStage::Landed);
+                    return SwimProgress::Landed;
+                }
+                if self.stage_elapsed >= SWIM_CROSSING_SECS {
+                    return SwimProgress::Aborted {
+                        stage: "crossing",
+                        observed: format!(
+                            "never stood on the far shore z>={} above SEA_LEVEL {SEA_LEVEL} \
+                             within {SWIM_CROSSING_SECS:.1}s; {observed} water_frames={}",
+                            self.route.land_z, self.crossing_water_frames
+                        ),
+                    };
+                }
+                SwimProgress::Continue
+            }
+            SwimStage::Landed => SwimProgress::Landed,
+        }
+    }
+}
+
+/// The `--demo-swim` seam's whole state: the resolved route, the armed watcher,
+/// the one latched digest, and the wall-clock deadline.
+#[derive(Debug)]
+struct SwimDemo {
+    seed: u32,
+    route: Option<SwimRoute>,
+    watch: Option<SwimWatch>,
+    /// The digest latched when the run ends (landing or abort). `about_to_wait`
+    /// prints it together with the frame-budget line, so the crate stays
+    /// log-free between demo seams (D006/MEM009, D086).
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status, so a bounded smoke can tell "ran and failed"
+    /// from "was killed by the harness timeout".
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+}
+
+impl SwimDemo {
+    fn new(seed: u32, route: Option<SwimRoute>, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            route,
+            watch: None,
+            digest: None,
+            failed: false,
+            deadline,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    fn finish_landed(&mut self) {
+        if self.finished() {
+            return;
+        }
+        if let Some(watch) = &self.watch {
+            self.digest = Some(watch.digest());
+        }
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins, so a
+    /// deadline that fires on the same frame as a stage abort cannot overwrite
+    /// the more specific message.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(match &self.watch {
+            Some(watch) => watch.abort_digest(stage, observed),
+            None => format!(
+                "swim_demo: seed={} axis={} distance=0 frames=0 sink=none rise=none \
+                 landed=false stage={} observed={}",
+                self.seed, SWIM_AXIS, stage, observed
+            ),
+        });
+        self.failed = true;
+    }
+}
+
+/// Drive one Playing frame of the scripted swim through the production player
+/// update seam. Returns true when this frame ended the run (landed or
+/// aborted), so the caller latches the bounded-demo shutdown.
+///
+/// The first call waits (bounded by the swim deadline) for the spawn column's
+/// water block to stream in before arming the watcher. This is the production
+/// analogue of S03's warm-up gate: `get_block` answers Air for a non-resident
+/// chunk, and falling through that Air would look like a body that sank
+/// through the ocean. No scripted input is fed while waiting.
+fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    let Some(route) = demo.route else {
+        demo.abort("route", "no_ocean_crossing_for_this_seed");
+        return true;
+    };
+    if demo.watch.is_none() {
+        let water = session.world.get_block(0, SEA_LEVEL, route.ocean_start_z);
+        if water != BlockId::Water {
+            return false;
+        }
+        demo.watch = Some(SwimWatch::new(route));
+    }
+    let watch = demo
+        .watch
+        .as_mut()
+        .expect("watch is armed immediately above");
+    // Streaming gate, mirroring the S03 harness's per-step residency gate: a
+    // non-resident chunk reads as Air, which silently removes the water branch
+    // (drag, sink, and rise) and drops the scripted body out of the crossing.
+    // the body to stream in before feeding any scripted input. The wall-clock
+    // deadline bounds the wait, and a gated frame is not a crossing frame: no
+    // physics runs and no simulated time is charged to the stage budget.
+    let col_x = session.player.position.x.floor() as i32;
+    let col_z = session.player.position.z.floor() as i32;
+    if terrain_height_at_seeded(col_x, col_z, route.seed) < SEA_LEVEL
+        && session.world.get_block(col_x, SEA_LEVEL, col_z) != BlockId::Water
+    {
+        return false;
+    }
+    let input = watch.input(session.player.position);
+    session
+        .player
+        .update(dt, &input, |x, y, z| session.world.get_block(x, y, z));
+    let feet_liquid = session
+        .world
+        .get_block(
+            session.player.position.x.floor() as i32,
+            (session.player.position.y + 1e-4).floor() as i32,
+            session.player.position.z.floor() as i32,
+        )
+        .is_liquid();
+    let progress = watch.observe(
+        dt.clamp(0.0, SWIM_STEP_CAP),
+        session.player.position,
+        session.player.on_ground,
+        feet_liquid,
+    );
+    match progress {
+        SwimProgress::Continue => false,
+        SwimProgress::Landed => {
+            demo.finish_landed();
+            true
+        }
+        SwimProgress::Aborted { stage, observed } => {
+            demo.abort(stage, &observed);
+            true
+        }
+    }
+}
+
+/// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
+/// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
+/// under this; the cap only guarantees bounded memory if a run is left going.
+const FRAME_BUDGET_SAMPLE_CAP: usize = 120_000;
+/// The operational frame-time target quoted in the digest (MEM229): a bounded
+/// release run must hold p95 wall frame time at or under one 60 Hz frame.
+const FRAME_BUDGET_TARGET_MS: f64 = 16.6;
+
+/// Percentiles over a bounded per-frame duration sample (S08-T01).
+///
+/// The math mirrors the `streaming_budget` harness in
+/// `world::manager` exactly — sort ascending, then index with
+/// `round((len - 1) * p)` — so the two evidence surfaces cannot disagree
+/// about what "p95" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameBudgetStats {
+    samples: usize,
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+}
+
+/// Pure percentile helper: `None` for an empty sample so callers never print
+/// a digest full of zeros (and never divide by zero).
+fn frame_budget_stats(samples: &[Duration]) -> Option<FrameBudgetStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    let pct = |p: f64| -> Duration {
+        let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+        sorted[idx]
+    };
+    Some(FrameBudgetStats {
+        samples: sorted.len(),
+        p50: pct(0.50),
+        p95: pct(0.95),
+        max: *sorted.last().expect("non-empty sample"),
+    })
+}
+
+/// Pure formatter for the one digest line printed on demo-seam shutdown
+/// (D086). `None` for an empty sample: a demo that never saw a frame has no
+/// budget to report and must not print a misleading all-zero line.
+fn format_frame_budget_digest(samples: &[Duration]) -> Option<String> {
+    let stats = frame_budget_stats(samples)?;
+    Some(format!(
+        "frame_budget: samples={} p50={:.3}ms p95={:.3}ms max={:.3}ms target: p95<={:.1}ms",
+        stats.samples,
+        stats.p50.as_secs_f64() * 1000.0,
+        stats.p95.as_secs_f64() * 1000.0,
+        stats.max.as_secs_f64() * 1000.0,
+        FRAME_BUDGET_TARGET_MS,
+    ))
+}
+
+/// Bounded per-frame wall-time sampler for the demo-shutdown digest.
+///
+/// HONESTY NOTE (S08-T01): the samples are real wall dt from the frame loop.
+/// Default settings run `vsync = false`, which requests the uncapped
+/// `Immediate` present mode (`render::context::preferred_present_mode`), so a
+/// frame's dt measures the work of that frame rather than a display refresh
+/// wait. The p95 <= 16.6 ms claim is therefore only meaningful at default
+/// settings; a vsync-on run is paced by the compositor and would report the
+/// refresh interval, not the render cost.
+#[derive(Debug, Default)]
+struct FrameBudgetSampler {
+    samples: Vec<Duration>,
+}
+
+impl FrameBudgetSampler {
+    fn new() -> Self {
+        Self {
+            samples: Vec::with_capacity(FRAME_BUDGET_SAMPLE_CAP),
+        }
+    }
+
+    /// Record one frame's wall dt. Silently drops samples past the cap: the
+    /// digest is a percentile summary, so a longer run only loses tail
+    /// resolution, never accuracy for the already-recorded window.
+    fn push(&mut self, dt: Duration) {
+        if self.samples.len() < FRAME_BUDGET_SAMPLE_CAP {
+            self.samples.push(dt);
+        }
+    }
+
+    /// Drop the sample window — called at session transitions so one digest
+    /// covers exactly one run/world.
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    /// Test-only accessor: production code reads the sample count through the
+    /// digest itself.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn digest(&self) -> Option<String> {
+        format_frame_budget_digest(&self.samples)
+    }
+}
+
+/// Sample one frame: only Playing frames are recorded (menu/settings/pause
+/// frames are not gameplay work and must not pad the milestone claim).
+fn sample_frame_budget(sampler: &mut FrameBudgetSampler, playing: bool, dt: Duration) {
+    if playing {
+        sampler.push(dt);
+    }
+}
+
+/// The shutdown digest is gated on a demo seam having run (D086) and on a
+/// non-empty sample window — the crate stays log-free (D006/MEM009) outside
+/// that one bounded diagnostic seam.
+fn frame_budget_digest_for_shutdown(
+    demo_seam_ran: bool,
+    sampler: &FrameBudgetSampler,
+) -> Option<String> {
+    if !demo_seam_ran {
+        return None;
+    }
+    sampler.digest()
 }
 
 /// Extra wall-clock allowance on top of one accelerated cycle before the
 /// bounded demo shuts down even if no redraws are being delivered.
 const DEMO_SHUTDOWN_GRACE_SECS: f32 = 5.0;
 
-/// Wall-clock safety net for a bounded accelerated run: one full cycle at
-/// the given scale plus a small grace for startup. The frame-driven
+/// Wall-clock safety net for a bounded accelerated run: `demo_days` full
+/// cycles at the given scale plus a small grace for startup. The frame-driven
 /// [`DemoCycleWatch`] is the primary completion signal; this deadline keeps
 /// the run bounded even if the compositor stops delivering redraws.
 /// `None` at the default scale (a normal run is unbounded).
-fn demo_shutdown_deadline(time_scale: f32) -> Option<Instant> {
+fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     if time_scale <= DEFAULT_TIME_SCALE {
         return None;
     }
     let cycle_secs = daycycle::DAY_SECONDS / time_scale;
-    Some(Instant::now() + Duration::from_secs_f32(cycle_secs + DEMO_SHUTDOWN_GRACE_SECS))
+    let demo_secs = cycle_secs * demo_days.max(1) as f32;
+    Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
 struct GameApp {
@@ -1284,16 +2119,38 @@ struct GameApp {
     /// `GameClock::tick`, so the clock itself stays config-free.
     time_scale: f32,
     /// Bounded accelerated-demo watch (S02-T04): armed on the first Playing
-    /// frame of an accelerated run, cleared when one full cycle has been
-    /// observed. `demo_finished` is then latched so `about_to_wait` can
-    /// perform the shutdown (the RedrawRequested region already holds
-    /// disjoint `gpu`/`window` borrows).
+    /// frame of an accelerated run, cleared when the configured number of
+    /// cycles (`demo_days`) has been observed. `demo_finished` is then
+    /// latched so `about_to_wait` can perform the shutdown (the
+    /// RedrawRequested region already holds disjoint `gpu`/`window` borrows).
     demo_cycle: Option<DemoCycleWatch>,
     demo_finished: bool,
+    /// Number of whole day cycles the bounded accelerated demo observes
+    /// before saving and exiting, from `--demo-days` (S06-T05). An app-level
+    /// test-seam parameter like `time_scale` — never world state, never
+    /// persisted, and it never affects `cli_has_world_intent`. Defaults to
+    /// one cycle, so a launch without the flag is bit-for-bit the pre-S06
+    /// bounded demo.
+    demo_days: u32,
     /// Wall-clock safety net for the bounded accelerated demo (S02-T04):
     /// armed only when the launch starts directly in Playing with an
     /// accelerated scale. `None` for every normal run.
     demo_shutdown_deadline: Option<Instant>,
+    /// Bounded Playing-frame wall-time window (S08-T01), reset at every
+    /// session transition. Its one consumer is the demo-shutdown digest.
+    frame_budget: FrameBudgetSampler,
+    /// Whether a bounded demo seam ran in this session (accelerated demo now,
+    /// scripted demo seams as they are added). Gates the one shutdown digest
+    /// line so a normal run stays log-free (D086, D006/MEM009).
+    demo_seam_ran: bool,
+    /// Scripted ocean-crossing seam (`--demo-swim`, S08-T02). `None` for every
+    /// normal run; a launch flag arms it and the fresh-world branch has already
+    /// teleported the player onto the route.
+    swim: Option<SwimDemo>,
+    /// Whether a failed demo seam requests a non-zero process status. Set by a
+    /// self-describing swim abort; `main` reads it after the event loop exits
+    /// (the shutdown path itself cannot set a process status).
+    exit_failure: bool,
 }
 
 impl GameApp {
@@ -1351,7 +2208,23 @@ impl GameApp {
         // net. Menu-first launches stay unbounded until gameplay begins (the
         // frame-driven cycle watch still completes them).
         let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
-            demo_shutdown_deadline(cli.time_scale)
+            demo_shutdown_deadline(cli.time_scale, cli.demo_days)
+        } else {
+            None
+        };
+        // Scripted ocean-crossing seam (S08-T02): armed by `--demo-swim`. The
+        // route is resolved from the SESSION's seed (the world actually being
+        // played) with the same pure scan S03 bounds, and the wall-clock
+        // deadline is independent of `time_scale` because the accelerated-demo
+        // deadline above never arms at the default scale the swim runs at.
+        let swim = if cli.demo_swim {
+            let seed = session.world.seed();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(SWIM_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(SwimDemo::new(seed, swim_route(seed), deadline))
         } else {
             None
         };
@@ -1412,7 +2285,12 @@ impl GameApp {
             time_scale: cli.time_scale,
             demo_cycle: None,
             demo_finished: false,
+            demo_days: cli.demo_days,
             demo_shutdown_deadline,
+            frame_budget: FrameBudgetSampler::new(),
+            demo_seam_ran: false,
+            swim,
+            exit_failure: false,
         }
     }
 
@@ -1706,6 +2584,14 @@ impl GameApp {
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        // A new session owns a fresh frame-budget window (S08-T01): one
+        // digest covers exactly one run, never a blend of two worlds.
+        self.frame_budget.reset();
+        self.demo_seam_ran = false;
+        // The scripted swim belongs to the LAUNCH (the fresh-world startup
+        // branch that teleported the player), never to a session created from
+        // the menu: swapping worlds retires the seam with the old world.
+        self.swim = None;
     }
 
     /// Apply a lifecycle decision from the S01 state machine (navigation,
@@ -1932,7 +2818,10 @@ impl GameApp {
                 return;
             }
         };
-        let session = WorldSession::new_session(seed, save_path);
+        // The New Game row owns the season length (S02-T04): the screen's
+        // cycler value, defaulting to one game day per season.
+        let session =
+            WorldSession::new_session(seed, save_path, self.new_game.season_length_days());
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
         if let Ok(LifecycleDecision::StartNewGame) = self
@@ -2067,6 +2956,12 @@ impl GameApp {
                     NewGameTarget::NameField => self.new_game.set_focus(FocusField::Name),
                     NewGameTarget::SeedField => self.new_game.set_focus(FocusField::Seed),
                     NewGameTarget::Randomize => self.new_game.randomize(),
+                    // Cycler row: advance 1 → 2 → 4 → 8 → 1. Like the
+                    // field rows this is a click action (one writer per
+                    // event), so the click sound below still plays.
+                    NewGameTarget::SeasonLength => {
+                        self.new_game.cycle_season_length();
+                    }
                     NewGameTarget::Create => self.attempt_create(),
                     NewGameTarget::Back => {
                         self.dispatch_screen_intent(
@@ -2776,7 +3671,8 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last_frame).as_secs_f32();
+                let frame_dt = now - self.last_frame;
+                let dt = frame_dt.as_secs_f32();
                 self.last_frame = now;
 
                 // Message expiry at a bounded ~60 ticks/s (see
@@ -2805,6 +3701,10 @@ impl ApplicationHandler for GameApp {
                 // nothing moves and no chunk loads/unloads (InputState was
                 // reset on screen entry, so no key sticks either).
                 let playing = self.lifecycle.screen() == LifecycleScreen::Playing;
+                // Frame-budget evidence (S08-T01): only Playing frames are
+                // real gameplay work; the digest is printed once on demo
+                // shutdown (see `about_to_wait`).
+                sample_frame_budget(&mut self.frame_budget, playing, frame_dt);
                 // Gameplay vs. world-liveness (S03-T03): the inventory panel
                 // freezes player movement, camera aim, the target raycast, and
                 // hold-to-mine, but NOT the world: time, table revalidation,
@@ -2818,24 +3718,30 @@ impl ApplicationHandler for GameApp {
                 // `window` already hold disjoint `self` borrows across this
                 // region, so a `&mut self` method call cannot be used.
                 self.session.clock.tick(playing, now, self.time_scale);
-                // Bounded accelerated demo (S02-T04): `--time-scale` is a
-                // test seam, so an accelerated run self-terminates after
-                // exactly one full day cycle and exits cleanly (status 0).
-                // That makes completion a health signal the harness can read
-                // directly, instead of inferring it from an external
-                // timeout kill. The exit itself is deferred to
-                // `about_to_wait` because `gpu`/`window` borrows span this
-                // region; only plain fields are touched here.
-                if !self.demo_finished
-                    && observe_demo_cycle(
+                // Bounded accelerated demo (S02-T04; N cycles since S06-T05):
+                // `--time-scale` is a test seam, so an accelerated run
+                // self-terminates after `--demo-days` (default 1) full day
+                // cycles and exits cleanly (status 0). That makes completion a
+                // health signal the harness can read directly, instead of
+                // inferring it from an external timeout kill. The exit itself
+                // is deferred to `about_to_wait` because `gpu`/`window`
+                // borrows span this region; only plain fields are touched
+                // here.
+                if !self.demo_finished {
+                    let finished = observe_demo_cycle(
                         &mut self.demo_cycle,
                         self.time_scale,
+                        self.demo_days,
                         playing,
                         self.session.clock.time_of_day,
-                    )
-                {
-                    self.demo_cycle = None;
-                    self.demo_finished = true;
+                    );
+                    // A watch armed (or just completed) means a demo seam ran;
+                    // only then does shutdown print the frame-budget digest.
+                    self.demo_seam_ran |= self.demo_cycle.is_some() || finished;
+                    if finished {
+                        self.demo_cycle = None;
+                        self.demo_finished = true;
+                    }
                 }
                 // Vista discriminator (M004/S02): the single `vista_visible`
                 // truth source — true only for the main-menu cluster. Pause,
@@ -2844,9 +3750,27 @@ impl ApplicationHandler for GameApp {
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
                     if gameplay {
-                        self.session.player.update(dt, &self.input, |x, y, z| {
-                            self.session.world.get_block(x, y, z)
-                        });
+                        // Scripted swim seam (S08-T02): while armed it feeds a
+                        // constructed `InputState` copy through the SAME
+                        // `Player::update` call the real input path uses.
+                        // `self.input` is never mutated, and the seam never runs
+                        // on menu/pause/inventory frames. A finished frame
+                        // latches the bounded-demo shutdown below.
+                        let swim_finished = match self.swim.as_mut() {
+                            Some(demo) => swim_frame(demo, &mut self.session, dt),
+                            None => {
+                                self.session.player.update(dt, &self.input, |x, y, z| {
+                                    self.session.world.get_block(x, y, z)
+                                });
+                                false
+                            }
+                        };
+                        if swim_finished {
+                            self.demo_seam_ran = true;
+                            self.demo_finished = true;
+                            self.exit_failure |=
+                                self.swim.as_ref().map(|demo| demo.failed).unwrap_or(false);
+                        }
                         self.session.camera.position = self.session.player.eye_position();
                         self.session.camera.yaw = self.session.player.yaw;
                         self.session.camera.pitch = self.session.player.pitch;
@@ -2874,7 +3798,16 @@ impl ApplicationHandler for GameApp {
                         self.session.player.position.y.floor() as i32,
                         self.session.player.position.z.floor() as i32,
                     );
-                    let (new_meshes, unloaded) = self.session.world.update_streaming(player_chunk);
+                    // Live season (M007/S05): derived from the persisted
+                    // calendar every frame, so a day rollover starts the
+                    // manager's bounded seasonal rollover wave. `WorldSession::season`
+                    // is the single home for the derivation (and the seam the
+                    // day-boundary test drives): a pure function of
+                    // (day_index, season_length_days, seed), never the wall
+                    // clock.
+                    let season = self.session.season();
+                    let (new_meshes, unloaded) =
+                        self.session.world.update_streaming(player_chunk, season);
                     if !unloaded.is_empty()
                         && self.session.world.has_unsaved_changes()
                         && save_current_world(&mut self.session).is_ok()
@@ -2904,7 +3837,9 @@ impl ApplicationHandler for GameApp {
                         anchor.y.floor() as i32,
                         anchor.z.floor() as i32,
                     );
-                    let (new_meshes, unloaded) = self.vista_world.update_streaming(vista_chunk);
+                    let (new_meshes, unloaded) = self
+                        .vista_world
+                        .update_streaming(vista_chunk, vista::VISTA_SEASON);
                     for upos in unloaded {
                         gpu.vista_store.remove_chunk(upos);
                     }
@@ -3337,6 +4272,8 @@ impl ApplicationHandler for GameApp {
                 let frame_result = if let Some(vista_camera) = vista_camera.as_ref() {
                     // Vista sky is pinned at golden hour: never the world clock
                     // and never `vista_epoch` (that only drifts the camera).
+                    // Weather is pinned Clear inside `vista_sky_params`, so the
+                    // panorama stays byte-identical and never draws precip.
                     let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
@@ -3346,13 +4283,33 @@ impl ApplicationHandler for GameApp {
                         None,
                         self.session.player.selected_slot(),
                         false,
-                        sky_params(palette, daycycle::VISTA_GOLDEN_HOUR),
+                        // Vista frames render the panorama from its own world,
+                        // whose camera anchors over land: never submerged.
+                        vista_sky_params(palette),
                         ui_pass,
                     )
                 } else {
                     // Per-frame palette from the live session clock (pure math,
                     // cheap — same rationale as the per-frame vista camera).
                     let palette = daycycle::sky_palette(self.session.clock.time_of_day);
+                    // Per-frame weather, derived from the persisted calendar
+                    // only: no `Weather` value is cached anywhere, so the
+                    // calendar remains the sole home of the weather state. A
+                    // paused frame renders a frozen clock and therefore frozen
+                    // weather — consistent, with no special case.
+                    let weather = session_weather(&self.session);
+                    // The ambient-audio seam is exercised on every session
+                    // frame and is a deliberate no-op in M007 (MEM227).
+                    weather_ambient_hook(weather);
+                    let palette = daycycle::weather_palette(palette, weather);
+                    // Eye submersion (S04-T03): one bounded block lookup per
+                    // session frame against the live eye position (synced from
+                    // `player.eye_position()` above), never a scan. It flips the
+                    // world-pass fog to the deep-water shift while the camera is
+                    // inside an ocean, and it takes precedence over the weather
+                    // fog compression inside `effective_fog`.
+                    let underwater =
+                        eye_is_submerged(&self.session.world, self.session.camera.position);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
@@ -3361,7 +4318,14 @@ impl ApplicationHandler for GameApp {
                         target_block,
                         self.session.player.selected_slot(),
                         playing,
-                        sky_params(palette, self.session.clock.time_of_day),
+                        sky_params(
+                            palette,
+                            self.session.clock.time_of_day,
+                            underwater,
+                            weather,
+                            daycycle::weather_fog_range_factor(weather),
+                            self.session.clock.cycle_phase(),
+                        ),
                         ui_pass,
                     )
                 };
@@ -3390,13 +4354,14 @@ impl ApplicationHandler for GameApp {
                                 ""
                             };
                             window.set_title(&format!(
-                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
+                                "OpenCraft{} | {} FPS ({:.2} ms) | Chunks: {}/{} | Quads: {} | Water: {} ({} KB VRAM) | Pos: ({:.0}, {:.0}, {:.0}) [{}] | Block [{}]: {} | RD: {} | Seed: {}{}",
                                 screen_title_tag(self.lifecycle.screen()),
                                 fps,
                                 ms,
                                 visible_chunks,
                                 self.session.world.loaded_chunk_count(),
                                 gpu.render_store.total_quads,
+                                gpu.render_store.total_water_quads,
                                 vram_kb,
                                 self.session.player.position.x,
                                 self.session.player.position.y,
@@ -3476,19 +4441,62 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Scripted swim wall-clock safety net (S08-T02): armed only for a
+        // direct-to-gameplay `--demo-swim` launch and deliberately independent
+        // of `time_scale` (the swim runs at the default scale so no seasonal
+        // rollover regenerates terrain mid-crossing). A stalled run latches a
+        // self-describing abort digest and shuts down instead of hanging, so an
+        // external `timeout` kill stays an explicit harness failure rather
+        // than the expected completion path.
+        if !self.demo_finished {
+            if let Some(deadline) = self.swim.as_ref().and_then(|demo| demo.deadline) {
+                if Instant::now() >= deadline {
+                    if let Some(demo) = self.swim.as_mut() {
+                        demo.abort(
+                            "deadline",
+                            &format!("bounded swim run exceeded {SWIM_DEADLINE_SECS}s"),
+                        );
+                    }
+                    self.demo_seam_ran = true;
+                    self.demo_finished = true;
+                    self.exit_failure |=
+                        self.swim.as_ref().map(|demo| demo.failed).unwrap_or(false);
+                }
+            }
+        }
+
         // Bounded accelerated demo completed: the last frame latched
         // `demo_finished`; persist and leave the loop with status 0. Checked
         // here rather than in RedrawRequested because the render region
         // holds disjoint `gpu`/`window` borrows and a whole-`self` shutdown
         // call cannot coexist with them.
         if self.demo_finished {
+            // Two digest lines, only for a bounded demo seam (D086), honoring
+            // the crate's no-logs convention (D006/MEM009). HONESTY NOTE:
+            // default settings request the uncapped `Immediate` present mode
+            // (vsync off), so wall dt measures frame work and the 16.6 ms p95
+            // claim only means what it says at default settings.
+            // Best-effort writes: these diagnostics exist for harnesses that
+            // redirect stdout. A consumer that already closed the pipe must
+            // not panic the process out of its clean demo shutdown.
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            if let Some(line) =
+                frame_budget_digest_for_shutdown(self.demo_seam_ran, &self.frame_budget)
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            if let Some(line) = self.swim.as_ref().and_then(|demo| demo.digest.as_deref()) {
+                let _ = writeln!(stdout, "{line}");
+            }
+            drop(stdout);
             self.shutdown(event_loop);
             return;
         }
 
         // Wall-clock safety net: if redraws stall, the accelerated run still
-        // ends after one cycle plus grace instead of relying on an external
-        // timeout kill.
+        // ends after its configured number of cycles plus grace instead of
+        // relying on an external timeout kill.
         if self
             .demo_shutdown_deadline
             .map(|deadline| Instant::now() >= deadline)
@@ -3542,6 +4550,12 @@ fn main() {
 
     let mut app = GameApp::new(cli, session);
     event_loop.run_app(&mut app).expect("Event loop error");
+    // A failed scripted demo seam (a self-describing swim abort) exits non-zero
+    // so a bounded smoke can distinguish "ran to a verdict and failed" from
+    // "was killed by the harness timeout" (status 124).
+    if app.exit_failure {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -3554,13 +4568,14 @@ mod tests {
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::season::Season;
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
     use opencraft::player::camera::Camera;
     use opencraft::world::persistence::ChunkEditMap;
-    use opencraft::world::terrain::terrain_height_at_seeded;
+    use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
     use glam::IVec3;
 
@@ -3878,13 +4893,20 @@ mod tests {
         ])));
         let scaled = GameApp::new(
             CliConfig::parse_args(["--time-scale", "60"]),
-            WorldSession::new_session(9, PathBuf::from("unused.mcvx")),
+            WorldSession::new_session(9, PathBuf::from("unused.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
         );
         assert_eq!(scaled.lifecycle.screen(), LifecycleScreen::MainMenu);
         assert_eq!(
             scaled.time_scale, 60.0,
             "the CLI scale reaches the app but never forces gameplay"
         );
+        // `--season-length` is a fresh-world parameter, NOT a world intent:
+        // on its own it must not bypass the main menu (same rule as
+        // `--time-scale`).
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--season-length",
+            "4"
+        ])));
         // Every flag together still bypasses (the smoke scripts' launches).
         assert!(cli_has_world_intent(&CliConfig::parse_args([
             "--new",
@@ -3907,7 +4929,10 @@ mod tests {
         let save_path = dir.join(name);
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
-        let app = GameApp::new(cli, WorldSession::new_session(11, save_path));
+        let app = GameApp::new(
+            cli,
+            WorldSession::new_session(11, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+        );
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         app
     }
@@ -4002,12 +5027,14 @@ mod tests {
 
     #[test]
     fn demo_cycle_watch_completes_after_one_full_day_and_never_arms_at_default_scale() {
-        // A normal (1.0x) run is unbounded: the bounded-demo seam never arms.
+        // A normal (1.0x) run is unbounded: the bounded-demo seam never arms,
+        // regardless of the configured demo day count.
         let mut watch = None;
         for time in [0, 6_000, 12_000, 18_000, 23_999] {
             assert!(!observe_demo_cycle(
                 &mut watch,
                 DEFAULT_TIME_SCALE,
+                4,
                 true,
                 time
             ));
@@ -4015,43 +5042,83 @@ mod tests {
         assert!(watch.is_none(), "default scale never starts a demo watch");
 
         // An accelerated run arms on the first Playing frame and completes
-        // only once a full 24,000-tick cycle has been observed.
+        // only once a full 24,000-tick cycle has been observed (the default
+        // one-cycle budget, which `scripts/season_smoke.sh` depends on).
         let mut watch = None;
         let start = daycycle::DEFAULT_TIME_OF_DAY;
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start));
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, start + 12_000));
+        assert!(!observe_demo_cycle(&mut watch, 60.0, 1, true, start));
         assert!(!observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
+            true,
+            start + 12_000
+        ));
+        assert!(!observe_demo_cycle(
+            &mut watch,
+            60.0,
+            1,
             true,
             (start + daycycle::DAY_TICKS - 1) % daycycle::DAY_TICKS
         ));
         assert!(observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             true,
             (start + daycycle::DAY_TICKS) % daycycle::DAY_TICKS
         ));
     }
 
     #[test]
+    fn demo_cycle_watch_multi_day_completes_only_on_the_last_cycle() {
+        // Four days = four summed cycles. `observe` reads `time_of_day`, which
+        // is modulo `DAY_TICKS`, so a frame always contributes a sub-cycle
+        // delta — that is exactly what the real frame loop feeds it. Advance
+        // in quarter-cycle steps and require completion only on the 16th.
+        let start = daycycle::DEFAULT_TIME_OF_DAY;
+        let step = daycycle::DAY_TICKS / 4;
+        let mut watch = DemoCycleWatch::new(start, 4);
+        for quarter in 1..=15 {
+            let time = (start + quarter * step) % daycycle::DAY_TICKS;
+            assert!(
+                !watch.observe(time),
+                "quarter-cycle {quarter} of 16 must not complete a 4-day demo"
+            );
+        }
+        assert!(
+            watch.observe((start + 16 * step) % daycycle::DAY_TICKS),
+            "the fourth full cycle completes a --demo-days 4 demo"
+        );
+
+        // A zero day count can never arm an instantly-complete watch: the
+        // constructor floors the budget at one cycle (CliConfig already
+        // rejects zero, this is the defensive second layer).
+        let mut zero = DemoCycleWatch::new(start, 0);
+        assert!(!zero.observe((start + daycycle::DAY_TICKS - 1) % daycycle::DAY_TICKS));
+        assert!(zero.observe(start));
+    }
+
+    #[test]
     fn demo_cycle_watch_is_wrap_safe_and_ignores_paused_frames() {
-        let mut watch = Some(DemoCycleWatch::new(daycycle::DAY_TICKS - 10));
+        let mut watch = Some(DemoCycleWatch::new(daycycle::DAY_TICKS - 10, 1));
 
         // Paused frames contribute nothing: the real clock is frozen there.
         assert!(!observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             false,
             daycycle::DAY_TICKS - 10
         ));
 
         // 15 ticks across the cycle boundary...
-        assert!(!observe_demo_cycle(&mut watch, 60.0, true, 5));
+        assert!(!observe_demo_cycle(&mut watch, 60.0, 1, true, 5));
         // ...and exactly the remaining ticks complete the full cycle.
         assert!(observe_demo_cycle(
             &mut watch,
             60.0,
+            1,
             true,
             (5 + daycycle::DAY_TICKS - 15) % daycycle::DAY_TICKS
         ));
@@ -4062,6 +5129,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = playing_app(dir.path(), "demo.mcvx");
         app.time_scale = 60.0;
+        assert_eq!(app.demo_days, 1, "no --demo-days keeps the one-cycle demo");
         let start = Instant::now();
 
         // First Playing frame arms both the clock marker and the demo watch.
@@ -4069,6 +5137,7 @@ mod tests {
         assert!(!observe_demo_cycle(
             &mut app.demo_cycle,
             app.time_scale,
+            app.demo_days,
             true,
             app.session.clock.time_of_day
         ));
@@ -4082,6 +5151,7 @@ mod tests {
             finished = observe_demo_cycle(
                 &mut app.demo_cycle,
                 app.time_scale,
+                app.demo_days,
                 true,
                 app.session.clock.time_of_day,
             );
@@ -4096,16 +5166,646 @@ mod tests {
 
     #[test]
     fn accelerated_runs_get_a_bounded_wall_clock_shutdown_deadline() {
-        // Default and slower-than-real scales are unbounded normal runs.
-        assert!(demo_shutdown_deadline(DEFAULT_TIME_SCALE).is_none());
-        assert!(demo_shutdown_deadline(0.5).is_none());
+        // Default and slower-than-real scales are unbounded normal runs, at
+        // every day count.
+        assert!(demo_shutdown_deadline(DEFAULT_TIME_SCALE, 1).is_none());
+        assert!(demo_shutdown_deadline(0.5, 4).is_none());
 
         // 60x: a 20 s cycle plus the 5 s redraw-stall grace.
         let before = Instant::now();
-        let deadline = demo_shutdown_deadline(60.0).expect("accelerated deadline");
+        let deadline = demo_shutdown_deadline(60.0, 1).expect("accelerated deadline");
         let after = Instant::now();
         assert!(deadline >= before + Duration::from_secs(24));
         assert!(deadline <= after + Duration::from_secs(26));
+    }
+
+    #[test]
+    fn demo_shutdown_deadline_scales_with_the_demo_day_count() {
+        // 60x: 20 s per cycle, so 4 days is ~80 s of cycles plus the same 5 s
+        // grace. Measured as a delta from the one-cycle deadline taken first,
+        // so Instant::now() jitter between calls cannot skew the comparison.
+        let one = demo_shutdown_deadline(60.0, 1).expect("one-cycle deadline");
+        let four = demo_shutdown_deadline(60.0, 4).expect("four-cycle deadline");
+        let delta = four.duration_since(one);
+        assert!(
+            delta >= Duration::from_secs(59) && delta <= Duration::from_secs(61),
+            "4 days must add 3 cycles (60 s) to the deadline, got {delta:?}"
+        );
+
+        // Zero never shortens the deadline below one cycle (the constructor
+        // floors it), matching DemoCycleWatch's defensive floor.
+        let zero = demo_shutdown_deadline(60.0, 0).expect("floored deadline");
+        let zero_delta = zero.duration_since(one).as_millis() as i64;
+        assert!(zero_delta.abs() < 100, "zero must behave as one cycle");
+    }
+
+    #[test]
+    fn demo_days_is_a_test_seam_and_never_a_world_intent() {
+        // `--demo-days` alone is not a world intent: a bare launch plus the
+        // flag still opens the main menu over the loaded world, exactly like
+        // a bare launch (so the bounded demo stays a test seam, never a way
+        // to bypass menus).
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let demo = CliConfig::parse_args(["--demo-days", "4"]);
+        assert_eq!(demo.demo_days, 4);
+        assert!(!cli_has_world_intent(&demo));
+        assert_eq!(cli_has_world_intent(&demo), cli_has_world_intent(&bare));
+
+        // Combined with a real world flag the intent is unchanged (the flag
+        // is still what grants direct gameplay entry).
+        let with_new = CliConfig::parse_args(["--new", "--demo-days", "4"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn frame_budget_percentiles_handle_empty_single_and_many_samples() {
+        // Empty: no percentiles, and no misleading all-zero digest line.
+        assert!(frame_budget_stats(&[]).is_none());
+        assert!(format_frame_budget_digest(&[]).is_none());
+
+        // One sample: p50, p95, and max all collapse to that sample.
+        let one = frame_budget_stats(&[Duration::from_millis(7)]).expect("one sample");
+        assert_eq!(one.samples, 1);
+        assert_eq!(one.p50, Duration::from_millis(7));
+        assert_eq!(one.p95, Duration::from_millis(7));
+        assert_eq!(one.max, Duration::from_millis(7));
+
+        // Twenty ordered samples mirror the streaming_budget index math:
+        // round((len - 1) * p).
+        let samples: Vec<Duration> = (1..=20).map(Duration::from_millis).collect();
+        let stats = frame_budget_stats(&samples).expect("twenty samples");
+        assert_eq!(stats.samples, 20);
+        assert_eq!(stats.p50, Duration::from_millis(11), "round(19 * 0.5) = 10");
+        assert_eq!(
+            stats.p95,
+            Duration::from_millis(19),
+            "round(19 * 0.95) = 18"
+        );
+        assert_eq!(stats.max, Duration::from_millis(20));
+
+        // Input order must never change the answer: the helper sorts first.
+        let unsorted = [
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ];
+        let stats = frame_budget_stats(&unsorted).expect("three samples");
+        assert_eq!(stats.p50, Duration::from_millis(2));
+        assert_eq!(stats.max, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn frame_budget_digest_line_is_pinned() {
+        // The format is a contract for scripts/swim_smoke.sh and the milestone
+        // evidence record: changing it must be a deliberate test edit.
+        let samples = [
+            Duration::from_micros(1_234),
+            Duration::from_millis(4),
+            Duration::from_millis(9),
+        ];
+        let line = format_frame_budget_digest(&samples).expect("non-empty sample");
+        assert_eq!(
+            line,
+            "frame_budget: samples=3 p50=4.000ms p95=9.000ms max=9.000ms target: p95<=16.6ms"
+        );
+    }
+
+    #[test]
+    fn frame_budget_sampler_is_capped_and_playing_only() {
+        let mut sampler = FrameBudgetSampler::new();
+        for _ in 0..FRAME_BUDGET_SAMPLE_CAP + 5 {
+            sampler.push(Duration::from_millis(1));
+        }
+        assert_eq!(
+            sampler.len(),
+            FRAME_BUDGET_SAMPLE_CAP,
+            "the sample window is capped so a run left going stays bounded"
+        );
+        let line = sampler.digest().expect("capped sample still summarizes");
+        assert!(
+            line.starts_with(&format!("frame_budget: samples={FRAME_BUDGET_SAMPLE_CAP} ")),
+            "digest reports the retained window: {line}"
+        );
+
+        // Only Playing frames are gameplay work; menu/settings/pause frames
+        // must not pad the milestone claim.
+        let mut sampler = FrameBudgetSampler::new();
+        sample_frame_budget(&mut sampler, false, Duration::from_millis(5));
+        assert_eq!(sampler.len(), 0);
+        sample_frame_budget(&mut sampler, true, Duration::from_millis(5));
+        assert_eq!(sampler.len(), 1);
+    }
+
+    #[test]
+    fn frame_budget_digest_is_gated_on_a_demo_seam() {
+        let mut sampler = FrameBudgetSampler::new();
+        sampler.push(Duration::from_millis(3));
+
+        // A normal run stays log-free (D086/D006/MEM009).
+        assert!(frame_budget_digest_for_shutdown(false, &sampler).is_none());
+        assert!(frame_budget_digest_for_shutdown(true, &sampler).is_some());
+
+        // A demo seam that never rendered a Playing frame has no budget to
+        // report and prints nothing.
+        let empty = FrameBudgetSampler::new();
+        assert!(frame_budget_digest_for_shutdown(true, &empty).is_none());
+    }
+
+    #[test]
+    fn frame_budget_window_resets_on_session_transitions() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/frame-budget-a.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.frame_budget.push(Duration::from_millis(4));
+        app.demo_seam_ran = true;
+        assert_eq!(app.frame_budget.len(), 1);
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/frame-budget-b.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+
+        assert_eq!(
+            app.frame_budget.len(),
+            0,
+            "one digest covers exactly one run/world"
+        );
+        assert!(
+            !app.demo_seam_ran,
+            "the seam flag belongs to the outgoing run"
+        );
+    }
+
+    // ---- Scripted ocean-crossing seam (S08-T02) ----
+
+    /// The pinned route for the smoke seed: seed 12345 starts in an Ocean
+    /// column at the origin and the first land at or above SEA_LEVEL along +Z
+    /// is the far shore S03 swims to.
+    #[test]
+    fn swim_route_pins_the_s03_ocean_crossing() {
+        let route = swim_route(12345).expect("seed 12345 has an ocean crossing on +Z");
+        assert_eq!(route.seed, 12345);
+        assert_eq!(route.ocean_start_z, 0, "the ocean starts at the origin");
+        assert_eq!(route.seabed_height, 14, "pinned by the S01 terrain proof");
+        assert_eq!(route.land_z, 321, "pinned by the S03 crossing proof");
+        assert_eq!(route.distance(), 321);
+        assert_eq!(
+            route.start,
+            Vec3::new(0.5, SEA_LEVEL as f32 + 3.0, 0.5),
+            "the teleport drops the body above the centre of the ocean column"
+        );
+
+        // The route is re-derived from the same pure terrain functions the
+        // generator uses, not from a table.
+        assert_eq!(biome_at_seeded(0, 0, 12345), Biome::Ocean);
+        assert!(terrain_height_at_seeded(0, 321, 12345) >= SEA_LEVEL);
+
+        // Determinism: a second resolution is the same route.
+        assert_eq!(swim_route(12345), Some(route));
+    }
+
+    /// Every resolved route is a real ocean crossing: the start column is
+    /// Ocean below sea level, the land target is the FIRST column at or above
+    /// sea level, and every column in between is still water. A seed without
+    /// one resolves to `None` (the seam's abort path) rather than a route that
+    /// swims at land.
+    #[test]
+    fn swim_route_is_a_valid_ocean_crossing_for_every_seed_it_resolves() {
+        for seed in [0u32, 1, 2, 3, 7, 42, 777, 4242, 12345, 31337, 99_999] {
+            let Some(route) = swim_route(seed) else {
+                continue;
+            };
+            assert_eq!(route.seed, seed);
+            assert_eq!(swim_route(seed), Some(route), "deterministic for {seed}");
+            assert_eq!(
+                biome_at_seeded(0, route.ocean_start_z, seed),
+                Biome::Ocean,
+                "seed {seed}: start column must be Ocean"
+            );
+            assert!(
+                route.seabed_height < SEA_LEVEL,
+                "seed {seed}: seabed {} must be below SEA_LEVEL {SEA_LEVEL}",
+                route.seabed_height
+            );
+            assert!(
+                terrain_height_at_seeded(0, route.land_z, seed) >= SEA_LEVEL,
+                "seed {seed}: land target {} must be at or above SEA_LEVEL",
+                route.land_z
+            );
+            assert!(
+                route.land_z > route.ocean_start_z + 1,
+                "seed {seed}: a crossing needs a multi-column ocean, got {}..{}",
+                route.ocean_start_z,
+                route.land_z
+            );
+            for z in route.ocean_start_z..route.land_z {
+                assert!(
+                    terrain_height_at_seeded(0, z, seed) < SEA_LEVEL,
+                    "seed {seed}: column z={z} inside the route is not water"
+                );
+            }
+        }
+    }
+
+    /// `--demo-swim` teleports the FRESH branch only. A normal fresh launch
+    /// keeps the deterministic spawn rule, and a loaded save is never moved —
+    /// its persisted position is the contract there.
+    #[test]
+    fn swim_cli_flag_teleports_only_the_fresh_world_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swim.mcvx");
+        let path_str = save_path.to_str().expect("utf8 path");
+        let route = swim_route(12345).expect("seed 12345 route");
+
+        // Fresh + flag: teleported onto the route, facing +Z, walking.
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--demo-swim",
+            "--save",
+            path_str,
+        ]);
+        let session = startup_session(&cli);
+        assert_eq!(session.player.position, route.start);
+        assert_eq!(session.player.velocity, Vec3::ZERO);
+        assert_eq!(session.player.yaw, SWIM_YAW);
+        assert_eq!(session.player.pitch, 0.0);
+        assert!(
+            !session.player.fly_mode,
+            "a flying body would never enter the water"
+        );
+        assert!(!session.player.on_ground);
+        assert_eq!(
+            session.camera.position,
+            session.player.eye_position(),
+            "the teleport re-syncs the camera"
+        );
+
+        // Fresh without the flag: the ordinary spawn rule is untouched.
+        let plain = CliConfig::parse_args(["--new", "--seed", "12345", "--save", path_str]);
+        let plain_session = startup_session(&plain);
+        let (spawn_x, spawn_z) = find_spawn_column(12345);
+        assert_eq!(
+            plain_session.player.position,
+            Vec3::new(
+                spawn_x as f32 + 0.5,
+                (terrain_height_at_seeded(spawn_x, spawn_z, 12345) + 4) as f32,
+                spawn_z as f32 + 0.5
+            )
+        );
+        assert!(plain_session.player.fly_mode);
+
+        // Load branch + flag: the persisted position wins, never the teleport.
+        let mut data = sample_save(12345);
+        data.player.position = [100.0, 40.0, -7.0];
+        save_world_to_path(&save_path, &data).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args(["--save", path_str, "--demo-swim"]));
+        assert_eq!(loaded.player.position, Vec3::new(100.0, 40.0, -7.0));
+    }
+
+    /// A synthetic route for the stage-watcher tests (the same pinned geometry
+    /// as seed 12345, without allocating a world).
+    fn test_swim_route() -> SwimRoute {
+        SwimRoute {
+            seed: 12345,
+            start: Vec3::new(0.5, SEA_LEVEL as f32 + 3.0, 0.5),
+            ocean_start_z: 0,
+            land_z: 321,
+            seabed_height: 14,
+        }
+    }
+
+    /// Asserts a scripted input copy is the idle default (no key held).
+    fn assert_swim_idle(input: InputState, why: &str) {
+        assert!(
+            !input.forward
+                && !input.backward
+                && !input.left
+                && !input.right
+                && !input.jump_or_up
+                && !input.crouch_or_down
+                && !input.sprint,
+            "expected an idle scripted input: {why}"
+        );
+    }
+
+    /// The stage watcher walks the D087 phases in order, refuses to skip a
+    /// phase, and reports each stage's own budget as its abort stage.
+    #[test]
+    fn swim_watch_advances_through_entry_sink_rise_crossing_and_landing() {
+        let route = test_swim_route();
+        let mut watch = SwimWatch::new(route);
+        assert_eq!(watch.stage.name(), "entry");
+        assert_swim_idle(watch.input(Vec3::new(0.5, 24.5, 0.5)), "entry is idle");
+
+        // Entry: above the water and not in it. It cannot advance by itself.
+        for _ in 0..30 {
+            assert_eq!(
+                watch.observe(1.0 / 60.0, Vec3::new(0.5, 24.5, 0.5), false, false),
+                SwimProgress::Continue
+            );
+        }
+        assert_eq!(watch.stage.name(), "entry");
+
+        // Feet in water -> sink (idle input: D087 water must sink the body).
+        assert_eq!(
+            watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true),
+            SwimProgress::Continue
+        );
+        assert_eq!(watch.stage.name(), "sink");
+        assert_swim_idle(
+            watch.input(Vec3::new(0.5, 22.2, 0.5)),
+            "sink is idle so gravity is the only vertical force",
+        );
+
+        // Sink budget: the idle body descends away from the surface.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true),
+            SwimProgress::Continue
+        );
+        assert_eq!(watch.stage.name(), "rise");
+        let rise_input = watch.input(Vec3::new(0.5, 20.5, 0.5));
+        assert!(rise_input.jump_or_up, "rise holds jump_or_up");
+        assert!(!rise_input.forward, "rise does not swim forward yet");
+
+        // Rise clears the water surface.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false),
+            SwimProgress::Continue
+        );
+        assert_eq!(watch.stage.name(), "crossing");
+        let crossing_input = watch.input(Vec3::new(0.5, 23.4, 0.5));
+        assert!(crossing_input.forward, "crossing swims forward");
+        assert!(
+            !crossing_input.jump_or_up,
+            "above the water top the cadence releases Jump"
+        );
+        assert!(
+            watch.input(Vec3::new(0.5, 22.9, 0.5)).jump_or_up,
+            "at or below the water top the cadence engages Jump"
+        );
+
+        // Crossing: short of the shore is not a landing; reaching the far-shore
+        // column standing above SEA_LEVEL is.
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 22.9, 300.5), false, true),
+            SwimProgress::Continue
+        );
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 22.9, 321.5), false, true),
+            SwimProgress::Continue,
+            "standing in water at the shore column is not a landing"
+        );
+        assert_eq!(
+            watch.observe(1.0, Vec3::new(0.5, 23.0, 321.5), true, false),
+            SwimProgress::Landed
+        );
+        assert_eq!(watch.stage.name(), "landed");
+        assert_eq!(
+            watch.digest(),
+            "swim_demo: seed=12345 axis=+Z distance=321 frames=36 sink=22.500->20.500 \
+             rise=23.400 landed=true"
+        );
+    }
+
+    /// Every stage budget is a hard abort that names its own stage and the
+    /// values observed there, instead of waiting forever.
+    #[test]
+    fn swim_watch_aborts_name_the_stage_that_stalled() {
+        let route = test_swim_route();
+
+        // Entry: never becomes water.
+        let mut watch = SwimWatch::new(route);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..11 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 24.5, 0.5), false, false);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "entry");
+                assert!(
+                    observed.contains("feet block never became water"),
+                    "{observed}"
+                );
+                assert!(observed.contains("y=24.500"), "{observed}");
+            }
+            other => panic!("expected an entry abort, got {other:?}"),
+        }
+
+        // Entry: sinks through the seabed margin (the pre-swim bug).
+        let mut watch = SwimWatch::new(route);
+        let progress = watch.observe(1.0 / 60.0, Vec3::new(0.5, 15.5, 0.5), false, false);
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "entry");
+                assert!(observed.contains("seabed"), "{observed}");
+            }
+            other => panic!("expected an entry seabed abort, got {other:?}"),
+        }
+
+        // Sink: touching ground is the seabed-walking bug.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        match watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), true, true) {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "sink");
+                assert!(observed.contains("touched ground"), "{observed}");
+            }
+            other => panic!("expected a sink abort, got {other:?}"),
+        }
+
+        // Sink: an idle body that barely moves is the rejected surface lock.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        match watch.observe(1.0, Vec3::new(0.5, 22.2, 0.5), false, true) {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "sink");
+                assert!(observed.contains("only dropped"), "{observed}");
+                assert!(observed.contains("D087"), "{observed}");
+            }
+            other => panic!("expected a sink drop abort, got {other:?}"),
+        }
+
+        // Rise: jump_or_up never clears the surface.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..3 {
+            progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 0.5), false, true);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "rise");
+                assert!(
+                    observed.contains("never cleared the water surface"),
+                    "{observed}"
+                );
+            }
+            other => panic!("expected a rise abort, got {other:?}"),
+        }
+
+        // Crossing: touching ground before the far shore is the seabed-walking bug.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
+        match watch.observe(1.0, Vec3::new(0.5, 20.5, 40.5), true, true) {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "crossing");
+                assert!(observed.contains("inside the water column"), "{observed}");
+            }
+            other => panic!("expected a crossing ground abort, got {other:?}"),
+        }
+
+        // Crossing: never reaches the far shore.
+        let mut watch = SwimWatch::new(route);
+        watch.observe(1.0 / 60.0, Vec3::new(0.5, 22.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 20.5, 0.5), false, true);
+        watch.observe(1.0, Vec3::new(0.5, 23.4, 0.5), false, false);
+        let mut progress = SwimProgress::Continue;
+        for _ in 0..(SWIM_CROSSING_SECS as usize + 1) {
+            progress = watch.observe(1.0, Vec3::new(0.5, 22.9, 40.5), false, true);
+        }
+        match progress {
+            SwimProgress::Aborted { stage, observed } => {
+                assert_eq!(stage, "crossing");
+                assert!(
+                    observed.contains("never stood on the far shore"),
+                    "{observed}"
+                );
+                assert!(observed.contains("z>=321"), "{observed}");
+            }
+            other => panic!("expected a crossing abort, got {other:?}"),
+        }
+    }
+
+    /// The panic-free `swim_frame` plumbing: with no world chunks resident the
+    /// seam must WAIT (no scripted input, no premature fall, no stage time
+    /// charged), and once the ocean column streams in it runs the real player
+    /// physics and arms the watcher. `SwimDemo::abort` keeps the self-describing
+    /// digest contract (the stage-level cases are pinned separately).
+    #[test]
+    fn swim_frame_waits_for_the_ocean_then_latches_a_self_describing_abort() {
+        let route = test_swim_route();
+        let save_path = PathBuf::from("/nonexistent/swim-plumbing.mcvx");
+        let mut session = WorldSession::new_session(12345, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        arm_swim_route(&mut session, route);
+        let mut demo = SwimDemo::new(12345, Some(route), None);
+
+        // Nothing is resident yet: `get_block` answers Air, so the seam holds
+        // the player at the teleport instead of falling through the gap. This
+        // is the fix for the stalled-crossing failure: a mid-run streaming gap
+        // must wait, never silently drop the water branch.
+        for _ in 0..10 {
+            assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        }
+        assert!(
+            demo.watch.is_none(),
+            "the watcher arms only over real water"
+        );
+        assert_eq!(session.player.position, route.start);
+        assert!(!demo.failed, "waiting for a chunk is not a failure");
+
+        // Pump the headless streaming queue (same bounded pump the manager's
+        // regeneration tests use) until the spawn column is resident.
+        let origin = ChunkPos::new(0, 0, 0);
+        for _ in 0..400 {
+            if session.world.get_block(0, SEA_LEVEL, route.ocean_start_z) == BlockId::Water {
+                break;
+            }
+            session.world.update_streaming(origin, Season::Summer);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            session.world.get_block(0, SEA_LEVEL, route.ocean_start_z),
+            BlockId::Water,
+            "the spawn column's ocean must stream in for this test to be meaningful"
+        );
+
+        // With water resident the seam runs the production physics: the body
+        // falls from above the surface and the watcher arms over the ocean.
+        assert!(!swim_frame(&mut demo, &mut session, 1.0 / 60.0));
+        assert!(demo.watch.is_some(), "the watcher arms over real water");
+        assert!(
+            session.player.position.y < route.start.y,
+            "the seam moved the real player"
+        );
+
+        // The digest contract: a latched abort names the seed/axis/route and
+        // flags the run as failed so `main` exits non-zero.
+        demo.watch = Some(SwimWatch::new(route));
+        demo.abort("entry", "synthetic abort for the digest contract");
+        assert!(demo.failed, "a self-describing abort is a failure");
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(
+            digest.starts_with("swim_demo: seed=12345 axis=+Z distance=321"),
+            "{digest}"
+        );
+        assert!(digest.contains("landed=false"), "{digest}");
+        assert!(digest.contains("stage=entry"), "{digest}");
+    }
+
+    /// The seam is launch state, not session state: swapping worlds from the
+    /// menu retires it (and a menu-first launch arms no wall-clock deadline).
+    #[test]
+    fn swim_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swim-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--demo-swim",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        let demo = app.swim.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 12345);
+        assert!(demo.route.is_some());
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay swim carries its 360s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.swim.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // A menu-first launch (`--demo-swim` alone) arms the seam without a
+        // deadline: the swim only bounds once gameplay actually owns frames.
+        let menu_cli = CliConfig::parse_args(["--demo-swim"]);
+        let menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                12345,
+                PathBuf::from("/nonexistent/menu-swim.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(menu_app
+            .swim
+            .as_ref()
+            .expect("seam armed")
+            .deadline
+            .is_none());
     }
 
     #[test]
@@ -4133,6 +5833,234 @@ mod tests {
         assert_eq!(relaunched.save_path, save_path);
     }
 
+    #[test]
+    fn accelerated_demo_cycle_saves_and_reloads_day_index_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("calendar.mcvx");
+        let mut app = playing_app(dir.path(), "calendar.mcvx");
+        app.time_scale = 60.0;
+        app.session.season_length_days = 4;
+        let start = Instant::now();
+
+        // The same frame loop the bounded demo runs: one full cycle at 60x
+        // takes 20 simulated seconds (24,000 ticks / 1,200 per second).
+        tick_app_clock(&mut app, start);
+        assert!(!observe_demo_cycle(
+            &mut app.demo_cycle,
+            app.time_scale,
+            app.demo_days,
+            true,
+            app.session.clock.time_of_day
+        ));
+        let mut finished = false;
+        let mut frames = 0;
+        while frames < 25 && !finished {
+            frames += 1;
+            tick_app_clock(&mut app, start + Duration::from_secs(frames));
+            finished = observe_demo_cycle(
+                &mut app.demo_cycle,
+                app.time_scale,
+                app.demo_days,
+                true,
+                app.session.clock.time_of_day,
+            );
+        }
+        assert!(finished, "the accelerated demo must complete one cycle");
+
+        // From the default noon start, one full cycle returns the clock to
+        // noon and crosses dawn (tick 0) exactly once: day index 1.
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+        assert_eq!(app.session.clock.day_index, 1);
+
+        // The demo's shutdown save persists the calendar tail; the reload
+        // restores both fields byte-exactly.
+        save_current_world(&mut app.session).expect("demo shutdown save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.day_index, 1);
+        assert_eq!(loaded.season_length_days, 4);
+        let relaunched = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(relaunched.clock.day_index, 1);
+        assert_eq!(relaunched.season_length_days, 4);
+    }
+
+    /// S06-T05: the demo seam itself. One accelerated session with
+    /// `--demo-days 4` spans the whole seed-1 year (Rain -> Clear -> Rain ->
+    /// Snowfall), proving the multi-cycle budget delivers what the slice demo
+    /// claims: warm-season rain and winter snowfall in a single run, with the
+    /// default one-cycle bound untouched (see
+    /// `accelerated_demo_cycle_saves_and_reloads_day_index_one`).
+    #[test]
+    fn four_day_demo_spans_the_seed_one_year_in_one_accelerated_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("year.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-days",
+            "4",
+            "--time-scale",
+            "60",
+        ]);
+        // Seed 1 at one-day seasons is the slice's demo calendar.
+        let session = WorldSession::new_session(1, save_path.clone(), 1);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.demo_days, 4, "the flag reaches the app");
+        assert_eq!(app.time_scale, 60.0);
+        let start = Instant::now();
+
+        // 4 days x 20 simulated seconds at 60x = 80 real seconds. The season
+        // packet must be re-derived per frame from the persisted calendar, so
+        // sampling it after each day boundary is the honest presentation path.
+        tick_app_clock(&mut app, start);
+        assert!(!observe_demo_cycle(
+            &mut app.demo_cycle,
+            app.time_scale,
+            app.demo_days,
+            true,
+            app.session.clock.time_of_day
+        ));
+
+        let expected = [
+            Weather::Rain,
+            Weather::Clear,
+            Weather::Rain,
+            Weather::Snowfall,
+        ];
+        let mut seen = vec![(app.session.clock.day_index, session_weather(&app.session))];
+        let mut finished = false;
+        let mut frames = 0;
+        while frames < 85 && !finished {
+            frames += 1;
+            tick_app_clock(&mut app, start + Duration::from_secs(frames));
+            finished = observe_demo_cycle(
+                &mut app.demo_cycle,
+                app.time_scale,
+                app.demo_days,
+                true,
+                app.session.clock.time_of_day,
+            );
+            let sample = (app.session.clock.day_index, session_weather(&app.session));
+            if seen.last() != Some(&sample) {
+                seen.push(sample);
+            }
+            // The watch must not latch before the fourth cycle completes.
+            if frames < 80 {
+                assert!(
+                    !finished,
+                    "a 4-day demo must not finish after {frames} simulated seconds"
+                );
+            }
+        }
+
+        assert!(finished, "the 4-day demo must complete");
+        assert_eq!(frames, 80, "4 days x 20 simulated seconds at 60x");
+        assert_eq!(app.session.clock.day_index, 4);
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+
+        // Each day of the seed-1 year was presented, in order, exactly once
+        // (day 4 wraps back to Spring's Rain, so it closes the pattern).
+        let days: Vec<(u32, Weather)> = seen.clone();
+        assert_eq!(
+            days,
+            vec![
+                (0, expected[0]),
+                (1, expected[1]),
+                (2, expected[2]),
+                (3, expected[3]),
+                (4, expected[0]),
+            ],
+            "one session must present the whole seed-1 year"
+        );
+
+        // The shutdown save persists the four-day calendar tail, so an
+        // accelerated year is resumable like any other session.
+        save_current_world(&mut app.session).expect("demo shutdown save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.day_index, 4);
+        assert_eq!(loaded.season_length_days, 1);
+    }
+
+    /// Accelerated day-boundary clock proof (M007/S05): a real `GameApp`
+    /// session whose `GameClock` crosses `DAY_BOUNDARY_TICK` at the
+    /// `--time-scale` seam derives Winter through `WorldSession::season`, the
+    /// exact method the Playing frame loop calls. The resident worldgen that
+    /// follows the season is proven separately in the lib-side
+    /// `world::manager` day-boundary test, where the global rayon pool can be
+    /// serialised and drained without starving sibling bin tests.
+    #[test]
+    fn accelerated_day_boundary_flips_the_session_season_to_winter() {
+        use opencraft::world::season::FIRST_WINTER_DAY;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("day-boundary.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        // Seed 1 starts in Spring, so day 3 is Winter at one-day seasons.
+        let mut app = GameApp::new(cli, WorldSession::new_session(1, save_path, 1));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        app.time_scale = 60.0;
+
+        // Day 2 is Autumn for seed 1. Start just before the day boundary so a
+        // single accelerated frame crosses it.
+        app.session.clock =
+            opencraft::world::daycycle::GameClock::from_day_and_time(2, daycycle::DAY_TICKS - 10);
+        assert_eq!(app.session.season(), Season::Autumn);
+
+        let start = Instant::now();
+        // Arm the clock marker; the next accelerated frame advances 1,200 ticks
+        // (1 real second at 60x), crossing DAY_BOUNDARY_TICK.
+        tick_app_clock(&mut app, start);
+        tick_app_clock(&mut app, start + Duration::from_secs(1));
+
+        assert_eq!(
+            app.session.clock.day_index, FIRST_WINTER_DAY,
+            "test premise: seed 1 at one-day seasons reaches Winter on day 3"
+        );
+        assert_eq!(
+            app.session.clock.time_of_day,
+            (daycycle::DAY_TICKS - 10 + 1_200) % daycycle::DAY_TICKS
+        );
+        assert_eq!(
+            app.session.season(),
+            Season::Winter,
+            "the real clock crossing must feed Winter into the session's season derivation"
+        );
+    }
+
+    #[test]
+    fn startup_session_honors_season_length_on_the_fresh_world_branch_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh_path = dir.path().join("fresh.mcvx");
+        let path_str = fresh_path.to_str().expect("utf8 path");
+
+        // Fresh branch: the CLI seam overrides the default season length.
+        let cli = CliConfig::parse_args(["--new", "--save", path_str, "--season-length", "4"]);
+        let session = startup_session(&cli);
+        assert_eq!(session.season_length_days, 4);
+        assert_eq!(session.clock.day_index, 0, "fresh worlds start on day 0");
+
+        // ...and the default applies when the flag is absent.
+        let bare_fresh = CliConfig::parse_args(["--new", "--save", path_str]);
+        assert_eq!(
+            startup_session(&bare_fresh).season_length_days,
+            DEFAULT_SEASON_LENGTH_DAYS
+        );
+
+        // Load branch: a persisted calendar wins over the launch flag.
+        let mut data = sample_save(42);
+        data.day_index = 3;
+        data.season_length_days = 8;
+        save_world_to_path(&fresh_path, &data).expect("write calendar save");
+        let load_cli = CliConfig::parse_args(["--save", path_str, "--season-length", "2"]);
+        let loaded = startup_session(&load_cli);
+        assert_eq!(loaded.clock.day_index, 3, "persisted day index wins");
+        assert_eq!(
+            loaded.season_length_days, 8,
+            "a load ignores --season-length"
+        );
+    }
+
     /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,
     /// and the given screen entered through the real `enter_screen` path
     /// (LoadGame entry refreshes rows from the tempdir catalog).
@@ -4140,7 +6068,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.catalog = WorldCatalogFs::new(saves_dir);
         app.enter_screen(screen);
@@ -4631,7 +6563,8 @@ mod tests {
     #[test]
     fn mining_collects_broken_blocks_into_the_hotbar() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(7, dir.path().join("mined.mcvx"));
+        let mut session =
+            WorldSession::new_session(7, dir.path().join("mined.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
         let (first, wear) = applied_break(break_mined_block(
@@ -4671,7 +6604,8 @@ mod tests {
     #[test]
     fn mining_collects_the_pre_break_block_not_the_now_air_cell() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(8, dir.path().join("ore.mcvx"));
+        let mut session =
+            WorldSession::new_session(8, dir.path().join("ore.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         session
             .world
@@ -4697,7 +6631,11 @@ mod tests {
     #[test]
     fn mining_an_unloaded_chunk_collects_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(9, dir.path().join("missing.mcvx"));
+        let mut session = WorldSession::new_session(
+            9,
+            dir.path().join("missing.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
 
         let outcome = break_mined_block(&mut session, IVec3::new(80, 10, 0), BlockId::Stone);
 
@@ -4716,7 +6654,8 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(11, dir.path().join("loop.mcvx"));
+        let mut session =
+            WorldSession::new_session(11, dir.path().join("loop.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(0.5, 10.0, 0.5);
@@ -4876,7 +6815,11 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        let mut session = WorldSession::new_session(
+            12,
+            dir.path().join("reject.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
 
         let mut slots = [None; INVENTORY_SLOTS];
@@ -4940,7 +6883,11 @@ mod tests {
         use opencraft::player::physics::Player;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(13, dir.path().join("last-use.mcvx"));
+        let mut session = WorldSession::new_session(
+            13,
+            dir.path().join("last-use.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -4995,7 +6942,8 @@ mod tests {
     fn hotbar_stacks_survive_save_and_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("stacks.mcvx");
-        let mut session = WorldSession::new_session(4242, save_path.clone());
+        let mut session =
+            WorldSession::new_session(4242, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         session.player.collect_block(BlockId::CoalOre);
         session.player.collect_block(BlockId::IronOre);
         assert!(session.player.select_slot(1));
@@ -5024,7 +6972,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("full.mcvx");
-        let mut session = WorldSession::new_session(909, save_path.clone());
+        let mut session =
+            WorldSession::new_session(909, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
 
         let mut slots = [None; INVENTORY_SLOTS];
         slots[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"));
@@ -5095,7 +7044,11 @@ mod tests {
     #[test]
     fn placing_the_selected_stack_consumes_exactly_one_item() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(10, dir.path().join("place.mcvx"));
+        let mut session = WorldSession::new_session(
+            10,
+            dir.path().join("place.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
@@ -5120,7 +7073,11 @@ mod tests {
     #[test]
     fn placement_rejects_empty_slots_and_player_overlap_without_consuming() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(12, dir.path().join("reject.mcvx"));
+        let mut session = WorldSession::new_session(
+            12,
+            dir.path().join("reject.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         session.player.position = Vec3::new(5.5, 10.0, 5.5);
@@ -5174,7 +7131,11 @@ mod tests {
     #[test]
     fn right_click_on_a_placed_table_opens_without_placing_or_consuming() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(20, dir.path().join("table.mcvx"));
+        let mut session = WorldSession::new_session(
+            20,
+            dir.path().join("table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5213,7 +7174,11 @@ mod tests {
     #[test]
     fn right_click_on_a_table_opens_even_with_an_empty_selected_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(21, dir.path().join("table-empty.mcvx"));
+        let mut session = WorldSession::new_session(
+            21,
+            dir.path().join("table-empty.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5234,7 +7199,11 @@ mod tests {
     #[test]
     fn right_click_on_a_non_table_falls_through_to_placement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(22, dir.path().join("fallback.mcvx"));
+        let mut session = WorldSession::new_session(
+            22,
+            dir.path().join("fallback.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5267,7 +7236,11 @@ mod tests {
     #[test]
     fn right_click_on_air_opens_and_places_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(23, dir.path().join("air-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            23,
+            dir.path().join("air-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
         session.player.collect_block(BlockId::Stone);
@@ -5291,7 +7264,11 @@ mod tests {
     #[test]
     fn right_click_placement_fallback_with_an_empty_slot_mutates_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(24, dir.path().join("empty-slot.mcvx"));
+        let mut session = WorldSession::new_session(
+            24,
+            dir.path().join("empty-slot.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5312,7 +7289,11 @@ mod tests {
     #[test]
     fn a_replaced_table_closes_the_open_state_and_falls_through_to_placement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(25, dir.path().join("replaced.mcvx"));
+        let mut session = WorldSession::new_session(
+            25,
+            dir.path().join("replaced.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5346,7 +7327,11 @@ mod tests {
     #[test]
     fn a_placed_crafting_table_can_then_be_targeted_and_opened() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(26, dir.path().join("place-then-open.mcvx"));
+        let mut session = WorldSession::new_session(
+            26,
+            dir.path().join("place-then-open.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
         aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
@@ -5436,7 +7421,11 @@ mod tests {
     #[test]
     fn a_targeted_table_click_opens_table_mode_and_is_cleared_on_close() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(31, dir.path().join("ui-table.mcvx"));
+        let mut session = WorldSession::new_session(
+            31,
+            dir.path().join("ui-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -5470,7 +7459,11 @@ mod tests {
     #[test]
     fn table_targets_are_rejected_without_a_live_table() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(32, dir.path().join("stale-table.mcvx"));
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("stale-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
         // Attached, but the session has no live table: mode falls back to Player.
@@ -5499,7 +7492,11 @@ mod tests {
     #[test]
     fn apply_inventory_click_moves_a_slot_stack_without_touching_world_or_selection() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(33, dir.path().join("slot-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("slot-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
@@ -5525,7 +7522,11 @@ mod tests {
     #[test]
     fn apply_inventory_right_click_splits_a_stack_and_places_one_in_the_grid() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(35, dir.path().join("right-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            35,
+            dir.path().join("right-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         for _ in 0..5 {
             session.player.collect_block(BlockId::OakPlanks);
         }
@@ -5590,7 +7591,11 @@ mod tests {
     #[test]
     fn apply_inventory_click_crafts_once_and_the_second_click_is_no_recipe() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(34, dir.path().join("craft-click.mcvx"));
+        let mut session = WorldSession::new_session(
+            34,
+            dir.path().join("craft-click.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::OakLog);
         let mut screen = InventoryScreen::new();
         screen.open_player();
@@ -5707,7 +7712,11 @@ mod tests {
     #[test]
     fn a_press_release_on_the_same_slot_leaves_the_stack_on_the_cursor() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(35, dir.path().join("same-cell.mcvx"));
+        let mut session = WorldSession::new_session(
+            35,
+            dir.path().join("same-cell.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
         screen.open_player();
@@ -5727,7 +7736,8 @@ mod tests {
     #[test]
     fn a_press_drag_release_between_slots_moves_and_conserves_the_whole_stack() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(36, dir.path().join("drag.mcvx"));
+        let mut session =
+            WorldSession::new_session(36, dir.path().join("drag.mcvx"), DEFAULT_SEASON_LENGTH_DAYS);
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
@@ -5763,7 +7773,11 @@ mod tests {
     #[test]
     fn dragging_into_a_table_cell_without_a_live_table_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(37, dir.path().join("table-drag.mcvx"));
+        let mut session = WorldSession::new_session(
+            37,
+            dir.path().join("table-drag.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session.player.collect_block(BlockId::Stone);
         session.player.collect_block(BlockId::Stone);
         let mut screen = InventoryScreen::new();
@@ -5800,7 +7814,11 @@ mod tests {
     #[test]
     fn drag_arms_only_when_the_cursor_was_empty_before_the_press() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(38, dir.path().join("drag-arm.mcvx"));
+        let mut session = WorldSession::new_session(
+            38,
+            dir.path().join("drag-arm.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         // Two different block ids sit in slots 0 and 1, so a press on slot 1
         // while holding slot 0's stack is a genuine swap (not a merge).
         session.player.collect_block(BlockId::Stone);
@@ -6177,7 +8195,11 @@ mod tests {
     #[test]
     fn placed_table_mode_reaches_cell_fifteen_through_clicks() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(41, dir.path().join("table-4x4.mcvx"));
+        let mut session = WorldSession::new_session(
+            41,
+            dir.path().join("table-4x4.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         session
             .world
@@ -6246,7 +8268,11 @@ mod tests {
     #[test]
     fn station_invalidated_between_redraws_rejects_or_closes_the_panel() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = WorldSession::new_session(47, dir.path().join("stale-station.mcvx"));
+        let mut session = WorldSession::new_session(
+            47,
+            dir.path().join("stale-station.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
         let table_pos = IVec3::new(0, 5, 0);
         session.world.set_block_immediate(
@@ -6404,7 +8430,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("ui-inert.mcvx");
-        let mut session = WorldSession::new_session(42, save_path.clone());
+        let mut session =
+            WorldSession::new_session(42, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
         // Two separate stacks: slot 0 is selected and must never be touched by
         // a click on the unrelated slot 1.
@@ -6479,16 +8506,45 @@ mod tests {
         assert_eq!(app.session.world.seed(), expected_seed);
         // The session owns the catalog-validated saves/<Name>.mcvx path.
         assert_eq!(app.session.save_path, dir.path().join("Deep Dark.mcvx"));
-        // The player spawns on the resolved seed's terrain (the session
-        // was built via session::new_session, not the old one).
-        let expected_y = (terrain_height_at_seeded(0, 0, expected_seed) + 4) as f32;
-        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        // The player spawns on the resolved seed's land-search column (the
+        // session was built via session::new_session, not the old one), 4
+        // blocks above the surface.
+        let (spawn_x, spawn_z) = find_spawn_column(expected_seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, expected_seed) + 4) as f32;
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
         // Playing semantics: cursor grabbed, no form message.
         assert!(app.cursor_grabbed);
         assert!(app.new_game.message().is_none());
         // No save is written at create time — persistence rides the
         // normal save sites once the world accumulates state.
         assert!(!dir.path().join("Deep Dark.mcvx").exists());
+    }
+
+    #[test]
+    fn new_game_season_length_row_feeds_the_session_it_creates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Slow Seasons".into()));
+        // Default create: one game day per season, matching persistence.
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.season_length_days, 1);
+
+        // Cycling the row twice (1 -> 2 -> 4) before Create is what the
+        // new session persists; the row's value is the single source.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Long Seasons".into()));
+        assert_eq!(app.new_game.cycle_season_length(), 2);
+        assert_eq!(app.new_game.cycle_season_length(), 4);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.season_length_days, 4);
     }
 
     #[test]
@@ -6506,8 +8562,12 @@ mod tests {
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.save_path, dir.path().join("Blank Seed.mcvx"));
         let seed = app.session.world.seed();
-        let expected_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-        assert_eq!(app.session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        assert_eq!(
+            app.session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
     }
 
     #[test]
@@ -6649,12 +8709,15 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, blocker.join("deep.mcvx")));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, blocker.join("deep.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         // An unsaved chunk edit: the flag the failure must preserve.
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -6700,11 +8763,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("kept.mcvx");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -6739,11 +8805,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("menu-return.mcvx");
         let cli = CliConfig::parse_args(Vec::<String>::new());
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+        );
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -6784,7 +8853,10 @@ mod tests {
         // Bare CliConfig: GameApp::new starts at the main menu over the
         // loaded default session (the same S03 test pattern as the
         // SaveAndQuit tests).
-        let mut app = GameApp::new(cli, WorldSession::new_session(9, save_path.clone()));
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(9, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+        );
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
         // Inject the settings save path AFTER construction (runtime keeps
         // DEFAULT_SETTINGS_PATH; the test points it at the tempdir).
@@ -6794,7 +8866,7 @@ mod tests {
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
         app.session
             .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9));
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 9, Season::Summer));
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -6836,7 +8908,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         assert_eq!(app.session.world.seed(), 1);
         assert_eq!(
@@ -6855,6 +8931,7 @@ mod tests {
         app.start_world_session(WorldSession::new_session(
             42,
             PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
         ));
 
         assert_eq!(app.session.world.seed(), 42, "seed swapped");
@@ -6863,11 +8940,12 @@ mod tests {
             PathBuf::from("/nonexistent/replacement.mcvx"),
             "save path swapped"
         );
-        let expected_y = (terrain_height_at_seeded(0, 0, 42) + 4) as f32;
+        let (spawn_x, spawn_z) = find_spawn_column(42);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 42) + 4) as f32;
         assert_eq!(
             app.session.player.position,
-            Vec3::new(0.5, expected_y, 0.5),
-            "player swapped to the new world's spawn"
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5),
+            "player swapped to the new world's land-search spawn"
         );
         assert_eq!(
             app.session.camera.position,
@@ -6895,7 +8973,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.left_mouse_held = true;
         app.mining.tick(
@@ -6923,7 +9005,11 @@ mod tests {
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut app = GameApp::new(
             cli,
-            WorldSession::new_session(1, PathBuf::from("/nonexistent/initial.mcvx")),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
         );
         app.left_mouse_held = true;
         app.mining.tick(
@@ -6935,6 +9021,7 @@ mod tests {
         app.start_world_session(WorldSession::new_session(
             42,
             PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
         ));
 
         assert!(!app.left_mouse_held, "held latch cleared on session swap");
@@ -6985,10 +9072,11 @@ mod tests {
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), 777);
         assert_eq!(session.save_path, missing);
-        let expected_y = (terrain_height_at_seeded(0, 0, 777) + 4) as f32;
+        let (spawn_x, spawn_z) = find_spawn_column(777);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 777) + 4) as f32;
         assert_eq!(
             session.player.position,
-            Vec3::new(0.5, expected_y, 0.5),
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5),
             "spawn mirrors main()'s fresh branch"
         );
 
@@ -7006,10 +9094,11 @@ mod tests {
         let cli = CliConfig::parse_args(["--save", corrupt.to_str().unwrap()]);
         let session = startup_session(&cli);
         assert_eq!(session.world.seed(), DEFAULT_WORLD_SEED);
+        let (default_x, default_z) = find_spawn_column(DEFAULT_WORLD_SEED);
         assert_eq!(
             session.player.position.y,
-            (terrain_height_at_seeded(0, 0, DEFAULT_WORLD_SEED) + 4) as f32,
-            "corrupt save falls back to the default-seed spawn"
+            (terrain_height_at_seeded(default_x, default_z, DEFAULT_WORLD_SEED) + 4) as f32,
+            "corrupt save falls back to the default-seed land-search spawn"
         );
 
         // --new forces a fresh session even when a save file exists
@@ -7024,8 +9113,12 @@ mod tests {
             5,
             "force_new ignores the existing save"
         );
-        let expected_y = (terrain_height_at_seeded(0, 0, 5) + 4) as f32;
-        assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let (spawn_x, spawn_z) = find_spawn_column(5);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, 5) + 4) as f32;
+        assert_eq!(
+            session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
         assert_eq!(session.save_path, existing);
     }
 
@@ -7056,9 +9149,10 @@ mod tests {
         // unsaved changes), and move the player / pick a hotbar slot so
         // the edited-time player state must survive the round trip.
         let cpos = ChunkPos { x: 0, y: 1, z: 0 };
-        app.session
-            .world
-            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, expected_seed));
+        app.session.world.insert_chunk_for_test(
+            cpos,
+            generate_chunk_seeded(cpos, expected_seed, Season::Summer),
+        );
         app.session
             .world
             .set_block_immediate(0, 40, 5, BlockId::Brick);
@@ -7130,9 +9224,12 @@ mod tests {
 
         // The persisted edit re-applies when the chunk regenerates (the
         // same bounded streaming pump the WorldManager
-        // unload/regeneration test uses — headless, rayon-driven).
-        for _ in 0..40 {
-            app.session.world.update_streaming(cpos);
+        // unload/regeneration test uses — headless, rayon-driven). The retry
+        // window is deliberately generous: this binary runs other streaming
+        // tests in parallel on the shared rayon pool, so a 200 ms window can
+        // miss an otherwise healthy generation result.
+        for _ in 0..400 {
+            app.session.world.update_streaming(cpos, Season::Summer);
             if app.session.world.get_block(0, 40, 5) == BlockId::Brick {
                 break;
             }
@@ -7721,7 +9818,9 @@ mod tests {
             "nothing is resident before the streaming pump runs"
         );
         for _ in 0..120 {
-            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            app.session
+                .world
+                .update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
             if app
                 .session
                 .world
@@ -7747,7 +9846,9 @@ mod tests {
             {
                 break;
             }
-            app.session.world.update_streaming(ChunkPos::new(0, 0, 0));
+            app.session
+                .world
+                .update_streaming(ChunkPos::new(0, 0, 0), Season::Summer);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
@@ -8031,14 +10132,14 @@ mod tests {
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
-            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nCreate World\nBack"
+            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None),
-            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nCreate World\nBack"
+            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
@@ -8231,6 +10332,8 @@ mod tests {
         WorldSaveData {
             seed,
             time_of_day: opencraft::world::daycycle::DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -8339,17 +10442,35 @@ mod tests {
             (0u32, [0.96f32, 0.66, 0.42], [0.92f32, 0.68, 0.48]),
         ];
         for (tick, sky, fog) in cases {
-            let params = sky_params(daycycle::sky_palette(tick), tick);
+            let params = sky_params(
+                daycycle::sky_palette(tick),
+                tick,
+                false,
+                Weather::Clear,
+                daycycle::CLEAR_FOG_RANGE_FACTOR,
+                0.0,
+            );
             assert_eq!(params.time_of_day, tick);
             assert_eq!(params.clear_color.r, sky[0] as f64);
             assert_eq!(params.clear_color.g, sky[1] as f64);
             assert_eq!(params.clear_color.b, sky[2] as f64);
             assert_eq!(params.clear_color.a, 1.0);
             assert_eq!(params.fog_color, [fog[0], fog[1], fog[2], 1.0]);
+            // The Clear identity keeps the pre-S06 dry path unchanged.
+            assert_eq!(params.weather, Weather::Clear);
+            assert_eq!(params.fog_range_factor, 1.0);
+            assert_eq!(params.weather_phase, 0.0);
         }
 
         // The midnight clear/fog must equal the NIGHT keyframe exactly.
-        let midnight = sky_params(daycycle::sky_palette(18_000), 18_000);
+        let midnight = sky_params(
+            daycycle::sky_palette(18_000),
+            18_000,
+            false,
+            Weather::Clear,
+            daycycle::CLEAR_FOG_RANGE_FACTOR,
+            0.0,
+        );
         let night = daycycle::sky_palette(18_000);
         assert_eq!(midnight.clear_color.r, night.sky_color[0] as f64);
         assert_eq!(midnight.clear_color.g, night.sky_color[1] as f64);
@@ -8365,6 +10486,295 @@ mod tests {
         );
         assert_eq!(midnight.day_factor, night.day_factor);
         assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
+    /// S06-T04: session weather is exactly the pure calendar derivation over
+    /// the persisted scalars, never a cache. The seed-1 year at one-day
+    /// seasons is the slice's demo calendar (Rain -> Clear -> Rain ->
+    /// Snowfall), driven across four real `advance_secs` day boundaries.
+    #[test]
+    fn session_weather_derives_the_seed_one_year_from_the_persisted_calendar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("weather-year.mcvx");
+        let mut session = WorldSession::new_session(1, save_path, 1);
+        assert_eq!(session.clock.day_index, 0);
+        assert_eq!(session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+
+        // Hand-derived rolls for seed 1: day 0 Spring roll 18 (< 30) -> Rain;
+        // day 1 Summer roll 25 (>= 20) -> Clear; day 2 Autumn roll 32 (< 35)
+        // -> Rain; day 3 Winter roll 23 (< 40) -> Snowfall.
+        let expected = [
+            Weather::Rain,
+            Weather::Clear,
+            Weather::Rain,
+            Weather::Snowfall,
+        ];
+        for (day, want) in expected.into_iter().enumerate() {
+            let day = day as u32;
+            assert_eq!(
+                session.clock.day_index, day,
+                "test premise: the previous boundary crossed exactly one day"
+            );
+            let derived = session_weather(&session);
+            assert_eq!(derived, want, "day {day} of the seed-1 year");
+            // The session seam must equal the pure derivation exactly: this is
+            // the no-cache invariant, not merely a same-shaped helper.
+            assert_eq!(
+                derived,
+                weather_of(
+                    season_of(
+                        session.clock.day_index,
+                        session.season_length_days,
+                        session.world.seed(),
+                    ),
+                    session.clock.day_index,
+                    session.world.seed(),
+                )
+            );
+            // Cross the next day through the real clock seam: 1,200 real
+            // seconds at scale 1.0 is exactly DAY_TICKS, so the clock lands on
+            // the same time-of-day one day later.
+            session.clock.advance_secs(daycycle::DAY_SECONDS, 1.0);
+        }
+
+        // Day 4 wraps the year back to Spring, so the pattern repeats.
+        assert_eq!(session.clock.day_index, 4);
+        assert_eq!(session_weather(&session), Weather::Rain);
+    }
+
+    /// S06-T04: fixed (seed, season_length, day) calendars all round-trip
+    /// through the session seam. Includes `season_length_days == 0`, which
+    /// persistence clamps but the pure calendar defensively treats as one day.
+    #[test]
+    fn session_weather_matches_the_pure_calendar_for_fixed_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (0u32, 1u32, 0u32),
+            (42, 2, 3),
+            (12_345, 4, 9),
+            (0xDEAD_BEEF, 8, 30),
+            (7, 0, 5),
+        ];
+        for (seed, length, day) in cases {
+            let save_path = dir.path().join(format!("cal-{seed}-{length}-{day}.mcvx"));
+            let mut session = WorldSession::new_session(seed, save_path, length);
+            session.clock =
+                daycycle::GameClock::from_day_and_time(day, daycycle::DEFAULT_TIME_OF_DAY);
+            assert_eq!(
+                session_weather(&session),
+                weather_of(season_of(day, length, seed), day, seed),
+                "seed {seed}, season length {length}, day {day}"
+            );
+        }
+    }
+
+    /// S06-T04: weather reaches the render inputs, and the vista arm is pinned
+    /// to the Clear identity so the menu panorama stays byte-identical and
+    /// never draws precipitation.
+    #[test]
+    fn weather_reaches_sky_params_and_the_vista_arm_stays_clear() {
+        let base = daycycle::sky_palette(daycycle::DEFAULT_TIME_OF_DAY);
+        let tinted = daycycle::weather_palette(base, Weather::Rain);
+        let params = sky_params(
+            tinted,
+            daycycle::DEFAULT_TIME_OF_DAY,
+            false,
+            Weather::Rain,
+            daycycle::weather_fog_range_factor(Weather::Rain),
+            12_345.5,
+        );
+        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.fog_range_factor, 0.75);
+        assert_eq!(params.weather_phase, 12_345.5);
+        assert_eq!(params.clear_color.r, tinted.sky_color[0] as f64);
+        assert_eq!(params.fog_color[0], tinted.fog_color[0]);
+        assert_ne!(tinted, base, "rain must tint the palette before upload");
+
+        // Vista frames construct Clear + identity, so the panorama is
+        // byte-identical to pre-S06 and the precip draw is skipped.
+        let vista = vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR));
+        assert_eq!(vista.time_of_day, daycycle::VISTA_GOLDEN_HOUR);
+        assert_eq!(vista.weather, Weather::Clear);
+        assert_eq!(vista.fog_range_factor, 1.0);
+        assert_eq!(vista.weather_phase, 0.0);
+        assert!(!vista.underwater);
+
+        // Source pin: the vista render arm actually calls the helper above, so
+        // those pinned values are the production vista path, not dead code.
+        let src = include_str!("main.rs");
+        let vista_arm = src
+            .split("let palette = daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR);")
+            .nth(1)
+            .and_then(|rest| rest.split("} else {").next())
+            .expect("the vista render arm must be present");
+        assert!(
+            vista_arm.contains("vista_sky_params(palette)"),
+            "vista frames must render through the pinned Clear-weather sky inputs"
+        );
+    }
+
+    /// S06-T04: the playing render arm derives weather per frame (no cache) and
+    /// exercises the ambient-audio seam on every session frame. Source-pinned
+    /// because the arm itself needs a live GPU and window.
+    #[test]
+    fn session_render_arm_derives_weather_per_frame_and_calls_the_audio_seam() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let weather = session_weather(&self.session);"),
+            "the session arm must derive weather per frame, not cache it"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "every session frame must exercise the audio seam"
+        );
+        assert!(
+            src.contains("let palette = daycycle::weather_palette(palette, weather);"),
+            "the session palette must be weather-tinted before upload"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the fall animation phase must come from the persisted game clock"
+        );
+    }
+
+    /// S06-T04: the audio hook is a named seam only. Calling it is free (the
+    /// unit return type is compile-time proof), and a source pin keeps the
+    /// M007 body empty: no playback call and no engine handle may appear
+    /// inside the seam (MEM168/MEM169/MEM171, MEM227).
+    #[test]
+    fn weather_ambient_hook_is_an_honestly_empty_noop_seam() {
+        weather_ambient_hook(Weather::Clear);
+        weather_ambient_hook(Weather::Rain);
+        weather_ambient_hook(Weather::Snowfall);
+
+        let src = include_str!("main.rs");
+        let line = src
+            .lines()
+            .find(|line| line.contains("fn weather_ambient_hook("))
+            .expect("the weather ambient hook seam must exist");
+        assert_eq!(
+            line.trim(),
+            "fn weather_ambient_hook(_weather: Weather) {}",
+            "the M007 seam must stay a genuinely empty single-line body"
+        );
+        assert!(
+            !line.contains("play("),
+            "M007 weather audio is a stub: the seam must not play anything"
+        );
+        assert!(
+            !line.contains("AudioEngine"),
+            "the seam must own no audio engine in M007"
+        );
+    }
+
+    /// S04-T03: submersion is one floored block lookup against the live world.
+    /// Exercised on a real generated ocean column (seed 12345: ocean at the
+    /// origin with a land spawn nearby) so the water id, sea level, and seabed
+    /// all come from terrain generation rather than a synthetic uniform chunk.
+    #[test]
+    fn eye_is_submerged_reads_the_live_block_at_the_floored_eye() {
+        use opencraft::world::chunk::CHUNK_SIZE;
+        use opencraft::world::terrain::SEA_LEVEL;
+
+        const SEED: u32 = 12345;
+        let mut world = WorldManager::with_seed_and_edits(4, SEED, ChunkEditMap::default());
+
+        // Find and insert one real chunk whose surface at sea level is ocean.
+        let mut ocean = None;
+        'scan: for cx in -4..=4 {
+            for cz in -4..=4 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let chunk = generate_chunk_seeded(pos, SEED, Season::Summer);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if chunk.get(lx, SEA_LEVEL as usize, lz) == BlockId::Water {
+                            ocean = Some((pos, lx, lz));
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        let (pos, lx, lz) = ocean.expect("seed 12345 must generate ocean near the origin");
+        let chunk = generate_chunk_seeded(pos, SEED, Season::Summer);
+        world.insert_chunk_for_test(pos, chunk.clone());
+        let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+        let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+
+        // Inside the ocean: the generated block is water, the eye is submerged.
+        assert_eq!(world.get_block(wx, SEA_LEVEL, wz), BlockId::Water);
+        let wet_eye = Vec3::new(wx as f32 + 0.5, SEA_LEVEL as f32 + 0.5, wz as f32 + 0.5);
+        assert!(
+            eye_is_submerged(&world, wet_eye),
+            "an eye inside a generated ocean block reports submersion"
+        );
+        // The lookup floors rather than rounds: a fractional eye still lands
+        // in the same water block.
+        assert!(eye_is_submerged(
+            &world,
+            wet_eye + Vec3::new(0.0, 0.49, 0.0)
+        ));
+
+        // One block above the top-most water in the column is air: dry.
+        let mut top = SEA_LEVEL;
+        while top + 1 < CHUNK_SIZE as i32 && chunk.get(lx, (top + 1) as usize, lz) == BlockId::Water
+        {
+            top += 1;
+        }
+        assert_eq!(world.get_block(wx, top + 1, wz), BlockId::Air);
+        let dry_eye = Vec3::new(wx as f32 + 0.5, top as f32 + 1.5, wz as f32 + 0.5);
+        assert!(
+            !eye_is_submerged(&world, dry_eye),
+            "an eye in the air above the ocean surface is not submerged"
+        );
+
+        // Inside the seabed's stone: solid, never reported as liquid.
+        let mut stone = None;
+        'stone: for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    if chunk.get(x, y, z) == BlockId::Stone {
+                        stone = Some((x, y, z));
+                        break 'stone;
+                    }
+                }
+            }
+        }
+        let (sx, sy, sz) = stone.expect("a real ocean chunk must contain stone");
+        let stone_eye = Vec3::new(
+            (pos.x * CHUNK_SIZE as i32) as f32 + sx as f32 + 0.5,
+            (pos.y * CHUNK_SIZE as i32) as f32 + sy as f32 + 0.5,
+            (pos.z * CHUNK_SIZE as i32) as f32 + sz as f32 + 0.5,
+        );
+        assert!(!eye_is_submerged(&world, stone_eye), "stone is not liquid");
+
+        // Unloaded chunks and above the world top answer Air, so the lookup can
+        // never invent water where nothing is loaded.
+        assert!(!eye_is_submerged(
+            &world,
+            Vec3::new(wx as f32 + 0.5, 400.0, wz as f32 + 0.5)
+        ));
+        assert!(!eye_is_submerged(
+            &world,
+            Vec3::new(9999.0, SEA_LEVEL as f32 + 0.5, 9999.0)
+        ));
+    }
+
+    /// S04-T03: the title-bar stats line carries the water quad counter next to
+    /// the opaque quad count and sources it from the render store's separate
+    /// water tally. The window itself is not headless-provable, so this pins the
+    /// observability contract at its single construction site.
+    #[test]
+    fn title_bar_stats_line_carries_the_water_quad_count() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("| Quads: {} | Water: {} ({} KB VRAM) |"),
+            "the stats line must expose water quads alongside the opaque quads"
+        );
+        assert!(
+            src.contains("gpu.render_store.total_water_quads,"),
+            "the water field must come from ChunkRenderStore::total_water_quads"
+        );
     }
 
     // -----------------------------------------------------------------------

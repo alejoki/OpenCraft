@@ -1,5 +1,6 @@
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::season::Season;
 
 #[inline]
 fn hash2d(x: i32, z: i32, seed: u32) -> u32 {
@@ -85,6 +86,132 @@ fn value_noise_2d(x: f32, z: f32, seed: u32) -> f32 {
 }
 
 pub const DEFAULT_WORLD_SEED: u32 = 1337;
+
+/// Water surface height for the whole world. Columns whose surface is below
+/// this are ocean basins, and the band just above it is the beach shelf.
+/// This is the value that used to be the implicit `h <= 22` Sand threshold in
+/// `generate_chunk_seeded`, now named (D071).
+///
+/// Every column with `h < SEA_LEVEL` is filled with static `BlockId::Water`
+/// from just above the seabed skin up to this height (MEM230: worldgen only,
+/// no flow, never persisted and never a `ChunkEditMap` entry).
+pub const SEA_LEVEL: i32 = 22;
+
+/// Highest surface the height function may ever produce.
+///
+/// D071 caps it at 150 so the vertical world (`MIN_CHUNK_Y..=MAX_CHUNK_Y` ->
+/// wy -32..=159) never has to grow. It is deliberately kept lower (120): the
+/// top chunk layer starts at wy 128, so `MAX_TERRAIN_HEIGHT +
+/// TREE_CANOPY_HEADROOM` (127) stays strictly below it and that whole layer
+/// keeps taking the uniform-Air fast path. Real mountains still reach wy ~110
+/// under a fixed cap of 120.
+pub const MAX_TERRAIN_HEIGHT: i32 = 120;
+
+/// Lowest surface the height function may produce (deep ocean floor).
+/// Comfortably above the bedrock floor at wy -32.
+pub const MIN_TERRAIN_HEIGHT: i32 = 4;
+
+/// At or above this surface height a land column is mountain stone instead of
+/// grass/dirt. Classification and surface skin both key on the same value.
+pub const MOUNTAIN_HEIGHT_THRESHOLD: i32 = 64;
+
+/// Snow caps appear only above this mountain surface height.
+pub const SNOW_CAP_HEIGHT: i32 = 96;
+
+/// A land column within `SEA_LEVEL..=SEA_LEVEL + BEACH_BAND` gets a Sand
+/// surface and subsurface, which reads as a shoreline beach.
+pub const BEACH_BAND: i32 = 3;
+
+/// Trees only grow on Plains/Forest land in this surface-height band. The
+/// lower bound is above the beach band (so never on Sand) and the upper bound
+/// stays below the mountain stone threshold (so never on mountain rock). The
+/// gate is the pre-season terrain class, not the post-season surface block:
+/// Winter keeps its trees even though the surface becomes Snow (D088).
+pub const TREE_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
+pub const TREE_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
+
+/// Tallest trunk any oak can generate, in blocks above its column surface.
+/// `oak_tree_at` returns `4..=TREE_MAX_TRUNK_HEIGHT`.
+const TREE_MAX_TRUNK_HEIGHT: i32 = 5;
+
+/// How far the canopy rises above the highest trunk cell.
+const TREE_CANOPY_TOP_OVER_TRUNK: i32 = 1;
+
+/// Tallest emitted oak cell above its column surface. Branches sit on the
+/// upper trunk, so they are strictly below this bound; the canopy top is the
+/// binding cell.
+const TREE_MAX_HEIGHT_OVER_SURFACE: i32 = TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK;
+
+/// Vertical headroom reserved above `MAX_TERRAIN_HEIGHT` for a trunk, its
+/// branches and its canopy. One spare block beyond the tallest emitted cell
+/// keeps the uniform-Air fast path provably above every possible tree cell, so
+/// it can never clip a branch. The derivation is asserted in the tests.
+const TREE_CANOPY_HEADROOM: i32 = TREE_MAX_HEIGHT_OVER_SURFACE + 1;
+
+/// Branch cells are single OakLog blocks one block out from the trunk. Four
+/// cardinal directions keep every branch inside the chunk interior (the trunk
+/// sits at `3..29`, so `2..30` is still strictly interior) and inside the
+/// `SPAWN_TREE_CLEARANCE` clearing radius shared with the trunk.
+const TREE_BRANCH_DIRECTIONS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const TREE_BRANCH_MIN: i32 = 2;
+const TREE_BRANCH_MAX: i32 = 4;
+
+// ---- Surface ruins (S07) ----------------------------------------------------
+
+/// Horizontal half-extent of a surface ruin's square footprint, in blocks.
+///
+/// A 5x5 shell (`2 * RUIN_FOOTPRINT_HALF + 1`) is small enough to read as one
+/// landmark and still fits inside a 32-block chunk once the anchor stays
+/// `RUIN_ANCHOR_MARGIN` away from each edge.
+const RUIN_FOOTPRINT_HALF: i32 = 2;
+
+/// Anchor margin from each chunk edge, derived from the footprint: an anchor at
+/// `RUIN_ANCHOR_MARGIN` reaches exactly chunk column 0 (and `CHUNK_SIZE - 1` on
+/// the far side), so every ruin cell is written by the chunk that generated it.
+/// That chunk confinement is what lets the loot seam (T02) stay registry- and
+/// persistence-free: one chunk owns each ruin, exactly like one chunk owns a
+/// tree.
+const RUIN_ANCHOR_MARGIN: i32 = RUIN_FOOTPRINT_HALF;
+
+/// Wall height band above the anchor column's surface, in blocks. Corner
+/// pillars are one taller, so the tallest ruin cell sits `surface +
+/// RUIN_WALL_MAX_HEIGHT + 1` = `surface + 4`, which is exactly the top block of
+/// the `surface + 1..=surface + 4` spawn body. `is_spawn_safe` therefore
+/// rejects every column inside a footprint rather than only wall cells.
+const RUIN_WALL_MIN_HEIGHT: i32 = 1;
+const RUIN_WALL_MAX_HEIGHT: i32 = 3;
+
+/// Surface-height band a ruin may stand on: exactly the Grass band above the
+/// Sand beach shelf and below Mountain stone (the same window trees use, so
+/// both structures agree on what counts as buildable land).
+const RUIN_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
+const RUIN_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
+
+/// Hash salt for the ruin gate, kept distinct from the tree (`777`) and ore
+/// salts so ruin placement cannot correlate with those passes.
+const RUIN_SALT: u32 = 0x5EED_9A11;
+
+/// Sparse per-anchor gate: `1 / (RUIN_GATE_MASK + 1)` = 1/512 of eligible
+/// interior anchors carry a ruin. Sized so a 32x32 chunk (~28x28 interior
+/// anchors, roughly half of them Plains/Forest land) yields a ruin now and then
+/// instead of in every chunk, while a 5x5 chunk headless scan still guarantees
+/// several (the acceptance scan asserts a non-zero lower bound).
+const RUIN_GATE_MASK: u32 = 0x1FF;
+
+/// Coarse worldgen biome for a column.
+///
+/// Classification reads the same continental/ridge sample as the height
+/// function (it is computed *from* the height), so classification and height
+/// cannot disagree: `Ocean` is exactly `height < SEA_LEVEL` and `Mountains` is
+/// exactly `height >= MOUNTAIN_HEIGHT_THRESHOLD`. Plains and forest split the
+/// remaining band on a third low-frequency noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Biome {
+    Plains,
+    Forest,
+    Mountains,
+    Ocean,
+}
 
 /// World-aligned cave lattice spacing in blocks. Sampling the density on a
 /// 4-block grid (9 corners per 32-block chunk axis) keeps cave generation
@@ -350,9 +477,232 @@ fn place_ore_veins(
     }
 }
 
+/// Whether any oak log — a trunk cell of a tree rooted in the footprint or a
+/// one-block branch of a tree rooted next to it — falls inside the vertical
+/// window a ruin could occupy (`surface + 1..=surface + TREE_CANOPY_HEADROOM`).
+///
+/// `place_ruin_at`'s in-chunk OakLog scan can only see the chunk layer that owns
+/// the anchor surface, while a D088 tree near a vertical chunk edge keeps cells
+/// in the layer above. This pure model check closes that gap, so the
+/// tree-overlap policy is layer-independent: a ruin never clips a trunk or a
+/// branch, even when the tree's upper cells live in the next chunk layer.
+fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
+    let min_wy = spec.surface + 1;
+    let max_wy = spec.surface + TREE_CANOPY_HEADROOM;
+    let min_x = spec.anchor_x - RUIN_FOOTPRINT_HALF;
+    let max_x = spec.anchor_x + RUIN_FOOTPRINT_HALF;
+    let min_z = spec.anchor_z - RUIN_FOOTPRINT_HALF;
+    let max_z = spec.anchor_z + RUIN_FOOTPRINT_HALF;
+
+    // A branch reaches one block out from its root, so every tree that could
+    // write a log into the footprint is rooted in the footprint expanded by
+    // one. One bounded 7x7 scan covers all of them.
+    for rz in (min_z - 1)..=(max_z + 1) {
+        for rx in (min_x - 1)..=(max_x + 1) {
+            let h = terrain_height_at_seeded(rx, rz, seed);
+            let biome = biome_at_seeded(rx, rz, seed);
+            let Some(tree) = oak_tree_at(rx, rz, h, biome, seed) else {
+                continue;
+            };
+
+            // Trunk cells stay on the root column, so only trees rooted inside
+            // the footprint can intersect it.
+            if (min_x..=max_x).contains(&rx)
+                && (min_z..=max_z).contains(&rz)
+                && h < max_wy
+                && h + tree.trunk_height >= min_wy
+            {
+                return true;
+            }
+
+            // Keep only branch cells that land in the footprint and the
+            // window. The terrain check mirrors the emission pass: a branch is
+            // never written into a ground cell. Branch cells are well above
+            // sea level, so Water cannot occupy them.
+            for (bx, by, bz) in tree.branch_cells(rx, rz, h) {
+                if (min_x..=max_x).contains(&bx)
+                    && (min_z..=max_z).contains(&bz)
+                    && (min_wy..=max_wy).contains(&by)
+                    && terrain_height_at_seeded(bx, bz, seed) < by
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Place the deterministic surface ruins whose anchors fall inside this chunk.
+///
+/// Modeled on `place_ore_veins`: one linear scan over the chunk's 32x32
+/// columns, then a tiny bounded write per ruin. Placement is confined to the
+/// chunk that owns the anchor (see `RUIN_ANCHOR_MARGIN`), so the pass never
+/// writes into a neighbouring chunk and needs no neighbour heights.
+///
+/// The surface-block gate is the authoritative one, exactly like the tree
+/// pass: the column must still hold `BlockId::Grass` after the terrain, cave,
+/// tree and ore passes. That single check is what keeps ruins off Sand beaches,
+/// seabed, mountain Stone, the altitude Snow cap and the seasonal Winter
+/// blanket (which turns Plains/Forest land into Snow emergently).
+fn place_surface_ruins(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    biomes: &[[Biome; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+    seed: u32,
+) {
+    let base_wx = pos.x * CHUNK_SIZE as i32;
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+    let base_wz = pos.z * CHUNK_SIZE as i32;
+
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let h = heights[lz][lx];
+            let surface_ly = h - base_wy;
+            if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                continue;
+            }
+            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+                continue;
+            }
+            let wx = base_wx + lx as i32;
+            let wz = base_wz + lz as i32;
+            let biome = biomes[lz][lx];
+            let Some(spec) = ruin_at(wx, wz, h, biome, seed) else {
+                continue;
+            };
+            // The in-chunk log scan inside `place_ruin_at` can only see the
+            // current chunk layer. A D088 tree can straddle a vertical chunk
+            // edge, so also reject anchors whose window intersects any trunk or
+            // branch in the pure tree model (see `tree_logs_intersect_ruin_window`).
+            if tree_logs_intersect_ruin_window(&spec, seed) {
+                continue;
+            }
+            place_ruin_at(chunk, heights, base_wy, spec);
+        }
+    }
+}
+
+/// Write one ruin shell into `chunk`.
+///
+/// `ruin_at`'s chunk-interior anchor margin guarantees the whole footprint lies
+/// inside this chunk, so every `lx`/`lz` below is a plain offset (no wrapping).
+///
+/// Two policies are pinned here, both deterministic and independent of
+/// iteration order:
+///
+/// 1. Tree-overlap: if any footprint column already holds `OakLog`, the anchor
+///    is skipped entirely — a ruin never carves through a tree.
+/// 2. Only-into-Air: each shell cell is written only where the chunk currently
+///    holds `BlockId::Air`, so trees, leaves, the Grass surface skin, Snow and
+///    Water are never overwritten. Footprint columns whose own surface is not
+///    Grass are skipped too, so a shell cannot stand on a Sand/Stone neighbour.
+fn place_ruin_at(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    base_wy: i32,
+    spec: RuinSpec,
+) {
+    let anchor_lx = spec.anchor_x.rem_euclid(CHUNK_SIZE as i32);
+    let anchor_lz = spec.anchor_z.rem_euclid(CHUNK_SIZE as i32);
+
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            let lx = (anchor_lx + dx) as usize;
+            let lz = (anchor_lz + dz) as usize;
+            if (0..CHUNK_SIZE).any(|ly| chunk.get(lx, ly, lz) == BlockId::OakLog) {
+                return;
+            }
+        }
+    }
+
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            // Shell only: the footprint interior stays open Air.
+            if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
+                continue;
+            }
+            let lx = (anchor_lx + dx) as usize;
+            let lz = (anchor_lz + dz) as usize;
+            let h = heights[lz][lx];
+            let surface_ly = h - base_wy;
+            if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                continue;
+            }
+            // Per-footprint-column surface gate: the shell stands on Grass
+            // only, so a footprint straddling a beach or a mountain stone
+            // column simply loses those cells.
+            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+                continue;
+            }
+            let block = ruin_wall_block(dx, dz);
+            let bottom = ruin_cell_bottom(dx, dz);
+            let top = ruin_cell_top(dx, dz, spec.wall_height);
+            for level in bottom..=top {
+                let ly = h + level - base_wy;
+                if !(0..CHUNK_SIZE as i32).contains(&ly) {
+                    continue;
+                }
+                let ly = ly as usize;
+                if chunk.get(lx, ly, lz) == BlockId::Air {
+                    chunk.set(lx, ly, lz, block);
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 pub fn terrain_height_at(wx: i32, wz: i32) -> i32 {
     terrain_height_at_seeded(wx, wz, DEFAULT_WORLD_SEED)
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Piecewise-linear continental elevation curve. Low continental noise digs
+/// ocean basins (4..15), the mid range builds plains/forest shelves (26..44),
+/// and high continental noise climbs into mountain foothills (58..70). Values
+/// are the column *mean*; hill/detail deviation and the ridge term are added on
+/// top (see `terrain_height_at_seeded`).
+const CONTINENTAL_ELEVATION: [(f32, f32); 8] = [
+    (0.00, 4.0),
+    (0.18, 8.0),
+    (0.30, 15.0),
+    (0.40, 26.0),
+    (0.50, 34.0),
+    (0.62, 44.0),
+    (0.78, 58.0),
+    (1.00, 70.0),
+];
+
+/// Below `OCEAN_LANDNESS_LOW` the column has no hill/detail deviation at all,
+/// which is what keeps every basin interior strictly below `SEA_LEVEL`.
+const OCEAN_LANDNESS_LOW: f32 = 0.30;
+const OCEAN_LANDNESS_HIGH: f32 = 0.50;
+/// Mountain ridges only grow once continental noise is this high, so mountains
+/// exist only in the continental highlands, not as mid-map spikes.
+const MOUNTAIN_NOISE_LOW: f32 = 0.62;
+const MOUNTAIN_NOISE_HIGH: f32 = 0.82;
+const MOUNTAIN_RIDGE_AMPLITUDE: f32 = 30.0;
+const HILL_AMPLITUDE: f32 = 14.0;
+const DETAIL_AMPLITUDE: f32 = 4.0;
+
+fn continental_elevation(continental: f32) -> f32 {
+    let continental = continental.clamp(0.0, 1.0);
+    for pair in CONTINENTAL_ELEVATION.windows(2) {
+        let (c0, b0) = pair[0];
+        let (c1, b1) = pair[1];
+        if continental <= c1 {
+            let t = (continental - c0) / (c1 - c0);
+            return b0 + t * (b1 - b0);
+        }
+    }
+    CONTINENTAL_ELEVATION[CONTINENTAL_ELEVATION.len() - 1].1
 }
 
 #[inline]
@@ -365,39 +715,501 @@ pub fn terrain_height_at_seeded(wx: i32, wz: i32, seed: u32) -> i32 {
     let detail = value_noise_2d(x * 0.05, z * 0.05, 303 ^ s);
     let ridge = (value_noise_2d(x * 0.008, z * 0.008, 404 ^ s) * 2.0 - 1.0).abs();
 
-    let mountain_factor = (continental - 0.55).max(0.0) * 2.2;
-    let base =
-        18.0 + continental * 26.0 + hills * 14.0 + detail * 4.0 + mountain_factor * ridge * 48.0;
+    // Ocean basins keep a flat seabed (landness == 0) so every column below
+    // SEA_LEVEL really is open water once T04 fills it; land columns get the
+    // full hill/detail deviation.
+    let landness = smoothstep(OCEAN_LANDNESS_LOW, OCEAN_LANDNESS_HIGH, continental);
+    let hills = (hills - 0.5) * 2.0 * HILL_AMPLITUDE;
+    let detail = (detail - 0.5) * 2.0 * DETAIL_AMPLITUDE;
+    let mountain = smoothstep(MOUNTAIN_NOISE_LOW, MOUNTAIN_NOISE_HIGH, continental)
+        * ridge
+        * MOUNTAIN_RIDGE_AMPLITUDE;
+
+    // Worst case: 70 (top of the curve) + 18 (hills + detail) + 30 (ridge)
+    // = 118 <= MAX_TERRAIN_HEIGHT; the basin floor bottoms out at 4.
+    let base = continental_elevation(continental) + landness * (hills + detail) + mountain;
     base.round() as i32
 }
 
-pub fn generate_chunk(pos: ChunkPos) -> Chunk {
-    generate_chunk_seeded(pos, DEFAULT_WORLD_SEED)
+/// Low-frequency forest mask. Deliberately a separate noise channel from the
+/// continental/ridge pair that shapes height: the split between plains and
+/// forest must not move the terrain surface.
+#[inline]
+fn forest_noise(wx: i32, wz: i32, seed: u32) -> f32 {
+    let s = seed.wrapping_mul(0x9E37_79B9);
+    value_noise_2d(wx as f32 * 0.006, wz as f32 * 0.006, 505 ^ s)
 }
 
-pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
+/// Above this forest-noise value a non-ocean, non-mountain column is forest.
+const FOREST_NOISE_THRESHOLD: f32 = 0.55;
+
+/// Pure height -> biome rule. Split out so the agreement pin has a small,
+/// directly testable surface.
+#[inline]
+fn biome_for_height(height: i32, forest: f32) -> Biome {
+    if height < SEA_LEVEL {
+        Biome::Ocean
+    } else if height >= MOUNTAIN_HEIGHT_THRESHOLD {
+        Biome::Mountains
+    } else if forest > FOREST_NOISE_THRESHOLD {
+        Biome::Forest
+    } else {
+        Biome::Plains
+    }
+}
+
+/// Pure biome classification for a world column.
+///
+/// Reads the same continental/ridge noise as `terrain_height_at_seeded` (it
+/// classifies the height that function returns), so a column can never be
+/// classified `Ocean` above sea level or `Mountains` below the mountain
+/// threshold.
+pub fn biome_at_seeded(wx: i32, wz: i32, seed: u32) -> Biome {
+    biome_for_height(
+        terrain_height_at_seeded(wx, wz, seed),
+        forest_noise(wx, wz, seed),
+    )
+}
+
+/// A deterministic oak's full vertical model: the trunk length plus the bits
+/// that select its branch cells.
+///
+/// Produced by [`oak_tree_at`], the single placement rule shared by the chunk
+/// generator, the spawn search and the tests. The model is a pure function of
+/// `(position, height, biome, seed)` — deliberately season-blind (D088), so a
+/// Winter tree keeps its trunk and branches while only its leaves are omitted
+/// from the emission pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OakTree {
+    /// Trunk length in blocks above the column surface, `4..=TREE_MAX_TRUNK_HEIGHT`.
+    trunk_height: i32,
+    /// Deterministic bits selecting the branch count and rotation.
+    branch_bits: u32,
+}
+
+impl OakTree {
+    /// Deterministic upper-trunk branch cells `(wx, wy, wz)`, `2..=4` of them.
+    ///
+    /// Each branch is a single OakLog one block out from the trunk in a
+    /// distinct cardinal direction, descending from just below the trunk top.
+    /// Directions are rotated by the per-seed hash (never by season), so the
+    /// same tree is identical in every season and across regenerations.
+    fn branch_cells(self, wx: i32, wz: i32, h: i32) -> impl Iterator<Item = (i32, i32, i32)> {
+        let count =
+            TREE_BRANCH_MIN + (self.branch_bits & 1) as i32 + ((self.branch_bits >> 1) & 1) as i32;
+        debug_assert!((TREE_BRANCH_MIN..=TREE_BRANCH_MAX).contains(&count));
+        let rotation = ((self.branch_bits >> 2) & 3) as usize;
+        (0..count).map(move |i| {
+            let (dx, dz) = TREE_BRANCH_DIRECTIONS[(rotation + i as usize) % 4];
+            // Upper trunk: two branches pair at the highest cell, then two at
+            // the cell below it. Always at or below the trunk top.
+            let dy = self.trunk_height - 1 - i / 2;
+            (wx + dx, h + dy, wz + dz)
+        })
+    }
+}
+
+/// The deterministic oak this column grows, or `None` when the column is
+/// ineligible.
+///
+/// Single source of truth shared by `generate_chunk_seeded` and
+/// `find_spawn_column`: the interior-only placement rule, the tree height band,
+/// the per-biome hash gate and the model (trunk + branches) all live here, so
+/// the spawn search can reject a column the generator would fill with OakLog
+/// without duplicating the rule. The gate is the pre-season terrain class
+/// (Plains/Forest + the Grass height band), never the post-season surface
+/// block, so Winter trees persist (D088).
+fn oak_tree_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<OakTree> {
+    // Trees only grow on the chunk interior (3..29) so canopies never cross a
+    // chunk border.
+    let lx = wx.rem_euclid(CHUNK_SIZE as i32);
+    let lz = wz.rem_euclid(CHUNK_SIZE as i32);
+    if !(3..29).contains(&lx) || !(3..29).contains(&lz) {
+        return None;
+    }
+    // `TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT` is exactly the pre-season Grass
+    // band: above the Sand beach shelf and below Mountain stone. Beaches and
+    // seabeds are below it, mountain stone above it, so both stay tree-free
+    // without consulting a seasonal surface block.
+    if !(TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&h) {
+        return None;
+    }
+    let tree_hash = hash2d(wx, wz, 777 ^ seed);
+    let gate = match biome {
+        Biome::Forest => (tree_hash & 0x0F) == 0,
+        Biome::Plains => (tree_hash & 0xFF) == 0,
+        Biome::Mountains | Biome::Ocean => false,
+    };
+    gate.then(|| OakTree {
+        trunk_height: 4 + ((tree_hash >> 8) & 1) as i32,
+        branch_bits: (tree_hash >> 9) & 0x0F,
+    })
+}
+
+/// Trunk height of the oak at this column, or `None` when it grows no tree.
+/// Convenience wrapper used by the spawn search and tests that only need the
+/// trunk; the generator uses [`oak_tree_at`] for the branches too.
+fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<i32> {
+    oak_tree_at(wx, wz, h, biome, seed).map(|tree| tree.trunk_height)
+}
+
+/// A deterministic surface ruin: a small Cobblestone shell with Brick corner
+/// pillars and a doorway, standing on one Plains/Forest Grass column.
+///
+/// Produced by [`ruin_at`], which is the single placement rule shared by the
+/// generator, the spawn search and the tests. The struct carries the anchor
+/// column plus the surface it was derived from, so consumers never have to
+/// re-derive the footprint or re-sample the terrain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuinSpec {
+    /// World x of the footprint centre column. The shell spans
+    /// `anchor_x - RUIN_FOOTPRINT_HALF..=anchor_x + RUIN_FOOTPRINT_HALF`.
+    pub anchor_x: i32,
+    /// World z of the footprint centre column.
+    pub anchor_z: i32,
+    /// Anchor column surface height; the shell starts at `surface + 1`.
+    pub surface: i32,
+    /// Wall height above `surface`; corner pillars are one block taller.
+    pub wall_height: i32,
+}
+
+/// Position-only half of the ruin gate: the chunk-interior anchor margin plus
+/// the sparse per-anchor hash.
+///
+/// Split out so callers that only need "could a ruin stand here at all" (the
+/// spawn search) skip the terrain samples for the 511/512 anchors the hash
+/// rejects. [`ruin_at`] remains the authoritative rule; this is its cheap
+/// prefix, so the gate cannot drift between the two.
+fn ruin_anchor_hash(wx: i32, wz: i32, seed: u32) -> Option<u32> {
+    let half = CHUNK_SIZE as i32 - 1 - RUIN_ANCHOR_MARGIN;
+    let lx = wx.rem_euclid(CHUNK_SIZE as i32);
+    let lz = wz.rem_euclid(CHUNK_SIZE as i32);
+    if !(RUIN_ANCHOR_MARGIN..=half).contains(&lx) || !(RUIN_ANCHOR_MARGIN..=half).contains(&lz) {
+        return None;
+    }
+    let ruin_hash = hash2d(wx, wz, RUIN_SALT ^ seed);
+    ((ruin_hash & RUIN_GATE_MASK) == 0).then_some(ruin_hash)
+}
+
+/// Whether a surface ruin is anchored at this world column, and which one.
+///
+/// Single source of truth shared by `generate_chunk_seeded`,
+/// `find_spawn_column` and the tests, mirroring the `tree_trunk_height` shape:
+/// the chunk-interior anchor margin, the land height band, the Plains/Forest
+/// gate and the sparse hash gate all live here, so no caller can disagree with
+/// the generator about where a ruin stands. The generator additionally checks
+/// the actual generated surface block (`Grass`), which is the authoritative
+/// gate for beaches, seabed, mountain stone and the seasonal Winter blanket.
+///
+/// Deliberately season-blind: ruins are a function of `(pos, seed)` only, so
+/// the same ruins exist in every season (in Winter the snow surface suppresses
+/// them emergently at the generator's `Grass` gate). Trees are different after
+/// D088: their placement ignores the seasonal surface, so only ruins keep this
+/// emergent Winter suppression.
+fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec> {
+    let ruin_hash = ruin_anchor_hash(wx, wz, seed)?;
+    // The band is the Grass window: above the Sand beach shelf and below the
+    // Mountain stone threshold. Combined with the Plains/Forest gate below,
+    // a ruin can never stand on Sand, Stone, Snow or a water column.
+    if !(RUIN_MIN_HEIGHT..=RUIN_MAX_HEIGHT).contains(&h) {
+        return None;
+    }
+    if !matches!(biome, Biome::Plains | Biome::Forest) {
+        return None;
+    }
+    let span = (RUIN_WALL_MAX_HEIGHT - RUIN_WALL_MIN_HEIGHT + 1) as u32;
+    Some(RuinSpec {
+        anchor_x: wx,
+        anchor_z: wz,
+        surface: h,
+        wall_height: RUIN_WALL_MIN_HEIGHT + ((ruin_hash >> 9) % span) as i32,
+    })
+}
+
+/// The ruin whose footprint contains `(wx, wz)`, if any.
+///
+/// A footprint is `RUIN_FOOTPRINT_HALF` wide around its anchor, so the anchor
+/// of any covering ruin must lie within that Chebyshev radius. Deriving the
+/// answer from [`ruin_at`] keeps the footprint size, gate and height band in
+/// one place: the spawn search (MEM242/MEM246 precedent) must not re-derive
+/// them, or a `surface + 4` spawn could end up inside a ruin shell exactly
+/// like an OakLog trunk.
+///
+/// Conservative by construction: it does not check the generated surface block
+/// (that needs a chunk), so a column can be rejected for a ruin the Winter
+/// blanket would suppress — the same over-rejection the tree clearance already
+/// accepts, and it keeps the spawn purely a function of `seed`.
+fn ruin_covering(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            let ax = wx + dx;
+            let az = wz + dz;
+            // Cheap position gate first: only hash-passing anchors pay for the
+            // terrain + forest samples below.
+            if ruin_anchor_hash(ax, az, seed).is_none() {
+                continue;
+            }
+            let h = terrain_height_at_seeded(ax, az, seed);
+            let biome = biome_for_height(h, forest_noise(ax, az, seed));
+            if let Some(spec) = ruin_at(ax, az, h, biome, seed) {
+                return Some(spec);
+            }
+        }
+    }
+    None
+}
+
+/// Wall material for a footprint offset: Brick on the four corner pillars,
+/// Cobblestone on the wall runs between them. Both are already complete,
+/// legal-edit opaque blocks, so ruins add no block ids and no registry rows.
+#[inline]
+fn ruin_wall_block(dx: i32, dz: i32) -> BlockId {
+    if dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF {
+        BlockId::Brick
+    } else {
+        BlockId::Cobblestone
+    }
+}
+
+/// Lowest wall level (above the column surface) at which this footprint cell
+/// starts. The centre of the +z wall is a doorway: it is left open for the
+/// whole wall height so the ruin reads as an entrance, not a sealed box.
+#[inline]
+fn ruin_cell_bottom(dx: i32, dz: i32) -> i32 {
+    if dx == 0 && dz == RUIN_FOOTPRINT_HALF {
+        2
+    } else {
+        1
+    }
+}
+
+/// Highest wall level of this footprint cell: corner pillars stand one block
+/// above the wall runs between them.
+#[inline]
+fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
+    let corner = dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF;
+    wall_height + i32::from(corner)
+}
+
+/// One prospective reward a ruin can yield.
+///
+/// Deliberately a placeholder: M007 ships the seam, not the content. Worldgen
+/// owns no item vocabulary (that belongs to the `player::inventory` layer), so
+/// an entry is only a stable identifier plus an inclusive count range. When the
+/// M008 survival loot tables land they resolve `item_id` to a real item; the
+/// seam's signature does not change when they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LootEntry {
+    /// Stable identifier for the yielded item, interpreted by the M008 loot
+    /// layer. No identifier space exists in M007 — nothing constructs one.
+    pub item_id: u16,
+    /// Inclusive lower bound on the stack size of one roll.
+    pub min_count: u16,
+    /// Inclusive upper bound on the stack size of one roll.
+    pub max_count: u16,
+}
+
+/// Loot yielded by one ruin — **present but empty** in M007.
+///
+/// This is the M008 survival-content hook, mirroring the M006 stubbed-hook
+/// pattern: the seam is named, typed and callable at every generated ruin, and
+/// it is honestly empty rather than pretending to be content. M008 fills it;
+/// until then the only observable property is that no entry is ever produced.
+///
+/// Pure by construction — a function of `(seed, ruin)` only. It reads no clock,
+/// no RNG state, no season/day index and no chunk, so loot can never make
+/// worldgen season-dependent (the cross-slice season-purity invariant) and two
+/// callers asking about the same ruin always get the same answer. The generator
+/// does not call it: as a no-op returning an empty `Vec` (which does not
+/// allocate) that call would be pure ceremony. The acceptance scan in the tests
+/// is what proves the seam is callable at every placed ruin.
+pub fn ruin_loot(_seed: u32, _ruin: &RuinSpec) -> Vec<LootEntry> {
+    // Empty in M007 — M008 fills this from the survival loot tables.
+    Vec::new()
+}
+
+/// Minimum surface height of a spawnable column: two blocks above the named sea
+/// level, so the player always starts on dry land above the water line rather
+/// than on the seabed. The Sand beach band can still reach `SEA_LEVEL +
+/// BEACH_BAND`, so a spawn on the shoreline shelf is possible (and safe);
+/// `SPAWN_MIN_HEIGHT` is the D071 threshold from the plan.
+pub const SPAWN_MIN_HEIGHT: i32 = SEA_LEVEL + 2;
+
+/// Horizontal Chebyshev radius of the tree-free clearing demanded around a
+/// spawn column.
+///
+/// A generated canopy reaches two blocks out from its trunk, so rejecting every
+/// tree within this radius guarantees no trunk or neighbour leaf can occupy the
+/// player's feet/head blocks (surface + 1..=surface + 4).
+const SPAWN_TREE_CLEARANCE: i32 = 2;
+
+/// Bounded Chebyshev radius (blocks) of the deterministic spawn search.
+///
+/// Sized from the terrain distribution, not guessed: a scan of 10_000 hashed
+/// seeds found the first safe land column within 365 blocks of (0, 0) in the
+/// worst case, so 512 leaves headroom while keeping the pathological
+/// no-land-found path to ~1M height samples.
+pub const SPAWN_SEARCH_RADIUS: i32 = 512;
+
+/// Whether a player can safely spawn on this column: land above the water line,
+/// with no generated oak trunk or neighbour canopy overhead.
+fn is_spawn_safe(wx: i32, wz: i32, seed: u32) -> bool {
+    let h = terrain_height_at_seeded(wx, wz, seed);
+    if h < SPAWN_MIN_HEIGHT {
+        return false;
+    }
+    // Land-biome policy stated explicitly rather than inferred: Ocean is
+    // exactly `h < SEA_LEVEL`, so this can only fire if that coupling ever
+    // breaks, and then the search keeps moving instead of spawning in water.
+    if biome_for_height(h, forest_noise(wx, wz, seed)) == Biome::Ocean {
+        return false;
+    }
+    for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+        for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+            let nx = wx + dx;
+            let nz = wz + dz;
+            let nh = terrain_height_at_seeded(nx, nz, seed);
+            let nb = biome_for_height(nh, forest_noise(nx, nz, seed));
+            if tree_trunk_height(nx, nz, nh, nb, seed).is_some() {
+                return false;
+            }
+        }
+    }
+    // Ruin clearance (S07): a footprint column is unsafe because the tallest
+    // ruin cell is `surface + 4` — the top of the spawn body — so a spawn here
+    // would be buried inside a wall or corner pillar. `ruin_covering` shares
+    // the placement rule with the generator, so the footprint shape and gate
+    // are never duplicated here.
+    if ruin_covering(wx, wz, seed).is_some() {
+        return false;
+    }
+    true
+}
+
+/// Deterministic, bounded land search for the player spawn column.
+///
+/// Scans fixed-order square rings outward from (0, 0) — every ring clockwise
+/// from its north edge — and returns the first column that is land
+/// (`SPAWN_MIN_HEIGHT` or higher, never `Biome::Ocean`) with a tree-free
+/// clearing (see `SPAWN_TREE_CLEARANCE`). Pure in `seed`: the same seed always
+/// yields the same column, with no clock, RNG, or shared state (R001).
+///
+/// D071: after the four-biome rewrite column (0, 0) can be open ocean for a
+/// given seed, and spawning there would drop the player on the seabed (and a
+/// tree column would swallow the surface + 4 spawn in OakLog). The search is
+/// bounded by `SPAWN_SEARCH_RADIUS`; if it finds nothing it panics loudly
+/// instead of silently returning an unsafe column.
+pub fn find_spawn_column(seed: u32) -> (i32, i32) {
+    find_spawn_column_within(seed, SPAWN_SEARCH_RADIUS)
+}
+
+/// `find_spawn_column` with an explicit bound, so the loud failure path is
+/// directly testable without needing a pathological seed.
+fn find_spawn_column_within(seed: u32, max_radius: i32) -> (i32, i32) {
+    assert!(max_radius >= 0, "spawn search radius must be non-negative");
+    if is_spawn_safe(0, 0, seed) {
+        return (0, 0);
+    }
+    for radius in 1..=max_radius {
+        // North edge: west -> east.
+        for wx in -radius..=radius {
+            if is_spawn_safe(wx, -radius, seed) {
+                return (wx, -radius);
+            }
+        }
+        // East edge: north -> south (the north-east corner was visited above).
+        for wz in (-radius + 1)..=radius {
+            if is_spawn_safe(radius, wz, seed) {
+                return (radius, wz);
+            }
+        }
+        // South edge: east -> west.
+        for wx in (-radius..radius).rev() {
+            if is_spawn_safe(wx, radius, seed) {
+                return (wx, radius);
+            }
+        }
+        // West edge: south -> north (both corners were visited above).
+        for wz in (-radius + 1..radius).rev() {
+            if is_spawn_safe(-radius, wz, seed) {
+                return (-radius, wz);
+            }
+        }
+    }
+    panic!(
+        "terrain: no land spawn column within {max_radius} blocks of (0, 0) for seed {seed} \
+         (need h >= SPAWN_MIN_HEIGHT {SPAWN_MIN_HEIGHT} and no oak within \
+         {SPAWN_TREE_CLEARANCE} blocks) — raise SPAWN_SEARCH_RADIUS or fix the height envelope"
+    );
+}
+
+/// Generates `pos` with the default world seed and [`Season::Summer`].
+///
+/// Season-independent callers (tooling, small unit tests, previews) use this
+/// wrapper: Summer is the blanket-absent baseline, so a caller that never
+/// thinks about the calendar still sees the pre-seasonal surface.
+pub fn generate_chunk(pos: ChunkPos) -> Chunk {
+    generate_chunk_seeded(pos, DEFAULT_WORLD_SEED, Season::Summer)
+}
+
+/// Surface block of a non-beach plains/forest column in `season`.
+///
+/// Winter paints the seasonal snow blanket; every other season keeps Grass.
+/// Beach Sand, Ocean Sand and the Mountains altitude rule never call this, so
+/// the seasonal blanket and the season-blind altitude snow cap stay
+/// distinguishable by construction.
+#[inline]
+fn seasonal_land_surface(season: Season) -> BlockId {
+    match season {
+        Season::Winter => BlockId::Snow,
+        Season::Spring | Season::Summer | Season::Autumn => BlockId::Grass,
+    }
+}
+
+/// Generates `pos` for `seed` under the given calendar `season`.
+///
+/// `season` is a plain value parameter — no manager state, no clock reads — so
+/// generation stays a pure function of `(pos, seed, season)`. It changes
+/// exactly two things:
+///
+/// 1. the surface skin of non-beach plains/forest land (`Snow` in Winter,
+///    `Grass` otherwise), and
+/// 2. the oak leaf canopy (Autumn sheds it while keeping the trunks; every
+///    other season keeps the full canopy).
+///
+/// Heights, biomes, subsurface skin, caves, ores, bedrock, water fill and the
+/// season-blind Mountain altitude snow cap are untouched, so a seasonal
+/// blanket can never be confused with the altitude cap.
+pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
 
-    // Fast path for high sky chunks
-    if base_wy > 105 {
+    // Fast path for high sky chunks. Derived from MAX_TERRAIN_HEIGHT so the
+    // envelope and this shortcut cannot silently desync: everything above all
+    // possible terrain plus tree headroom is Air.
+    if base_wy > MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM {
         return Chunk::new_uniform(BlockId::Air);
     }
 
-    // Precompute column heights in 32x32
+    // Precompute column heights and biomes in 32x32. The biome is derived from
+    // the same height (plus the forest mask), so one pass serves both.
     let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
+    let mut biomes = [[Biome::Plains; CHUNK_SIZE]; CHUNK_SIZE];
     let mut max_h = i32::MIN;
     for (lz, row) in heights.iter_mut().enumerate() {
         for (lx, height) in row.iter_mut().enumerate() {
-            let h = terrain_height_at_seeded(base_wx + lx as i32, base_wz + lz as i32, seed);
+            let wx = base_wx + lx as i32;
+            let wz = base_wz + lz as i32;
+            let h = terrain_height_at_seeded(wx, wz, seed);
             *height = h;
             max_h = max_h.max(h);
+            biomes[lz][lx] = biome_for_height(h, forest_noise(wx, wz, seed));
         }
     }
 
-    // If the entire chunk is well above max terrain height + max tree height (7)
-    if base_wy > max_h + 7 {
+    // If the entire chunk is well above max terrain height + tree headroom
+    if base_wy > max_h + TREE_CANOPY_HEADROOM {
         return Chunk::new_uniform(BlockId::Air);
     }
     // Deep chunks must still flow through the block loop so caves (and,
@@ -409,6 +1221,8 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
         for (lx, &h) in row.iter().enumerate() {
             let wx = base_wx + lx as i32;
             let wz = base_wz + lz as i32;
+            let biome = biomes[lz][lx];
+            let beach = h <= SEA_LEVEL + BEACH_BAND;
 
             for ly in 0..CHUNK_SIZE {
                 let wy = base_wy + ly as i32;
@@ -417,21 +1231,47 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
                 } else if wy < h - 3 {
                     BlockId::Stone
                 } else if wy < h {
-                    if h <= 22 {
-                        BlockId::Sand
-                    } else {
-                        BlockId::Dirt
+                    // Subsurface skin, three blocks deep. It is never carved
+                    // (caves/ores stop at h - 4), so it is also the seal that
+                    // keeps future water columns from draining into caves.
+                    match biome {
+                        Biome::Mountains => BlockId::Stone,
+                        Biome::Ocean => BlockId::Sand,
+                        Biome::Plains | Biome::Forest => {
+                            if beach {
+                                BlockId::Sand
+                            } else {
+                                BlockId::Dirt
+                            }
+                        }
                     }
                 } else if wy == h {
-                    if h <= 22 {
-                        BlockId::Sand
-                    } else if h >= 68 {
-                        BlockId::Snow
-                    } else if h >= 58 {
-                        BlockId::Stone
-                    } else {
-                        BlockId::Grass
+                    match biome {
+                        Biome::Mountains => {
+                            if h >= SNOW_CAP_HEIGHT {
+                                BlockId::Snow
+                            } else {
+                                BlockId::Stone
+                            }
+                        }
+                        Biome::Ocean => BlockId::Sand,
+                        Biome::Plains | Biome::Forest => {
+                            if beach {
+                                // Beaches stay Sand in every season: the
+                                // seasonal blanket is land-only.
+                                BlockId::Sand
+                            } else {
+                                seasonal_land_surface(season)
+                            }
+                        }
                     }
+                } else if h < SEA_LEVEL && wy <= SEA_LEVEL {
+                    // Ocean basin: static worldgen water from just above the
+                    // seabed skin (wy > h) up to the named sea level. The
+                    // three-block skin below stays Sand and cave carving stops
+                    // at h - 4, so the seabed is a real seal. MEM230: no flow,
+                    // never a persisted edit (see T02's Water rejection paths).
+                    BlockId::Water
                 } else {
                     BlockId::Air
                 };
@@ -448,37 +1288,78 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
                 }
             }
 
-            // Place deterministic oak trees inside safe interior (lx, lz in 3..29) on grass
-            if (3..29).contains(&lx) && (3..29).contains(&lz) && (24..54).contains(&h) {
-                let tree_hash = hash2d(wx, wz, 777 ^ seed);
-                if (tree_hash & 0xFF) == 0 {
-                    let trunk_h = 4 + ((tree_hash >> 8) & 1) as i32;
-                    for ty in (h + 1)..=(h + trunk_h) {
+            // Deterministic oak trees inside the safe interior (lx, lz in
+            // 3..29) so canopies never cross a chunk border. The gate is the
+            // pre-season terrain class (`Plains`/`Forest` + the Grass height
+            // band in `oak_tree_at`), never the post-season surface block, so
+            // Winter keeps its trunks and branches and only the leaves are
+            // seasonal (D088). Beaches, seabeds and mountain stone stay out of
+            // the band by construction, exactly as before.
+            //
+            // Every chunk layer whose vertical span intersects the tree emits
+            // the cells it owns. A tree near the shore can top the first
+            // chunk-Y boundary (wy 32); gating on the surface layer alone used
+            // to clip exactly those trees halfway. `tree_top` is derived from
+            // the same model constants as the emitted cells, so this
+            // intersection test can never skip a branch or canopy top.
+            let tree_top = h + TREE_MAX_HEIGHT_OVER_SURFACE;
+            if tree_top >= base_wy && h + 1 < base_wy + CHUNK_SIZE as i32 {
+                if let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) {
+                    for ty in (h + 1)..=(h + tree.trunk_height) {
                         let ly_tree = ty - base_wy;
                         if (0..CHUNK_SIZE as i32).contains(&ly_tree) {
                             chunk.set(lx, ly_tree as usize, lz, BlockId::OakLog);
                         }
                     }
-                    let canopy_base = h + trunk_h - 1;
-                    let canopy_top = h + trunk_h + 1;
-                    for cy in canopy_base..=canopy_top {
-                        let ly_c = cy - base_wy;
-                        if !(0..CHUNK_SIZE as i32).contains(&ly_c) {
+
+                    // Deterministic branches on the upper trunk. A branch may
+                    // replace an existing leaf but never terrain, water, Snow or
+                    // another structure cell. Admitting leaves keeps the log
+                    // skeleton identical in every season regardless of the
+                    // column iteration order (Autumn/Winter have no leaves to
+                    // collide with, so an Air-only rule would make winter trees
+                    // grow extra branches).
+                    for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                        let ly_b = by - base_wy;
+                        if !(0..CHUNK_SIZE as i32).contains(&ly_b) {
                             continue;
                         }
-                        let radius: i32 = if cy == canopy_top { 1 } else { 2 };
-                        for dz in -radius..=radius {
-                            for dx in -radius..=radius {
-                                if dx == 0 && dz == 0 && cy <= h + trunk_h {
-                                    continue;
-                                }
-                                if dx.abs() == 2 && dz.abs() == 2 && cy == canopy_base {
-                                    continue;
-                                }
-                                let tlx = (lx as i32 + dx) as usize;
-                                let tlz = (lz as i32 + dz) as usize;
-                                if chunk.get(tlx, ly_c as usize, tlz) == BlockId::Air {
-                                    chunk.set(tlx, ly_c as usize, tlz, BlockId::OakLeaves);
+                        let tlx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+                        let tlz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+                        if matches!(
+                            chunk.get(tlx, ly_b as usize, tlz),
+                            BlockId::Air | BlockId::OakLeaves
+                        ) {
+                            chunk.set(tlx, ly_b as usize, tlz, BlockId::OakLog);
+                        }
+                    }
+
+                    // Only leaves are seasonal: Spring and Summer keep the
+                    // full canopy, Autumn sheds it, Winter stays bare. The
+                    // trunk and branches above survive every season.
+                    if matches!(season, Season::Spring | Season::Summer) {
+                        let trunk_h = tree.trunk_height;
+                        let canopy_base = h + trunk_h - 1;
+                        let canopy_top = h + trunk_h + 1;
+                        for cy in canopy_base..=canopy_top {
+                            let ly_c = cy - base_wy;
+                            if !(0..CHUNK_SIZE as i32).contains(&ly_c) {
+                                continue;
+                            }
+                            let radius: i32 = if cy == canopy_top { 1 } else { 2 };
+                            for dz in -radius..=radius {
+                                for dx in -radius..=radius {
+                                    if dx == 0 && dz == 0 && cy <= h + trunk_h {
+                                        continue;
+                                    }
+                                    if dx.abs() == 2 && dz.abs() == 2 && cy == canopy_base {
+                                        continue;
+                                    }
+                                    let tlx = (lx as i32 + dx) as usize;
+                                    let tlz = (lz as i32 + dz) as usize;
+                                    if chunk.get(tlx, ly_c as usize, tlz) == BlockId::Air {
+                                        chunk.set(tlx, ly_c as usize, tlz, BlockId::OakLeaves);
+                                    }
                                 }
                             }
                         }
@@ -489,6 +1370,10 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
     }
 
     place_ore_veins(&mut chunk, &heights, pos, seed);
+    // Third structure pass (S07): after ores, so a ruin can never be carved by
+    // the ore pass, and after trees, so the tree-overlap policy can see the
+    // actual OakLog cells it refuses to overwrite.
+    place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed);
     chunk.try_compress();
     chunk
 }
@@ -497,14 +1382,18 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32) -> Chunk {
 mod tests {
     use super::*;
     use crate::world::block::BlockId;
+    use crate::world::season::{
+        season_of, DEFAULT_SEASON_LENGTH_DAYS, FIRST_AUTUMN_DAY, FIRST_SPRING_DAY,
+        FIRST_SUMMER_DAY, FIRST_WINTER_DAY,
+    };
 
     #[test]
     fn test_cave_generation_deterministic_full_chunks() {
         for seed in [DEFAULT_WORLD_SEED, 424_242] {
             for cy in -1..=1 {
                 let pos = ChunkPos::new(0, cy, 0);
-                let first = generate_chunk_seeded(pos, seed);
-                let second = generate_chunk_seeded(pos, seed);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for ly in 0..CHUNK_SIZE {
                         for lx in 0..CHUNK_SIZE {
@@ -527,7 +1416,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in -1..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -570,8 +1460,8 @@ mod tests {
         }
         let (wx, wz, h) = highest.expect("height search must yield a column");
         assert!(
-            h >= 58,
-            "height search did not reach mountain terrain (max h = {h})"
+            h >= MOUNTAIN_HEIGHT_THRESHOLD,
+            "height search did not reach mountain terrain (max h = {h}, threshold = {MOUNTAIN_HEIGHT_THRESHOLD})"
         );
 
         let pos = ChunkPos::new(
@@ -579,7 +1469,7 @@ mod tests {
             h.div_euclid(CHUNK_SIZE as i32),
             wz.div_euclid(CHUNK_SIZE as i32),
         );
-        let chunk = generate_chunk_seeded(pos, seed);
+        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
         let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
         let ly = h.rem_euclid(CHUNK_SIZE as i32) as usize;
         let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
@@ -592,7 +1482,8 @@ mod tests {
 
     #[test]
     fn test_bedrock_floor_preserved_in_deep_chunk() {
-        let chunk = generate_chunk_seeded(ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED);
+        let chunk =
+            generate_chunk_seeded(ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 assert_eq!(
@@ -610,7 +1501,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in 0..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -669,6 +1561,14 @@ mod tests {
 
         let sky = generate_chunk(ChunkPos::new(0, 4, 0));
         assert_eq!(sky.is_uniform(), Some(BlockId::Air));
+        // The top chunk layer is only provably air while the envelope plus
+        // tree headroom stays below its base wy; this pins the derivation.
+        const {
+            assert!(
+                MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM < 4 * CHUNK_SIZE as i32,
+                "MAX_TERRAIN_HEIGHT drifted above the uniform-Air fast-path bound"
+            );
+        }
     }
 
     fn has_subsurface_air_neighbor(
@@ -712,8 +1612,8 @@ mod tests {
                 for cz in -1..=1 {
                     for cx in -1..=1 {
                         let pos = ChunkPos::new(cx, cy, cz);
-                        let first = generate_chunk_seeded(pos, seed);
-                        let second = generate_chunk_seeded(pos, seed);
+                        let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                        let second = generate_chunk_seeded(pos, seed, Season::Summer);
                         for lz in 0..CHUNK_SIZE {
                             for ly in 0..CHUNK_SIZE {
                                 for lx in 0..CHUNK_SIZE {
@@ -747,7 +1647,8 @@ mod tests {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in -1..=1 {
-                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed);
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                     for lz in 0..CHUNK_SIZE {
                         for ly in 0..CHUNK_SIZE {
                             for lx in 0..CHUNK_SIZE {
@@ -774,7 +1675,7 @@ mod tests {
             for cz in -2..=2 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -827,7 +1728,7 @@ mod tests {
             for cz in -2..=2 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     for lz in 0..CHUNK_SIZE {
                         for ly in 0..CHUNK_SIZE {
                             for lx in 0..CHUNK_SIZE {
@@ -873,7 +1774,7 @@ mod tests {
                 for cx in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
                     for (seed, layout) in [(1337u32, &mut layout_a), (424_242u32, &mut layout_b)] {
-                        let chunk = generate_chunk_seeded(pos, seed);
+                        let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                         for lz in 0..CHUNK_SIZE {
                             for ly in 0..CHUNK_SIZE {
                                 for lx in 0..CHUNK_SIZE {
@@ -972,8 +1873,8 @@ mod tests {
 
         for seed in [DEFAULT_WORLD_SEED, 424_242] {
             for &pos in &positions {
-                let first = generate_chunk_seeded(pos, seed);
-                let second = generate_chunk_seeded(pos, seed);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
                 let heights = chunk_heights(pos, seed);
                 let base_wy = pos.y * CHUNK_SIZE as i32;
                 for (lz, row) in heights.iter().enumerate() {
@@ -1000,8 +1901,8 @@ mod tests {
 
         let mut seed_changed_any_block = false;
         for &pos in &positions {
-            let first = generate_chunk_seeded(pos, DEFAULT_WORLD_SEED);
-            let second = generate_chunk_seeded(pos, 424_242);
+            let first = generate_chunk_seeded(pos, DEFAULT_WORLD_SEED, Season::Summer);
+            let second = generate_chunk_seeded(pos, 424_242, Season::Summer);
             for lz in 0..CHUNK_SIZE {
                 for ly in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
@@ -1042,7 +1943,7 @@ mod tests {
             for cz in -4..=4 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let heights = chunk_heights(pos, seed);
                     let base_wy = pos.y * CHUNK_SIZE as i32;
                     let mut has_carved_air = false;
@@ -1154,7 +2055,7 @@ mod tests {
             for cz in -4..=4 {
                 for cy in -1..=1 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wx = cx * CHUNK_SIZE as i32;
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let base_wz = cz * CHUNK_SIZE as i32;
@@ -1201,8 +2102,8 @@ mod tests {
 
     /// Slice acceptance invariants over a broad region: ores stay strictly
     /// below the h-3 roof and inside their depth bands, the bedrock floor is
-    /// intact, the surface skin (h, h-1..h-3) is never carved, and Stone
-    /// mountain tops (h >= 58) are never punched through.
+    /// intact, the surface skin (h, h-1..h-3) is never carved, and mountain
+    /// stone tops (h >= MOUNTAIN_HEIGHT_THRESHOLD) are never punched through.
     #[test]
     fn test_acceptance_invariants_over_broad_region() {
         let seed = DEFAULT_WORLD_SEED;
@@ -1216,7 +2117,7 @@ mod tests {
                 let base_wz = cz * CHUNK_SIZE as i32;
                 for cy in -1..=2 {
                     let pos = ChunkPos::new(cx, cy, cz);
-                    let chunk = generate_chunk_seeded(pos, seed);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
                     let base_wy = cy * CHUNK_SIZE as i32;
                     let top_wy = base_wy + CHUNK_SIZE as i32 - 1;
                     for (lz, row) in heights.iter().enumerate() {
@@ -1261,7 +2162,7 @@ mod tests {
                                     "surface skin carved at world ({wx}, {wy}, {wz}) (h = {h})"
                                 );
                             }
-                            if h >= 58 && (base_wy..=top_wy).contains(&h) {
+                            if h >= MOUNTAIN_HEIGHT_THRESHOLD && (base_wy..=top_wy).contains(&h) {
                                 let ly = (h - base_wy) as usize;
                                 let surface = chunk.get(lx, ly, lz);
                                 assert_ne!(
@@ -1269,7 +2170,7 @@ mod tests {
                                     BlockId::Air,
                                     "mountain-top surface carved at ({wx}, {h}, {wz})"
                                 );
-                                if h < 68 {
+                                if h < SNOW_CAP_HEIGHT {
                                     assert_eq!(
                                         surface,
                                         BlockId::Stone,
@@ -1300,15 +2201,15 @@ mod tests {
             }
             let (wx, wz, h) = highest.expect("height search must yield a column");
             assert!(
-                h >= 58,
-                "height search did not reach mountain terrain (max h = {h})"
+                h >= MOUNTAIN_HEIGHT_THRESHOLD,
+                "height search did not reach mountain terrain (max h = {h}, threshold = {MOUNTAIN_HEIGHT_THRESHOLD})"
             );
             let pos = ChunkPos::new(
                 wx.div_euclid(CHUNK_SIZE as i32),
                 h.div_euclid(CHUNK_SIZE as i32),
                 wz.div_euclid(CHUNK_SIZE as i32),
             );
-            let chunk = generate_chunk_seeded(pos, seed);
+            let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
             let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
             let ly = h.rem_euclid(CHUNK_SIZE as i32) as usize;
             let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
@@ -1322,5 +2223,1912 @@ mod tests {
                 "acceptance invariants: checked {mountain_surface_checks} mountain-top surface cells"
             );
         }
+    }
+
+    // ---- Four-biome envelope acceptance -------------------------------------
+
+    /// Deterministic index for per-biome bookkeeping.
+    fn biome_index(biome: Biome) -> usize {
+        match biome {
+            Biome::Plains => 0,
+            Biome::Forest => 1,
+            Biome::Mountains => 2,
+            Biome::Ocean => 3,
+        }
+    }
+
+    /// First `(wx, wz, height)` column of each biome inside the bounded,
+    /// seed-pinned acceptance region.
+    fn first_column_per_biome(seed: u32) -> [Option<(i32, i32, i32)>; 4] {
+        let mut found = [None; 4];
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                let idx = biome_index(biome_at_seeded(wx, wz, seed));
+                if found[idx].is_none() {
+                    found[idx] = Some((wx, wz, terrain_height_at_seeded(wx, wz, seed)));
+                }
+            }
+        }
+        found
+    }
+
+    /// Block at a world position for an explicit `season`; the chunk is
+    /// regenerated per call, so callers sample a handful of blocks at most.
+    fn generated_block_at(wx: i32, wy: i32, wz: i32, seed: u32, season: Season) -> BlockId {
+        let pos = ChunkPos::new(
+            wx.div_euclid(CHUNK_SIZE as i32),
+            wy.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+        let chunk = generate_chunk_seeded(pos, seed, season);
+        chunk.get(
+            wx.rem_euclid(CHUNK_SIZE as i32) as usize,
+            wy.rem_euclid(CHUNK_SIZE as i32) as usize,
+            wz.rem_euclid(CHUNK_SIZE as i32) as usize,
+        )
+    }
+
+    /// Acceptance: one pinned seed's reachable region contains all four
+    /// biomes — plains, forest, mountains and ocean basins.
+    #[test]
+    fn test_acceptance_four_biomes_present_in_one_seed() {
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            let mut counts = [0usize; 4];
+            for wz in (-512..=512).step_by(4) {
+                for wx in (-512..=512).step_by(4) {
+                    counts[biome_index(biome_at_seeded(wx, wz, seed))] += 1;
+                }
+            }
+            assert!(counts[0] > 0, "seed {seed} has no plains columns");
+            assert!(counts[1] > 0, "seed {seed} has no forest columns");
+            assert!(counts[2] > 0, "seed {seed} has no mountain columns");
+            assert!(counts[3] > 0, "seed {seed} has no ocean columns");
+            eprintln!(
+                "four-biome scan seed {seed}: plains {}, forest {}, mountains {}, ocean {}",
+                counts[0], counts[1], counts[2], counts[3]
+            );
+        }
+    }
+
+    /// Negative/envelope: over a wide scan the surface never leaves the named
+    /// envelope, mountains actually reach the mountain threshold, and ocean
+    /// basins below sea level exist.
+    #[test]
+    fn test_acceptance_height_envelope_scan() {
+        const {
+            assert!(MAX_TERRAIN_HEIGHT <= 150, "D071 caps the envelope at 150");
+            assert!(
+                MIN_TERRAIN_HEIGHT > -32,
+                "the envelope must stay above the bedrock floor"
+            );
+            assert!(
+                MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM < 4 * CHUNK_SIZE as i32,
+                "the top chunk layer must stay provably air"
+            );
+        }
+
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            let mut min_h = i32::MAX;
+            let mut max_h = i32::MIN;
+            let mut ocean_columns = 0usize;
+            for wz in (-1024..=1024).step_by(8) {
+                for wx in (-1024..=1024).step_by(8) {
+                    let h = terrain_height_at_seeded(wx, wz, seed);
+                    assert!(
+                        (MIN_TERRAIN_HEIGHT..=MAX_TERRAIN_HEIGHT).contains(&h),
+                        "seed {seed} height {h} at ({wx}, {wz}) outside envelope {MIN_TERRAIN_HEIGHT}..={MAX_TERRAIN_HEIGHT}"
+                    );
+                    if h < SEA_LEVEL {
+                        ocean_columns += 1;
+                    }
+                    min_h = min_h.min(h);
+                    max_h = max_h.max(h);
+                }
+            }
+            assert!(
+                max_h >= MOUNTAIN_HEIGHT_THRESHOLD,
+                "seed {seed} never reaches mountain height (max {max_h})"
+            );
+            assert!(
+                min_h < SEA_LEVEL,
+                "seed {seed} carves no ocean basins (min {min_h})"
+            );
+            assert!(
+                ocean_columns > 0,
+                "seed {seed} has no columns below SEA_LEVEL"
+            );
+            eprintln!(
+                "envelope scan seed {seed}: min {min_h}, max {max_h}, ocean columns {ocean_columns}"
+            );
+        }
+    }
+
+    /// Positive + determinism: the spawn column is always land above the water
+    /// line, is identical across repeat calls (R001 purity), and has no tree
+    /// trunk or neighbour canopy inside the spawn body.
+    #[test]
+    fn test_find_spawn_column_is_land_above_sea_level_and_deterministic() {
+        // Includes seeds whose (0, 0) column is open ocean after the T03
+        // rewrite (12345 -> h 14, 4 -> h 8, VISTA_SEED -> h 4) beside seeds
+        // whose origin is already safe, plus the seed with the widest observed
+        // search ring (2400638911 -> 365 blocks).
+        for seed in [DEFAULT_WORLD_SEED, 12345, 9, 4, 0x5EED_4A11, 2_400_638_911] {
+            let (wx, wz) = find_spawn_column(seed);
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            assert!(
+                h >= SPAWN_MIN_HEIGHT,
+                "seed {seed} spawn ({wx}, {wz}) has h {h} below SPAWN_MIN_HEIGHT {SPAWN_MIN_HEIGHT}"
+            );
+            assert!(
+                h <= MAX_TERRAIN_HEIGHT,
+                "seed {seed} spawn ({wx}, {wz}) leaves the height envelope"
+            );
+            assert_ne!(
+                biome_at_seeded(wx, wz, seed),
+                Biome::Ocean,
+                "seed {seed} spawned in an ocean column"
+            );
+            assert_eq!(
+                find_spawn_column(seed),
+                (wx, wz),
+                "seed {seed} spawn search must be byte-identical across repeats"
+            );
+            // Tree clearance: no oak within the canopy radius, so the surface+4
+            // spawn can never be inside a trunk or a neighbour's leaves.
+            for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                    let nx = wx + dx;
+                    let nz = wz + dz;
+                    let nh = terrain_height_at_seeded(nx, nz, seed);
+                    let nb = biome_for_height(nh, forest_noise(nx, nz, seed));
+                    assert_eq!(
+                        tree_trunk_height(nx, nz, nh, nb, seed),
+                        None,
+                        "seed {seed} spawn ({wx}, {wz}) is within {SPAWN_TREE_CLEARANCE} blocks of a tree at ({nx}, {nz})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The common case stays put: a safe origin column keeps the spawn at
+    /// (0, 0), so the search changes nothing for the default world.
+    #[test]
+    fn test_find_spawn_column_keeps_a_safe_origin() {
+        let seed = DEFAULT_WORLD_SEED;
+        assert!(is_spawn_safe(0, 0, seed));
+        assert_eq!(find_spawn_column(seed), (0, 0));
+    }
+
+    /// Negative/envelope: when (0, 0) is open ocean the search must move to
+    /// land instead of pinning the old fixed column.
+    #[test]
+    fn test_find_spawn_column_moves_off_an_ocean_origin() {
+        let seed = 12345u32;
+        assert!(
+            terrain_height_at_seeded(0, 0, seed) < SEA_LEVEL,
+            "test premise: seed {seed} must have an ocean at (0, 0)"
+        );
+        assert_eq!(biome_at_seeded(0, 0, seed), Biome::Ocean);
+        let (wx, wz) = find_spawn_column(seed);
+        assert_ne!((wx, wz), (0, 0));
+        assert!(terrain_height_at_seeded(wx, wz, seed) >= SPAWN_MIN_HEIGHT);
+    }
+
+    /// Integration: the block the player's feet occupy (surface + 1..=+4) is
+    /// Air in the actually generated chunk, so no trunk, leaf, or water block
+    /// sits inside the spawn body.
+    #[test]
+    fn test_spawn_column_body_is_air_in_the_generated_chunk() {
+        let ch = CHUNK_SIZE as i32;
+        for seed in [DEFAULT_WORLD_SEED, 12345, 4, 0x5EED_4A11] {
+            let (wx, wz) = find_spawn_column(seed);
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            for dy in 1..=4 {
+                let wy = h + dy;
+                let pos = ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+                let block = chunk.get(
+                    wx.rem_euclid(ch) as usize,
+                    wy.rem_euclid(ch) as usize,
+                    wz.rem_euclid(ch) as usize,
+                );
+                assert_eq!(
+                    block,
+                    BlockId::Air,
+                    "seed {seed} spawn body block at ({wx}, {wy}, {wz}) is {block:?}, not Air"
+                );
+            }
+        }
+    }
+
+    /// Failure mode: a bound too small for the seed panics loudly with the
+    /// search parameters instead of silently returning an unsafe column.
+    #[test]
+    #[should_panic(expected = "no land spawn column within 8 blocks")]
+    fn test_find_spawn_column_fails_loudly_when_bounded_out() {
+        let seed = 12345u32;
+        // Premise: the first safe column for this seed is far outside 8 blocks.
+        for wx in -8..=8 {
+            for wz in -8..=8 {
+                assert!(
+                    !is_spawn_safe(wx, wz, seed),
+                    "test premise: ({wx}, {wz}) is safe, widen the bound"
+                );
+            }
+        }
+        let _ = find_spawn_column_within(seed, 8);
+    }
+
+    /// Negative: classification can never disagree with the height it was
+    /// derived from. Ocean is exactly below sea level, Mountains exactly at or
+    /// above the mountain threshold, and land in between.
+    #[test]
+    fn test_biome_height_agreement_pin() {
+        for seed in [DEFAULT_WORLD_SEED, 424_242] {
+            for wz in (-512..=512).step_by(4) {
+                for wx in (-512..=512).step_by(4) {
+                    let h = terrain_height_at_seeded(wx, wz, seed);
+                    let biome = biome_at_seeded(wx, wz, seed);
+                    assert_eq!(
+                        biome,
+                        biome_at_seeded(wx, wz, seed),
+                        "biome classification is not pure at ({wx}, {wz})"
+                    );
+                    match biome {
+                        Biome::Ocean => assert!(
+                            h < SEA_LEVEL,
+                            "Ocean column ({wx}, {wz}) has h {h} >= SEA_LEVEL"
+                        ),
+                        Biome::Mountains => assert!(
+                            h >= MOUNTAIN_HEIGHT_THRESHOLD,
+                            "Mountains column ({wx}, {wz}) has h {h} < threshold"
+                        ),
+                        Biome::Plains | Biome::Forest => assert!(
+                            (SEA_LEVEL..MOUNTAIN_HEIGHT_THRESHOLD).contains(&h),
+                            "land column ({wx}, {wz}) has h {h} outside sea..mountain band"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Surface skin follows the biome: sand seabed and beaches, grass/dirt on
+    /// plains and forest, stone (or snow high up) on mountains. The three-block
+    /// subsurface band stays solid so caves never open the surface.
+    #[test]
+    fn test_surface_skin_matches_biome() {
+        let seed = DEFAULT_WORLD_SEED;
+        let found = first_column_per_biome(seed);
+        for (idx, column) in found.iter().enumerate() {
+            let (wx, wz, h) = column.unwrap_or_else(|| panic!("missing biome index {idx}"));
+            let biome = biome_at_seeded(wx, wz, seed);
+            let surface = generated_block_at(wx, h, wz, seed, Season::Summer);
+            let expected = match biome {
+                Biome::Ocean => BlockId::Sand,
+                Biome::Mountains if h >= SNOW_CAP_HEIGHT => BlockId::Snow,
+                Biome::Mountains => BlockId::Stone,
+                Biome::Plains | Biome::Forest if h <= SEA_LEVEL + BEACH_BAND => BlockId::Sand,
+                Biome::Plains | Biome::Forest => BlockId::Grass,
+            };
+            assert_eq!(
+                surface, expected,
+                "{biome:?} column ({wx}, {h}, {wz}) has surface {surface:?}, expected {expected:?}"
+            );
+            for wy in (h - 3)..h {
+                assert_ne!(
+                    generated_block_at(wx, wy, wz, seed, Season::Summer),
+                    BlockId::Air,
+                    "subsurface skin at ({wx}, {wy}, {wz}) is Air"
+                );
+            }
+        }
+    }
+
+    /// Water fill invariant: every ocean column is filled with static Water
+    /// from just above the seabed up to SEA_LEVEL, no land column ever holds
+    /// water, and water never appears below the seabed or above sea level.
+    #[test]
+    fn test_ocean_basins_are_filled_with_water_up_to_sea_level() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut water_blocks = 0usize;
+        let mut ocean_columns = 0usize;
+        let mut land_columns = 0usize;
+
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -1..=0 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let wx = base_wx + lx as i32;
+                            let wz = base_wz + lz as i32;
+                            let h = terrain_height_at_seeded(wx, wz, seed);
+                            let is_ocean = h < SEA_LEVEL;
+                            if is_ocean {
+                                ocean_columns += 1;
+                            } else {
+                                land_columns += 1;
+                            }
+
+                            for ly in 0..CHUNK_SIZE {
+                                let wy = base_wy + ly as i32;
+                                if chunk.get(lx, ly, lz) != BlockId::Water {
+                                    continue;
+                                }
+                                water_blocks += 1;
+                                assert!(
+                                    is_ocean,
+                                    "water in land column ({wx}, {wy}, {wz}) with h = {h}"
+                                );
+                                assert!(
+                                    (h + 1..=SEA_LEVEL).contains(&wy),
+                                    "water at ({wx}, {wy}, {wz}) outside seabed..sea band \
+                                     (h = {h}, SEA_LEVEL = {SEA_LEVEL})"
+                                );
+                            }
+
+                            if cy == 0 {
+                                // The layer that owns the whole sea band.
+                                for wy in (h + 1)..=SEA_LEVEL {
+                                    let ly = (wy - base_wy) as usize;
+                                    assert_eq!(
+                                        chunk.get(lx, ly, lz),
+                                        BlockId::Water,
+                                        "ocean column ({wx}, {wz}) is not filled at wy {wy} \
+                                         (h = {h})"
+                                    );
+                                }
+                                if is_ocean {
+                                    let ly = (SEA_LEVEL + 1 - base_wy) as usize;
+                                    assert_eq!(
+                                        chunk.get(lx, ly, lz),
+                                        BlockId::Air,
+                                        "ocean column ({wx}, {wz}) has a block above SEA_LEVEL"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(ocean_columns > 0, "scan found no ocean columns to fill");
+        assert!(land_columns > 0, "scan found no land columns");
+        assert!(water_blocks > 0, "scan found no Water blocks");
+        eprintln!(
+            "water fill scan: {ocean_columns} ocean columns, {land_columns} land columns, \
+             {water_blocks} Water blocks"
+        );
+    }
+
+    /// The seabed seal under a water column: the three-block subsurface skin
+    /// and the surface stay Sand. Caves only carve strictly below `h - 3`, so
+    /// they can never puncture the skin and drain a basin into a cave.
+    #[test]
+    fn test_water_columns_keep_seabed_skin_and_caves_below_it() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut checked = 0usize;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+                let base_wx = cx * CHUNK_SIZE as i32;
+                let base_wy = 0;
+                let base_wz = cz * CHUNK_SIZE as i32;
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = base_wx + lx as i32;
+                        let wz = base_wz + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        if h >= SEA_LEVEL {
+                            continue;
+                        }
+                        checked += 1;
+                        assert!(
+                            (0..CHUNK_SIZE as i32).contains(&h),
+                            "ocean surface h {h} outside the inspected layer"
+                        );
+                        for wy in (h - 3)..=h {
+                            let ly = (wy - base_wy) as usize;
+                            assert_eq!(
+                                chunk.get(lx, ly, lz),
+                                BlockId::Sand,
+                                "seabed skin at ({wx}, {wy}, {wz}) is not Sand (h = {h})"
+                            );
+                            assert!(
+                                !is_cave_carvable(BlockId::Sand, wy, h),
+                                "a cave must never carve the seabed skin at wy {wy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "scan found no water columns to guard");
+        eprintln!("seabed skin scan: {checked} water columns kept their three-block seal");
+    }
+
+    /// Water generation is a pure function of position + seed: two repeats of
+    /// the same ocean chunk are byte-identical, including the water volume.
+    #[test]
+    fn test_water_generation_is_byte_identical_across_repeats() {
+        let seed = DEFAULT_WORLD_SEED;
+        let mut found_water = false;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let pos = ChunkPos::new(cx, 0, cz);
+                let first = generate_chunk_seeded(pos, seed, Season::Summer);
+                let second = generate_chunk_seeded(pos, seed, Season::Summer);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let a = first.get(lx, ly, lz);
+                            assert_eq!(
+                                a,
+                                second.get(lx, ly, lz),
+                                "seed {seed} chunk {pos:?} differs at ({lx}, {ly}, {lz})"
+                            );
+                            found_water |= a == BlockId::Water;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_water,
+            "repeat scan never encountered the water volume"
+        );
+    }
+
+    /// First column of `biome` whose surface is high enough for trees (above
+    /// the beach band), so the density comparison is not sampled on a coast.
+    fn first_tree_column(seed: u32, biome: Biome) -> (i32, i32, i32) {
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                if biome_at_seeded(wx, wz, seed) != biome {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if (TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&h) {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no {biome:?} column inside the tree height band");
+    }
+
+    /// Count oak logs around a chunk and assert the per-column placement rule.
+    ///
+    /// Every log column must be either a valid trunk column (the pure
+    /// `oak_tree_at` gate holds, its lowest log sits exactly on `h + 1`, and its
+    /// Summer surface is Grass) or a one-block branch of an adjacent valid tree
+    /// (D088). No free-floating OakLog is allowed, and no log may grow on a
+    /// column outside the Plains/Forest tree band.
+    fn scan_region_for_log_rule(cx: i32, cz: i32, radius: i32, seed: u32) -> usize {
+        use std::collections::HashMap;
+        let mut logs = 0usize;
+        // (wx, wz) -> lowest log wy seen in that column.
+        let mut log_columns: HashMap<(i32, i32), i32> = HashMap::new();
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                for cy in 0..=1 {
+                    let chunk = generate_chunk_seeded(
+                        ChunkPos::new(cx + dx, cy, cz + dz),
+                        seed,
+                        Season::Summer,
+                    );
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                if chunk.get(lx, ly, lz) != BlockId::OakLog {
+                                    continue;
+                                }
+                                logs += 1;
+                                let wx = (cx + dx) * CHUNK_SIZE as i32 + lx as i32;
+                                let wz = (cz + dz) * CHUNK_SIZE as i32 + lz as i32;
+                                let wy = base_wy + ly as i32;
+                                let slot = log_columns.entry((wx, wz)).or_insert(wy);
+                                *slot = (*slot).min(wy);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut trunk_columns_checked = 0usize;
+        for (&(wx, wz), &lowest_log) in &log_columns {
+            let biome = biome_at_seeded(wx, wz, seed);
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            if oak_tree_at(wx, wz, h, biome, seed).is_some() {
+                assert_eq!(
+                    lowest_log,
+                    h + 1,
+                    "lowest oak log at ({wx}, {lowest_log}, {wz}) is not the trunk base h+1 (h = {h})"
+                );
+                // Bound the surface-block regeneration sample: the pure gate
+                // above already proves the height/biome rule; this re-checks
+                // the actual post-season surface block.
+                if trunk_columns_checked < 40 {
+                    assert_eq!(
+                        generated_block_at(wx, h, wz, seed, Season::Summer),
+                        BlockId::Grass,
+                        "oak log grows out of a non-Grass surface at ({wx}, {h}, {wz})"
+                    );
+                    trunk_columns_checked += 1;
+                }
+                continue;
+            }
+
+            // Not a trunk column: the only other legal log is a branch of a
+            // tree rooted in a neighbouring column (branches are one block
+            // out, so dx/dz are in -1..=1).
+            let mut explained = false;
+            'neighbours: for ndz in -1..=1 {
+                for ndx in -1..=1 {
+                    if ndx == 0 && ndz == 0 {
+                        continue;
+                    }
+                    let (sx, sz) = (wx + ndx, wz + ndz);
+                    let sh = terrain_height_at_seeded(sx, sz, seed);
+                    let sb = biome_at_seeded(sx, sz, seed);
+                    let Some(source) = oak_tree_at(sx, sz, sh, sb, seed) else {
+                        continue;
+                    };
+                    if source
+                        .branch_cells(sx, sz, sh)
+                        .any(|(bx, by, bz)| (bx, by, bz) == (wx, lowest_log, wz))
+                    {
+                        explained = true;
+                        break 'neighbours;
+                    }
+                }
+            }
+            assert!(
+                explained,
+                "oak log at ({wx}, {lowest_log}, {wz}) is neither a trunk base nor a branch of an adjacent tree (h {h}, biome {biome:?})"
+            );
+        }
+        if !log_columns.is_empty() {
+            assert!(
+                trunk_columns_checked > 0,
+                "logs were found but no trunk column was sampled, so the log rule was never exercised"
+            );
+        }
+        logs
+    }
+
+    /// Trees follow biome density: forest is dense, plains sparse, and no trunk
+    /// ever appears on sand beaches/seabeds or mountain stone. Branches only
+    /// ever extend one block from a valid trunk (D088).
+    #[test]
+    fn test_tree_density_follows_biome_and_surface_block() {
+        let seed = DEFAULT_WORLD_SEED;
+        let forest = first_tree_column(seed, Biome::Forest);
+        let plains = first_tree_column(seed, Biome::Plains);
+        let found = first_column_per_biome(seed);
+        let ocean = found[biome_index(Biome::Ocean)].expect("seed must have ocean");
+        let mountains = found[biome_index(Biome::Mountains)].expect("seed must have mountains");
+
+        let chunk_of = |(wx, wz, _h): (i32, i32, i32)| {
+            (
+                wx.div_euclid(CHUNK_SIZE as i32),
+                wz.div_euclid(CHUNK_SIZE as i32),
+            )
+        };
+        let (fcx, fcz) = chunk_of(forest);
+        let (pcx, pcz) = chunk_of(plains);
+        let (ocx, ocz) = chunk_of(ocean);
+        let (mcx, mcz) = chunk_of(mountains);
+
+        let forest_logs = scan_region_for_log_rule(fcx, fcz, 1, seed);
+        let plains_logs = scan_region_for_log_rule(pcx, pcz, 1, seed);
+        assert!(
+            forest_logs > 0,
+            "forest region produced no oak logs (dense forest is empty)"
+        );
+        assert!(
+            forest_logs > plains_logs,
+            "forest density {forest_logs} not above plains density {plains_logs}"
+        );
+
+        // Scan ocean and mountain regions too; the helper asserts the per-column
+        // gate for every log it finds (these regions may contain land chunks).
+        let _ = scan_region_for_log_rule(ocx, ocz, 1, seed);
+        let _ = scan_region_for_log_rule(mcx, mcz, 1, seed);
+
+        // The selected ocean and mountain columns themselves are never log
+        // columns: their surface block is Sand / Stone, never Grass.
+        for (wx, h, wz, biome) in [
+            (ocean.0, ocean.2, ocean.1, Biome::Ocean),
+            (mountains.0, mountains.2, mountains.1, Biome::Mountains),
+        ] {
+            let surface = generated_block_at(wx, h, wz, seed, Season::Summer);
+            assert_ne!(
+                surface,
+                BlockId::Grass,
+                "{biome:?} column ({wx}, {h}, {wz}) has a Grass surface"
+            );
+        }
+    }
+
+    // ---- Surface ruins (S07) ------------------------------------------------
+
+    /// Chunk radius of the ruin acceptance region (7x7 chunks, three vertical
+    /// layers so every ruin cell up to `surface + 4` is covered). Sized from
+    /// the 1/512 per-anchor gate: ~784 interior anchors per chunk, so this
+    /// region yields dozens of ruins and the non-zero bounds below are not
+    /// flaky.
+    const RUIN_SCAN_RADIUS: i32 = 3;
+
+    /// Lower bound on the distinct ruins the loot-seam acceptance scan must
+    /// find before "every ruin returns no loot" means anything.
+    ///
+    /// Derived from the same envelope: `RUIN_SCAN_RADIUS` covers 49 chunks, ~784
+    /// interior anchors each, so the 1/512 gate passes ~75 anchors and roughly
+    /// half of those sit in the Plains/Forest band — tens of candidates before
+    /// tree overlaps and interlocking shells. 8 is comfortably below the
+    /// observed count yet far above vacuous.
+    const RUIN_LOOT_MIN_RUINS: usize = 8;
+
+    /// Every ruin anchor the placement rule yields inside a chunk region,
+    /// derived from `ruin_at` exactly as `place_surface_ruins` does.
+    fn ruin_anchors_in_region(radius: i32, seed: u32) -> Vec<RuinSpec> {
+        let mut anchors = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = cx * CHUNK_SIZE as i32 + lx as i32;
+                        let wz = cz * CHUNK_SIZE as i32 + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let biome = biome_for_height(h, forest_noise(wx, wz, seed));
+                        if let Some(spec) = ruin_at(wx, wz, h, biome, seed) {
+                            anchors.push(spec);
+                        }
+                    }
+                }
+            }
+        }
+        anchors
+    }
+
+    /// Every Cobblestone/Brick cell in a chunk region (`cy 0..=2`, enough for
+    /// `surface + 4` up to the top of the ruin band). Worldgen paints exactly
+    /// those two blocks for ruins — ores are CoalOre/IronOre, trees are
+    /// OakLog/OakLeaves — so this set is the placed ruin shells.
+    fn ruin_blocks_in_region(radius: i32, seed: u32, season: Season) -> Vec<(i32, i32, i32, u8)> {
+        let mut blocks = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for cy in 0..=2 {
+                    let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, season);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                let block = chunk.get(lx, ly, lz);
+                                if matches!(block, BlockId::Cobblestone | BlockId::Brick) {
+                                    blocks.push((
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                        block as u8,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Gating: ruins stand only on Grass-surface Plains/Forest columns inside
+    /// the land band — never on Sand beaches, seabed, mountain Stone, the
+    /// altitude/seasonal Snow cap or a Water column — and every painted cell is
+    /// on the perimeter of a valid anchor's shell, strictly above the surface
+    /// (so the surface skin is never replaced).
+    #[test]
+    fn test_surface_ruins_stand_only_on_grass_land() {
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        assert!(!anchors.is_empty(), "region has no ruin anchors");
+        let blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
+        assert!(
+            blocks.len() >= 16,
+            "region produced {} ruin cells — expected several 5x5 shells",
+            blocks.len()
+        );
+        let brick_cells = blocks
+            .iter()
+            .filter(|b| b.3 == BlockId::Brick as u8)
+            .count();
+        assert!(
+            brick_cells >= 4,
+            "region produced {brick_cells} Brick cells, expected corner accents"
+        );
+
+        let mut surface_checked = 0usize;
+        for &(wx, wy, wz, id) in &blocks {
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            let biome = biome_at_seeded(wx, wz, seed);
+            assert!(
+                matches!(biome, Biome::Plains | Biome::Forest),
+                "ruin cell at ({wx}, {wy}, {wz}) stands in {biome:?}"
+            );
+            assert!(
+                (RUIN_MIN_HEIGHT..=RUIN_MAX_HEIGHT).contains(&h),
+                "ruin column ({wx}, {wz}) has h {h} outside the ruin band"
+            );
+            assert!(
+                (h + 1..=h + RUIN_WALL_MAX_HEIGHT + 1).contains(&wy),
+                "ruin cell at ({wx}, {wy}, {wz}) outside surface+1..=surface+{} (h = {h})",
+                RUIN_WALL_MAX_HEIGHT + 1
+            );
+            // Attribute the cell to the anchors whose footprint contains it.
+            // Overlapping ruins are legal (two anchors may sit within 4
+            // blocks), so a cell only has to be a shell cell of *some*
+            // covering anchor, with that anchor's wall material.
+            let covering: Vec<&RuinSpec> = anchors
+                .iter()
+                .filter(|spec| {
+                    (spec.anchor_x - wx).abs() <= RUIN_FOOTPRINT_HALF
+                        && (spec.anchor_z - wz).abs() <= RUIN_FOOTPRINT_HALF
+                })
+                .collect();
+            assert!(
+                !covering.is_empty(),
+                "ruin cell at ({wx}, {wy}, {wz}) belongs to no anchor footprint"
+            );
+            let on_shell = covering.iter().any(|spec| {
+                let dx = wx - spec.anchor_x;
+                let dz = wz - spec.anchor_z;
+                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF && ruin_wall_block(dx, dz) as u8 == id
+            });
+            assert!(
+                on_shell,
+                "ruin cell at ({wx}, {wy}, {wz}) is not a shell cell of any covering anchor"
+            );
+            // Bound the per-column regeneration sample: the biome/band checks
+            // above already pin the rule, this re-checks the generated block.
+            if surface_checked < 40 {
+                assert_eq!(
+                    generated_block_at(wx, h, wz, seed, Season::Summer),
+                    BlockId::Grass,
+                    "ruin cell column ({wx}, {h}, {wz}) has a non-Grass surface"
+                );
+                surface_checked += 1;
+            }
+        }
+
+        // The seasonal Winter blanket turns Plains/Forest land into Snow, so the
+        // authoritative Grass gate suppresses every ruin: the same chunks that
+        // carried shells in Summer must carry none in Winter.
+        let mut ruin_chunks: Vec<(i32, i32)> = blocks
+            .iter()
+            .map(|&(wx, _, wz, _)| {
+                (
+                    wx.div_euclid(CHUNK_SIZE as i32),
+                    wz.div_euclid(CHUNK_SIZE as i32),
+                )
+            })
+            .collect();
+        ruin_chunks.sort_unstable();
+        ruin_chunks.dedup();
+        assert!(!ruin_chunks.is_empty(), "no ruin chunks to re-check");
+        for &(cx, cz) in ruin_chunks.iter().take(8) {
+            for cy in 0..=2 {
+                let winter = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Winter);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let block = winter.get(lx, ly, lz);
+                            assert!(
+                                !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                                "winter Snow surface should suppress ruins, but ({cx}, {cy}, {cz}) has {block:?} at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ocean and mountain chunks carry no ruin at all: Sand and Stone
+        // surfaces fail the same Grass gate as Snow.
+        let found = first_column_per_biome(seed);
+        for biome in [Biome::Ocean, Biome::Mountains] {
+            let (wx, _, wz) = found[biome_index(biome)].expect("seed must have both biomes");
+            let (cx, cz) = (
+                wx.div_euclid(CHUNK_SIZE as i32),
+                wz.div_euclid(CHUNK_SIZE as i32),
+            );
+            for cy in 0..=2 {
+                let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let block = chunk.get(lx, ly, lz);
+                            assert!(
+                                !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                                "{biome:?} chunk ({cx}, {cy}, {cz}) has ruin block {block:?} at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Determinism and seed sensitivity: the same seed regenerates the same ruin
+    /// set, distinct seeds move it. Mirrors `test_different_seeds_change_ore_layout`.
+    #[test]
+    fn test_surface_ruins_are_deterministic_and_seed_dependent() {
+        // Radius 3 matches RUIN_SCAN_RADIUS: the D088 branch-aware overlap
+        // policy rejects more forest anchors, so the smaller radius-2 sample
+        // can legitimately contain zero surviving ruins for a given seed.
+        let radius = RUIN_SCAN_RADIUS;
+        let first = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
+        let repeat = ruin_blocks_in_region(radius, DEFAULT_WORLD_SEED, Season::Summer);
+        let other = ruin_blocks_in_region(radius, 424_242, Season::Summer);
+        assert!(!first.is_empty(), "seed 1337 produced no ruins");
+        assert!(!other.is_empty(), "seed 424242 produced no ruins");
+        assert_eq!(first, repeat, "same seed produced different ruin layouts");
+        assert_ne!(
+            first, other,
+            "different seeds produced identical ruin layouts"
+        );
+    }
+
+    /// Only-into-Air pinned directly on the pass: a shell cell that already
+    /// holds a non-Air block (OakLeaves from a neighbouring canopy, Water, the
+    /// Grass surface skin) is left untouched, and an anchor whose footprint
+    /// holds an OakLog is skipped entirely. Inline fixture chunk, real
+    /// `place_ruin_at` — no mocks.
+    #[test]
+    fn test_place_ruin_only_writes_into_air() {
+        let heights = [[40i32; CHUNK_SIZE]; CHUNK_SIZE];
+        let base_wy = 32;
+        let spec = RuinSpec {
+            anchor_x: 16,
+            anchor_z: 16,
+            surface: 40,
+            wall_height: 2,
+        };
+
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                chunk.set(lx, 8, lz, BlockId::Grass);
+            }
+        }
+        // (18, 16) is a +x wall-run cell at level 1 and (14, 14) a corner at
+        // level 2: non-Air blocks there must survive the pass.
+        chunk.set(18, 9, 16, BlockId::OakLeaves);
+        chunk.set(14, 10, 14, BlockId::Water);
+
+        place_ruin_at(&mut chunk, &heights, base_wy, spec);
+
+        assert_eq!(
+            chunk.get(18, 9, 16),
+            BlockId::OakLeaves,
+            "ruin overwrote OakLeaves"
+        );
+        assert_eq!(
+            chunk.get(14, 10, 14),
+            BlockId::Water,
+            "ruin overwrote Water"
+        );
+        // Free shell cells did get their wall material (level 1 Cobblestone on
+        // the wall run, level 2 Brick on the corner pillar).
+        assert_eq!(chunk.get(18, 9, 17), BlockId::Cobblestone);
+        assert_eq!(chunk.get(18, 10, 18), BlockId::Brick);
+        // The doorway and the footprint interior stay open.
+        assert_eq!(chunk.get(16, 9, 18), BlockId::Air, "doorway was walled up");
+        assert_eq!(
+            chunk.get(16, 9, 16),
+            BlockId::Air,
+            "ruin interior is not hollow"
+        );
+        // The Grass surface skin itself is never a shell target.
+        assert_eq!(chunk.get(18, 8, 16), BlockId::Grass);
+
+        // Tree-overlap policy: an OakLog anywhere in the footprint skips the
+        // whole anchor, even where the shell cell itself is still Air.
+        let mut tree_chunk = Chunk::new_uniform(BlockId::Air);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                tree_chunk.set(lx, 8, lz, BlockId::Grass);
+            }
+        }
+        tree_chunk.set(17, 9, 17, BlockId::OakLog);
+        place_ruin_at(&mut tree_chunk, &heights, base_wy, spec);
+        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for ly in 0..CHUNK_SIZE {
+                    let block = tree_chunk.get((16 + dx) as usize, ly, (16 + dz) as usize);
+                    assert!(
+                        !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                        "anchor overlapping an OakLog still placed {block:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(tree_chunk.get(17, 9, 17), BlockId::OakLog);
+    }
+
+    /// Tree-overlap policy pinned: an anchor whose footprint already holds an
+    /// OakLog is skipped entirely, so a ruin never carves through a tree.
+    #[test]
+    fn test_surface_ruins_skip_tree_overlaps() {
+        use std::collections::HashMap;
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        assert!(!anchors.is_empty(), "region has no ruin anchors to check");
+        let ch = CHUNK_SIZE as i32;
+        let mut cache: HashMap<(i32, i32, i32), Chunk> = HashMap::new();
+        let mut checked = 0usize;
+
+        for spec in &anchors {
+            // Only unambiguous anchors: when another ruin anchor sits within 4
+            // blocks its shell may legally paint inside this footprint, which
+            // would blur the "this anchor was skipped" assertion.
+            let overlapped_by_ruin = anchors.iter().any(|other| {
+                other != spec
+                    && (other.anchor_x - spec.anchor_x).abs() <= 2 * RUIN_FOOTPRINT_HALF
+                    && (other.anchor_z - spec.anchor_z).abs() <= 2 * RUIN_FOOTPRINT_HALF
+            });
+            if overlapped_by_ruin {
+                continue;
+            }
+
+            let mut has_log = false;
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    let wx = spec.anchor_x + dx;
+                    let wz = spec.anchor_z + dz;
+                    for wy in (spec.surface + 1)..=(spec.surface + TREE_CANOPY_HEADROOM) {
+                        let pos =
+                            ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                        let chunk = cache
+                            .entry((pos.x, pos.y, pos.z))
+                            .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
+                        let block = chunk.get(
+                            wx.rem_euclid(ch) as usize,
+                            wy.rem_euclid(ch) as usize,
+                            wz.rem_euclid(ch) as usize,
+                        );
+                        if block == BlockId::OakLog {
+                            has_log = true;
+                        }
+                    }
+                }
+            }
+            if !has_log {
+                continue;
+            }
+            checked += 1;
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
+                        continue;
+                    }
+                    let wx = spec.anchor_x + dx;
+                    let wz = spec.anchor_z + dz;
+                    let top = ruin_cell_top(dx, dz, spec.wall_height);
+                    for level in ruin_cell_bottom(dx, dz)..=top {
+                        let wy = spec.surface + level;
+                        let pos =
+                            ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                        let chunk = cache
+                            .entry((pos.x, pos.y, pos.z))
+                            .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
+                        let block = chunk.get(
+                            wx.rem_euclid(ch) as usize,
+                            wy.rem_euclid(ch) as usize,
+                            wz.rem_euclid(ch) as usize,
+                        );
+                        assert!(
+                            !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                            "anchor ({}, {}) overlaps a tree but still placed {block:?} at ({wx}, {wy}, {wz})",
+                            spec.anchor_x,
+                            spec.anchor_z
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 1,
+            "no ruin anchor overlapped a tree, so the skip policy was never exercised"
+        );
+    }
+
+    /// Spawn clearance: the row of ruin tests the spawn search shares the ruin
+    /// rule, so no spawn column is inside a footprint, and the generated spawn
+    /// body stays Air.
+    #[test]
+    fn test_find_spawn_column_avoids_ruin_footprints() {
+        for seed in [DEFAULT_WORLD_SEED, 12345, 9, 4, 0x5EED_4A11] {
+            let (wx, wz) = find_spawn_column(seed);
+            assert_eq!(
+                ruin_covering(wx, wz, seed),
+                None,
+                "seed {seed} spawn ({wx}, {wz}) is inside a ruin footprint"
+            );
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            let ch = CHUNK_SIZE as i32;
+            let chunk = generate_chunk_seeded(
+                ChunkPos::new(wx.div_euclid(ch), (h + 1).div_euclid(ch), wz.div_euclid(ch)),
+                seed,
+                Season::Summer,
+            );
+            for dy in 1..=4 {
+                let wy = h + dy;
+                let block = chunk.get(
+                    wx.rem_euclid(ch) as usize,
+                    wy.rem_euclid(ch) as usize,
+                    wz.rem_euclid(ch) as usize,
+                );
+                assert!(
+                    !matches!(block, BlockId::Cobblestone | BlockId::Brick),
+                    "seed {seed} spawn body at ({wx}, {wy}, {wz}) holds ruin block {block:?}"
+                );
+            }
+        }
+
+        // Non-vacuity: a Plains ruin column that is otherwise spawn-eligible
+        // (dry land, no oak within the tree clearance) must still be rejected.
+        let seed = DEFAULT_WORLD_SEED;
+        let candidate = ruin_anchors_in_region(2, seed)
+            .into_iter()
+            .find(|spec| {
+                let (wx, wz) = (spec.anchor_x, spec.anchor_z);
+                if biome_at_seeded(wx, wz, seed) != Biome::Plains {
+                    return false;
+                }
+                for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                    for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
+                        let nh = terrain_height_at_seeded(wx + dx, wz + dz, seed);
+                        let nb = biome_for_height(nh, forest_noise(wx + dx, wz + dz, seed));
+                        if tree_trunk_height(wx + dx, wz + dz, nh, nb, seed).is_some() {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .expect("no tree-free Plains ruin anchor in the scan region");
+        assert!(
+            !is_spawn_safe(candidate.anchor_x, candidate.anchor_z, seed),
+            "is_spawn_safe accepted ruin anchor ({}, {})",
+            candidate.anchor_x,
+            candidate.anchor_z
+        );
+    }
+
+    /// Acceptance: the empty loot seam is callable at *every* ruin the generator
+    /// actually places, not merely declared.
+    ///
+    /// The region is regenerated and its Cobblestone/Brick cells (worldgen paints
+    /// those only for ruins) are attributed back to a covering anchor from
+    /// `ruin_at`. Each distinct ruin found then gets one `ruin_loot` call and
+    /// every answer must be an empty `Vec`. Both non-vacuity bounds are explicit:
+    /// the scan must find ruin cells at all *and* at least [`RUIN_LOOT_MIN_RUINS`]
+    /// distinct ruins, plus every ruin cell must have a covering anchor (a
+    /// generator/placement-rule disagreement fails loudly instead of silently
+    /// shrinking the checked set).
+    #[test]
+    fn test_ruin_loot_seam_is_empty_at_every_generated_ruin() {
+        use std::collections::BTreeSet;
+
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        let blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
+        assert!(
+            !blocks.is_empty(),
+            "acceptance scan found no ruin cells, so the empty-seam assertion would be vacuous"
+        );
+
+        let mut ruins: BTreeSet<(i32, i32)> = BTreeSet::new();
+        let mut loot_calls = 0usize;
+        for (bx, by, bz, block) in &blocks {
+            let Some(spec) = anchors.iter().find(|spec| {
+                (bx - spec.anchor_x).abs() <= RUIN_FOOTPRINT_HALF
+                    && (bz - spec.anchor_z).abs() <= RUIN_FOOTPRINT_HALF
+            }) else {
+                panic!(
+                    "generated ruin block {block:?} at ({bx}, {by}, {bz}) has no covering anchor — \
+                     the generator and ruin_at disagree"
+                );
+            };
+            if !ruins.insert((spec.anchor_x, spec.anchor_z)) {
+                continue;
+            }
+            let loot = ruin_loot(seed, spec);
+            assert!(
+                loot.is_empty(),
+                "ruin_loot returned {} entries for ruin ({}, {}) — the M007 seam must stay empty",
+                loot.len(),
+                spec.anchor_x,
+                spec.anchor_z
+            );
+            loot_calls += 1;
+        }
+
+        assert!(
+            ruins.len() >= RUIN_LOOT_MIN_RUINS,
+            "acceptance scan found only {} distinct ruins (need >= {RUIN_LOOT_MIN_RUINS}) — \
+             the empty-seam assertion would be near-vacuous",
+            ruins.len()
+        );
+        assert_eq!(loot_calls, ruins.len());
+
+        // Negative: the seam is empty for *any* (seed, ruin) pair, including a
+        // synthetic spec the generator would never produce and seeds with no
+        // ruins at all. There is no hidden content path keyed off the inputs.
+        let synthetic = RuinSpec {
+            anchor_x: 0,
+            anchor_z: 0,
+            surface: RUIN_MIN_HEIGHT,
+            wall_height: RUIN_WALL_MAX_HEIGHT,
+        };
+        for probe_seed in [0, 1, seed, u32::MAX] {
+            assert!(
+                ruin_loot(probe_seed, &synthetic).is_empty(),
+                "ruin_loot produced content for seed {probe_seed}"
+            );
+        }
+    }
+
+    /// Negative: a fixed set of chunk positions spanning all four biomes
+    /// regenerates byte-for-byte identically.
+    #[test]
+    fn test_acceptance_byte_identical_repeat_generation() {
+        let seed = DEFAULT_WORLD_SEED;
+        let found = first_column_per_biome(seed);
+        let mut positions = vec![
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-3, 0, 7),
+        ];
+        for column in found.into_iter().flatten() {
+            let (wx, _, wz) = column;
+            let cx = wx.div_euclid(CHUNK_SIZE as i32);
+            let cz = wz.div_euclid(CHUNK_SIZE as i32);
+            for cy in 0..=1 {
+                positions.push(ChunkPos::new(cx, cy, cz));
+            }
+        }
+
+        for pos in positions {
+            let first = generate_chunk_seeded(pos, seed, Season::Summer);
+            let second = generate_chunk_seeded(pos, seed, Season::Summer);
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        assert_eq!(
+                            first.get(lx, ly, lz),
+                            second.get(lx, ly, lz),
+                            "chunk {pos:?} differs at ({lx}, {ly}, {lz})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Seasonal surfacing (S05) -------------------------------------------
+
+    /// Season for each named calendar boundary day at the default length,
+    /// derived exactly as the live session will (pure `season_of`). The paper
+    /// value is asserted too, so the test can never quietly run the wrong
+    /// season if the calendar math drifts.
+    fn four_seasons_from_days(seed: u32) -> [(u32, Season); 4] {
+        [
+            (FIRST_SPRING_DAY, Season::Spring),
+            (FIRST_SUMMER_DAY, Season::Summer),
+            (FIRST_AUTUMN_DAY, Season::Autumn),
+            (FIRST_WINTER_DAY, Season::Winter),
+        ]
+        .map(|(day, expected)| {
+            let season = season_of(day, DEFAULT_SEASON_LENGTH_DAYS, seed);
+            assert_eq!(
+                season, expected,
+                "day {day} derived {season:?}, wanted {expected:?}"
+            );
+            (day, season)
+        })
+    }
+
+    /// Chunk positions spanning all four biomes for `seed` (plus the sky layer
+    /// and a fixed off-origin column), mirroring the existing byte-identity
+    /// precedent so the four-season acceptance is not sampled on one biome.
+    fn biome_spanning_chunk_positions(seed: u32) -> Vec<ChunkPos> {
+        let mut positions = vec![
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-3, 0, 7),
+        ];
+        for (wx, wz, _) in first_column_per_biome(seed).into_iter().flatten() {
+            let cx = wx.div_euclid(CHUNK_SIZE as i32);
+            let cz = wz.div_euclid(CHUNK_SIZE as i32);
+            for cy in 0..=1 {
+                positions.push(ChunkPos::new(cx, cy, cz));
+            }
+        }
+        positions
+    }
+
+    /// First `(wx, wz, h)` column of `biome` with `h` inside `min_h..=max_h`,
+    /// used to pin seasonal surfaces away from the beach band.
+    fn first_column_in_height_band(
+        seed: u32,
+        biome: Biome,
+        min_h: i32,
+        max_h: i32,
+    ) -> (i32, i32, i32) {
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                if biome_at_seeded(wx, wz, seed) != biome {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if (min_h..=max_h).contains(&h) {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no {biome:?} column with h in {min_h}..={max_h} in the acceptance region");
+    }
+
+    /// First `(wx, wz, h)` Mountain column at or above the altitude snow cap.
+    ///
+    /// The cap only exists in the continental highlands, far outside the ±512
+    /// four-biome acceptance region, so this scans a wider coarse grid (step
+    /// 32). Cap regions span dozens of blocks, so a 32-block lattice cannot
+    /// step over one.
+    fn first_snow_cap_column(seed: u32) -> (i32, i32, i32) {
+        for wz in (-8192..=8192).step_by(32) {
+            for wx in (-8192..=8192).step_by(32) {
+                if biome_at_seeded(wx, wz, seed) != Biome::Mountains {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h >= SNOW_CAP_HEIGHT {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no mountain column at or above the altitude snow cap in the wide region");
+    }
+
+    /// First `(wx, wz, h)` beach column: plains/forest land inside the Sand
+    /// beach band (`SEA_LEVEL..=SEA_LEVEL + BEACH_BAND`).
+    fn first_beach_column(seed: u32) -> (i32, i32, i32) {
+        for wz in (-512..=512).step_by(4) {
+            for wx in (-512..=512).step_by(4) {
+                let biome = biome_at_seeded(wx, wz, seed);
+                if !matches!(biome, Biome::Plains | Biome::Forest) {
+                    continue;
+                }
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                if h <= SEA_LEVEL + BEACH_BAND {
+                    return (wx, wz, h);
+                }
+            }
+        }
+        panic!("no beach column in the acceptance region");
+    }
+
+    /// First oak satisfying `predicate`, scanning the reachable region. The
+    /// generator's pure gate is used to find candidates, so the test never has
+    /// to duplicate the placement rule.
+    fn find_tree(
+        seed: u32,
+        mut predicate: impl FnMut(i32, i32, i32, OakTree) -> bool,
+    ) -> Option<(i32, i32, i32, OakTree)> {
+        for wz in -512..=512 {
+            for wx in -512..=512 {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                if predicate(wx, wz, h, tree) {
+                    return Some((wx, wz, h, tree));
+                }
+            }
+        }
+        None
+    }
+
+    /// First oak near the seed's beach whose model crosses the first chunk-Y
+    /// boundary (wy 32) and whose branch cells are all above their neighbour
+    /// columns. This is the D088 shoreline repro: before the fix the tree pass
+    /// ran only in the surface chunk layer, so exactly these near-shore trees
+    /// lost their upper trunk and canopy.
+    fn shoreline_tree_crossing_a_chunk_y_boundary(seed: u32) -> (i32, i32, i32, OakTree) {
+        let (beach_x, beach_z, _) = first_beach_column(seed);
+        let search = 48;
+        for wz in (beach_z - search)..=(beach_z + search) {
+            for wx in (beach_x - search)..=(beach_x + search) {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                let top = h + tree.trunk_height + TREE_CANOPY_TOP_OVER_TRUNK;
+                if top < CHUNK_SIZE as i32 {
+                    continue;
+                }
+                let clear_branches = tree
+                    .branch_cells(wx, wz, h)
+                    .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by);
+                if clear_branches {
+                    return (wx, wz, h, tree);
+                }
+            }
+        }
+        panic!("no shoreline oak crossing a chunk-Y boundary near ({beach_x}, {beach_z})");
+    }
+
+    /// Count `block` across every chunk layer of one chunk column. Trees stay
+    /// inside a chunk's interior, so this captures a full oak (and every other
+    /// oak in the same column).
+    fn count_blocks_in_chunk_column(
+        cx: i32,
+        cz: i32,
+        seed: u32,
+        season: Season,
+        block: BlockId,
+    ) -> usize {
+        let mut count = 0;
+        for cy in -1..=2 {
+            let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, season);
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if chunk.get(lx, ly, lz) == block {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Acceptance: the same seed generated at the four boundary game-times (one
+    /// per season) is byte-identical across repeat runs.
+    #[test]
+    fn test_acceptance_four_season_generation_is_byte_identical_across_repeats() {
+        // SPRING_START_SEED precedent: seed 1 starts in Spring, so the named
+        // FIRST_*_DAY consts land exactly on the four seasons.
+        let seed = 1;
+        let positions = biome_spanning_chunk_positions(seed);
+        let seasons = four_seasons_from_days(seed);
+
+        for &pos in &positions {
+            for (day, season) in seasons {
+                let first = generate_chunk_seeded(pos, seed, season);
+                let second = generate_chunk_seeded(pos, seed, season);
+                for lz in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            assert_eq!(
+                                first.get(lx, ly, lz),
+                                second.get(lx, ly, lz),
+                                "seed {seed} day {day} ({season:?}) chunk {pos:?} \
+                                 differs at ({lx}, {ly}, {lz})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // The four derived seasons must be distinct or the loop above was
+        // vacuous.
+        for (i, (_, a)) in seasons.iter().enumerate() {
+            for (_, b) in &seasons[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "season derivation collapsed two boundary days onto {a:?}"
+                );
+            }
+        }
+
+        // D088: the four-season pass must contain winter trees, not quietly
+        // regenerate a treeless Winter. The trunk and branches survive every
+        // season; only leaves disappear in Autumn/Winter.
+        let (twx, twz, th, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed 1 must grow at least one oak with clear branch cells");
+        for (day, season) in seasons {
+            for ty in (th + 1)..=(th + tree.trunk_height) {
+                assert_eq!(
+                    generated_block_at(twx, ty, twz, seed, season),
+                    BlockId::OakLog,
+                    "day {day} ({season:?}) lost the trunk block at ({twx}, {ty}, {twz})"
+                );
+            }
+            for (bx, by, bz) in tree.branch_cells(twx, twz, th) {
+                assert_eq!(
+                    generated_block_at(bx, by, bz, seed, season),
+                    BlockId::OakLog,
+                    "day {day} ({season:?}) lost a branch at ({bx}, {by}, {bz})"
+                );
+            }
+        }
+    }
+
+    /// Acceptance: winter turns every non-beach plains/forest land surface into
+    /// Snow, and summer carries none of it — the seasonal snow blanket is
+    /// present in winter and absent in summer for the same seed.
+    #[test]
+    fn test_acceptance_winter_snow_blanket_present_and_summer_absent() {
+        let seed = 1;
+        let seasons = four_seasons_from_days(seed);
+        let winter = seasons[3].1;
+        let summer = seasons[1].1;
+        assert_eq!(winter, Season::Winter);
+        assert_eq!(summer, Season::Summer);
+
+        let mut winter_blanket = 0usize;
+        let mut summer_blanket = 0usize;
+        let mut summer_grass = 0usize;
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                for cy in 0..=1 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let winter_chunk = generate_chunk_seeded(pos, seed, winter);
+                    let summer_chunk = generate_chunk_seeded(pos, seed, summer);
+                    let base_wx = cx * CHUNK_SIZE as i32;
+                    let base_wy = cy * CHUNK_SIZE as i32;
+                    let base_wz = cz * CHUNK_SIZE as i32;
+                    for lz in 0..CHUNK_SIZE {
+                        for lx in 0..CHUNK_SIZE {
+                            let wx = base_wx + lx as i32;
+                            let wz = base_wz + lz as i32;
+                            let biome = biome_at_seeded(wx, wz, seed);
+                            if !matches!(biome, Biome::Plains | Biome::Forest) {
+                                continue;
+                            }
+                            let h = terrain_height_at_seeded(wx, wz, seed);
+                            if h <= SEA_LEVEL + BEACH_BAND {
+                                // Beaches are season-blind Sand.
+                                continue;
+                            }
+                            let ly = h - base_wy;
+                            if !(0..CHUNK_SIZE as i32).contains(&ly) {
+                                continue;
+                            }
+                            let ly = ly as usize;
+                            assert_eq!(
+                                winter_chunk.get(lx, ly, lz),
+                                BlockId::Snow,
+                                "winter land surface at ({wx}, {h}, {wz}) is not blanket Snow"
+                            );
+                            winter_blanket += 1;
+                            match summer_chunk.get(lx, ly, lz) {
+                                BlockId::Grass => summer_grass += 1,
+                                BlockId::Snow => summer_blanket += 1,
+                                other => panic!(
+                                    "summer land surface at ({wx}, {h}, {wz}) is {other:?}, not Grass"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(winter_blanket > 0, "winter region produced no snow blanket");
+        assert_eq!(
+            summer_blanket, 0,
+            "summer land surface still carried the seasonal blanket"
+        );
+        assert_eq!(
+            winter_blanket, summer_grass,
+            "winter blanket must cover exactly the summer grass land columns"
+        );
+    }
+
+    /// Semantic pins: the blanket is land-only (beaches/ocean stay Sand), the
+    /// Mountain altitude cap exists in every season, and plains/forest are
+    /// Grass in the three non-winter seasons.
+    #[test]
+    fn test_seasonal_surfaces_are_pinned_per_biome() {
+        let seed = DEFAULT_WORLD_SEED;
+        let all = [
+            Season::Spring,
+            Season::Summer,
+            Season::Autumn,
+            Season::Winter,
+        ];
+
+        let non_beach = SEA_LEVEL + BEACH_BAND + 1;
+        let plains = first_column_in_height_band(seed, Biome::Plains, non_beach, TREE_MAX_HEIGHT);
+        let forest = first_column_in_height_band(seed, Biome::Forest, non_beach, TREE_MAX_HEIGHT);
+        for (wx, wz, h) in [plains, forest] {
+            for season in all {
+                let expected = if season == Season::Winter {
+                    BlockId::Snow
+                } else {
+                    BlockId::Grass
+                };
+                assert_eq!(
+                    generated_block_at(wx, h, wz, seed, season),
+                    expected,
+                    "{season:?} surface at ({wx}, {h}, {wz}) must be {expected:?}"
+                );
+            }
+        }
+
+        // The altitude snow cap is season-blind: it must exist in summer.
+        let mountain = first_snow_cap_column(seed);
+        for season in all {
+            assert_eq!(
+                generated_block_at(mountain.0, mountain.2, mountain.1, seed, season),
+                BlockId::Snow,
+                "{season:?} lost the season-blind altitude cap at ({}, {}, {})",
+                mountain.0,
+                mountain.2,
+                mountain.1
+            );
+        }
+
+        // Beaches and the ocean seabed stay Sand in every season.
+        let beach = first_beach_column(seed);
+        let ocean =
+            first_column_per_biome(seed)[biome_index(Biome::Ocean)].expect("seed must have ocean");
+        for season in all {
+            assert_eq!(
+                generated_block_at(beach.0, beach.2, beach.1, seed, season),
+                BlockId::Sand,
+                "{season:?} painted the beach at ({}, {}, {})",
+                beach.0,
+                beach.2,
+                beach.1
+            );
+            assert_eq!(
+                generated_block_at(ocean.0, ocean.2, ocean.1, seed, season),
+                BlockId::Sand,
+                "{season:?} painted the ocean seabed at ({}, {}, {})",
+                ocean.0,
+                ocean.2,
+                ocean.1
+            );
+        }
+    }
+
+    /// Autumn sheds the oak canopy but keeps every trunk and branch;
+    /// Spring/Summer keep the full canopy. Deterministic, so "leaves have
+    /// fallen" reads consistently and the bare tree still has a silhouette.
+    #[test]
+    fn test_autumn_sheds_oak_leaves_and_keeps_trunks() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed must grow at least one oak with clear branch cells");
+        let trunk_h = tree.trunk_height;
+        let (cx, cz) = (
+            wx.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+        // The canopy top centre is always a leaf in Spring/Summer and is too
+        // high to collide with a branch cell on this tree.
+        let leaf_wy = h + trunk_h + 1;
+
+        for season in [Season::Spring, Season::Summer] {
+            assert_eq!(
+                generated_block_at(wx, h + 1, wz, seed, season),
+                BlockId::OakLog,
+                "{season:?} lost the trunk at ({wx}, {}, {wz})",
+                h + 1
+            );
+            assert_eq!(
+                generated_block_at(wx, leaf_wy, wz, seed, season),
+                BlockId::OakLeaves,
+                "{season:?} has no canopy leaf at ({wx}, {leaf_wy}, {wz})"
+            );
+            for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                assert_eq!(
+                    generated_block_at(bx, by, bz, seed, season),
+                    BlockId::OakLog,
+                    "{season:?} lost the branch at ({bx}, {by}, {bz})"
+                );
+            }
+            assert!(
+                count_blocks_in_chunk_column(cx, cz, seed, season, BlockId::OakLeaves) > 0,
+                "{season:?} chunk column has no oak leaves at all"
+            );
+        }
+
+        for ty in (h + 1)..=(h + trunk_h) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Autumn),
+                BlockId::OakLog,
+                "autumn removed the trunk block at ({wx}, {ty}, {wz})"
+            );
+        }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Autumn),
+                BlockId::OakLog,
+                "autumn removed the branch at ({bx}, {by}, {bz})"
+            );
+        }
+        assert_eq!(
+            generated_block_at(wx, leaf_wy, wz, seed, Season::Autumn),
+            BlockId::Air,
+            "autumn kept a canopy leaf at ({wx}, {leaf_wy}, {wz})"
+        );
+        assert_eq!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLeaves),
+            0,
+            "autumn chunk column still contains oak leaves"
+        );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Autumn, BlockId::OakLog) > 0,
+            "autumn chunk column lost every oak trunk"
+        );
+    }
+
+    /// D088: Winter turns the grass surface of plains and forest into Snow but
+    /// keeps the whole tree skeleton — every trunk block and every deterministic
+    /// branch — with zero leaves. Only leaves are seasonal.
+    #[test]
+    fn test_seasonal_winter_keeps_trunks_and_branches_without_leaves() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
+            tree.branch_cells(wx, wz, h)
+                .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed must grow at least one oak with clear branch cells");
+        let trunk_h = tree.trunk_height;
+        let (cx, cz) = (
+            wx.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        assert_eq!(
+            generated_block_at(wx, h, wz, seed, Season::Winter),
+            BlockId::Snow,
+            "the same column must carry the winter blanket"
+        );
+        for ty in (h + 1)..=(h + trunk_h) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Winter),
+                BlockId::OakLog,
+                "winter removed the trunk block at ({wx}, {ty}, {wz})"
+            );
+        }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Winter),
+                BlockId::OakLog,
+                "winter removed the branch at ({bx}, {by}, {bz})"
+            );
+        }
+
+        // The same site keeps its full canopy in Spring: only the leaves are
+        // seasonal, and the model itself is unchanged.
+        assert_eq!(
+            generated_block_at(wx, h + trunk_h + 1, wz, seed, Season::Spring),
+            BlockId::OakLeaves,
+            "spring lost the canopy top at ({wx}, {}, {wz})",
+            h + trunk_h + 1
+        );
+        assert_eq!(
+            generated_block_at(wx, h + trunk_h + 1, wz, seed, Season::Winter),
+            BlockId::Air,
+            "winter kept a canopy leaf at ({wx}, {}, {wz})",
+            h + trunk_h + 1
+        );
+        assert_eq!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLeaves),
+            0,
+            "winter chunk column still contains oak leaves"
+        );
+        assert!(
+            count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BlockId::OakLog) > 0,
+            "winter chunk column lost every oak trunk"
+        );
+    }
+
+    /// Negative/structural: a season change alters only two things — the
+    /// non-beach plains/forest surface block (Grass -> Snow) and oak leaves
+    /// (present -> Air). Trunks and branches are season-persistent, so the tree
+    /// skeleton must be byte-identical between Summer and Winter (D088).
+    /// Heights, biomes, subsurface skin, caves, ores, bedrock, water and the
+    /// Mountain cap are also byte-identical (R001/R005 survivors).
+    #[test]
+    fn test_season_changes_only_surface_skin_and_oak_canopy() {
+        let seed = DEFAULT_WORLD_SEED;
+        let positions = [
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(-3, 0, 7),
+            ChunkPos::new(3, 0, -2),
+        ];
+
+        let mut surface_swaps = 0usize;
+        let mut leaves_shed = 0usize;
+        let mut summer_logs = 0usize;
+        let mut winter_logs = 0usize;
+        for pos in positions {
+            let summer = generate_chunk_seeded(pos, seed, Season::Summer);
+            let winter = generate_chunk_seeded(pos, seed, Season::Winter);
+            let base_wx = pos.x * CHUNK_SIZE as i32;
+            let base_wy = pos.y * CHUNK_SIZE as i32;
+            let base_wz = pos.z * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let a = summer.get(lx, ly, lz);
+                        let b = winter.get(lx, ly, lz);
+                        if a == BlockId::OakLog {
+                            summer_logs += 1;
+                        }
+                        if b == BlockId::OakLog {
+                            winter_logs += 1;
+                        }
+                        if a == b {
+                            continue;
+                        }
+                        let wx = base_wx + lx as i32;
+                        let wy = base_wy + ly as i32;
+                        let wz = base_wz + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let biome = biome_at_seeded(wx, wz, seed);
+
+                        let surface_swap = wy == h
+                            && h > SEA_LEVEL + BEACH_BAND
+                            && matches!(biome, Biome::Plains | Biome::Forest)
+                            && a == BlockId::Grass
+                            && b == BlockId::Snow;
+                        let shed_leaf = a == BlockId::OakLeaves && b == BlockId::Air;
+                        assert!(
+                            surface_swap || shed_leaf,
+                            "unexpected winter change at ({wx}, {wy}, {wz}) in {pos:?}: \
+                             {a:?} -> {b:?} (h {h}, biome {biome:?}); trunks and \
+                             branches must be season-persistent (D088)"
+                        );
+                        if surface_swap {
+                            surface_swaps += 1;
+                        } else {
+                            leaves_shed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            surface_swaps > 0,
+            "the scan found no winter blanket surface swap (test is vacuous)"
+        );
+        assert!(
+            leaves_shed > 0,
+            "the scan found no leaves shed in winter (test is vacuous)"
+        );
+        assert_eq!(
+            winter_logs, summer_logs,
+            "winter changed the oak log skeleton ({summer_logs} summer logs vs \
+             {winter_logs} winter logs); only leaves may be seasonal (D088)"
+        );
+    }
+
+    /// The model bound used by `TREE_CANOPY_HEADROOM` must cover every emitted
+    /// cell — trunk, branch and canopy — so the uniform-Air fast path can never
+    /// clip a branch. Pins the constants together with a sampled scan.
+    #[test]
+    fn test_tree_model_bounds_fit_the_canopy_headroom() {
+        const {
+            assert!(
+                TREE_MAX_HEIGHT_OVER_SURFACE >= TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK,
+                "the max tree height must cover the tallest trunk plus its canopy top"
+            );
+            assert!(
+                TREE_CANOPY_HEADROOM > TREE_MAX_HEIGHT_OVER_SURFACE,
+                "headroom must leave at least one spare block above the tallest tree cell"
+            );
+            assert!(
+                MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM < 4 * CHUNK_SIZE as i32,
+                "the top chunk layer must stay provably air with tree headroom"
+            );
+        }
+
+        let seed = DEFAULT_WORLD_SEED;
+        let mut sampled = 0usize;
+        for wz in -256..=256 {
+            for wx in -256..=256 {
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_at_seeded(wx, wz, seed);
+                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                    continue;
+                };
+                sampled += 1;
+                assert!(
+                    (4..=TREE_MAX_TRUNK_HEIGHT).contains(&tree.trunk_height),
+                    "trunk height {} outside the headroom derivation at ({wx}, {wz})",
+                    tree.trunk_height
+                );
+                for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+                    assert!(
+                        (1..=TREE_MAX_HEIGHT_OVER_SURFACE).contains(&(by - h)),
+                        "branch cell ({bx}, {by}, {bz}) is outside the headroom derivation"
+                    );
+                    assert!(
+                        (2..=CHUNK_SIZE as i32 - 3).contains(&bx.rem_euclid(CHUNK_SIZE as i32)),
+                        "branch x {bx} left the chunk interior"
+                    );
+                    assert!(
+                        (2..=CHUNK_SIZE as i32 - 3).contains(&bz.rem_euclid(CHUNK_SIZE as i32)),
+                        "branch z {bz} left the chunk interior"
+                    );
+                }
+            }
+        }
+        assert!(
+            sampled > 0,
+            "no oak sampled in the model-bound region (test is vacuous)"
+        );
+    }
+
+    /// D088 shoreline regression: a deterministic oak whose trunk/canopy top
+    /// crosses the first chunk-Y boundary (exactly the near-shore band where the
+    /// surface sits at wy 26..31) must render every trunk and branch cell in
+    /// full. Before the fix, generation only ran the tree pass in the chunk
+    /// layer holding the surface, so these trees were cut off at wy 32.
+    #[test]
+    fn test_shoreline_trees_are_not_clipped_at_the_chunk_y_boundary() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, tree) = shoreline_tree_crossing_a_chunk_y_boundary(seed);
+        let top = h + tree.trunk_height + TREE_CANOPY_TOP_OVER_TRUNK;
+
+        // The repro premise: the tree genuinely straddles a vertical chunk
+        // edge, so a surface-layer-only pass would have dropped its top cells.
+        assert!(
+            top >= CHUNK_SIZE as i32,
+            "the chosen shoreline tree does not cross the first chunk-Y boundary"
+        );
+        assert_ne!(
+            h.div_euclid(CHUNK_SIZE as i32),
+            top.div_euclid(CHUNK_SIZE as i32),
+            "the trunk/top must live in different vertical chunk layers"
+        );
+
+        for ty in (h + 1)..=(h + tree.trunk_height) {
+            assert_eq!(
+                generated_block_at(wx, ty, wz, seed, Season::Summer),
+                BlockId::OakLog,
+                "shoreline tree at ({wx}, {wz}) lost trunk block ({wx}, {ty}, {wz})"
+            );
+        }
+        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            assert_eq!(
+                generated_block_at(bx, by, bz, seed, Season::Summer),
+                BlockId::OakLog,
+                "shoreline tree at ({wx}, {wz}) lost branch ({bx}, {by}, {bz})"
+            );
+        }
+        assert_eq!(
+            generated_block_at(wx, top, wz, seed, Season::Summer),
+            BlockId::OakLeaves,
+            "shoreline tree at ({wx}, {wz}) lost its canopy top at ({wx}, {top}, {wz})"
+        );
     }
 }

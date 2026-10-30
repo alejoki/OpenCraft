@@ -17,7 +17,8 @@ use crate::player::raycast::raycast_voxels;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChunkEditMap, WorldSaveData};
-use crate::world::terrain::terrain_height_at_seeded;
+use crate::world::season::{season_of, Season};
+use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
 /// reachable. Shared with the placement/mining ray length so every world
@@ -33,6 +34,11 @@ pub struct WorldSession {
     /// The session-owned game clock. Every save/load boundary restores it
     /// from persisted game time, never from the wall clock.
     pub clock: GameClock,
+    /// Length of one season in game days, persisted with the world and
+    /// consumed by the pure [`crate::world::season`] calendar. New worlds
+    /// start at [`DEFAULT_SEASON_LENGTH_DAYS`]; the New Game row and the
+    /// `--season-length` seam override it.
+    pub season_length_days: u32,
     pub save_path: PathBuf,
     /// Ephemeral crafting-station state: the position of the table whose
     /// interface is open, if any. Deliberately not persisted (`SAVE_VERSION`
@@ -43,15 +49,23 @@ pub struct WorldSession {
 
 impl WorldSession {
     /// A fresh world, exactly mirroring main()'s fresh-world branch:
-    /// render distance 16, the given seed, no chunk edits, and the player
-    /// spawned 4 blocks above the seeded terrain at column (0, 0).
-    pub fn new_session(seed: u32, save_path: PathBuf) -> WorldSession {
-        let spawn_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
+    /// render distance 16, the given seed, the requested season length, day 0
+    /// at the default time of day, no chunk edits, and the player spawned 4
+    /// blocks above the deterministic land-search column (D071: the old fixed
+    /// (0, 0) column can be open ocean after the biome rewrite).
+    pub fn new_session(seed: u32, save_path: PathBuf, season_length_days: u32) -> WorldSession {
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let spawn_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-            player: Player::new(Vec3::new(0.5, spawn_y, 0.5)),
+            player: Player::new(Vec3::new(
+                spawn_x as f32 + 0.5,
+                spawn_y,
+                spawn_z as f32 + 0.5,
+            )),
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
+            season_length_days,
             save_path,
             open_table: None,
         };
@@ -61,15 +75,19 @@ impl WorldSession {
 
     /// Reconstruct a session from persisted save data, exactly mirroring
     /// main()'s load branch: player position/yaw/pitch/fly_mode copied, the
-    /// validated inventory aggregate and both crafting grids restored, and
-    /// `selected_slot` clamped to the 9-slot hotbar, and the world rebuilt
-    /// with the saved render distance, seed, and chunk edits.
+    /// validated inventory aggregate and both crafting grids restored,
+    /// `selected_slot` clamped to the 9-slot hotbar, the clock restored to
+    /// the saved day index and time of day, the saved season length carried
+    /// through, and the world rebuilt with the saved render distance, seed,
+    /// and chunk edits.
     ///
     /// `Player::with_inventory` and `restore_selected_slot` are the only
     /// restore entry points, so a save can never publish an out-of-range
     /// selection or a grid stored under the wrong kind.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
-        let clock = GameClock::from_time(data.time_of_day);
+        // Both calendar fields are persisted world state: the clock resumes
+        // at the exact day/time and the season length survives the reload.
+        let clock = GameClock::from_day_and_time(data.day_index, data.time_of_day);
         let mut player = Player::with_inventory(
             Vec3::from_array(data.player.position),
             data.player.inventory,
@@ -89,11 +107,27 @@ impl WorldSession {
             player,
             camera: Camera::new(Vec3::ZERO),
             clock,
+            season_length_days: data.season_length_days,
             save_path,
             open_table: None,
         };
         session.sync_camera();
         session
+    }
+
+    /// The live season of this session, derived from its persisted calendar.
+    ///
+    /// The Playing frame loop calls this once per frame so a day rollover starts
+    /// the world manager's bounded seasonal rollover wave. Pure function of
+    /// `(day_index, season_length_days, seed)` — never the wall clock — and the
+    /// day-boundary acceptance test drives this exact method, so the seam the
+    /// test proves is the seam production runs.
+    pub fn season(&self) -> Season {
+        season_of(
+            self.clock.day_index,
+            self.season_length_days,
+            self.world.seed(),
+        )
     }
 
     /// Sync the camera from the player: eye position plus yaw/pitch. Called
@@ -205,11 +239,14 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
     fn make_save(seed: u32) -> WorldSaveData {
         WorldSaveData {
             seed,
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: crate::world::persistence::SavedPlayerState {
                 position: [1.5, 20.5, 2.5],
                 yaw: 0.75,
@@ -230,25 +267,62 @@ mod tests {
     }
 
     #[test]
-    fn new_session_spawns_player_on_the_seeded_terrain() {
+    fn new_session_spawns_player_on_the_searched_land_column() {
+        // Seed 12345's (0, 0) column is open ocean after the T03 biome rewrite,
+        // so this seed proves the session really moved instead of spawning on
+        // the seabed.
         let seed = 12345u32;
-        let session = WorldSession::new_session(seed, PathBuf::from("/tmp/fresh.mcvx"));
-        let expected_y = (terrain_height_at_seeded(0, 0, seed) + 4) as f32;
-        assert_eq!(session.player.position, Vec3::new(0.5, expected_y, 0.5));
+        let session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let expected_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        assert_eq!(
+            session.player.position,
+            Vec3::new(spawn_x as f32 + 0.5, expected_y, spawn_z as f32 + 0.5)
+        );
+        assert!(
+            terrain_height_at_seeded(0, 0, seed) < crate::world::terrain::SEA_LEVEL,
+            "test premise: seed {seed} must have an ocean at (0, 0)"
+        );
+        assert!(
+            (spawn_x, spawn_z) != (0, 0),
+            "the session must spawn away from the ocean column"
+        );
+        let h = terrain_height_at_seeded(spawn_x, spawn_z, seed);
+        assert!(h >= crate::world::terrain::SPAWN_MIN_HEIGHT);
+        assert_ne!(
+            crate::world::terrain::biome_at_seeded(spawn_x, spawn_z, seed),
+            crate::world::terrain::Biome::Ocean
+        );
     }
 
     #[test]
     fn new_session_preserves_the_seed() {
         let seed = 777u32;
-        let session = WorldSession::new_session(seed, PathBuf::from("/tmp/fresh.mcvx"));
+        let session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         assert_eq!(session.world.seed(), seed);
     }
 
     #[test]
     fn new_session_is_deterministic_for_the_same_seed() {
         let seed = 4242u32;
-        let a = WorldSession::new_session(seed, PathBuf::from("/tmp/a.mcvx"));
-        let b = WorldSession::new_session(seed, PathBuf::from("/tmp/b.mcvx"));
+        let a = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/a.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let b = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/b.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         assert_eq!(a.player.position, b.player.position);
         assert_eq!(a.camera.position, b.camera.position);
         assert_eq!(a.camera.yaw, b.camera.yaw);
@@ -258,7 +332,11 @@ mod tests {
 
     #[test]
     fn new_session_syncs_the_camera_from_the_player() {
-        let session = WorldSession::new_session(9u32, PathBuf::from("/tmp/fresh.mcvx"));
+        let session = WorldSession::new_session(
+            9u32,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         assert_eq!(session.camera.position, session.player.eye_position());
         assert_eq!(session.camera.yaw, session.player.yaw);
         assert_eq!(session.camera.pitch, session.player.pitch);
@@ -267,7 +345,7 @@ mod tests {
     #[test]
     fn new_session_passes_the_save_path_through_unchanged() {
         let path = PathBuf::from("saves/alpha.mcvx");
-        let session = WorldSession::new_session(1u32, path.clone());
+        let session = WorldSession::new_session(1u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         assert_eq!(session.save_path, path);
     }
 
@@ -319,6 +397,8 @@ mod tests {
         let data = WorldSaveData {
             seed,
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
+            day_index: 0,
+            season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             player: SavedPlayerState {
                 position: [0.0, 8.0, 0.0],
                 yaw: 0.0,
@@ -467,7 +547,11 @@ mod tests {
 
     #[test]
     fn new_session_starts_with_an_empty_inventory_and_grids() {
-        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        let session = WorldSession::new_session(
+            4u32,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         assert!(session
             .player
             .inventory()
@@ -551,7 +635,11 @@ mod tests {
 
     #[test]
     fn new_session_starts_at_default_time_of_day() {
-        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"));
+        let session = WorldSession::new_session(
+            4u32,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         assert_eq!(
             session.clock.time_of_day,
             crate::world::daycycle::DEFAULT_TIME_OF_DAY
@@ -567,6 +655,28 @@ mod tests {
     }
 
     #[test]
+    fn new_session_starts_on_day_zero_with_the_requested_season_length() {
+        let session = WorldSession::new_session(4u32, PathBuf::from("/tmp/fresh.mcvx"), 8);
+        assert_eq!(session.clock.day_index, 0);
+        assert_eq!(session.season_length_days, 8);
+    }
+
+    #[test]
+    fn session_from_save_restores_the_day_index_and_season_length_exactly() {
+        let mut data = make_save(77u32);
+        data.time_of_day = 12_345;
+        data.day_index = 21;
+        data.season_length_days = 4;
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
+        assert_eq!(
+            session.clock.day_index, 21,
+            "the saved day index must survive a reload"
+        );
+        assert_eq!(session.clock.time_of_day, 12_345);
+        assert_eq!(session.season_length_days, 4);
+    }
+
+    #[test]
     fn session_from_save_passes_the_save_path_through_unchanged() {
         let path = PathBuf::from("saves/beta.mcvx");
         let session = WorldSession::session_from_save(make_save(2u32), path.clone());
@@ -579,7 +689,11 @@ mod tests {
         use crate::world::block::BlockId;
         use crate::world::chunk::{Chunk, ChunkPos};
 
-        let mut session = WorldSession::new_session(31u32, PathBuf::from("/tmp/table.mcvx"));
+        let mut session = WorldSession::new_session(
+            31u32,
+            PathBuf::from("/tmp/table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
         session
             .world
             .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
@@ -786,8 +900,12 @@ mod tests {
             WorldSession::session_from_save(make_save(31u32), PathBuf::from("/tmp/table.mcvx"));
         assert_eq!(restored.open_table_position(), None);
         assert_eq!(
-            WorldSession::new_session(31u32, PathBuf::from("/tmp/fresh.mcvx"))
-                .open_table_position(),
+            WorldSession::new_session(
+                31u32,
+                PathBuf::from("/tmp/fresh.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS
+            )
+            .open_table_position(),
             None
         );
     }
