@@ -53,14 +53,17 @@ pub enum MainMenuRow {
     NewGame,
     LoadGame,
     Settings,
+    /// Enter the persisted menu-background world as an edit session (M012).
+    EditBackground,
     ExitGame,
 }
 
 /// All main-menu rows, top-to-bottom in display order.
-pub const MAIN_MENU_ROWS: [MainMenuRow; 4] = [
+pub const MAIN_MENU_ROWS: [MainMenuRow; 5] = [
     MainMenuRow::NewGame,
     MainMenuRow::LoadGame,
     MainMenuRow::Settings,
+    MainMenuRow::EditBackground,
     MainMenuRow::ExitGame,
 ];
 
@@ -74,6 +77,7 @@ impl MainMenuRow {
             MainMenuRow::NewGame => "New Game",
             MainMenuRow::LoadGame => "Load Game",
             MainMenuRow::Settings => "Settings",
+            MainMenuRow::EditBackground => "Edit Background",
             MainMenuRow::ExitGame => "Exit Game",
         }
     }
@@ -908,19 +912,21 @@ mod tests {
 
     #[test]
     fn main_menu_rows_are_in_display_order_with_labels() {
-        assert_eq!(MAIN_MENU_ROW_COUNT, 4);
+        assert_eq!(MAIN_MENU_ROW_COUNT, 5);
         assert_eq!(
             MAIN_MENU_ROWS,
             [
                 MainMenuRow::NewGame,
                 MainMenuRow::LoadGame,
                 MainMenuRow::Settings,
+                MainMenuRow::EditBackground,
                 MainMenuRow::ExitGame
             ]
         );
         assert_eq!(MainMenuRow::NewGame.label(), "New Game");
         assert_eq!(MainMenuRow::LoadGame.label(), "Load Game");
         assert_eq!(MainMenuRow::Settings.label(), "Settings");
+        assert_eq!(MainMenuRow::EditBackground.label(), "Edit Background");
         assert_eq!(MainMenuRow::ExitGame.label(), "Exit Game");
     }
 

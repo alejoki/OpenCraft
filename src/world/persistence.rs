@@ -15,6 +15,12 @@ use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
 use crate::world::season::{DEFAULT_SEASON_LENGTH_DAYS, MAX_SEASON_LENGTH_DAYS};
 
 pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
+/// Save path of the main-menu background world (M012).
+///
+/// Deliberately a subdirectory of the saves tree: [`crate::world::catalog_fs`]
+/// lists only top-level `saves/*.mcvx` files, so the background can never
+/// appear in the Load Game screen or be deleted from it.
+pub const DEFAULT_BACKGROUND_SAVE_PATH: &str = "saves/background/background.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
 pub const SAVE_VERSION: u32 = 5;
 /// First save version that carries the 27-byte hotbar header block.

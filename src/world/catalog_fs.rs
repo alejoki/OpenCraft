@@ -388,6 +388,29 @@ mod tests {
         assert!(missing.saves_dir().is_dir());
     }
 
+    #[test]
+    fn nested_background_save_is_not_listed_as_a_world() {
+        // M012: the background lives at saves/background/background.mcvx.
+        // The catalog scans only top-level saves/*.mcvx entries, so the
+        // backdrop can never be loaded or deleted as a playable world.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = WorldCatalogFs::new(dir.path().join("saves"));
+        catalog.ensure_dir().expect("ensure_dir");
+        let background = catalog.saves_dir().join("background/background.mcvx");
+        save_world_to_path(&background, &sample_save(7)).expect("write background");
+        catalog
+            .save_world("Playable", &sample_save(9))
+            .expect("write playable world");
+
+        let rows = catalog.list_rows();
+        assert_eq!(rows.len(), 1, "only top-level *.mcvx files are worlds");
+        assert_eq!(rows[0].name, "Playable");
+        assert!(
+            background.exists(),
+            "the nested background file is untouched"
+        );
+    }
+
     /// `modified_secs` has whole-second granularity, so two writes inside
     /// the same wall-clock second tie and fall back to the name tie-break.
     /// Sleeping past the next second boundary makes the newest-first

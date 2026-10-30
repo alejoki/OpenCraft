@@ -20,13 +20,14 @@ use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 /// terrain, so the vista is reproducible and its camera anchor is meaningful.
 pub const VISTA_SEED: u32 = 0x5EED_4A11;
 
-/// Season the menu panorama always renders in.
+/// Season the deterministic demo scene streams in when no background save
+/// exists.
 ///
-/// Pinned to the blanket-absent baseline rather than derived from the live
-/// clock: the vista is a fixed demo world, so the menu must look identical
-/// across real-time years and across saves. Never replace this with a
-/// clock-derived value -- a season-keyed world manager would then reshuffle the
-/// background on every menu visit.
+/// This is a default-scene value, not a render-time invariant: a persisted or
+/// edited background derives its season from its own saved calendar (D091).
+/// Under [`VISTA_SEED`] the calendar's day-0 season is Summer, so this constant
+/// and [`crate::world::background::BackgroundScene::season`] agree for the
+/// demo scene.
 pub const VISTA_SEASON: Season = Season::Summer;
 
 /// Slow linear yaw drift, in radians per second. At this rate a full turn
@@ -53,14 +54,14 @@ pub fn vista_anchor_column() -> (i32, i32) {
 }
 
 /// The camera anchor as a plain position: the land-search column's x/z, y just
-/// above the seeded demo terrain. `main.rs` derives the vista streaming anchor
-/// chunk from this same function so the camera and the streamed world cannot
-/// drift apart.
+/// above the seeded demo terrain. This is the default scene's anchor; a
+/// persisted background supplies its own saved eye position instead, and the
+/// application derives the streaming anchor chunk from the active scene.
 ///
-/// Cached: `main.rs` calls this once per rendered menu frame, and the land
-/// search walks thousands of columns, so the result is computed once. The
-/// cached value is exactly what the pure function returns, so determinism and
-/// the exposed-anchor contract are unchanged.
+/// Cached: this walks thousands of columns and is now used only to construct
+/// the deterministic demo scene (plus tests), so the result is computed once.
+/// The cached value is exactly what the pure function returns, so determinism
+/// and the exposed-anchor contract are unchanged.
 pub fn vista_anchor() -> Vec3 {
     static ANCHOR: OnceLock<Vec3> = OnceLock::new();
     *ANCHOR.get_or_init(|| {
@@ -72,12 +73,13 @@ pub fn vista_anchor() -> Vec3 {
 
 /// Drifting vista camera as a pure function of elapsed time.
 ///
-/// Yaw advances linearly from zero; position and pitch are fixed. FOV is
-/// supplied by the caller so Settings remains the single source of truth for
-/// FOV (same rule as `GameApp::new` / `start_world_session`) and live changes
-/// reach the vista. Near/far planes keep `Camera::new` defaults.
-pub fn vista_camera(elapsed_secs: f32, fov_y_radians: f32) -> Camera {
-    let mut camera = Camera::new(vista_anchor());
+/// Yaw advances linearly from zero; position, supplied by the caller as the
+/// scene anchor, and pitch are fixed. FOV is supplied by the caller so Settings
+/// remains the single source of truth for FOV (same rule as `GameApp::new` /
+/// `start_world_session`) and live changes reach the vista. Near/far planes keep
+/// `Camera::new` defaults.
+pub fn vista_camera(anchor: Vec3, elapsed_secs: f32, fov_y_radians: f32) -> Camera {
+    let mut camera = Camera::new(anchor);
     camera.yaw = elapsed_secs * VISTA_DRIFT_RATE_RADIANS_PER_SEC;
     camera.pitch = VISTA_PITCH_RADIANS;
     camera.fov_y_radians = fov_y_radians;
@@ -106,22 +108,27 @@ mod tests {
 
     #[test]
     fn drift_yaw_is_linear_in_elapsed_time() {
-        let t0 = vista_camera(0.0, 1.0);
+        let anchor = vista_anchor();
+        let t0 = vista_camera(anchor, 0.0, 1.0);
         assert_eq!(t0.yaw, 0.0);
 
-        let t1 = vista_camera(3.5, 1.0);
+        let t1 = vista_camera(anchor, 3.5, 1.0);
         assert_eq!(t1.yaw, VISTA_DRIFT_RATE_RADIANS_PER_SEC * 3.5);
 
-        let t2 = vista_camera(17.0, 1.0);
+        let t2 = vista_camera(anchor, 17.0, 1.0);
         assert_eq!(t2.yaw, VISTA_DRIFT_RATE_RADIANS_PER_SEC * 17.0);
     }
 
     #[test]
-    fn vista_season_is_pinned_to_the_blanket_absent_baseline() {
-        // The menu panorama is a fixed demo world: it must never follow the
-        // player's persisted clock, so the season is a named constant pinned
-        // here. Changing this intentionally also changes this assertion.
+    fn default_demo_season_is_summer() {
+        // The demo scene's calendar (VISTA_SEED at day 0) must keep resolving
+        // to Summer so a fresh install looks unchanged after M012. A persisted
+        // background derives its season from its own save instead (D091).
         assert_eq!(VISTA_SEASON, Season::Summer);
+        assert_eq!(
+            crate::world::season::season_of(0, 1, VISTA_SEED),
+            VISTA_SEASON
+        );
     }
 
     #[test]
@@ -160,14 +167,15 @@ mod tests {
     }
 
     #[test]
-    fn camera_position_matches_the_exposed_anchor() {
-        let camera = vista_camera(12.0, 1.0);
-        assert_eq!(camera.position, vista_anchor());
+    fn camera_position_is_the_passed_anchor() {
+        let anchor = Vec3::new(101.5, 72.25, -33.0);
+        let camera = vista_camera(anchor, 12.0, 1.0);
+        assert_eq!(camera.position, anchor);
     }
 
     #[test]
     fn pitch_is_a_fixed_downward_angle() {
-        let camera = vista_camera(1.0, 1.0);
+        let camera = vista_camera(vista_anchor(), 1.0, 1.0);
         assert_eq!(camera.pitch, VISTA_PITCH_RADIANS);
         assert!(camera.pitch < 0.0);
     }
@@ -175,7 +183,7 @@ mod tests {
     #[test]
     fn caller_fov_passes_through_unchanged() {
         let fov = 1.234_5_f32;
-        let camera = vista_camera(5.0, fov);
+        let camera = vista_camera(vista_anchor(), 5.0, fov);
         assert_eq!(camera.fov_y_radians, fov);
     }
 
@@ -197,7 +205,7 @@ mod tests {
 
     #[test]
     fn large_elapsed_stays_finite() {
-        let camera = vista_camera(1_000_000.0, 1.0);
+        let camera = vista_camera(vista_anchor(), 1_000_000.0, 1.0);
         assert!(camera.yaw.is_finite());
         assert!(camera.pitch.is_finite());
         assert!(camera.position.is_finite());

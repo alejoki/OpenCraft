@@ -73,6 +73,33 @@ impl WorldSession {
         session
     }
 
+    /// A fresh world starting at a caller-supplied position and clock.
+    ///
+    /// Used by M012's Edit Background: the editor starts exactly at the menu
+    /// scene's anchor (feet below the saved eye) and at the scene's clock,
+    /// instead of the seed's deterministic spawn column. Every other field
+    /// mirrors [`WorldSession::new_session`]; the caller applies settings FOV
+    /// and render distance at the session-swap boundary like any other swap.
+    pub fn new_at(
+        seed: u32,
+        save_path: PathBuf,
+        season_length_days: u32,
+        position: Vec3,
+        clock: GameClock,
+    ) -> WorldSession {
+        let mut session = WorldSession {
+            world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
+            player: Player::new(position),
+            camera: Camera::new(Vec3::ZERO),
+            clock,
+            season_length_days,
+            save_path,
+            open_table: None,
+        };
+        session.sync_camera();
+        session
+    }
+
     /// Reconstruct a session from persisted save data, exactly mirroring
     /// main()'s load branch: player position/yaw/pitch/fly_mode copied, the
     /// validated inventory aggregate and both crafting grids restored,
@@ -340,6 +367,20 @@ mod tests {
         assert_eq!(session.camera.position, session.player.eye_position());
         assert_eq!(session.camera.yaw, session.player.yaw);
         assert_eq!(session.camera.pitch, session.player.pitch);
+    }
+
+    #[test]
+    fn new_at_uses_the_supplied_position_and_clock() {
+        let clock = GameClock::from_day_and_time(3, 4_321);
+        let position = Vec3::new(10.5, 80.0, -4.5);
+        let session = WorldSession::new_at(7u32, PathBuf::from("/tmp/bg.mcvx"), 2, position, clock);
+        assert_eq!(session.player.position, position);
+        assert_eq!(session.camera.position, session.player.eye_position());
+        assert_eq!(session.clock.day_index, 3);
+        assert_eq!(session.clock.time_of_day, 4_321);
+        assert_eq!(session.season_length_days, 2);
+        assert_eq!(session.world.seed(), 7);
+        assert_eq!(session.save_path, PathBuf::from("/tmp/bg.mcvx"));
     }
 
     #[test]

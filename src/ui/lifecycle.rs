@@ -33,6 +33,8 @@ pub enum MainMenuIntent {
     NewGame,
     LoadGame,
     Settings,
+    /// Enter the persisted menu-background world as an edit session (M012).
+    EditBackground,
     Exit,
     /// More explicit spelling for event-loop integrations.
     ExitGame,
@@ -85,6 +87,10 @@ pub enum LifecycleDecision {
     StartNewGame,
     /// The caller should load the selected catalog entry.
     LoadWorld,
+    /// The caller should install the menu background as the active edit
+    /// session, then enter Playing. The caller owns the load and the swap; this
+    /// decision never changes the screen on its own (M012).
+    EditBackground,
     /// The caller should return control to the active session.
     ResumeGame,
     /// The caller should save the active session, then show the main menu.
@@ -141,6 +147,10 @@ impl LifecycleState {
             LifecycleDecision::StartNewGame | LifecycleDecision::LoadWorld => {
                 self.screen = LifecycleScreen::Playing
             }
+            LifecycleDecision::EditBackground => {
+                // The caller switches to Playing only after the edit session
+                // is installed, so a failed load leaves the menu untouched.
+            }
             LifecycleDecision::ResumeGame => self.screen = LifecycleScreen::Playing,
             LifecycleDecision::SaveAndQuit => self.screen = LifecycleScreen::MainMenu,
             LifecycleDecision::ExitGame => {}
@@ -158,6 +168,7 @@ pub fn decide(screen: LifecycleScreen, intent: LifecycleIntent) -> LifecycleResu
             MainMenuIntent::Settings => {
                 LifecycleDecision::Navigate(LifecycleScreen::Settings(SettingsCaller::MainMenu))
             }
+            MainMenuIntent::EditBackground => LifecycleDecision::EditBackground,
             MainMenuIntent::Exit | MainMenuIntent::ExitGame => LifecycleDecision::ExitGame,
         },
         (LifecycleScreen::NewGame, LifecycleIntent::NewGame(intent)) => match intent {
@@ -223,6 +234,13 @@ mod tests {
                 LifecycleIntent::MainMenu(MainMenuIntent::ExitGame)
             ),
             Ok(LifecycleDecision::ExitGame)
+        );
+        assert_eq!(
+            decide(
+                Screen::MainMenu,
+                LifecycleIntent::MainMenu(MainMenuIntent::EditBackground)
+            ),
+            Ok(LifecycleDecision::EditBackground)
         );
     }
 
