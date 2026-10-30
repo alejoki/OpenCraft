@@ -68,9 +68,12 @@ const HORIZON_FADE_BAND: f32 = 0.08;
 /// Fixed seed for [`generate_star_field`]; no wall-clock or global state.
 const STAR_SEED: u32 = 0x5EED_5A17;
 
-/// Pinned time of day for the main-menu vista: a dawn-side golden hour that is
-/// warm and clearly not noon-blue. This is the single home for the constant;
-/// the vista render arm and S03's sun/moon consume it and never redefine it.
+/// Default clock time for the deterministic menu background scene.
+///
+/// A dawn-side golden hour that is warm and clearly not noon-blue. This is the
+/// single home for the constant: [`crate::world::background::BackgroundScene`]
+/// seeds a never-customized scene with it, while a persisted background supplies
+/// its own saved clock instead (D091). It is not a render-time constant.
 pub const VISTA_GOLDEN_HOUR: u32 = 1_000;
 
 /// The player's game clock.
@@ -903,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn vista_golden_hour_is_warm_and_not_noon_blue() {
+    fn default_scene_golden_hour_is_warm_and_not_noon_blue() {
         let palette = sky_palette(VISTA_GOLDEN_HOUR);
         assert!(palette.day_factor < 1.0);
         assert!(
@@ -1054,11 +1057,11 @@ mod tests {
     }
 
     #[test]
-    fn star_visibility_is_zero_at_the_vista_golden_hour() {
+    fn star_visibility_is_zero_at_the_default_scene_golden_hour() {
         assert_eq!(
             star_visibility(VISTA_GOLDEN_HOUR),
             0.0,
-            "the menu vista never shows stars"
+            "the default demo scene never shows stars at its golden-hour clock"
         );
     }
 

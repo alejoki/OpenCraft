@@ -734,11 +734,11 @@ fn weather_ambient_hook(_weather: Weather) {}
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
 /// Session frames use the live clock's weather-tinted palette *and* its
-/// `clock.time_of_day`; vista frames use the pinned
-/// [`daycycle::VISTA_GOLDEN_HOUR`] palette (see [`vista_sky_params`]) and that
-/// same constant as the sky time, never deriving either from the world clock
-/// or `vista_epoch` (that only drives camera drift). Passing the constant here
-/// is what makes the golden-hour sun appear:
+/// `clock.time_of_day`; menu frames use the background scene's own persisted
+/// clock for both the palette and the sky time (see [`vista_sky_params`]),
+/// never deriving either from the session clock (D091). `vista_epoch` only
+/// drives camera drift. A never-customized scene's clock is
+/// [`daycycle::VISTA_GOLDEN_HOUR`], which keeps the demo's golden-hour sun:
 /// `sun_direction(VISTA_GOLDEN_HOUR)` sits ~15° above the eastern horizon.
 fn sky_params(
     palette: daycycle::SkyPalette,
@@ -6324,6 +6324,27 @@ mod tests {
         );
     }
 
+    /// Every `.mcvx` file below `root`, recursively: proves a launch wrote no
+    /// playable (or background) save path, not just the one path under test.
+    fn mcvx_files_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "mcvx") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
     /// A headless GameApp for background-scene tests: tempdir settings and
     /// background paths, bare CLI (main menu), and a fixed session.
     fn app_with_background(saves_dir: &Path) -> GameApp {
@@ -6360,6 +6381,10 @@ mod tests {
             "launch must not create a background save"
         );
         assert!(
+            mcvx_files_under(dir.path()).is_empty(),
+            "launch must not write a playable save path"
+        );
+        assert!(
             app.main_menu_message.is_none(),
             "a missing background is silent"
         );
@@ -6391,6 +6416,11 @@ mod tests {
         );
         assert!(app.background.persisted);
         assert!(app.main_menu_message.is_none());
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path.clone()],
+            "launch reads the background without writing any other save path"
+        );
     }
 
     #[test]
@@ -6418,6 +6448,11 @@ mod tests {
             std::fs::read(&background_path).expect("read junk back"),
             junk,
             "launch must not repair or rewrite an invalid background save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path],
+            "a corrupt background must not make launch write a playable save"
         );
     }
 

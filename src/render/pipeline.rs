@@ -1689,9 +1689,29 @@ mod tests {
             src.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
             "menu frames must follow the background scene clock and stay dry"
         );
+        // Whitespace-insensitive copy for chained calls that rustfmt wraps.
+        let compact: String = src.split_whitespace().collect();
         assert!(
             src.contains("self.background.anchor"),
             "the menu camera must anchor at the background scene's saved eye position"
+        );
+        assert!(
+            compact.contains(
+                "self.background.world.update_streaming(vista_chunk,self.background.season())"
+            ),
+            "menu streaming must use the background world and its saved-calendar season"
+        );
+        assert!(
+            src.contains("self.background.world.render_distance(),"),
+            "menu rendering must use the background world's render distance"
+        );
+        assert!(
+            !compact.contains("vista_sky_params(palette,daycycle::VISTA_GOLDEN_HOUR)")
+                && !compact.contains(
+                    "vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR))"
+                )
+                && !compact.contains("update_streaming(vista_chunk,vista::VISTA_SEASON)"),
+            "VISTA_GOLDEN_HOUR / VISTA_SEASON are default-scene values, never render-time menu constants"
         );
         assert!(
             src.contains("let weather = session_weather(&self.session);"),
