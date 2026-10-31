@@ -16,8 +16,11 @@ use crate::player::container::Container;
 use crate::player::inventory::{InventoryError, Item, ItemId};
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
-use crate::player::survival::GameMode;
+use crate::player::survival::{
+    GameMode, SurvivalContext, SurvivalRuntime, SurvivalState, SurvivalTick,
+};
 use crate::world::block::BlockId;
+use crate::world::chunk::world_to_chunk_and_local;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
@@ -60,6 +63,13 @@ pub struct WorldSession {
     /// interface is open, if any. Never persisted; chest *contents* live in
     /// [`WorldSession::chests`]. Mutually exclusive with `open_table`.
     open_chest: Option<IVec3>,
+    /// Pure game-time survival rules and their fractional accumulators.
+    /// Ephemeral: a load or respawn starts from a fresh runtime.
+    survival_runtime: SurvivalRuntime,
+    /// Set only for a fresh Survival session (and respawn): player physics is
+    /// gated until the chunks containing the feet and four blocks below are
+    /// resident. Ephemeral and never saved.
+    spawn_settle: bool,
 }
 
 impl WorldSession {
@@ -85,14 +95,16 @@ impl WorldSession {
         season_length_days: u32,
         mode: GameMode,
     ) -> WorldSession {
-        let (spawn_x, spawn_z) = find_spawn_column(seed);
-        let spawn_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        let mut player = Player::new_with_mode(Self::spawn_position(seed), mode);
+        if mode == GameMode::Survival {
+            // The deterministic spawn is four blocks above the surface, so the
+            // first dry landing is discarded instead of costing health while
+            // the spawn chunks stream in.
+            player.arm_spawn_immunity();
+        }
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-            player: Player::new_with_mode(
-                Vec3::new(spawn_x as f32 + 0.5, spawn_y, spawn_z as f32 + 0.5),
-                mode,
-            ),
+            player,
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
             season_length_days,
@@ -101,9 +113,20 @@ impl WorldSession {
             save_path,
             open_table: None,
             open_chest: None,
+            survival_runtime: SurvivalRuntime::default(),
+            spawn_settle: mode == GameMode::Survival,
         };
         session.sync_camera();
         session
+    }
+
+    /// The deterministic fresh-world spawn: the land-search column center at
+    /// terrain height + 4 (D071). Shared by every fresh-session constructor
+    /// and [`WorldSession::respawn`], so the +4 rule has one source of truth.
+    pub fn spawn_position(seed: u32) -> Vec3 {
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let spawn_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
+        Vec3::new(spawn_x as f32 + 0.5, spawn_y, spawn_z as f32 + 0.5)
     }
 
     /// A fresh world starting at a caller-supplied position and clock.
@@ -133,6 +156,9 @@ impl WorldSession {
             save_path,
             open_table: None,
             open_chest: None,
+            survival_runtime: SurvivalRuntime::default(),
+            // Edit Background is a Creative-rules editor and is never gated.
+            spawn_settle: false,
         };
         session.sync_camera();
         session
@@ -196,6 +222,10 @@ impl WorldSession {
             save_path,
             open_table: None,
             open_chest: None,
+            survival_runtime: SurvivalRuntime::default(),
+            // A restored player is never spawn-gated: the visible world state
+            // is the save's, and a mid-air fall must still hurt.
+            spawn_settle: false,
         };
         session.sync_camera();
         session
@@ -206,6 +236,83 @@ impl WorldSession {
     /// world cannot silently rewrite that world to Creative on the next save.
     pub fn use_creative_rules(&mut self) {
         self.player.set_mode(GameMode::Creative);
+    }
+
+    /// Whether the session's player has reached zero health.
+    ///
+    /// A dead player is inert for survival rules but remains a fully valid
+    /// session; the Death screen (T04/T05) owns what the player sees next.
+    pub fn is_dead(&self) -> bool {
+        self.player.survival.health() == 0
+    }
+
+    /// Whether player physics may run this frame.
+    ///
+    /// Creative and restored sessions are never gated. A fresh Survival
+    /// session (or respawn) waits until both the chunk containing the feet and
+    /// the chunk containing four blocks below it are resident, so the +4 spawn
+    /// drop cannot fall through unloaded (Air) chunks. The flag clears once
+    /// and every later call reports ready.
+    pub fn settle_spawn(&mut self) -> bool {
+        if !self.spawn_settle {
+            return true;
+        }
+        let feet_x = self.player.position.x.floor() as i32;
+        let feet_y = self.player.position.y.floor() as i32;
+        let feet_z = self.player.position.z.floor() as i32;
+        let support_y = (self.player.position.y - 4.0).floor() as i32;
+        let (feet_chunk, _) = world_to_chunk_and_local(feet_x, feet_y, feet_z);
+        let (support_chunk, _) = world_to_chunk_and_local(feet_x, support_y, feet_z);
+        if self.world.is_resident(feet_chunk) && self.world.is_resident(support_chunk) {
+            self.spawn_settle = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advances the pure survival rules by one frame of game time.
+    ///
+    /// `dt` is clamped to `0..=0.1` exactly like [`Player::update`], then
+    /// scaled by `time_scale` (negative scales become zero). The player's
+    /// one-shot landing distance is consumed exactly once and handed to
+    /// [`SurvivalRuntime`], which owns the defensive `MAX_TICK_GAME_SECS`
+    /// clamp. Creative and dead players are inert.
+    pub fn tick_survival(
+        &mut self,
+        dt: f32,
+        time_scale: f32,
+        head_submerged: bool,
+    ) -> SurvivalTick {
+        let dt = dt.clamp(0.0, 0.1);
+        let game_dt = dt * time_scale.max(0.0);
+        let ctx = SurvivalContext {
+            mode: self.player.mode(),
+            head_submerged,
+            fall_distance: self.player.take_landing_fall(),
+        };
+        self.survival_runtime
+            .tick(&mut self.player.survival, ctx, game_dt)
+    }
+
+    /// Restores the player to the deterministic spawn with full vitals.
+    ///
+    /// Only survival-transient state is reset: position/velocity/on-ground,
+    /// vitals, spawn immunity, the runtime accumulators, the settle gate, and
+    /// both open stations. The durable inventory aggregate (slots, cursor,
+    /// grids), selected slot, clock, chest records, and `save_mode` are
+    /// deliberately untouched.
+    pub fn respawn(&mut self) {
+        self.player.position = Self::spawn_position(self.world.seed());
+        self.player.velocity = Vec3::ZERO;
+        self.player.on_ground = false;
+        self.player.survival = SurvivalState::full();
+        self.player.arm_spawn_immunity();
+        self.survival_runtime.reset();
+        self.spawn_settle = true;
+        self.close_table();
+        self.close_chest();
+        self.sync_camera();
     }
 
     /// The live season of this session, derived from its persisted calendar.
@@ -501,7 +608,8 @@ mod tests {
     use super::*;
     use crate::player::container::Container;
     use crate::player::inventory::{InventoryError, Item, ItemId, Material, CHEST_SLOTS};
-    use crate::player::survival::{GameMode, SurvivalState};
+    use crate::player::physics::InputState;
+    use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
@@ -1759,5 +1867,374 @@ mod tests {
             1,
             "the chest drops exactly once"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Survival session loop: spawn settle, tick, death, and respawn
+    // -----------------------------------------------------------------------
+
+    fn survival_session(seed: u32) -> WorldSession {
+        WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/session-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        )
+    }
+
+    /// Ticks `seconds` game-seconds through the session seam, one second per
+    /// call (raw dt 0.1 x time_scale 10).
+    fn tick_game_seconds(
+        session: &mut WorldSession,
+        seconds: u32,
+        head_submerged: bool,
+    ) -> SurvivalTick {
+        let mut total = SurvivalTick::default();
+        for _ in 0..seconds {
+            let tick = session.tick_survival(0.1, 10.0, head_submerged);
+            total.damage = total.damage.saturating_add(tick.damage);
+            total.healed = total.healed.saturating_add(tick.healed);
+        }
+        total
+    }
+
+    /// Runs the real walk-mode physics against the session's live world.
+    fn run_physics(session: &mut WorldSession, frames: usize) {
+        let input = InputState::default();
+        for _ in 0..frames {
+            session.player.update(1.0 / 60.0, &input, |x, y, z| {
+                session.world.get_block(x, y, z)
+            });
+        }
+    }
+
+    /// Lays a 3x3 Stone floor at `y` under the (16.5, *, 16.5) scratch column.
+    fn lay_scratch_floor(session: &mut WorldSession, y: i32) {
+        for x in 15..=17 {
+            for z in 15..=17 {
+                session.world.set_block_immediate(x, y, z, BlockId::Stone);
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_position_matches_the_constructor_and_the_pinned_formula() {
+        let seed = 12345u32;
+        let (spawn_x, spawn_z) = find_spawn_column(seed);
+        let pinned = Vec3::new(
+            spawn_x as f32 + 0.5,
+            (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32,
+            spawn_z as f32 + 0.5,
+        );
+        assert_eq!(WorldSession::spawn_position(seed), pinned);
+
+        let session = WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/spawn.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        assert_eq!(session.player.position, pinned);
+        assert_eq!(session.camera.position, session.player.eye_position());
+        assert!(session.spawn_settle);
+    }
+
+    #[test]
+    fn survival_spawn_waits_for_the_feet_and_support_chunks() {
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = survival_session(18);
+        // Feet at y=34 and support at y=30 straddle the y=32 chunk boundary.
+        session.player.position = Vec3::new(0.5, 34.0, 0.5);
+        assert!(session.spawn_settle);
+        assert!(!session.settle_spawn(), "no chunks are resident yet");
+
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+        assert!(
+            !session.settle_spawn(),
+            "the feet chunk alone is not enough"
+        );
+
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        assert!(session.settle_spawn());
+        assert!(!session.spawn_settle, "the gate clears after settling");
+        assert!(
+            session.settle_spawn(),
+            "a settled session is never gated again"
+        );
+
+        let mut creative = WorldSession::new_session_with_mode(
+            19u32,
+            PathBuf::from("/tmp/settle-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        assert!(creative.settle_spawn(), "Creative is never spawn-gated");
+        assert!(!creative.spawn_settle);
+
+        let mut restored = WorldSession::session_from_save(
+            make_save(20u32),
+            PathBuf::from("/tmp/settle-restored.mcvx"),
+        );
+        assert!(restored.settle_spawn(), "a restored session is never gated");
+    }
+
+    #[test]
+    fn respawn_restores_spawn_and_vitals_while_preserving_inventory_and_selection() {
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let seed = 77u32;
+        let mut session = survival_session(seed);
+        session
+            .player
+            .insert_items(&[
+                Item::new(ItemId::Block(BlockId::Stone), 7).expect("stone"),
+                Item::new(ItemId::Material(Material::Apple), 2).expect("apple"),
+            ])
+            .expect("the empty inventory accepts the stacks");
+        assert!(session.player.select_slot(4));
+        let inventory = session.player.inventory().clone();
+        let selected = session.player.selected_slot();
+
+        // Open a chest station so respawn has something to close.
+        session.player.position = Vec3::new(16.5, 40.0, 16.5);
+        session.sync_camera();
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+        session
+            .world
+            .set_block_immediate(16, 40, 17, BlockId::Chest);
+        assert!(session.open_chest_at(IVec3::new(16, 40, 17)));
+        assert_eq!(session.open_chest_position(), Some(IVec3::new(16, 40, 17)));
+
+        // Transient state that respawn must overwrite.
+        session.player.survival = SurvivalState::new(0, 3, 12).expect("in-range vitals");
+        session.player.velocity = Vec3::new(1.0, 5.0, -2.0);
+        session.player.on_ground = true;
+
+        session.respawn();
+
+        assert_eq!(session.player.position, WorldSession::spawn_position(seed));
+        assert_eq!(session.player.velocity, Vec3::ZERO);
+        assert!(!session.player.on_ground);
+        assert_eq!(session.player.survival, SurvivalState::full());
+        assert!(session.spawn_settle);
+        assert_eq!(session.camera.position, session.player.eye_position());
+        assert!(!session.player.can_fly());
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(session.player.inventory(), &inventory);
+        assert_eq!(session.player.selected_slot(), selected);
+    }
+
+    #[test]
+    fn tick_survival_scales_dt_by_time_scale_and_clamps_raw_dt() {
+        let mut session = survival_session(22);
+        let tick = session.tick_survival(0.1, 10.0, true);
+        assert_eq!(tick, SurvivalTick::default());
+        assert_eq!(session.player.survival.air(), FULL_AIR - 20);
+
+        // Raw dt is clamped to 0.1 before scaling: 0.2 x 1 is still 0.1.
+        let air = session.player.survival.air();
+        session.tick_survival(0.2, 1.0, true);
+        assert_eq!(session.player.survival.air(), air - 2);
+
+        // A negative scale cannot run time backwards.
+        let air = session.player.survival.air();
+        session.tick_survival(0.1, -5.0, true);
+        assert_eq!(session.player.survival.air(), air);
+    }
+
+    #[test]
+    fn tick_survival_drowns_after_air_runs_out_and_refills_on_the_surface() {
+        let mut session = survival_session(23);
+        tick_game_seconds(&mut session, 15, true);
+        assert_eq!(session.player.survival.air(), 0);
+        assert_eq!(session.player.survival.health(), 20);
+        assert!(!session.is_dead());
+
+        tick_game_seconds(&mut session, 10, true);
+        assert_eq!(session.player.survival.health(), 0);
+        assert!(session.is_dead());
+
+        // A zero-health session ticks inert.
+        let after_death = session.player.survival;
+        assert_eq!(
+            session.tick_survival(0.1, 10.0, true),
+            SurvivalTick::default()
+        );
+        assert_eq!(session.player.survival, after_death);
+
+        // Surfacing refills to FULL_AIR, not the wire ceiling.
+        let mut surfaced = survival_session(24);
+        tick_game_seconds(&mut surfaced, 5, true);
+        assert_eq!(surfaced.player.survival.air(), FULL_AIR - 100);
+        surfaced.tick_survival(0.1, 10.0, false);
+        assert_eq!(surfaced.player.survival.air(), FULL_AIR);
+    }
+
+    #[test]
+    fn tick_survival_starves_eighty_game_seconds_after_hunger_is_empty() {
+        let mut session = survival_session(29);
+        session.player.survival = SurvivalState::new(20, 0, FULL_AIR).expect("in-range vitals");
+
+        tick_game_seconds(&mut session, 79, false);
+        assert_eq!(session.player.survival.health(), 1);
+        assert!(!session.is_dead());
+
+        tick_game_seconds(&mut session, 1, false);
+        assert_eq!(session.player.survival.health(), 0);
+        assert!(session.is_dead());
+    }
+
+    #[test]
+    fn tick_survival_regenerates_only_at_hunger_eighteen_and_spends_hunger() {
+        let mut below = survival_session(31);
+        below.player.survival = SurvivalState::new(10, 17, FULL_AIR).expect("in-range vitals");
+        let tick = tick_game_seconds(&mut below, 4, false);
+        assert_eq!(tick.healed, 0);
+        assert_eq!(below.player.survival.health(), 10);
+        assert_eq!(below.player.survival.hunger(), 17);
+
+        let mut session = survival_session(32);
+        session.player.survival = SurvivalState::new(10, 18, FULL_AIR).expect("in-range vitals");
+        let tick = tick_game_seconds(&mut session, 4, false);
+        assert_eq!(tick.healed, 1);
+        assert_eq!(session.player.survival.health(), 11);
+        assert_eq!(session.player.survival.hunger(), 17);
+
+        // One heal drops hunger below the threshold, stopping regeneration.
+        let tick = tick_game_seconds(&mut session, 4, false);
+        assert_eq!(tick.healed, 0);
+        assert_eq!(session.player.survival.health(), 11);
+        assert_eq!(session.player.survival.hunger(), 17);
+    }
+
+    #[test]
+    fn creative_sessions_never_lose_vitals_from_falls_or_submersion() {
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = WorldSession::new_session_with_mode(
+            33u32,
+            PathBuf::from("/tmp/session-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        session.player.survival = SurvivalState::new(5, 3, 12).expect("in-range vitals");
+        assert!(
+            session.player.toggle_fly(),
+            "a Creative player may walk under Creative rules"
+        );
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+        lay_scratch_floor(&mut session, 36);
+        session.player.position = Vec3::new(16.5, 42.0, 16.5);
+        session.sync_camera();
+        let before = session.player.survival;
+
+        run_physics(&mut session, 90);
+        assert!(session.player.on_ground, "the Creative body still lands");
+        let tick = session.tick_survival(0.1, 10.0, true);
+        assert_eq!(tick, SurvivalTick::default());
+        assert_eq!(session.player.survival, before);
+    }
+
+    #[test]
+    fn the_landing_latch_is_consumed_exactly_once() {
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = survival_session(71);
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+        lay_scratch_floor(&mut session, 36);
+
+        // Spend the one-shot spawn immunity on the safe 3-block spawn drop.
+        session.player.position = Vec3::new(16.5, 40.0, 16.5);
+        session.sync_camera();
+        assert!(session.settle_spawn());
+        run_physics(&mut session, 60);
+        assert!(session.player.on_ground);
+        assert_eq!(session.tick_survival(0.1, 10.0, false).damage, 0);
+
+        // A later 5-block dry landing applies damage once...
+        session.player.position = Vec3::new(16.5, 42.0, 16.5);
+        session.player.velocity = Vec3::ZERO;
+        session.sync_camera();
+        run_physics(&mut session, 60);
+        assert!(session.player.on_ground);
+        let first = session.tick_survival(0.1, 10.0, false);
+        assert_eq!(first.damage, 2);
+        assert_eq!(session.player.survival.health(), 18);
+
+        // ...and the cleared latch never damages a second time.
+        let second = session.tick_survival(0.1, 10.0, false);
+        assert_eq!(second.damage, 0);
+        assert_eq!(session.player.survival.health(), 18);
+    }
+
+    #[test]
+    fn lethal_fall_kills_then_respawn_restores_spawn_vitals_inventory_and_selection() {
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let seed = 61u32;
+        let mut session = survival_session(seed);
+        session
+            .player
+            .insert_items(&[
+                Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"),
+                Item::new(ItemId::Material(Material::Bread), 3).expect("bread"),
+            ])
+            .expect("the empty inventory accepts the stacks");
+        assert!(session.player.select_slot(4));
+        let inventory = session.player.inventory().clone();
+        let selected = session.player.selected_slot();
+
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+        lay_scratch_floor(&mut session, 36);
+        session.player.position = Vec3::new(16.5, 40.0, 16.5);
+        session.sync_camera();
+        assert!(session.settle_spawn(), "the scratch chunk is resident");
+
+        // First landing: spawn immunity discards the 3-block drop.
+        run_physics(&mut session, 60);
+        assert!(session.player.on_ground, "the player landed on the floor");
+        assert_eq!(session.player.take_landing_fall(), 0.0);
+        assert_eq!(session.player.survival.health(), 20);
+
+        // Teleport high above the same floor and fall until the drop kills.
+        session.player.position = Vec3::new(16.5, 300.0, 16.5);
+        session.player.velocity = Vec3::ZERO;
+        session.sync_camera();
+        for _ in 0..900 {
+            session
+                .player
+                .update(1.0 / 60.0, &InputState::default(), |x, y, z| {
+                    session.world.get_block(x, y, z)
+                });
+            session.tick_survival(1.0 / 60.0, 1.0, false);
+            if session.is_dead() {
+                break;
+            }
+        }
+        assert!(session.is_dead(), "a fall from y=300 must be lethal");
+        assert_eq!(session.player.survival.health(), 0);
+
+        session.respawn();
+
+        assert_eq!(session.player.position, WorldSession::spawn_position(seed));
+        assert_eq!(session.player.survival, SurvivalState::full());
+        assert_eq!(session.player.velocity, Vec3::ZERO);
+        assert!(session.spawn_settle);
+        assert_eq!(session.player.inventory(), &inventory);
+        assert_eq!(session.player.selected_slot(), selected);
+        assert!(!session.player.can_fly());
     }
 }

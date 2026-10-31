@@ -2181,10 +2181,7 @@ mod tests {
             loaded.chests[&IVec3::new(4, -2, 7)].slot(26),
             Some(Item::new(ItemId::Material(Material::Apple), 2).unwrap())
         );
-        assert_eq!(
-            loaded.chests[&IVec3::new(-1, 0, 3)],
-            Container::empty()
-        );
+        assert_eq!(loaded.chests[&IVec3::new(-1, 0, 3)], Container::empty());
 
         // Re-saving a loaded world reproduces the exact bytes, and insertion
         // order is irrelevant because records are sorted before writing.
