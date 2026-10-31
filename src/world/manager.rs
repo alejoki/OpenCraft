@@ -2761,10 +2761,12 @@ mod tests {
     /// axis, the crossing distance and the relevant frame/poll budget, so a
     /// regression pinpoints which stage stalled.
     ///
-    /// Honesty note: no fall-damage, health, or drowning claim is made here — no
-    /// health/fall/damage system exists in `src/`; fall damage and drowning are
-    /// deferred to M008 per MEM227. The assertions are mechanics only:
-    /// positions, sink/rise and `on_ground`.
+    /// Honesty note: this acceptance test makes no damage claim of its own.
+    /// `Player::update` measures dry-land fall distance, while the fall,
+    /// drowning, and starvation damage rules live in `player::survival` and are
+    /// applied by `WorldSession::tick_survival` (M008/S04); water contact cancels
+    /// a fall. The assertions here are mechanics only: positions, sink/rise and
+    /// `on_ground`.
     #[test]
     fn test_acceptance_swim_ocean_crossing() {
         let _heavy = lock_heavy_streaming();

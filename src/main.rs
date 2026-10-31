@@ -4404,7 +4404,13 @@ impl ApplicationHandler for GameApp {
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
-                    if gameplay {
+                    // Spawn gate (S04-T07): a fresh Survival session holds the
+                    // whole gameplay movement block until the feet and support
+                    // chunks are resident, so the body cannot fall through
+                    // unloaded Air. Creative and restored sessions are never
+                    // gated (`settle_spawn` answers true immediately).
+                    let spawn_ready = self.session.settle_spawn();
+                    if gameplay && spawn_ready {
                         // Scripted swim seam (S08-T02): while armed it feeds a
                         // constructed `InputState` copy through the SAME
                         // `Player::update` call the real input path uses.
@@ -4430,6 +4436,16 @@ impl ApplicationHandler for GameApp {
                         self.session.camera.yaw = self.session.player.yaw;
                         self.session.camera.pitch = self.session.player.pitch;
                     }
+                    // Survival tick (S04-T07): runs on every Playing frame,
+                    // including frames where gameplay is frozen by an open
+                    // inventory/chest panel — hunger, air, and regeneration
+                    // are game-time rules, not input. The one-shot fall
+                    // distance latched by `Player::update` above is consumed
+                    // exactly once inside the session.
+                    let head_submerged =
+                        eye_is_submerged(&self.session.world, self.session.camera.position);
+                    self.session
+                        .tick_survival(dt, self.time_scale, head_submerged);
                     // Open-station state is a world fact (S02-T02/S03-T03):
                     // close a station as soon as its block is removed/replaced
                     // or the player steps out of reach. One bounded lookup per
