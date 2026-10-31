@@ -3,12 +3,14 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+use glam::IVec3;
 use rustc_hash::FxHashMap;
 
 use crate::player::inventory::{
-    CraftingGrid, GridKind, Hotbar, Inventory, Item, ItemError, ItemId, ItemStack, Material,
-    ToolKind, ToolTier, HOTBAR_SLOTS, INVENTORY_SLOTS, MAX_GRID_SLOTS,
+    ChestSlots, CraftingGrid, GridKind, Hotbar, Inventory, Item, ItemError, ItemId, ItemStack,
+    Material, ToolKind, ToolTier, CHEST_SLOTS, HOTBAR_SLOTS, INVENTORY_SLOTS, MAX_GRID_SLOTS,
 };
+use crate::player::survival::{GameMode, SurvivalState};
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
 use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
@@ -22,7 +24,13 @@ pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 /// appear in the Load Game screen or be deleted from it.
 pub const DEFAULT_BACKGROUND_SAVE_PATH: &str = "saves/background/background.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 5;
+pub const SAVE_VERSION: u32 = 6;
+/// First save version that carries the survival tail: game mode, the
+/// health/hunger/air triple, and the sorted per-position chest records.
+pub const SURVIVAL_VERSION: u32 = 6;
+/// Upper bound on persisted chest records. Mirrors the chunk-count bound so a
+/// forged count can never request an unbounded decode pass.
+pub const MAX_SAVED_CHESTS: usize = 1_000_000;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
@@ -59,6 +67,25 @@ const TOOL_TIER_IRON: u8 = 2;
 
 const GRID_KIND_PLAYER: u8 = 0;
 const GRID_KIND_TABLE: u8 = 1;
+
+// v6 game-mode wire tags. Explicit and append-only like every other tag.
+const GAME_MODE_SURVIVAL: u8 = 0;
+const GAME_MODE_CREATIVE: u8 = 1;
+
+fn game_mode_tag(mode: GameMode) -> u8 {
+    match mode {
+        GameMode::Survival => GAME_MODE_SURVIVAL,
+        GameMode::Creative => GAME_MODE_CREATIVE,
+    }
+}
+
+fn game_mode_from_tag(tag: u8) -> Option<GameMode> {
+    match tag {
+        GAME_MODE_SURVIVAL => Some(GameMode::Survival),
+        GAME_MODE_CREATIVE => Some(GameMode::Creative),
+        _ => None,
+    }
+}
 
 /// Default acceleration scale for the game clock: 1.0 is the real 20-real-minute
 /// cycle. `--time-scale` overrides it (a test seam for observing a full cycle in
@@ -219,6 +246,10 @@ pub struct SavedPlayerState {
     pub player_grid: CraftingGrid,
     /// Unfinished crafting-table grid (4x4 active cells).
     pub table_grid: CraftingGrid,
+    /// Persisted vitals triple. Only reachable through the checked
+    /// [`SurvivalState`] constructors, so decode can reject out-of-range wire
+    /// values before they enter the domain.
+    pub survival: SurvivalState,
 }
 
 impl SavedPlayerState {
@@ -241,6 +272,11 @@ fn legacy_hotbar_projection(inventory: &Inventory) -> Hotbar {
 
 pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
 
+/// Persisted world chests keyed by their absolute block position. Every chest
+/// owns exactly [`CHEST_SLOTS`] validated item slots, including an all-empty
+/// chest (which is written as-is rather than dropped).
+pub type ChestMap = FxHashMap<IVec3, ChestSlots>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSaveData {
     pub seed: u32,
@@ -257,7 +293,14 @@ pub struct WorldSaveData {
     /// [`crate::world::season`] calendar. World state, so it sits next to
     /// `day_index`.
     pub season_length_days: u32,
+    /// Persisted game mode. Kept separate from `player.fly_mode`: the writer
+    /// canonicalises the legacy fly byte through [`GameMode::allows_fly`], so
+    /// a Survival save never carries a flying player.
+    pub mode: GameMode,
     pub player: SavedPlayerState,
+    /// Persisted chest records, written sorted by `(x, y, z)` for a stable
+    /// byte layout independent of hash-map iteration order.
+    pub chests: ChestMap,
     pub chunk_edits: ChunkEditMap,
 }
 
@@ -283,6 +326,17 @@ pub enum PersistenceError {
     InvalidItem(ItemError),
     /// Crafting-grid state was inconsistent with its persisted kind/position.
     InvalidCraftingState,
+    /// Version-6 survival tail carried an unknown game-mode tag.
+    InvalidGameMode(u8),
+    /// Version-6 vitals were outside the checked [`SurvivalState`] bounds.
+    InvalidVitals {
+        health: u16,
+        hunger: u16,
+        air: u16,
+    },
+    /// Version-6 chest section was malformed (unbounded count, duplicate
+    /// position, or internally inconsistent record).
+    InvalidChestState,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -326,6 +380,20 @@ impl fmt::Display for PersistenceError {
             PersistenceError::InvalidCraftingState => {
                 write!(f, "invalid crafting state in save")
             }
+            PersistenceError::InvalidGameMode(tag) => {
+                write!(f, "unknown game mode {tag} in save")
+            }
+            PersistenceError::InvalidVitals {
+                health,
+                hunger,
+                air,
+            } => write!(
+                f,
+                "invalid vitals in save (health {health}, hunger {hunger}, air {air})"
+            ),
+            PersistenceError::InvalidChestState => {
+                write!(f, "invalid chest state in save")
+            }
         }
     }
 }
@@ -356,6 +424,11 @@ pub fn save_world_to_bytes(
         }
     }
 
+    // The chest section carries a u32 count. Validate the bound and the
+    // narrowing before the first byte is written: a rejected save must leave
+    // `out` untouched (atomic-rejection contract).
+    let chest_count = checked_chest_count(data.chests.len())?;
+
     out.extend_from_slice(SAVE_MAGIC);
     out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
     out.extend_from_slice(&data.seed.to_le_bytes());
@@ -364,7 +437,10 @@ pub fn save_world_to_bytes(
     }
     out.extend_from_slice(&data.player.yaw.to_le_bytes());
     out.extend_from_slice(&data.player.pitch.to_le_bytes());
-    out.push(u8::from(data.player.fly_mode));
+    // Canonicalise the legacy fly flag through the persisted mode: a Survival
+    // save can never carry a flying player, so a reload cannot resurrect
+    // flight the mode forbids.
+    out.push(u8::from(data.player.fly_mode && data.mode.allows_fly()));
     out.push(data.player.selected_slot.min(8));
     out.extend_from_slice(&data.player.render_distance.clamp(4, 36).to_le_bytes());
 
@@ -436,7 +512,35 @@ pub fn save_world_to_bytes(
             .to_le_bytes(),
     );
 
+    // v6 survival tail, appended after the v5 calendar: mode, vitals, then
+    // the chest count and sorted records. The calendar offsets 130/134 stay
+    // fixed because everything new comes after them.
+    out.push(game_mode_tag(data.mode));
+    out.extend_from_slice(&data.player.survival.health().to_le_bytes());
+    out.extend_from_slice(&data.player.survival.hunger().to_le_bytes());
+    out.extend_from_slice(&data.player.survival.air().to_le_bytes());
+    out.extend_from_slice(&chest_count.to_le_bytes());
+
+    let mut sorted_chests: Vec<(&IVec3, &ChestSlots)> = data.chests.iter().collect();
+    sorted_chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    for (pos, slots) in sorted_chests {
+        out.extend_from_slice(&pos.x.to_le_bytes());
+        out.extend_from_slice(&pos.y.to_le_bytes());
+        out.extend_from_slice(&pos.z.to_le_bytes());
+        for slot in slots {
+            write_item(out, *slot);
+        }
+    }
+
     Ok(())
+}
+
+/// Bounds-checks the persisted chest count before any bytes are emitted.
+fn checked_chest_count(len: usize) -> Result<u32, PersistenceError> {
+    if len > MAX_SAVED_CHESTS {
+        return Err(PersistenceError::InvalidChestState);
+    }
+    u32::try_from(len).map_err(|_| PersistenceError::InvalidChestState)
 }
 
 fn grid_kind_tag(kind: GridKind) -> u8 {
@@ -679,7 +783,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
     // season_length_days). Missing bytes are a truncated record; extra bytes
     // mean the payload does not match the declared version.
     let (inventory, player_grid, table_grid) = if version >= INVENTORY_EXTENSION_VERSION {
-        read_inventory_extension(&mut cur)?
+        read_inventory_extension(&mut cur, version)?
     } else {
         // v1-v3 stored only the hotbar. Migrate it losslessly into the same
         // nine hotbar slots and leave all new state empty/default.
@@ -708,6 +812,51 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         (0, DEFAULT_SEASON_LENGTH_DAYS)
     };
 
+    // v6 appends the survival tail after the calendar. v1-v5 migrate to the
+    // Creative/full/empty baseline; only a v6 payload is allowed to claim a
+    // mode or vitals. Every field is strictly validated because values
+    // derived from an untrusted file must never enter the domain unchecked.
+    let (mode, survival, chests) = if version >= SURVIVAL_VERSION {
+        let mode_raw = read_u8(&mut cur)?;
+        let mode =
+            game_mode_from_tag(mode_raw).ok_or(PersistenceError::InvalidGameMode(mode_raw))?;
+        let health = read_u16(&mut cur)?;
+        let hunger = read_u16(&mut cur)?;
+        let air = read_u16(&mut cur)?;
+        let survival =
+            SurvivalState::new(health, hunger, air).ok_or(PersistenceError::InvalidVitals {
+                health,
+                hunger,
+                air,
+            })?;
+        let chest_count = read_u32(&mut cur)?;
+        if chest_count as usize > MAX_SAVED_CHESTS {
+            return Err(PersistenceError::InvalidChestState);
+        }
+        let mut chests: ChestMap = FxHashMap::default();
+        for _ in 0..chest_count {
+            let x = read_i32(&mut cur)?;
+            let y = read_i32(&mut cur)?;
+            let z = read_i32(&mut cur)?;
+            let pos = IVec3::new(x, y, z);
+            if chests.contains_key(&pos) {
+                return Err(PersistenceError::InvalidChestState);
+            }
+            let mut slots: ChestSlots = [None; CHEST_SLOTS];
+            for slot in slots.iter_mut() {
+                *slot = read_item(&mut cur, version)?;
+            }
+            chests.insert(pos, slots);
+        }
+        (mode, survival, chests)
+    } else {
+        (
+            GameMode::Creative,
+            SurvivalState::full(),
+            ChestMap::default(),
+        )
+    };
+
     // Exact-length check AFTER the newest known tail so v5 saves load while
     // trailing bytes still fail closed. v1-v3 never had the check (their
     // payload is the whole file by construction).
@@ -720,6 +869,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         time_of_day,
         day_index,
         season_length_days,
+        mode,
         player: SavedPlayerState {
             position: [px, py, pz],
             yaw,
@@ -730,7 +880,9 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             inventory,
             player_grid,
             table_grid,
+            survival,
         },
+        chests,
         chunk_edits,
     })
 }
@@ -777,7 +929,19 @@ fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
 /// durability` (count is implicit one). All construction funnels through
 /// [`Item`]'s checked constructors, so forged counts/durability never enter
 /// the domain.
-fn read_item<R: Read>(r: &mut R) -> Result<Option<Item>, PersistenceError> {
+/// Reads one validated item record from the v4 extension.
+///
+/// Every payload is bounded and fixed-size: a block/material record is
+/// `tag + id + u16 count`, a tool record is `tag + kind + tier + u16
+/// durability` (count is implicit one). All construction funnels through
+/// [`Item`]'s checked constructors, so forged counts/durability never enter
+/// the domain.
+///
+/// The Apple/Wheat/WheatSeeds/Bread materials and the Hoe tool kind are v6
+/// wire identities. A pre-v6 payload that contains one is corrupt (or
+/// forged), so it fails closed instead of being silently accepted under a
+/// version that never could have written it.
+fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, PersistenceError> {
     let tag = read_u8(r)?;
     match tag {
         ITEM_TAG_EMPTY => Ok(None),
@@ -794,6 +958,9 @@ fn read_item<R: Read>(r: &mut R) -> Result<Option<Item>, PersistenceError> {
         ITEM_TAG_MATERIAL => {
             let material_raw = read_u8(r)?;
             let count = read_u16(r)?;
+            if version < SURVIVAL_VERSION && is_survival_only_material_tag(material_raw) {
+                return Err(PersistenceError::InvalidMaterial(material_raw));
+            }
             let material = material_from_tag(material_raw)
                 .ok_or(PersistenceError::InvalidMaterial(material_raw))?;
             Item::new(ItemId::Material(material), count)
@@ -804,6 +971,9 @@ fn read_item<R: Read>(r: &mut R) -> Result<Option<Item>, PersistenceError> {
             let kind_raw = read_u8(r)?;
             let tier_raw = read_u8(r)?;
             let durability = read_u16(r)?;
+            if version < SURVIVAL_VERSION && kind_raw == TOOL_KIND_HOE {
+                return Err(PersistenceError::InvalidToolKind(kind_raw));
+            }
             let kind =
                 tool_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidToolKind(kind_raw))?;
             let tier =
@@ -816,7 +986,19 @@ fn read_item<R: Read>(r: &mut R) -> Result<Option<Item>, PersistenceError> {
     }
 }
 
-fn read_grid<R: Read>(r: &mut R, expected: GridKind) -> Result<CraftingGrid, PersistenceError> {
+/// Materials appended in v6; a pre-v6 payload may not contain them.
+fn is_survival_only_material_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        MATERIAL_APPLE | MATERIAL_WHEAT | MATERIAL_WHEAT_SEEDS | MATERIAL_BREAD
+    )
+}
+
+fn read_grid<R: Read>(
+    r: &mut R,
+    version: u32,
+    expected: GridKind,
+) -> Result<CraftingGrid, PersistenceError> {
     let kind_raw = read_u8(r)?;
     let kind = grid_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidGridKind(kind_raw))?;
     if kind != expected {
@@ -825,21 +1007,22 @@ fn read_grid<R: Read>(r: &mut R, expected: GridKind) -> Result<CraftingGrid, Per
 
     let mut slots = [None; MAX_GRID_SLOTS];
     for slot in slots.iter_mut().take(kind.slot_count()) {
-        *slot = read_item(r)?;
+        *slot = read_item(r, version)?;
     }
     CraftingGrid::from_slots(kind, slots).map_err(|_| PersistenceError::InvalidCraftingState)
 }
 
 fn read_inventory_extension<R: Read>(
     r: &mut R,
+    version: u32,
 ) -> Result<(Inventory, CraftingGrid, CraftingGrid), PersistenceError> {
     let mut slots = [None; INVENTORY_SLOTS];
     for slot in slots.iter_mut() {
-        *slot = read_item(r)?;
+        *slot = read_item(r, version)?;
     }
-    let cursor = read_item(r)?;
-    let player_grid = read_grid(r, GridKind::Player)?;
-    let table_grid = read_grid(r, GridKind::Table)?;
+    let cursor = read_item(r, version)?;
+    let player_grid = read_grid(r, version, GridKind::Player)?;
+    let table_grid = read_grid(r, version, GridKind::Table)?;
     Ok((
         Inventory::from_parts(slots, cursor),
         player_grid,
@@ -878,6 +1061,7 @@ pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceErr
 mod tests {
     use super::*;
     use crate::player::inventory::{MAIN_SLOTS, MAX_STACK_COUNT};
+    use crate::player::survival::{MAX_AIR, MAX_HEALTH, MAX_HUNGER};
     use crate::world::block::BlockId;
     use crate::world::chunk::{linear_index, ChunkPos};
 
@@ -895,6 +1079,7 @@ mod tests {
             time_of_day: 4321,
             day_index: 3,
             season_length_days: 2,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [-12.5, 64.25, 108.0],
                 yaw: 1.25,
@@ -905,7 +1090,9 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: ChestMap::default(),
             chunk_edits: edits,
         };
 
@@ -946,6 +1133,7 @@ mod tests {
             time_of_day: 12345,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [1.0, 2.0, 3.0],
                 yaw: 0.0,
@@ -956,12 +1144,16 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: ChestMap::default(),
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, SEASON_VERSION);
+        assert_eq!(SAVE_VERSION, SURVIVAL_VERSION);
+        assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
         assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
+        assert_eq!(SAVE_VERSION, 6);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -992,6 +1184,7 @@ mod tests {
             time_of_day: DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [0.0, 50.0, 0.0],
                 yaw: 0.0,
@@ -1002,7 +1195,9 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: ChestMap::default(),
             chunk_edits: edits,
         };
         save_world_to_bytes(&mut valid, &data).unwrap();
@@ -1103,6 +1298,7 @@ mod tests {
             inventory: Inventory::empty(),
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
+            survival: SurvivalState::full(),
         }
     }
 
@@ -1112,9 +1308,18 @@ mod tests {
             time_of_day: DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player,
+            chests: ChestMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
+    }
+
+    /// v1-v5 predate the survival tail and all migrate to the same baseline.
+    fn assert_v6_migration_defaults(loaded: &WorldSaveData) {
+        assert_eq!(loaded.mode, GameMode::Creative);
+        assert_eq!(loaded.player.survival, SurvivalState::full());
+        assert!(loaded.chests.is_empty());
     }
 
     #[test]
@@ -1133,7 +1338,7 @@ mod tests {
         // record (+3 bytes each).
         assert_eq!(
             bytes.len(),
-            V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + V5_SEASON_LEN + 4 * 3
+            V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + V5_SEASON_LEN + V6_HEADER_LEN + 4 * 3
         );
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
 
@@ -1220,6 +1425,7 @@ mod tests {
         assert_eq!(loaded.player.inventory, Inventory::empty());
         assert!(loaded.player.player_grid.is_empty());
         assert!(loaded.player.table_grid.is_empty());
+        assert_v6_migration_defaults(&loaded);
 
         let chunk = loaded
             .chunk_edits
@@ -1245,6 +1451,19 @@ mod tests {
     const V5_SEASON_OFFSET: usize = V4_EXTENSION_OFFSET + V4_EXTENSION_LEN;
     /// Calendar tail size: `day_index` u32 + `season_length_days` u32.
     const V5_SEASON_LEN: usize = 8;
+    /// v6 survival tail size: mode u8 + health u16 + hunger u16 + air u16 +
+    /// chest_count u32.
+    const V6_HEADER_LEN: usize = 11;
+    /// Byte offset of the v6 mode byte with no chunk edits (130 + 8 = 138).
+    const V6_MODE_OFFSET: usize = V5_SEASON_OFFSET + V5_SEASON_LEN;
+    const V6_HEALTH_OFFSET: usize = V6_MODE_OFFSET + 1;
+    const V6_HUNGER_OFFSET: usize = V6_HEALTH_OFFSET + 2;
+    const V6_AIR_OFFSET: usize = V6_HUNGER_OFFSET + 2;
+    const V6_CHEST_COUNT_OFFSET: usize = V6_AIR_OFFSET + 2;
+    /// First chest record: x/y/z i32 LE, then 27 item records.
+    const V6_FIRST_CHEST_OFFSET: usize = V6_CHEST_COUNT_OFFSET + 4;
+    /// First item record inside the first chest (after x/y/z).
+    const V6_FIRST_CHEST_SLOT_OFFSET: usize = V6_FIRST_CHEST_OFFSET + 12;
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -1314,6 +1533,7 @@ mod tests {
         assert_eq!(loaded.player.inventory, Inventory::empty());
         assert!(loaded.player.player_grid.is_empty());
         assert!(loaded.player.table_grid.is_empty());
+        assert_v6_migration_defaults(&loaded);
         assert_eq!(
             loaded.time_of_day, DEFAULT_TIME_OF_DAY,
             "v2 predates game time and migrates to noon"
@@ -1337,6 +1557,7 @@ mod tests {
             loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
             "v3 predates season lengths"
         );
+        assert_v6_migration_defaults(&loaded);
         for slot in 0..HOTBAR_SLOTS {
             assert_eq!(
                 loaded
@@ -1585,7 +1806,7 @@ mod tests {
         ));
 
         // Drop the final table-grid cell.
-        let truncated = &bytes[..bytes.len() - 1];
+        let truncated = &bytes[..V5_SEASON_OFFSET - 1];
         assert!(matches!(
             load_world_from_bytes(truncated),
             Err(PersistenceError::Io(_))
@@ -1593,12 +1814,24 @@ mod tests {
     }
 
     /// Build a byte-valid v4 save: the current writer's payload with the
-    /// version field patched back to 4 and the v5 calendar tail removed.
+    /// version field patched back to 4 and the v5+v6 tails removed.
     fn v4_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
+        assert!(data.chests.is_empty(), "v4 has no chest section");
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(bytes.len() - V5_SEASON_LEN);
+        bytes.truncate(bytes.len() - V6_HEADER_LEN - V5_SEASON_LEN);
         bytes[4..8].copy_from_slice(&INVENTORY_EXTENSION_VERSION.to_le_bytes());
+        bytes
+    }
+
+    /// Build a byte-valid v5 save: the current writer's payload with the
+    /// version field patched back to 5 and the v6 survival tail removed.
+    fn v5_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
+        assert!(data.chests.is_empty(), "v5 has no chest section");
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, data).unwrap();
+        bytes.truncate(bytes.len() - V6_HEADER_LEN);
+        bytes[4..8].copy_from_slice(&SEASON_VERSION.to_le_bytes());
         bytes
     }
 
@@ -1656,6 +1889,7 @@ mod tests {
             loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS,
             "v4 predates season lengths and migrates to the default"
         );
+        assert_v6_migration_defaults(&loaded);
     }
 
     #[test]
@@ -1733,6 +1967,418 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &sample_data(player)).unwrap();
         bytes
+    }
+
+    // ------------------------------------------------------------------
+    // v6 survival tail: mode, vitals, chests
+    // ------------------------------------------------------------------
+
+    fn survival_chest() -> ChestSlots {
+        let mut chest: ChestSlots = [None; CHEST_SLOTS];
+        chest[0] = Some(Item::new(ItemId::Material(Material::Bread), 3).unwrap());
+        chest[26] = Some(Item::new(ItemId::Material(Material::Apple), 2).unwrap());
+        chest
+    }
+
+    fn v6_data_with_chests(chests: ChestMap) -> WorldSaveData {
+        let mut data = sample_data(sample_player());
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = false;
+        data.player.survival = SurvivalState::new(7, 3, 12).unwrap();
+        data.chests = chests;
+        data
+    }
+
+    fn v6_bytes_with_chest(chest: ChestSlots) -> Vec<u8> {
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(1, 2, 3), chest);
+        let data = v6_data_with_chests(chests);
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        bytes
+    }
+
+    fn v6_bytes_with_one_empty_chest() -> Vec<u8> {
+        let bytes = v6_bytes_with_chest([None; CHEST_SLOTS]);
+        assert_eq!(
+            bytes.len(),
+            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS,
+            "one all-empty chest writes a fixed 12 + 27 byte record"
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_v6_roundtrips_mode_vitals_and_chests_byte_stably() {
+        // Pin the absolute layout: v6 is appended after the v5 calendar, so
+        // the offsets the season smokes read never move.
+        assert_eq!(V6_MODE_OFFSET, 138);
+        assert_eq!(V6_HEALTH_OFFSET, 139);
+        assert_eq!(V6_HUNGER_OFFSET, 141);
+        assert_eq!(V6_AIR_OFFSET, 143);
+        assert_eq!(V6_CHEST_COUNT_OFFSET, 145);
+        assert_eq!(V6_FIRST_CHEST_OFFSET, 149);
+
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(4, -2, 7), survival_chest());
+        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        let data = v6_data_with_chests(chests);
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+
+        assert_eq!(bytes[V6_MODE_OFFSET], GAME_MODE_SURVIVAL);
+        assert_eq!(
+            &bytes[V6_HEALTH_OFFSET..V6_HEALTH_OFFSET + 2],
+            &7u16.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_HUNGER_OFFSET..V6_HUNGER_OFFSET + 2],
+            &3u16.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_AIR_OFFSET..V6_AIR_OFFSET + 2],
+            &12u16.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_CHEST_COUNT_OFFSET..V6_CHEST_COUNT_OFFSET + 4],
+            &2u32.to_le_bytes()
+        );
+
+        // Records are sorted by (x, y, z): (-1, 0, 3) comes first and is the
+        // all-empty chest, so its 27 slot records are all empty tags.
+        assert_eq!(
+            &bytes[V6_FIRST_CHEST_OFFSET..V6_FIRST_CHEST_OFFSET + 4],
+            &(-1i32).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_FIRST_CHEST_OFFSET + 4..V6_FIRST_CHEST_OFFSET + 8],
+            &0i32.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_FIRST_CHEST_OFFSET + 8..V6_FIRST_CHEST_OFFSET + 12],
+            &3i32.to_le_bytes()
+        );
+        assert!(
+            bytes[V6_FIRST_CHEST_SLOT_OFFSET..V6_FIRST_CHEST_SLOT_OFFSET + CHEST_SLOTS]
+                .iter()
+                .all(|&tag| tag == ITEM_TAG_EMPTY),
+            "an all-empty chest is written as-is, not dropped"
+        );
+
+        // Second record: (4, -2, 7) with Bread in slot 0 and Apple in slot 26.
+        const SECOND_CHEST_OFFSET: usize = V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS;
+        assert_eq!(
+            &bytes[SECOND_CHEST_OFFSET..SECOND_CHEST_OFFSET + 4],
+            &4i32.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[SECOND_CHEST_OFFSET + 4..SECOND_CHEST_OFFSET + 8],
+            &(-2i32).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[SECOND_CHEST_OFFSET + 8..SECOND_CHEST_OFFSET + 12],
+            &7i32.to_le_bytes()
+        );
+        let slot0 = SECOND_CHEST_OFFSET + 12;
+        assert_eq!(bytes[slot0], ITEM_TAG_MATERIAL);
+        assert_eq!(bytes[slot0 + 1], MATERIAL_BREAD);
+        assert_eq!(&bytes[slot0 + 2..slot0 + 4], &3u16.to_le_bytes());
+        let slot26 = slot0 + 4 + 25;
+        assert_eq!(bytes[slot26], ITEM_TAG_MATERIAL);
+        assert_eq!(bytes[slot26 + 1], MATERIAL_APPLE);
+        assert_eq!(&bytes[slot26 + 2..slot26 + 4], &2u16.to_le_bytes());
+
+        let loaded = load_world_from_bytes(&bytes).expect("v6 must load");
+        assert_eq!(loaded, data);
+        assert_eq!(loaded.mode, GameMode::Survival);
+        assert_eq!(
+            loaded.player.survival,
+            SurvivalState::new(7, 3, 12).unwrap()
+        );
+        assert_eq!(loaded.chests.len(), 2);
+        assert_eq!(
+            loaded.chests[&IVec3::new(4, -2, 7)][0],
+            Some(Item::new(ItemId::Material(Material::Bread), 3).unwrap())
+        );
+        assert_eq!(
+            loaded.chests[&IVec3::new(4, -2, 7)][26],
+            Some(Item::new(ItemId::Material(Material::Apple), 2).unwrap())
+        );
+        assert_eq!(loaded.chests[&IVec3::new(-1, 0, 3)], [None; CHEST_SLOTS]);
+
+        // Re-saving a loaded world reproduces the exact bytes, and insertion
+        // order is irrelevant because records are sorted before writing.
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).unwrap();
+        assert_eq!(again, bytes);
+
+        let mut reversed = ChestMap::default();
+        reversed.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        reversed.insert(IVec3::new(4, -2, 7), survival_chest());
+        let mut reversed_bytes = Vec::new();
+        save_world_to_bytes(&mut reversed_bytes, &v6_data_with_chests(reversed)).unwrap();
+        assert_eq!(
+            reversed_bytes, bytes,
+            "sorted chest records make the wire independent of insertion order"
+        );
+    }
+
+    #[test]
+    fn test_version_constants_are_coupled() {
+        assert_eq!(SAVE_VERSION, SURVIVAL_VERSION);
+        assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
+        assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
+        assert_eq!(SAVE_VERSION, 6);
+    }
+
+    #[test]
+    fn test_v6_accepts_zero_vitals_for_the_death_state() {
+        let mut data = sample_data(sample_player());
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = false;
+        data.player.survival = SurvivalState::new(0, 0, 0).unwrap();
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        assert_eq!(
+            &bytes[V6_HEALTH_OFFSET..V6_HEALTH_OFFSET + 2],
+            &0u16.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_HUNGER_OFFSET..V6_HUNGER_OFFSET + 2],
+            &0u16.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V6_AIR_OFFSET..V6_AIR_OFFSET + 2],
+            &0u16.to_le_bytes()
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("a dead save must be loadable");
+        assert_eq!(loaded.player.survival, SurvivalState::new(0, 0, 0).unwrap());
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn test_v6_canonicalizes_the_header_fly_byte_through_the_mode() {
+        // Header layout: magic, version, seed, position, yaw, pitch, fly.
+        const V3_FLY_OFFSET: usize = 32;
+
+        let mut survival = sample_data(sample_player());
+        assert!(survival.player.fly_mode);
+        survival.mode = GameMode::Survival;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &survival).unwrap();
+        assert_eq!(
+            bytes[V3_FLY_OFFSET], 0,
+            "a Survival save may not carry a flying player"
+        );
+        let loaded = load_world_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.mode, GameMode::Survival);
+        assert!(!loaded.player.fly_mode);
+
+        let mut creative = sample_data(sample_player());
+        creative.mode = GameMode::Creative;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &creative).unwrap();
+        assert_eq!(bytes[V3_FLY_OFFSET], 1);
+        let loaded = load_world_from_bytes(&bytes).unwrap();
+        assert!(loaded.player.fly_mode);
+    }
+
+    #[test]
+    fn test_v5_save_migrates_to_creative_full_vitals_and_no_chests() {
+        let mut data = sample_data(sample_player());
+        data.mode = GameMode::Survival;
+        data.player.survival = SurvivalState::new(1, 2, 3).unwrap();
+        let bytes = v5_bytes_from_current(&data);
+
+        let loaded = load_world_from_bytes(&bytes).expect("v5 must migrate, not fail");
+        assert_v6_migration_defaults(&loaded);
+        // Everything the v5 payload actually carried still round-trips.
+        assert_eq!(loaded.seed, data.seed);
+        assert_eq!(loaded.time_of_day, data.time_of_day);
+        assert_eq!(loaded.player.inventory, data.player.inventory);
+    }
+
+    #[test]
+    fn test_v6_rejects_invalid_mode_tag() {
+        let mut bytes = v6_bytes_with_one_empty_chest();
+        bytes[V6_MODE_OFFSET] = 2;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidGameMode(2))
+        ));
+    }
+
+    #[test]
+    fn test_v6_rejects_out_of_range_vitals() {
+        let base = v6_bytes_with_one_empty_chest();
+
+        let mut bytes = base.clone();
+        bytes[V6_HEALTH_OFFSET..V6_HEALTH_OFFSET + 2]
+            .copy_from_slice(&(MAX_HEALTH + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidVitals { health, hunger: 3, air })
+                if health == MAX_HEALTH + 1 && air == 12
+        ));
+
+        let mut bytes = base.clone();
+        bytes[V6_HUNGER_OFFSET..V6_HUNGER_OFFSET + 2]
+            .copy_from_slice(&(MAX_HUNGER + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidVitals { health: 7, hunger, air }) if hunger == MAX_HUNGER + 1 && air == 12
+        ));
+
+        let mut bytes = base;
+        bytes[V6_AIR_OFFSET..V6_AIR_OFFSET + 2].copy_from_slice(&(MAX_AIR + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidVitals { health: 7, hunger: 3, air }) if air == MAX_AIR + 1
+        ));
+    }
+
+    #[test]
+    fn test_v6_rejects_invalid_chest_sections() {
+        // Count above the decode bound fails before any record is read.
+        let mut bytes = v6_bytes_with_one_empty_chest();
+        bytes[V6_CHEST_COUNT_OFFSET..V6_CHEST_COUNT_OFFSET + 4]
+            .copy_from_slice(&((MAX_SAVED_CHESTS as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidChestState)
+        ));
+
+        // Duplicate positions are ambiguous state, not a merge.
+        let mut bytes = v6_bytes_with_one_empty_chest();
+        let record = bytes[V6_FIRST_CHEST_OFFSET..].to_vec();
+        bytes.extend_from_slice(&record);
+        bytes[V6_CHEST_COUNT_OFFSET..V6_CHEST_COUNT_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidChestState)
+        ));
+
+        // Unknown item tag inside a chest slot.
+        let mut bytes = v6_bytes_with_one_empty_chest();
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET] = 200;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItemTag(200))
+        ));
+
+        // Unknown block id inside a chest slot.
+        let mut slot0: ChestSlots = [None; CHEST_SLOTS];
+        slot0[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 1).unwrap());
+        let mut bytes = v6_bytes_with_chest(slot0);
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 99;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidBlockId(99))
+        ));
+
+        // Water stays worldgen-only even inside a chest: `Item::new` rejects
+        // the carryable-block funnel as before.
+        let mut water_slot: ChestSlots = [None; CHEST_SLOTS];
+        water_slot[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 1).unwrap());
+        let mut bytes = v6_bytes_with_chest(water_slot);
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = BlockId::Water as u8;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::UncarryableBlock))
+        ));
+
+        // Unknown material id inside a chest slot.
+        let mut material_slot: ChestSlots = [None; CHEST_SLOTS];
+        material_slot[0] = Some(Item::new(ItemId::Material(Material::Bread), 1).unwrap());
+        let mut bytes = v6_bytes_with_chest(material_slot);
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMaterial(9))
+        ));
+
+        // Unknown tool kind inside a chest slot.
+        let mut tool_slot: ChestSlots = [None; CHEST_SLOTS];
+        tool_slot[0] =
+            Some(Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 10).unwrap());
+        let mut bytes = v6_bytes_with_chest(tool_slot);
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidToolKind(9))
+        ));
+
+        // Trailing bytes and a truncated chest tail both fail closed.
+        let mut bytes = v6_bytes_with_one_empty_chest();
+        bytes.push(0);
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidPlayerState)
+        ));
+
+        let bytes = v6_bytes_with_one_empty_chest();
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+
+        let truncated = &bytes[..V6_CHEST_COUNT_OFFSET + 2];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_checked_chest_count_bounds_the_writer_before_any_byte() {
+        assert_eq!(checked_chest_count(0).unwrap(), 0);
+        assert_eq!(
+            checked_chest_count(MAX_SAVED_CHESTS).unwrap(),
+            MAX_SAVED_CHESTS as u32
+        );
+        assert!(matches!(
+            checked_chest_count(MAX_SAVED_CHESTS + 1),
+            Err(PersistenceError::InvalidChestState)
+        ));
+    }
+
+    #[test]
+    fn test_v5_rejects_v6_only_material_and_hoe_records() {
+        for material in [
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+        ] {
+            let item = Item::new(ItemId::Material(material), 1).unwrap();
+            let mut slots = [None; INVENTORY_SLOTS];
+            slots[0] = Some(item);
+            let mut player = sample_player();
+            player.inventory = Inventory::from_parts(slots, None);
+            let bytes = v5_bytes_from_current(&sample_data(player));
+            assert!(
+                matches!(
+                    load_world_from_bytes(&bytes),
+                    Err(PersistenceError::InvalidMaterial(tag)) if tag == material_tag(material)
+                ),
+                "a v5 payload may not contain {material:?}"
+            );
+        }
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::tool_with_durability(ToolKind::Hoe, ToolTier::Wood, 10).unwrap());
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let bytes = v5_bytes_from_current(&sample_data(player));
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidToolKind(TOOL_KIND_HOE))
+        ));
     }
 
     #[test]

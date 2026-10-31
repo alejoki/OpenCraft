@@ -332,6 +332,7 @@ impl WorldCatalogFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::survival::{GameMode, SurvivalState};
     use crate::world::catalog::{
         ConfirmOutcome, DeleteConfirmation, RowStatus, WORLD_FILE_EXTENSION,
     };
@@ -350,6 +351,7 @@ mod tests {
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: crate::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -364,7 +366,9 @@ mod tests {
                 table_grid: crate::player::inventory::CraftingGrid::new(
                     crate::player::inventory::GridKind::Table,
                 ),
+                survival: SurvivalState::full(),
             },
+            chests: crate::world::persistence::ChestMap::default(),
             chunk_edits: edits,
         }
     }

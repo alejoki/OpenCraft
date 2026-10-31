@@ -198,6 +198,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         time_of_day: session.clock.time_of_day,
         day_index: session.clock.day_index,
         season_length_days: session.season_length_days,
+        mode: session.player.mode(),
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -208,7 +209,9 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             inventory: session.player.inventory().clone(),
             player_grid: session.player.player_grid().clone(),
             table_grid: session.player.table_grid().clone(),
+            survival: session.player.survival,
         },
+        chests: Default::default(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -4773,6 +4776,7 @@ mod tests {
     use std::path::PathBuf;
 
     use opencraft::player::camera::Camera;
+    use opencraft::player::survival::{GameMode, SurvivalState};
     use opencraft::world::persistence::ChunkEditMap;
     use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -11019,6 +11023,7 @@ mod tests {
             time_of_day: opencraft::world::daycycle::DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -11029,7 +11034,9 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: rustc_hash::FxHashMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
     }

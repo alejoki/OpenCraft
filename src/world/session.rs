@@ -266,6 +266,7 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::survival::{GameMode, SurvivalState};
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
     fn make_save(seed: u32) -> WorldSaveData {
@@ -274,6 +275,7 @@ mod tests {
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: crate::world::persistence::SavedPlayerState {
                 position: [1.5, 20.5, 2.5],
                 yaw: 0.75,
@@ -288,7 +290,9 @@ mod tests {
                 table_grid: crate::player::inventory::CraftingGrid::new(
                     crate::player::inventory::GridKind::Table,
                 ),
+                survival: SurvivalState::full(),
             },
+            chests: crate::world::persistence::ChestMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
     }
@@ -440,6 +444,7 @@ mod tests {
             time_of_day: crate::world::daycycle::DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [0.0, 8.0, 0.0],
                 yaw: 0.0,
@@ -454,7 +459,9 @@ mod tests {
                 table_grid: crate::player::inventory::CraftingGrid::new(
                     crate::player::inventory::GridKind::Table,
                 ),
+                survival: SurvivalState::full(),
             },
+            chests: crate::world::persistence::ChestMap::default(),
             chunk_edits: edits.clone(),
         };
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
