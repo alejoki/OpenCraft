@@ -592,9 +592,10 @@ fn place_surface_ruins(
 ///
 /// `ruin_at`'s chunk-interior anchor margin guarantees the whole footprint lies
 /// inside this chunk, so every `lx`/`lz` below is a plain offset (no wrapping).
-/// `ruin_at`'s vertical-fit gate additionally guarantees every shell cell —
-/// including the tallest corner pillar — stays in the chunk layer that owns the
-/// anchor surface, so the in-range skips remain defensive only.
+/// `ruin_at`'s footprint-aware vertical-fit gate additionally guarantees every
+/// shell cell — including the tallest corner pillar on the highest footprint
+/// column — stays in the chunk layer that owns the anchor surface, so the
+/// in-range skips remain defensive only.
 ///
 /// Three policies are pinned here, all deterministic and independent of
 /// iteration order:
@@ -963,20 +964,70 @@ fn ruin_anchor_hash(wx: i32, wz: i32, seed: u32) -> Option<u32> {
     ((ruin_hash & RUIN_GATE_MASK) == 0).then_some(ruin_hash)
 }
 
-/// Whether a ruin at `surface` with `wall_height` keeps every shell cell in
-/// the chunk layer that owns the anchor surface.
+/// Wall height a ruin hash selects, inside the
+/// `RUIN_WALL_MIN_HEIGHT..=RUIN_WALL_MAX_HEIGHT` band.
 ///
-/// L085: the generator only writes the layer that owns the anchor surface
-/// (`place_surface_ruins` runs there), while `place_ruin_at` keeps defensive
-/// in-range skips. Without this gate an anchor near a layer boundary would
-/// silently lose its top wall/corner cells in generation yet still be reported
-/// by [`ruin_at`] to `find_spawn_column`/`ruin_covering` and the tests. The
-/// topmost cell is the corner pillar at `surface + wall_height + 1`, so keeping
-/// its local index within the layer (`local_surface + wall_height` below the
-/// layer's last index) makes [`ruin_at`] authoritative for every caller.
+/// Split out so the footprint-fit regression can re-derive the height the gate
+/// must account for instead of duplicating the mixer's bit slice.
+fn ruin_wall_height(ruin_hash: u32) -> i32 {
+    let span = (RUIN_WALL_MAX_HEIGHT - RUIN_WALL_MIN_HEIGHT + 1) as u32;
+    RUIN_WALL_MIN_HEIGHT + ((ruin_hash >> 9) % span) as i32
+}
+
+/// Whether a ruin at `surface` with `wall_height` keeps its own corner pillar
+/// in the chunk layer that owns the anchor surface.
+///
+/// Anchor-column half of the L085 bound, kept as the cheap prefix in
+/// [`ruin_at`]. The authoritative gate is
+/// [`ruin_footprint_fits_chunk_layer`]: [`place_ruin_at`] paints every shell
+/// column from that column's own surface, so a footprint can cross a layer
+/// boundary even when the anchor column does not. This check still rejects the
+/// common anchor-boundary case without sampling the 25 footprint columns. The
+/// topmost cell is the corner pillar at `surface + wall_height + 1`.
 fn ruin_fits_chunk_layer(surface: i32, wall_height: i32) -> bool {
     let surface_ly = surface.rem_euclid(CHUNK_SIZE as i32);
     surface_ly + wall_height < CHUNK_SIZE as i32 - 1
+}
+
+/// Whether a ruin anchored at `(anchor_x, anchor_z)` keeps its **whole**
+/// footprint in the chunk layer that owns the anchor surface.
+///
+/// L085: the generator only writes the layer that owns the anchor surface
+/// (`place_surface_ruins` runs there), while [`place_ruin_at`] paints each
+/// shell column from that column's own `terrain_height_at_seeded` and keeps
+/// defensive in-range skips. The anchor-column check alone therefore misses two
+/// boundary-incomplete classes:
+///
+/// - an uphill footprint column whose higher surface pushes its corner pillar
+///   into the layer above — the highest corner cell, not the anchor cell, is
+///   the top bound; and
+/// - a downhill footprint column whose surface falls into the layer below,
+///   where the in-range guard skips the whole column and the shell loses cells
+///   entirely.
+///
+/// Sampling all 25 footprint columns is only paid by candidates that already
+/// passed the cheap hash, height-band and biome gates.
+fn ruin_footprint_fits_chunk_layer(
+    anchor_x: i32,
+    anchor_z: i32,
+    surface: i32,
+    wall_height: i32,
+    seed: u32,
+) -> bool {
+    let base_wy = surface.div_euclid(CHUNK_SIZE as i32) * CHUNK_SIZE as i32;
+    let mut min_h = surface;
+    let mut max_h = surface;
+    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            let h = terrain_height_at_seeded(anchor_x + dx, anchor_z + dz, seed);
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+        }
+    }
+    // Every shell column needs its own surface inside the anchor layer (a lower
+    // column would be skipped entirely), and the tallest footprint corner
+    // (surface + wall_height + 1) must stay below the layer's last index.
+    min_h >= base_wy && max_h + wall_height < base_wy + CHUNK_SIZE as i32 - 1
 }
 
 /// Whether a surface ruin is anchored at this world column, and which one.
@@ -984,11 +1035,11 @@ fn ruin_fits_chunk_layer(surface: i32, wall_height: i32) -> bool {
 /// Single source of truth shared by `generate_chunk_seeded`,
 /// `find_spawn_column` and the tests, mirroring the `tree_trunk_height` shape:
 /// the chunk-interior anchor margin, the land height band, the Plains/Forest
-/// gate, the sparse hash gate and the vertical-fit gate all live here, so no
-/// caller can disagree with the generator about where a ruin stands. The
-/// generator additionally checks the actual generated surface block (`Grass`),
-/// which is the authoritative gate for beaches, seabed, mountain stone and the
-/// seasonal Winter blanket.
+/// gate, the sparse hash gate and the footprint-aware vertical-fit gate all
+/// live here, so no caller can disagree with the generator about where a ruin
+/// stands. The generator additionally checks the actual generated surface
+/// block (`Grass`), which is the authoritative gate for beaches, seabed,
+/// mountain stone and the seasonal Winter blanket.
 ///
 /// Deliberately season-blind: ruins are a function of `(pos, seed)` only, so
 /// the same ruins exist in every season (in Winter the snow surface suppresses
@@ -1006,11 +1057,18 @@ fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec
     if !matches!(biome, Biome::Plains | Biome::Forest) {
         return None;
     }
-    let span = (RUIN_WALL_MAX_HEIGHT - RUIN_WALL_MIN_HEIGHT + 1) as u32;
-    let wall_height = RUIN_WALL_MIN_HEIGHT + ((ruin_hash >> 9) % span) as i32;
-    // L085: reject anchors whose tallest corner pillar would cross into the
-    // chunk layer above the one that owns the anchor surface.
+    let wall_height = ruin_wall_height(ruin_hash);
+    // L085: reject anchors whose own tallest corner pillar would cross into
+    // the chunk layer above the one that owns the anchor surface. This cheap
+    // prefix is subsumed by the footprint check below, but it skips the 25
+    // terrain samples for the common anchor-boundary case.
     if !ruin_fits_chunk_layer(h, wall_height) {
+        return None;
+    }
+    // L085 closeout: each shell column is painted from its own surface, so the
+    // whole footprint — highest corner and lowest column — must stay in the
+    // anchor layer.
+    if !ruin_footprint_fits_chunk_layer(wx, wz, h, wall_height, seed) {
         return None;
     }
     Some(RuinSpec {
@@ -1021,13 +1079,20 @@ fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec
     })
 }
 
-/// The ruin anchored at this world column, derived from `seed` alone.
+/// The ruin whose placement rule yields an anchor at this world column,
+/// derived from `seed` alone.
 ///
 /// Public wrapper for tests, demos and S08: samples the terrain height and
 /// biome exactly as the generator does and forwards to [`ruin_at`], so no
-/// caller can disagree with worldgen. Deliberately does not check the
-/// generated Grass block — that needs a chunk — matching [`ruin_covering`]'s
-/// conservative contract; the generator still applies the Grass gate.
+/// caller can disagree with worldgen about *placement*.
+///
+/// It cannot observe the chunk-only suppressions the generator applies: an
+/// `OakLog` anywhere in the footprint skips the anchor, a footprint column
+/// whose generated surface is not `Grass` loses its shell cells, and an
+/// occupied chest cell suppresses the `LootChest`. Callers that need to know
+/// whether a ruin — or its chest — actually exists must inspect the live
+/// chunk; [`ruin_loot_chest_at`] in particular only proves a cell is a *legal*
+/// ruin chest cell, matching [`ruin_covering`]'s conservative contract.
 pub fn ruin_at_seeded(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
     let h = terrain_height_at_seeded(wx, wz, seed);
     let biome = biome_at_seeded(wx, wz, seed);
@@ -1122,9 +1187,13 @@ pub fn ruin_loot(seed: u32, ruin: &RuinSpec) -> Vec<LootEntry> {
 /// ruin can never supply loot for a cell it does not own.
 ///
 /// Pure and chunk-free like [`ruin_loot`]: it validates the position against
-/// [`ruin_at_seeded`] and never re-derives placement or height rules. It does
-/// not check the live block; the session layer gates on `BlockId::LootChest`
-/// so a player-placed chest never derives ruin loot.
+/// [`ruin_at_seeded`] and never re-derives placement or height rules. `Some`
+/// means "legal ruin chest cell", not "the live world holds a `LootChest`
+/// here": the generator can skip the anchor (footprint `OakLog` overlap), drop
+/// shell cells on a non-Grass footprint column, or suppress the chest when its
+/// cell is already occupied. It does not check the live block; the session
+/// layer gates on `BlockId::LootChest`, so a suppressed cell opens nothing and
+/// a player-placed chest never derives ruin loot.
 pub fn ruin_loot_chest_at(pos: IVec3, seed: u32) -> Option<Vec<LootEntry>> {
     let spec = ruin_at_seeded(pos.x, pos.z, seed)?;
     if ruin_loot_chest_pos(&spec) != pos {
@@ -3150,7 +3219,9 @@ mod tests {
     /// Derived from the same envelope: `RUIN_SCAN_RADIUS` covers 49 chunks, ~784
     /// interior anchors each, so the 1/512 gate passes ~75 anchors and roughly
     /// half of those sit in the Plains/Forest band — tens of candidates before
-    /// tree overlaps and interlocking shells. 8 is comfortably below the
+    /// the footprint-aware vertical-fit gate, tree overlaps and interlocking
+    /// shells. Measured after the footprint gate on DEFAULT_WORLD_SEED: 23
+    /// distinct ruins place at least one cell. 8 is comfortably below the
     /// observed count yet far above vacuous.
     const RUIN_LOOT_MIN_RUINS: usize = 8;
 
@@ -3234,8 +3305,9 @@ mod tests {
         chests
     }
 
-    /// Boundary pin for the L085 vertical-fit gate: the topmost corner pillar
-    /// (`surface + wall_height + 1`) must stay in the anchor-surface layer.
+    /// Boundary pin for the anchor-column half of the L085 vertical-fit gate:
+    /// the topmost corner pillar (`surface + wall_height + 1`) must stay in the
+    /// anchor-surface layer.
     #[test]
     fn test_ruin_fits_chunk_layer() {
         // Local surface 26/27 leave room for every legal wall height.
@@ -3273,6 +3345,58 @@ mod tests {
         }
     }
 
+    /// L085 closeout regression: a ruin must keep its **whole footprint** in
+    /// the chunk layer that owns the anchor surface, because `place_ruin_at`
+    /// paints each shell column from that column's own surface. The anchor-only
+    /// gate accepted both real sampled anchors below; the footprint-aware gate
+    /// must reject them.
+    #[test]
+    fn test_ruin_footprint_vertical_fit_rejects_boundary_incomplete_anchors() {
+        let seed = DEFAULT_WORLD_SEED;
+
+        // Uphill footprint: the anchor surface 29 and wall 1 pass the
+        // anchor-only bound, but footprint column (45, 121) sits at surface 31,
+        // so its corner pillar would need (45, 33, 121) — one layer above the
+        // chunk that generates the anchor.
+        assert_eq!(terrain_height_at_seeded(47, 123, seed), 29);
+        assert_eq!(terrain_height_at_seeded(45, 121, seed), 31);
+        let hash = ruin_anchor_hash(47, 123, seed).expect("anchor passes the cheap gate");
+        let wall_height = ruin_wall_height(hash);
+        assert!(
+            ruin_fits_chunk_layer(29, wall_height),
+            "the anchor-only bound must accept (47, 123) so the regression is real"
+        );
+        assert!(!ruin_footprint_fits_chunk_layer(
+            47,
+            123,
+            29,
+            wall_height,
+            seed
+        ));
+        assert_eq!(ruin_at_seeded(47, 123, seed), None);
+
+        // Downhill footprint: the anchor surface 32 (local 0) and wall 1 pass
+        // the anchor-only bound, but footprint column (-87, -111) sits at
+        // surface 31 in the layer below, where `place_ruin_at` skips the whole
+        // column and the shell loses cells.
+        assert_eq!(terrain_height_at_seeded(-85, -109, seed), 32);
+        assert_eq!(terrain_height_at_seeded(-87, -111, seed), 31);
+        let hash = ruin_anchor_hash(-85, -109, seed).expect("anchor passes the cheap gate");
+        let wall_height = ruin_wall_height(hash);
+        assert!(
+            ruin_fits_chunk_layer(32, wall_height),
+            "the anchor-only bound must accept (-85, -109) so the regression is real"
+        );
+        assert!(!ruin_footprint_fits_chunk_layer(
+            -85,
+            -109,
+            32,
+            wall_height,
+            seed
+        ));
+        assert_eq!(ruin_at_seeded(-85, -109, seed), None);
+    }
+
     /// Every anchor the placement rule reports fits the chunk layer that owns
     /// its surface, so `ruin_at` never advertises a shell the generator cannot
     /// paint completely (L085).
@@ -3291,21 +3415,36 @@ mod tests {
                 spec.surface,
                 spec.wall_height
             );
+            assert!(
+                ruin_footprint_fits_chunk_layer(
+                    spec.anchor_x,
+                    spec.anchor_z,
+                    spec.surface,
+                    spec.wall_height,
+                    seed
+                ),
+                "anchor ({}, {}) surface {} wall {} has a footprint outside its chunk layer",
+                spec.anchor_x,
+                spec.anchor_z,
+                spec.surface,
+                spec.wall_height
+            );
             surface_ly_counts[spec.surface.rem_euclid(CHUNK_SIZE as i32) as usize] += 1;
         }
-        // Measured after the gate on DEFAULT_WORLD_SEED: 68 surviving anchors
-        // in the 7x7-chunk region. The rejected local heights are 28..=31 and
-        // only the taller walls there (8 of the 38 legal surface heights), so
-        // the old envelope holds. 8 is a conservative non-vacuity floor far
+        // Measured after the footprint-aware gate on DEFAULT_WORLD_SEED: 65
+        // surviving anchors in the 7x7-chunk region (anchor-only gate: 68). The
+        // footprint gate also rejects anchors at other local surface heights
+        // when a footprint column crosses a layer boundary, so the distribution
+        // below is informational. 8 is a conservative non-vacuity floor far
         // below the measured count.
         assert!(
             anchors.len() >= 8,
             "measured {} ruin anchors in the {RUIN_SCAN_RADIUS}-chunk region (need >= 8)",
             anchors.len()
         );
-        // The gate is not vacuous: anchors survive and none sit in a rejected
-        // local surface height for their wall height (implied by the loop
-        // above; this keeps the measured distribution visible).
+        // The gate is not vacuous: anchors survive and every surviving anchor
+        // (and its whole footprint) fits its chunk layer. The distribution is
+        // kept visible for future measurements.
         eprintln!(
             "ruin anchors by local surface ly (seed {seed}): {:?}",
             surface_ly_counts
@@ -3662,8 +3801,8 @@ mod tests {
 
     /// Generated acceptance: real chunks in the pinned region contain at least
     /// one LootChest; every chest belongs to the anchor at its own column, sits
-    /// at `ruin_loot_chest_pos`, and its owning chunk holds exactly one chest in
-    /// that footprint. At least one isolated, chest-bearing anchor must show the
+    /// at `ruin_loot_chest_pos`, and keeps its whole footprint in the anchor
+    /// chunk layer. At least one isolated, chest-bearing anchor must show the
     /// complete shell, so "a chest exists somewhere" is never enough.
     #[test]
     fn test_generated_surface_ruin_has_one_loot_chest() {
@@ -3671,8 +3810,9 @@ mod tests {
 
         let seed = DEFAULT_WORLD_SEED;
         // Widen deterministically only if the default region yields no complete
-        // ruin at all; measured on the default seed, RUIN_SCAN_RADIUS already
-        // contains several chest-bearing ruins, so this loop does not run.
+        // ruin at all. Measured after the footprint-aware gate on the default
+        // seed: the 7x7-chunk region still contains 23 chest-bearing ruins (the
+        // two boundary-incomplete chests are gone), so this loop does not run.
         let mut radius = RUIN_SCAN_RADIUS;
         let mut chests = loot_chests_in_region(radius, seed, Season::Summer);
         while chests.is_empty() && radius < 5 {
@@ -3709,30 +3849,78 @@ mod tests {
             );
             chest_columns.insert((wx, wz));
 
-            // The owning chunk carries exactly one chest in the footprint.
+            // L085 closeout: every footprint column's surface and every shell
+            // cell must stay in the chunk layer that owns this anchor, for
+            // *every* generated chest, not only the isolated one below.
+            let base_wy = spec.surface.div_euclid(CHUNK_SIZE as i32) * CHUNK_SIZE as i32;
+            let layer_top = base_wy + CHUNK_SIZE as i32 - 1;
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    let fx = spec.anchor_x + dx;
+                    let fz = spec.anchor_z + dz;
+                    let column_surface = terrain_height_at_seeded(fx, fz, seed);
+                    assert!(
+                        (base_wy..=layer_top).contains(&column_surface),
+                        "ruin at ({}, {}) footprint column ({fx}, {fz}) surface \
+                         {column_surface} is outside its anchor layer {base_wy}..={layer_top}",
+                        spec.anchor_x,
+                        spec.anchor_z
+                    );
+                    for level in ruin_cell_bottom(dx, dz)..=ruin_cell_top(dx, dz, spec.wall_height)
+                    {
+                        let cell_wy = column_surface + level;
+                        assert!(
+                            (base_wy..=layer_top).contains(&cell_wy),
+                            "ruin at ({}, {}) shell cell ({fx}, {cell_wy}, {fz}) is outside \
+                             its anchor layer {base_wy}..={layer_top}",
+                            spec.anchor_x,
+                            spec.anchor_z
+                        );
+                    }
+                }
+            }
+
+            // This anchor's own cell is present in the owning chunk layer. A
+            // legally interlocking neighbouring anchor may own another chest
+            // inside the footprint, so this is per anchor, not per footprint.
             let (cx, cy, cz) = (
                 wx.div_euclid(CHUNK_SIZE as i32),
                 wy.div_euclid(CHUNK_SIZE as i32),
                 wz.div_euclid(CHUNK_SIZE as i32),
             );
             let chunk = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
-            let mut footprint_chests = 0usize;
-            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                    let lx = (spec.anchor_x + dx).rem_euclid(CHUNK_SIZE as i32) as usize;
-                    let lz = (spec.anchor_z + dz).rem_euclid(CHUNK_SIZE as i32) as usize;
-                    for ly in 0..CHUNK_SIZE {
-                        if chunk.get(lx, ly, lz) == BlockId::LootChest {
-                            footprint_chests += 1;
-                        }
-                    }
+            assert_eq!(
+                chunk.get(
+                    wx.rem_euclid(CHUNK_SIZE as i32) as usize,
+                    wy.rem_euclid(CHUNK_SIZE as i32) as usize,
+                    wz.rem_euclid(CHUNK_SIZE as i32) as usize,
+                ),
+                BlockId::LootChest,
+                "ruin at ({}, {}) is missing its own chest cell ({wx}, {wy}, {wz})",
+                spec.anchor_x,
+                spec.anchor_z
+            );
+
+            // No other generated chest inside the footprint may resolve to
+            // this anchor's table; an interlocking ruin keeps its own table.
+            let own_table = ruin_loot(seed, &spec);
+            for &(ox, oy, oz) in &chests {
+                if (ox, oz) == (wx, wz) {
+                    continue;
+                }
+                if (ox - spec.anchor_x).abs() <= RUIN_FOOTPRINT_HALF
+                    && (oz - spec.anchor_z).abs() <= RUIN_FOOTPRINT_HALF
+                {
+                    assert_ne!(
+                        ruin_loot_chest_at(IVec3::new(ox, oy, oz), seed),
+                        Some(own_table.clone()),
+                        "chest at ({ox}, {oy}, {oz}) inside ruin ({}, {}) resolves this \
+                         anchor's table",
+                        spec.anchor_x,
+                        spec.anchor_z
+                    );
                 }
             }
-            assert_eq!(
-                footprint_chests, 1,
-                "ruin at ({}, {}) has {footprint_chests} chests in its footprint",
-                spec.anchor_x, spec.anchor_z
-            );
         }
 
         // Isolated means no other anchor within Chebyshev 4 (2 * footprint
@@ -4074,13 +4262,17 @@ mod tests {
                 "chest at ({wx}, {wy}, {wz}) must recover its own anchor's table"
             );
 
-            // Exact cell means exact: a neighbouring column and the block
-            // below the chest are never this ruin's chest cell.
-            assert_eq!(
+            // Exact cell means exact. A +x neighbour may legally be another
+            // interlocking ruin's own chest cell, so it must never resolve
+            // *this* anchor's table (`None` and a neighbour's own table are
+            // both fine).
+            assert_ne!(
                 ruin_loot_chest_at(pos + IVec3::new(1, 0, 0), seed),
-                None,
-                "chest at ({wx}, {wy}, {wz}) resolved loot for its +x neighbour"
+                Some(expected.clone()),
+                "chest at ({wx}, {wy}, {wz}) resolved its own table for the +x neighbour"
             );
+            // The block below is never a chest cell: every chest sits exactly
+            // at `surface + 1` on its own anchor column.
             assert_eq!(
                 ruin_loot_chest_at(pos - IVec3::new(0, 1, 0), seed),
                 None,
