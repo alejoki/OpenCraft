@@ -110,6 +110,37 @@ impl InputState {
     }
 }
 
+/// Dry-land fall measurement carried by the player's physics step.
+///
+/// Physics measures distance only; damage, hunger, and air rules live in
+/// [`crate::player::survival`] and are applied by `WorldSession::tick_survival`
+/// (S04). Water contact always cancels a pending fall and consumes the armed
+/// spawn immunity, because touching water counts as the first contact.
+#[derive(Clone, Debug, Default)]
+struct FallState {
+    /// Highest feet height seen since the body last left the ground.
+    peak_y: Option<f32>,
+    /// One-shot dry-land distance latched on landing, consumed by the session.
+    landing_distance: f32,
+    /// Discards the first ground (or water) contact after a fresh spawn or
+    /// respawn.
+    spawn_immune: bool,
+}
+
+impl FallState {
+    /// Drops all fall bookkeeping, including spawn immunity.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Drops the in-flight fall and any latched landing but keeps spawn
+    /// immunity.
+    fn clear_pending(&mut self) {
+        self.peak_y = None;
+        self.landing_distance = 0.0;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Player {
     pub position: Vec3,
@@ -134,6 +165,8 @@ pub struct Player {
     player_grid: CraftingGrid,
     /// Unfinished 4x4 crafting-table grid carried with the player.
     table_grid: CraftingGrid,
+    /// Dry-land fall measurement and one-shot spawn immunity (S04).
+    fall: FallState,
 }
 
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
@@ -175,6 +208,7 @@ impl Player {
             inventory: Inventory::empty(),
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
+            fall: FallState::default(),
         }
     }
 
@@ -205,6 +239,8 @@ impl Player {
         if !mode.allows_fly() {
             self.fly_mode = false;
         }
+        // A mode change never carries an in-flight fall or spawn immunity.
+        self.fall.clear();
     }
 
     /// Whether the player can actually fly right now.
@@ -227,7 +263,27 @@ impl Player {
         }
         self.fly_mode = !self.fly_mode;
         self.velocity = Vec3::ZERO;
+        // Entering or leaving flight drops any in-flight fall measurement, but
+        // a fresh-spawn immunity survives an honest mode toggle.
+        self.fall.clear_pending();
         true
+    }
+
+    /// Returns the one-shot dry-land fall distance latched by the last landing.
+    ///
+    /// The value is cleared on read so a single fall can never be damaged
+    /// twice. Water contact and flight leave no latch behind.
+    pub fn take_landing_fall(&mut self) -> f32 {
+        let distance = self.fall.landing_distance;
+        self.fall.landing_distance = 0.0;
+        distance
+    }
+
+    /// Arms the first-contact spawn immunity used by fresh Survival sessions
+    /// and respawn (S04). Any in-flight fall is discarded.
+    pub fn arm_spawn_immunity(&mut self) {
+        self.fall.clear_pending();
+        self.fall.spawn_immune = true;
     }
 
     /// Rebuilds a player from a persisted aggregate (session restore).
@@ -618,8 +674,12 @@ impl Player {
             self.velocity = vel;
             self.position += self.velocity * dt;
             self.on_ground = false;
+            // Flight is never a fall: drop any in-flight measurement.
+            self.fall.clear_pending();
             return;
         }
+
+        let start_y = self.position.y;
 
         // Submersion is derived from the already-in-scope `get_block` closure —
         // no signature change and no new call-site parameter. Sampling the feet
@@ -646,10 +706,10 @@ impl Player {
         self.velocity.z = move_dir.z * walk_speed;
 
         // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
-        // only (positions, sink/rise, on_ground). No fall-damage, health, or
-        // drowning claim is made anywhere in this slice — no health/fall/damage
-        // system exists in `src/`; fall damage and drowning are deferred to M008
-        // (MEM227).
+        // only (positions, sink/rise, on_ground). Fall distance is measured by
+        // the dry-land bookkeeping after the sub-step loop below; the damage,
+        // hunger, and air rules live in `player::survival` and are applied by
+        // `WorldSession::tick_survival` (S04). Water contact cancels a fall.
         if submerged {
             // D087: no buoyant surface lock. A submerged walk-mode body is
             // dragged vertically and then pulled down by gravity while
@@ -719,6 +779,41 @@ impl Player {
                     self.velocity.z = 0.0;
                 }
             }
+        }
+
+        // Fall measurement (dry land only). Physics owns the distance; the
+        // survival runtime owns the damage. Re-sample submersion at the new
+        // position because the body may have entered water during this step.
+        let body_x_after = self.position.x.floor() as i32;
+        let body_z_after = self.position.z.floor() as i32;
+        let feet_block_y_after = (self.position.y + 1e-4).floor() as i32;
+        let mid_block_y_after = (self.position.y + PLAYER_HEIGHT * 0.5).floor() as i32;
+        let submerged_after = get_block(body_x_after, feet_block_y_after, body_z_after).is_liquid()
+            || get_block(body_x_after, mid_block_y_after, body_z_after).is_liquid();
+
+        if submerged || submerged_after {
+            // Water contact counts as the first contact: cancel the fall and
+            // spend the fresh-spawn immunity.
+            self.fall.clear_pending();
+            self.fall.spawn_immune = false;
+        } else if self.on_ground {
+            let peak = self.fall.peak_y.take();
+            if self.fall.spawn_immune {
+                // Fresh spawn/respawn: discard the first dry landing whole.
+                self.fall.spawn_immune = false;
+            } else if let Some(peak) = peak {
+                self.fall.landing_distance = (peak - self.position.y).max(0.0);
+            }
+        } else {
+            // A ledge walk-off keeps its takeoff height, and a jump still
+            // peaks at the apex instead of only recording the final height.
+            self.fall.peak_y = Some(
+                self.fall
+                    .peak_y
+                    .unwrap_or(start_y)
+                    .max(start_y)
+                    .max(self.position.y),
+            );
         }
     }
 }
@@ -1895,6 +1990,191 @@ mod tests {
         }
     }
 
+    /// Solid floor at `floor_y` with open air above. Used by the fall tests.
+    fn dry_land_at(floor_y: i32) -> impl Fn(i32, i32, i32) -> BlockId {
+        move |_x, y, _z| {
+            if y < floor_y {
+                BlockId::Stone
+            } else {
+                BlockId::Air
+            }
+        }
+    }
+
+    /// Runs gravity-only frames until the body lands, bounded to 10 game
+    /// seconds at 60 Hz.
+    fn fall_to_ground(player: &mut Player, floor_y: i32) {
+        let idle = InputState::default();
+        for frame in 0..600 {
+            player.update(1.0 / 60.0, &idle, dry_land_at(floor_y));
+            if player.on_ground {
+                return;
+            }
+            assert!(
+                player.position.y > floor_y as f32 - 1.0,
+                "fall fell through the floor at frame {frame}: y={}",
+                player.position.y
+            );
+        }
+        panic!("body never landed on floor y={floor_y}");
+    }
+
+    #[test]
+    fn dry_land_falls_latch_distance_and_map_to_survival_damage() {
+        for (drop, expected_damage) in [(3.0_f32, 0_u16), (4.0, 1), (5.0, 2)] {
+            let mut player =
+                Player::new_with_mode(Vec3::new(0.5, 5.0 + drop, 0.5), GameMode::Survival);
+            fall_to_ground(&mut player, 5);
+            let distance = player.take_landing_fall();
+            assert!(
+                (distance - drop).abs() < 1e-3,
+                "a {drop}-block drop must latch {drop}, got {distance}"
+            );
+            assert_eq!(
+                crate::player::survival::fall_damage(distance),
+                expected_damage,
+                "a {drop}-block drop must map to {expected_damage} damage"
+            );
+            assert_eq!(
+                player.take_landing_fall(),
+                0.0,
+                "the landing latch must be consumed exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_land_jump_latches_less_than_the_safe_drop() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 5.0, 0.5), GameMode::Survival);
+        player.on_ground = true;
+        let jump = InputState {
+            jump_or_up: true,
+            ..Default::default()
+        };
+        player.update(1.0 / 60.0, &jump, dry_land_at(5));
+        let idle = InputState::default();
+        for _ in 0..600 {
+            player.update(1.0 / 60.0, &idle, dry_land_at(5));
+            if player.on_ground {
+                break;
+            }
+        }
+        assert!(player.on_ground, "the jump must come back down");
+        let distance = player.take_landing_fall();
+        assert!(
+            distance > 0.0 && distance < 3.0,
+            "a 9.0 m/s jump must stay under the 3-block safe drop, got {distance}"
+        );
+    }
+
+    #[test]
+    fn water_entry_cancels_the_fall_and_spends_spawn_immunity() {
+        let mut player = Player::new_with_mode(
+            Vec3::new(0.5, TEST_SEA_LEVEL as f32 + 10.0, 0.5),
+            GameMode::Survival,
+        );
+        player.arm_spawn_immunity();
+        let idle = InputState::default();
+        let mut entered = false;
+        for _ in 0..600 {
+            player.update(1.0 / 60.0, &idle, water_column);
+            if player.position.y < TEST_SEA_LEVEL as f32 {
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered, "the body must enter the water column");
+        assert_eq!(
+            player.take_landing_fall(),
+            0.0,
+            "water contact must cancel the fall"
+        );
+        assert!(
+            !player.fall.spawn_immune,
+            "water contact counts as the first contact and spends immunity"
+        );
+        assert!(player.fall.peak_y.is_none());
+    }
+
+    #[test]
+    fn spawn_immunity_discards_only_the_first_dry_landing() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 9.0, 0.5), GameMode::Survival);
+        player.arm_spawn_immunity();
+        fall_to_ground(&mut player, 5);
+        assert_eq!(
+            player.take_landing_fall(),
+            0.0,
+            "the armed first landing must be discarded"
+        );
+        assert!(!player.fall.spawn_immune, "immunity is a one-shot");
+
+        player.position.y = 9.0;
+        player.velocity = Vec3::ZERO;
+        player.on_ground = false;
+        fall_to_ground(&mut player, 5);
+        let distance = player.take_landing_fall();
+        assert!(
+            (distance - 4.0).abs() < 1e-3,
+            "the second 4-block fall must be measured, got {distance}"
+        );
+    }
+
+    #[test]
+    fn restored_player_without_armed_immunity_takes_the_first_fall() {
+        // Session restore never arms immunity: a saved mid-air fall must hurt.
+        let mut player = Player::with_inventory(
+            Vec3::new(0.5, 9.0, 0.5),
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        assert!(!player.fall.spawn_immune);
+        fall_to_ground(&mut player, 5);
+        let distance = player.take_landing_fall();
+        assert!(
+            (distance - 4.0).abs() < 1e-3,
+            "an unarmed restored player must take the first 4-block fall, got {distance}"
+        );
+    }
+
+    #[test]
+    fn toggle_fly_and_set_mode_drop_a_pending_fall() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 40.0, 0.5), GameMode::Survival);
+        let idle = InputState::default();
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(player.fall.peak_y.is_some(), "a dry fall must build a peak");
+
+        player.set_mode(GameMode::Creative);
+        assert!(
+            player.fall.peak_y.is_none(),
+            "set_mode must clear the pending peak"
+        );
+        assert_eq!(
+            player.fall.landing_distance, 0.0,
+            "set_mode must clear a latched landing"
+        );
+
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(player.fall.peak_y.is_some());
+        assert!(player.toggle_fly(), "Creative must allow the fly toggle");
+        assert!(
+            player.fall.peak_y.is_none(),
+            "toggling flight must clear the pending peak"
+        );
+
+        player.fall.landing_distance = 7.0;
+        assert!(player.toggle_fly());
+        assert_eq!(
+            player.fall.landing_distance, 0.0,
+            "toggling flight must clear a latched landing"
+        );
+    }
+
     #[test]
     fn swim_idle_submerged_player_sinks_away_from_the_surface() {
         // D087: no automatic surface lock. Released just under the surface with
@@ -2149,11 +2429,12 @@ mod tests {
     /// The `BlockId` solid/liquid matrix itself is pinned by
     /// `test_solid_and_liquid_matrix_over_every_block_id` in `src/world/block.rs`.
     ///
-    /// Honesty note: no fall-damage, health, or drowning claim is made anywhere
-    /// in S03 (or in the D087 rework). No health/fall/damage system exists in
-    /// `src/` (grep-verified during research); fall damage and drowning are
-    /// deferred to M008 (MEM227). Swim assertions cover mechanics only
-    /// (positions, sink/rise, `on_ground`).
+    /// Honesty note: this S03/D087 acceptance test makes no fall-damage,
+    /// health, or drowning claim. Fall distance is measured in `Player::update`
+    /// (S04), while the damage/hunger/air rules live in `player::survival` and
+    /// are applied by `WorldSession::tick_survival`; water contact cancels a
+    /// fall. The swim assertions here cover mechanics only (positions,
+    /// sink/rise, `on_ground`).
     #[test]
     fn water_is_passable_but_never_walkable_at_the_physics_consumer() {
         assert!(!BlockId::Water.is_solid(), "water must stay passable");
