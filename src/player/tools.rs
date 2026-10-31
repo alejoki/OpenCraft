@@ -30,9 +30,22 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
     match block {
         BlockId::Stone | BlockId::Cobblestone | BlockId::Brick => Some(ToolKind::Pickaxe),
         BlockId::CoalOre | BlockId::IronOre => Some(ToolKind::Pickaxe),
-        BlockId::OakLog | BlockId::OakPlanks | BlockId::CraftingTable => Some(ToolKind::Axe),
-        BlockId::Grass | BlockId::Dirt | BlockId::Sand | BlockId::Snow => Some(ToolKind::Shovel),
-        BlockId::Air | BlockId::OakLeaves | BlockId::Bedrock | BlockId::Water => None,
+        BlockId::OakLog
+        | BlockId::OakPlanks
+        | BlockId::CraftingTable
+        | BlockId::Chest
+        | BlockId::LootChest => Some(ToolKind::Axe),
+        BlockId::Grass | BlockId::Dirt | BlockId::Sand | BlockId::Snow | BlockId::Farmland => {
+            Some(ToolKind::Shovel)
+        }
+        BlockId::Air
+        | BlockId::OakLeaves
+        | BlockId::Bedrock
+        | BlockId::Water
+        | BlockId::WheatStage0
+        | BlockId::WheatStage1
+        | BlockId::WheatStage2
+        | BlockId::WheatStage3 => None,
     }
 }
 
@@ -70,7 +83,7 @@ mod tests {
     use super::*;
     use crate::player::inventory::{ItemId, Material};
 
-    const ALL_BLOCKS: [BlockId; 16] = [
+    const ALL_BLOCKS: [BlockId; 23] = [
         BlockId::Air,
         BlockId::Grass,
         BlockId::Dirt,
@@ -87,6 +100,13 @@ mod tests {
         BlockId::IronOre,
         BlockId::CraftingTable,
         BlockId::Water,
+        BlockId::Farmland,
+        BlockId::WheatStage0,
+        BlockId::WheatStage1,
+        BlockId::WheatStage2,
+        BlockId::WheatStage3,
+        BlockId::Chest,
+        BlockId::LootChest,
     ];
 
     const ALL_KINDS: [ToolKind; 4] = [
@@ -116,7 +136,14 @@ mod tests {
         for block in ALL_BLOCKS {
             let class = block_tool_class(block);
             match block {
-                BlockId::Air | BlockId::Bedrock | BlockId::OakLeaves | BlockId::Water => {
+                BlockId::Air
+                | BlockId::Bedrock
+                | BlockId::OakLeaves
+                | BlockId::Water
+                | BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3 => {
                     assert_eq!(class, None, "{block:?} must not be accelerated by a tool");
                 }
                 _ => assert!(class.is_some(), "{block:?} must belong to a tool class"),
@@ -132,11 +159,31 @@ mod tests {
         ] {
             assert_eq!(block_tool_class(block), Some(ToolKind::Pickaxe));
         }
-        for block in [BlockId::OakLog, BlockId::OakPlanks, BlockId::CraftingTable] {
+        for block in [
+            BlockId::OakLog,
+            BlockId::OakPlanks,
+            BlockId::CraftingTable,
+            BlockId::Chest,
+            BlockId::LootChest,
+        ] {
             assert_eq!(block_tool_class(block), Some(ToolKind::Axe));
         }
-        for block in [BlockId::Grass, BlockId::Dirt, BlockId::Sand, BlockId::Snow] {
+        for block in [
+            BlockId::Grass,
+            BlockId::Dirt,
+            BlockId::Sand,
+            BlockId::Snow,
+            BlockId::Farmland,
+        ] {
             assert_eq!(block_tool_class(block), Some(ToolKind::Shovel));
+        }
+        for block in [
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+        ] {
+            assert_eq!(block_tool_class(block), None);
         }
     }
 

@@ -69,10 +69,7 @@ impl ItemStack {
     /// Builds a stack, rejecting blocks that cannot be carried and counts
     /// outside `1..=MAX_STACK_COUNT`.
     pub fn new(block: BlockId, count: u16) -> Option<Self> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water)
-            || count == 0
-            || count > MAX_STACK_COUNT
-        {
+        if !block.is_carryable() || count == 0 || count > MAX_STACK_COUNT {
             return None;
         }
         Some(Self { block, count })
@@ -110,7 +107,7 @@ impl Hotbar {
     /// slot is capped at `MAX_STACK_COUNT`. Returns the first slot written, or
     /// `None` when the block/amount is invalid or nothing can be accepted.
     pub fn collect(&mut self, block: BlockId, amount: u16) -> Option<usize> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
+        if !block.is_carryable() || amount == 0 {
             return None;
         }
 
@@ -366,9 +363,7 @@ impl Item {
     /// must be count one (they start at full durability).
     pub fn new(id: ItemId, count: u16) -> Result<Self, ItemError> {
         match id {
-            ItemId::Block(BlockId::Air | BlockId::Bedrock | BlockId::Water) => {
-                Err(ItemError::UncarryableBlock)
-            }
+            ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
             ItemId::Tool { tier, .. } => {
@@ -762,7 +757,7 @@ impl Inventory {
     /// the remainder. Returns `None` (no mutation) when nothing was accepted
     /// or the block cannot be carried.
     pub fn collect_block(&mut self, block: BlockId, amount: u16) -> Option<CollectOutcome> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
+        if !block.is_carryable() || amount == 0 {
             return None;
         }
 
@@ -1766,6 +1761,65 @@ mod tests {
             }
             .stack_limit(),
             1
+        );
+    }
+
+    #[test]
+    fn central_carryability_predicate_drives_all_item_constructors() {
+        let uncarryable = [
+            BlockId::Farmland,
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+            BlockId::LootChest,
+        ];
+        for block in uncarryable {
+            assert!(
+                ItemStack::new(block, 1).is_none(),
+                "{block:?} must be rejected by the legacy stack constructor"
+            );
+            assert_eq!(
+                Item::new(ItemId::Block(block), 1),
+                Err(ItemError::UncarryableBlock),
+                "{block:?} must be rejected by Item::new"
+            );
+            assert_eq!(
+                Hotbar::empty().collect(block, 1),
+                None,
+                "{block:?} must be rejected by the legacy hotbar"
+            );
+            assert_eq!(
+                Inventory::empty().collect_block(block, 1),
+                None,
+                "{block:?} must be rejected by Inventory::collect_block"
+            );
+        }
+
+        // Chest is the one carryable block appended in S02 and must still flow
+        // through every constructor.
+        let stack = ItemStack::new(BlockId::Chest, 1).expect("chest stack");
+        assert_eq!(stack.block, BlockId::Chest);
+        let item = Item::new(ItemId::Block(BlockId::Chest), 1).expect("chest item");
+        assert_eq!(item.id(), ItemId::Block(BlockId::Chest));
+
+        let mut hotbar = Hotbar::empty();
+        assert_eq!(hotbar.collect(BlockId::Chest, 1), Some(0));
+        assert_eq!(
+            hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Chest,
+                count: 1
+            })
+        );
+
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            inventory.collect_block(BlockId::Chest, 2),
+            Some(CollectOutcome {
+                first_slot: 0,
+                accepted: 2
+            })
         );
     }
 

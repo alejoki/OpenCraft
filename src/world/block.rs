@@ -21,7 +21,30 @@ pub enum BlockId {
     /// below the named sea level, never placed by the player, never persisted
     /// into a chunk edit, and never carried as an item.
     Water = 15,
+    /// Tilled soil produced by hoeing grass or dirt. Drops dirt when broken.
+    Farmland = 16,
+    /// Wheat growth stage 0: freshly planted seeds.
+    WheatStage0 = 17,
+    /// Wheat growth stage 1: short green sprouts.
+    WheatStage1 = 18,
+    /// Wheat growth stage 2: tall green stalks.
+    WheatStage2 = 19,
+    /// Wheat growth stage 3: mature golden wheat.
+    WheatStage3 = 20,
+    /// Storage block placeholder for the survival chest container.
+    Chest = 21,
+    /// Loot-bearing chest variant; drops itself until the loot slice lands.
+    LootChest = 22,
 }
+
+/// The four wheat growth stages in ascending order, index-aligned with
+/// [`BlockId::wheat_stage`].
+pub const WHEAT_STAGES: [BlockId; 4] = [
+    BlockId::WheatStage0,
+    BlockId::WheatStage1,
+    BlockId::WheatStage2,
+    BlockId::WheatStage3,
+];
 
 impl BlockId {
     /// Whether this block blocks movement, sight lines, and light.
@@ -41,6 +64,53 @@ impl BlockId {
     #[inline]
     pub const fn is_liquid(self) -> bool {
         matches!(self, BlockId::Water)
+    }
+
+    /// Whether this block can be carried as an inventory item.
+    ///
+    /// Air, bedrock, water, farmland, every wheat growth stage, and the
+    /// loot-chest block are world-only. Every other block id, including the
+    /// ordinary [`BlockId::Chest`], can become a stackable item. This is the
+    /// single predicate behind every constructor that rejects uncarryable
+    /// blocks, so the item and legacy hotbar paths cannot drift apart.
+    #[inline]
+    pub const fn is_carryable(self) -> bool {
+        !matches!(
+            self,
+            BlockId::Air
+                | BlockId::Bedrock
+                | BlockId::Water
+                | BlockId::Farmland
+                | BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3
+                | BlockId::LootChest
+        )
+    }
+
+    /// Whether this block is any wheat growth stage.
+    #[inline]
+    pub const fn is_wheat_stage(self) -> bool {
+        matches!(
+            self,
+            BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3
+        )
+    }
+
+    /// Maps a growth stage (`0..=3`) to its block id, or `None` above stage 3.
+    #[inline]
+    pub const fn wheat_stage(stage: u8) -> Option<BlockId> {
+        match stage {
+            0 => Some(BlockId::WheatStage0),
+            1 => Some(BlockId::WheatStage1),
+            2 => Some(BlockId::WheatStage2),
+            3 => Some(BlockId::WheatStage3),
+            _ => None,
+        }
     }
 
     /// Whether right-clicking this block opens a crafting station interface.
@@ -73,11 +143,18 @@ impl BlockId {
             13 => Some(BlockId::IronOre),
             14 => Some(BlockId::CraftingTable),
             15 => Some(BlockId::Water),
+            16 => Some(BlockId::Farmland),
+            17 => Some(BlockId::WheatStage0),
+            18 => Some(BlockId::WheatStage1),
+            19 => Some(BlockId::WheatStage2),
+            20 => Some(BlockId::WheatStage3),
+            21 => Some(BlockId::Chest),
+            22 => Some(BlockId::LootChest),
             _ => None,
         }
     }
 
-    /// Returns texture array layer index (0..16) for a face direction:
+    /// Returns texture array layer index (0..32) for a face direction:
     /// 0 = +X, 1 = -X, 2 = +Y (top), 3 = -Y (bottom), 4 = +Z, 5 = -Z
     #[inline]
     pub const fn face_tex_layer(self, face_dir: u8) -> u8 {
@@ -112,9 +189,16 @@ impl BlockId {
             BlockId::CraftingTable => 9,
             // Placeholder only: water surfaces are carried on a separate,
             // deliberately un-uploaded mesh field, so this layer is never
-            // sampled by the opaque GPU path. Kept inside 0..=15 so the
+            // sampled by the opaque GPU path. Kept inside 0..=31 so the
             // texture-array index stays valid if that ever changes.
             BlockId::Water => 0,
+            BlockId::Farmland => 16,
+            BlockId::WheatStage0 => 17,
+            BlockId::WheatStage1 => 18,
+            BlockId::WheatStage2 => 19,
+            BlockId::WheatStage3 => 20,
+            BlockId::Chest => 21,
+            BlockId::LootChest => 22,
         }
     }
 
@@ -136,6 +220,13 @@ impl BlockId {
             BlockId::IronOre => "Iron Ore",
             BlockId::CraftingTable => "Crafting Table",
             BlockId::Water => "Water",
+            BlockId::Farmland => "Farmland",
+            BlockId::WheatStage0 => "Wheat Stage 0",
+            BlockId::WheatStage1 => "Wheat Stage 1",
+            BlockId::WheatStage2 => "Wheat Stage 2",
+            BlockId::WheatStage3 => "Wheat Stage 3",
+            BlockId::Chest => "Chest",
+            BlockId::LootChest => "Loot Chest",
         }
     }
 
@@ -163,6 +254,14 @@ impl BlockId {
             // Liquids are not mineable: the mining loop treats `None` as
             // "no target", so a water raycast hit never starts a break.
             BlockId::Water => None,
+            BlockId::Farmland => Some(0.55),
+            // Wheat is deliberately fragile: any stage breaks almost instantly
+            // so harvesting never competes with soil or container hardness.
+            BlockId::WheatStage0
+            | BlockId::WheatStage1
+            | BlockId::WheatStage2
+            | BlockId::WheatStage3 => Some(0.05),
+            BlockId::Chest | BlockId::LootChest => Some(0.8),
         }
     }
 
@@ -170,8 +269,10 @@ impl BlockId {
     ///
     /// Stone yields Cobblestone so the stone-tier tool recipes (whose head
     /// material is [`BlockId::Cobblestone`]) are reachable through real
-    /// gameplay. Every other block drops itself. This is block metadata, not
-    /// tool behavior: the mining loop and durability rules are untouched.
+    /// gameplay. Farmland yields Dirt because tilling is reversible. Every
+    /// other block, including the new wheat stages, chests, and the loot
+    /// chest, drops itself in this slice: loot rolls and wheat-harvest drops
+    /// belong to later survival slices.
     ///
     /// Drops are inventory state only and are never persisted, and the wire
     /// format keeps Cobblestone's id 4 unchanged, so save compatibility is
@@ -179,6 +280,7 @@ impl BlockId {
     pub const fn mined_drop(self) -> BlockId {
         match self {
             BlockId::Stone => BlockId::Cobblestone,
+            BlockId::Farmland => BlockId::Dirt,
             // Unbreakable ids never reach a drop path; returning the id keeps
             // the mapping total without inventing an item.
             BlockId::Water => BlockId::Water,
@@ -205,11 +307,11 @@ mod tests {
 
     #[test]
     fn test_block_ids_roundtrip_and_ore_metadata() {
-        for id in 0u8..=15 {
+        for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(block as u8, id, "block id {id} must round-trip");
         }
-        assert_eq!(BlockId::from_u8(16), None);
+        assert_eq!(BlockId::from_u8(23), None);
         assert_eq!(BlockId::from_u8(99), None);
 
         assert_eq!(BlockId::Water as u8, 15);
@@ -237,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_only_the_crafting_table_is_table_interactable() {
-        for id in 0u8..=15 {
+        for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(
                 block.is_table_interactable(),
@@ -256,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_break_durations_cover_every_breakable_block() {
-        for id in 0u8..=15 {
+        for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             match block {
                 BlockId::Air | BlockId::Bedrock | BlockId::Water => {
@@ -277,26 +379,30 @@ mod tests {
     }
 
     #[test]
-    fn test_mined_drop_is_identity_except_stone_yields_cobblestone() {
-        for id in 0u8..=15 {
+    fn test_mined_drop_is_identity_except_stone_and_farmland() {
+        for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
-            let expected = if block == BlockId::Stone {
-                BlockId::Cobblestone
-            } else {
-                block
+            let expected = match block {
+                BlockId::Stone => BlockId::Cobblestone,
+                BlockId::Farmland => BlockId::Dirt,
+                _ => block,
             };
             assert_eq!(block.mined_drop(), expected, "{block:?} mined drop drifted");
         }
-        // Explicit anchors for the two interesting cases.
+        // Explicit anchors for the interesting cases.
         assert_eq!(BlockId::Stone.mined_drop(), BlockId::Cobblestone);
         assert_eq!(BlockId::Cobblestone.mined_drop(), BlockId::Cobblestone);
+        assert_eq!(BlockId::Farmland.mined_drop(), BlockId::Dirt);
+        // LootChest -> Chest lands with the loot slice, not here.
+        assert_eq!(BlockId::LootChest.mined_drop(), BlockId::LootChest);
+        assert_eq!(BlockId::Chest.mined_drop(), BlockId::Chest);
     }
 
     #[test]
     fn test_solid_and_liquid_matrix_over_every_block_id() {
         // Exactly Air and Water are passable/transparent; Water is the only
         // liquid. Everything else is a solid, non-liquid block.
-        for id in 0u8..=15 {
+        for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected_solid = !matches!(block, BlockId::Air | BlockId::Water);
             assert_eq!(block.is_solid(), expected_solid, "{block:?} solidity");
@@ -314,6 +420,23 @@ mod tests {
         assert!(!BlockId::CraftingTable.is_liquid());
         assert!(BlockId::Water.is_liquid());
         assert!(!BlockId::Water.is_solid());
+        // The seven appended ids are solid terrain, not liquids.
+        for block in [
+            BlockId::Farmland,
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+            BlockId::Chest,
+            BlockId::LootChest,
+        ] {
+            assert!(block.is_solid(), "{block:?} must be solid");
+            assert!(!block.is_liquid(), "{block:?} must not be a liquid");
+            assert!(
+                !block.is_table_interactable(),
+                "{block:?} must not open the crafting table"
+            );
+        }
     }
 
     #[test]
@@ -325,11 +448,158 @@ mod tests {
         for face_dir in 0u8..6 {
             let layer = BlockId::Water.face_tex_layer(face_dir);
             assert!(
-                layer <= 15,
-                "water layer {layer} must index the 16-layer array"
+                layer < 32,
+                "water layer {layer} must index the 32-layer array"
             );
         }
         assert!(!BlockId::Water.is_table_interactable());
+    }
+
+    #[test]
+    fn test_wheat_stage_helpers_cover_stages_zero_through_three() {
+        assert_eq!(
+            WHEAT_STAGES,
+            [
+                BlockId::WheatStage0,
+                BlockId::WheatStage1,
+                BlockId::WheatStage2,
+                BlockId::WheatStage3,
+            ]
+        );
+
+        for (stage, block) in WHEAT_STAGES.iter().copied().enumerate() {
+            assert_eq!(
+                BlockId::wheat_stage(stage as u8),
+                Some(block),
+                "stage {stage} must map to {block:?}"
+            );
+            assert!(block.is_wheat_stage(), "{block:?} must be a wheat stage");
+            assert_eq!(block.mined_drop(), block);
+            assert_eq!(block.break_duration_secs(), Some(0.05));
+        }
+
+        assert_eq!(BlockId::wheat_stage(4), None);
+        assert_eq!(BlockId::wheat_stage(u8::MAX), None);
+        assert!(!BlockId::Farmland.is_wheat_stage());
+        assert!(!BlockId::Chest.is_wheat_stage());
+
+        for id in 0u8..=22 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(
+                block.is_wheat_stage(),
+                WHEAT_STAGES.contains(&block),
+                "{block:?} wheat-stage classification drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_carryability_matrix_over_every_block_id() {
+        for id in 0u8..=22 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            let expected = !matches!(
+                block,
+                BlockId::Air
+                    | BlockId::Bedrock
+                    | BlockId::Water
+                    | BlockId::Farmland
+                    | BlockId::WheatStage0
+                    | BlockId::WheatStage1
+                    | BlockId::WheatStage2
+                    | BlockId::WheatStage3
+                    | BlockId::LootChest
+            );
+            assert_eq!(
+                block.is_carryable(),
+                expected,
+                "{block:?} carryability drifted"
+            );
+        }
+
+        assert!(BlockId::Chest.is_carryable(), "the chest must be carryable");
+        for block in [
+            BlockId::Air,
+            BlockId::Bedrock,
+            BlockId::Water,
+            BlockId::Farmland,
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+            BlockId::LootChest,
+        ] {
+            assert!(!block.is_carryable(), "{block:?} must stay world-only");
+        }
+        // Ids 0..=15 keep their pre-M008 carryability answers.
+        for id in 0u8..=15 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(
+                block.is_carryable(),
+                !matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water),
+                "{block:?} legacy carryability drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_survival_palette_metadata() {
+        let cases: [(BlockId, u8, &str, f32, BlockId); 7] = [
+            (BlockId::Farmland, 16, "Farmland", 0.55, BlockId::Dirt),
+            (
+                BlockId::WheatStage0,
+                17,
+                "Wheat Stage 0",
+                0.05,
+                BlockId::WheatStage0,
+            ),
+            (
+                BlockId::WheatStage1,
+                18,
+                "Wheat Stage 1",
+                0.05,
+                BlockId::WheatStage1,
+            ),
+            (
+                BlockId::WheatStage2,
+                19,
+                "Wheat Stage 2",
+                0.05,
+                BlockId::WheatStage2,
+            ),
+            (
+                BlockId::WheatStage3,
+                20,
+                "Wheat Stage 3",
+                0.05,
+                BlockId::WheatStage3,
+            ),
+            (BlockId::Chest, 21, "Chest", 0.8, BlockId::Chest),
+            (
+                BlockId::LootChest,
+                22,
+                "Loot Chest",
+                0.8,
+                BlockId::LootChest,
+            ),
+        ];
+
+        for (block, id, name, duration, drop) in cases {
+            assert_eq!(block as u8, id, "{name} id must be stable");
+            assert_eq!(block.name(), name, "{name} display name drifted");
+            assert_eq!(block.break_duration_secs(), Some(duration));
+            assert_eq!(block.mined_drop(), drop, "{name} drop drifted");
+            for face_dir in 0u8..6 {
+                assert_eq!(
+                    block.face_tex_layer(face_dir),
+                    id,
+                    "{name} must sample texture layer {id} on face {face_dir}"
+                );
+            }
+        }
+
+        // The palette appends without renumbering any existing id.
+        assert_eq!(BlockId::Water as u8, 15);
+        assert_eq!(BlockId::CraftingTable as u8, 14);
     }
 
     #[test]

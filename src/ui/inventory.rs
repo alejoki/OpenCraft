@@ -377,8 +377,9 @@ pub fn target_rect(
 /// Deterministic opaque palette per item identity. No art files: the UI can
 /// draw recognizable stacks from pure data.
 ///
-/// Air, bedrock, and water are uncarryable, so their shared fallback color can
-/// never appear as an item.
+/// Air, bedrock, water, farmland, wheat stages, and the loot chest are
+/// uncarryable, so their palette entries are unreachable through the item UI;
+/// they exist so the block map stays total.
 pub fn item_color(item: Item) -> [f32; 4] {
     match item.id() {
         ItemId::Block(block) => block_color(block),
@@ -406,6 +407,15 @@ fn block_color(block: BlockId) -> [f32; 4] {
         // the item UI; it exists so the block color map stays total and a
         // future HUD/debug readout has a canonical tint.
         BlockId::Water => [0.20, 0.42, 0.78, 1.0],
+        BlockId::Farmland => [0.34, 0.25, 0.15, 1.0],
+        // The four wheat stages warm from sprout green to harvest gold so the
+        // item/block readout can distinguish growth without art files.
+        BlockId::WheatStage0 => [0.32, 0.55, 0.20, 1.0],
+        BlockId::WheatStage1 => [0.41, 0.61, 0.22, 1.0],
+        BlockId::WheatStage2 => [0.52, 0.65, 0.24, 1.0],
+        BlockId::WheatStage3 => [0.75, 0.66, 0.20, 1.0],
+        BlockId::Chest => [0.70, 0.44, 0.15, 1.0],
+        BlockId::LootChest => [0.86, 0.70, 0.16, 1.0],
         BlockId::Air | BlockId::Bedrock => [0.16, 0.16, 0.18, 1.0],
     }
 }
@@ -1189,6 +1199,9 @@ mod tests {
             BlockId::CoalOre,
             BlockId::IronOre,
             BlockId::CraftingTable,
+            // The only carryable block appended in M008/S02; the other six are
+            // world-only and covered by the fallback-distinctness test below.
+            BlockId::Chest,
         ];
         let mut identities: Vec<ItemId> = blocks.into_iter().map(ItemId::Block).collect();
         for material in [
@@ -1238,6 +1251,42 @@ mod tests {
         let a = item(ItemId::Block(BlockId::Stone), 3);
         let b = item(ItemId::Block(BlockId::Stone), 64);
         assert_eq!(item_color(a), item_color(b));
+    }
+
+    #[test]
+    fn survival_block_colors_are_defined_and_not_the_fallback() {
+        let fallback = block_color(BlockId::Air);
+        assert_eq!(block_color(BlockId::Bedrock), fallback);
+
+        let uncarryable = [
+            BlockId::Farmland,
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+            BlockId::LootChest,
+        ];
+        for (index, block) in uncarryable.iter().copied().enumerate() {
+            let color = block_color(block);
+            assert_eq!(color[3], 1.0, "{block:?} color must be opaque");
+            assert_ne!(color, fallback, "{block:?} must not use the fallback tint");
+            for channel in &color[..3] {
+                assert!(
+                    (0.0..=1.0).contains(channel),
+                    "{block:?} channel {channel} out of range"
+                );
+            }
+            for other in uncarryable.iter().copied().skip(index + 1) {
+                assert_ne!(color, block_color(other), "{block:?} aliases {other:?}");
+            }
+        }
+
+        // Chest is carryable, so its distinctness must already be locked by
+        // the item-identity palette test; anchor the non-fallback here too.
+        let chest = block_color(BlockId::Chest);
+        assert_eq!(chest[3], 1.0);
+        assert_ne!(chest, fallback);
+        assert_ne!(chest, block_color(BlockId::LootChest));
     }
 
     #[test]
