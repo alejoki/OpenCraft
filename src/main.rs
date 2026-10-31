@@ -241,6 +241,22 @@ enum BreakRejection {
     /// The world edit returned no remesh work, so it did not apply (unloaded
     /// chunk or outside the vertical world range).
     EditRejected,
+    /// A chest break's contents plus its own drop do not all fit in the 36
+    /// inventory slots, so the all-or-nothing preflight refused before any
+    /// edit, wear, or record change.
+    ChestNoRoom,
+}
+
+/// The transient gameplay notice a rejected break shows, or `None` for
+/// rejections that are already visible in the world (a stale target or an
+/// unbreakable block needs no message).
+fn break_rejection_notice(rejection: BreakRejection) -> Option<&'static str> {
+    match rejection {
+        BreakRejection::ChestNoRoom => Some("Not enough inventory space to break the chest"),
+        BreakRejection::Unbreakable
+        | BreakRejection::StaleTarget
+        | BreakRejection::EditRejected => None,
+    }
 }
 
 /// What an applied break did to the selected hotbar slot.
@@ -297,6 +313,20 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
     if session.world.get_block(pos.x, pos.y, pos.z) != block {
         return BreakOutcome::Rejected(BreakRejection::StaleTarget);
     }
+    // A chest break drops its whole contents plus the chest item itself. The
+    // batch preflight is the only correct capacity test (heterogeneous stacks
+    // compete for the same mergeable room), and it runs before the edit, the
+    // wear, and the record change so a refusal leaves every byte untouched.
+    let chest_items = if block == BlockId::Chest {
+        let items = session.chest_break_items(pos);
+        if !session.player.can_insert_items(&items) {
+            return BreakOutcome::Rejected(BreakRejection::ChestNoRoom);
+        }
+        Some(items)
+    } else {
+        None
+    };
+
     let remeshed = session
         .world
         .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
@@ -314,10 +344,23 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         // Empty slot / non-tool / out-of-range selection: no mutation.
         Err(_) => ToolWearOutcome::Nothing,
     };
-    // Drop mapping is block metadata (Stone -> Cobblestone); the item identity
-    // is the only thing that differs, and the drop is still collected last so
-    // MEM195 ordering is preserved.
-    session.player.collect_block(block.mined_drop());
+    if let Some(items) = chest_items {
+        // The preflight proved capacity, and wearing only ever frees room, so
+        // this batch cannot fail. The record is removed with the block, and an
+        // open station on this exact chest closes; the world edit already set
+        // the unsaved flag.
+        session
+            .player
+            .insert_items(&items)
+            .expect("preflight proved capacity");
+        session.chests.remove(&pos);
+        session.close_chest_at(pos);
+    } else {
+        // Drop mapping is block metadata (Stone -> Cobblestone); the item
+        // identity is the only thing that differs, and the drop is still
+        // collected last so MEM195 ordering is preserved.
+        session.player.collect_block(block.mined_drop());
+    }
 
     BreakOutcome::Applied { remeshed, wear }
 }
@@ -345,6 +388,12 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
     let remeshed = session.world.set_block_immediate(ap.x, ap.y, ap.z, block);
     if remeshed.is_empty() {
         return None;
+    }
+    // A fresh chest must never inherit contents a removed chest left behind at
+    // this position. Only after the edit actually applied, so a rejected
+    // placement cannot erase a live record.
+    if block == BlockId::Chest {
+        session.chests.remove(&ap);
     }
     session.player.consume_selected();
     Some(remeshed)
@@ -4461,8 +4510,18 @@ impl ApplicationHandler for GameApp {
                             target_block = None;
                         }
                         // A rejected break edited nothing, so the block is
-                        // still there and the wireframe stays truthful.
-                        BreakOutcome::Rejected(_) => {}
+                        // still there and the wireframe stays truthful. The
+                        // one rejection the player cannot infer visually (a
+                        // full inventory refusing a chest break) posts a
+                        // readable transient notice above the hotbar.
+                        BreakOutcome::Rejected(rejection) => {
+                            if let Some(text) = break_rejection_notice(rejection) {
+                                self.game_message = Some(MenuMessage {
+                                    text: text.to_string(),
+                                    ticks_left: menu::MESSAGE_TICKS,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -13671,5 +13730,438 @@ mod tests {
             }),
             "placement consumes exactly one selected item"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T06: chest break preflight and end-to-end persistence proof
+    // -----------------------------------------------------------------------
+
+    /// A preflight-refused chest break has no visual cue in the world (the
+    /// chest is still there), so it owns the one readable notice. Every other
+    /// rejection is already visible and must not post a message.
+    #[test]
+    fn break_rejection_notice_names_only_the_full_inventory_chest_refusal() {
+        assert_eq!(
+            break_rejection_notice(BreakRejection::ChestNoRoom),
+            Some("Not enough inventory space to break the chest")
+        );
+        assert_eq!(break_rejection_notice(BreakRejection::Unbreakable), None);
+        assert_eq!(break_rejection_notice(BreakRejection::StaleTarget), None);
+        assert_eq!(break_rejection_notice(BreakRejection::EditRejected), None);
+    }
+
+    #[test]
+    fn breaking_a_chest_drops_every_content_plus_one_chest_item() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Item, ItemId, ToolKind, ToolTier, CHEST_SLOTS,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 60, "chest-break.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"));
+        contents[25] = Some(Item::new(ItemId::Block(BlockId::OakPlanks), 3).expect("planks"));
+        session.chests.insert(pos, Container::from_slots(contents));
+
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        session.player.insert_items(&[axe]).expect("axe fits");
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(&mut session, pos, BlockId::Chest));
+
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 9 },
+            "exactly one durability point is spent"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert!(
+            session.chest_at(pos).is_none(),
+            "the persisted record is removed with the block"
+        );
+        // Slot 0 held the axe; the batch lands in insertion (slot) order.
+        assert_eq!(
+            session.player.hotbar_stack(1),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 5,
+            })
+        );
+        assert_eq!(
+            session.player.hotbar_stack(2),
+            Some(ItemStack {
+                block: BlockId::OakPlanks,
+                count: 3,
+            })
+        );
+        assert_eq!(
+            session.player.hotbar_stack(3),
+            Some(ItemStack {
+                block: BlockId::Chest,
+                count: 1,
+            }),
+            "exactly one chest item drops"
+        );
+    }
+
+    #[test]
+    fn breaking_a_non_empty_chest_with_a_full_inventory_is_refused_untouched() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Inventory, Item, ItemId, ToolKind, ToolTier, CHEST_SLOTS, INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 61, "chest-full.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone"));
+        let record = Container::from_slots(contents);
+        session.chests.insert(pos, record.clone());
+
+        // 36 non-stackable tools: the contents plus the chest item cannot fit.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the break"
+        );
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::Chest,
+            "the refused break edits nothing"
+        );
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&record),
+            "the record survives a refused break"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "a refused break spends no durability"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "a refused break does not partially insert the contents"
+        );
+    }
+
+    #[test]
+    fn cursor_and_crafting_grids_do_not_create_chest_break_capacity() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Inventory, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
+            INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 62, "chest-spill.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone"));
+        let record = Container::from_slots(contents);
+        session.chests.insert(pos, record.clone());
+
+        // 35 tools leave exactly one empty slot: the contents can land there,
+        // but the chest item cannot. A matching cursor stack and items in both
+        // crafting grids must not be counted as spill capacity.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let stick = Item::new(ItemId::Material(Material::Stick), 4).expect("stick");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(axe);
+        }
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid.set(0, Some(stick)).expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid.set(0, Some(stick)).expect("table grid cell");
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, Some(stick)),
+            player_grid.clone(),
+            table_grid.clone(),
+        );
+        assert!(session.player.select_slot(0));
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "the cursor and grids are not 36-slot capacity"
+        );
+        assert_eq!(session.chest_at(pos), Some(&record));
+        assert_eq!(session.player.inventory().cursor(), Some(stick));
+        assert_eq!(session.player.player_grid(), &player_grid);
+        assert_eq!(session.player.table_grid(), &table_grid);
+    }
+
+    #[test]
+    fn an_empty_chest_needs_room_only_for_the_chest_item() {
+        use opencraft::player::inventory::{
+            Inventory, Item, ItemId, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 63, "chest-empty.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+
+        // No record means an untouched, empty chest: only the chest item is
+        // dropped, but a completely full inventory still refuses.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut full = [None; INVENTORY_SLOTS];
+        for slot in full.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(full, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "the chest item itself has nowhere to go"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Chest);
+        assert_eq!(session.player.inventory(), &inventory_before);
+
+        // One free slot is exactly enough for the chest item.
+        let mut one_free = [None; INVENTORY_SLOTS];
+        for slot in one_free.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(one_free, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::Chest));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert!(session.chest_at(pos).is_none());
+        let chest_items: u16 = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Block(BlockId::Chest))
+            .map(Item::count)
+            .sum();
+        assert_eq!(chest_items, 1, "an empty chest drops exactly one chest");
+    }
+
+    #[test]
+    fn placing_a_chest_clears_a_stale_record_only_after_the_edit_applies() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{ChestSlots, Item, ItemId, CHEST_SLOTS};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 64, "chest-place-clean.mcvx");
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        let destination = IVec3::new(0, 6, 0);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 4).expect("stone"));
+        session
+            .chests
+            .insert(destination, Container::from_slots(contents));
+
+        // Nothing selected: the placement never reaches the world, so the
+        // stale record must survive a rejected attempt.
+        assert!(session.player.select_slot(5));
+        assert!(try_place_selected_block(&mut session).is_none());
+        assert!(
+            session.chest_at(destination).is_some(),
+            "a placement that did not apply must not clear the record"
+        );
+
+        // A real chest placement replaces the stale record's position.
+        assert!(session.player.collect_block(BlockId::Chest).is_some());
+        assert!(session.player.select_slot(0));
+        let remeshed = try_place_selected_block(&mut session).expect("chest places");
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Chest);
+        assert!(
+            session.chest_at(destination).is_none(),
+            "a fresh chest must not inherit stale contents"
+        );
+        assert_eq!(session.player.hotbar_stack(0), None);
+    }
+
+    #[test]
+    fn crafted_chest_places_stores_saves_and_reloads_contents() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            CraftingGrid, GridKind, Inventory, Item, ItemId, CHEST_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+        use opencraft::world::chunk::linear_index;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("chest-roundtrip.mcvx");
+        let mut session =
+            WorldSession::new_session(5151, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        // Real crafting step: eight planks in the table grid's 3x3 ring.
+        let ring = [0usize, 1, 2, 4, 6, 8, 9, 10];
+        let mut inventory = Inventory::empty();
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        let planks = Item::new(ItemId::Block(BlockId::OakPlanks), 1).expect("planks");
+        for cell in ring {
+            table_grid.set(cell, Some(planks)).expect("ring cell");
+        }
+        let chest = table_grid
+            .take_result(&mut inventory)
+            .expect("eight planks craft one chest");
+        assert_eq!(chest.id(), ItemId::Block(BlockId::Chest));
+        assert!(table_grid.is_empty(), "the craft consumes all eight planks");
+
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 12).expect("stone");
+        inventory.insert(stone).expect("stone fits");
+        session.player = Player::with_inventory(
+            session.player.position,
+            inventory,
+            CraftingGrid::new(GridKind::Player),
+            table_grid,
+        );
+        assert!(session.player.select_slot(0), "the chest is selected");
+
+        let placed = try_place_selected_block(&mut session).expect("crafted chest places");
+        assert!(!placed.is_empty());
+        let pos = IVec3::new(0, 6, 0);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Chest);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            None,
+            "placement consumed exactly the crafted chest"
+        );
+
+        // Store the stone stack through the real station command pair.
+        aim_table_interaction_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+        assert!(session.player.click_inventory_slot(1).is_ok());
+        assert!(session.click_open_chest_slot(0).is_ok());
+        assert_eq!(session.player.inventory().cursor(), None);
+        let stored = Item::new(ItemId::Block(BlockId::Stone), 12).expect("stone");
+        assert_eq!(
+            session
+                .chest_at(pos)
+                .and_then(|container| container.slot(0)),
+            Some(stored),
+            "the chest record holds the moved stack"
+        );
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let (chunk, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        assert_eq!(
+            loaded
+                .chunk_edits
+                .get(&chunk)
+                .and_then(|edits| edits.get(&(linear_index(lx, ly, lz) as u16))),
+            Some(&BlockId::Chest),
+            "the placed chest survives in the saved chunk edits"
+        );
+        assert_eq!(
+            loaded
+                .chests
+                .get(&pos)
+                .and_then(|container| container.slot(0)),
+            Some(stored),
+            "the saved chest record holds the stack"
+        );
+
+        // A restored WorldManager starts with no loaded chunks, so the test
+        // re-creates the all-air neighbourhood and the chest block itself as
+        // scaffolding before reopening the persisted record.
+        let mut restored = WorldSession::session_from_save(loaded, save_path.clone());
+        insert_test_chunk_with_face_neighbors(&mut restored, BlockId::Air);
+        assert!(restored.chests.contains_key(&pos));
+        assert!(!restored
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest)
+            .is_empty());
+        assert!(restored.open_chest_at(pos));
+
+        // Take the stack back into the inventory: this leaves a touched-empty
+        // record rather than deleting it.
+        assert!(restored.click_open_chest_slot(0).is_ok());
+        assert_eq!(restored.player.inventory().cursor(), Some(stored));
+        assert!(restored.player.click_inventory_slot(1).is_ok());
+        assert_eq!(restored.player.inventory().cursor(), None);
+        save_current_world(&mut restored).expect("second save succeeds");
+
+        let reloaded = load_world_from_path(&save_path).expect("second load succeeds");
+        assert_eq!(
+            reloaded.chests.get(&pos),
+            Some(&Container::empty()),
+            "a touched-empty chest keeps its record"
+        );
+        assert_eq!(
+            reloaded
+                .player
+                .inventory
+                .slots()
+                .iter()
+                .flatten()
+                .find(|item| item.id() == ItemId::Block(BlockId::Stone))
+                .map(Item::count),
+            Some(12),
+            "the taken stack is in the saved inventory"
+        );
+        assert_eq!(CHEST_SLOTS, 27, "the record has the full chest width");
     }
 }
