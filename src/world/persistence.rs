@@ -138,6 +138,13 @@ pub struct CliConfig {
     /// branch owns its effect (teleporting the player to the pinned route
     /// start); a loaded save is never teleported.
     pub demo_swim: bool,
+    /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
+    /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
+    /// and physics test keeps its flying default. A fresh-world parameter like
+    /// `time_scale`: it never affects `cli_has_world_intent`, and only the
+    /// fresh startup branch consumes it — a loaded save always restores the
+    /// persisted mode instead of a launch flag. Bare flags, last one wins.
+    pub mode: GameMode,
 }
 
 impl CliConfig {
@@ -153,6 +160,7 @@ impl CliConfig {
         let mut season_length = DEFAULT_SEASON_LENGTH_DAYS;
         let mut demo_days = DEFAULT_DEMO_DAYS;
         let mut demo_swim = false;
+        let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -212,6 +220,11 @@ impl CliConfig {
                     // a stray following token stays an independent argument.
                     demo_swim = true;
                 }
+                // Bare mode switches, last one wins (plain assignment order).
+                // They consume no value and are not world intents, so a
+                // launch with only a mode flag still opens the main menu.
+                "--creative" => mode = GameMode::Creative,
+                "--survival" => mode = GameMode::Survival,
                 "--new" | "--new-world" => {
                     force_new_world = true;
                 }
@@ -227,6 +240,7 @@ impl CliConfig {
             season_length,
             demo_days,
             demo_swim,
+            mode,
         }
     }
 }
@@ -2712,6 +2726,55 @@ mod tests {
         assert!(!loner.force_new_world);
         assert_eq!(loner.seed_override, None);
         assert_eq!(loner.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+    }
+
+    #[test]
+    fn test_cli_mode_defaults_creative_and_bare_flags_are_last_wins() {
+        // Absent flags keep the pre-M008 Creative default, so every existing
+        // CLI demo/smoke keeps its flying start.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.mode, GameMode::Creative);
+
+        // Each flag alone selects its mode.
+        assert_eq!(
+            CliConfig::parse_args(["--survival"]).mode,
+            GameMode::Survival
+        );
+        assert_eq!(
+            CliConfig::parse_args(["--creative"]).mode,
+            GameMode::Creative
+        );
+
+        // Both flags: the last one on the command line wins, in either order.
+        assert_eq!(
+            CliConfig::parse_args(["--survival", "--creative"]).mode,
+            GameMode::Creative
+        );
+        assert_eq!(
+            CliConfig::parse_args(["--creative", "--survival"]).mode,
+            GameMode::Survival
+        );
+        assert_eq!(
+            CliConfig::parse_args(["--survival", "--creative", "--survival"]).mode,
+            GameMode::Survival
+        );
+
+        // Mode flags are launch parameters, not world intent: alone they
+        // leave every world-selection field at its default (the main-menu
+        // entry decision is asserted in main.rs via cli_has_world_intent).
+        let survival = CliConfig::parse_args(["--survival"]);
+        assert!(!survival.force_new_world);
+        assert_eq!(survival.seed_override, None);
+        assert_eq!(
+            survival.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+        // A mode flag consumes no value: the following token still parses as
+        // its own flag.
+        let flags = CliConfig::parse_args(["--survival", "--new", "--seed", "7"]);
+        assert_eq!(flags.mode, GameMode::Survival);
+        assert!(flags.force_new_world);
+        assert_eq!(flags.seed_override, Some(7));
     }
 
     #[test]

@@ -846,8 +846,15 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // Fresh worlds start at the default season length; the New Game row and
     // the `--season-length` CLI seam override it on this branch only. A load
     // branch above never reaches here, so a persisted calendar always wins
-    // over a launch flag.
-    let mut session = WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length);
+    // over a launch flag. The mode follows the same rule: `--creative` /
+    // `--survival` pick the fresh world's persisted mode, while a loaded save
+    // restores its own stored mode and ignores the flag.
+    let mut session = WorldSession::new_session_with_mode(
+        seed,
+        cli.save_path.clone(),
+        cli.season_length,
+        cli.mode,
+    );
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
     // resumed save is never moved — its own position is the contract there.
@@ -2726,6 +2733,12 @@ impl GameApp {
                 self.background.clock,
             )
         };
+        // Edit Background always runs Creative movement rules over the live
+        // player, while `save_mode` keeps the world's stored mode intact. The
+        // call must happen after either branch (a loaded Survival world starts
+        // with Survival rules) and before settings application, so the editor
+        // is uniformly Creative without rewriting the file on save.
+        session.use_creative_rules();
         // Settings win over any stored render distance/FOV, exactly like every
         // other session installation (GameApp::new / start_world_session).
         session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
@@ -3010,10 +3023,15 @@ impl GameApp {
                 return;
             }
         };
-        // The New Game row owns the season length (S02-T04): the screen's
-        // cycler value, defaulting to one game day per season.
-        let session =
-            WorldSession::new_session(seed, save_path, self.new_game.season_length_days());
+        // The New Game row owns the season length (S02-T04) and the game mode
+        // (S08-T01 T05): the screen's cycler values, defaulting to one game
+        // day per season and Survival.
+        let session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            self.new_game.season_length_days(),
+            self.new_game.mode(),
+        );
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
         if let Ok(LifecycleDecision::StartNewGame) = self
@@ -3159,6 +3177,12 @@ impl GameApp {
                     // event), so the click sound below still plays.
                     NewGameTarget::SeasonLength => {
                         self.new_game.cycle_season_length();
+                    }
+                    // Game-mode cycler row: Survival ↔ Creative. Click-only
+                    // like the field rows (one writer per event), so the click
+                    // sound below still plays.
+                    NewGameTarget::GameMode => {
+                        self.new_game.cycle_mode();
                     }
                     NewGameTarget::Create => self.attempt_create(),
                     NewGameTarget::Back => {
@@ -3507,8 +3531,11 @@ impl ApplicationHandler for GameApp {
                             );
                         }
                         KeyCode::KeyF if pressed && !event.repeat => {
-                            self.session.player.fly_mode = !self.session.player.fly_mode;
-                            self.session.player.velocity = Vec3::ZERO;
+                            // Flight is a Creative capability: `toggle_fly` is a
+                            // no-op in Survival (and zeroes velocity when it
+                            // flips), so this one call keeps the F key honest
+                            // for both modes instead of flipping the raw flag.
+                            self.session.player.toggle_fly();
                         }
                         KeyCode::F5 if pressed && !event.repeat => {
                             if save_current_world(&mut self.session).is_ok() {
@@ -5096,6 +5123,14 @@ mod tests {
             "--time-scale",
             "60"
         ])));
+        // Mode flags are fresh-world parameters too, NOT a world intent: a
+        // bare `--creative` or `--survival` still opens the main menu.
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--creative"
+        ])));
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--survival"
+        ])));
         let scaled = GameApp::new(
             CliConfig::parse_args(["--time-scale", "60"]),
             WorldSession::new_session(9, PathBuf::from("unused.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
@@ -6269,6 +6304,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_session_applies_cli_mode_to_fresh_worlds_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh_path = dir.path().join("fresh-mode.mcvx");
+        let path_str = fresh_path.to_str().expect("utf8 path");
+
+        // Fresh + --survival: Survival rules, full vitals, walking.
+        let cli = CliConfig::parse_args(["--new", "--save", path_str, "--survival"]);
+        let session = startup_session(&cli);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert!(!session.player.can_fly());
+        assert_eq!(session.player.survival, SurvivalState::full());
+
+        // Fresh default and explicit --creative both keep the Creative /
+        // flying default every pre-M008 launch had.
+        for args in [
+            vec!["--new", "--save", path_str],
+            vec!["--new", "--save", path_str, "--creative"],
+        ] {
+            let session = startup_session(&CliConfig::parse_args(args.iter().copied()));
+            assert_eq!(session.save_mode, GameMode::Creative, "args: {args:?}");
+            assert_eq!(session.player.mode(), GameMode::Creative);
+            assert!(session.player.can_fly(), "args: {args:?}");
+        }
+
+        // Loaded saves ignore the flag: the persisted mode is authoritative,
+        // in both directions.
+        let mut survival = sample_save(11);
+        survival.mode = GameMode::Survival;
+        survival.player.fly_mode = false;
+        let survival_path = dir.path().join("persisted-survival.mcvx");
+        save_world_to_path(&survival_path, &survival).expect("write survival save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            survival_path.to_str().unwrap(),
+            "--creative",
+        ]));
+        assert_eq!(loaded.save_mode, GameMode::Survival);
+        assert_eq!(loaded.player.mode(), GameMode::Survival);
+        assert!(!loaded.player.can_fly());
+
+        let creative_path = dir.path().join("persisted-creative.mcvx");
+        save_world_to_path(&creative_path, &sample_save(12)).expect("write creative save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            creative_path.to_str().unwrap(),
+            "--survival",
+        ]));
+        assert_eq!(loaded.save_mode, GameMode::Creative);
+        assert_eq!(loaded.player.mode(), GameMode::Creative);
+        assert!(loaded.player.can_fly());
+    }
+
     /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,
     /// and the given screen entered through the real `enter_screen` path
     /// (LoadGame entry refreshes rows from the tempdir catalog).
@@ -6553,6 +6642,68 @@ mod tests {
         );
         assert_eq!(relaunched.background.clock.time_of_day, 9_000);
         assert_eq!(relaunched.background.clock.day_index, 2);
+    }
+
+    #[test]
+    fn edit_background_applies_creative_rules_without_rewriting_a_survival_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        // A Survival background whose raw fly byte is true: the codec must
+        // canonicalise it to false on write, so this fixture also proves the
+        // stored mode survives the edit round trip.
+        let mut data = sample_save(777);
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = true;
+        data.player.position = [10.0, 65.0, -4.0];
+        save_world_to_path(&background_path, &data).expect("write survival background");
+
+        let mut app = app_with_background(dir.path());
+        let playable_path = dir.path().join("playable.mcvx");
+        app.session.save_path = playable_path.clone();
+        assert!(app.background.persisted);
+
+        assert!(app.begin_background_edit());
+        assert_eq!(
+            app.session.player.mode(),
+            GameMode::Creative,
+            "the editor always runs Creative rules"
+        );
+        assert_eq!(
+            app.session.save_mode,
+            GameMode::Survival,
+            "the stored mode is not rewritten by the editor"
+        );
+        assert!(
+            !app.session.player.can_fly(),
+            "mode switch alone does not enable flight"
+        );
+
+        // Move and save through the real Save-and-Quit path.
+        app.session.player.position = Vec3::new(20.5, 66.0, -8.5);
+        app.session.sync_camera();
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+
+        let persisted = load_world_from_path(&background_path).expect("background decodes");
+        assert_eq!(
+            persisted.mode,
+            GameMode::Survival,
+            "editing the background must not rewrite its stored mode"
+        );
+        assert!(
+            !persisted.player.fly_mode,
+            "the writer canonicalises Survival fly=false"
+        );
+        assert_eq!(persisted.player.position, [20.5, 66.0, -8.5]);
+        assert!(
+            !playable_path.exists(),
+            "editing the background must not write a playable save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path],
+            "the edit round-trip writes only the background save"
+        );
     }
 
     #[test]
@@ -9212,6 +9363,47 @@ mod tests {
     }
 
     #[test]
+    fn new_game_create_defaults_to_survival_and_cycling_selects_creative() {
+        // Default form: Survival wins, with full vitals and no flight. This
+        // is the user-visible New Game default (the CLI default stays
+        // Creative, asserted separately).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Survival World".into()));
+        assert_eq!(app.new_game.mode(), GameMode::Survival);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_mode, GameMode::Survival);
+        assert_eq!(app.session.player.mode(), GameMode::Survival);
+        assert!(!app.session.player.can_fly(), "Survival cannot fly");
+        assert!(
+            !app.session.player.toggle_fly(),
+            "the F toggle is a no-op in Survival"
+        );
+        assert!(!app.session.player.can_fly());
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+        assert_eq!(
+            app.session.save_path,
+            dir.path().join("Survival World.mcvx")
+        );
+
+        // Cycling the mode row once before Create selects Creative, and the
+        // resulting session is the pre-M008 flying default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Creative World".into()));
+        assert_eq!(app.new_game.cycle_mode(), GameMode::Creative);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_mode, GameMode::Creative);
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
+        assert!(app.session.player.can_fly(), "Creative starts flying");
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+    }
+
+    #[test]
     fn new_game_season_length_row_feeds_the_session_it_creates() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
@@ -9823,17 +10015,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
 
-        // The create flow: name "alpha", seed text "42".
+        // The create flow: name "alpha", seed text "42". The integrated
+        // loop asserts flight persistence below, so select Creative on the
+        // mode row before Create — the default is Survival, whose save
+        // writer canonicalises fly=false.
         app.new_game
             .apply(TextInputAction::InsertText("alpha".into()));
         app.new_game.cycle_focus();
         app.new_game.apply(TextInputAction::InsertText("42".into()));
+        assert_eq!(app.new_game.cycle_mode(), GameMode::Creative);
         app.attempt_create();
 
         let expected_seed = resolve_seed_or("42", 0);
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.world.seed(), expected_seed);
         assert_eq!(app.session.save_path, dir.path().join("alpha.mcvx"));
+        assert_eq!(app.session.save_mode, GameMode::Creative);
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
 
         // Edit the world: load the spawn chunk and place a block (marking
         // unsaved changes), and move the player / pick a hotbar slot so
@@ -9872,6 +10070,11 @@ mod tests {
         let save_path = dir.path().join("alpha.mcvx");
         let data = load_world_from_path(&save_path).expect("alpha.mcvx written and loadable");
         assert_eq!(data.seed, expected_seed);
+        assert_eq!(
+            data.mode,
+            GameMode::Creative,
+            "the selected mode is what the save carries"
+        );
         assert_eq!(data.player.position, [12.5, 70.0, -3.5]);
         assert_eq!(data.player.yaw, 1.25);
         assert_eq!(data.player.pitch, -0.5);
@@ -9892,6 +10095,12 @@ mod tests {
 
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.world.seed(), expected_seed, "seed round-trips");
+        assert_eq!(
+            app.session.save_mode,
+            GameMode::Creative,
+            "mode round-trips"
+        );
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
         assert_eq!(
             app.session.save_path, save_path,
             "session owns the row's own file path"
@@ -10846,14 +11055,14 @@ mod tests {
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
-            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
+            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
-            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
+            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);

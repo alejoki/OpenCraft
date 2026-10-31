@@ -24,6 +24,7 @@ use super::lifecycle::LifecycleScreen;
 use super::menu::{hit_test, MenuMessage, Rect, MENU_PAD, MENU_TOP, MESSAGE_TICKS};
 use super::text_input::{TextInput, TextInputAction, TextInputOutcome};
 use super::LINE_HEIGHT;
+use crate::player::survival::GameMode;
 use crate::world::catalog::{
     is_duplicate_name, validate_world_name, CatalogRow, ConfirmOutcome, DeleteConfirmation,
     PendingDelete, RowStatus, WorldNameError, MAX_WORLD_NAME_LEN,
@@ -208,24 +209,26 @@ pub const NEW_GAME_SEASON_LENGTHS: [u32; 4] =
     [crate::world::season::DEFAULT_SEASON_LENGTH_DAYS, 2, 4, 8];
 
 /// One clickable/hoverable target on the new-game screen, in display
-/// order: two text fields, then four action rows (the season-length row
-/// is a cycler, like the settings-screen choice rows).
+/// order: two text fields, then five action rows (the season-length and
+/// game-mode rows are cyclers, like the settings-screen choice rows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewGameTarget {
     NameField,
     SeedField,
     Randomize,
     SeasonLength,
+    GameMode,
     Create,
     Back,
 }
 
 /// All new-game rows, top-to-bottom in display order.
-pub const NEW_GAME_ROWS: [NewGameTarget; 6] = [
+pub const NEW_GAME_ROWS: [NewGameTarget; 7] = [
     NewGameTarget::NameField,
     NewGameTarget::SeedField,
     NewGameTarget::Randomize,
     NewGameTarget::SeasonLength,
+    NewGameTarget::GameMode,
     NewGameTarget::Create,
     NewGameTarget::Back,
 ];
@@ -242,6 +245,7 @@ impl NewGameTarget {
             NewGameTarget::SeedField => "Seed (blank = random)",
             NewGameTarget::Randomize => "Randomize Seed",
             NewGameTarget::SeasonLength => "Season Length",
+            NewGameTarget::GameMode => "Game Mode",
             NewGameTarget::Create => "Create World",
             NewGameTarget::Back => "Back",
         }
@@ -471,6 +475,10 @@ pub struct NewGameScreen {
     /// cycler state. Always in range: only [`Self::cycle_season_length`]
     /// writes it, and it wraps modulo the list length.
     season_length_index: usize,
+    /// The game-mode row's cycler state. Defaults to [`GameMode::Survival`]:
+    /// the New Game screen is a survival-first selection, unlike the pre-M008
+    /// CLI default which stays Creative. Only [`Self::cycle_mode`] writes it.
+    mode: GameMode,
     message: Option<MenuMessage>,
 }
 
@@ -488,6 +496,7 @@ impl NewGameScreen {
             seed: TextInput::new(SEED_MAX_CHARS),
             focus: FocusField::Name,
             season_length_index: 0,
+            mode: GameMode::Survival,
             message: None,
         }
     }
@@ -544,6 +553,21 @@ impl NewGameScreen {
     pub fn cycle_season_length(&mut self) -> u32 {
         self.season_length_index = (self.season_length_index + 1) % NEW_GAME_SEASON_LENGTHS.len();
         self.season_length_days()
+    }
+
+    /// The selected game mode for the world Create will build. Default is
+    /// [`GameMode::Survival`]; the value feeds
+    /// `session::new_session_with_mode` at Create time.
+    pub fn mode(&self) -> GameMode {
+        self.mode
+    }
+
+    /// Advance the game-mode row to the other mode (Survival → Creative →
+    /// Survival). Like the season-length cycler this is click-only, so the
+    /// text-focus cycle and `screen_key_action` are untouched.
+    pub fn cycle_mode(&mut self) -> GameMode {
+        self.mode = self.mode.next();
+        self.mode
     }
 
     /// The currently focused field, by reference.
@@ -637,6 +661,8 @@ fn insert_caret(value: &str, cursor: usize) -> String {
 /// The season-length row never takes text focus (Tab only toggles
 /// [`FocusField`]), so it renders as a plain `Season Length: N day(s)`
 /// value line and the pluralization is honest: "1 day" but "4 days".
+/// The game-mode row follows it as `Game Mode: Survival|Creative`; it is
+/// likewise click-only.
 pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
     let name = screen.name().value();
     let seed = screen.seed().value();
@@ -660,6 +686,7 @@ pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
         seed_line,
         NewGameTarget::Randomize.label().to_string(),
         season_length_line(screen.season_length_days()),
+        game_mode_line(screen.mode()),
         NewGameTarget::Create.label().to_string(),
         NewGameTarget::Back.label().to_string(),
     ]
@@ -672,6 +699,11 @@ fn season_length_line(days: u32) -> String {
     } else {
         format!("Season Length: {days} days")
     }
+}
+
+/// The game-mode row's display text, e.g. "Game Mode: Survival".
+fn game_mode_line(mode: GameMode) -> String {
+    format!("{}: {}", NewGameTarget::GameMode.label(), mode.label())
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,8 +1225,9 @@ mod tests {
         );
         assert_eq!(hovered_pause_row((x, 0.0), SW, SH), None, "above the panel");
 
-        // new-game targets: name field (0) and create (4; SeasonLength
-        // was inserted at 3, shifting the action rows down)
+        // new-game targets: name field (0), the game-mode cycler (4), and
+        // create (5; SeasonLength sits at 3 and GameMode was inserted at 4,
+        // shifting Create/Back down one more)
         let (x, y0, w, h) = new_game_row_rect(SW, SH, 0).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w / 2.0, y0 + h / 2.0), SW, SH),
@@ -1208,6 +1241,11 @@ mod tests {
         let (_, y4, w4, h4) = new_game_row_rect(SW, SH, 4).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w4 / 2.0, y4 + h4 / 2.0), SW, SH),
+            Some(NewGameTarget::GameMode)
+        );
+        let (_, y5, w5, h5) = new_game_row_rect(SW, SH, 5).unwrap();
+        assert_eq!(
+            hovered_new_game_target((x + w5 / 2.0, y5 + h5 / 2.0), SW, SH),
             Some(NewGameTarget::Create)
         );
         assert_eq!(hovered_new_game_target((0.0, 0.0), SW, SH), None);
@@ -1624,6 +1662,7 @@ mod tests {
                 "  Seed: (random)".to_string(),
                 "Randomize Seed".to_string(),
                 "Season Length: 1 day".to_string(),
+                "Game Mode: Survival".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1641,6 +1680,7 @@ mod tests {
                 "> Seed:   |".to_string(),
                 "Randomize Seed".to_string(),
                 "Season Length: 1 day".to_string(),
+                "Game Mode: Survival".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1651,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn new_game_rows_include_the_season_length_cycler_between_randomize_and_create() {
+    fn new_game_rows_include_the_season_length_and_game_mode_cyclers_before_create() {
         assert_eq!(
             NEW_GAME_ROWS,
             [
@@ -1659,15 +1699,47 @@ mod tests {
                 NewGameTarget::SeedField,
                 NewGameTarget::Randomize,
                 NewGameTarget::SeasonLength,
+                NewGameTarget::GameMode,
                 NewGameTarget::Create,
                 NewGameTarget::Back,
             ]
         );
-        assert_eq!(NEW_GAME_ROW_COUNT, 6);
+        assert_eq!(NEW_GAME_ROW_COUNT, 7);
         assert_eq!(NewGameTarget::SeasonLength.label(), "Season Length");
-        // Create/Back shifted down by one: the enum order is the click map.
-        assert_eq!(NEW_GAME_ROWS[4], NewGameTarget::Create);
-        assert_eq!(NEW_GAME_ROWS[5], NewGameTarget::Back);
+        assert_eq!(NewGameTarget::GameMode.label(), "Game Mode");
+        // SeasonLength stays pinned at 3; GameMode is inserted at 4 and
+        // Create/Back shift down by one: enum order is the click map.
+        assert_eq!(NEW_GAME_ROWS[3], NewGameTarget::SeasonLength);
+        assert_eq!(NEW_GAME_ROWS[4], NewGameTarget::GameMode);
+        assert_eq!(NEW_GAME_ROWS[5], NewGameTarget::Create);
+        assert_eq!(NEW_GAME_ROWS[6], NewGameTarget::Back);
+    }
+
+    #[test]
+    fn game_mode_defaults_to_survival_and_cycles_to_creative_and_back() {
+        let mut screen = NewGameScreen::new();
+        assert_eq!(screen.mode(), GameMode::Survival, "survival-first default");
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Survival");
+
+        assert_eq!(screen.cycle_mode(), GameMode::Creative);
+        assert_eq!(screen.mode(), GameMode::Creative);
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Creative");
+
+        assert_eq!(screen.cycle_mode(), GameMode::Survival);
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Survival");
+
+        // The mode row is click-only: Tab keeps toggling exactly the two
+        // text fields, and cycling the mode leaves both values and the
+        // focused field untouched (one writer per event).
+        screen.apply(TextInputAction::InsertText("Deep Dark".into()));
+        screen.cycle_mode();
+        assert_eq!(screen.focus(), FocusField::Name);
+        assert_eq!(screen.name().value(), "Deep Dark");
+        assert_eq!(screen.season_length_days(), 1);
+        assert_eq!(
+            screen_key_action(LifecycleScreen::NewGame, KeyCode::Tab, false),
+            ScreenKeyAction::CycleField
+        );
     }
 
     #[test]
