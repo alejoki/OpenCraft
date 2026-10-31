@@ -198,7 +198,9 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         time_of_day: session.clock.time_of_day,
         day_index: session.clock.day_index,
         season_length_days: session.season_length_days,
-        mode: session.player.mode(),
+        // The stored mode, not the effective one: Edit Background may be
+        // running Creative rules over a Survival world without rewriting it.
+        mode: session.save_mode,
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -211,7 +213,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             table_grid: session.player.table_grid().clone(),
             survival: session.player.survival,
         },
-        chests: Default::default(),
+        chests: session.chests.clone(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -7600,6 +7602,53 @@ mod tests {
                 session.player.hotbar_stack(slot)
             );
         }
+    }
+
+    #[test]
+    fn survival_mode_vitals_and_chests_survive_save_and_restart() {
+        use opencraft::player::inventory::{ChestSlots, Item, ItemId, Material, CHEST_SLOTS};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            5150,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let vitals = SurvivalState::new(4, 11, 120).expect("in-range vitals");
+        session.player.survival = vitals;
+        let mut chest: ChestSlots = [None; CHEST_SLOTS];
+        chest[0] = Some(Item::new(ItemId::Material(Material::Apple), 3).expect("apple"));
+        chest[26] = Some(Item::new(ItemId::Material(Material::Bread), 1).expect("bread"));
+        session.chests.insert(IVec3::new(2, 30, -5), chest);
+
+        // A stale fly byte must not leak through the save writer: the persisted
+        // mode canonicalises it to false even though the field itself is true.
+        session.player.fly_mode = true;
+        assert!(
+            !session.player.can_fly(),
+            "Survival cannot fly even with a hand-set fly flag"
+        );
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.mode, GameMode::Survival);
+        assert_eq!(loaded.player.survival, vitals);
+        assert!(
+            !loaded.player.fly_mode,
+            "the writer canonicalises Survival fly=false"
+        );
+        assert_eq!(loaded.chests.len(), 1);
+        assert_eq!(loaded.chests[&IVec3::new(2, 30, -5)], chest);
+
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(restored.save_mode, GameMode::Survival);
+        assert_eq!(restored.player.mode(), GameMode::Survival);
+        assert_eq!(restored.player.survival, vitals);
+        assert_eq!(restored.chests[&IVec3::new(2, 30, -5)], chest);
+        assert!(!restored.player.fly_mode);
+        assert!(!restored.player.can_fly());
     }
 
     #[test]

@@ -14,9 +14,10 @@ use glam::{IVec3, Vec3};
 use crate::player::camera::Camera;
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
+use crate::player::survival::GameMode;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
-use crate::world::persistence::{ChunkEditMap, WorldSaveData};
+use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -39,6 +40,13 @@ pub struct WorldSession {
     /// start at [`DEFAULT_SEASON_LENGTH_DAYS`]; the New Game row and the
     /// `--season-length` seam override it.
     pub season_length_days: u32,
+    /// The mode a save writes. Deliberately separate from `player.mode()`:
+    /// Edit Background applies Creative rules to the live player while the
+    /// world's stored mode must survive the next save unchanged.
+    pub save_mode: GameMode,
+    /// Persisted chest contents keyed by absolute block position. Cloned only
+    /// at save time; the frame loop never iterates it.
+    pub chests: ChestMap,
     pub save_path: PathBuf,
     /// Ephemeral crafting-station state: the position of the table whose
     /// interface is open, if any. Deliberately not persisted (`SAVE_VERSION`
@@ -54,18 +62,35 @@ impl WorldSession {
     /// blocks above the deterministic land-search column (D071: the old fixed
     /// (0, 0) column can be open ocean after the biome rewrite).
     pub fn new_session(seed: u32, save_path: PathBuf, season_length_days: u32) -> WorldSession {
+        // Every pre-M008 CLI demo and test keeps the Creative/flying default.
+        Self::new_session_with_mode(seed, save_path, season_length_days, GameMode::Creative)
+    }
+
+    /// A fresh world whose persisted and effective mode is `mode`.
+    ///
+    /// Survival spawns a walking player with full vitals; Creative inherits
+    /// [`Player::new`]'s flying default. Every other field mirrors
+    /// [`WorldSession::new_session`], so the New Game mode row (T05) can pick a
+    /// mode without a second spawn/seed path.
+    pub fn new_session_with_mode(
+        seed: u32,
+        save_path: PathBuf,
+        season_length_days: u32,
+        mode: GameMode,
+    ) -> WorldSession {
         let (spawn_x, spawn_z) = find_spawn_column(seed);
         let spawn_y = (terrain_height_at_seeded(spawn_x, spawn_z, seed) + 4) as f32;
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
-            player: Player::new(Vec3::new(
-                spawn_x as f32 + 0.5,
-                spawn_y,
-                spawn_z as f32 + 0.5,
-            )),
+            player: Player::new_with_mode(
+                Vec3::new(spawn_x as f32 + 0.5, spawn_y, spawn_z as f32 + 0.5),
+                mode,
+            ),
             camera: Camera::new(Vec3::ZERO),
             clock: GameClock::new(),
             season_length_days,
+            save_mode: mode,
+            chests: ChestMap::default(),
             save_path,
             open_table: None,
         };
@@ -93,6 +118,10 @@ impl WorldSession {
             camera: Camera::new(Vec3::ZERO),
             clock,
             season_length_days,
+            // Edit Background is a Creative-rules editor; a stored world mode
+            // only enters through `session_from_save`.
+            save_mode: GameMode::Creative,
+            chests: ChestMap::default(),
             save_path,
             open_table: None,
         };
@@ -100,46 +129,73 @@ impl WorldSession {
         session
     }
 
-    /// Reconstruct a session from persisted save data, exactly mirroring
-    /// main()'s load branch: player position/yaw/pitch/fly_mode copied, the
+    /// Reconstruct a session from persisted save data: player
+    /// position/yaw/pitch copied, the legacy fly byte normalized through the
+    /// stored mode, the checked vitals and chest records restored, the
     /// validated inventory aggregate and both crafting grids restored,
     /// `selected_slot` clamped to the 9-slot hotbar, the clock restored to
     /// the saved day index and time of day, the saved season length carried
-    /// through, and the world rebuilt with the saved render distance, seed,
-    /// and chunk edits.
+    /// through, the stored mode kept separately in `save_mode`, and the world
+    /// rebuilt with the saved render distance, seed, and chunk edits.
     ///
     /// `Player::with_inventory` and `restore_selected_slot` are the only
     /// restore entry points, so a save can never publish an out-of-range
-    /// selection or a grid stored under the wrong kind.
+    /// selection or a grid stored under the wrong kind. `set_mode` runs after
+    /// the raw fly assignment, so a Survival record cannot restore flight.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
+        let WorldSaveData {
+            seed,
+            time_of_day,
+            day_index,
+            season_length_days,
+            mode,
+            player: saved,
+            chests,
+            chunk_edits,
+        } = data;
+
         // Both calendar fields are persisted world state: the clock resumes
         // at the exact day/time and the season length survives the reload.
-        let clock = GameClock::from_day_and_time(data.day_index, data.time_of_day);
+        let clock = GameClock::from_day_and_time(day_index, time_of_day);
         let mut player = Player::with_inventory(
-            Vec3::from_array(data.player.position),
-            data.player.inventory,
-            data.player.player_grid,
-            data.player.table_grid,
+            Vec3::from_array(saved.position),
+            saved.inventory,
+            saved.player_grid,
+            saved.table_grid,
         );
-        player.yaw = data.player.yaw;
-        player.pitch = data.player.pitch;
-        player.fly_mode = data.player.fly_mode;
-        player.restore_selected_slot(data.player.selected_slot as usize);
+        player.yaw = saved.yaw;
+        player.pitch = saved.pitch;
+        // Normalise the legacy fly byte through the stored mode before
+        // `set_mode`, so a Survival save whose raw byte says flying still
+        // restores a walking player. `set_mode` then enforces the rule again.
+        player.fly_mode = saved.fly_mode && mode.allows_fly();
+        player.set_mode(mode);
+        player.survival = saved.survival;
+        player.restore_selected_slot(saved.selected_slot as usize);
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
-                data.player.render_distance as i32,
-                data.seed,
-                data.chunk_edits,
+                saved.render_distance as i32,
+                seed,
+                chunk_edits,
             ),
             player,
             camera: Camera::new(Vec3::ZERO),
             clock,
-            season_length_days: data.season_length_days,
+            season_length_days,
+            save_mode: mode,
+            chests,
             save_path,
             open_table: None,
         };
         session.sync_camera();
         session
+    }
+
+    /// Applies Creative movement rules to the live player without changing the
+    /// mode a save writes. Edit Background uses this so editing a Survival
+    /// world cannot silently rewrite that world to Creative on the next save.
+    pub fn use_creative_rules(&mut self) {
+        self.player.set_mode(GameMode::Creative);
     }
 
     /// The live season of this session, derived from its persisted calendar.
@@ -266,6 +322,7 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::inventory::{ChestSlots, Item, ItemId, Material, CHEST_SLOTS};
     use crate::player::survival::{GameMode, SurvivalState};
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
@@ -295,6 +352,74 @@ mod tests {
             chests: crate::world::persistence::ChestMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
+    }
+
+    fn chest_with_items() -> ChestSlots {
+        let mut chest: ChestSlots = [None; CHEST_SLOTS];
+        chest[0] =
+            Some(Item::new(ItemId::Block(crate::world::block::BlockId::Stone), 7).expect("stone"));
+        chest[13] = Some(Item::new(ItemId::Material(Material::Apple), 1).expect("apple"));
+        chest[26] = Some(Item::new(ItemId::Material(Material::Bread), 2).expect("bread"));
+        chest
+    }
+
+    #[test]
+    fn new_session_defaults_to_creative_with_no_chests() {
+        let session = WorldSession::new_session(
+            17u32,
+            PathBuf::from("/tmp/fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(session.save_mode, GameMode::Creative);
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert!(session.player.can_fly());
+        assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn new_session_with_mode_survival_walks_with_full_vitals() {
+        let session = WorldSession::new_session_with_mode(
+            18u32,
+            PathBuf::from("/tmp/survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(session.player.survival, SurvivalState::full());
+        assert!(!session.player.fly_mode);
+        assert!(!session.player.can_fly());
+        assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn new_session_with_mode_creative_flies_with_full_vitals() {
+        let session = WorldSession::new_session_with_mode(
+            19u32,
+            PathBuf::from("/tmp/creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        assert_eq!(session.save_mode, GameMode::Creative);
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert_eq!(session.player.survival, SurvivalState::full());
+        assert!(session.player.fly_mode);
+        assert!(session.player.can_fly());
+        assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn new_at_defaults_to_creative_with_no_chests() {
+        let session = WorldSession::new_at(
+            20u32,
+            PathBuf::from("/tmp/background.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.5, 20.0, 2.5),
+            GameClock::new(),
+        );
+        assert_eq!(session.save_mode, GameMode::Creative);
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert!(session.chests.is_empty());
     }
 
     #[test]
@@ -403,6 +528,105 @@ mod tests {
         assert_eq!(session.player.pitch, -0.15);
         assert!(!session.player.fly_mode);
         assert_eq!(session.player.selected_slot(), 3);
+    }
+
+    #[test]
+    fn session_from_save_restores_survival_vitals_and_chests_without_flight() {
+        let chest = chest_with_items();
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(4, -2, 7), chest);
+        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+
+        let mut data = make_save(88u32);
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = true; // stale/hostile byte: Survival must walk
+        data.player.survival = SurvivalState::new(7, 3, 12).expect("in-range vitals");
+        data.chests = chests.clone();
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/survival.mcvx"));
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(
+            session.player.survival,
+            SurvivalState::new(7, 3, 12).expect("in-range vitals")
+        );
+        assert_eq!(session.chests, chests);
+        assert_eq!(session.chests[&IVec3::new(4, -2, 7)], chest);
+        assert_eq!(session.chests[&IVec3::new(-1, 0, 3)], [None; CHEST_SLOTS]);
+        assert!(
+            !session.player.fly_mode,
+            "a Survival save cannot restore a flying player"
+        );
+        assert!(!session.player.can_fly());
+    }
+
+    #[test]
+    fn session_from_save_creative_preserves_a_saved_fly_flag() {
+        let mut data = make_save(89u32);
+        data.mode = GameMode::Creative;
+        data.player.fly_mode = true;
+
+        let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/creative.mcvx"));
+        assert_eq!(session.save_mode, GameMode::Creative);
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert!(session.player.fly_mode);
+        assert!(session.player.can_fly());
+    }
+
+    #[test]
+    fn use_creative_rules_keeps_the_stored_save_mode() {
+        let mut session = WorldSession::new_session_with_mode(
+            90u32,
+            PathBuf::from("/tmp/edit.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        assert_eq!(session.save_mode, GameMode::Survival);
+
+        session.use_creative_rules();
+
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert_eq!(
+            session.save_mode,
+            GameMode::Survival,
+            "Edit Background must not rewrite the stored world mode"
+        );
+        assert!(
+            !session.player.fly_mode,
+            "Creative rules do not re-enable a toggle Survival turned off"
+        );
+    }
+
+    #[test]
+    fn v6_bytes_roundtrip_preserves_mode_vitals_and_chests() {
+        use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
+
+        let chest = chest_with_items();
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(3, 40, -2), chest);
+        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+
+        let vitals = SurvivalState::new(7, 3, 12).expect("in-range vitals");
+        let mut data = make_save(60606u32);
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = true; // the codec must canonicalise this away
+        data.player.survival = vitals;
+        data.chests = chests.clone();
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v6 encodes");
+        let loaded = load_world_from_bytes(&bytes).expect("v6 decodes");
+        assert_eq!(loaded.mode, GameMode::Survival);
+        assert_eq!(loaded.player.survival, vitals);
+        assert_eq!(loaded.chests, chests);
+
+        let session = WorldSession::session_from_save(loaded, PathBuf::from("/tmp/roundtrip.mcvx"));
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(session.player.survival, vitals);
+        assert_eq!(session.chests, chests);
+        assert!(!session.player.fly_mode);
+        assert!(!session.player.can_fly());
     }
 
     #[test]

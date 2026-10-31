@@ -2082,9 +2082,7 @@ mod tests {
         assert!(!player.on_ground);
         // No gravity while flying: idle input leaves the position unchanged.
         let hover_y = player.position.y;
-        player.update(1.0 / 60.0, &InputState::default(), |_, _, _| {
-            BlockId::Air
-        });
+        player.update(1.0 / 60.0, &InputState::default(), |_, _, _| BlockId::Air);
         assert!((player.position.y - hover_y).abs() < 1e-6);
     }
 }

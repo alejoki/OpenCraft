@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(full.hunger(), MAX_HUNGER);
         assert_eq!(full.air(), FULL_AIR);
         // FULL_AIR is a gameplay value, not the wire ceiling.
-        assert!(FULL_AIR < MAX_AIR);
+        const { assert!(FULL_AIR < MAX_AIR) };
     }
 
     #[test]
