@@ -8,6 +8,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Efficient Chunk Rendering**: Implements Greedy Meshing to optimize the rendering of voxel chunks, significantly reducing the number of vertices sent to the GPU.
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
+*   **Survival and Creative Modes**: New worlds default to Survival, where you walk and cannot fly. Creative keeps the existing flying and building behavior. Choose the mode when you create a world; the Survival damage and hunger loop lands later in the same milestone.
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
     *   Fly mode for free movement and exploration.
@@ -62,6 +63,7 @@ You can also launch directly into a world using command-line flags, bypassing th
 *   `--new`: Force the creation of a new world, even if a save file exists at the specified path.
 *   `--seed <NUMBER>`: Specify a seed for world generation.
 *   `--save <PATH>`: Set the path for the save file (e.g., `my_world.mcvx`).
+*   `--creative` / `--survival`: Select the game mode for a fresh world only. The last flag wins; a loaded world keeps its stored mode.
 
 For example, to start a new world with seed 4242:
 
@@ -75,7 +77,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | Key | Action |
 | --- | --- |
 | **Escape** | Open/Close Pause Menu (in-game) or back out of other menus. |
-| **F** | Toggle Fly/Walk mode. |
+| **F** | Toggle Fly/Walk (Creative only). |
 | **F5** | Quick save the current world. |
 
 ### Movement
