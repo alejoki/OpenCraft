@@ -4,6 +4,7 @@
 //! append the returned [`Quad`]s to the existing UI quad list.
 
 use crate::player::inventory::{Inventory, Item, ItemStack, HOTBAR_SLOTS};
+use crate::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HEALTH, MAX_HUNGER};
 use crate::render::pipeline::hotbar_slot_rect_ndc;
 use crate::ui::quad::Quad;
 
@@ -18,6 +19,27 @@ pub const CROSSHAIR_BAR_OFFSET_Y: f32 = 24.0;
 pub const HOTBAR_COUNT_FONT_SIZE: f32 = 14.0;
 /// Line height for per-slot hotbar count labels, in physical pixels.
 pub const HOTBAR_COUNT_LINE_HEIGHT: f32 = 16.0;
+
+/// Pixel size of one vitals icon (heart, hunger pip, or air bubble).
+pub const VITALS_ICON_SIZE: f32 = 16.0;
+/// Horizontal gap between adjacent icons in one vitals row, in pixels.
+pub const VITALS_ICON_GAP: f32 = 2.0;
+/// Vertical gap between the vitals rows, in pixels.
+pub const VITALS_ROW_GAP: f32 = 4.0;
+/// Dark background behind every vitals icon, so empty ones stay legible.
+pub const VITALS_BACKGROUND_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
+/// Fill color of a heart icon.
+pub const HEART_FILL_COLOR: [f32; 4] = [0.85, 0.15, 0.15, 0.95];
+/// Fill color of a hunger pip.
+pub const HUNGER_FILL_COLOR: [f32; 4] = [0.95, 0.65, 0.15, 0.95];
+/// Fill color of an air bubble.
+pub const AIR_FILL_COLOR: [f32; 4] = [0.25, 0.6, 0.95, 0.9];
+
+/// Icons per vitals row: ten two-point hearts / hunger pips.
+const VITALS_ICON_COUNT: usize = (MAX_HEALTH / 2) as usize;
+/// Full width of one ten-icon vitals row, including its interior gaps.
+const VITALS_ROW_WIDTH: f32 =
+    VITALS_ICON_COUNT as f32 * VITALS_ICON_SIZE + (VITALS_ICON_COUNT - 1) as f32 * VITALS_ICON_GAP;
 
 /// Hotbar slot rects in physical pixels `(x, y, w, h)` (top-left origin).
 ///
@@ -111,6 +133,149 @@ pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [
     };
 
     [background, fill]
+}
+
+/// Fill fraction of one heart icon: ten hearts of two health points each.
+///
+/// An odd health value shows a half heart (`0.5`); indices past the tenth
+/// heart (and any index the row cannot draw) return `0.0`. The fill never
+/// exceeds `1.0` even when a caller passes health above the gameplay maximum.
+pub fn heart_fill(health: u16, index: usize) -> f32 {
+    icon_fill(health, index, MAX_HEALTH)
+}
+
+/// Fill fraction of one hunger pip: ten pips of two hunger points each.
+///
+/// Shares the heart rule — an odd value shows a half pip and out-of-range
+/// indices return `0.0` — so both rows stay visually symmetric.
+pub fn hunger_fill(hunger: u16, index: usize) -> f32 {
+    icon_fill(hunger, index, MAX_HUNGER)
+}
+
+/// Shared two-points-per-icon fill rule for hearts and hunger pips.
+fn icon_fill(points: u16, index: usize, max_points: u16) -> f32 {
+    let icons = usize::from(max_points / 2);
+    if index >= icons {
+        return 0.0;
+    }
+    let consumed = (index as u16).saturating_mul(2);
+    let remaining = points.saturating_sub(consumed).min(2);
+    f32::from(remaining) / 2.0
+}
+
+/// Number of air bubbles to draw for `air` points: ten bubbles scale linearly
+/// with the [`FULL_AIR`] lung, rounding up so any remaining breath is visible.
+///
+/// Integer arithmetic keeps exact boundaries exact (`30` points is exactly one
+/// bubble) and the result is clamped to ten; a save above `FULL_AIR` never
+/// draws more than a full row.
+pub fn air_bubbles(air: u16) -> u8 {
+    const BUBBLE_COUNT: u32 = 10;
+    let scaled = u32::from(air) * BUBBLE_COUNT;
+    let bubbles = scaled.div_ceil(u32::from(FULL_AIR));
+    bubbles.min(BUBBLE_COUNT) as u8
+}
+
+/// Pixel-space vitals HUD quads for one frame.
+///
+/// Creative is structurally exempt: it draws nothing even when vitals are low
+/// or the head is submerged. Survival draws ten hearts anchored to the first
+/// hotbar slot's left edge and ten hunger pips anchored to the last hotbar
+/// slot's right edge, both one row above the hotbar. When the head is
+/// submerged or the lungs are not full, ten air bubbles appear one row above
+/// the hunger row, right-aligned to the same hotbar edge.
+///
+/// Every icon gets a dark background quad so an empty row is still legible;
+/// a filled icon adds a colored quad scaled by its fill fraction (a half heart
+/// is half-width). A zero fill emits no fill quad because it would draw
+/// nothing.
+///
+/// All geometry derives from [`hotbar_slot_rects`], whose `max(1)` convention
+/// keeps every coordinate finite on a zero-sized surface.
+pub fn vitals_quads(
+    vitals: &SurvivalState,
+    mode: GameMode,
+    head_submerged: bool,
+    surface_w: u32,
+    surface_h: u32,
+) -> Vec<Quad> {
+    if mode != GameMode::Survival {
+        return Vec::new();
+    }
+
+    let rects = hotbar_slot_rects(surface_w, surface_h);
+    let (first_x, hotbar_top, _, _) = rects[0];
+    let (last_x, _, last_w, _) = rects[HOTBAR_SLOTS - 1];
+    let right_edge = last_x + last_w;
+
+    // Hunger and air are right-aligned to the hotbar's right edge; hearts are
+    // left-aligned to its left edge. Both rows share the same ten-icon width,
+    // and the row gap lifts them clear of the hotbar and each other.
+    let heart_y = hotbar_top - VITALS_ROW_GAP - VITALS_ICON_SIZE;
+    let air_y = heart_y - VITALS_ROW_GAP - VITALS_ICON_SIZE;
+    let hunger_x = right_edge - VITALS_ROW_WIDTH;
+    let step = VITALS_ICON_SIZE + VITALS_ICON_GAP;
+
+    let mut quads = Vec::with_capacity(VITALS_ICON_COUNT * 6);
+    for index in 0..VITALS_ICON_COUNT {
+        push_vitals_icon(
+            &mut quads,
+            first_x + index as f32 * step,
+            heart_y,
+            heart_fill(vitals.health(), index),
+            HEART_FILL_COLOR,
+        );
+    }
+    for index in 0..VITALS_ICON_COUNT {
+        push_vitals_icon(
+            &mut quads,
+            hunger_x + index as f32 * step,
+            heart_y,
+            hunger_fill(vitals.hunger(), index),
+            HUNGER_FILL_COLOR,
+        );
+    }
+    if head_submerged || vitals.air() < FULL_AIR {
+        let bubbles = usize::from(air_bubbles(vitals.air()));
+        for index in 0..VITALS_ICON_COUNT {
+            let fill = if index < bubbles { 1.0 } else { 0.0 };
+            push_vitals_icon(
+                &mut quads,
+                hunger_x + index as f32 * step,
+                air_y,
+                fill,
+                AIR_FILL_COLOR,
+            );
+        }
+    }
+
+    quads
+}
+
+/// One vitals icon: an always-present dark background plus an optional colored
+/// fill scaled horizontally by `fill` (odd hearts/hunger show half an icon).
+fn push_vitals_icon(quads: &mut Vec<Quad>, x: f32, y: f32, fill: f32, fill_color: [f32; 4]) {
+    quads.push(Quad {
+        x,
+        y,
+        w: VITALS_ICON_SIZE,
+        h: VITALS_ICON_SIZE,
+        color: VITALS_BACKGROUND_COLOR,
+    });
+    let fill = if fill.is_finite() {
+        fill.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if fill > 0.0 {
+        quads.push(Quad {
+            x,
+            y,
+            w: VITALS_ICON_SIZE * fill,
+            h: VITALS_ICON_SIZE,
+            color: fill_color,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +464,217 @@ mod tests {
             ty >= rect.1 && ty < rect.1 + rect.3,
             "origin above the slot bottom and below its top"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Vitals HUD (S04-T06)
+    // -----------------------------------------------------------------------
+
+    fn count_color(quads: &[Quad], color: [f32; 4]) -> usize {
+        quads.iter().filter(|quad| quad.color == color).count()
+    }
+
+    #[test]
+    fn heart_fill_splits_two_points_per_icon() {
+        for index in 0..10 {
+            assert_eq!(heart_fill(0, index), 0.0, "zero health index {index}");
+        }
+        assert_eq!(heart_fill(1, 0), 0.5, "odd health shows a half heart");
+        assert_eq!(heart_fill(1, 1), 0.0);
+        assert_eq!(heart_fill(2, 0), 1.0);
+        assert_eq!(heart_fill(2, 1), 0.0);
+        assert_eq!(heart_fill(19, 8), 1.0, "16 points consumed by icons 0..8");
+        assert_eq!(heart_fill(19, 9), 0.5, "the last icon holds the odd point");
+        assert_eq!(heart_fill(20, 9), 1.0);
+        assert_eq!(heart_fill(20, 10), 0.0, "no eleventh heart");
+        assert_eq!(heart_fill(20, usize::MAX), 0.0, "out-of-range is empty");
+        assert_eq!(heart_fill(99, 0), 1.0, "fills never exceed one icon");
+    }
+
+    #[test]
+    fn hunger_fill_splits_two_points_per_pip() {
+        for index in 0..10 {
+            assert_eq!(hunger_fill(0, index), 0.0, "zero hunger index {index}");
+        }
+        assert_eq!(hunger_fill(1, 0), 0.5);
+        assert_eq!(hunger_fill(1, 1), 0.0);
+        assert_eq!(hunger_fill(2, 0), 1.0);
+        assert_eq!(hunger_fill(2, 1), 0.0);
+        assert_eq!(hunger_fill(19, 8), 1.0);
+        assert_eq!(hunger_fill(19, 9), 0.5);
+        assert_eq!(hunger_fill(20, 9), 1.0);
+        assert_eq!(hunger_fill(20, 10), 0.0);
+        assert_eq!(hunger_fill(20, usize::MAX), 0.0);
+        assert_eq!(hunger_fill(99, 0), 1.0);
+    }
+
+    #[test]
+    fn air_bubbles_round_up_and_clamp_to_ten() {
+        assert_eq!(air_bubbles(0), 0);
+        assert_eq!(air_bubbles(1), 1, "any remaining breath shows one bubble");
+        assert_eq!(air_bubbles(30), 1, "exact boundary stays exactly one");
+        assert_eq!(air_bubbles(150), 5, "half a lung is five bubbles");
+        assert_eq!(air_bubbles(299), 10, "rounding up fills the last bubble");
+        assert_eq!(air_bubbles(300), 10);
+        assert_eq!(air_bubbles(1200), 10, "a save above FULL_AIR clamps");
+    }
+
+    #[test]
+    fn creative_draws_no_vitals_even_when_hurt_or_submerged() {
+        let low = SurvivalState::new(1, 0, 0).expect("valid vitals");
+        assert!(
+            vitals_quads(&low, GameMode::Creative, true, 1280, 720).is_empty(),
+            "Creative is structurally exempt from the vitals HUD"
+        );
+        assert!(vitals_quads(&SurvivalState::full(), GameMode::Creative, false, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn survival_full_and_dry_draws_hearts_and_hunger_but_no_air() {
+        let quads = vitals_quads(&SurvivalState::full(), GameMode::Survival, false, 1280, 720);
+        assert_eq!(count_color(&quads, HEART_FILL_COLOR), 10);
+        assert_eq!(count_color(&quads, HUNGER_FILL_COLOR), 10);
+        assert_eq!(count_color(&quads, AIR_FILL_COLOR), 0, "full lungs on land");
+        assert_eq!(count_color(&quads, VITALS_BACKGROUND_COLOR), 20);
+    }
+
+    #[test]
+    fn survival_submerged_or_low_air_draws_the_air_row() {
+        let full = SurvivalState::full();
+        let submerged = vitals_quads(&full, GameMode::Survival, true, 1280, 720);
+        assert_eq!(count_color(&submerged, AIR_FILL_COLOR), 10);
+        assert_eq!(count_color(&submerged, VITALS_BACKGROUND_COLOR), 30);
+
+        // Low breath shows the row even while the head is above water: one
+        // bubble for 30/300 points, and the row still has all ten backgrounds.
+        let low = SurvivalState::new(20, 20, 30).expect("valid vitals");
+        let surface = vitals_quads(&low, GameMode::Survival, false, 1280, 720);
+        assert_eq!(count_color(&surface, AIR_FILL_COLOR), 1);
+        assert_eq!(count_color(&surface, VITALS_BACKGROUND_COLOR), 30);
+
+        // Empty lungs on land still draw the dark row (no colored bubble).
+        let empty = SurvivalState::new(20, 20, 0).expect("valid vitals");
+        let surface = vitals_quads(&empty, GameMode::Survival, false, 1280, 720);
+        assert_eq!(count_color(&surface, AIR_FILL_COLOR), 0);
+        assert_eq!(count_color(&surface, VITALS_BACKGROUND_COLOR), 30);
+    }
+
+    #[test]
+    fn empty_icons_stay_dark_and_half_icons_are_half_width() {
+        let empty = SurvivalState::new(0, 0, FULL_AIR).expect("valid vitals");
+        let quads = vitals_quads(&empty, GameMode::Survival, false, 1280, 720);
+        assert_eq!(count_color(&quads, HEART_FILL_COLOR), 0);
+        assert_eq!(count_color(&quads, HUNGER_FILL_COLOR), 0);
+        assert_eq!(
+            count_color(&quads, VITALS_BACKGROUND_COLOR),
+            20,
+            "empty icons are still drawn dark"
+        );
+
+        let one = SurvivalState::new(1, 1, FULL_AIR).expect("valid vitals");
+        let quads = vitals_quads(&one, GameMode::Survival, false, 1280, 720);
+        let hearts: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HEART_FILL_COLOR)
+            .collect();
+        assert_eq!(hearts.len(), 1, "one half heart");
+        assert_close(hearts[0].w, VITALS_ICON_SIZE * 0.5, "half-heart width");
+        let hunger: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+            .collect();
+        assert_eq!(hunger.len(), 1, "one half hunger pip");
+        assert_close(hunger[0].w, VITALS_ICON_SIZE * 0.5, "half-pip width");
+    }
+
+    #[test]
+    fn vitals_rows_sit_above_the_hotbar_and_align_with_its_edges() {
+        let surface_w = 1280;
+        let surface_h = 720;
+        let rects = hotbar_slot_rects(surface_w, surface_h);
+        let hotbar_top = rects[0].1;
+        let last_right = rects[HOTBAR_SLOTS - 1].0 + rects[HOTBAR_SLOTS - 1].2;
+        let quads = vitals_quads(
+            &SurvivalState::full(),
+            GameMode::Survival,
+            true,
+            surface_w,
+            surface_h,
+        );
+
+        for quad in &quads {
+            assert!(
+                quad.y + quad.h <= hotbar_top + 1e-4,
+                "every vitals row sits above the hotbar top"
+            );
+        }
+
+        let hearts: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HEART_FILL_COLOR)
+            .collect();
+        assert_eq!(hearts.len(), 10);
+        let hearts_left = hearts.iter().map(|q| q.x).fold(f32::MAX, f32::min);
+        let hearts_right = hearts.iter().map(|q| q.x + q.w).fold(f32::MIN, f32::max);
+        assert_close(hearts_left, rects[0].0, "hearts left-aligned to slot 0");
+        assert_close(
+            hearts_right,
+            rects[0].0 + VITALS_ROW_WIDTH,
+            "ten hearts span one icon row",
+        );
+
+        let hunger: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+            .collect();
+        let hunger_right = hunger.iter().map(|q| q.x + q.w).fold(f32::MIN, f32::max);
+        assert_close(
+            hunger_right,
+            last_right,
+            "hunger right edge is slot 8's right edge",
+        );
+        let hunger_left = hunger.iter().map(|q| q.x).fold(f32::MAX, f32::min);
+        assert_close(
+            hunger_left,
+            last_right - VITALS_ROW_WIDTH,
+            "hunger row is right-aligned as one block",
+        );
+
+        let air: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == AIR_FILL_COLOR)
+            .collect();
+        let air_bottom = air.iter().map(|q| q.y + q.h).fold(f32::MIN, f32::max);
+        let hunger_top = hunger.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+        assert!(
+            air_bottom < hunger_top,
+            "the air row sits above the hunger row"
+        );
+    }
+
+    #[test]
+    fn vitals_quads_stay_finite_on_degenerate_surfaces() {
+        for (w, h) in [(0, 0), (1, 1)] {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                let quads = vitals_quads(&SurvivalState::full(), mode, true, w, h);
+                for quad in &quads {
+                    for (name, value) in
+                        [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)]
+                    {
+                        assert!(value.is_finite(), "{name} finite on {w}x{h}");
+                    }
+                    for channel in quad.color {
+                        assert!(channel.is_finite(), "color finite on {w}x{h}");
+                    }
+                }
+            }
+        }
+        // Zero vitals, zero surface: still no panic and finite output.
+        let zero = SurvivalState::new(0, 0, 0).expect("valid vitals");
+        let quads = vitals_quads(&zero, GameMode::Survival, true, 0, 0);
+        assert!(!quads.is_empty());
+        for quad in quads {
+            assert!(quad.x.is_finite() && quad.y.is_finite());
+        }
     }
 }

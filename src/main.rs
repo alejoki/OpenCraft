@@ -35,7 +35,7 @@ use opencraft::ui::chest::{
 };
 use opencraft::ui::hud::{
     hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
-    selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -1009,6 +1009,24 @@ fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
             eye.z.floor() as i32,
         )
         .is_liquid()
+}
+
+/// Vitals HUD quads for the current Playing frame.
+///
+/// One helper shared by the frame loop and the headless tests, so what the
+/// window draws and what the tests prove cannot drift: it reads the session's
+/// live eye submersion and hands the player's vitals and effective mode to the
+/// pure [`vitals_quads`]. Only the Playing block calls it — menu, pause, and
+/// death screens never draw the Survival HUD.
+fn playing_hud_quads(session: &WorldSession, surface_w: u32, surface_h: u32) -> Vec<Quad> {
+    let head_submerged = eye_is_submerged(&session.world, session.camera.position);
+    vitals_quads(
+        &session.player.survival,
+        session.player.mode(),
+        head_submerged,
+        surface_w,
+        surface_h,
+    )
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -4799,6 +4817,16 @@ impl ApplicationHandler for GameApp {
                     }
                 }
                 if playing {
+                    // Vitals HUD (S04-T06): pure hearts/hunger/air quads drawn
+                    // above the hotbar only on Playing frames — including while
+                    // the inventory or chest panel is open, since both panels
+                    // are appended later and therefore draw above them. Creative
+                    // returns an empty Vec, so the HUD is structurally absent.
+                    quads.extend(playing_hud_quads(
+                        &self.session,
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ));
                     if let Some(progress) = self.mining.progress() {
                         quads.extend(mining_progress_quads(
                             progress,
@@ -12485,6 +12513,152 @@ mod tests {
         assert!(
             src.contains("gpu.render_store.total_water_quads,"),
             "the water field must come from ChunkRenderStore::total_water_quads"
+        );
+    }
+
+    /// S04-T06: the Playing-frame HUD seam draws exactly ten heart fills and
+    /// ten hunger fills for a full-vitals Survival session, and Creative is
+    /// structurally empty even though it shares the same seam.
+    #[test]
+    fn playing_hud_quads_shows_survival_vitals_and_hides_creative() {
+        use opencraft::ui::hud::{AIR_FILL_COLOR, HEART_FILL_COLOR, HUNGER_FILL_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        assert_eq!(session.player.survival, SurvivalState::full());
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert!(!quads.is_empty(), "Survival draws the vitals HUD");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .count(),
+            10,
+            "ten full hearts at full health"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .count(),
+            10,
+            "ten full hunger pips at full hunger"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .count(),
+            0,
+            "full lungs on dry land draw no air row"
+        );
+
+        let creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        assert!(
+            playing_hud_quads(&creative, 1280, 720).is_empty(),
+            "Creative is structurally exempt from the vitals HUD"
+        );
+    }
+
+    /// S04-T06: low vitals change the fills (one half heart, no hunger fill)
+    /// and a non-full lung adds the air row even while the eye is dry.
+    #[test]
+    fn playing_hud_quads_tracks_low_vitals_and_the_air_row() {
+        use opencraft::ui::hud::{
+            HEART_FILL_COLOR, HUNGER_FILL_COLOR, VITALS_BACKGROUND_COLOR, VITALS_ICON_SIZE,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-low.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        session.player.survival = SurvivalState::new(1, 0, 0).expect("valid vitals");
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        let hearts: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HEART_FILL_COLOR)
+            .collect();
+        assert_eq!(hearts.len(), 1, "one health point is one half heart");
+        assert_eq!(hearts[0].w, VITALS_ICON_SIZE * 0.5, "half-heart width");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .count(),
+            0,
+            "zero hunger emits no amber fill"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == VITALS_BACKGROUND_COLOR)
+                .count(),
+            30,
+            "the air row adds ten dark icons above hunger even at zero breath"
+        );
+    }
+
+    /// S04-T06: a submerged eye (a live water chunk around the camera) shows
+    /// the ten-bubble air row even at full breath.
+    #[test]
+    fn playing_hud_quads_submerged_vitals_show_the_air_row() {
+        use opencraft::ui::hud::{AIR_FILL_COLOR, VITALS_BACKGROUND_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-submerged.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        // Feet at y=32 place the eye at y≈33.6, inside the water chunk below.
+        session.player.position = Vec3::new(16.5, 32.0, 16.5);
+        session.sync_camera();
+        assert!(
+            !eye_is_submerged(&session.world, session.camera.position),
+            "the fixture must start dry (the chunk is unloaded)"
+        );
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Water));
+        assert!(
+            eye_is_submerged(&session.world, session.camera.position),
+            "the inserted water chunk must submerge the eye"
+        );
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .count(),
+            10,
+            "a submerged head with full lungs still draws ten bubbles"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == VITALS_BACKGROUND_COLOR)
+                .count(),
+            30,
+            "hearts + hunger + air backgrounds"
         );
     }
 
