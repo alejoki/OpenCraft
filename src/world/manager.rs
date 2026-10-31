@@ -228,6 +228,17 @@ impl WorldManager {
         self.unsaved_changes = false;
     }
 
+    /// Marks the world as having unsaved changes.
+    ///
+    /// Chest-content edits live in the session-owned chest map rather than
+    /// the chunk-edit map, so the chest command path needs the same dirty flag
+    /// a block edit sets. This mutates only the flag; the caller decides when
+    /// the record was actually changed.
+    #[inline]
+    pub fn mark_unsaved(&mut self) {
+        self.unsaved_changes = true;
+    }
+
     pub fn dirty_mesh_queue_len(&self) -> usize {
         self.dirty_mesh_queue.len()
     }

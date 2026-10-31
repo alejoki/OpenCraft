@@ -124,6 +124,17 @@ impl BlockId {
         matches!(self, BlockId::CraftingTable)
     }
 
+    /// Whether right-clicking this block opens a chest container interface.
+    ///
+    /// Both storage variants share the container domain: the plain chest and
+    /// the loot chest. Deliberately separate from
+    /// [`Self::is_table_interactable`] so the two station kinds can never be
+    /// confused by the interaction path.
+    #[inline]
+    pub const fn is_container_interactable(self) -> bool {
+        matches!(self, BlockId::Chest | BlockId::LootChest)
+    }
+
     #[inline]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -346,7 +357,15 @@ mod tests {
                 block == BlockId::CraftingTable,
                 "{block:?} interaction classification drifted"
             );
+            assert_eq!(
+                block.is_container_interactable(),
+                matches!(block, BlockId::Chest | BlockId::LootChest),
+                "{block:?} container interaction classification drifted"
+            );
         }
+        assert!(!BlockId::Chest.is_table_interactable());
+        assert!(!BlockId::LootChest.is_table_interactable());
+        assert!(!BlockId::CraftingTable.is_container_interactable());
         assert!(!BlockId::Air.is_table_interactable());
         assert!(!BlockId::Bedrock.is_table_interactable());
         assert!(!BlockId::OakPlanks.is_table_interactable());
@@ -435,6 +454,11 @@ mod tests {
             assert!(
                 !block.is_table_interactable(),
                 "{block:?} must not open the crafting table"
+            );
+            assert_eq!(
+                block.is_container_interactable(),
+                matches!(block, BlockId::Chest | BlockId::LootChest),
+                "{block:?} container classification drifted"
             );
         }
     }

@@ -12,9 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use glam::{IVec3, Vec3};
 
 use crate::player::camera::Camera;
+use crate::player::container::Container;
+use crate::player::inventory::{InventoryError, Item, ItemId};
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
 use crate::player::survival::GameMode;
+use crate::world::block::BlockId;
 use crate::world::daycycle::GameClock;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
@@ -53,6 +56,10 @@ pub struct WorldSession {
     /// unchanged) and reset by both constructors, so a restart always starts
     /// with no table open.
     open_table: Option<IVec3>,
+    /// Ephemeral chest-station state: the position of the chest whose
+    /// interface is open, if any. Never persisted; chest *contents* live in
+    /// [`WorldSession::chests`]. Mutually exclusive with `open_table`.
+    open_chest: Option<IVec3>,
 }
 
 impl WorldSession {
@@ -93,6 +100,7 @@ impl WorldSession {
             chests: ChestMap::default(),
             save_path,
             open_table: None,
+            open_chest: None,
         };
         session.sync_camera();
         session
@@ -124,6 +132,7 @@ impl WorldSession {
             chests: ChestMap::default(),
             save_path,
             open_table: None,
+            open_chest: None,
         };
         session.sync_camera();
         session
@@ -186,6 +195,7 @@ impl WorldSession {
             chests,
             save_path,
             open_table: None,
+            open_chest: None,
         };
         session.sync_camera();
         session
@@ -230,6 +240,49 @@ impl WorldSession {
         self.open_table
     }
 
+    /// The position of the chest whose interface is open, if any.
+    ///
+    /// Ephemeral and never saved. Validity is re-established by
+    /// [`Self::sync_open_chest`] and [`Self::open_chest_at`], never by the
+    /// reader.
+    pub const fn open_chest_position(&self) -> Option<IVec3> {
+        self.open_chest
+    }
+
+    /// The contents of the open chest, if one is open and has a record.
+    ///
+    /// An opened-but-untouched chest has no record yet, so this is `None`
+    /// rather than an empty container; the caller treats both as empty.
+    pub fn open_chest_contents(&self) -> Option<&Container> {
+        self.open_chest.and_then(|pos| self.chests.get(&pos))
+    }
+
+    /// The persisted contents at `pos`, or `None` when no record exists.
+    ///
+    /// This is the record-lifecycle read: `None` means the chest was never
+    /// touched, `Some(Container::empty())` means it was emptied.
+    pub fn chest_at(&self, pos: IVec3) -> Option<&Container> {
+        self.chests.get(&pos)
+    }
+
+    /// Everything a broken chest drops: its contents in slot order followed
+    /// by exactly one chest item.
+    ///
+    /// A missing or empty record still yields the chest item, so the caller's
+    /// all-or-nothing insertion preflight sees the same drop shape either way.
+    pub fn chest_break_items(&self, pos: IVec3) -> Vec<Item> {
+        let mut items = self
+            .chests
+            .get(&pos)
+            .map(Container::contents)
+            .unwrap_or_default();
+        items.push(
+            Item::new(ItemId::Block(BlockId::Chest), 1)
+                .expect("one chest block is a valid single-item stack"),
+        );
+        items
+    }
+
     /// Opens the crafting table at `pos` only when the *live* world block
     /// there is a crafting table and the player's eye is within
     /// [`TABLE_INTERACT_REACH`].
@@ -246,10 +299,11 @@ impl WorldSession {
         {
             return false;
         }
-        if !self.table_within_reach(pos) {
+        if !self.station_within_reach(pos) {
             return false;
         }
         self.open_table = Some(pos);
+        self.open_chest = None;
         true
     }
 
@@ -283,7 +337,7 @@ impl WorldSession {
             .world
             .get_block(pos.x, pos.y, pos.z)
             .is_table_interactable()
-            && self.table_within_reach(pos)
+            && self.station_within_reach(pos)
         {
             Some(pos)
         } else {
@@ -297,15 +351,138 @@ impl WorldSession {
         self.open_table = None;
     }
 
+    /// Opens the chest at `pos` only when the *live* world block there is a
+    /// container and the player's eye is within [`TABLE_INTERACT_REACH`].
+    ///
+    /// `pos` is untrusted, so the world is re-read at interaction time. A
+    /// missing/wrong/replaced/out-of-reach coordinate returns `false` and
+    /// mutates nothing, so a failed interaction cannot close a station that is
+    /// already open. A successful open clears any open crafting table.
+    pub fn open_chest_at(&mut self, pos: IVec3) -> bool {
+        if !self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_container_interactable()
+        {
+            return false;
+        }
+        if !self.station_within_reach(pos) {
+            return false;
+        }
+        self.open_chest = Some(pos);
+        self.open_table = None;
+        true
+    }
+
+    /// Raycasts one bounded step from the session camera and opens the targeted
+    /// chest.
+    ///
+    /// Returns the opened position, or `None` when the ray misses, hits a
+    /// non-container block, or the hit is out of reach. The caller then falls
+    /// through to its normal placement/interaction path.
+    pub fn try_open_targeted_chest(&mut self) -> Option<IVec3> {
+        let hit = raycast_voxels(
+            self.camera.position,
+            self.camera.forward(),
+            TABLE_INTERACT_REACH,
+            |x, y, z| self.world.get_block(x, y, z),
+        )?;
+        if self.open_chest_at(hit.block_pos) {
+            Some(hit.block_pos)
+        } else {
+            None
+        }
+    }
+
+    /// Re-validates the open chest against the current world and reach,
+    /// closing it when the block was removed/replaced or the player walked
+    /// away. Returns the still-open position. One bounded block lookup.
+    pub fn sync_open_chest(&mut self) -> Option<IVec3> {
+        let pos = self.open_chest?;
+        if self
+            .world
+            .get_block(pos.x, pos.y, pos.z)
+            .is_container_interactable()
+            && self.station_within_reach(pos)
+        {
+            Some(pos)
+        } else {
+            self.open_chest = None;
+            None
+        }
+    }
+
+    /// Closes the open chest, if any. Idempotent.
+    pub fn close_chest(&mut self) {
+        self.open_chest = None;
+    }
+
+    /// Closes the open chest only when it is the chest at `pos`.
+    ///
+    /// Used by the break path so removing a different block cannot close the
+    /// station the player is using.
+    pub fn close_chest_at(&mut self, pos: IVec3) {
+        if self.open_chest == Some(pos) {
+            self.open_chest = None;
+        }
+    }
+
+    /// Applies one whole-stack click to the open chest's slot `index`.
+    ///
+    /// The station is re-validated first: losing the live block or walking
+    /// out of reach closes it and reports [`ChestCommandError::NotOpen`]. On a
+    /// successful click, the candidate record is written only when it differs
+    /// from the pre-click record or the shared cursor changed. A no-op click
+    /// therefore creates no record and does not dirty the save; an existing
+    /// all-empty record is retained rather than deleted, because a touched
+    /// empty chest must stay distinguishable from an untouched one.
+    pub fn click_open_chest_slot(&mut self, index: usize) -> Result<(), ChestCommandError> {
+        let pos = self.sync_open_chest().ok_or(ChestCommandError::NotOpen)?;
+        let previous = self.chests.get(&pos).cloned();
+        let previous_cursor = self.player.inventory().cursor();
+        let mut candidate = previous.clone().unwrap_or_else(Container::empty);
+        self.player
+            .click_container_slot(&mut candidate, index)
+            .map_err(ChestCommandError::Slot)?;
+
+        // An absent record and an all-empty candidate are the same observable
+        // state: a no-op click must not create a record. Any existing record
+        // (including a touched-empty one) is compared by value.
+        let record_changed = match &previous {
+            Some(record) => record != &candidate,
+            None => !candidate.is_empty(),
+        };
+        let cursor_changed = self.player.inventory().cursor() != previous_cursor;
+        if record_changed || cursor_changed {
+            self.chests.insert(pos, candidate);
+            self.world.mark_unsaved();
+        }
+        Ok(())
+    }
+
     /// Reach check against the block's axis-aligned box: the player may
-    /// interact when the nearest point of the table block is within
-    /// [`TABLE_INTERACT_REACH`] of the eye.
-    fn table_within_reach(&self, pos: IVec3) -> bool {
+    /// interact when the nearest point of the station block is within
+    /// [`TABLE_INTERACT_REACH`] of the eye. Shared by the table and chest
+    /// stations so both use one reach budget.
+    fn station_within_reach(&self, pos: IVec3) -> bool {
         let eye = self.player.eye_position();
         let min = pos.as_vec3();
         let closest = eye.clamp(min, min + Vec3::ONE);
         eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
     }
+}
+
+/// Why a chest-slot command was rejected.
+///
+/// [`ChestCommandError::NotOpen`] means the station disappeared (block
+/// removed/replaced or out of reach) before the click could be applied;
+/// [`ChestCommandError::Slot`] forwards the domain transfer error, whose
+/// guarantee is that the chest record and cursor are unchanged. Neither
+/// variant creates a chest record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChestCommandError {
+    NotOpen,
+    Slot(InventoryError),
 }
 
 /// A time-derived random seed for blank-seed creates. Uses the wall clock's
@@ -323,8 +500,9 @@ pub fn random_seed() -> u32 {
 mod tests {
     use super::*;
     use crate::player::container::Container;
-    use crate::player::inventory::{Item, ItemId, Material};
+    use crate::player::inventory::{InventoryError, Item, ItemId, Material, CHEST_SLOTS};
     use crate::player::survival::{GameMode, SurvivalState};
+    use crate::world::block::BlockId;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
     fn make_save(seed: u32) -> WorldSaveData {
@@ -553,10 +731,7 @@ mod tests {
         );
         assert_eq!(session.chests, chests);
         assert_eq!(session.chests[&IVec3::new(4, -2, 7)], chest);
-        assert_eq!(
-            session.chests[&IVec3::new(-1, 0, 3)],
-            Container::empty()
-        );
+        assert_eq!(session.chests[&IVec3::new(-1, 0, 3)], Container::empty());
         assert!(
             !session.player.fly_mode,
             "a Survival save cannot restore a flying player"
@@ -1183,6 +1358,406 @@ mod tests {
             )
             .open_table_position(),
             None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Chest station
+    // -----------------------------------------------------------------------
+
+    /// A session with a deterministic all-air chunk at the origin, so chest
+    /// placement and raycasts never depend on generated terrain.
+    fn chest_session() -> WorldSession {
+        use crate::world::block::BlockId;
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut session = WorldSession::new_session(
+            37u32,
+            PathBuf::from("/tmp/chest.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+    }
+
+    /// Places a block and clears the setup-time dirty flag, so tests can
+    /// attribute `has_unsaved_changes()` to the chest command under test.
+    fn place_block(session: &mut WorldSession, pos: IVec3, block: crate::world::block::BlockId) {
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, block);
+        session.world.mark_saved();
+    }
+
+    fn stone(count: u16) -> Item {
+        Item::new(ItemId::Block(BlockId::Stone), count).expect("valid stone stack")
+    }
+
+    fn chest_item() -> Item {
+        Item::new(ItemId::Block(BlockId::Chest), 1).expect("valid chest item")
+    }
+
+    /// Inserts one stack into the empty inventory and picks it up, leaving it
+    /// on the shared cursor for a chest click.
+    fn give_to_cursor(session: &mut WorldSession, item: Item) {
+        session
+            .player
+            .insert_items(&[item])
+            .expect("empty inventory accepts one stack");
+        let slot = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .position(|stack| stack.is_some())
+            .expect("the inserted stack is present");
+        session
+            .player
+            .click_inventory_slot(slot)
+            .expect("pick the inserted stack into the cursor");
+        assert_eq!(session.player.inventory().cursor(), Some(item));
+    }
+
+    #[test]
+    fn every_constructor_starts_with_no_open_chest() {
+        let fresh = WorldSession::new_session(
+            41u32,
+            PathBuf::from("/tmp/chest-fresh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(fresh.open_chest_position(), None);
+
+        let survival = WorldSession::new_session_with_mode(
+            42u32,
+            PathBuf::from("/tmp/chest-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        assert_eq!(survival.open_chest_position(), None);
+
+        let editor = WorldSession::new_at(
+            43u32,
+            PathBuf::from("/tmp/chest-editor.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(0.5, 40.0, 0.5),
+            GameClock::new(),
+        );
+        assert_eq!(editor.open_chest_position(), None);
+
+        let restored =
+            WorldSession::session_from_save(make_save(44u32), PathBuf::from("/tmp/chest.mcvx"));
+        assert_eq!(restored.open_chest_position(), None);
+    }
+
+    #[test]
+    fn targeting_a_placed_chest_opens_it_without_creating_a_record() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert_eq!(session.sync_open_chest(), Some(pos));
+        assert!(session.chests.is_empty(), "opening alone creates no record");
+        assert!(!session.world.has_unsaved_changes());
+        assert_eq!(session.open_chest_contents(), None);
+    }
+
+    #[test]
+    fn a_loot_chest_is_container_interactable() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::LootChest);
+        aim_down_at(&mut session, pos);
+
+        assert!(session.open_chest_at(pos));
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn a_non_container_target_does_not_open_a_chest() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Stone);
+        aim_down_at(&mut session, pos);
+
+        assert_eq!(session.try_open_targeted_chest(), None);
+        assert_eq!(session.open_chest_position(), None);
+    }
+
+    #[test]
+    fn chest_and_table_opens_are_mutually_exclusive() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let chest_pos = IVec3::new(0, 5, 0);
+        let table_pos = IVec3::new(1, 5, 0);
+        place_block(&mut session, chest_pos, BlockId::Chest);
+        place_block(&mut session, table_pos, BlockId::CraftingTable);
+        aim_down_at(&mut session, chest_pos);
+
+        assert!(session.open_chest_at(chest_pos));
+        assert!(session.open_table_at(table_pos));
+        assert_eq!(session.open_table_position(), Some(table_pos));
+        assert_eq!(
+            session.open_chest_position(),
+            None,
+            "opening a table closes the chest station"
+        );
+
+        assert!(session.open_chest_at(chest_pos));
+        assert_eq!(session.open_chest_position(), Some(chest_pos));
+        assert_eq!(
+            session.open_table_position(),
+            None,
+            "opening a chest closes the table station"
+        );
+    }
+
+    #[test]
+    fn a_rejected_chest_open_mutates_nothing() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let open = IVec3::new(0, 5, 0);
+        let far = IVec3::new(20, 5, 0);
+        place_block(&mut session, open, BlockId::Chest);
+        place_block(&mut session, far, BlockId::Chest);
+        aim_down_at(&mut session, open);
+        assert!(session.open_chest_at(open));
+
+        assert!(
+            !session.open_chest_at(IVec3::new(0, 6, 0)),
+            "air is not a chest"
+        );
+        assert!(
+            !session.open_chest_at(IVec3::new(500, 5, 500)),
+            "unloaded chunk"
+        );
+        assert!(!session.open_chest_at(far), "beyond the reach budget");
+        assert!(!session.open_table_at(open), "a chest is not a table");
+        assert!(
+            !session.open_table_at(IVec3::new(0, 6, 0)),
+            "a rejected table open is side-effect free"
+        );
+
+        assert_eq!(session.open_chest_position(), Some(open));
+        assert_eq!(session.open_table_position(), None);
+        assert!(session.chests.is_empty());
+        assert!(!session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn the_first_transfer_creates_a_record_and_dirties_the_save() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        give_to_cursor(&mut session, stone(4));
+        assert!(session.chests.is_empty());
+        assert!(!session.world.has_unsaved_changes());
+
+        session
+            .click_open_chest_slot(5)
+            .expect("cursor into the chest");
+
+        let record = session
+            .chest_at(pos)
+            .expect("first transfer creates a record");
+        assert_eq!(record.slot(5), Some(stone(4)));
+        assert_eq!(session.player.inventory().cursor(), None);
+        assert_eq!(
+            session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(5)),
+            Some(stone(4))
+        );
+        assert!(session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn no_op_and_failed_transfers_create_no_record() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        // Empty cursor into an empty slot is a successful inert no-op.
+        session
+            .click_open_chest_slot(0)
+            .expect("empty/empty click is a no-op");
+        assert!(session.chests.is_empty(), "a no-op click creates no record");
+        assert!(!session.world.has_unsaved_changes());
+
+        // A rejected index is a failed transfer and must not create one.
+        assert_eq!(
+            session.click_open_chest_slot(CHEST_SLOTS),
+            Err(ChestCommandError::Slot(InventoryError::OutOfBounds))
+        );
+        assert!(
+            session.chests.is_empty(),
+            "a failed click creates no record"
+        );
+        assert!(!session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn taking_the_last_item_retains_a_present_empty_record() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        let mut slots = [None; CHEST_SLOTS];
+        slots[0] = Some(stone(1));
+        session.chests.insert(pos, Container::from_slots(slots));
+        assert!(session.open_chest_at(pos));
+
+        session
+            .click_open_chest_slot(0)
+            .expect("chest into the cursor");
+
+        assert_eq!(session.player.inventory().cursor(), Some(stone(1)));
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "a touched-empty chest keeps its record"
+        );
+        assert!(session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_no_op_click_retains_an_existing_all_empty_record() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        session.chests.insert(pos, Container::empty());
+        assert!(session.open_chest_at(pos));
+
+        session
+            .click_open_chest_slot(3)
+            .expect("empty/empty click is a no-op");
+
+        assert_eq!(session.chest_at(pos), Some(&Container::empty()));
+        assert!(!session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn removing_or_replacing_the_block_closes_the_station() {
+        use crate::world::block::BlockId;
+
+        for replacement in [BlockId::Air, BlockId::Stone] {
+            let mut session = chest_session();
+            let pos = IVec3::new(0, 5, 0);
+            place_block(&mut session, pos, BlockId::Chest);
+            aim_down_at(&mut session, pos);
+            assert!(session.open_chest_at(pos));
+
+            place_block(&mut session, pos, replacement);
+
+            assert_eq!(session.sync_open_chest(), None);
+            assert_eq!(session.open_chest_position(), None);
+            assert_eq!(
+                session.click_open_chest_slot(0),
+                Err(ChestCommandError::NotOpen)
+            );
+            assert!(session.chests.is_empty());
+        }
+    }
+
+    #[test]
+    fn walking_out_of_reach_closes_the_chest_station() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        session.player.position = Vec3::new(20.5, 8.0, 0.5);
+        session.sync_camera();
+
+        assert_eq!(session.sync_open_chest(), None);
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(
+            session.click_open_chest_slot(0),
+            Err(ChestCommandError::NotOpen)
+        );
+    }
+
+    #[test]
+    fn close_chest_helpers_are_idempotent_and_position_guarded() {
+        use crate::world::block::BlockId;
+
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::Chest);
+        aim_down_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        session.close_chest_at(IVec3::new(1, 5, 0));
+        assert_eq!(
+            session.open_chest_position(),
+            Some(pos),
+            "a different position must not close the station"
+        );
+        session.close_chest_at(pos);
+        assert_eq!(session.open_chest_position(), None);
+
+        session.close_chest();
+        session.close_chest();
+        assert_eq!(session.open_chest_position(), None);
+    }
+
+    #[test]
+    fn chest_break_items_are_contents_plus_exactly_one_chest() {
+        let mut session = chest_session();
+        let pos = IVec3::new(4, 40, -2);
+
+        assert_eq!(session.chest_break_items(pos), vec![chest_item()]);
+
+        session.chests.insert(pos, Container::empty());
+        assert_eq!(session.chest_break_items(pos), vec![chest_item()]);
+
+        let contents = chest_with_items();
+        let expected = [
+            contents.slot(0).expect("slot 0"),
+            contents.slot(13).expect("slot 13"),
+            contents.slot(26).expect("slot 26"),
+            chest_item(),
+        ];
+        session.chests.insert(pos, contents);
+        assert_eq!(session.chest_break_items(pos), expected);
+        assert_eq!(
+            session
+                .chest_break_items(pos)
+                .iter()
+                .filter(|item| item.id() == ItemId::Block(BlockId::Chest))
+                .count(),
+            1,
+            "the chest drops exactly once"
         );
     }
 }
