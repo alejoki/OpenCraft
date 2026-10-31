@@ -5695,7 +5695,7 @@ mod tests {
     use super::*;
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
-        HOTBAR_SLOTS, INVENTORY_SLOTS,
+        RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
@@ -16593,6 +16593,338 @@ mod tests {
             session.world.get_block(0, 6, 0),
             BlockId::WheatStage0,
             "a floating crop never advances past stage 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T05: end-to-end farm chain through the real interactions
+    // -----------------------------------------------------------------------
+
+    /// Seeds a 4x4 table grid with one unit per cell taken from the live
+    /// inventory, proves the expected recipe preview, installs that grid on the
+    /// player, and crafts exactly once through the production result-slot
+    /// adapter the S05 tool lab uses.
+    ///
+    /// One unit per ingredient is consumed from the inventory before the craft,
+    /// so the conservation asserted by the caller is a real aggregate change:
+    /// the result replaces exactly the units the recipe consumed. The player is
+    /// rebuilt only because `Player::with_inventory` is the one seam that
+    /// accepts a pre-filled grid; position, mode, vitals, and the 2x2 grid are
+    /// preserved.
+    fn craft_once_at_table(
+        session: &mut WorldSession,
+        cells: &[(usize, ItemId)],
+        expected: RecipeId,
+    ) -> Item {
+        let mut inventory = session.player.inventory().clone();
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for &(index, id) in cells {
+            let slot = inventory
+                .slots()
+                .iter()
+                .position(|slot| slot.map(|item| item.id()) == Some(id))
+                .unwrap_or_else(|| panic!("no {id:?} in the inventory for {expected:?}"));
+            let ingredient = inventory
+                .consume_one(slot)
+                .expect("the located slot holds the requested ingredient");
+            table_grid
+                .set(index, Some(ingredient))
+                .expect("the cell index is inside the 4x4 grid");
+        }
+        assert_eq!(
+            table_grid.preview().map(|preview| preview.recipe),
+            Some(expected),
+            "the seeded table cells must match the expected recipe"
+        );
+
+        let position = session.player.position;
+        let player_grid = session.player.player_grid().clone();
+        let mode = session.player.mode();
+        let survival = session.player.survival;
+        session.player = Player::with_inventory(position, inventory, player_grid, table_grid);
+        session.player.set_mode(mode);
+        session.player.survival = survival;
+
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        match apply_inventory_click(
+            &mut session.player,
+            &screen,
+            Some(IVec3::new(0, 5, 0)),
+            InventoryTarget::ResultSlot(GridKind::Table),
+        ) {
+            Ok(InventoryClickOutcome::Crafted(item)) => item,
+            other => panic!("expected the {expected:?} result slot to craft, got {other:?}"),
+        }
+    }
+
+    /// The first inventory slot holding `id`, so crafted tools and looted
+    /// stacks are selected through the real hotbar selection seam.
+    fn player_slot_of(player: &Player, id: ItemId) -> usize {
+        player
+            .inventory()
+            .slots()
+            .iter()
+            .position(|slot| slot.map(|item| item.id()) == Some(id))
+            .unwrap_or_else(|| panic!("no {id:?} in the inventory"))
+    }
+
+    #[test]
+    fn farm_chain_from_seed_to_bread_through_real_interactions() {
+        use opencraft::player::inventory::ToolTier;
+        use opencraft::world::chunk::linear_index;
+        use opencraft::world::daycycle::{GameClock, DEFAULT_TIME_OF_DAY};
+        use opencraft::world::loot::LootItem;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 1u32;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("farm-chain.mcvx"),
+            1,
+            GameMode::Survival,
+        );
+        assert_eq!(session.season(), Season::Spring);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+
+        // The first seeds come from an S06 generated ruin chest, never a
+        // test-only constructor. One-day seasons make seed 1 Spring today and
+        // Winter on day 3.
+        let chest = find_generated_loot_chest(seed, 3);
+        let entries = opencraft::world::terrain::ruin_loot_chest_at(chest, seed)
+            .expect("a generated LootChest resolves its table");
+        assert!(
+            entries.iter().any(|entry| entry.item == LootItem::Wheat),
+            "every ruin guarantees wheat"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.item == LootItem::WheatSeeds),
+            "every ruin guarantees wheat seeds"
+        );
+        let mut loot: Vec<Item> = entries
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count)
+                    .expect("a generated loot count is a valid stack")
+            })
+            .collect();
+        // The table guarantees 1..=2 wheat and the mature harvest adds one, so
+        // top up to the three the bread recipe consumes. The shaped hoe also
+        // consumes two planks and two sticks, which the ruin table need not
+        // supply.
+        loot.push(Item::new(ItemId::Material(Material::Wheat), 2).expect("wheat stock"));
+        loot.push(Item::new(ItemId::Block(BlockId::OakPlanks), 2).expect("plank stock"));
+        loot.push(Item::new(ItemId::Material(Material::Stick), 2).expect("stick stock"));
+        session
+            .player
+            .insert_items(&loot)
+            .expect("the ruin loot fits the empty inventory");
+
+        // Flat test world: no generated terrain at the farm coordinates.
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        assert!(
+            !session
+                .world
+                .set_block_immediate(0, 5, 0, BlockId::Grass)
+                .is_empty(),
+            "seeding the farm ground remeshes"
+        );
+
+        // Craft the wood hoe through the shaped recipe and the real
+        // result-slot adapter, then select it.
+        let hoe_id = ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        };
+        let hoe = craft_once_at_table(
+            &mut session,
+            &[
+                (0, ItemId::Block(BlockId::OakPlanks)),
+                (1, ItemId::Block(BlockId::OakPlanks)),
+                (5, ItemId::Material(Material::Stick)),
+                (9, ItemId::Material(Material::Stick)),
+            ],
+            RecipeId::WoodHoe,
+        );
+        assert_eq!(hoe.id(), hoe_id);
+        assert_eq!(hoe.durability(), Some(59), "a fresh wood hoe is full");
+        let hoe_slot = player_slot_of(&session.player, hoe_id);
+        assert!(
+            session.player.select_slot(hoe_slot),
+            "the crafted hoe must be selectable from the hotbar"
+        );
+
+        // Till the top face: exactly one durability is spent only after the
+        // edit is proven.
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Tilled(ref remeshed) if !remeshed.is_empty()
+        ));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "tilling spends exactly one durability"
+        );
+
+        // Plant the looted seeds: exactly one seed leaves the selected stack.
+        let seeds_id = ItemId::Material(Material::WheatSeeds);
+        let seeds_slot = player_slot_of(&session.player, seeds_id);
+        assert!(session.player.select_slot(seeds_slot));
+        let seeds_before_plant = player_item_count(&session.player, seeds_id);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(ref remeshed) if !remeshed.is_empty()
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert_eq!(
+            player_item_count(&session.player, seeds_id),
+            seeds_before_plant - 1,
+            "planting consumes exactly one seed"
+        );
+
+        // Winter freezes growth; Spring resumes from the same stage zero.
+        session.clock = GameClock::from_day_and_time(3, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Winter);
+        assert!(
+            session.tick_crops(0.1, 600.0).is_empty(),
+            "winter pauses crop growth"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+
+        session.clock = GameClock::from_day_and_time(0, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Spring);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "winter left the crop untouched"
+        );
+        for stage in [
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+        ] {
+            let remeshed = session.tick_crops(0.1, 600.0);
+            assert!(!remeshed.is_empty(), "{stage:?} must remesh the crop");
+            assert_eq!(session.world.get_block(0, 6, 0), stage);
+        }
+
+        // Harvest the mature crop through the production break path.
+        let wheat_before = player_item_count(&session.player, ItemId::Material(Material::Wheat));
+        let seeds_before_harvest = player_item_count(&session.player, seeds_id);
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 6, 0),
+            BlockId::WheatStage3,
+        ));
+        assert!(!remeshed.is_empty(), "the harvest remeshes");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            wheat_before + 1,
+            "mature wheat yields exactly one wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, seeds_id),
+            seeds_before_harvest + 2,
+            "mature wheat returns exactly two seeds"
+        );
+
+        // Craft bread from three wheat through the same real recipe path.
+        let wheat_before_bread =
+            player_item_count(&session.player, ItemId::Material(Material::Wheat));
+        let bread_before = player_item_count(&session.player, ItemId::Material(Material::Bread));
+        let bread = craft_once_at_table(
+            &mut session,
+            &[
+                (0, ItemId::Material(Material::Wheat)),
+                (1, ItemId::Material(Material::Wheat)),
+                (2, ItemId::Material(Material::Wheat)),
+            ],
+            RecipeId::Bread,
+        );
+        assert_eq!(bread.id(), ItemId::Material(Material::Bread));
+        assert_eq!(bread.count(), 1);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            wheat_before_bread - 3,
+            "bread consumes exactly three wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Bread)),
+            bread_before + 1
+        );
+
+        // Plant again, grow one stage, save, and reload. The stage is an
+        // ordinary v6 chunk edit; the candidate is rebuilt from it at zero.
+        let seeds_slot = player_slot_of(&session.player, seeds_id);
+        assert!(session.player.select_slot(seeds_slot));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(_)
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert!(!session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage1);
+
+        let (crop_chunk, (lx, ly, lz)) = world_to_chunk_and_local(0, 6, 0);
+        let crop_index = linear_index(lx, ly, lz) as u16;
+        assert_eq!(
+            session
+                .world
+                .chunk_edits()
+                .get(&crop_chunk)
+                .and_then(|edits| edits.get(&crop_index)),
+            Some(&BlockId::WheatStage1),
+            "the live stage is recorded as a chunk edit"
+        );
+
+        save_current_world(&mut session).expect("the farm save writes");
+        let loaded = load_world_from_path(&session.save_path).expect("the farm save decodes");
+        let persisted_stage = loaded
+            .chunk_edits
+            .get(&crop_chunk)
+            .and_then(|edits| edits.get(&crop_index))
+            .copied();
+        assert_eq!(
+            persisted_stage,
+            Some(BlockId::WheatStage1),
+            "the visible stage survives the save"
+        );
+        assert_eq!(loaded.seed, seed);
+        assert_eq!(loaded.season_length_days, 1);
+
+        let mut restored = WorldSession::session_from_save(loaded, session.save_path.clone());
+        assert_eq!(restored.season(), Season::Spring);
+        assert_eq!(restored.player.mode(), GameMode::Survival);
+
+        insert_test_chunk_with_face_neighbors(&mut restored, BlockId::Air);
+        assert!(!restored
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland)
+            .is_empty());
+        assert!(!restored
+            .world
+            .set_block_immediate(0, 6, 0, persisted_stage.expect("the saved stage edit"))
+            .is_empty());
+        assert!(!restored.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(
+            restored.world.get_block(0, 6, 0),
+            BlockId::WheatStage2,
+            "the rebuilt crop resumes growing from the persisted stage"
         );
     }
 }
