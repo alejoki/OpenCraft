@@ -139,6 +139,20 @@ pub struct CliConfig {
     /// branch owns its effect (teleporting the player to the pinned route
     /// start); a loaded save is never teleported.
     pub demo_swim: bool,
+    /// Whether the bounded scripted survival demo (`--demo-survival`, S08-T02)
+    /// is requested. Same bare-launch-switch contract as `demo_swim`: it takes
+    /// no value, is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. Only the fresh startup
+    /// branch owns its effect, and the flag suppresses the accelerated-demo
+    /// watch so the survival digest is never pre-empted by a `--time-scale`
+    /// auto-shutdown.
+    pub demo_survival: bool,
+    /// Whether the bounded scripted ruin/farm/chest content demo
+    /// (`--demo-content`, S08-T03) is requested. Same bare-switch contract as
+    /// `demo_swim`/`demo_survival`: no value, never a world intent, never
+    /// persisted, fresh startup only, and exempt from the accelerated-demo
+    /// watch.
+    pub demo_content: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -161,6 +175,8 @@ impl CliConfig {
         let mut season_length = DEFAULT_SEASON_LENGTH_DAYS;
         let mut demo_days = DEFAULT_DEMO_DAYS;
         let mut demo_swim = false;
+        let mut demo_survival = false;
+        let mut demo_content = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -221,6 +237,14 @@ impl CliConfig {
                     // a stray following token stays an independent argument.
                     demo_swim = true;
                 }
+                "--demo-survival" => {
+                    // Same bare-switch rule as `--demo-swim`.
+                    demo_survival = true;
+                }
+                "--demo-content" => {
+                    // Same bare-switch rule as `--demo-swim`.
+                    demo_content = true;
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -241,6 +265,8 @@ impl CliConfig {
             season_length,
             demo_days,
             demo_swim,
+            demo_survival,
+            demo_content,
             mode,
         }
     }
@@ -2927,6 +2953,74 @@ mod tests {
         assert!(!loner.force_new_world);
         assert_eq!(loner.seed_override, None);
         assert_eq!(loner.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+    }
+
+    #[test]
+    fn test_demo_survival_and_content_parse_as_bare_switches() {
+        // Absent keeps both seams off: a normal launch is byte-identical.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_survival);
+        assert!(!bare.demo_content);
+
+        // Each flag alone sets exactly its own seam and consumes no value.
+        let survival = CliConfig::parse_args(["--demo-survival"]);
+        assert!(survival.demo_survival);
+        assert!(!survival.demo_content);
+        assert!(!survival.force_new_world);
+        assert_eq!(survival.seed_override, None);
+        assert_eq!(
+            survival.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        let content = CliConfig::parse_args(["--demo-content"]);
+        assert!(content.demo_content);
+        assert!(!content.demo_survival);
+        assert!(!content.force_new_world);
+        assert_eq!(content.seed_override, None);
+        assert_eq!(
+            content.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A token after each flag still parses as its own flag, proving the
+        // bare switch consumed nothing.
+        let after_survival = CliConfig::parse_args([
+            "--demo-survival",
+            "--new",
+            "--seed",
+            "7",
+            "--save",
+            "survival.mcvx",
+        ]);
+        assert!(after_survival.demo_survival);
+        assert!(after_survival.force_new_world);
+        assert_eq!(after_survival.seed_override, Some(7));
+        assert_eq!(
+            after_survival.save_path,
+            std::path::PathBuf::from("survival.mcvx")
+        );
+
+        let after_content = CliConfig::parse_args([
+            "--demo-content",
+            "--new",
+            "--seed",
+            "1",
+            "--save",
+            "content.mcvx",
+        ]);
+        assert!(after_content.demo_content);
+        assert!(after_content.force_new_world);
+        assert_eq!(after_content.seed_override, Some(1));
+        assert_eq!(
+            after_content.save_path,
+            std::path::PathBuf::from("content.mcvx")
+        );
+
+        // Both flags together arm both seams without cross-toggling.
+        let both = CliConfig::parse_args(["--demo-survival", "--demo-content"]);
+        assert!(both.demo_survival);
+        assert!(both.demo_content);
     }
 
     #[test]

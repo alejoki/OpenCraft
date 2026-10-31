@@ -1262,6 +1262,18 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
         || cli.save_path != Path::new(DEFAULT_SAVE_PATH)
 }
 
+/// Accelerated-watch suppression predicate: true when the launch requested a
+/// scripted demo seam (`--demo-swim`, `--demo-survival`, or `--demo-content`).
+/// A scripted demo owns its own completion and digest contract at its own
+/// pace, so the accelerated `--time-scale` watch and its wall-clock deadline
+/// must stay disarmed even when `--time-scale` is also on the command line —
+/// otherwise a `--demo-content --time-scale 60` launch could shut down before
+/// the scripted run prints its own digest. The flags themselves are still
+/// launch switches, never world intents (see [`cli_has_world_intent`]).
+fn scripted_demo_requested(cli: &CliConfig) -> bool {
+    cli.demo_swim || cli.demo_survival || cli.demo_content
+}
+
 /// The startup world session, mirroring main()'s pre-S03 load-or-fresh
 /// block EXACTLY (byte-identical legacy behavior — including the
 /// default.mcvx launch and every CLI-flag direct launch — now testable
@@ -2660,6 +2672,12 @@ struct GameApp {
     /// self-describing swim abort; `main` reads it after the event loop exits
     /// (the shutdown path itself cannot set a process status).
     exit_failure: bool,
+    /// True when the launch requested a scripted demo seam (`--demo-swim`,
+    /// `--demo-survival`, or `--demo-content`) — see
+    /// [`scripted_demo_requested`]. The accelerated-demo watch and its
+    /// wall-clock deadline stay disarmed for these runs, so a scripted demo
+    /// owns its own bounded completion even when `--time-scale` is present.
+    scripted_demo: bool,
 }
 
 impl GameApp {
@@ -2740,8 +2758,13 @@ impl GameApp {
         // Bounded accelerated demo (S02-T04): a direct-launch gameplay run
         // with `--time-scale > 1` carries a wall-clock deadline as a safety
         // net. Menu-first launches stay unbounded until gameplay begins (the
-        // frame-driven cycle watch still completes them).
-        let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
+        // frame-driven cycle watch still completes them). Scripted demos
+        // (`--demo-swim`/`--demo-survival`/`--demo-content`) keep the whole
+        // accelerated watch disarmed: they own their own bounded completion
+        // and digest, so a combined `--time-scale` must not pre-empt them.
+        let scripted_demo = scripted_demo_requested(&cli);
+        let demo_shutdown_deadline = if !scripted_demo && startup_screen == LifecycleScreen::Playing
+        {
             demo_shutdown_deadline(cli.time_scale, cli.demo_days)
         } else {
             None
@@ -2845,6 +2868,7 @@ impl GameApp {
             demo_seam_ran: false,
             swim,
             exit_failure: false,
+            scripted_demo,
         }
     }
 
@@ -4682,8 +4706,9 @@ impl ApplicationHandler for GameApp {
                 // inferring it from an external timeout kill. The exit itself
                 // is deferred to `about_to_wait` because `gpu`/`window`
                 // borrows span this region; only plain fields are touched
-                // here.
-                if !self.demo_finished {
+                // here. A scripted demo run skips the watch entirely: its own
+                // bounded state machine owns completion and digest output.
+                if !self.demo_finished && !self.scripted_demo {
                     let finished = observe_demo_cycle(
                         &mut self.demo_cycle,
                         self.time_scale,
@@ -6056,6 +6081,133 @@ mod tests {
             "--save",
             "custom.mcvx"
         ])));
+    }
+
+    #[test]
+    fn scripted_demo_flags_are_launch_switches_and_never_world_intents() {
+        // Each new scripted-demo flag alone is NOT a world intent: a bare
+        // launch plus the flag still opens the main menu, exactly like a bare
+        // launch. (The effect belongs to the fresh startup branch only.)
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            let cli = CliConfig::parse_args([flag]);
+            assert!(
+                !cli_has_world_intent(&cli),
+                "{flag} alone must not bypass the menus"
+            );
+            assert_eq!(cli_has_world_intent(&cli), cli_has_world_intent(&bare));
+        }
+
+        // Combined with a real world flag the intent is unchanged (the world
+        // flag is still what grants direct gameplay entry).
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            let with_new = CliConfig::parse_args(["--new", flag]);
+            assert!(
+                cli_has_world_intent(&with_new),
+                "{flag} + --new keeps intent"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_demo_requested_suppresses_the_accelerated_watch() {
+        // Neither a bare launch nor a pure `--time-scale` run is scripted: the
+        // accelerated watch stays armed for those (the long-standing demo).
+        assert!(!scripted_demo_requested(&CliConfig::parse_args(Vec::<
+            String,
+        >::new(
+        ))));
+        assert!(!scripted_demo_requested(&CliConfig::parse_args([
+            "--time-scale",
+            "60"
+        ])));
+        assert!(!scripted_demo_requested(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--time-scale",
+            "60"
+        ])));
+
+        // Each scripted flag requests the suppression, with or without an
+        // accelerated scale on the same command line.
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            assert!(
+                scripted_demo_requested(&CliConfig::parse_args([flag])),
+                "{flag} must suppress the accelerated watch"
+            );
+            assert!(
+                scripted_demo_requested(&CliConfig::parse_args([flag, "--time-scale", "60"])),
+                "{flag} must stay scripted even with an accelerated scale"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_demo_arming_disarms_the_accelerated_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("scripted.mcvx");
+        let settings_path = dir.path().join("settings.toml");
+        let background_path = dir.path().join("background/background.mcvx");
+        let save = save_path.to_str().expect("utf8 path");
+
+        // Scripted launch carrying an accelerated scale: the scripted flag
+        // wins and no accelerated wall-clock deadline arms.
+        let scripted_cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-content",
+            "--time-scale",
+            "60",
+            "--save",
+            save,
+        ]);
+        let scripted = GameApp::new_with_paths(
+            scripted_cli,
+            WorldSession::new_session(1, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+            settings_path.clone(),
+            background_path.clone(),
+        );
+        assert!(scripted.scripted_demo);
+        assert!(
+            scripted.demo_shutdown_deadline.is_none(),
+            "a scripted demo must own its own bounded completion"
+        );
+        assert_eq!(scripted.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // The same launch without the scripted flag keeps the accelerated
+        // deadline: the suppression is scoped to the scripted seams.
+        let accelerated_cli =
+            CliConfig::parse_args(["--new", "--seed", "1", "--time-scale", "60", "--save", save]);
+        let accelerated = GameApp::new_with_paths(
+            accelerated_cli,
+            WorldSession::new_session(1, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+            settings_path.clone(),
+            background_path.clone(),
+        );
+        assert!(!accelerated.scripted_demo);
+        assert!(
+            accelerated.demo_shutdown_deadline.is_some(),
+            "accelerated runs without a scripted flag stay bounded"
+        );
+        assert_eq!(accelerated.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // Menu-first scripted launch: the flag never bypasses the menu, so
+        // startup is MainMenu and no accelerated deadline arms.
+        let menu = GameApp::new_with_paths(
+            CliConfig::parse_args(["--demo-content"]),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/menu.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            settings_path,
+            background_path,
+        );
+        assert!(menu.scripted_demo);
+        assert!(menu.demo_shutdown_deadline.is_none());
+        assert_eq!(menu.lifecycle.screen(), LifecycleScreen::MainMenu);
     }
 
     /// One frame of clock progression exactly as the RedrawRequested pass
