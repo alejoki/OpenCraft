@@ -33,7 +33,7 @@ pub enum BlockId {
     WheatStage3 = 20,
     /// Storage block placeholder for the survival chest container.
     Chest = 21,
-    /// Loot-bearing chest variant; drops itself until the loot slice lands.
+    /// Loot-bearing chest variant; world-only, breaks into an ordinary Chest.
     LootChest = 22,
 }
 
@@ -280,12 +280,13 @@ impl BlockId {
     ///
     /// Stone yields Cobblestone so the stone-tier tool recipes (whose head
     /// material is [`BlockId::Cobblestone`]) are reachable through real
-    /// gameplay. Farmland yields Dirt because tilling is reversible. Every
-    /// other block, including the new wheat stages, chests, and the loot
-    /// chest, drops itself here. The oak-leaf apple secondary drop is resolved
-    /// at the break site through [`crate::world::loot::oak_leaves_apple`], not
-    /// in this single-identity mapping; ruin loot tables and wheat-harvest
-    /// drops belong to later survival slices.
+    /// gameplay. Farmland yields Dirt because tilling is reversible. The
+    /// loot-chest block yields an ordinary [`BlockId::Chest`], so a broken
+    /// ruin chest stays a chest when carried. Every other block, including the
+    /// wheat stages and the ordinary chest, drops itself here. The oak-leaf
+    /// apple secondary drop is resolved at the break site through
+    /// [`crate::world::loot::oak_leaves_apple`], not in this single-identity
+    /// mapping; wheat-harvest drops belong to a later survival slice.
     ///
     /// Drops are inventory state only and are never persisted, and the wire
     /// format keeps Cobblestone's id 4 unchanged, so save compatibility is
@@ -294,6 +295,7 @@ impl BlockId {
         match self {
             BlockId::Stone => BlockId::Cobblestone,
             BlockId::Farmland => BlockId::Dirt,
+            BlockId::LootChest => BlockId::Chest,
             // Unbreakable ids never reach a drop path; returning the id keeps
             // the mapping total without inventing an item.
             BlockId::Water => BlockId::Water,
@@ -406,6 +408,7 @@ mod tests {
             let expected = match block {
                 BlockId::Stone => BlockId::Cobblestone,
                 BlockId::Farmland => BlockId::Dirt,
+                BlockId::LootChest => BlockId::Chest,
                 _ => block,
             };
             assert_eq!(block.mined_drop(), expected, "{block:?} mined drop drifted");
@@ -414,8 +417,9 @@ mod tests {
         assert_eq!(BlockId::Stone.mined_drop(), BlockId::Cobblestone);
         assert_eq!(BlockId::Cobblestone.mined_drop(), BlockId::Cobblestone);
         assert_eq!(BlockId::Farmland.mined_drop(), BlockId::Dirt);
-        // LootChest -> Chest lands with the loot slice, not here.
-        assert_eq!(BlockId::LootChest.mined_drop(), BlockId::LootChest);
+        // A LootChest is world-only loot storage: breaking it yields the
+        // ordinary carryable Chest, never another LootChest.
+        assert_eq!(BlockId::LootChest.mined_drop(), BlockId::Chest);
         assert_eq!(BlockId::Chest.mined_drop(), BlockId::Chest);
     }
 
@@ -600,13 +604,7 @@ mod tests {
                 BlockId::WheatStage3,
             ),
             (BlockId::Chest, 21, "Chest", 0.8, BlockId::Chest),
-            (
-                BlockId::LootChest,
-                22,
-                "Loot Chest",
-                0.8,
-                BlockId::LootChest,
-            ),
+            (BlockId::LootChest, 22, "Loot Chest", 0.8, BlockId::Chest),
         ];
 
         for (block, id, name, duration, drop) in cases {
