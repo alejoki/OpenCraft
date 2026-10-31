@@ -50,7 +50,7 @@ fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
         |channel: usize| green[channel] + (gold[channel] - green[channel]) * ripeness as i32 / 3;
     make_layer(seed, move |x, y, j| {
         let stalk = x % 4 == 1;
-        let jitter_top = (hash_pixel(x, 0, seed) % 2) as u32;
+        let jitter_top = hash_pixel(x, 0, seed) % 2;
         let top = 15u32.saturating_sub(stalk_height + jitter_top);
         let on_stalk = stalk && y >= top;
         let head = on_stalk && y + 3 > top;

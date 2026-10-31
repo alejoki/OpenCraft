@@ -622,9 +622,9 @@ whatever = true
         );
 
         // The 16 legacy names still override exactly layers 0..=15.
-        for index in 0..16 {
-            assert_eq!(pack.layers[index], expected, "layer {index} override");
-            assert_ne!(pack.layers[index], procedural[index]);
+        for (index, layer) in pack.layers.iter().enumerate().take(16) {
+            assert_eq!(*layer, expected, "layer {index} override");
+            assert_ne!(*layer, procedural[index]);
         }
 
         // Layers 16..23 (new authored names) and 23..32 (reserved) keep the
