@@ -15,11 +15,13 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
+use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
+use opencraft::player::survival::GameMode;
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
@@ -34,8 +36,9 @@ use opencraft::ui::chest::{
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
 };
 use opencraft::ui::hud::{
-    hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
-    selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects,
+    mining_progress_quads, selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE,
+    HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -413,6 +416,12 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 /// interpreted — replaced stations fall through to placement. Chest targeting
 /// runs before table targeting so one shared ray can only ever open the block
 /// the player is actually looking at.
+///
+/// Survival food comes after both station checks and before placement: holding
+/// a food item never places a block, a full-hunger click is refused through
+/// the transient notice channel instead of silently doing nothing, and Creative
+/// keeps its byte-identical placement fallback because food rules are
+/// Survival-only.
 fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     session.sync_open_chest();
     session.sync_open_table();
@@ -421,6 +430,22 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
     if session.try_open_targeted_table().is_some() {
         return RightClickOutcome::TableOpened;
+    }
+    if session.player.mode() == GameMode::Survival {
+        if let Some(item) = session.player.selected_item() {
+            if food_value(item.id()).is_some() {
+                return match EatingTarget::new(
+                    session.player.selected_slot(),
+                    item,
+                    session.player.survival.hunger(),
+                ) {
+                    Some(_) => RightClickOutcome::EatingStarted,
+                    // Full hunger is the only way a food item refuses here;
+                    // the target constructor already validated slot and food.
+                    None => RightClickOutcome::EatingRefused,
+                };
+            }
+        }
     }
     match try_place_selected_block(session) {
         Some(remeshed) => RightClickOutcome::Placed(remeshed),
@@ -435,8 +460,71 @@ enum RightClickOutcome {
     /// A table was opened; the authoritative position is exposed by
     /// [`WorldSession::open_table_position`], not duplicated in this outcome.
     TableOpened,
+    /// A Survival food click started the hold-to-eat gesture. No item is
+    /// consumed here: the redraw loop owns completion through `eat_selected`.
+    EatingStarted,
+    /// A Survival food click was refused because hunger is already full. The
+    /// press arm reports [`right_click_notice`] through the transient message
+    /// channel.
+    EatingRefused,
     Placed(Vec<(ChunkPos, ChunkMesh)>),
     Nothing,
+}
+
+/// Transient notice text for a right-click outcome, if any.
+///
+/// Only the full-hunger refusal needs an explanation: every other outcome is
+/// already visible in the world (a station opened, a block appeared) or is an
+/// ordinary non-event.
+fn right_click_notice(outcome: &RightClickOutcome) -> Option<&'static str> {
+    match outcome {
+        RightClickOutcome::EatingRefused => Some("Cannot eat while full"),
+        _ => None,
+    }
+}
+
+/// The hold-to-eat candidate for this frame, or `None` when eating must not
+/// progress.
+///
+/// Cancellation is structural: a released right button, a panel/menu frame
+/// (non-gameplay), an ungrabbed cursor, a non-Survival mode, a dead player, any
+/// movement key, or a selected item that is not food all produce `None`, which
+/// makes [`EatingState::tick`] reset accumulated progress. There is no
+/// separate cancellation switch that a reset site could forget.
+fn eating_candidate(
+    session: &WorldSession,
+    input: &InputState,
+    right_mouse_held: bool,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> Option<EatingTarget> {
+    if !(gameplay && cursor_grabbed && right_mouse_held) {
+        return None;
+    }
+    let player = &session.player;
+    if player.mode() != GameMode::Survival || session.is_dead() || input.is_moving() {
+        return None;
+    }
+    let item = player.selected_item()?;
+    EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
+}
+
+/// Crosshair progress bar for this frame.
+///
+/// Eating owns the single sanctioned bar slot while a meal is in progress; a
+/// completed meal resets the eating state, so mining's amber bar comes back on
+/// the very next frame. `None` means neither action is progressing and no bar
+/// is drawn.
+fn frame_progress_bar(
+    eating: Option<f32>,
+    mining: Option<f32>,
+    surface_w: u32,
+    surface_h: u32,
+) -> Option<[Quad; 2]> {
+    if let Some(progress) = eating {
+        return Some(eating_progress_quads(progress, surface_w, surface_h));
+    }
+    mining.map(|progress| mining_progress_quads(progress, surface_w, surface_h))
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +561,10 @@ fn open_inventory(
     via_table: bool,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -485,7 +575,9 @@ fn open_inventory(
     }
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *drag = None;
     *cursor_grabbed = false;
     set_cursor_grab(window, false);
@@ -500,8 +592,10 @@ fn close_inventory(
     session: &mut WorldSession,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -509,7 +603,9 @@ fn close_inventory(
     session.close_table();
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *drag = None;
     *cursor_grabbed = true;
     set_cursor_grab(window, true);
@@ -696,8 +792,10 @@ fn open_chest_screen(
     inventory: &mut InventoryScreen,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     status: &mut Option<String>,
     window: &Window,
@@ -707,7 +805,9 @@ fn open_chest_screen(
     screen.open();
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *drag = None;
     *cursor_grabbed = false;
     *status = None;
@@ -723,7 +823,9 @@ fn close_chest_screen(
     session: &mut WorldSession,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -731,7 +833,9 @@ fn close_chest_screen(
     session.close_chest();
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
@@ -2271,6 +2375,10 @@ struct GameApp {
     /// frame from the RedrawRequested pass. Any reset boundary below clears it
     /// so a menu/focus/session change never inherits partial progress.
     mining: MiningState,
+    /// Hold-to-eat accumulator (S05): driven once per frame with raw frame
+    /// dt and reset by every left-hold/mining reset boundary so a menu, panel,
+    /// focus loss, or session swap can never resume an invisible meal.
+    eating: EatingState,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -2281,6 +2389,11 @@ struct GameApp {
     /// press. Set only after the screen routing and click-to-grab early
     /// returns, cleared on release, focus loss, and screen/session changes.
     left_mouse_held: bool,
+    /// Whether the right mouse button is physically held after a Survival
+    /// food press. Only eating reads it; it is cleared by the dedicated
+    /// Released Right arm and by every reset boundary that clears the left
+    /// hold.
+    right_mouse_held: bool,
     /// Inventory/crafting screen state (S03-T03): mode + table attachment from
     /// the pure T01 model. Open only while the lifecycle screen is Playing —
     /// the panel is a gameplay surface, not a lifecycle screen.
@@ -2572,8 +2685,10 @@ impl GameApp {
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
+            eating: EatingState::new(),
             audio,
             left_mouse_held: false,
+            right_mouse_held: false,
             inventory: InventoryScreen::new(),
             inventory_status: None,
             inventory_drag: None,
@@ -2820,7 +2935,9 @@ impl GameApp {
         }
         self.input.reset();
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
+        self.eating.reset();
         // The inventory and chest screens are Playing-only surfaces. Any
         // lifecycle screen entry drops them (with their transient drag/status)
         // and closes the ephemeral chest station so no stale panel can keep
@@ -2865,7 +2982,9 @@ impl GameApp {
         // Defensive: a hold or partial progress must never survive a trip
         // through a menu and back into gameplay.
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
+        self.eating.reset();
         self.pause_message = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
@@ -2946,7 +3065,9 @@ impl GameApp {
         }
         self.input.reset();
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
+        self.eating.reset();
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
@@ -3696,7 +3817,9 @@ impl ApplicationHandler for GameApp {
             WindowEvent::Focused(false) => {
                 self.input.reset();
                 self.left_mouse_held = false;
+                self.right_mouse_held = false;
                 self.mining.reset();
+                self.eating.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -3821,8 +3944,10 @@ impl ApplicationHandler for GameApp {
                                 &mut self.session,
                                 &mut self.input,
                                 &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
                                 &mut self.inventory_drag,
                                 &mut self.mining,
+                                &mut self.eating,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -3845,7 +3970,9 @@ impl ApplicationHandler for GameApp {
                                 &mut self.session,
                                 &mut self.input,
                                 &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
                                 &mut self.mining,
+                                &mut self.eating,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -3865,8 +3992,10 @@ impl ApplicationHandler for GameApp {
                                 false,
                                 &mut self.input,
                                 &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
                                 &mut self.inventory_drag,
                                 &mut self.mining,
+                                &mut self.eating,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -3997,7 +4126,9 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some("Crafting Table closed".to_string());
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -4020,7 +4151,9 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some(inventory_status_text(result));
                     }
                     self.left_mouse_held = false;
+                    self.right_mouse_held = false;
                     self.mining.reset();
+                    self.eating.reset();
                     return;
                 }
                 // Chest panel (S03-T05): a release never transfers a stack
@@ -4034,6 +4167,8 @@ impl ApplicationHandler for GameApp {
                         self.session.close_chest();
                         self.chest_status = None;
                         self.inventory_drag = None;
+                        self.right_mouse_held = false;
+                        self.eating.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -4042,14 +4177,31 @@ impl ApplicationHandler for GameApp {
                         set_cursor_grab(window, true);
                     }
                     self.left_mouse_held = false;
+                    self.right_mouse_held = false;
                     self.mining.reset();
+                    self.eating.reset();
                     return;
                 }
                 // A release can arrive while a menu owns the input, so this
                 // arm deliberately bypasses the screen routing: clearing the
                 // hold and any partial progress is always safe.
                 self.left_mouse_held = false;
+                self.right_mouse_held = false;
                 self.mining.reset();
+                self.eating.reset();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Right,
+                ..
+            } => {
+                // A release can arrive while a menu owns the input, so this
+                // arm deliberately bypasses the screen routing (exactly like
+                // the Left release arm): clearing the right hold and any
+                // partial meal progress is always safe. It is a dedicated arm
+                // so no generic Released branch can swallow the button.
+                self.right_mouse_held = false;
+                self.eating.reset();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -4136,7 +4288,9 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some("Crafting Table closed".to_string());
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -4216,7 +4370,9 @@ impl ApplicationHandler for GameApp {
                         self.chest_status = None;
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -4236,7 +4392,9 @@ impl ApplicationHandler for GameApp {
                         }
                     }
                     self.left_mouse_held = false;
+                    self.right_mouse_held = false;
                     self.mining.reset();
+                    self.eating.reset();
                     return;
                 }
 
@@ -4289,8 +4447,10 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory,
                                     &mut self.input,
                                     &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
                                     &mut self.inventory_drag,
                                     &mut self.mining,
+                                    &mut self.eating,
                                     &mut self.cursor_grabbed,
                                     &mut self.chest_status,
                                     window,
@@ -4307,11 +4467,32 @@ impl ApplicationHandler for GameApp {
                                     true,
                                     &mut self.input,
                                     &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
                                     &mut self.inventory_drag,
                                     &mut self.mining,
+                                    &mut self.eating,
                                     &mut self.cursor_grabbed,
                                     window,
                                 );
+                            }
+                            RightClickOutcome::EatingStarted => {
+                                // The press only arms the hold. Progress and
+                                // the exactly-once consumption happen on the
+                                // redraw ticks, so a press can never eat a
+                                // whole stack and an immediate release
+                                // consumes nothing. No audio (D006).
+                                self.right_mouse_held = true;
+                            }
+                            refusal @ RightClickOutcome::EatingRefused => {
+                                // Full hunger is the only refusal a player
+                                // cannot infer from the world, so it owns the
+                                // transient notice above the hotbar.
+                                if let Some(text) = right_click_notice(&refusal) {
+                                    self.game_message = Some(MenuMessage {
+                                        text: text.to_string(),
+                                        ticks_left: menu::MESSAGE_TICKS,
+                                    });
+                                }
                             }
                             RightClickOutcome::Nothing => {}
                         }
@@ -4452,6 +4633,27 @@ impl ApplicationHandler for GameApp {
                     // station per playing frame, never a scan.
                     self.session.sync_open_table();
                     self.session.sync_open_chest();
+                    // Hold-to-eat (S05-T03): raw frame dt, never
+                    // `dt * time_scale` — eating is real time exactly like
+                    // mining (D013). The candidate is structurally `None` on
+                    // panel frames (gameplay false), a released hold, a dead
+                    // player, movement, a non-Survival mode, or a non-food
+                    // selection, so progress can never survive its cancel
+                    // condition. `EatingTick::Ate` is the only consumption
+                    // site: the pure state resets before returning, and
+                    // `eat_selected` consumes exactly one item after its own
+                    // fail-closed guards.
+                    let eating_target = eating_candidate(
+                        &self.session,
+                        &self.input,
+                        self.right_mouse_held,
+                        gameplay,
+                        self.cursor_grabbed,
+                    );
+                    if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
+                    {
+                        self.session.player.eat_selected(slot, item);
+                    }
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -4473,7 +4675,9 @@ impl ApplicationHandler for GameApp {
                         self.chest_status = None;
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -4843,12 +5047,13 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
                     ));
-                    if let Some(progress) = self.mining.progress() {
-                        quads.extend(mining_progress_quads(
-                            progress,
-                            gpu.ctx.config.width,
-                            gpu.ctx.config.height,
-                        ));
+                    if let Some(bar) = frame_progress_bar(
+                        self.eating.progress(),
+                        self.mining.progress(),
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ) {
+                        quads.extend(bar);
                     }
                 }
                 // Inventory/crafting panel (S03-T04): extend the same CPU quad
@@ -5354,8 +5559,8 @@ fn main() {
 mod tests {
     use super::*;
     use opencraft::player::inventory::{
-        CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack,
-        HOTBAR_SLOTS,
+        CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
+        HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
@@ -5366,7 +5571,7 @@ mod tests {
     use std::path::PathBuf;
 
     use opencraft::player::camera::Camera;
-    use opencraft::player::survival::{GameMode, SurvivalState};
+    use opencraft::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
     use opencraft::world::persistence::ChunkEditMap;
     use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -13084,9 +13289,7 @@ mod tests {
     // S05-T03: all-nine-tool matrix and the break-at-zero generalization
     // -----------------------------------------------------------------------
 
-    use opencraft::player::inventory::{
-        Material, ToolKind, ToolTier, INVENTORY_SLOTS, MAX_STACK_COUNT,
-    };
+    use opencraft::player::inventory::{ToolKind, ToolTier, MAX_STACK_COUNT};
 
     /// Table-grid cells the head row of `kind` occupies.
     fn tool_head_cells(kind: ToolKind) -> &'static [usize] {
@@ -14656,5 +14859,434 @@ mod tests {
             "the taken stack is in the saved inventory"
         );
         assert_eq!(CHEST_SLOTS, 27, "the record has the full chest width");
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T03: Survival right-click eating priority, hold completion, and
+    // lifecycle resets
+    // -----------------------------------------------------------------------
+
+    fn apple_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Apple), count).expect("valid apple stack")
+    }
+
+    fn bread_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
+    }
+
+    /// A Survival session holding `item` in slot 0 at `hunger`.
+    fn survival_food_session(
+        dir: &Path,
+        seed: u32,
+        name: &str,
+        item: Item,
+        hunger: u16,
+    ) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item);
+        let mut player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        let deficit = MAX_HUNGER - hunger;
+        assert_eq!(
+            player.survival.spend_hunger(deficit),
+            deficit,
+            "hunger fixture"
+        );
+        assert!(player.select_slot(0));
+        session.player = player;
+        session
+    }
+
+    fn selected_food_count(session: &WorldSession) -> Option<u16> {
+        session.player.selected_item().map(|item| item.count())
+    }
+
+    fn tick_until_ate(state: &mut EatingState, target: EatingTarget) -> Option<(usize, ItemId)> {
+        for _ in 0..64 {
+            if let EatingTick::Ate { slot, item, .. } = state.tick(0.1, Some(target)) {
+                return Some((slot, item));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn eating_right_click_prefers_a_targeted_chest_over_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 70, "eat-chest.mcvx", apple_item(3), 10);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::ChestOpened(opened) if opened == pos),
+            "a targeted chest wins over a held apple"
+        );
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10, "nothing eaten");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_prefers_a_targeted_table_over_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 71, "eat-table.mcvx", apple_item(3), 10);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::TableOpened));
+        assert_eq!(session.open_table_position(), Some(pos));
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10, "nothing eaten");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_starts_a_meal_without_consuming_or_placing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 72, "eat-start.mcvx", apple_item(3), 10);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::EatingStarted));
+        assert_eq!(right_click_notice(&outcome), None);
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "starting a meal never edits the world"
+        );
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn eating_right_click_refuses_full_hunger_with_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 73, "eat-full.mcvx", apple_item(3), MAX_HUNGER);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::EatingRefused));
+        assert_eq!(right_click_notice(&outcome), Some("Cannot eat while full"));
+        assert_eq!(selected_food_count(&session), Some(3), "nothing consumed");
+        assert_eq!(session.player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_never_starts_in_creative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 74, "eat-creative.mcvx", apple_item(3), 10);
+        session.player.set_mode(GameMode::Creative);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::Nothing));
+        assert_eq!(right_click_notice(&outcome), None);
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10);
+    }
+
+    #[test]
+    fn eating_right_click_falls_through_to_placement_for_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = survival_food_session(
+            dir.path(),
+            75,
+            "eat-place.mcvx",
+            Item::new(ItemId::Block(BlockId::Stone), 2).expect("stone stack"),
+            MAX_HUNGER,
+        );
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "a non-food block still uses the placement path"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(selected_food_count(&session), Some(1));
+        assert_eq!(session.player.survival.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn eating_candidate_gates_every_cancel_condition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 76, "eat-candidate.mcvx", apple_item(3), 10);
+        let idle = InputState::default();
+
+        let candidate = eating_candidate(&session, &idle, true, true, true)
+            .expect("an idle Survival player holding right click can eat");
+        assert_eq!(candidate.slot(), 0);
+        assert_eq!(candidate.item(), ItemId::Material(Material::Apple));
+        assert_eq!(candidate.restore(), 4);
+
+        assert!(eating_candidate(&session, &idle, false, true, true).is_none());
+        assert!(eating_candidate(&session, &idle, true, false, true).is_none());
+        assert!(eating_candidate(&session, &idle, true, true, false).is_none());
+
+        let moving = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        assert!(eating_candidate(&session, &moving, true, true, true).is_none());
+
+        session.player.set_mode(GameMode::Creative);
+        assert!(eating_candidate(&session, &idle, true, true, true).is_none());
+        session.player.set_mode(GameMode::Survival);
+
+        session.player.survival.damage(MAX_HUNGER);
+        assert!(session.is_dead(), "fixture kills the player");
+        assert!(eating_candidate(&session, &idle, true, true, true).is_none());
+
+        let full = survival_food_session(
+            dir.path(),
+            77,
+            "eat-candidate-full.mcvx",
+            apple_item(3),
+            MAX_HUNGER,
+        );
+        assert!(eating_candidate(&full, &idle, true, true, true).is_none());
+
+        let non_food = survival_food_session(
+            dir.path(),
+            78,
+            "eat-candidate-stick.mcvx",
+            Item::new(ItemId::Material(Material::Stick), 1).expect("stick"),
+            10,
+        );
+        assert!(eating_candidate(&non_food, &idle, true, true, true).is_none());
+    }
+
+    #[test]
+    fn eating_hold_completes_one_apple_then_starts_a_fresh_meal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 79, "eat-apple.mcvx", apple_item(3), 10);
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("meal target");
+        let mut state = EatingState::new();
+
+        let (slot, item) = tick_until_ate(&mut state, target).expect("first meal completes");
+        assert_eq!((slot, item), (0, ItemId::Material(Material::Apple)));
+        assert!(state.progress().is_none(), "Ate resets before returning");
+        assert_eq!(session.player.eat_selected(slot, item), Some(4));
+        assert_eq!(session.player.survival.hunger(), 14);
+        assert_eq!(selected_food_count(&session), Some(2));
+
+        // The hold is still active: the same target starts a fresh cycle.
+        let (slot, item) =
+            tick_until_ate(&mut state, target).expect("a sustained hold starts a second meal");
+        assert_eq!(session.player.eat_selected(slot, item), Some(4));
+        assert_eq!(session.player.survival.hunger(), 18);
+        assert_eq!(selected_food_count(&session), Some(1));
+    }
+
+    #[test]
+    fn eating_hold_bread_restores_more_hunger_than_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 80, "eat-bread.mcvx", bread_item(2), 10);
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("meal target");
+        let mut state = EatingState::new();
+
+        let (slot, item) = tick_until_ate(&mut state, target).expect("bread meal completes");
+        assert_eq!((slot, item), (0, ItemId::Material(Material::Bread)));
+        assert_eq!(session.player.eat_selected(slot, item), Some(6));
+        assert_eq!(session.player.survival.hunger(), 16);
+        assert_eq!(selected_food_count(&session), Some(1));
+    }
+
+    #[test]
+    fn eating_progress_cancels_on_release_panel_slot_change_and_movement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (index, case) in ["release", "panel", "slot", "movement"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut session = survival_food_session(
+                dir.path(),
+                90 + index as u32,
+                &format!("eat-cancel-{case}.mcvx"),
+                apple_item(3),
+                10,
+            );
+            let idle = InputState::default();
+            let target = eating_candidate(&session, &idle, true, true, true).expect("start");
+            let mut state = EatingState::new();
+            for _ in 0..5 {
+                assert!(matches!(
+                    state.tick(0.1, Some(target)),
+                    EatingTick::Eating { .. }
+                ));
+            }
+            assert!(state.progress().is_some(), "{case}: progress accumulated");
+
+            let interrupted = match index {
+                0 => eating_candidate(&session, &idle, false, true, true),
+                1 => eating_candidate(&session, &idle, true, false, true),
+                2 => {
+                    assert!(session.player.select_slot(1));
+                    eating_candidate(&session, &idle, true, true, true)
+                }
+                3 => {
+                    let moving = InputState {
+                        forward: true,
+                        ..Default::default()
+                    };
+                    eating_candidate(&session, &moving, true, true, true)
+                }
+                _ => unreachable!(),
+            };
+            assert!(interrupted.is_none(), "{case}: candidate must cancel");
+            assert!(matches!(state.tick(0.1, interrupted), EatingTick::Idle));
+            assert!(
+                state.progress().is_none(),
+                "{case}: partial progress cleared"
+            );
+            assert_eq!(session.player.survival.hunger(), 10, "{case}: no restore");
+            assert_eq!(
+                session
+                    .player
+                    .inventory()
+                    .hotbar(0)
+                    .map(|item| item.count()),
+                Some(3),
+                "{case}: no consumption"
+            );
+        }
+    }
+
+    #[test]
+    fn eating_right_click_notice_only_explains_full_hunger() {
+        assert_eq!(
+            right_click_notice(&RightClickOutcome::EatingRefused),
+            Some("Cannot eat while full")
+        );
+        for quiet in [
+            RightClickOutcome::EatingStarted,
+            RightClickOutcome::Nothing,
+            RightClickOutcome::TableOpened,
+            RightClickOutcome::ChestOpened(IVec3::ZERO),
+            RightClickOutcome::Placed(Vec::new()),
+        ] {
+            assert_eq!(right_click_notice(&quiet), None);
+        }
+    }
+
+    #[test]
+    fn eating_frame_progress_bar_prefers_eating_then_mining_then_none() {
+        use opencraft::ui::hud::EATING_FILL_COLOR;
+
+        let eating = frame_progress_bar(Some(0.5), Some(0.5), 1280, 720)
+            .expect("eating wins when both bars exist");
+        assert_eq!(eating[1].color, EATING_FILL_COLOR);
+
+        let mining =
+            frame_progress_bar(None, Some(0.5), 1280, 720).expect("mining is the fallback bar");
+        assert_eq!(
+            mining[1].color,
+            mining_progress_quads(0.5, 1280, 720)[1].color
+        );
+        assert_ne!(eating[1].color, mining[1].color);
+
+        assert!(frame_progress_bar(None, None, 1280, 720).is_none());
+    }
+
+    /// S05-T03: a lifecycle screen entry drops the right hold and any partial
+    /// meal, mirroring the S02 left-hold test.
+    #[test]
+    fn eating_state_cleared_by_enter_screen() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.right_mouse_held = true;
+        let target = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        app.eating.tick(0.5, Some(target));
+        assert!(app.eating.progress().is_some());
+
+        app.enter_screen(LifecycleScreen::MainMenu);
+
+        assert!(!app.right_mouse_held, "right hold cleared on screen entry");
+        assert!(
+            app.eating.progress().is_none(),
+            "partial meal cleared on screen entry"
+        );
+    }
+
+    /// S05-T03: a world swap clears the right hold and any partial meal.
+    #[test]
+    fn eating_state_cleared_by_start_world_session() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.right_mouse_held = true;
+        let target = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        app.eating.tick(0.5, Some(target));
+        assert!(app.eating.progress().is_some());
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+
+        assert!(!app.right_mouse_held, "right hold cleared on session swap");
+        assert!(
+            app.eating.progress().is_none(),
+            "partial meal cleared on session swap"
+        );
     }
 }

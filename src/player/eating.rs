@@ -270,7 +270,7 @@ mod tests {
         );
         assert_eq!(APPLE_HUNGER, 4);
         assert_eq!(BREAD_HUNGER, 6);
-        assert!(BREAD_HUNGER > APPLE_HUNGER, "bread must beat apple");
+        const { assert!(BREAD_HUNGER > APPLE_HUNGER, "bread must beat apple") };
     }
 
     #[test]

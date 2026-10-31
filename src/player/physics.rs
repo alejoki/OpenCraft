@@ -1,11 +1,12 @@
 use glam::Vec3;
 
 use crate::player::container::Container;
+use crate::player::eating::food_value;
 use crate::player::inventory::{
-    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack,
-    RecipePreview, ToolWear, HOTBAR_SLOTS,
+    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemId,
+    ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
-use crate::player::survival::{GameMode, SurvivalState};
+use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
 
 /// Errors from the narrow inventory-screen command façade.
@@ -107,6 +108,21 @@ impl InputState {
     #[inline]
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Whether any movement key is held this frame.
+    ///
+    /// Hold-to-eat cancels on movement (see [`crate::player::eating`]), so the
+    /// check lives next to the flags themselves rather than being re-derived
+    /// from them at the call site.
+    pub fn is_moving(&self) -> bool {
+        self.forward
+            || self.backward
+            || self.left
+            || self.right
+            || self.jump_or_up
+            || self.crouch_or_down
+            || self.sprint
     }
 }
 
@@ -376,6 +392,40 @@ impl Player {
     /// Consumes exactly one item from the selected hotbar slot.
     pub fn consume_selected(&mut self) -> Option<Item> {
         self.inventory.consume_one(self.selected_slot)
+    }
+
+    /// Completes one hold-to-eat meal: consumes exactly one `expected` item
+    /// from `slot` and restores its food value, returning the hunger actually
+    /// applied.
+    ///
+    /// This is the caller-owned completion half of
+    /// [`crate::player::eating::EatingState`]. Every guard runs before any
+    /// mutation, so a stale completion (slot switched, item picked up, hunger
+    /// already full) is a fail-closed `None` with the inventory and vitals
+    /// untouched:
+    ///
+    /// - `slot` must still be the selected hotbar slot;
+    /// - the selected item identity must equal `expected`;
+    /// - hunger must be below [`MAX_HUNGER`];
+    /// - `expected` must be a food identity.
+    ///
+    /// One successful call consumes exactly one unit, never a whole stack,
+    /// and `SurvivalState::restore_hunger` reports the applied amount after
+    /// the cap.
+    pub fn eat_selected(&mut self, slot: usize, expected: ItemId) -> Option<u16> {
+        if slot != self.selected_slot || self.survival.hunger() >= MAX_HUNGER {
+            return None;
+        }
+        let restore = food_value(expected)?;
+        if self.selected_item()?.id() != expected {
+            return None;
+        }
+        // The slot is the selected slot and holds `expected`, so this cannot
+        // fail; the `?` keeps a hypothetical decode bug fail-closed before the
+        // hunger restore runs.
+        let consumed = self.inventory.consume_one(slot)?;
+        debug_assert_eq!(consumed.id(), expected);
+        Some(self.survival.restore_hunger(restore))
     }
 
     /// Spends exactly one durability point on the selected hotbar tool.
@@ -2610,5 +2660,198 @@ mod tests {
         let hover_y = player.position.y;
         player.update(1.0 / 60.0, &InputState::default(), |_, _, _| BlockId::Air);
         assert!((player.position.y - hover_y).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T03: caller-owned hold-to-eat completion
+    // -----------------------------------------------------------------------
+
+    fn apple_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Apple), count).expect("valid apple stack")
+    }
+
+    fn bread_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
+    }
+
+    /// A Survival player holding `item` in slot 0 at `hunger`.
+    ///
+    /// `Player::with_inventory` is always Creative, so the mode is set
+    /// explicitly before any eating command runs.
+    fn food_player(item: Item, hunger: u16) -> Player {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item);
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(MAX_HUNGER - hunger);
+        assert!(player.select_slot(0));
+        player
+    }
+
+    fn selected_count(player: &Player) -> Option<u16> {
+        player.selected_item().map(|item| item.count())
+    }
+
+    #[test]
+    fn eat_selected_consumes_one_apple_and_restores_four_hunger() {
+        let mut player = food_player(apple_item(2), 10);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Apple));
+
+        assert_eq!(applied, Some(4), "one apple restores exactly 4 hunger");
+        assert_eq!(player.survival.hunger(), 14);
+        assert_eq!(
+            selected_count(&player),
+            Some(1),
+            "exactly one item consumed"
+        );
+    }
+
+    #[test]
+    fn eat_selected_consumes_one_bread_and_restores_six_hunger() {
+        let mut player = food_player(bread_item(2), 10);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Bread));
+
+        assert_eq!(applied, Some(6), "one bread restores exactly 6 hunger");
+        assert_eq!(player.survival.hunger(), 16);
+        assert_eq!(
+            selected_count(&player),
+            Some(1),
+            "exactly one item consumed"
+        );
+    }
+
+    #[test]
+    fn eat_selected_reports_the_capped_restore_at_hunger_nineteen() {
+        // 19 is the last hunger value a meal can start from; the restore is
+        // reported after the MAX_HUNGER cap rather than as the food's nominal
+        // value.
+        let mut player = food_player(bread_item(2), MAX_HUNGER - 1);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Bread));
+
+        assert_eq!(applied, Some(1));
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(1));
+    }
+
+    #[test]
+    fn eat_selected_rejects_a_slot_mismatch_without_mutation() {
+        let mut player = food_player(apple_item(2), 10);
+        // A second apple elsewhere proves the guard is about the selected
+        // slot, not merely about the item existing somewhere.
+        let mut slots = *player.inventory().slots();
+        slots[1] = Some(apple_item(1));
+        player = Player::with_inventory(
+            player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(10);
+        assert!(player.select_slot(1));
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(
+            player.inventory().hotbar(1).map(|item| item.count()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn eat_selected_rejects_an_item_mismatch_without_mutation() {
+        let mut player = food_player(apple_item(2), 10);
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Bread)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+    }
+
+    #[test]
+    fn eat_selected_rejects_an_empty_slot_without_mutation() {
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(10);
+        assert!(player.select_slot(0));
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), None);
+    }
+
+    #[test]
+    fn eat_selected_refuses_full_hunger_without_consuming() {
+        let mut player = food_player(apple_item(2), MAX_HUNGER);
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(2), "nothing was consumed");
+    }
+
+    #[test]
+    fn eat_selected_rejects_non_food_even_when_selected() {
+        let mut player = food_player(
+            Item::new(ItemId::Material(Material::Stick), 2).expect("stick stack"),
+            10,
+        );
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Stick)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+    }
+
+    #[test]
+    fn is_moving_tracks_every_movement_key() {
+        let input = InputState::default();
+        assert!(!input.is_moving(), "an idle input is not moving");
+
+        for index in 0..7 {
+            let mut input = InputState::default();
+            match index {
+                0 => input.forward = true,
+                1 => input.backward = true,
+                2 => input.left = true,
+                3 => input.right = true,
+                4 => input.jump_or_up = true,
+                5 => input.crouch_or_down = true,
+                6 => input.sprint = true,
+                _ => unreachable!(),
+            }
+            assert!(input.is_moving(), "key index {index} must count as moving");
+            input.reset();
+            assert!(!input.is_moving(), "reset clears every movement key");
+        }
     }
 }
