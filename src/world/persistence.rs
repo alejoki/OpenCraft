@@ -740,7 +740,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
     // v2 added the 27-byte hotbar block between render_distance and
     // chunk_count. v1 files predate it and migrate to an empty hotbar.
     let hotbar = if version >= HOTBAR_HEADER_VERSION {
-        read_hotbar(&mut cur)?
+        read_hotbar(&mut cur, version)?
     } else {
         Hotbar::empty()
     };
@@ -785,6 +785,13 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             // never round-trip through a persisted chunk edit. Treating a
             // forged water edit as an unknown id fails the whole save closed.
             if block.is_liquid() {
+                return Err(PersistenceError::InvalidBlockId(block_raw));
+            }
+            // Ids 16..=22 are v6 wire identities. A pre-v6 payload that
+            // claims one is corrupt (or forged), so fail closed instead of
+            // inventing a block under a version that never could have
+            // written it. Water keeps its own unconditional rejection above.
+            if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
                 return Err(PersistenceError::InvalidBlockId(block_raw));
             }
             edits.insert(local_idx, block);
@@ -905,8 +912,9 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
 ///
 /// A zero block id is the empty-slot sentinel and must pair with count 0.
 /// Any other id must decode, be carryable (not Air/Bedrock), and carry a
-/// count within `1..=MAX_STACK_COUNT`. Short reads surface as `Io`.
-fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
+/// count within `1..=MAX_STACK_COUNT`. Ids appended in v6 are rejected on a
+/// pre-v6 payload, mirroring [`read_item`]. Short reads surface as `Io`.
+fn read_hotbar<R: Read>(r: &mut R, version: u32) -> Result<Hotbar, PersistenceError> {
     let mut slots: [Option<ItemStack>; crate::player::inventory::HOTBAR_SLOTS] =
         [None; crate::player::inventory::HOTBAR_SLOTS];
 
@@ -924,6 +932,9 @@ fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
         let Some(block) = BlockId::from_u8(block_raw) else {
             return Err(PersistenceError::InvalidBlockId(block_raw));
         };
+        if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
+            return Err(PersistenceError::InvalidBlockId(block_raw));
+        }
         if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) {
             return Err(PersistenceError::InvalidPlayerState);
         }
@@ -943,18 +954,11 @@ fn read_hotbar<R: Read>(r: &mut R) -> Result<Hotbar, PersistenceError> {
 /// durability` (count is implicit one). All construction funnels through
 /// [`Item`]'s checked constructors, so forged counts/durability never enter
 /// the domain.
-/// Reads one validated item record from the v4 extension.
 ///
-/// Every payload is bounded and fixed-size: a block/material record is
-/// `tag + id + u16 count`, a tool record is `tag + kind + tier + u16
-/// durability` (count is implicit one). All construction funnels through
-/// [`Item`]'s checked constructors, so forged counts/durability never enter
-/// the domain.
-///
-/// The Apple/Wheat/WheatSeeds/Bread materials and the Hoe tool kind are v6
-/// wire identities. A pre-v6 payload that contains one is corrupt (or
-/// forged), so it fails closed instead of being silently accepted under a
-/// version that never could have written it.
+/// The Apple/Wheat/WheatSeeds/Bread materials, the Hoe tool kind, and block
+/// ids 16..=22 are v6 wire identities. A pre-v6 payload that contains one is
+/// corrupt (or forged), so it fails closed instead of being silently
+/// accepted under a version that never could have written it.
 fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, PersistenceError> {
     let tag = read_u8(r)?;
     match tag {
@@ -965,6 +969,9 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             let Some(block) = BlockId::from_u8(block_raw) else {
                 return Err(PersistenceError::InvalidBlockId(block_raw));
             };
+            if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
+                return Err(PersistenceError::InvalidBlockId(block_raw));
+            }
             Item::new(ItemId::Block(block), count)
                 .map(Some)
                 .map_err(PersistenceError::InvalidItem)
@@ -998,6 +1005,21 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
         }
         other => Err(PersistenceError::InvalidItemTag(other)),
     }
+}
+
+/// Block ids appended in v6; a pre-v6 payload may not contain them.
+/// Water (id 15) is a distinct, older constraint handled by `is_liquid`.
+fn is_survival_only_block_id(block: BlockId) -> bool {
+    matches!(
+        block,
+        BlockId::Farmland
+            | BlockId::WheatStage0
+            | BlockId::WheatStage1
+            | BlockId::WheatStage2
+            | BlockId::WheatStage3
+            | BlockId::Chest
+            | BlockId::LootChest
+    )
 }
 
 /// Materials appended in v6; a pre-v6 payload may not contain them.
@@ -1179,6 +1201,45 @@ mod tests {
         assert_eq!(loaded_chunk[&coal_index], BlockId::CoalOre);
         assert_eq!(loaded_chunk[&iron_index], BlockId::IronOre);
         assert_eq!(loaded.seed, data.seed);
+    }
+
+    #[test]
+    fn test_save_roundtrips_every_known_block_id_through_22() {
+        // v6 accepts every decodable id except water (worldgen-only, refused
+        // by the writer). Pin the full append-only span 0..=22 so a future
+        // palette addition cannot silently shift an existing id.
+        let mut chunk = rustc_hash::FxHashMap::default();
+        let mut expected = Vec::new();
+        for raw in 0u8..=22 {
+            let block = BlockId::from_u8(raw).expect("id 0..=22 decodes");
+            if block == BlockId::Water {
+                continue;
+            }
+            let index = linear_index(raw as usize, 1, 1) as u16;
+            chunk.insert(index, block);
+            expected.push((index, block));
+        }
+        assert_eq!(chunk.len(), 22, "ids 0..=22 minus water");
+
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(0, 0, 0), chunk);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = edits;
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v6 palette must save");
+        let loaded = load_world_from_bytes(&bytes).expect("v6 palette must load");
+        let loaded_chunk = loaded
+            .chunk_edits
+            .get(&ChunkPos::new(0, 0, 0))
+            .expect("edited chunk must round-trip");
+        assert_eq!(loaded_chunk.len(), expected.len());
+        for (index, block) in expected {
+            assert_eq!(
+                loaded_chunk[&index], block,
+                "{block:?} (id {}) must round-trip",
+                block as u8
+            );
+        }
     }
 
     #[test]
@@ -2358,6 +2419,116 @@ mod tests {
         assert!(matches!(
             checked_chest_count(MAX_SAVED_CHESTS + 1),
             Err(PersistenceError::InvalidChestState)
+        ));
+    }
+
+    /// Block ids appended in M008: v6-only wire identities.
+    const SURVIVAL_ONLY_BLOCKS: [BlockId; 7] = [
+        BlockId::Farmland,
+        BlockId::WheatStage0,
+        BlockId::WheatStage1,
+        BlockId::WheatStage2,
+        BlockId::WheatStage3,
+        BlockId::Chest,
+        BlockId::LootChest,
+    ];
+
+    fn v6_data_with_block_edit(block: BlockId) -> WorldSaveData {
+        let mut chunk = rustc_hash::FxHashMap::default();
+        chunk.insert(linear_index(3, 4, 5) as u16, block);
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(1, 2, 3), chunk);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = edits;
+        data
+    }
+
+    #[test]
+    fn test_v6_roundtrips_survival_only_block_edits_and_chest_item() {
+        // Every id 16..=22 is legal in a v6 save, both as a chunk edit and
+        // (for the carryable Chest) as an inventory item.
+        let mut chunk = rustc_hash::FxHashMap::default();
+        for (offset, block) in SURVIVAL_ONLY_BLOCKS.iter().enumerate() {
+            chunk.insert(linear_index(offset, 4, 5) as u16, *block);
+        }
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(1, 2, 3), chunk);
+
+        // Slot 9 is the first main-inventory slot, so the legacy hotbar
+        // projection stays empty and this item exercises `read_item` only.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[HOTBAR_SLOTS] = Some(Item::new(ItemId::Block(BlockId::Chest), 5).unwrap());
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let mut data = sample_data(player);
+        data.chunk_edits = edits;
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v6 survival palette must save");
+        assert_eq!(&bytes[4..8], &SURVIVAL_VERSION.to_le_bytes());
+        let loaded = load_world_from_bytes(&bytes).expect("v6 survival palette must load");
+
+        let loaded_chunk = loaded
+            .chunk_edits
+            .get(&ChunkPos::new(1, 2, 3))
+            .expect("edited chunk must round-trip");
+        for (offset, block) in SURVIVAL_ONLY_BLOCKS.iter().enumerate() {
+            assert_eq!(
+                loaded_chunk[&(linear_index(offset, 4, 5) as u16)],
+                *block,
+                "{block:?} chunk edit must round-trip"
+            );
+        }
+        assert_eq!(
+            loaded.player.inventory.main(0),
+            Some(Item::new(ItemId::Block(BlockId::Chest), 5).unwrap()),
+            "a v6 Chest item must round-trip"
+        );
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn test_v5_rejects_survival_only_block_edits_hotbar_and_chest_item() {
+        // Chunk-edit funnel: every v6-only id is a typed error on a v5
+        // payload, not a silently accepted block.
+        for block in SURVIVAL_ONLY_BLOCKS {
+            let bytes = v5_bytes_from_current(&v6_data_with_block_edit(block));
+            assert!(
+                matches!(
+                    load_world_from_bytes(&bytes),
+                    Err(PersistenceError::InvalidBlockId(raw)) if raw == block as u8
+                ),
+                "a v5 chunk edit may not claim {block:?}"
+            );
+        }
+
+        // Legacy-hotbar funnel: forge block id 16 into slot 0 of a byte-valid
+        // v5 save (36-byte header, then 9 * 3 hotbar bytes).
+        let mut bytes = v5_bytes_from_current(&sample_data(sample_player()));
+        bytes[V2_HOTBAR_OFFSET] = BlockId::Farmland as u8;
+        bytes[V2_HOTBAR_OFFSET + 1..V2_HOTBAR_OFFSET + 3].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidBlockId(16))
+        ));
+
+        // Item funnel: Chest is the only carryable new id. A v5 payload that
+        // claims one is corrupt; the identical v6 payload loads.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[HOTBAR_SLOTS] = Some(Item::new(ItemId::Block(BlockId::Chest), 5).unwrap());
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let data = sample_data(player);
+
+        let mut v6_bytes = Vec::new();
+        save_world_to_bytes(&mut v6_bytes, &data).expect("v6 Chest item must save");
+        let loaded = load_world_from_bytes(&v6_bytes).expect("v6 Chest item must load");
+        assert_eq!(loaded.player.inventory, data.player.inventory);
+
+        let v5_bytes = v5_bytes_from_current(&data);
+        assert!(matches!(
+            load_world_from_bytes(&v5_bytes),
+            Err(PersistenceError::InvalidBlockId(21))
         ));
     }
 
