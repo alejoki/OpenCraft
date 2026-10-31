@@ -7757,6 +7757,7 @@ mod tests {
 
     #[test]
     fn survival_mode_vitals_and_chests_survive_save_and_restart() {
+        use opencraft::player::container::Container;
         use opencraft::player::inventory::{ChestSlots, Item, ItemId, Material, CHEST_SLOTS};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7772,7 +7773,8 @@ mod tests {
         let mut chest: ChestSlots = [None; CHEST_SLOTS];
         chest[0] = Some(Item::new(ItemId::Material(Material::Apple), 3).expect("apple"));
         chest[26] = Some(Item::new(ItemId::Material(Material::Bread), 1).expect("bread"));
-        session.chests.insert(IVec3::new(2, 30, -5), chest);
+        let chest = Container::from_slots(chest);
+        session.chests.insert(IVec3::new(2, 30, -5), chest.clone());
 
         // A stale fly byte must not leak through the save writer: the persisted
         // mode canonicalises it to false even though the field itself is true.
@@ -7792,6 +7794,14 @@ mod tests {
         );
         assert_eq!(loaded.chests.len(), 1);
         assert_eq!(loaded.chests[&IVec3::new(2, 30, -5)], chest);
+        assert_eq!(
+            loaded.chests[&IVec3::new(2, 30, -5)].slot(0),
+            Some(Item::new(ItemId::Material(Material::Apple), 3).expect("apple"))
+        );
+        assert_eq!(
+            loaded.chests[&IVec3::new(2, 30, -5)].slot(26),
+            Some(Item::new(ItemId::Material(Material::Bread), 1).expect("bread"))
+        );
 
         let restored = WorldSession::session_from_save(loaded, save_path.clone());
         assert_eq!(restored.save_mode, GameMode::Survival);

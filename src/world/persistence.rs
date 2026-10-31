@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use glam::IVec3;
 use rustc_hash::FxHashMap;
 
+use crate::player::container::Container;
 use crate::player::inventory::{
     ChestSlots, CraftingGrid, GridKind, Hotbar, Inventory, Item, ItemError, ItemId, ItemStack,
     Material, ToolKind, ToolTier, CHEST_SLOTS, HOTBAR_SLOTS, INVENTORY_SLOTS, MAX_GRID_SLOTS,
@@ -289,7 +290,7 @@ pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
 /// Persisted world chests keyed by their absolute block position. Every chest
 /// owns exactly [`CHEST_SLOTS`] validated item slots, including an all-empty
 /// chest (which is written as-is rather than dropped).
-pub type ChestMap = FxHashMap<IVec3, ChestSlots>;
+pub type ChestMap = FxHashMap<IVec3, Container>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSaveData {
@@ -535,13 +536,13 @@ pub fn save_world_to_bytes(
     out.extend_from_slice(&data.player.survival.air().to_le_bytes());
     out.extend_from_slice(&chest_count.to_le_bytes());
 
-    let mut sorted_chests: Vec<(&IVec3, &ChestSlots)> = data.chests.iter().collect();
+    let mut sorted_chests: Vec<(&IVec3, &Container)> = data.chests.iter().collect();
     sorted_chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
-    for (pos, slots) in sorted_chests {
+    for (pos, container) in sorted_chests {
         out.extend_from_slice(&pos.x.to_le_bytes());
         out.extend_from_slice(&pos.y.to_le_bytes());
         out.extend_from_slice(&pos.z.to_le_bytes());
-        for slot in slots {
+        for slot in container.slots() {
             write_item(out, *slot);
         }
     }
@@ -867,7 +868,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             for slot in slots.iter_mut() {
                 *slot = read_item(&mut cur, version)?;
             }
-            chests.insert(pos, slots);
+            chests.insert(pos, Container::from_slots(slots));
         }
         (mode, survival, chests)
     } else {
@@ -2048,11 +2049,11 @@ mod tests {
     // v6 survival tail: mode, vitals, chests
     // ------------------------------------------------------------------
 
-    fn survival_chest() -> ChestSlots {
+    fn survival_chest() -> Container {
         let mut chest: ChestSlots = [None; CHEST_SLOTS];
         chest[0] = Some(Item::new(ItemId::Material(Material::Bread), 3).unwrap());
         chest[26] = Some(Item::new(ItemId::Material(Material::Apple), 2).unwrap());
-        chest
+        Container::from_slots(chest)
     }
 
     fn v6_data_with_chests(chests: ChestMap) -> WorldSaveData {
@@ -2064,7 +2065,7 @@ mod tests {
         data
     }
 
-    fn v6_bytes_with_chest(chest: ChestSlots) -> Vec<u8> {
+    fn v6_bytes_with_chest(chest: Container) -> Vec<u8> {
         let mut chests = ChestMap::default();
         chests.insert(IVec3::new(1, 2, 3), chest);
         let data = v6_data_with_chests(chests);
@@ -2074,7 +2075,7 @@ mod tests {
     }
 
     fn v6_bytes_with_one_empty_chest() -> Vec<u8> {
-        let bytes = v6_bytes_with_chest([None; CHEST_SLOTS]);
+        let bytes = v6_bytes_with_chest(Container::empty());
         assert_eq!(
             bytes.len(),
             V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS,
@@ -2096,7 +2097,7 @@ mod tests {
 
         let mut chests = ChestMap::default();
         chests.insert(IVec3::new(4, -2, 7), survival_chest());
-        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        chests.insert(IVec3::new(-1, 0, 3), Container::empty());
         let data = v6_data_with_chests(chests);
 
         let mut bytes = Vec::new();
@@ -2173,14 +2174,17 @@ mod tests {
         );
         assert_eq!(loaded.chests.len(), 2);
         assert_eq!(
-            loaded.chests[&IVec3::new(4, -2, 7)][0],
+            loaded.chests[&IVec3::new(4, -2, 7)].slot(0),
             Some(Item::new(ItemId::Material(Material::Bread), 3).unwrap())
         );
         assert_eq!(
-            loaded.chests[&IVec3::new(4, -2, 7)][26],
+            loaded.chests[&IVec3::new(4, -2, 7)].slot(26),
             Some(Item::new(ItemId::Material(Material::Apple), 2).unwrap())
         );
-        assert_eq!(loaded.chests[&IVec3::new(-1, 0, 3)], [None; CHEST_SLOTS]);
+        assert_eq!(
+            loaded.chests[&IVec3::new(-1, 0, 3)],
+            Container::empty()
+        );
 
         // Re-saving a loaded world reproduces the exact bytes, and insertion
         // order is irrelevant because records are sorted before writing.
@@ -2189,7 +2193,7 @@ mod tests {
         assert_eq!(again, bytes);
 
         let mut reversed = ChestMap::default();
-        reversed.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        reversed.insert(IVec3::new(-1, 0, 3), Container::empty());
         reversed.insert(IVec3::new(4, -2, 7), survival_chest());
         let mut reversed_bytes = Vec::new();
         save_world_to_bytes(&mut reversed_bytes, &v6_data_with_chests(reversed)).unwrap();
@@ -2197,6 +2201,35 @@ mod tests {
             reversed_bytes, bytes,
             "sorted chest records make the wire independent of insertion order"
         );
+    }
+
+    #[test]
+    fn test_v6_present_empty_chest_is_distinct_from_missing_position() {
+        // A missing position and a stored all-empty container are different
+        // world states: only the latter survives a reload as a present record.
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(-1, 0, 3), Container::empty());
+        let data = v6_data_with_chests(chests);
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let loaded = load_world_from_bytes(&bytes).expect("v6 must load");
+
+        assert_eq!(loaded.chests.len(), 1, "an empty chest is not dropped");
+        assert_eq!(
+            loaded.chests.get(&IVec3::new(-1, 0, 3)),
+            Some(&Container::empty())
+        );
+        assert!(
+            loaded.chests.get(&IVec3::new(0, 0, 0)).is_none(),
+            "a position without a record stays missing"
+        );
+        // The present-empty record still occupies its full 12 + 27 bytes and
+        // re-saves byte-identically.
+        assert_eq!(bytes.len(), V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS);
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).unwrap();
+        assert_eq!(again, bytes);
     }
 
     #[test]
@@ -2348,7 +2381,7 @@ mod tests {
         // Unknown block id inside a chest slot.
         let mut slot0: ChestSlots = [None; CHEST_SLOTS];
         slot0[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 1).unwrap());
-        let mut bytes = v6_bytes_with_chest(slot0);
+        let mut bytes = v6_bytes_with_chest(Container::from_slots(slot0));
         bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 99;
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -2359,7 +2392,7 @@ mod tests {
         // the carryable-block funnel as before.
         let mut water_slot: ChestSlots = [None; CHEST_SLOTS];
         water_slot[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 1).unwrap());
-        let mut bytes = v6_bytes_with_chest(water_slot);
+        let mut bytes = v6_bytes_with_chest(Container::from_slots(water_slot));
         bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = BlockId::Water as u8;
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -2369,7 +2402,7 @@ mod tests {
         // Unknown material id inside a chest slot.
         let mut material_slot: ChestSlots = [None; CHEST_SLOTS];
         material_slot[0] = Some(Item::new(ItemId::Material(Material::Bread), 1).unwrap());
-        let mut bytes = v6_bytes_with_chest(material_slot);
+        let mut bytes = v6_bytes_with_chest(Container::from_slots(material_slot));
         bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -2380,7 +2413,7 @@ mod tests {
         let mut tool_slot: ChestSlots = [None; CHEST_SLOTS];
         tool_slot[0] =
             Some(Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 10).unwrap());
-        let mut bytes = v6_bytes_with_chest(tool_slot);
+        let mut bytes = v6_bytes_with_chest(Container::from_slots(tool_slot));
         bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
         assert!(matches!(
             load_world_from_bytes(&bytes),

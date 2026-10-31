@@ -322,7 +322,8 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::{ChestSlots, Item, ItemId, Material, CHEST_SLOTS};
+    use crate::player::container::Container;
+    use crate::player::inventory::{Item, ItemId, Material};
     use crate::player::survival::{GameMode, SurvivalState};
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
@@ -354,13 +355,13 @@ mod tests {
         }
     }
 
-    fn chest_with_items() -> ChestSlots {
-        let mut chest: ChestSlots = [None; CHEST_SLOTS];
+    fn chest_with_items() -> Container {
+        let mut chest = [None; crate::player::inventory::CHEST_SLOTS];
         chest[0] =
             Some(Item::new(ItemId::Block(crate::world::block::BlockId::Stone), 7).expect("stone"));
         chest[13] = Some(Item::new(ItemId::Material(Material::Apple), 1).expect("apple"));
         chest[26] = Some(Item::new(ItemId::Material(Material::Bread), 2).expect("bread"));
-        chest
+        Container::from_slots(chest)
     }
 
     #[test]
@@ -534,8 +535,8 @@ mod tests {
     fn session_from_save_restores_survival_vitals_and_chests_without_flight() {
         let chest = chest_with_items();
         let mut chests = ChestMap::default();
-        chests.insert(IVec3::new(4, -2, 7), chest);
-        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        chests.insert(IVec3::new(4, -2, 7), chest.clone());
+        chests.insert(IVec3::new(-1, 0, 3), Container::empty());
 
         let mut data = make_save(88u32);
         data.mode = GameMode::Survival;
@@ -552,7 +553,10 @@ mod tests {
         );
         assert_eq!(session.chests, chests);
         assert_eq!(session.chests[&IVec3::new(4, -2, 7)], chest);
-        assert_eq!(session.chests[&IVec3::new(-1, 0, 3)], [None; CHEST_SLOTS]);
+        assert_eq!(
+            session.chests[&IVec3::new(-1, 0, 3)],
+            Container::empty()
+        );
         assert!(
             !session.player.fly_mode,
             "a Survival save cannot restore a flying player"
@@ -604,7 +608,7 @@ mod tests {
         let chest = chest_with_items();
         let mut chests = ChestMap::default();
         chests.insert(IVec3::new(3, 40, -2), chest);
-        chests.insert(IVec3::new(-1, 0, 3), [None; CHEST_SLOTS]);
+        chests.insert(IVec3::new(-1, 0, 3), Container::empty());
 
         let vitals = SurvivalState::new(7, 3, 12).expect("in-range vitals");
         let mut data = make_save(60606u32);
