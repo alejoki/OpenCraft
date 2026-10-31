@@ -13,7 +13,7 @@ use glam::{IVec3, Vec3};
 
 use crate::player::camera::Camera;
 use crate::player::container::Container;
-use crate::player::inventory::{InventoryError, Item, ItemId};
+use crate::player::inventory::{ChestSlots, InventoryError, Item, ItemId, CHEST_SLOTS};
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
@@ -22,10 +22,11 @@ use crate::player::survival::{
 use crate::world::block::BlockId;
 use crate::world::chunk::world_to_chunk_and_local;
 use crate::world::daycycle::GameClock;
+use crate::world::loot::LootEntry;
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
-use crate::world::terrain::{find_spawn_column, terrain_height_at_seeded};
+use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
 /// reachable. Shared with the placement/mining ray length so every world
@@ -358,8 +359,10 @@ impl WorldSession {
 
     /// The contents of the open chest, if one is open and has a record.
     ///
-    /// An opened-but-untouched chest has no record yet, so this is `None`
-    /// rather than an empty container; the caller treats both as empty.
+    /// A generated LootChest materializes its deterministic record on first
+    /// open, so it has contents here; a plain chest that has never been
+    /// touched has no record, so this is `None` rather than an empty
+    /// container and the caller treats both as empty.
     pub fn open_chest_contents(&self) -> Option<&Container> {
         self.open_chest.and_then(|pos| self.chests.get(&pos))
     }
@@ -367,7 +370,9 @@ impl WorldSession {
     /// The persisted contents at `pos`, or `None` when no record exists.
     ///
     /// This is the record-lifecycle read: `None` means the chest was never
-    /// touched, `Some(Container::empty())` means it was emptied.
+    /// touched (or is not a generated ruin chest), `Some(Container::empty())`
+    /// means it was emptied. A generated LootChest gets a record on its first
+    /// open, so it reports `Some` from then on.
     pub fn chest_at(&self, pos: IVec3) -> Option<&Container> {
         self.chests.get(&pos)
     }
@@ -375,14 +380,15 @@ impl WorldSession {
     /// Everything a broken chest drops: its contents in slot order followed
     /// by exactly one chest item.
     ///
-    /// A missing or empty record still yields the chest item, so the caller's
-    /// all-or-nothing insertion preflight sees the same drop shape either way.
+    /// When no record exists, a generated LootChest derives the same contents
+    /// first open would materialize, so the caller's all-or-nothing insertion
+    /// preflight sees the loot that would otherwise be lost. A missing or
+    /// empty record on any other block still yields the chest item alone.
     pub fn chest_break_items(&self, pos: IVec3) -> Vec<Item> {
-        let mut items = self
-            .chests
-            .get(&pos)
-            .map(Container::contents)
-            .unwrap_or_default();
+        let mut items = match self.chests.get(&pos) {
+            Some(record) => record.contents(),
+            None => self.derived_loot_items(pos).unwrap_or_default(),
+        };
         items.push(
             Item::new(ItemId::Block(BlockId::Chest), 1)
                 .expect("one chest block is a valid single-item stack"),
@@ -462,9 +468,13 @@ impl WorldSession {
     /// container and the player's eye is within [`TABLE_INTERACT_REACH`].
     ///
     /// `pos` is untrusted, so the world is re-read at interaction time. A
+    /// generated LootChest materializes its deterministic record on first
+    /// open (a repeat open reuses it); a plain Chest still creates no record
+    /// until a player transfer touches it. A LootChest outside a generated
+    /// ruin opens empty rather than guessing a neighbouring table. A
     /// missing/wrong/replaced/out-of-reach coordinate returns `false` and
-    /// mutates nothing, so a failed interaction cannot close a station that is
-    /// already open. A successful open clears any open crafting table.
+    /// mutates nothing, so a failed interaction cannot close a station that
+    /// is already open. A successful open clears any open crafting table.
     pub fn open_chest_at(&mut self, pos: IVec3) -> bool {
         if !self
             .world
@@ -476,6 +486,7 @@ impl WorldSession {
         if !self.station_within_reach(pos) {
             return false;
         }
+        self.materialize_loot_chest(pos);
         self.open_chest = Some(pos);
         self.open_table = None;
         true
@@ -577,6 +588,62 @@ impl WorldSession {
         let closest = eye.clamp(min, min + Vec3::ONE);
         eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
     }
+
+    /// The deterministic loot a generated ruin chest at `pos` would hold, in
+    /// slot order, or `None` when `pos` is not a live generated LootChest.
+    ///
+    /// The live-block check is what keeps a player-placed plain Chest (or a
+    /// LootChest placed outside a ruin) from ever deriving ruin loot.
+    fn derived_loot_items(&self, pos: IVec3) -> Option<Vec<Item>> {
+        if self.world.get_block(pos.x, pos.y, pos.z) != BlockId::LootChest {
+            return None;
+        }
+        let entries = ruin_loot_chest_at(pos, self.world.seed())?;
+        loot_items(&entries)
+    }
+
+    /// Gives a generated LootChest its deterministic record on first open.
+    ///
+    /// A repeat open reuses the existing record, and a non-LootChest or a
+    /// LootChest outside a generated ruin opens empty. Opening deliberately
+    /// does not mark the world unsaved: materializing generated contents is
+    /// not a player content change, and a plain chest still creates no record
+    /// until a transfer touches it.
+    fn materialize_loot_chest(&mut self, pos: IVec3) {
+        if self.chests.contains_key(&pos) {
+            return;
+        }
+        let Some(items) = self.derived_loot_items(pos) else {
+            return;
+        };
+        let mut slots: ChestSlots = [None; CHEST_SLOTS];
+        for (slot, item) in slots.iter_mut().zip(items) {
+            *slot = Some(item);
+        }
+        self.chests.insert(pos, Container::from_slots(slots));
+    }
+}
+
+/// Maps a world-local loot table onto validated inventory items.
+///
+/// Fails closed on malformed data instead of inventing partial loot: an empty
+/// table, more entries than a chest has slots, a zero count, or a range the
+/// generator failed to roll all reject the whole batch. The M008 table is
+/// guaranteed non-empty with degenerate ranges, so any rejection means the
+/// world/local vocabulary drifted.
+fn loot_items(entries: &[LootEntry]) -> Option<Vec<Item>> {
+    if entries.is_empty() || entries.len() > CHEST_SLOTS {
+        return None;
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.min_count == 0 || entry.min_count != entry.max_count {
+                return None;
+            }
+            Item::new(ItemId::from(entry.item), entry.min_count).ok()
+        })
+        .collect()
 }
 
 /// Why a chest-slot command was rejected.
@@ -1867,6 +1934,297 @@ mod tests {
             1,
             "the chest drops exactly once"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ruin LootChest materialization and unopened-break spill
+    // -----------------------------------------------------------------------
+
+    /// Every generated LootChest in a bounded chunk region (radius, cy 0..=2,
+    /// Summer), scanned through the same `generate_chunk_seeded` seam
+    /// worldgen uses.
+    fn generated_loot_chests(seed: u32, radius: i32) -> Vec<IVec3> {
+        use crate::world::chunk::{ChunkPos, CHUNK_SIZE};
+        use crate::world::terrain::generate_chunk_seeded;
+
+        let mut chests = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for cy in 0..=2 {
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                if chunk.get(lx, ly, lz) == BlockId::LootChest {
+                                    chests.push(IVec3::new(
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        chests
+    }
+
+    /// The first generated LootChest in the region; fails loudly rather than
+    /// letting the test pass vacuously.
+    fn generated_loot_chest(seed: u32, radius: i32) -> IVec3 {
+        let chests = generated_loot_chests(seed, radius);
+        assert!(
+            !chests.is_empty(),
+            "no generated LootChest in the {radius}-chunk region for seed {seed}"
+        );
+        chests[0]
+    }
+
+    /// Inserts the generated chunk that owns `pos`, so the live world holds
+    /// the same LootChest the seed's worldgen produces.
+    fn insert_generated_chunk(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> crate::world::chunk::ChunkPos {
+        use crate::world::terrain::generate_chunk_seeded;
+
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let chunk = generate_chunk_seeded(chunk_pos, session.world.seed(), Season::Summer);
+        session.world.insert_chunk_for_test(chunk_pos, chunk);
+        chunk_pos
+    }
+
+    /// The validated inventory items a generated chest's table yields, in
+    /// slot order.
+    fn loot_chest_items(pos: IVec3, seed: u32) -> Vec<Item> {
+        ruin_loot_chest_at(pos, seed)
+            .expect("a generated LootChest must resolve its own table")
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count).expect("valid loot stack")
+            })
+            .collect()
+    }
+
+    /// Takes every non-empty chest stack through the real click seam and puts
+    /// each on an empty inventory slot.
+    fn take_all_from_open_chest(session: &mut WorldSession) {
+        for index in 0..CHEST_SLOTS {
+            let occupied = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(index))
+                .is_some();
+            if !occupied {
+                continue;
+            }
+            session
+                .click_open_chest_slot(index)
+                .expect("chest slot into the cursor");
+            let empty = (0..crate::player::inventory::INVENTORY_SLOTS)
+                .find(|&slot| session.player.inventory().slot(slot).is_none())
+                .expect("an empty inventory slot accepts the stack");
+            session
+                .player
+                .click_inventory_slot(empty)
+                .expect("cursor into the inventory");
+        }
+        assert!(
+            session.player.inventory().cursor().is_none(),
+            "every taken stack was deposited"
+        );
+    }
+
+    #[test]
+    fn loot_items_fails_closed_on_malformed_tables() {
+        use crate::world::loot::{LootEntry, LootItem};
+
+        let valid = LootEntry {
+            item: LootItem::Wheat,
+            min_count: 2,
+            max_count: 2,
+        };
+        assert_eq!(loot_items(&[]), None, "an empty table is malformed");
+        let oversized = [valid; CHEST_SLOTS + 1];
+        assert!(
+            loot_items(&oversized).is_none(),
+            "more entries than chest slots is malformed"
+        );
+        assert!(
+            loot_items(&[LootEntry {
+                min_count: 0,
+                max_count: 0,
+                ..valid
+            }])
+            .is_none(),
+            "a zero count is malformed"
+        );
+        assert!(
+            loot_items(&[LootEntry {
+                min_count: 1,
+                max_count: 2,
+                ..valid
+            }])
+            .is_none(),
+            "an unrolled range is malformed"
+        );
+        assert_eq!(
+            loot_items(&[valid]),
+            Some(vec![
+                Item::new(ItemId::from(valid.item), 2).expect("a valid wheat stack")
+            ]),
+            "a well-formed table maps in slot order"
+        );
+    }
+
+    #[test]
+    fn a_generated_ruin_loot_chest_materializes_deterministic_contents_on_first_open() {
+        let seed = 37u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/loot-first-open.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = generated_loot_chest(seed, 3);
+        insert_generated_chunk(&mut session, pos);
+        aim_down_at(&mut session, pos);
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest
+        );
+        assert!(
+            session.chest_at(pos).is_none(),
+            "no record before the first open"
+        );
+        assert!(!session.world.has_unsaved_changes());
+
+        assert!(session.open_chest_at(pos));
+
+        let expected = loot_chest_items(pos, seed);
+        assert_eq!(
+            session.chest_at(pos).map(Container::contents),
+            Some(expected.clone()),
+            "first open materializes the deterministic table"
+        );
+        assert_eq!(
+            session.open_chest_contents().map(Container::contents),
+            Some(expected)
+        );
+        assert_eq!(session.chests.len(), 1, "exactly one record");
+        assert!(
+            !session.world.has_unsaved_changes(),
+            "materializing generated loot is not a player content change"
+        );
+    }
+
+    #[test]
+    fn emptying_a_ruin_loot_chest_persists_a_present_empty_record_across_save_and_reload() {
+        use crate::world::persistence::{
+            load_world_from_path, save_world_to_path, SavedPlayerState,
+        };
+
+        let seed = 37u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/loot-empty.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = generated_loot_chest(seed, 3);
+        insert_generated_chunk(&mut session, pos);
+        aim_down_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+        take_all_from_open_chest(&mut session);
+
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "a looted chest keeps a present-empty record"
+        );
+        assert!(session.world.has_unsaved_changes());
+
+        let data = WorldSaveData {
+            seed: session.world.seed(),
+            time_of_day: session.clock.time_of_day,
+            day_index: session.clock.day_index,
+            season_length_days: session.season_length_days,
+            mode: session.save_mode,
+            player: SavedPlayerState {
+                position: session.player.position.to_array(),
+                yaw: session.player.yaw,
+                pitch: session.player.pitch,
+                fly_mode: session.player.fly_mode,
+                selected_slot: session.player.selected_slot() as u8,
+                render_distance: session.world.render_distance() as u16,
+                inventory: session.player.inventory().clone(),
+                player_grid: session.player.player_grid().clone(),
+                table_grid: session.player.table_grid().clone(),
+                survival: session.player.survival,
+            },
+            chests: session.chests.clone(),
+            chunk_edits: session.world.chunk_edits().clone(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loot-empty.mcvx");
+        save_world_to_path(&path, &data).expect("the save writes");
+        let loaded = load_world_from_path(&path).expect("the save loads");
+        let mut restored = WorldSession::session_from_save(loaded, path);
+        insert_generated_chunk(&mut restored, pos);
+
+        assert_eq!(
+            restored.chest_at(pos),
+            Some(&Container::empty()),
+            "reload must not re-roll a looted chest"
+        );
+        assert!(restored.open_chest_at(pos));
+        assert_eq!(
+            restored.open_chest_contents(),
+            Some(&Container::empty()),
+            "the reloaded chest stays present-empty"
+        );
+    }
+
+    #[test]
+    fn an_arbitrary_loot_chest_opens_empty_without_a_record() {
+        let mut session = chest_session();
+        let pos = IVec3::new(0, 5, 0);
+        place_block(&mut session, pos, BlockId::LootChest);
+        aim_down_at(&mut session, pos);
+
+        assert!(session.open_chest_at(pos));
+        assert!(
+            session.chests.is_empty(),
+            "a LootChest outside a generated ruin opens empty"
+        );
+        assert_eq!(session.open_chest_contents(), None);
+    }
+
+    #[test]
+    fn an_unopened_ruin_loot_chest_derives_break_items_without_mutating() {
+        let seed = 37u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/loot-break-items.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = generated_loot_chest(seed, 3);
+        insert_generated_chunk(&mut session, pos);
+        assert!(session.chests.is_empty());
+
+        let mut expected = loot_chest_items(pos, seed);
+        expected.push(chest_item());
+
+        assert_eq!(
+            session.chest_break_items(pos),
+            expected,
+            "an unopened chest derives the same loot first open would materialize"
+        );
+        assert!(
+            session.chests.is_empty(),
+            "deriving break items creates no record"
+        );
+        assert!(!session.world.has_unsaved_changes());
     }
 
     // -----------------------------------------------------------------------

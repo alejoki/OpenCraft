@@ -318,11 +318,13 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
     if session.world.get_block(pos.x, pos.y, pos.z) != block {
         return BreakOutcome::Rejected(BreakRejection::StaleTarget);
     }
-    // A chest break drops its whole contents plus the chest item itself. The
-    // batch preflight is the only correct capacity test (heterogeneous stacks
-    // compete for the same mergeable room), and it runs before the edit, the
-    // wear, and the record change so a refusal leaves every byte untouched.
-    let chest_items = if block == BlockId::Chest {
+    // A chest or loot-chest break drops its whole contents plus the container
+    // item itself. The batch preflight is the only correct capacity test
+    // (heterogeneous stacks compete for the same mergeable room), and it runs
+    // before the edit, the wear, and the record change so a refusal leaves
+    // every byte untouched. An unopened generated LootChest derives the same
+    // contents first open would materialize, so its loot is never lost.
+    let chest_items = if block.is_container_interactable() {
         let items = session.chest_break_items(pos);
         if !session.player.can_insert_items(&items) {
             return BreakOutcome::Rejected(BreakRejection::ChestNoRoom);
@@ -8114,6 +8116,74 @@ mod tests {
         }
     }
 
+    /// The first generated LootChest in a bounded chunk region (radius, cy
+    /// 0..=2, Summer), scanned through worldgen exactly as the session derives
+    /// its table. Panics with the region/seed when the fixture is empty.
+    fn find_generated_loot_chest(seed: u32, radius: i32) -> IVec3 {
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for cy in 0..=2 {
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                if chunk.get(lx, ly, lz) == BlockId::LootChest {
+                                    return IVec3::new(
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no generated LootChest for seed {seed} in the {radius}-chunk region");
+    }
+
+    /// Inserts the generated chunk that owns `pos` plus uniform-Air face
+    /// neighbours, so `set_block_immediate` can remesh a break at `pos`.
+    fn insert_generated_chunk_with_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let chunk = generate_chunk_seeded(chunk_pos, session.world.seed(), Season::Summer);
+        session.world.insert_chunk_for_test(chunk_pos, chunk);
+        for neighbour in [
+            ChunkPos::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1),
+        ] {
+            if neighbour != chunk_pos {
+                session
+                    .world
+                    .insert_chunk_for_test(neighbour, Chunk::new_uniform(BlockId::Air));
+            }
+        }
+        chunk_pos
+    }
+
+    /// The validated inventory items a generated ruin chest's table yields, in
+    /// slot order.
+    fn generated_loot_stacks(pos: IVec3, seed: u32) -> Vec<Item> {
+        use opencraft::world::terrain::ruin_loot_chest_at;
+
+        ruin_loot_chest_at(pos, seed)
+            .expect("a generated LootChest must resolve its own table")
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count).expect("valid loot stack")
+            })
+            .collect()
+    }
+
     /// Camera looking straight down at the stone placed by the placement tests.
     fn aim_placement_camera(session: &mut WorldSession) {
         session.camera.position = Vec3::new(0.5, 10.0, 0.5);
@@ -14702,6 +14772,197 @@ mod tests {
             .map(Item::count)
             .sum();
         assert_eq!(chest_items, 1, "an empty chest drops exactly one chest");
+    }
+
+    #[test]
+    fn breaking_an_unopened_loot_chest_spills_derived_loot_and_one_chest_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 73u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest
+        );
+
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::LootChest));
+
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Air);
+        assert!(
+            session.chest_at(pos).is_none(),
+            "no record exists for a never-opened chest"
+        );
+
+        let mut expected = generated_loot_stacks(pos, seed);
+        expected
+            .push(Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item is valid"));
+        let stored: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            stored, expected,
+            "the unopened chest spills the same table first open would materialize, plus one chest"
+        );
+    }
+
+    #[test]
+    fn breaking_an_unopened_loot_chest_with_a_full_inventory_is_refused_untouched() {
+        use opencraft::player::inventory::{Inventory, Item, ToolKind, ToolTier, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 74u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+
+        // 36 non-stackable tools: the derived stacks plus the chest item
+        // cannot fit, so the all-or-nothing preflight must refuse.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::LootChest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the unopened-chest break"
+        );
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest,
+            "the refused break edits nothing"
+        );
+        assert!(
+            session.chest_at(pos).is_none(),
+            "a refused break creates no record"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "a refused break does not partially insert the derived loot"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "a refused break spends no durability"
+        );
+    }
+
+    #[test]
+    fn breaking_a_looted_loot_chest_drops_only_the_chest_item() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{Inventory, Item, ItemId, CHEST_SLOTS, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 75u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-looted.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        aim_table_interaction_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        // Take every stack through the real chest click seam.
+        for index in 0..CHEST_SLOTS {
+            let occupied = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(index))
+                .is_some();
+            if !occupied {
+                continue;
+            }
+            session
+                .click_open_chest_slot(index)
+                .expect("chest slot into the cursor");
+            let empty = (0..INVENTORY_SLOTS)
+                .find(|&slot| session.player.inventory().slot(slot).is_none())
+                .expect("an empty inventory slot accepts the stack");
+            session
+                .player
+                .click_inventory_slot(empty)
+                .expect("cursor into the inventory");
+        }
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "the looted chest keeps a present-empty record"
+        );
+        let looted: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(looted, generated_loot_stacks(pos, seed));
+
+        // Pocket the loot away: the break must not re-derive a table the
+        // present-empty record already spent.
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::LootChest));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Air);
+        assert!(session.chest_at(pos).is_none());
+        let stored: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            stored,
+            vec![Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item is valid")],
+            "a looted chest drops only the chest item"
+        );
     }
 
     #[test]
