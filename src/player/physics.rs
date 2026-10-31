@@ -4,6 +4,7 @@ use crate::player::inventory::{
     CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack,
     RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
+use crate::player::survival::{GameMode, SurvivalState};
 use crate::world::block::BlockId;
 
 /// Errors from the narrow inventory-screen command façade.
@@ -116,6 +117,12 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub fly_mode: bool,
+    /// Persisted vitals. Constructed only through checked `SurvivalState`
+    /// constructors, so an out-of-range save record never reaches this field.
+    pub survival: SurvivalState,
+    /// Effective mode. Private with a mode checked by `GameMode::allows_fly`;
+    /// `fly_mode` alone can never grant Survival flight.
+    mode: GameMode,
     /// Selected hotbar slot, always in `0..HOTBAR_SLOTS`. Private so the only
     /// ways to change it are the bounds-checked methods below; session restore
     /// cannot publish an out-of-range selection.
@@ -158,11 +165,68 @@ impl Player {
             pitch: -0.25,
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
+            // Fresh players stay Creative so every pre-M008 CLI demo, smoke, and
+            // physics test keeps its flying default. `new_with_mode` (and later
+            // session restore) overwrites both fields explicitly.
+            survival: SurvivalState::full(),
+            mode: GameMode::Creative,
             selected_slot: 0,
             inventory: Inventory::empty(),
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
         }
+    }
+
+    /// Builds a fresh player in `mode`.
+    ///
+    /// Starts from [`Player::new`] so the position/velocity/inventory/grid
+    /// defaults are identical to the Creative constructor, then applies the
+    /// mode rule. A Survival player walks (fly toggle off); a Creative player
+    /// keeps the inherited flying default.
+    pub fn new_with_mode(position: Vec3, mode: GameMode) -> Self {
+        let mut player = Self::new(position);
+        player.set_mode(mode);
+        player
+    }
+
+    /// The effective game mode.
+    pub const fn mode(&self) -> GameMode {
+        self.mode
+    }
+
+    /// Sets the effective mode.
+    ///
+    /// Survival structurally forces the fly toggle off; Creative does not
+    /// re-enable it, so switching Creative -> Survival -> Creative leaves the
+    /// player walking until it explicitly turns flight back on.
+    pub fn set_mode(&mut self, mode: GameMode) {
+        self.mode = mode;
+        if !mode.allows_fly() {
+            self.fly_mode = false;
+        }
+    }
+
+    /// Whether the player can actually fly right now.
+    ///
+    /// Only a Creative mode with the toggle on passes. Survival is rejected by
+    /// `GameMode::allows_fly`, so assigning `fly_mode = true` by hand (or a
+    /// future decode bug) still cannot make a Survival player fly.
+    pub const fn can_fly(&self) -> bool {
+        self.fly_mode && self.mode.allows_fly()
+    }
+
+    /// Toggles flight for a mode that allows it.
+    ///
+    /// Returns `false` and mutates nothing in Survival. In Creative it flips the
+    /// toggle, zeroes the velocity so the mode switch cannot carry momentum
+    /// into (or out of) a different movement rule, and returns `true`.
+    pub fn toggle_fly(&mut self) -> bool {
+        if !self.mode.allows_fly() {
+            return false;
+        }
+        self.fly_mode = !self.fly_mode;
+        self.velocity = Vec3::ZERO;
+        true
     }
 
     /// Rebuilds a player from a persisted aggregate (session restore).
@@ -511,7 +575,7 @@ impl Player {
             move_dir = move_dir.normalize();
         }
 
-        if self.fly_mode {
+        if self.can_fly() {
             let speed = if input.sprint { 48.0 } else { 18.0 };
             let mut vel = move_dir * speed;
             if input.jump_or_up {
@@ -1904,5 +1968,123 @@ mod tests {
             lowest < start_y - 2.0,
             "an idle body must sink away from the water surface (start {start_y}, lowest {lowest})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M008: game modes and the structurally gated flight rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_player_is_creative_full_and_flying() {
+        let player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert_eq!(player.survival, SurvivalState::full());
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn new_with_mode_survival_walks_with_full_vitals() {
+        let player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        assert_eq!(player.mode(), GameMode::Survival);
+        assert_eq!(player.survival, SurvivalState::full());
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+    }
+
+    #[test]
+    fn new_with_mode_creative_flies() {
+        let player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Creative);
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn set_mode_survival_disables_fly() {
+        let mut player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert!(player.can_fly());
+        player.set_mode(GameMode::Survival);
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+    }
+
+    #[test]
+    fn set_mode_creative_does_not_re_enable_fly() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        player.set_mode(GameMode::Creative);
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+        // An explicit toggle is still available once the mode allows it.
+        assert!(player.toggle_fly());
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn toggle_fly_creative_toggles_and_zeroes_velocity() {
+        let mut player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        player.velocity = Vec3::new(1.0, -2.0, 3.0);
+        assert!(player.toggle_fly());
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+        assert_eq!(player.velocity, Vec3::ZERO);
+
+        player.velocity = Vec3::new(-4.0, 5.0, -6.0);
+        assert!(player.toggle_fly());
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+        assert_eq!(player.velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn toggle_fly_survival_is_a_no_op() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        player.fly_mode = true; // stale hand-set flag: still structurally gated
+        player.velocity = Vec3::new(1.0, 2.0, 3.0);
+        assert!(!player.toggle_fly());
+        assert!(player.fly_mode, "Survival toggle must mutate nothing");
+        assert!(!player.can_fly());
+        assert_eq!(player.velocity, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn survival_update_falls_under_gravity_even_with_fly_flag_true() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 60.0, 0.5), GameMode::Survival);
+        player.fly_mode = true;
+        let start_y = player.position.y;
+        let idle = InputState::default();
+        for _ in 0..30 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(
+            player.position.y < start_y - 1.0,
+            "Survival must fall, not hover: {start_y} -> {}",
+            player.position.y
+        );
+        assert!(!player.on_ground);
+    }
+
+    #[test]
+    fn creative_update_still_uses_the_fly_branch() {
+        let mut player = Player::new(Vec3::new(0.5, 60.0, 0.5));
+        let start_y = player.position.y;
+        let up = InputState {
+            jump_or_up: true,
+            ..Default::default()
+        };
+        player.update(1.0 / 60.0, &up, |_, _, _| BlockId::Air);
+        assert!(
+            player.position.y > start_y,
+            "Creative flying must rise: {start_y} -> {}",
+            player.position.y
+        );
+        assert!(!player.on_ground);
+        // No gravity while flying: idle input leaves the position unchanged.
+        let hover_y = player.position.y;
+        player.update(1.0 / 60.0, &InputState::default(), |_, _, _| {
+            BlockId::Air
+        });
+        assert!((player.position.y - hover_y).abs() < 1e-6);
     }
 }
