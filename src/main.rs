@@ -7043,7 +7043,7 @@ mod tests {
         assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
         let loaded = app.current_pack.as_ref().expect("pack loaded");
         assert_eq!(loaded.display_name, "Alpha Pack");
-        assert_eq!(loaded.layers.len(), 16);
+        assert_eq!(loaded.layers.len(), 32);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
@@ -7107,7 +7107,7 @@ mod tests {
 
         assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
         let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(loaded.layers.len(), 16, "fallback still fully usable");
+        assert_eq!(loaded.layers.len(), 32, "fallback still fully usable");
         let message = app.menu.message.as_ref().expect("warning in the menu");
         assert!(
             message.text.contains("grass_top.png"),
@@ -7271,7 +7271,7 @@ mod tests {
             pack.logo.is_none(),
             "corrupt logo falls back to the text title"
         );
-        assert_eq!(pack.layers.len(), 16, "layers stay fully usable");
+        assert_eq!(pack.layers.len(), 32, "layers stay fully usable");
         assert!(
             warnings.iter().any(|w| w.field == "title.png"),
             "warning names the bare logo file: {warnings:?}"

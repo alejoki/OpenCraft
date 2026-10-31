@@ -1,5 +1,11 @@
 pub const TEX_SIZE: u32 = 16;
-pub const NUM_TEX_LAYERS: u32 = 16;
+/// Block texture array layers.
+///
+/// Layers 0..=22 are authored art (23 layers, see
+/// [`crate::pack::LAYER_FILES`]); layers 23..=31 are reserved built-in
+/// placeholders no pack can override. The WGSL `w1 & 255` pack stays the
+/// wire format because 32 fits in a byte with room to spare.
+pub const NUM_TEX_LAYERS: u32 = 32;
 pub const MIP_LEVELS: u32 = 5;
 
 #[inline]
@@ -34,8 +40,46 @@ fn make_layer<F: Fn(u32, u32, i32) -> [u8; 3]>(seed: u32, f: F) -> Vec<u8> {
     data
 }
 
+/// Deterministic wheat art shared by stages 17..=20: a soil-toned backdrop
+/// with vertical stalks that grow taller and ripen from green to gold as
+/// `stalk_height` and `ripeness` (0..=3) increase.
+fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
+    let green = [80i32, 148, 46];
+    let gold = [208i32, 172, 56];
+    let mix =
+        |channel: usize| green[channel] + (gold[channel] - green[channel]) * ripeness as i32 / 3;
+    make_layer(seed, move |x, y, j| {
+        let stalk = x % 4 == 1;
+        let jitter_top = (hash_pixel(x, 0, seed) % 2) as u32;
+        let top = 15u32.saturating_sub(stalk_height + jitter_top);
+        let on_stalk = stalk && y >= top;
+        let head = on_stalk && y + 3 > top;
+        if head {
+            [
+                clamp_u8(mix(0) + 20 + j / 2),
+                clamp_u8(mix(1) + 20 + j / 2),
+                clamp_u8(mix(2) + 10 + j / 2),
+            ]
+        } else if on_stalk {
+            [
+                clamp_u8(mix(0) + j),
+                clamp_u8(mix(1) + j),
+                clamp_u8(mix(2) + j),
+            ]
+        } else {
+            // Tilled soil backdrop so every wheat layer stays fully opaque.
+            let d = if (x / 4 + y / 4) % 2 == 0 { 0 } else { -7 };
+            [
+                clamp_u8(92 + d + j),
+                clamp_u8(68 + d + j),
+                clamp_u8(46 + d + j),
+            ]
+        }
+    })
+}
+
 pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
-    vec![
+    let mut layers = vec![
         // 0: Grass Top
         make_layer(1, |_, _, j| {
             [clamp_u8(88 + j), clamp_u8(168 + j * 2), clamp_u8(54 + j)]
@@ -185,7 +229,117 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 [v, v, clamp_u8(v as i32 + 3)]
             }
         }),
-    ]
+        // 16: Farmland - dirt with dark tilled furrows and raised ridges
+        make_layer(25, |x, y, j| {
+            let furrow = y % 5 == 2 || (y % 5 == 3 && x % 4 == 0);
+            let ridge = if y % 5 == 0 { 14 } else { 0 };
+            let d = if furrow { -34 } else { 0 };
+            [
+                clamp_u8(134 + d + ridge + j),
+                clamp_u8(96 + d / 2 + ridge + j),
+                clamp_u8(67 + d / 3 + ridge + j),
+            ]
+        }),
+        // 17: Wheat Stage 0 - short green sprouts
+        wheat_layer_rgba(26, 4, 0),
+        // 18: Wheat Stage 1 - taller green sprouts
+        wheat_layer_rgba(27, 7, 1),
+        // 19: Wheat Stage 2 - tall, greening gold
+        wheat_layer_rgba(28, 10, 2),
+        // 20: Wheat Stage 3 - full height, ripe golden wheat
+        wheat_layer_rgba(29, 13, 3),
+        // 21: Chest - plank body, dark band and latch
+        make_layer(30, |x, y, j| {
+            let border = x == 0 || y == 0 || x == 15 || y == 15;
+            let band = y == 6 || y == 7;
+            let latch = (x == 7 || x == 8) && (6..=8).contains(&y);
+            if border {
+                [
+                    clamp_u8(96 + j / 2),
+                    clamp_u8(62 + j / 2),
+                    clamp_u8(32 + j / 2),
+                ]
+            } else if latch {
+                [
+                    clamp_u8(232 + j / 2),
+                    clamp_u8(196 + j / 2),
+                    clamp_u8(72 + j / 2),
+                ]
+            } else if band {
+                [
+                    clamp_u8(78 + j / 2),
+                    clamp_u8(52 + j / 2),
+                    clamp_u8(28 + j / 2),
+                ]
+            } else {
+                let seam = y % 4 == 0;
+                let d = if seam { -22 } else { 0 };
+                [
+                    clamp_u8(176 + d + j),
+                    clamp_u8(132 + d + j),
+                    clamp_u8(74 + d + j),
+                ]
+            }
+        }),
+        // 22: Loot Chest - darker body with gold trim, distinct from 21
+        make_layer(31, |x, y, j| {
+            let border = x == 0 || y == 0 || x == 15 || y == 15;
+            let trim = x == 2 || x == 13 || y == 2 || y == 13;
+            let latch = (x == 7 || x == 8) && (6..=9).contains(&y);
+            if latch || (border && (x + y) % 3 == 0) {
+                [
+                    clamp_u8(238 + j / 3),
+                    clamp_u8(206 + j / 3),
+                    clamp_u8(88 + j / 3),
+                ]
+            } else if border {
+                [
+                    clamp_u8(56 + j / 2),
+                    clamp_u8(36 + j / 2),
+                    clamp_u8(78 + j / 2),
+                ]
+            } else if trim {
+                [
+                    clamp_u8(214 + j / 3),
+                    clamp_u8(178 + j / 3),
+                    clamp_u8(64 + j / 3),
+                ]
+            } else {
+                let seam = (x / 5) % 2 == 0;
+                let d = if seam { 0 } else { -16 };
+                [
+                    clamp_u8(88 + d + j),
+                    clamp_u8(64 + d + j),
+                    clamp_u8(112 + d + j),
+                ]
+            }
+        }),
+    ];
+
+    // 23..32: reserved built-in layers. They are not authorable (no pack file
+    // name maps to them) and exist so the array is a round 32 layers. A
+    // deterministic magenta checker, offset per layer, keeps each one opaque
+    // and visibly distinct from every authored layer.
+    layers.extend((23..NUM_TEX_LAYERS).map(|index| {
+        make_layer(100 + index, move |x, y, j| {
+            if (x / 2 + y / 2 + index) % 2 == 0 {
+                [
+                    clamp_u8(236 + j / 4),
+                    clamp_u8(32 + j / 4),
+                    clamp_u8(214 + j / 4),
+                ]
+            } else {
+                [
+                    clamp_u8(24 + j / 4),
+                    clamp_u8(8 + j / 4),
+                    clamp_u8(40 + j / 4),
+                ]
+            }
+        })
+    }));
+
+    debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
+    layers
 }
 
 /// Halve a square RGBA image with a 2x box average (edge-clamped).
@@ -321,7 +475,7 @@ mod tests {
     fn test_procedural_texture_layers_non_empty() {
         let layers = generate_all_texture_layers_rgba();
         assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
-        assert_eq!(layers.len(), 16);
+        assert_eq!(layers.len(), 32);
         for layer in &layers {
             assert_eq!(layer.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
             let (pixels, remainder) = layer.as_chunks::<4>();
@@ -357,6 +511,78 @@ mod tests {
         let mut long = generate_all_texture_layers_rgba();
         long[0].push(0);
         assert!(!block_layers_match_shape(&long));
+    }
+
+    #[test]
+    fn test_new_block_texture_layers_are_distinct() {
+        let layers = generate_all_texture_layers_rgba();
+        let authored_new = [16usize, 17, 18, 19, 20, 21, 22];
+
+        // Every new layer differs from every other new layer.
+        for (offset, a) in authored_new.iter().enumerate() {
+            for b in &authored_new[offset + 1..] {
+                assert_ne!(layers[*a], layers[*b], "layers {a} and {b} must differ");
+            }
+        }
+
+        // ... and from the nearest existing art.
+        assert_ne!(layers[16], layers[2], "farmland must differ from dirt");
+        for index in [17usize, 18, 19, 20] {
+            assert_ne!(layers[index], layers[0], "wheat {index} vs grass top");
+            assert_ne!(layers[index], layers[8], "wheat {index} vs leaves");
+        }
+        assert_ne!(layers[21], layers[9], "chest must differ from planks");
+        assert_ne!(layers[22], layers[21], "loot chest must differ from chest");
+
+        // Every new layer is real art, not a flat color.
+        for index in authored_new {
+            let (pixels, _) = layers[index].as_chunks::<4>();
+            let first = &pixels[0];
+            assert!(
+                pixels.iter().any(|px| px != first),
+                "layer {index} must not be a flat color"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reserved_texture_layers_are_distinct_opaque_placeholders() {
+        let layers = generate_all_texture_layers_rgba();
+        let authorable = 23usize;
+        assert_eq!(NUM_TEX_LAYERS as usize, 32);
+
+        for reserved in authorable..NUM_TEX_LAYERS as usize {
+            for authored in 0..authorable {
+                assert_ne!(
+                    layers[reserved], layers[authored],
+                    "reserved layer {reserved} must differ from authored layer {authored}"
+                );
+            }
+            let (pixels, remainder) = layers[reserved].as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(
+                pixels.iter().all(|px| px[3] == 255),
+                "reserved layer {reserved} must stay opaque"
+            );
+            let first = &pixels[0];
+            assert!(
+                pixels.iter().any(|px| px != first),
+                "reserved layer {reserved} must not be a flat color"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_layer_shape_rejects_31_and_33_layers() {
+        let mut fewer = generate_all_texture_layers_rgba();
+        fewer.pop();
+        assert_eq!(fewer.len(), 31);
+        assert!(!block_layers_match_shape(&fewer));
+
+        let mut more = generate_all_texture_layers_rgba();
+        more.push(vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize]);
+        assert_eq!(more.len(), 33);
+        assert!(!block_layers_match_shape(&more));
     }
 
     #[test]
