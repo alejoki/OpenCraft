@@ -11883,6 +11883,9 @@ mod tests {
             ToolKind::Pickaxe => &[0, 1, 2],
             ToolKind::Axe => &[0, 1, 4],
             ToolKind::Shovel => &[0],
+            // Hoe recipes belong to S07; this S05 matrix deliberately covers
+            // only the nine Pickaxe/Axe/Shovel combinations.
+            ToolKind::Hoe => &[],
         }
     }
 
@@ -11891,6 +11894,9 @@ mod tests {
         match kind {
             ToolKind::Pickaxe | ToolKind::Axe => &[5, 9],
             ToolKind::Shovel => &[4, 8],
+            // Hoe recipes belong to S07; this S05 matrix deliberately covers
+            // only the nine Pickaxe/Axe/Shovel combinations.
+            ToolKind::Hoe => &[],
         }
     }
 
@@ -12429,6 +12435,7 @@ mod tests {
                 ToolKind::Pickaxe => BlockId::Dirt,
                 ToolKind::Axe => BlockId::Stone,
                 ToolKind::Shovel => BlockId::OakLog,
+                ToolKind::Hoe => unreachable!("hoe recipes are S07"),
             };
             let wrong = MiningTarget::from_block(IVec3::new(7, 8, 0), wrong_block, Some(tool))
                 .expect("a mismatched block is still breakable");
@@ -12477,6 +12484,7 @@ mod tests {
                         ToolTier::Iron => 0.075,
                     },
                 ),
+                ToolKind::Hoe => unreachable!("hoe recipes are S07"),
             };
             assert_eq!(target_block.break_duration_secs(), Some(base_duration));
             let drop_id = ItemId::Block(target_block.mined_drop());

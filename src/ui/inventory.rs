@@ -16,7 +16,7 @@
 use glam::IVec3;
 
 use crate::player::inventory::{
-    CraftingGrid, GridKind, Inventory, Item, ItemId, RecipePreview, ToolKind, ToolTier,
+    CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
     INVENTORY_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
 };
 use crate::ui::Quad;
@@ -382,7 +382,7 @@ pub fn target_rect(
 pub fn item_color(item: Item) -> [f32; 4] {
     match item.id() {
         ItemId::Block(block) => block_color(block),
-        ItemId::Material(_) => [0.60, 0.42, 0.24, 1.0],
+        ItemId::Material(material) => material_color(material),
         ItemId::Tool { kind, tier } => tool_color(kind, tier),
     }
 }
@@ -410,6 +410,18 @@ fn block_color(block: BlockId) -> [f32; 4] {
     }
 }
 
+fn material_color(material: Material) -> [f32; 4] {
+    match material {
+        // The original stick tint is kept so pre-M008 saves and screenshots
+        // look unchanged.
+        Material::Stick => [0.60, 0.42, 0.24, 1.0],
+        Material::Apple => [0.80, 0.16, 0.14, 1.0],
+        Material::Wheat => [0.85, 0.73, 0.24, 1.0],
+        Material::WheatSeeds => [0.53, 0.58, 0.22, 1.0],
+        Material::Bread => [0.85, 0.55, 0.24, 1.0],
+    }
+}
+
 fn tool_color(kind: ToolKind, tier: ToolTier) -> [f32; 4] {
     let base = match tier {
         ToolTier::Wood => [0.55, 0.38, 0.22],
@@ -420,6 +432,7 @@ fn tool_color(kind: ToolKind, tier: ToolTier) -> [f32; 4] {
         ToolKind::Pickaxe => (0.0, 0.0, 0.0),
         ToolKind::Axe => (0.07, -0.05, -0.07),
         ToolKind::Shovel => (-0.05, 0.05, -0.02),
+        ToolKind::Hoe => (-0.09, -0.02, 0.06),
     };
     [base[0] + dr, base[1] + dg, base[2] + db, 1.0]
 }
@@ -1178,9 +1191,22 @@ mod tests {
             BlockId::CraftingTable,
         ];
         let mut identities: Vec<ItemId> = blocks.into_iter().map(ItemId::Block).collect();
-        identities.push(ItemId::Material(Material::Stick));
+        for material in [
+            Material::Stick,
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+        ] {
+            identities.push(ItemId::Material(material));
+        }
         for tier in [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron] {
-            for kind in [ToolKind::Pickaxe, ToolKind::Axe, ToolKind::Shovel] {
+            for kind in [
+                ToolKind::Pickaxe,
+                ToolKind::Axe,
+                ToolKind::Shovel,
+                ToolKind::Hoe,
+            ] {
                 identities.push(ItemId::Tool { kind, tier });
             }
         }

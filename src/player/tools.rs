@@ -89,7 +89,15 @@ mod tests {
         BlockId::Water,
     ];
 
-    const ALL_KINDS: [ToolKind; 3] = [ToolKind::Pickaxe, ToolKind::Axe, ToolKind::Shovel];
+    const ALL_KINDS: [ToolKind; 4] = [
+        ToolKind::Pickaxe,
+        ToolKind::Axe,
+        ToolKind::Shovel,
+        // Hoe is a real tool identity but has no block class: it is mined
+        // with but never accelerates a block, so the exhaustive matrix below
+        // correctly expects base hardness for it.
+        ToolKind::Hoe,
+    ];
     const ALL_TIERS: [ToolTier; 3] = [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron];
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {

@@ -44,9 +44,15 @@ const ITEM_TAG_MATERIAL: u8 = 2;
 const ITEM_TAG_TOOL: u8 = 3;
 
 const MATERIAL_STICK: u8 = 0;
+// Append-only: new material identities take the next unused discriminant.
+const MATERIAL_APPLE: u8 = 1;
+const MATERIAL_WHEAT: u8 = 2;
+const MATERIAL_WHEAT_SEEDS: u8 = 3;
+const MATERIAL_BREAD: u8 = 4;
 const TOOL_KIND_PICKAXE: u8 = 0;
 const TOOL_KIND_AXE: u8 = 1;
 const TOOL_KIND_SHOVEL: u8 = 2;
+const TOOL_KIND_HOE: u8 = 3;
 const TOOL_TIER_WOOD: u8 = 0;
 const TOOL_TIER_STONE: u8 = 1;
 const TOOL_TIER_IRON: u8 = 2;
@@ -451,12 +457,20 @@ fn grid_kind_from_tag(tag: u8) -> Option<GridKind> {
 fn material_tag(material: Material) -> u8 {
     match material {
         Material::Stick => MATERIAL_STICK,
+        Material::Apple => MATERIAL_APPLE,
+        Material::Wheat => MATERIAL_WHEAT,
+        Material::WheatSeeds => MATERIAL_WHEAT_SEEDS,
+        Material::Bread => MATERIAL_BREAD,
     }
 }
 
 fn material_from_tag(tag: u8) -> Option<Material> {
     match tag {
         MATERIAL_STICK => Some(Material::Stick),
+        MATERIAL_APPLE => Some(Material::Apple),
+        MATERIAL_WHEAT => Some(Material::Wheat),
+        MATERIAL_WHEAT_SEEDS => Some(Material::WheatSeeds),
+        MATERIAL_BREAD => Some(Material::Bread),
         _ => None,
     }
 }
@@ -466,6 +480,7 @@ fn tool_kind_tag(kind: ToolKind) -> u8 {
         ToolKind::Pickaxe => TOOL_KIND_PICKAXE,
         ToolKind::Axe => TOOL_KIND_AXE,
         ToolKind::Shovel => TOOL_KIND_SHOVEL,
+        ToolKind::Hoe => TOOL_KIND_HOE,
     }
 }
 
@@ -474,6 +489,7 @@ fn tool_kind_from_tag(tag: u8) -> Option<ToolKind> {
         TOOL_KIND_PICKAXE => Some(ToolKind::Pickaxe),
         TOOL_KIND_AXE => Some(ToolKind::Axe),
         TOOL_KIND_SHOVEL => Some(ToolKind::Shovel),
+        TOOL_KIND_HOE => Some(ToolKind::Hoe),
         _ => None,
     }
 }
@@ -1794,6 +1810,48 @@ mod tests {
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidItem(ItemError::StackOverflow))
         ));
+    }
+
+    #[test]
+    fn test_wire_tags_are_stable_and_append_only() {
+        // Pre-M008 discriminants are on-disk format: existing v4/v5 saves
+        // encode them, so they must never move.
+        assert_eq!(MATERIAL_STICK, 0);
+        assert_eq!(TOOL_KIND_PICKAXE, 0);
+        assert_eq!(TOOL_KIND_AXE, 1);
+        assert_eq!(TOOL_KIND_SHOVEL, 2);
+
+        // M008 appends at the next free discriminants instead of renumbering.
+        assert_eq!(MATERIAL_APPLE, 1);
+        assert_eq!(MATERIAL_WHEAT, 2);
+        assert_eq!(MATERIAL_WHEAT_SEEDS, 3);
+        assert_eq!(MATERIAL_BREAD, 4);
+        assert_eq!(TOOL_KIND_HOE, 3);
+
+        for (material, tag) in [
+            (Material::Stick, MATERIAL_STICK),
+            (Material::Apple, MATERIAL_APPLE),
+            (Material::Wheat, MATERIAL_WHEAT),
+            (Material::WheatSeeds, MATERIAL_WHEAT_SEEDS),
+            (Material::Bread, MATERIAL_BREAD),
+        ] {
+            assert_eq!(material_tag(material), tag, "{material:?} tag moved");
+            assert_eq!(material_from_tag(tag), Some(material));
+        }
+
+        for (kind, tag) in [
+            (ToolKind::Pickaxe, TOOL_KIND_PICKAXE),
+            (ToolKind::Axe, TOOL_KIND_AXE),
+            (ToolKind::Shovel, TOOL_KIND_SHOVEL),
+            (ToolKind::Hoe, TOOL_KIND_HOE),
+        ] {
+            assert_eq!(tool_kind_tag(kind), tag, "{kind:?} tag moved");
+            assert_eq!(tool_kind_from_tag(tag), Some(kind));
+        }
+
+        // The next unused discriminants still fail closed.
+        assert_eq!(material_from_tag(5), None);
+        assert_eq!(tool_kind_from_tag(4), None);
     }
 
     #[test]

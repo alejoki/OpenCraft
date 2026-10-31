@@ -15,6 +15,7 @@
 //! consumers can migrate without regaining mutable slot arrays.
 
 use crate::world::block::BlockId;
+use crate::world::loot::LootItem;
 
 /// Number of hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
@@ -37,6 +38,12 @@ pub const MATERIAL_STACK_LIMIT: u16 = 64;
 
 /// Largest storage bound for any crafting grid (4x4 inclusive).
 pub const MAX_GRID_SLOTS: usize = 16;
+
+/// Number of durable chest slots in a world chest.
+pub const CHEST_SLOTS: usize = 27;
+
+/// Fixed-size chest storage: 27 optional validated items.
+pub type ChestSlots = [Option<Item>; CHEST_SLOTS];
 
 /// Side length of the player (inventory) crafting grid.
 pub const PLAYER_GRID_DIM: usize = 2;
@@ -177,16 +184,24 @@ impl Default for Hotbar {
 // Item identity and validated instances
 // ---------------------------------------------------------------------------
 
-/// Non-block materials produced by crafting.
+/// Non-block materials produced by crafting or harvested from the world.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Material {
     Stick,
+    Apple,
+    Wheat,
+    WheatSeeds,
+    Bread,
 }
 
 impl Material {
     pub const fn name(self) -> &'static str {
         match self {
             Material::Stick => "Stick",
+            Material::Apple => "Apple",
+            Material::Wheat => "Wheat",
+            Material::WheatSeeds => "Wheat Seeds",
+            Material::Bread => "Bread",
         }
     }
 }
@@ -197,6 +212,7 @@ pub enum ToolKind {
     Pickaxe,
     Axe,
     Shovel,
+    Hoe,
 }
 
 impl ToolKind {
@@ -205,6 +221,7 @@ impl ToolKind {
             ToolKind::Pickaxe => "Pickaxe",
             ToolKind::Axe => "Axe",
             ToolKind::Shovel => "Shovel",
+            ToolKind::Hoe => "Hoe",
         }
     }
 }
@@ -277,13 +294,35 @@ impl ItemId {
                 (ToolTier::Wood, ToolKind::Pickaxe) => "Wood Pickaxe",
                 (ToolTier::Wood, ToolKind::Axe) => "Wood Axe",
                 (ToolTier::Wood, ToolKind::Shovel) => "Wood Shovel",
+                (ToolTier::Wood, ToolKind::Hoe) => "Wood Hoe",
                 (ToolTier::Stone, ToolKind::Pickaxe) => "Stone Pickaxe",
                 (ToolTier::Stone, ToolKind::Axe) => "Stone Axe",
                 (ToolTier::Stone, ToolKind::Shovel) => "Stone Shovel",
+                (ToolTier::Stone, ToolKind::Hoe) => "Stone Hoe",
                 (ToolTier::Iron, ToolKind::Pickaxe) => "Iron Pickaxe",
                 (ToolTier::Iron, ToolKind::Axe) => "Iron Axe",
                 (ToolTier::Iron, ToolKind::Shovel) => "Iron Shovel",
+                (ToolTier::Iron, ToolKind::Hoe) => "Iron Hoe",
             },
+        }
+    }
+}
+
+/// Maps a worldgen loot identity onto the player item identity it yields.
+///
+/// Ores resolve to their block item; harvested plants resolve to the matching
+/// material. This is the only bridge from [`LootItem`] into this module —
+/// worldgen itself never imports the player layer.
+impl From<LootItem> for ItemId {
+    fn from(item: LootItem) -> Self {
+        match item {
+            LootItem::Apple => ItemId::Material(Material::Apple),
+            LootItem::Bread => ItemId::Material(Material::Bread),
+            LootItem::Wheat => ItemId::Material(Material::Wheat),
+            LootItem::WheatSeeds => ItemId::Material(Material::WheatSeeds),
+            LootItem::Stick => ItemId::Material(Material::Stick),
+            LootItem::CoalOre => ItemId::Block(BlockId::CoalOre),
+            LootItem::IronOre => ItemId::Block(BlockId::IronOre),
         }
     }
 }
@@ -1728,6 +1767,98 @@ mod tests {
             .stack_limit(),
             1
         );
+    }
+
+    #[test]
+    fn loot_vocabulary_maps_to_valid_item_identities() {
+        use crate::world::loot::LootItem;
+
+        let cases = [
+            (LootItem::Apple, ItemId::Material(Material::Apple)),
+            (LootItem::Bread, ItemId::Material(Material::Bread)),
+            (LootItem::Wheat, ItemId::Material(Material::Wheat)),
+            (LootItem::WheatSeeds, ItemId::Material(Material::WheatSeeds)),
+            (LootItem::Stick, ItemId::Material(Material::Stick)),
+            (LootItem::CoalOre, ItemId::Block(BlockId::CoalOre)),
+            (LootItem::IronOre, ItemId::Block(BlockId::IronOre)),
+        ];
+
+        for (loot, expected) in cases {
+            let id: ItemId = loot.into();
+            assert_eq!(id, expected, "{loot:?} maps to the wrong identity");
+            let item = Item::new(id, 1)
+                .unwrap_or_else(|error| panic!("{loot:?} must build an item, got {error:?}"));
+            assert_eq!(item.id(), expected);
+            assert_eq!(item.count(), 1);
+        }
+    }
+
+    #[test]
+    fn food_and_hoe_identities_have_stable_names_and_limits() {
+        assert_eq!(Material::Stick.name(), "Stick");
+        assert_eq!(Material::Apple.name(), "Apple");
+        assert_eq!(Material::Wheat.name(), "Wheat");
+        assert_eq!(Material::WheatSeeds.name(), "Wheat Seeds");
+        assert_eq!(Material::Bread.name(), "Bread");
+        assert_eq!(ToolKind::Hoe.name(), "Hoe");
+
+        for material in [
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+        ] {
+            let id = ItemId::Material(material);
+            assert_eq!(id.name(), material.name());
+            assert_eq!(id.stack_limit(), MATERIAL_STACK_LIMIT);
+            assert_eq!(Item::new(id, 0), Err(ItemError::EmptyStack));
+            assert_eq!(
+                Item::new(id, MATERIAL_STACK_LIMIT + 1),
+                Err(ItemError::StackOverflow)
+            );
+            assert!(Item::new(id, MATERIAL_STACK_LIMIT).is_ok());
+            assert!(item(id, MATERIAL_STACK_LIMIT).is_stackable());
+        }
+
+        let names = [
+            (ToolTier::Wood, "Wood Hoe"),
+            (ToolTier::Stone, "Stone Hoe"),
+            (ToolTier::Iron, "Iron Hoe"),
+        ];
+        for (tier, name) in names {
+            let id = ItemId::Tool {
+                kind: ToolKind::Hoe,
+                tier,
+            };
+            assert_eq!(id.name(), name);
+            assert_eq!(id.stack_limit(), 1);
+            let fresh = item(id, 1);
+            assert!(fresh.is_tool());
+            assert!(!fresh.is_stackable());
+            assert_eq!(fresh.durability(), Some(tier.max_durability()));
+            assert_eq!(fresh.max_durability(), Some(tier.max_durability()));
+
+            // Hoes reuse the checked durability constructor, so they inherit
+            // the same zero/over-maximum rejection as every other tool.
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, 0),
+                Err(ItemError::InvalidDurability)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, tier.max_durability() + 1),
+                Err(ItemError::InvalidDurability)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, tier.max_durability())
+                    .expect("full durability is valid")
+                    .durability(),
+                Some(tier.max_durability())
+            );
+        }
+
+        assert_eq!(CHEST_SLOTS, 27);
+        let chest: ChestSlots = [None; CHEST_SLOTS];
+        assert_eq!(chest.len(), 27, "a chest carries exactly 27 slots");
     }
 
     #[test]

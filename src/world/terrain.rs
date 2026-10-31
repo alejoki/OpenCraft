@@ -1,5 +1,6 @@
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::world::loot::LootEntry;
 use crate::world::season::Season;
 
 #[inline]
@@ -1024,30 +1025,14 @@ fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
     wall_height + i32::from(corner)
 }
 
-/// One prospective reward a ruin can yield.
-///
-/// Deliberately a placeholder: M007 ships the seam, not the content. Worldgen
-/// owns no item vocabulary (that belongs to the `player::inventory` layer), so
-/// an entry is only a stable identifier plus an inclusive count range. When the
-/// M008 survival loot tables land they resolve `item_id` to a real item; the
-/// seam's signature does not change when they do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LootEntry {
-    /// Stable identifier for the yielded item, interpreted by the M008 loot
-    /// layer. No identifier space exists in M007 — nothing constructs one.
-    pub item_id: u16,
-    /// Inclusive lower bound on the stack size of one roll.
-    pub min_count: u16,
-    /// Inclusive upper bound on the stack size of one roll.
-    pub max_count: u16,
-}
-
 /// Loot yielded by one ruin — **present but empty** in M007.
 ///
 /// This is the M008 survival-content hook, mirroring the M006 stubbed-hook
 /// pattern: the seam is named, typed and callable at every generated ruin, and
-/// it is honestly empty rather than pretending to be content. M008 fills it;
-/// until then the only observable property is that no entry is ever produced.
+/// it is honestly empty rather than pretending to be content. The M008 loot
+/// vocabulary lives in [`crate::world::loot`]; this function keeps its empty
+/// contract until a later survival task fills the tables. Until then the only
+/// observable property is that no entry is ever produced.
 ///
 /// Pure by construction — a function of `(seed, ruin)` only. It reads no clock,
 /// no RNG state, no season/day index and no chunk, so loot can never make
@@ -1057,7 +1042,7 @@ pub struct LootEntry {
 /// allocate) that call would be pure ceremony. The acceptance scan in the tests
 /// is what proves the seam is callable at every placed ruin.
 pub fn ruin_loot(_seed: u32, _ruin: &RuinSpec) -> Vec<LootEntry> {
-    // Empty in M007 — M008 fills this from the survival loot tables.
+    // Empty in M007 — M008 survival loot tables land in a later S01 task.
     Vec::new()
 }
 

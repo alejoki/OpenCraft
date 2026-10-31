@@ -5,6 +5,7 @@ pub mod catalog_fs;
 pub mod chunk;
 pub mod daycycle;
 pub mod light;
+pub mod loot;
 pub mod manager;
 pub mod persistence;
 pub mod season;
