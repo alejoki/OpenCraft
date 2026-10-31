@@ -971,12 +971,12 @@ fn ruin_anchor_hash(wx: i32, wz: i32, seed: u32) -> Option<u32> {
 /// in-range skips. Without this gate an anchor near a layer boundary would
 /// silently lose its top wall/corner cells in generation yet still be reported
 /// by [`ruin_at`] to `find_spawn_column`/`ruin_covering` and the tests. The
-/// topmost cell is the corner pillar at `surface + wall_height + 1`, so
-/// requiring `local_surface + wall_height + 1 <= CHUNK_SIZE - 1` makes
-/// [`ruin_at`] authoritative for every caller.
+/// topmost cell is the corner pillar at `surface + wall_height + 1`, so keeping
+/// its local index within the layer (`local_surface + wall_height` below the
+/// layer's last index) makes [`ruin_at`] authoritative for every caller.
 fn ruin_fits_chunk_layer(surface: i32, wall_height: i32) -> bool {
     let surface_ly = surface.rem_euclid(CHUNK_SIZE as i32);
-    surface_ly + wall_height + 1 <= CHUNK_SIZE as i32 - 1
+    surface_ly + wall_height < CHUNK_SIZE as i32 - 1
 }
 
 /// Whether a surface ruin is anchored at this world column, and which one.
@@ -1099,25 +1099,38 @@ fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
     wall_height + i32::from(corner)
 }
 
-/// Loot yielded by one ruin — **present but empty** in M007.
+/// Loot yielded by one ruin — the filled deterministic table.
 ///
-/// This is the M008 survival-content hook, mirroring the M006 stubbed-hook
-/// pattern: the seam is named, typed and callable at every generated ruin, and
-/// it is honestly empty rather than pretending to be content. The M008 loot
-/// vocabulary lives in [`crate::world::loot`]; this function keeps its empty
-/// contract until a later survival task fills the tables. Until then the only
-/// observable property is that no entry is ever produced.
+/// Delegates to [`crate::world::loot::ruin_loot`] with the ruin's anchor
+/// column, keeping the D084 signature (`seed`, `&RuinSpec`) and its purity
+/// contract: a function of `(seed, ruin)` only. It reads no clock, RNG state,
+/// season/day index or chunk, so loot can never make worldgen
+/// season-dependent (the cross-slice season-purity invariant) and two callers
+/// asking about the same ruin always get the same answer. The generator does
+/// not call it: loot is materialized on demand from the chest position (see
+/// [`ruin_loot_chest_at`]).
+pub fn ruin_loot(seed: u32, ruin: &RuinSpec) -> Vec<LootEntry> {
+    crate::world::loot::ruin_loot(seed, ruin.anchor_x, ruin.anchor_z)
+}
+
+/// The loot of the ruin whose exact anchor-column chest cell is `pos`.
 ///
-/// Pure by construction — a function of `(seed, ruin)` only. It reads no clock,
-/// no RNG state, no season/day index and no chunk, so loot can never make
-/// worldgen season-dependent (the cross-slice season-purity invariant) and two
-/// callers asking about the same ruin always get the same answer. The generator
-/// does not call it: as a no-op returning an empty `Vec` (which does not
-/// allocate) that call would be pure ceremony. The acceptance scan in the tests
-/// is what proves the seam is callable at every placed ruin.
-pub fn ruin_loot(_seed: u32, _ruin: &RuinSpec) -> Vec<LootEntry> {
-    // Empty in M007 — M008 survival loot tables land in a later S01 task.
-    Vec::new()
+/// `Some` means `pos` is exactly [`ruin_loot_chest_pos`] for a legal ruin
+/// anchored at `(pos.x, pos.z)`; the contents are that ruin's deterministic
+/// table. `None` means "not a generated ruin chest" — the caller must open
+/// empty rather than guess a neighbouring anchor's table, so an interlocked
+/// ruin can never supply loot for a cell it does not own.
+///
+/// Pure and chunk-free like [`ruin_loot`]: it validates the position against
+/// [`ruin_at_seeded`] and never re-derives placement or height rules. It does
+/// not check the live block; the session layer gates on `BlockId::LootChest`
+/// so a player-placed chest never derives ruin loot.
+pub fn ruin_loot_chest_at(pos: IVec3, seed: u32) -> Option<Vec<LootEntry>> {
+    let spec = ruin_at_seeded(pos.x, pos.z, seed)?;
+    if ruin_loot_chest_pos(&spec) != pos {
+        return None;
+    }
+    Some(ruin_loot(seed, &spec))
 }
 
 /// Minimum surface height of a spawnable column: two blocks above the named sea
@@ -3253,7 +3266,7 @@ mod tests {
             for wall_height in RUIN_WALL_MIN_HEIGHT..=RUIN_WALL_MAX_HEIGHT {
                 assert_eq!(
                     ruin_fits_chunk_layer(surface, wall_height),
-                    local + wall_height + 1 <= CHUNK_SIZE as i32 - 1,
+                    local + wall_height < CHUNK_SIZE as i32 - 1,
                     "surface {surface} (local {local}) with wall {wall_height}"
                 );
             }
@@ -3916,19 +3929,22 @@ mod tests {
         );
     }
 
-    /// Acceptance: the empty loot seam is callable at *every* ruin the generator
-    /// actually places, not merely declared.
+    /// Acceptance: the filled loot table is deterministic and capacity-bounded
+    /// at *every* ruin the generator actually places, not merely declared.
     ///
-    /// The region is regenerated and its Cobblestone/Brick cells (worldgen paints
-    /// those only for ruins) are attributed back to a covering anchor from
-    /// `ruin_at`. Each distinct ruin found then gets one `ruin_loot` call and
-    /// every answer must be an empty `Vec`. Both non-vacuity bounds are explicit:
-    /// the scan must find ruin cells at all *and* at least [`RUIN_LOOT_MIN_RUINS`]
-    /// distinct ruins, plus every ruin cell must have a covering anchor (a
-    /// generator/placement-rule disagreement fails loudly instead of silently
-    /// shrinking the checked set).
+    /// The region is regenerated and its Cobblestone/Brick cells (worldgen
+    /// paints those only for ruins) are attributed back to a covering anchor
+    /// from `ruin_at`. Each distinct ruin found then gets two `ruin_loot` calls
+    /// that must agree, stay within the 27-slot chest, keep every rolled count
+    /// in `1..=64`, and always carry the Wheat + WheatSeeds pair S07 needs.
+    /// Both non-vacuity bounds are explicit: the scan must find ruin cells at
+    /// all *and* at least [`RUIN_LOOT_MIN_RUINS`] distinct ruins, plus every
+    /// ruin cell must have a covering anchor (a generator/placement-rule
+    /// disagreement fails loudly instead of silently shrinking the checked
+    /// set).
     #[test]
-    fn test_ruin_loot_seam_is_empty_at_every_generated_ruin() {
+    fn test_ruin_loot_is_deterministic_and_capacity_bounded_at_every_generated_ruin() {
+        use crate::world::loot::{LootEntry, LootItem, RUIN_LOOT_MAX_SLOTS};
         use std::collections::BTreeSet;
 
         let seed = DEFAULT_WORLD_SEED;
@@ -3936,11 +3952,11 @@ mod tests {
         let blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
         assert!(
             !blocks.is_empty(),
-            "acceptance scan found no ruin cells, so the empty-seam assertion would be vacuous"
+            "acceptance scan found no ruin cells, so the loot assertion would be vacuous"
         );
 
         let mut ruins: BTreeSet<(i32, i32)> = BTreeSet::new();
-        let mut loot_calls = 0usize;
+        let mut loot_by_ruin: Vec<Vec<LootEntry>> = Vec::new();
         for (bx, by, bz, block) in &blocks {
             let Some(spec) = anchors.iter().find(|spec| {
                 (bx - spec.anchor_x).abs() <= RUIN_FOOTPRINT_HALF
@@ -3954,40 +3970,152 @@ mod tests {
             if !ruins.insert((spec.anchor_x, spec.anchor_z)) {
                 continue;
             }
-            let loot = ruin_loot(seed, spec);
+            let first = ruin_loot(seed, spec);
+            let second = ruin_loot(seed, spec);
+            assert_eq!(
+                first, second,
+                "ruin_loot must be deterministic at ruin ({}, {})",
+                spec.anchor_x, spec.anchor_z
+            );
             assert!(
-                loot.is_empty(),
-                "ruin_loot returned {} entries for ruin ({}, {}) — the M007 seam must stay empty",
-                loot.len(),
+                !first.is_empty(),
+                "ruin_loot returned nothing for ruin ({}, {})",
                 spec.anchor_x,
                 spec.anchor_z
             );
-            loot_calls += 1;
+            assert!(
+                first.len() <= RUIN_LOOT_MAX_SLOTS,
+                "ruin_loot returned {} entries for ruin ({}, {}) — a chest holds {RUIN_LOOT_MAX_SLOTS}",
+                first.len(),
+                spec.anchor_x,
+                spec.anchor_z
+            );
+            let items: Vec<LootItem> = first.iter().map(|entry| entry.item).collect();
+            assert!(
+                items.contains(&LootItem::Wheat) && items.contains(&LootItem::WheatSeeds),
+                "ruin ({}, {}) is missing the farm pair: {items:?}",
+                spec.anchor_x,
+                spec.anchor_z
+            );
+            for entry in &first {
+                assert_eq!(
+                    entry.min_count, entry.max_count,
+                    "ruin ({}, {}) left a range unrolled: {entry:?}",
+                    spec.anchor_x, spec.anchor_z
+                );
+                assert!(
+                    (1..=64).contains(&entry.min_count),
+                    "ruin ({}, {}) rolled count {} outside 1..=64",
+                    spec.anchor_x,
+                    spec.anchor_z,
+                    entry.min_count
+                );
+            }
+            loot_by_ruin.push(first);
         }
 
         assert!(
             ruins.len() >= RUIN_LOOT_MIN_RUINS,
             "acceptance scan found only {} distinct ruins (need >= {RUIN_LOOT_MIN_RUINS}) — \
-             the empty-seam assertion would be near-vacuous",
+             the loot assertion would be near-vacuous",
             ruins.len()
         );
-        assert_eq!(loot_calls, ruins.len());
+        assert_eq!(loot_by_ruin.len(), ruins.len());
 
-        // Negative: the seam is empty for *any* (seed, ruin) pair, including a
-        // synthetic spec the generator would never produce and seeds with no
-        // ruins at all. There is no hidden content path keyed off the inputs.
-        let synthetic = RuinSpec {
-            anchor_x: 0,
-            anchor_z: 0,
-            surface: RUIN_MIN_HEIGHT,
-            wall_height: RUIN_WALL_MAX_HEIGHT,
-        };
-        for probe_seed in [0, 1, seed, u32::MAX] {
-            assert!(
-                ruin_loot(probe_seed, &synthetic).is_empty(),
-                "ruin_loot produced content for seed {probe_seed}"
+        // The table is not a constant: either two generated ruins disagree or
+        // the same anchor under a different seed changes. Requiring every ruin
+        // to differ would be flaky; requiring at least one difference proves
+        // the mixer is live.
+        let all_equal = loot_by_ruin.iter().all(|loot| loot == &loot_by_ruin[0]);
+        let seed_rerolls = anchors
+            .first()
+            .is_some_and(|spec| ruin_loot(seed, spec) != ruin_loot(seed ^ 0x5555_5555, spec));
+        assert!(
+            !all_equal || seed_rerolls,
+            "ruin loot is constant across every generated ruin and both seeds"
+        );
+    }
+
+    /// Acceptance: `ruin_loot_chest_at` recovers a ruin's table only from the
+    /// exact anchor-column chest cell that `place_ruin_at` writes.
+    ///
+    /// Generated chests are the oracle: each must resolve to its own anchor's
+    /// table, a neighbouring column and the block below must resolve to
+    /// `None`, and no neighbouring anchor may claim the cell. A non-ruin
+    /// all-air coordinate must also resolve to `None`, so the session opens
+    /// empty instead of guessing the nearest table.
+    #[test]
+    fn test_ruin_loot_chest_at_matches_exactly_one_generated_anchor_column() {
+        let seed = DEFAULT_WORLD_SEED;
+        let chests = loot_chests_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer);
+        assert!(
+            !chests.is_empty(),
+            "no generated LootChest in the {RUIN_SCAN_RADIUS}-chunk region"
+        );
+        eprintln!(
+            "generated loot chests for exact-cell recovery: {}",
+            chests.len()
+        );
+
+        for &(wx, wy, wz) in &chests {
+            let pos = IVec3::new(wx, wy, wz);
+            let spec = ruin_at_seeded(wx, wz, seed).unwrap_or_else(|| {
+                panic!("generated LootChest at ({wx}, {wy}, {wz}) has no ruin anchor")
+            });
+            assert_eq!(
+                ruin_loot_chest_pos(&spec),
+                pos,
+                "chest at ({wx}, {wy}, {wz}) is not its anchor column's chest cell"
             );
+            let expected = ruin_loot(seed, &spec);
+            assert_eq!(
+                ruin_loot_chest_at(pos, seed),
+                Some(expected.clone()),
+                "chest at ({wx}, {wy}, {wz}) must recover its own anchor's table"
+            );
+
+            // Exact cell means exact: a neighbouring column and the block
+            // below the chest are never this ruin's chest cell.
+            assert_eq!(
+                ruin_loot_chest_at(pos + IVec3::new(1, 0, 0), seed),
+                None,
+                "chest at ({wx}, {wy}, {wz}) resolved loot for its +x neighbour"
+            );
+            assert_eq!(
+                ruin_loot_chest_at(pos - IVec3::new(0, 1, 0), seed),
+                None,
+                "chest at ({wx}, {wy}, {wz}) resolved loot for the block below"
+            );
+
+            // No neighbouring anchor owns this cell: interlocking shells are
+            // legal, but every chest cell stays on its own anchor column.
+            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    if let Some(other) = ruin_at_seeded(wx + dx, wz + dz, seed) {
+                        assert_ne!(
+                            ruin_loot_chest_pos(&other),
+                            pos,
+                            "neighbour anchor ({}, {}) claims chest ({wx}, {wy}, {wz})",
+                            other.anchor_x,
+                            other.anchor_z
+                        );
+                    }
+                }
+            }
         }
+
+        // A non-ruin all-air coordinate must recover nothing: the session has
+        // to open empty instead of guessing the nearest anchor.
+        let sky = IVec3::new(0, 159, 0);
+        assert_eq!(
+            generated_block_at(sky.x, sky.y, sky.z, seed, Season::Summer),
+            BlockId::Air,
+            "the chosen negative coordinate must be ungenerated all-air"
+        );
+        assert_eq!(ruin_loot_chest_at(sky, seed), None);
     }
 
     /// Negative: a fixed set of chunk positions spanning all four biomes
