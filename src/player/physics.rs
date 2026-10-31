@@ -389,6 +389,17 @@ impl Player {
         self.inventory.collect_block(block, 1)
     }
 
+    /// Inserts one whole item stack, all-or-nothing.
+    ///
+    /// Thin forwarder over [`Inventory::insert`]: `true` only when every unit
+    /// fit, `false` with no slot mutated otherwise. World pickup uses this for
+    /// the oak-leaf apple bonus; M008 has no item entities or spill, so a full
+    /// inventory simply loses the bonus instead of duplicating or dropping it
+    /// on the ground.
+    pub fn collect_item(&mut self, item: Item) -> bool {
+        self.inventory.insert(item).is_ok()
+    }
+
     /// Consumes exactly one item from the selected hotbar slot.
     pub fn consume_selected(&mut self) -> Option<Item> {
         self.inventory.consume_one(self.selected_slot)
@@ -1026,6 +1037,37 @@ mod tests {
         assert!(
             player.collect_block(BlockId::Bedrock).is_none(),
             "uncarryable blocks are rejected without mutation"
+        );
+    }
+
+    #[test]
+    fn collect_item_is_all_or_nothing() {
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("valid apple");
+        let mut player = Player::new(Vec3::ZERO);
+        assert!(
+            player.collect_item(apple),
+            "an empty inventory fits an apple"
+        );
+        assert_eq!(player.inventory().slot(0), Some(apple));
+
+        let stone = block_item(BlockId::Stone, 64);
+        let slots = [Some(stone); INVENTORY_SLOTS];
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let before = player.inventory().clone();
+
+        assert!(
+            !player.collect_item(apple),
+            "one free slot filled by 64 stone cannot take an apple"
+        );
+        assert_eq!(
+            player.inventory(),
+            &before,
+            "a rejected item leaves every slot untouched"
         );
     }
 

@@ -11,6 +11,37 @@
 //! The enum is intentionally small and closed: an unknown identity is not
 //! representable, so a typo cannot reach a loot table.
 
+use glam::IVec3;
+
+/// Probability denominator for the oak-leaf apple bonus: one in eight.
+///
+/// Denominator form keeps the roll comparable and testable instead of hiding
+/// a floating-point threshold in the break path.
+pub const OAK_LEAVES_APPLE_DENOMINATOR: u32 = 8;
+
+/// Whether breaking oak leaves at `pos` in a world with `seed` also drops an
+/// apple.
+///
+/// Deliberately world-local and independent of `terrain::hash3d`: that hash is
+/// private, tuned to noise generation, and a terrain retune must never move
+/// the world's drop table. The mixer below owns its constants (xor-shift plus
+/// wrapping-multiply finalizer), so the result is stable for one
+/// `(seed, pos)` and changes with either input.
+pub fn oak_leaves_apple(seed: u32, pos: IVec3) -> bool {
+    let mut hash = seed ^ 0x9E37_79B9;
+    hash ^= (pos.x as u32).wrapping_mul(0x85EB_CA6B);
+    hash ^= (pos.y as u32).wrapping_mul(0xC2B2_AE35);
+    hash ^= (pos.z as u32).wrapping_mul(0x27D4_EB2F);
+    // Murmur3-style fmix32 finalizer: avalanche every input bit into the low
+    // bits the modulo reads, so nearby coordinates do not cluster.
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85EB_CA6B);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xC2B2_AE35);
+    hash ^= hash >> 16;
+    hash.is_multiple_of(OAK_LEAVES_APPLE_DENOMINATOR)
+}
+
 /// One item identity a ruin can yield.
 ///
 /// This is worldgen's vocabulary, not the player's: it deliberately has fewer
@@ -59,6 +90,97 @@ mod tests {
         LootItem::CoalOre,
         LootItem::IronOre,
     ];
+
+    fn oak_leaves_apple_scan(seed: u32) -> Vec<(IVec3, bool)> {
+        let mut results = Vec::new();
+        for x in 0..16 {
+            for y in 0..16 {
+                for z in 0..16 {
+                    let pos = IVec3::new(x, y, z);
+                    results.push((pos, oak_leaves_apple(seed, pos)));
+                }
+            }
+        }
+        results
+    }
+
+    #[test]
+    fn oak_leaves_apple_denominator_is_nonzero() {
+        assert_ne!(
+            OAK_LEAVES_APPLE_DENOMINATOR, 0,
+            "a zero denominator would panic on modulo"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_is_deterministic_for_the_same_seed_and_position() {
+        for pos in [
+            IVec3::new(0, 0, 0),
+            IVec3::new(3, 12, -7),
+            IVec3::new(-15, 31, 8),
+        ] {
+            assert_eq!(
+                oak_leaves_apple(42, pos),
+                oak_leaves_apple(42, pos),
+                "the roll must not depend on call order"
+            );
+        }
+    }
+
+    #[test]
+    fn oak_leaves_apple_scan_produces_both_outcomes_inside_a_loose_rate_band() {
+        let results = oak_leaves_apple_scan(1);
+        let hits = results.iter().filter(|(_, hit)| *hit).count();
+        let total = results.len();
+
+        assert!(
+            hits > 0 && hits < total,
+            "a 16x16x16 scan must contain both outcomes, got {hits}/{total}"
+        );
+        let rate_percent = hits * 100 / total;
+        assert!(
+            (5..=25).contains(&rate_percent),
+            "hit rate {rate_percent}% is outside the 5-25% band"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_changes_with_the_seed_across_a_fixed_scan() {
+        let small_scan = |seed: u32| {
+            let mut outcomes = Vec::new();
+            for x in 0..4 {
+                for y in 0..4 {
+                    for z in 0..4 {
+                        outcomes.push(oak_leaves_apple(seed, IVec3::new(x, y, z)));
+                    }
+                }
+            }
+            outcomes
+        };
+
+        let seed_one = small_scan(1);
+        let seed_two = small_scan(2);
+        assert!(
+            seed_one
+                .iter()
+                .zip(&seed_two)
+                .any(|(left, right)| left != right),
+            "changing the seed must change at least one result"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_changes_with_coordinates_across_a_fixed_scan() {
+        let results: Vec<bool> = (0..4)
+            .flat_map(|x| (0..4).flat_map(move |y| (0..4).map(move |z| (x, y, z))))
+            .map(|(x, y, z)| oak_leaves_apple(1, IVec3::new(x, y, z)))
+            .collect();
+
+        assert!(
+            results.iter().any(|hit| *hit) && results.iter().any(|hit| !*hit),
+            "coordinate changes must be observable within a small scan"
+        );
+    }
 
     #[test]
     fn loot_entry_is_constructible_with_an_inclusive_range() {

@@ -282,8 +282,10 @@ impl BlockId {
     /// material is [`BlockId::Cobblestone`]) are reachable through real
     /// gameplay. Farmland yields Dirt because tilling is reversible. Every
     /// other block, including the new wheat stages, chests, and the loot
-    /// chest, drops itself in this slice: loot rolls and wheat-harvest drops
-    /// belong to later survival slices.
+    /// chest, drops itself here. The oak-leaf apple secondary drop is resolved
+    /// at the break site through [`crate::world::loot::oak_leaves_apple`], not
+    /// in this single-identity mapping; ruin loot tables and wheat-harvest
+    /// drops belong to later survival slices.
     ///
     /// Drops are inventory state only and are never persisted, and the wire
     /// format keeps Cobblestone's id 4 unchanged, so save compatibility is

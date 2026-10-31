@@ -8,7 +8,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Efficient Chunk Rendering**: Implements Greedy Meshing to optimize the rendering of voxel chunks, significantly reducing the number of vertices sent to the GPU.
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
-*   **Survival and Creative Modes**: New worlds default to Survival, where you walk and cannot fly. Survival now includes health, hunger, air, fall/drowning/starvation damage, death and respawn, and a hearts/hunger/air HUD; food, farming, and chests are not part of Survival yet. Creative keeps the existing flying and building behavior and stays structurally invulnerable and never hungry. Choose the mode when you create a world.
+*   **Survival and Creative Modes**: New worlds default to Survival, where you walk and cannot fly. Survival now includes health, hunger, air, fall/drowning/starvation damage, death and respawn, a hearts/hunger/air HUD, and apples and bread that restore hunger through a hold-to-eat action; farming and chests are not part of Survival yet. Creative keeps the existing flying and building behavior and stays structurally invulnerable and never hungry. Choose the mode when you create a world.
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
     *   Fly mode for free movement and exploration.

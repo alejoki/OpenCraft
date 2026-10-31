@@ -16,7 +16,7 @@ use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
-use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
+use opencraft::player::inventory::{GridKind, Item, ItemId, Material, ToolWear, HOTBAR_SLOTS};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
@@ -67,6 +67,7 @@ use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use opencraft::world::daycycle;
+use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
@@ -364,6 +365,17 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         // identity is the only thing that differs, and the drop is still
         // collected last so MEM195 ordering is preserved.
         session.player.collect_block(block.mined_drop());
+
+        // Oak leaves carry a deterministic secondary apple drop, resolved
+        // here because `BlockId::mined_drop` returns a single identity. The
+        // leaf drop was collected first, so the bonus can never displace it.
+        // The bonus is best-effort: M008 has no item entities or ground spill,
+        // so a full inventory simply loses the apple.
+        if block == BlockId::OakLeaves && loot::oak_leaves_apple(session.world.seed(), pos) {
+            let apple = Item::new(ItemId::Material(Material::Apple), 1)
+                .expect("an apple is a valid carryable item");
+            session.player.collect_item(apple);
+        }
     }
 
     BreakOutcome::Applied { remeshed, wear }
@@ -5564,7 +5576,7 @@ mod tests {
     };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
     use opencraft::world::season::Season;
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
@@ -15288,5 +15300,173 @@ mod tests {
             app.eating.progress().is_none(),
             "partial meal cleared on session swap"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T04: deterministic oak-leaf apple bonus drop
+    // -----------------------------------------------------------------------
+
+    /// Finds one position inside the loaded test chunk whose oak-leaf apple
+    /// roll matches `wanted`. Chunk (0,0,0) spans world 0..32 on every axis and
+    /// its face halo is loaded by [`insert_test_chunk_with_face_neighbors`].
+    fn leaf_position_with_roll(seed: u32, wanted: bool) -> IVec3 {
+        for x in 0..CHUNK_SIZE as i32 {
+            for y in 0..CHUNK_SIZE as i32 {
+                for z in 0..CHUNK_SIZE as i32 {
+                    let pos = IVec3::new(x, y, z);
+                    if opencraft::world::loot::oak_leaves_apple(seed, pos) == wanted {
+                        return pos;
+                    }
+                }
+            }
+        }
+        panic!("no oak-leaf position with roll {wanted} for seed {seed}");
+    }
+
+    /// Total units of one identity across the 36 inventory slots.
+    fn player_item_count(player: &Player, id: ItemId) -> u32 {
+        player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == id)
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn oak_leaves_apple_drop_is_deterministic_and_only_on_a_true_roll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            1,
+            dir.path().join("leaf-apple.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let seed = session.world.seed();
+        let true_pos = leaf_position_with_roll(seed, true);
+        let false_pos = leaf_position_with_roll(seed, false);
+        assert_ne!(true_pos, false_pos, "both rolls must be observable");
+
+        let leaf_id = ItemId::Block(BlockId::OakLeaves);
+        let apple_id = ItemId::Material(Material::Apple);
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            true_pos,
+            BlockId::OakLeaves,
+        ));
+        assert!(!remeshed.is_empty(), "the true-roll leaf break applies");
+        assert_eq!(player_item_count(&session.player, leaf_id), 1);
+        assert_eq!(
+            player_item_count(&session.player, apple_id),
+            1,
+            "a true roll yields exactly one apple"
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            false_pos,
+            BlockId::OakLeaves,
+        ));
+        assert!(!remeshed.is_empty(), "the false-roll leaf break applies");
+        assert_eq!(player_item_count(&session.player, leaf_id), 2);
+        assert_eq!(
+            player_item_count(&session.player, apple_id),
+            1,
+            "a false roll yields no bonus apple"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_replay_on_the_now_air_cell_adds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            2,
+            dir.path().join("leaf-replay.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let pos = leaf_position_with_roll(session.world.seed(), true);
+        applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+        let leaf_id = ItemId::Block(BlockId::OakLeaves);
+        let apple_id = ItemId::Material(Material::Apple);
+        let leaves_before = player_item_count(&session.player, leaf_id);
+        let apples_before = player_item_count(&session.player, apple_id);
+
+        let replay = break_mined_block(&mut session, pos, BlockId::OakLeaves);
+
+        assert!(
+            matches!(replay, BreakOutcome::Rejected(BreakRejection::StaleTarget)),
+            "the now-Air cell is a stale target"
+        );
+        assert_eq!(player_item_count(&session.player, leaf_id), leaves_before);
+        assert_eq!(player_item_count(&session.player, apple_id), apples_before);
+    }
+
+    #[test]
+    fn oak_leaves_apple_is_lost_when_the_inventory_is_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            3,
+            dir.path().join("leaf-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let pos = leaf_position_with_roll(session.world.seed(), true);
+
+        // 35 stone stacks plus one free slot: the leaf drop fills the free
+        // slot, so the bonus apple has nowhere to go and is silently lost.
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 64).expect("stone stack");
+        let mut slots = [Some(stone); INVENTORY_SLOTS];
+        slots[INVENTORY_SLOTS - 1] = None;
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+
+        assert!(!remeshed.is_empty(), "the leaf break applies");
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::Stone)),
+            35 * 64,
+            "the stone stacks are untouched"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::OakLeaves)),
+            1,
+            "the leaf drop lands in the last free slot"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Apple)),
+            0,
+            "a full inventory loses only the bonus apple"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_roll_repeats_with_the_same_seed_and_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut drops = Vec::new();
+        for attempt in 0..2 {
+            let mut session = WorldSession::new_session(
+                21,
+                dir.path().join(format!("leaf-repeat-{attempt}.mcvx")),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            );
+            insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+            let pos = leaf_position_with_roll(session.world.seed(), true);
+            applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+            drops.push(player_item_count(
+                &session.player,
+                ItemId::Material(Material::Apple),
+            ));
+        }
+
+        assert_eq!(drops, vec![1, 1], "the same seed and position agree");
     }
 }
