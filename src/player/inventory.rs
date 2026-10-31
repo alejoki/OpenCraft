@@ -750,6 +750,35 @@ impl Inventory {
         Ok(())
     }
 
+    /// Whether every item in `items` fits, in order, without touching the
+    /// cursor or either crafting grid.
+    ///
+    /// This is a trial run of [`Inventory::insert_all`]: the items compete for
+    /// the same mergeable stacks and empty slots, so per-item `can_insert`
+    /// checks are not equivalent when the list contains several stacks of the
+    /// same identity.
+    pub fn can_insert_all(&self, items: &[Item]) -> bool {
+        let mut trial = self.clone();
+        items.iter().all(|item| trial.insert(*item).is_ok())
+    }
+
+    /// Inserts every item completely or none at all.
+    ///
+    /// Works on a clone and commits the whole slot array only after the last
+    /// item inserts, which is what makes the chest-break preflight atomic for
+    /// heterogeneous contents plus the chest's own drop item. The cursor and
+    /// both crafting grids are never part of the trial or the commit.
+    pub fn insert_all(&mut self, items: &[Item]) -> Result<(), InventoryError> {
+        let mut trial = self.clone();
+        for item in items {
+            trial.insert(*item)?;
+        }
+        // A full inventory clone is cheap (36 copyable slots) and committing
+        // the slots keeps the cursor exactly as the caller left it.
+        self.slots = trial.slots;
+        Ok(())
+    }
+
     /// Best-effort block collection in hotbar-then-main order.
     ///
     /// Unlike [`Inventory::insert`], this matches world pickup semantics: it
@@ -1065,6 +1094,7 @@ pub enum RecipeId {
     Planks,
     Sticks,
     CraftingTable,
+    Chest,
     WoodPickaxe,
     WoodAxe,
     WoodShovel,
@@ -1144,6 +1174,12 @@ const RECIPES: &[Recipe] = &[
         id: RecipeId::CraftingTable,
         pattern: &["PP", "PP"],
         output: ItemId::Block(BlockId::CraftingTable),
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::Chest,
+        pattern: &["PPP", "P P", "PPP"],
+        output: ItemId::Block(BlockId::Chest),
         output_count: 1,
     },
     Recipe {
@@ -2075,6 +2111,79 @@ mod tests {
     }
 
     #[test]
+    fn insert_all_inserts_every_item_and_leaves_the_cursor_alone() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, 900));
+        inventory.cursor = Some(stick(7));
+
+        let items = [block(BlockId::Stone, 50), stick(3)];
+        let before = inventory.clone();
+        assert!(inventory.can_insert_all(&items));
+        assert_eq!(inventory, before, "a trial capacity check never mutates");
+
+        inventory.insert_all(&items).expect("both items fit");
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(950));
+        assert_eq!(inventory.hotbar(1), Some(stick(3)));
+        assert_eq!(
+            inventory.cursor(),
+            Some(stick(7)),
+            "the cursor is not a batch destination"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::Stone)), 950);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 10);
+    }
+
+    #[test]
+    fn insert_all_failure_preserves_every_slot_and_the_cursor() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        let pickaxe = tool(ToolKind::Pickaxe, ToolTier::Iron);
+        for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(pickaxe);
+        }
+        let mut inventory = Inventory::from_parts(slots, Some(stick(9)));
+        let before = inventory.clone();
+
+        // The stone would fill the single empty slot, then the axe has nowhere
+        // to go; the batch must not commit the stone partially.
+        let items = [
+            block(BlockId::Stone, 1),
+            tool(ToolKind::Axe, ToolTier::Iron),
+        ];
+        assert!(!inventory.can_insert_all(&items));
+        assert_eq!(inventory.insert_all(&items), Err(InventoryError::NoRoom));
+        assert_eq!(inventory, before, "a failed batch must not commit");
+        assert_eq!(inventory.slot(INVENTORY_SLOTS - 1), None);
+        assert_eq!(inventory.cursor(), Some(stick(9)));
+    }
+
+    #[test]
+    fn cursor_contents_do_not_create_spill_capacity() {
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        inventory.cursor = Some(block(BlockId::Stone, 1));
+        let before = inventory.clone();
+
+        let stone = [block(BlockId::Stone, 1)];
+        assert!(
+            !inventory.can_insert_all(&stone),
+            "a matching cursor stack is not 36-slot capacity"
+        );
+        assert_eq!(inventory.insert_all(&stone), Err(InventoryError::NoRoom));
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn insert_all_accepts_an_empty_batch_without_mutation() {
+        let mut inventory = Inventory::empty();
+        inventory.cursor = Some(stick(2));
+        let before = inventory.clone();
+
+        assert!(inventory.can_insert_all(&[]));
+        assert_eq!(inventory.insert_all(&[]), Ok(()));
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
     fn collect_block_reports_first_slot_accepted_and_conserves_items() {
         let mut inventory = Inventory::empty();
         let amount = MAX_STACK_COUNT + 501;
@@ -2675,6 +2784,108 @@ mod tests {
             .expect("table craft succeeds");
         assert_eq!(crafted.id(), ItemId::Block(BlockId::CraftingTable));
         assert_eq!(crafted.count(), 1);
+    }
+
+    #[test]
+    fn chest_recipe_is_a_ring_of_eight_planks_in_the_table_grid() {
+        let cells = [0, 1, 2, 4, 6, 8, 9, 10];
+        let mut grid = CraftingGrid::new(GridKind::Table);
+        for cell in cells {
+            grid.set(cell, Some(block(BlockId::OakPlanks, 2)))
+                .expect("ring cell in the 4x4 grid");
+        }
+
+        let preview = grid.preview().expect("eight planks in a ring make a chest");
+        assert_eq!(preview.recipe, RecipeId::Chest);
+        assert_eq!(preview.output, ItemId::Block(BlockId::Chest));
+        assert_eq!(preview.output_count, 1);
+
+        let mut inventory = Inventory::empty();
+        let first = grid.take_result(&mut inventory).expect("first chest");
+        assert_eq!(first.id(), ItemId::Block(BlockId::Chest));
+        assert_eq!(first.count(), 1);
+        for cell in cells {
+            assert_eq!(
+                grid.slot(cell).map(|item| item.count()),
+                Some(1),
+                "exactly one plank is consumed from cell {cell}"
+            );
+        }
+
+        let second = grid.take_result(&mut inventory).expect("second chest");
+        assert_eq!(second.id(), ItemId::Block(BlockId::Chest));
+        assert!(grid.is_empty(), "eight planks per chest empties the ring");
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Chest)),
+            2,
+            "two crafts yield two chests"
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            0,
+            "no planks leak into the inventory"
+        );
+        assert_eq!(grid.take_result(&mut inventory), Err(CraftError::NoRecipe));
+    }
+
+    #[test]
+    fn chest_recipe_projections_match_anywhere_in_the_table_grid() {
+        // The ring shifted one cell down and right still matches: the matcher
+        // compares trimmed bounding boxes, not absolute cells.
+        let mut offset = CraftingGrid::new(GridKind::Table);
+        for (row, col) in [
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 1),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (3, 3),
+        ] {
+            offset
+                .set(
+                    row * TABLE_GRID_DIM + col,
+                    Some(block(BlockId::OakPlanks, 1)),
+                )
+                .expect("cell in range");
+        }
+        assert_eq!(
+            offset.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Chest)
+        );
+    }
+
+    #[test]
+    fn chest_recipe_cannot_be_crafted_in_the_2x2_player_grid() {
+        // Four planks in the player grid are the crafting-table recipe; the
+        // chest's 3x3 bounding box can never fit there.
+        let mut player_grid = grid_from_pattern(GridKind::Player, &["PP", "PP"]);
+        assert_eq!(
+            player_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::CraftingTable)
+        );
+
+        let mut inventory = Inventory::empty();
+        let crafted = player_grid
+            .take_result(&mut inventory)
+            .expect("the 2x2 grid still crafts a table");
+        assert_eq!(crafted.id(), ItemId::Block(BlockId::CraftingTable));
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Chest)),
+            0,
+            "a chest can never come out of a 2x2 craft"
+        );
+
+        // Even a 2x2 arrangement of planks with a hole is not the chest: the
+        // only four-plank player recipe is the table.
+        let mut holed = CraftingGrid::new(GridKind::Player);
+        for index in [0, 1, 2] {
+            holed
+                .set(index, Some(block(BlockId::OakPlanks, 1)))
+                .expect("cell in range");
+        }
+        assert_eq!(holed.preview(), None);
     }
 
     #[test]

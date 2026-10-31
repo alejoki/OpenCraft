@@ -1,5 +1,6 @@
 use glam::Vec3;
 
+use crate::player::container::Container;
 use crate::player::inventory::{
     CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack,
     RecipePreview, ToolWear, HOTBAR_SLOTS,
@@ -331,6 +332,22 @@ impl Player {
         self.inventory.use_tool(self.selected_slot)
     }
 
+    /// Whether every item in `items` fits into the 36 inventory slots.
+    ///
+    /// Thin forwarder over [`Inventory::can_insert_all`]: the cursor and both
+    /// crafting grids are never counted as spill capacity.
+    pub fn can_insert_items(&self, items: &[Item]) -> bool {
+        self.inventory.can_insert_all(items)
+    }
+
+    /// Inserts every item completely or none at all.
+    ///
+    /// Thin forwarder over [`Inventory::insert_all`]. The cursor and both
+    /// crafting grids are untouched on success and on failure.
+    pub fn insert_items(&mut self, items: &[Item]) -> Result<(), InventoryError> {
+        self.inventory.insert_all(items)
+    }
+
     // -----------------------------------------------------------------------
     // Inventory-screen command façade
     //
@@ -367,6 +384,20 @@ impl Player {
         } else {
             self.inventory.pick_up_half(index)
         }
+    }
+
+    /// Whole-stack left-click between one chest slot and the shared cursor.
+    ///
+    /// Thin forwarder over [`Container::click_slot`]. The player aggregate owns
+    /// the only cursor, so this is the single UI entry point for moving items
+    /// in or out of a chest; both grids and the 36 inventory slots are
+    /// untouched.
+    pub fn click_container_slot(
+        &mut self,
+        container: &mut Container,
+        index: usize,
+    ) -> Result<(), InventoryError> {
+        container.click_slot(&mut self.inventory, index)
     }
 
     /// Moves a whole stack between one crafting-grid cell and the cursor.
@@ -1051,7 +1082,10 @@ mod tests {
 
     // -- Inventory-screen command façade -------------------------------------
 
-    use crate::player::inventory::{ItemId, Material, RecipeId, INVENTORY_SLOTS, MAX_STACK_COUNT};
+    use crate::player::inventory::{
+        ItemId, Material, RecipeId, ToolKind, ToolTier, CHEST_SLOTS, INVENTORY_SLOTS,
+        MAX_STACK_COUNT,
+    };
 
     fn block_item(block: BlockId, count: u16) -> Item {
         Item::new(ItemId::Block(block), count).expect("valid test block stack")
@@ -1182,6 +1216,217 @@ mod tests {
             &after_pick_up,
             "an out-of-range put-down keeps the cursor stack"
         );
+    }
+
+    // -- Chest container / batch insert forwarders ---------------------------
+
+    fn tool_item(kind: ToolKind, tier: ToolTier) -> Item {
+        Item::new(ItemId::Tool { kind, tier }, 1).expect("valid test tool")
+    }
+
+    /// 36 non-stackable tool slots plus a tool on the cursor. Every inventory
+    /// slot is occupied, so no item can be inserted without merging.
+    fn full_tool_inventory_with_cursor() -> Inventory {
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let kind = match index % 3 {
+                0 => ToolKind::Pickaxe,
+                1 => ToolKind::Axe,
+                _ => ToolKind::Shovel,
+            };
+            let tier = match index % 2 {
+                0 => ToolTier::Wood,
+                _ => ToolTier::Iron,
+            };
+            *slot = Some(tool_item(kind, tier));
+        }
+        Inventory::from_parts(slots, Some(tool_item(ToolKind::Hoe, ToolTier::Stone)))
+    }
+
+    fn container_units(container: &Container) -> u32 {
+        container
+            .slots()
+            .iter()
+            .flatten()
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn insert_items_moves_a_batch_without_touching_cursor_or_grids() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(block_item(BlockId::Stone, 900));
+        let inventory = Inventory::from_parts(slots, Some(stick_item(7)));
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(3, Some(stick_item(2)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::OakPlanks, 2)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(Vec3::ZERO, inventory, player_grid, table_grid);
+
+        let cursor_before = player.inventory().cursor();
+        let player_grid_before = player.player_grid().clone();
+        let table_grid_before = player.table_grid().clone();
+
+        let items = [block_item(BlockId::Stone, 50), stick_item(3)];
+        assert!(player.can_insert_items(&items));
+        player.insert_items(&items).expect("both items fit");
+
+        assert_eq!(
+            player.inventory().slot(0).map(|item| item.count()),
+            Some(950)
+        );
+        assert_eq!(player.inventory().slot(1), Some(stick_item(3)));
+        assert_eq!(
+            player.inventory().cursor(),
+            cursor_before,
+            "the cursor is not a batch destination"
+        );
+        assert_eq!(player.player_grid(), &player_grid_before);
+        assert_eq!(player.table_grid(), &table_grid_before);
+    }
+
+    #[test]
+    fn insert_items_failure_leaves_slots_cursor_and_both_grids_unchanged() {
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::OakPlanks, 4)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(5, Some(stick_item(3)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            full_tool_inventory_with_cursor(),
+            player_grid,
+            table_grid,
+        );
+
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        let items = [block_item(BlockId::Chest, 1), stick_item(1)];
+        assert!(!player.can_insert_items(&items));
+        assert_eq!(player.insert_items(&items), Err(InventoryError::NoRoom));
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(
+            player.table_grid(),
+            &before_table_grid,
+            "a rejected batch never spills into the crafting grids"
+        );
+    }
+
+    #[test]
+    fn cursor_and_grid_contents_do_not_create_spill_capacity() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(block_item(BlockId::Brick, MAX_STACK_COUNT));
+        }
+        // Cursor and both grids hold the identity being inserted; none of
+        // them is part of the 36-slot capacity calculation.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::Stone, MAX_STACK_COUNT)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::Stone, MAX_STACK_COUNT)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, Some(block_item(BlockId::Stone, 5))),
+            player_grid,
+            table_grid,
+        );
+
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        let stone = [block_item(BlockId::Stone, 1)];
+        assert!(
+            !player.can_insert_items(&stone),
+            "a matching cursor stack and grid cells are not inventory capacity"
+        );
+        assert_eq!(player.insert_items(&stone), Err(InventoryError::NoRoom));
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(player.table_grid(), &before_table_grid);
+    }
+
+    #[test]
+    fn container_slot_click_moves_items_through_the_shared_cursor() {
+        let mut player = player_with_slots([(0, block_item(BlockId::Stone, 4))]);
+        let mut container = Container::from_slots([None; CHEST_SLOTS]);
+        let units_before = player_units(&player) + container_units(&container);
+
+        player
+            .click_inventory_slot(0)
+            .expect("pick the stone into the cursor");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 4))
+        );
+
+        player
+            .click_container_slot(&mut container, 5)
+            .expect("cursor into the chest");
+        assert_eq!(container.slot(5), Some(block_item(BlockId::Stone, 4)));
+        assert_eq!(player.inventory().cursor(), None);
+        assert_eq!(
+            player_units(&player) + container_units(&container),
+            units_before,
+            "player -> chest conserves items"
+        );
+
+        player
+            .click_container_slot(&mut container, 5)
+            .expect("chest back onto the cursor");
+        assert_eq!(container.slot(5), None);
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 4))
+        );
+        assert_eq!(
+            player_units(&player) + container_units(&container),
+            units_before,
+            "chest -> player conserves items"
+        );
+    }
+
+    #[test]
+    fn container_slot_click_out_of_bounds_preserves_chest_and_player() {
+        let mut player = player_with_slots([(0, block_item(BlockId::Stone, 2))]);
+        player
+            .click_inventory_slot(0)
+            .expect("pick the stone into the cursor");
+        let mut slots = [None; CHEST_SLOTS];
+        slots[0] = Some(stick_item(3));
+        let mut container = Container::from_slots(slots);
+
+        let before_container = container.clone();
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        assert_eq!(
+            player.click_container_slot(&mut container, CHEST_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(
+            player.click_container_slot(&mut container, usize::MAX),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(container, before_container);
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(player.table_grid(), &before_table_grid);
     }
 
     #[test]
