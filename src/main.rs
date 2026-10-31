@@ -17,13 +17,13 @@ use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
-    GridKind, Item, ItemId, Material, ToolKind, ToolWear, HOTBAR_SLOTS,
+    GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolWear, HOTBAR_SLOTS,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
-use opencraft::player::survival::GameMode;
+use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
@@ -2335,6 +2335,447 @@ fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted survival demo (`--demo-survival`, S08-T02)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock safety net for the scripted survival loop. Every stage is also
+/// bounded by its own 200-update loop, so this only catches a run whose chunks
+/// never stream in (the settle/drown waits).
+const SURVIVAL_DEMO_DEADLINE_SECS: u64 = 120;
+
+/// The scripted survival loop's fixed stage order. Each stage is fed once per
+/// `about_to_wait` call; the wait stages (settle/drown) return `false` until
+/// their world gate is satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurvivalStage {
+    Settle,
+    Fall,
+    Eat,
+    Drown,
+    Starve,
+    Save,
+    Done,
+}
+
+/// The `--demo-survival` seam's whole state: the pinned seed, the resolved
+/// ocean route, the stage cursor, the one latched digest, and the observed
+/// numbers the success digest reports.
+#[derive(Debug)]
+struct SurvivalDemo {
+    seed: u32,
+    route: Option<SwimRoute>,
+    stage: SurvivalStage,
+    /// The digest latched when the run ends (success or abort). Printed by the
+    /// demo-shutdown block with the other bounded-demo diagnostics.
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status.
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+    /// The applied fall damage the demo proved (4 for the pinned 7-block
+    /// drop).
+    fall_damage: u16,
+    /// The hunger the apple restored (4).
+    eat_restored: u16,
+}
+
+impl SurvivalDemo {
+    fn new(seed: u32, route: Option<SwimRoute>, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            route,
+            stage: SurvivalStage::Settle,
+            digest: None,
+            failed: false,
+            deadline,
+            fall_damage: 0,
+            eat_restored: 0,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(format!(
+            "survival_demo: seed={} stage={} observed={} ok=false",
+            self.seed, stage, observed
+        ));
+        self.failed = true;
+    }
+
+    /// The exact success digest printed once on the demo-shutdown path.
+    fn success_digest(&self) -> String {
+        let full = SurvivalState::full();
+        format!(
+            "survival_demo: seed={} fall=true fall_damage={} eat=true eat_restored={} drown=true air_empty=true starve=true death=true respawn=true inventory_kept=true mode=survival saved=true health={} hunger={} air={} ok=true",
+            self.seed,
+            self.fall_damage,
+            self.eat_restored,
+            full.health(),
+            full.hunger(),
+            full.air(),
+        )
+    }
+}
+
+/// Total carried count of one identity across the 36 durable inventory slots.
+fn inventory_item_count(inventory: &Inventory, id: ItemId) -> u16 {
+    inventory
+        .slots()
+        .iter()
+        .flatten()
+        .filter(|item| item.id() == id)
+        .map(|item| item.count())
+        .fold(0u16, u16::saturating_add)
+}
+
+/// The first solid block below the deterministic spawn column, scanning the
+/// same bounded band the fall stage uses. `None` when the spawn ground is not
+/// resident or not solid, so the caller aborts with a self-describing digest.
+fn spawn_ground_y(session: &WorldSession) -> Option<i32> {
+    let spawn = WorldSession::spawn_position(session.world.seed());
+    let spawn_x = spawn.x.floor() as i32;
+    let spawn_z = spawn.z.floor() as i32;
+    let spawn_y = spawn.y.floor() as i32;
+    let top = spawn_y + 2;
+    let bottom = spawn_y - 8;
+    (bottom..=top)
+        .rev()
+        .find(|&y| session.world.get_block(spawn_x, y, spawn_z).is_solid())
+}
+
+/// Drive one Playing frame of the scripted survival loop. Returns true when
+/// this call ended the run (success or abort).
+///
+/// Every stage is bounded: the fall and starvation/drowning simulations are
+/// capped at 200 updates, the wait stages are bounded by the wall-clock
+/// deadline, and every failure latches an abort digest instead of panicking on
+/// live-world variance.
+fn survival_demo_step(demo: &mut SurvivalDemo, session: &mut WorldSession) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    if let Some(deadline) = demo.deadline {
+        if Instant::now() >= deadline {
+            demo.abort(
+                "deadline",
+                &format!("bounded survival run exceeded {SURVIVAL_DEMO_DEADLINE_SECS}s"),
+            );
+            return true;
+        }
+    }
+    let input = InputState::default();
+    match demo.stage {
+        SurvivalStage::Settle => {
+            if !session.settle_spawn() {
+                return false;
+            }
+            demo.stage = SurvivalStage::Fall;
+            false
+        }
+        SurvivalStage::Fall => {
+            let spawn = WorldSession::spawn_position(session.world.seed());
+            if !session.player.on_ground {
+                let mut landed = false;
+                for _ in 0..200 {
+                    session.player.update(1.0 / 60.0, &input, |x, y, z| {
+                        session.world.get_block(x, y, z)
+                    });
+                    if session.player.on_ground {
+                        landed = true;
+                        break;
+                    }
+                }
+                if !landed {
+                    demo.abort(
+                        "fall",
+                        &format!(
+                            "never landed on the spawn column; y={:.3}",
+                            session.player.position.y
+                        ),
+                    );
+                    return true;
+                }
+            }
+            let Some(ground_y) = spawn_ground_y(session) else {
+                demo.abort("fall", "no_ground");
+                return true;
+            };
+            // The spawn landing above consumed the fresh-spawn immunity, so
+            // this pinned 7-block drop is the first landing that can hurt.
+            session.player.survival = SurvivalState::full();
+            session.player.position = Vec3::new(spawn.x, ground_y as f32 + 1.0 + 7.0, spawn.z);
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = false;
+            let mut landed = false;
+            for _ in 0..200 {
+                session.player.update(1.0 / 60.0, &input, |x, y, z| {
+                    session.world.get_block(x, y, z)
+                });
+                if session.player.on_ground {
+                    landed = true;
+                    break;
+                }
+            }
+            if !landed {
+                demo.abort(
+                    "fall",
+                    &format!(
+                        "did not land after the pinned 7-block drop; y={:.3} ground_y={ground_y}",
+                        session.player.position.y
+                    ),
+                );
+                return true;
+            }
+            session.tick_survival(0.1, 1.0, false);
+            let health = session.player.survival.health();
+            if health != 16 {
+                demo.abort(
+                    "fall",
+                    &format!("health={health} after a 7-block drop (expected 16)"),
+                );
+                return true;
+            }
+            demo.fall_damage = 4;
+            demo.stage = SurvivalStage::Eat;
+            false
+        }
+        SurvivalStage::Eat => {
+            let health = session.player.survival.health();
+            let Some(mut vitals) = SurvivalState::new(health, MAX_HUNGER, FULL_AIR) else {
+                demo.abort("eat", "could_not_construct_checked_vitals");
+                return true;
+            };
+            let spent = vitals.spend_hunger(6);
+            if spent != 6 {
+                demo.abort("eat", &format!("spent_hunger={spent} (expected 6)"));
+                return true;
+            }
+            session.player.survival = vitals;
+            let Ok(apple) = Item::new(ItemId::Material(Material::Apple), 2) else {
+                demo.abort("eat", "could_not_build_apple_stack");
+                return true;
+            };
+            let Ok(stick) = Item::new(ItemId::Material(Material::Stick), 1) else {
+                demo.abort("eat", "could_not_build_stick_stack");
+                return true;
+            };
+            if session.player.insert_items(&[apple, stick]).is_err() {
+                demo.abort("eat", "inventory_refused_the_food_and_marker");
+                return true;
+            }
+            let apple_id = ItemId::Material(Material::Apple);
+            let Some(slot) = (0..HOTBAR_SLOTS).find(|&slot| {
+                session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(apple_id)
+            }) else {
+                demo.abort("eat", "apple_slot_missing_after_insert");
+                return true;
+            };
+            if !session.player.select_slot(slot) {
+                demo.abort("eat", "apple_slot_out_of_hotbar_range");
+                return true;
+            }
+            let Some(restored) = session.player.eat_selected(slot, apple_id) else {
+                demo.abort("eat", "eat_selected_refused_the_apple");
+                return true;
+            };
+            if restored != 4 {
+                demo.abort("eat", &format!("eat_restored={restored} (expected 4)"));
+                return true;
+            }
+            let hunger = session.player.survival.hunger();
+            if hunger != 18 {
+                demo.abort("eat", &format!("hunger={hunger} (expected 18)"));
+                return true;
+            }
+            let apples = inventory_item_count(session.player.inventory(), apple_id);
+            if apples != 1 {
+                demo.abort("eat", &format!("apples={apples} (expected 1)"));
+                return true;
+            }
+            demo.eat_restored = restored;
+            demo.stage = SurvivalStage::Drown;
+            false
+        }
+        SurvivalStage::Drown => {
+            let Some(route) = demo.route else {
+                demo.abort("drown", "no_ocean_route");
+                return true;
+            };
+            let spawn = WorldSession::spawn_position(session.world.seed());
+            session.player.position = Vec3::new(
+                0.5,
+                SEA_LEVEL as f32 - 2.0,
+                route.ocean_start_z as f32 + 0.5,
+            );
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = false;
+            session.sync_camera();
+            let (ocean_chunk, _) = world_to_chunk_and_local(0, SEA_LEVEL, route.ocean_start_z);
+            if !session.world.is_resident(ocean_chunk)
+                || session.world.get_block(0, SEA_LEVEL, route.ocean_start_z) != BlockId::Water
+            {
+                return false;
+            }
+            session.player.survival.refill_air();
+            let health_before = session.player.survival.health();
+            let mut drowned = false;
+            for _ in 0..200 {
+                session.tick_survival(0.1, 10.0, true);
+                if session.player.survival.air() == 0
+                    && session.player.survival.health() < health_before
+                {
+                    drowned = true;
+                    break;
+                }
+            }
+            if !drowned {
+                demo.abort(
+                    "drown",
+                    &format!(
+                        "air={} health={} (expected empty air and damage from {health_before})",
+                        session.player.survival.air(),
+                        session.player.survival.health()
+                    ),
+                );
+                return true;
+            }
+            let Some(ground_y) = spawn_ground_y(session) else {
+                demo.abort("drown", "no_ground");
+                return true;
+            };
+            session.player.position = Vec3::new(spawn.x, ground_y as f32 + 1.0, spawn.z);
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = true;
+            session.player.survival.refill_air();
+            session.sync_camera();
+            demo.stage = SurvivalStage::Starve;
+            false
+        }
+        SurvivalStage::Starve => {
+            // The eaten apple leaves hunger below MAX_HUNGER; spending the
+            // maximum simply empties it (the mutator reports the clamped
+            // amount). The observable contract is hunger == 0.
+            session.player.survival.spend_hunger(MAX_HUNGER);
+            let hunger = session.player.survival.hunger();
+            if hunger != 0 {
+                demo.abort(
+                    "starve",
+                    &format!("hunger={hunger} after spending {MAX_HUNGER}"),
+                );
+                return true;
+            }
+            let mut died = false;
+            for _ in 0..200 {
+                session.tick_survival(0.1, 100.0, false);
+                if session.is_dead() {
+                    died = true;
+                    break;
+                }
+            }
+            if !died {
+                demo.abort(
+                    "starve",
+                    &format!(
+                        "health={} hunger={} (expected death within the starvation window)",
+                        session.player.survival.health(),
+                        session.player.survival.hunger()
+                    ),
+                );
+                return true;
+            }
+            session.respawn();
+            if session.player.survival != SurvivalState::full() {
+                demo.abort(
+                    "starve",
+                    &format!(
+                        "respawn left health={} hunger={} air={} (expected full vitals)",
+                        session.player.survival.health(),
+                        session.player.survival.hunger(),
+                        session.player.survival.air()
+                    ),
+                );
+                return true;
+            }
+            let stick_id = ItemId::Material(Material::Stick);
+            if inventory_item_count(session.player.inventory(), stick_id) == 0 {
+                demo.abort("starve", "stick_marker_missing_after_respawn");
+                return true;
+            }
+            demo.stage = SurvivalStage::Save;
+            false
+        }
+        SurvivalStage::Save => {
+            if let Err(err) = save_current_world(session) {
+                demo.abort("save", &format!("save_failed={err}"));
+                return true;
+            }
+            let loaded = match load_world_from_path(&session.save_path) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    demo.abort("save", &format!("load_failed={err}"));
+                    return true;
+                }
+            };
+            if loaded.mode != GameMode::Survival {
+                demo.abort(
+                    "save",
+                    &format!("mode={:?} (expected Survival)", loaded.mode),
+                );
+                return true;
+            }
+            if loaded.player.survival != SurvivalState::full() {
+                demo.abort(
+                    "save",
+                    &format!(
+                        "loaded health={} hunger={} air={} (expected full vitals)",
+                        loaded.player.survival.health(),
+                        loaded.player.survival.hunger(),
+                        loaded.player.survival.air()
+                    ),
+                );
+                return true;
+            }
+            if !loaded.chests.is_empty() {
+                demo.abort(
+                    "save",
+                    &format!("chests={} (expected empty)", loaded.chests.len()),
+                );
+                return true;
+            }
+            if !loaded.chunk_edits.is_empty() {
+                demo.abort(
+                    "save",
+                    &format!("chunk_edits={} (expected empty)", loaded.chunk_edits.len()),
+                );
+                return true;
+            }
+            let stick_id = ItemId::Material(Material::Stick);
+            if inventory_item_count(&loaded.player.inventory, stick_id) == 0 {
+                demo.abort("save", "stick_marker_missing_in_the_loaded_save");
+                return true;
+            }
+            demo.digest = Some(demo.success_digest());
+            demo.stage = SurvivalStage::Done;
+            true
+        }
+        SurvivalStage::Done => true,
+    }
+}
+
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
 /// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
 /// under this; the cap only guarantees bounded memory if a run is left going.
@@ -2668,9 +3109,13 @@ struct GameApp {
     /// normal run; a launch flag arms it and the fresh-world branch has already
     /// teleported the player onto the route.
     swim: Option<SwimDemo>,
+    /// Scripted survival-loop seam (`--demo-survival`, S08-T02). `None` for
+    /// every normal run; the launch flag arms it and `step_scripted_demos`
+    /// drives the fall/eat/drown/starve/respawn/save stages on Playing frames.
+    survival_demo: Option<SurvivalDemo>,
     /// Whether a failed demo seam requests a non-zero process status. Set by a
-    /// self-describing swim abort; `main` reads it after the event loop exits
-    /// (the shutdown path itself cannot set a process status).
+    /// self-describing swim or survival abort; `main` reads it after the event
+    /// loop exits (the shutdown path itself cannot set a process status).
     exit_failure: bool,
     /// True when the launch requested a scripted demo seam (`--demo-swim`,
     /// `--demo-survival`, or `--demo-content`) — see
@@ -2785,6 +3230,21 @@ impl GameApp {
         } else {
             None
         };
+        // Scripted survival seam (S08-T02): the route is resolved from the
+        // same session seed as the swim, and the wall-clock deadline only
+        // arms for a direct-to-gameplay launch. The stage cursor starts at
+        // Settle; `step_scripted_demos` owns every later transition.
+        let survival_demo = if cli.demo_survival {
+            let seed = session.world.seed();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(SURVIVAL_DEMO_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(SurvivalDemo::new(seed, swim_route(seed), deadline))
+        } else {
+            None
+        };
         // The loaded Settings are the single source of truth for video
         // parameters: FOV applies to the session's camera at startup, and
         // render distance to its world (defaults are 75 degrees / 16
@@ -2867,6 +3327,7 @@ impl GameApp {
             frame_budget: FrameBudgetSampler::new(),
             demo_seam_ran: false,
             swim,
+            survival_demo,
             exit_failure: false,
             scripted_demo,
         }
@@ -3150,6 +3611,41 @@ impl GameApp {
         }
     }
 
+    /// Drive every armed scripted demo through one `about_to_wait` turn.
+    ///
+    /// Called before the death transition: the starvation stage respawns in
+    /// the same step, so `enter_death_if_dead` sees full health rather than a
+    /// stale zero-health frame and never flashes the Death screen. An armed
+    /// demo on a non-Playing screen aborts with a self-describing digest
+    /// instead of waiting forever on frames that will never arrive (a
+    /// menu-first `--demo-survival` launch, or a demo that lost the screen to
+    /// death).
+    fn step_scripted_demos(&mut self) {
+        if self.demo_finished {
+            return;
+        }
+        let screen = self.lifecycle.screen();
+        let playing = screen == LifecycleScreen::Playing;
+        let Some(demo) = self.survival_demo.as_mut() else {
+            return;
+        };
+        let finished = if playing {
+            survival_demo_step(demo, &mut self.session)
+        } else {
+            demo.abort("screen", &format!("screen={screen:?}"));
+            true
+        };
+        if finished {
+            self.demo_seam_ran = true;
+            self.demo_finished = true;
+            self.exit_failure |= self
+                .survival_demo
+                .as_ref()
+                .map(|demo| demo.failed)
+                .unwrap_or(false);
+        }
+    }
+
     /// Transition a live Playing session into Death once its health reaches
     /// zero. Returns true only on the transition and is idempotent once the
     /// screen is Death. Called from `about_to_wait`, outside the
@@ -3221,10 +3717,12 @@ impl GameApp {
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
         self.demo_seam_ran = false;
-        // The scripted swim belongs to the LAUNCH (the fresh-world startup
-        // branch that teleported the player), never to a session created from
-        // the menu: swapping worlds retires the seam with the old world.
+        // The scripted swim and survival seams belong to the LAUNCH (the
+        // fresh-world startup branch that teleported the player), never to a
+        // session created from the menu: swapping worlds retires them with
+        // the old world.
         self.swim = None;
+        self.survival_demo = None;
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -5590,6 +6088,12 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Scripted demo seams (S08-T02): drive the survival state machine
+        // before the death transition so its starvation stage can respawn in
+        // the same step and never flashes a stale Death screen. The wrapper
+        // also latches `demo_finished` for the bounded shutdown below.
+        self.step_scripted_demos();
+
         // Mid-game death transition (S04-T05): the Playing frame loop keeps
         // rendering the frozen session after a lethal tick, and this is the
         // non-render region that can call the whole-`self` screen transition
@@ -5644,6 +6148,13 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             if let Some(line) = self.swim.as_ref().and_then(|demo| demo.digest.as_deref()) {
+                let _ = writeln!(stdout, "{line}");
+            }
+            if let Some(line) = self
+                .survival_demo
+                .as_ref()
+                .and_then(|demo| demo.digest.as_deref())
+            {
                 let _ = writeln!(stdout, "{line}");
             }
             drop(stdout);
@@ -7102,6 +7613,234 @@ mod tests {
             .expect("seam armed")
             .deadline
             .is_none());
+    }
+
+    // ---- Scripted survival seam (S08-T02) ----
+
+    /// Insert the generated chunk owning `pos` plus its six face neighbours,
+    /// each generated from the session seed. Unlike the edit-remesh helper the
+    /// neighbours are real terrain, so a fixture that keeps two nearby columns
+    /// resident cannot blank one insertion with the other's Air halo.
+    fn insert_generated_chunk_with_generated_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let seed = session.world.seed();
+        for (dx, dy, dz) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let neighbour = ChunkPos::new(chunk_pos.x + dx, chunk_pos.y + dy, chunk_pos.z + dz);
+            let chunk = generate_chunk_seeded(neighbour, seed, Season::Summer);
+            session.world.insert_chunk_for_test(neighbour, chunk);
+        }
+        chunk_pos
+    }
+
+    /// The success digest is pinned, and the save the loop leaves behind is
+    /// edit-free and chest-free (the fixed-offset script never mutates the
+    /// world).
+    #[test]
+    fn survival_demo_success_digest_is_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival-demo.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(12345);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(0, SEA_LEVEL, 0),
+        );
+
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), None);
+        let mut steps = 0;
+        while steps < 64 && !demo.finished() {
+            steps += 1;
+            survival_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the scripted loop must finish within 64 steps"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, SurvivalStage::Done);
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(
+                "survival_demo: seed=12345 fall=true fall_damage=4 eat=true eat_restored=4 \
+                 drown=true air_empty=true starve=true death=true respawn=true \
+                 inventory_kept=true mode=survival saved=true health=20 hunger=20 air=300 \
+                 ok=true"
+            )
+        );
+
+        // The Save stage leaves the v6 file edit-free: the fixed-offset script
+        // never mutates the world, so the save is reproducible.
+        let saved = load_world_from_path(&save_path).expect("the demo's save loads");
+        assert_eq!(saved.mode, GameMode::Survival);
+        assert!(saved.chests.is_empty(), "the demo opens no chests");
+        assert!(
+            saved.chunk_edits.is_empty(),
+            "the fixed-offset script must leave chunk_edits empty"
+        );
+    }
+
+    /// A stalled run aborts with a self-describing digest, and the first
+    /// outcome wins so a later abort cannot rewrite it.
+    #[test]
+    fn survival_demo_deadline_aborts_with_a_self_describing_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("deadline.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), Some(past));
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.finished());
+        assert!(demo.failed, "a deadline is a failed run");
+        let digest = demo.digest.clone().expect("abort digest latched");
+        assert!(
+            digest.starts_with("survival_demo: seed=12345 stage=deadline "),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+
+        demo.abort("starve", "synthetic_second_abort");
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(digest.as_str()),
+            "the first outcome wins"
+        );
+    }
+
+    /// A seed without a resolved ocean route aborts at the drown stage with a
+    /// self-describing digest instead of teleporting at nothing.
+    #[test]
+    fn survival_demo_without_an_ocean_route_aborts_at_drown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("no-route.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let mut demo = SurvivalDemo::new(12345, None, None);
+        demo.stage = SurvivalStage::Drown;
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.failed);
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(digest.contains("stage=drown"), "{digest}");
+        assert!(digest.contains("observed=no_ocean_route"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+    }
+
+    /// A fall stage over an unresident world is bounded: after its 200-update
+    /// window it aborts instead of looping forever.
+    #[test]
+    fn survival_demo_fall_without_ground_aborts_inside_the_update_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("no-ground.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), None);
+        demo.stage = SurvivalStage::Fall;
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.failed);
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(digest.contains("stage=fall"), "{digest}");
+        assert!(digest.contains("observed=no_ground"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+    }
+
+    /// The seam is launch state, not session state; a menu-first launch arms
+    /// without a deadline and the wrapper aborts on its non-Playing screen.
+    #[test]
+    fn survival_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--survival",
+            "--demo-survival",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        let demo = app.survival_demo.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 12345);
+        assert!(demo.route.is_some());
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay survival run carries its 120s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.survival_demo.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // Menu-first launch (`--demo-survival` alone): armed without a
+        // deadline. The wrapper aborts it with the screen it actually saw
+        // instead of waiting forever for gameplay frames.
+        let menu_cli = CliConfig::parse_args(["--demo-survival"]);
+        let mut menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                12345,
+                PathBuf::from("/nonexistent/menu-survival.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let menu_demo = menu_app.survival_demo.as_ref().expect("seam armed");
+        assert_eq!(menu_demo.seed, 12345);
+        assert!(menu_demo.deadline.is_none());
+
+        menu_app.step_scripted_demos();
+        let digest = menu_app
+            .survival_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("screen abort digest");
+        assert!(digest.contains("stage=screen"), "{digest}");
+        assert!(digest.contains("observed=screen=MainMenu"), "{digest}");
+        assert!(menu_app.demo_finished, "the abort ends the bounded run");
+        assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
     }
 
     #[test]
