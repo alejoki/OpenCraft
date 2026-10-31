@@ -2474,10 +2474,17 @@ impl GameApp {
         // gameplay directly, bypassing every menu screen (preserving every
         // flagged launch, including both smoke scripts' --new/--seed/--save
         // runs); a bare launch opens the main menu over the loaded world.
-        // Cursor state follows the screen: menu screens start with the
-        // cursor released so they are clickable immediately.
+        // A dead session from such a launch enters the Death screen instead
+        // of a frozen Playing frame (S04-T05); a bare launch still starts on
+        // the main menu, which renders over the dead world until the player
+        // loads it. Cursor state follows the screen: menu screens start with
+        // the cursor released so they are clickable immediately.
         let startup_screen = if cli_has_world_intent(&cli) {
-            LifecycleScreen::Playing
+            if session.is_dead() {
+                LifecycleScreen::Death
+            } else {
+                LifecycleScreen::Playing
+            }
         } else {
             LifecycleScreen::MainMenu
         };
@@ -2850,6 +2857,31 @@ impl GameApp {
             self.menu.close();
         }
         self.lifecycle = LifecycleState::from_screen(LifecycleScreen::Playing);
+    }
+
+    /// Enter gameplay when the session is alive, or the Death screen when its
+    /// health is already zero. Every menu gameplay entry path (Play on a
+    /// load row, Create on the new-game screen) funnels through here so a
+    /// health-0 save can never resume a frozen dead player.
+    fn enter_gameplay_or_death(&mut self) {
+        if self.session.is_dead() {
+            self.enter_screen(LifecycleScreen::Death);
+        } else {
+            self.enter_playing();
+        }
+    }
+
+    /// Transition a live Playing session into Death once its health reaches
+    /// zero. Returns true only on the transition and is idempotent once the
+    /// screen is Death. Called from `about_to_wait`, outside the
+    /// RedrawRequested region that holds disjoint `gpu`/`window` borrows, so
+    /// the whole-`self` `enter_screen` call is legal (P005).
+    fn enter_death_if_dead(&mut self) -> bool {
+        if self.lifecycle.screen() != LifecycleScreen::Playing || !self.session.is_dead() {
+            return false;
+        }
+        self.enter_screen(LifecycleScreen::Death);
+        true
     }
 
     /// Swap in a new world session atomically — the ONE boundary a world
@@ -3282,7 +3314,7 @@ impl GameApp {
             .dispatch(LifecycleIntent::NewGame(NewGameIntent::Create))
         {
             self.start_world_session(session);
-            self.enter_playing();
+            self.enter_gameplay_or_death();
         }
     }
 
@@ -3344,7 +3376,7 @@ impl GameApp {
             .dispatch(LifecycleIntent::LoadGame(LoadGameIntent::Load))
         {
             self.start_world_session(session);
-            self.enter_playing();
+            self.enter_gameplay_or_death();
         }
     }
 
@@ -5149,6 +5181,14 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Mid-game death transition (S04-T05): the Playing frame loop keeps
+        // rendering the frozen session after a lethal tick, and this is the
+        // non-render region that can call the whole-`self` screen transition
+        // (P005). `enter_screen` already drops input/mining, closes the
+        // inventory/chest panels, and releases the cursor; the call is
+        // idempotent once the screen is Death.
+        self.enter_death_if_dead();
+
         // Scripted swim wall-clock safety net (S08-T02): armed only for a
         // direct-to-gameplay `--demo-swim` launch and deliberately independent
         // of `time_scale` (the swim runs at the default scale so no seasonal
@@ -11784,6 +11824,235 @@ mod tests {
             chests: rustc_hash::FxHashMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
+    }
+
+    /// A dead Survival save carrying a hotbar stack and a non-default
+    /// selection, so the death-entry and respawn tests prove inventory and
+    /// selected-slot preservation alongside the zero-health routing.
+    fn dead_survival_save(seed: u32) -> WorldSaveData {
+        let mut save = sample_save(seed);
+        save.mode = GameMode::Survival;
+        save.player.fly_mode = false;
+        save.player.selected_slot = 4;
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone stack"))
+            .expect("the empty inventory accepts the stack");
+        save.player.inventory = inventory;
+        save.player.survival = SurvivalState::new(0, 6, 40).expect("dead but in-range vitals");
+        save
+    }
+
+    #[test]
+    fn dead_save_load_enters_death_and_respawn_preserves_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        WorldCatalogFs::new(dir.path())
+            .save_world("doomed", &dead_survival_save(21))
+            .expect("write dead save");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+        assert_eq!(app.load.row_count(), 1);
+        app.play_row(0);
+
+        // Play routes a health-0 save to Death instead of a frozen Playing
+        // frame, and the save's own selection/inventory survive the load.
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Death);
+        assert!(app.session.is_dead());
+        assert_eq!(app.session.world.seed(), 21);
+        assert_eq!(app.session.player.selected_slot(), 4);
+        let inventory = app.session.player.inventory().clone();
+        let selected = app.session.player.selected_slot();
+        assert!(
+            inventory.hotbar(0).is_some(),
+            "the loaded hotbar item survives the load"
+        );
+
+        // Respawn returns to Playing at the deterministic spawn with full
+        // vitals, while the exact pre-respawn inventory and selection stay.
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::Respawn));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            app.session.player.position,
+            WorldSession::spawn_position(21)
+        );
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+        assert_eq!(app.session.player.inventory(), &inventory);
+        assert_eq!(app.session.player.selected_slot(), selected);
+    }
+
+    #[test]
+    fn healthy_save_load_enters_playing_not_death() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut save = sample_save(22);
+        save.mode = GameMode::Survival;
+        save.player.fly_mode = false;
+        WorldCatalogFs::new(dir.path())
+            .save_world("alive", &save)
+            .expect("write healthy save");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+        app.play_row(0);
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(!app.session.is_dead());
+        assert!(app.cursor_grabbed, "Playing semantics grab the cursor");
+    }
+
+    #[test]
+    fn dead_cli_save_starts_on_death_while_bare_launch_starts_on_main_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("dead-cli.mcvx");
+        save_world_to_path(&save_path, &dead_survival_save(23)).expect("write dead save");
+        let save_arg = save_path.to_str().expect("utf-8 tempdir path");
+
+        // A flagged CLI launch that restores zero health starts on Death.
+        let flagged = CliConfig::parse_args(["--save", save_arg]);
+        let session = startup_session(&flagged);
+        assert!(session.is_dead(), "the CLI load restores zero health");
+        let app = GameApp::new_with_paths(
+            flagged,
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Death);
+
+        // The same dead session through a bare launch starts on the main
+        // menu (which renders over the dead world until it is loaded).
+        let session = startup_session(&CliConfig::parse_args(["--save", save_arg]));
+        assert!(session.is_dead());
+        let app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+    }
+
+    #[test]
+    fn death_quit_writes_zero_health_and_returns_to_the_main_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("death-quit.mcvx");
+        let session = WorldSession::session_from_save(dead_survival_save(24), save_path.clone());
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        app.enter_screen(LifecycleScreen::Death);
+
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none(), "the save succeeded");
+
+        // Death Quit reuses the one save site: the file keeps health 0 and
+        // the rest of the loaded state, including the selection.
+        let data = load_world_from_path(&save_path).expect("the death save decodes");
+        assert_eq!(data.mode, GameMode::Survival);
+        assert_eq!(data.player.survival.health(), 0);
+        assert_eq!(data.player.selected_slot, 4);
+    }
+
+    #[test]
+    fn death_quit_save_failure_lands_on_the_main_menu_never_pause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Force a save failure exactly like the existing blocker pattern: the
+        // save path's parent is a regular file, so create_dir_all fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let save_path = blocker.join("dead.mcvx");
+        let session = WorldSession::session_from_save(dead_survival_save(25), save_path.clone());
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        app.enter_screen(LifecycleScreen::Death);
+
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let message = app
+            .main_menu_message
+            .as_ref()
+            .expect("save failure surfaces on the main menu");
+        assert!(
+            message.text.contains("could not save world"),
+            "unexpected failure text: {}",
+            message.text
+        );
+        assert_ne!(
+            app.lifecycle.screen(),
+            LifecycleScreen::Pause,
+            "a failed death quit never falls back to Pause"
+        );
+        assert!(!save_path.exists());
+    }
+
+    #[test]
+    fn enter_death_if_dead_is_idempotent_and_only_transitions_from_dead_playing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A dead session on the main menu is left alone: the menu owns it.
+        let mut menu = app_at_screen(dir.path(), LifecycleScreen::MainMenu);
+        menu.session.player.survival = SurvivalState::new(0, 3, 10).expect("dead vitals");
+        assert!(!menu.enter_death_if_dead());
+        assert_eq!(menu.lifecycle.screen(), LifecycleScreen::MainMenu);
+
+        // A healthy Playing session is left alone.
+        let mut alive = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        assert!(!alive.enter_death_if_dead());
+        assert_eq!(alive.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // A dead Playing session transitions once and closes the panel.
+        let mut dead = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        dead.session.player.survival = SurvivalState::new(0, 3, 10).expect("dead vitals");
+        dead.inventory.open_player();
+        assert!(dead.inventory.is_open());
+        assert!(dead.enter_death_if_dead());
+        assert_eq!(dead.lifecycle.screen(), LifecycleScreen::Death);
+        assert!(
+            !dead.inventory.is_open(),
+            "Death closes the inventory panel"
+        );
+        assert!(!dead.enter_death_if_dead(), "already on Death: idempotent");
+        assert_eq!(dead.lifecycle.screen(), LifecycleScreen::Death);
+    }
+
+    #[test]
+    fn death_screen_text_title_tag_and_geometry_match_the_death_rows() {
+        let (sw, sh) = (1280u32, 720u32);
+        let app = app_at_screen(Path::new("/nonexistent/saves"), LifecycleScreen::MainMenu);
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::Death,
+                &app.new_game,
+                &app.load,
+                None,
+                None,
+                None
+            ),
+            "You Died\nRespawn\nQuit"
+        );
+        assert_eq!(screen_title_tag(LifecycleScreen::Death), " | Dead");
+        assert_eq!(
+            screen_panel_rect(LifecycleScreen::Death, &app.load, sw, sh),
+            death_panel_rect(sw, sh)
+        );
+        for (index, row) in DEATH_ROWS.iter().enumerate() {
+            let rect = death_row_rect(sw, sh, index).expect("row geometry exists");
+            let center = (rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0);
+            assert_eq!(
+                hovered_target_rect(LifecycleScreen::Death, &app.load, Some(center), sw, sh),
+                Some(rect),
+                "hover follows the {row:?} row geometry"
+            );
+        }
+        assert_eq!(
+            hovered_target_rect(LifecycleScreen::Death, &app.load, Some((0.0, 0.0)), sw, sh),
+            None,
+            "the title line is not clickable"
+        );
     }
 
     #[test]
