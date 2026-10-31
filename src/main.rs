@@ -16,7 +16,9 @@ use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
-use opencraft::player::inventory::{GridKind, Item, ItemId, Material, ToolWear, HOTBAR_SLOTS};
+use opencraft::player::inventory::{
+    GridKind, Item, ItemId, Material, ToolKind, ToolWear, HOTBAR_SLOTS,
+};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
@@ -250,6 +252,10 @@ enum BreakRejection {
     /// inventory slots, so the all-or-nothing preflight refused before any
     /// edit, wear, or record change.
     ChestNoRoom,
+    /// A wheat harvest's deterministic drops do not fit in the 36 inventory
+    /// slots, so the all-or-nothing preflight refused before any edit, wear,
+    /// or inventory change. The crop stays intact and the break is retryable.
+    HarvestNoRoom,
 }
 
 /// The transient gameplay notice a rejected break shows, or `None` for
@@ -258,6 +264,7 @@ enum BreakRejection {
 fn break_rejection_notice(rejection: BreakRejection) -> Option<&'static str> {
     match rejection {
         BreakRejection::ChestNoRoom => Some("Not enough inventory space to break the chest"),
+        BreakRejection::HarvestNoRoom => Some("Not enough inventory space to harvest the wheat"),
         BreakRejection::Unbreakable
         | BreakRejection::StaleTarget
         | BreakRejection::EditRejected => None,
@@ -279,8 +286,10 @@ enum ToolWearOutcome {
 ///
 /// `Applied` is the only arm that carries remesh work, and it is produced
 /// only after the world edit proved it happened. Every other path — a stale
-/// target, an unbreakable block, or an edit that returned nothing — is a
-/// rejection that left the world, the inventory, and durability untouched.
+/// target, an unbreakable block, a malformed harvest table, an edit that
+/// returned nothing, or a full-inventory preflight refusal (chest or wheat) —
+/// is a rejection that left the world, the inventory, and durability
+/// untouched.
 ///
 /// Production only needs the remesh work, but the wear transition and the
 /// rejection reason are the outcome contract the executable harness asserts
@@ -299,11 +308,19 @@ enum BreakOutcome {
 /// Applies one mining break with a fixed, testable ordering:
 ///
 /// 1. re-read the world and refuse unbreakable/stale targets,
-/// 2. apply the world edit (the only authority that a break happened),
-/// 3. wear the selected tool exactly once, but only after non-empty remesh
+/// 2. for wheat, derive the deterministic harvest and preflight the whole
+///    batch; for a container, preflight its contents plus its own drop, so a
+///    full inventory refuses before any edit, wear, or record change,
+/// 3. apply the world edit (the only authority that a break happened),
+/// 4. wear the selected tool exactly once, but only after non-empty remesh
 ///    work proved the edit applied,
-/// 4. collect the pre-break block last, so a tool that broke has already
+/// 5. collect the pre-break block last, so a tool that broke has already
 ///    freed its hotbar slot and the drop can land there.
+///
+/// Wheat is not a carryable block, so its drops come from
+/// [`WorldSession::wheat_harvest_items`] rather than `collect_block`, and the
+/// crop candidate is removed only after the proven edit. Breaking Farmland
+/// forgets a floating crop candidate above it without editing that crop block.
 ///
 /// An empty remesh result means the edit did not apply (unloaded chunk or
 /// outside the vertical world range), so nothing is worn or collected —
@@ -318,12 +335,28 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
     if session.world.get_block(pos.x, pos.y, pos.z) != block {
         return BreakOutcome::Rejected(BreakRejection::StaleTarget);
     }
+    // Wheat's deterministic drops are the only source of truth for a harvest,
+    // and the all-or-nothing preflight runs before the edit and the wear so a
+    // refusal leaves the block, inventory, and durability byte-identical and
+    // the break retryable. A malformed table fails closed with no loss.
+    let wheat_items = if block.is_wheat_stage() {
+        let Some(items) = session.wheat_harvest_items(block) else {
+            return BreakOutcome::Rejected(BreakRejection::EditRejected);
+        };
+        if !session.player.can_insert_items(&items) {
+            return BreakOutcome::Rejected(BreakRejection::HarvestNoRoom);
+        }
+        Some(items)
+    } else {
+        None
+    };
     // A chest or loot-chest break drops its whole contents plus the container
     // item itself. The batch preflight is the only correct capacity test
     // (heterogeneous stacks compete for the same mergeable room), and it runs
     // before the edit, the wear, and the record change so a refusal leaves
     // every byte untouched. An unopened generated LootChest derives the same
     // contents first open would materialize, so its loot is never lost.
+    // Wheat and containers are mutually exclusive classifications.
     let chest_items = if block.is_container_interactable() {
         let items = session.chest_break_items(pos);
         if !session.player.can_insert_items(&items) {
@@ -362,11 +395,28 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
             .expect("preflight proved capacity");
         session.chests.remove(&pos);
         session.close_chest_at(pos);
+    } else if let Some(items) = wheat_items {
+        // Wheat has no `collect_block` path (the stage blocks are not
+        // carryable); the preflighted batch is inserted after the proven edit
+        // and the crop candidate is forgotten at the same time it leaves the
+        // world, so a stale candidate can never keep ticking.
+        session
+            .player
+            .insert_items(&items)
+            .expect("preflight proved capacity");
+        session.remove_crop(pos);
     } else {
         // Drop mapping is block metadata (Stone -> Cobblestone); the item
         // identity is the only thing that differs, and the drop is still
         // collected last so MEM195 ordering is preserved.
         session.player.collect_block(block.mined_drop());
+
+        // Breaking the support ends the crop's eligibility even though the
+        // floating wheat block itself is not edited: the candidate is
+        // forgotten so it can never advance without Farmland below.
+        if block == BlockId::Farmland {
+            session.remove_crop(pos + IVec3::Y);
+        }
 
         // Oak leaves carry a deterministic secondary apple drop, resolved
         // here because `BlockId::mined_drop` returns a single identity. The
@@ -419,11 +469,16 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 
 /// Outcome of one production right-click world interaction.
 ///
-/// Chest and table targeting run before placement and are pure session
-/// decisions: a successfully targeted storage block or crafting table neither
-/// edits the world nor consumes the selected stack. Anything else falls
-/// through to the pre-existing placement path, so non-station clicks stay
-/// byte-compatible with the placement-only behavior.
+/// The full precedence is chest/table -> Survival food -> hoe/seed farming ->
+/// block placement. Stations and Survival food run before everything else and
+/// are pure session decisions: a successfully targeted storage block or
+/// crafting table neither edits the world nor consumes the selected stack, and
+/// a food item never places a block. Farming follows because the top-face rule
+/// needs the raycast normal, which only this layer sees; a refused farm action
+/// falls through to placement, which is a no-op for tools and materials, so one
+/// click can never edit twice. Farming is mode-independent (Creative farms
+/// too). Anything else falls through to the pre-existing placement path, so
+/// non-station clicks stay byte-compatible with the placement-only behavior.
 ///
 /// Both station syncs run at the interaction boundary so a stale open station
 /// (removed/replaced or out of reach) is closed before the click is
@@ -431,10 +486,10 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 /// runs before table targeting so one shared ray can only ever open the block
 /// the player is actually looking at.
 ///
-/// Survival food comes after both station checks and before placement: holding
-/// a food item never places a block, a full-hunger click is refused through
-/// the transient notice channel instead of silently doing nothing, and Creative
-/// keeps its byte-identical placement fallback because food rules are
+/// Survival food comes after both station checks and before farming/placement:
+/// holding a food item never places a block, a full-hunger click is refused
+/// through the transient notice channel instead of silently doing nothing, and
+/// Creative keeps its byte-identical placement fallback because food rules are
 /// Survival-only.
 fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     session.sync_open_chest();
@@ -461,9 +516,54 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
             }
         }
     }
+    if let Some(outcome) = try_farm_interaction(session) {
+        return outcome;
+    }
     match try_place_selected_block(session) {
         Some(remeshed) => RightClickOutcome::Placed(remeshed),
         None => RightClickOutcome::Nothing,
+    }
+}
+
+/// Tries the hoe and wheat-seed branches of a right click.
+///
+/// Only the two farming selections raycast here: any other held item or empty
+/// slot returns `None` without work and falls through to placement. The
+/// top-face rule lives at this layer because it is raycast metadata the session
+/// seams never see — tilling a side face and planting into a side face are both
+/// refusals, not mutations. Hoe tills the hit block; seeds plant into its
+/// adjacent cell, with the session re-checking Air/Farmland/reach/overlap.
+/// Returns `None` for every refusal so the click falls through exactly once.
+fn try_farm_interaction(session: &mut WorldSession) -> Option<RightClickOutcome> {
+    let selected = session.player.selected_item()?;
+    let is_hoe = matches!(
+        selected.id(),
+        ItemId::Tool {
+            kind: ToolKind::Hoe,
+            ..
+        }
+    );
+    let is_seeds = selected.id() == ItemId::Material(Material::WheatSeeds);
+    if !is_hoe && !is_seeds {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    if hit.normal != IVec3::Y {
+        return None;
+    }
+    if is_hoe {
+        session
+            .till_at(hit.block_pos)
+            .map(RightClickOutcome::Tilled)
+    } else {
+        session
+            .plant_wheat_at(hit.adjacent_pos)
+            .map(RightClickOutcome::Planted)
     }
 }
 
@@ -481,6 +581,10 @@ enum RightClickOutcome {
     /// press arm reports [`right_click_notice`] through the transient message
     /// channel.
     EatingRefused,
+    /// A hoe tilled soil into Farmland; carries the remesh work to upload.
+    Tilled(Vec<(ChunkPos, ChunkMesh)>),
+    /// Wheat seeds were planted; carries the remesh work to upload.
+    Planted(Vec<(ChunkPos, ChunkMesh)>),
     Placed(Vec<(ChunkPos, ChunkMesh)>),
     Nothing,
 }
@@ -4435,11 +4539,13 @@ impl ApplicationHandler for GameApp {
                         // and missing targets fall through to the existing
                         // instant placement path.
                         match right_click_interaction(&mut self.session) {
-                            RightClickOutcome::Placed(remeshed) => {
-                                // Placement applied: one thump at the current
-                                // volume. A rejected placement stays silent.
-                                // Field-disjoint from the live `gpu` borrow
-                                // (P005).
+                            RightClickOutcome::Tilled(remeshed)
+                            | RightClickOutcome::Planted(remeshed)
+                            | RightClickOutcome::Placed(remeshed) => {
+                                // A world edit applied (placement, tilling, or
+                                // planting): one thump at the current volume.
+                                // A refusal stays silent. Field-disjoint from
+                                // the live `gpu` borrow (P005).
                                 self.audio.play(SoundSlot::Place, self.settings.volume);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
@@ -4641,6 +4747,21 @@ impl ApplicationHandler for GameApp {
                         eye_is_submerged(&self.session.world, self.session.camera.position);
                     self.session
                         .tick_survival(dt, self.time_scale, head_submerged);
+                    // Crop growth (S07-T04): wheat advances on every Playing
+                    // frame, including panel frames where gameplay is false,
+                    // because growth is a game-time rule like hunger. The
+                    // session clamps/scales dt, pauses in Winter, skips
+                    // non-resident crops, and re-checks each live stage before
+                    // applying it; only proven advances return mesh work to
+                    // upload.
+                    for (cpos, mesh) in self.session.tick_crops(dt, self.time_scale) {
+                        gpu.render_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
                     // Open-station state is a world fact (S02-T02/S03-T03):
                     // close a station as soon as its block is removed/replaced
                     // or the player steps out of reach. One bounded lookup per
@@ -14542,14 +14663,18 @@ mod tests {
     // S03-T06: chest break preflight and end-to-end persistence proof
     // -----------------------------------------------------------------------
 
-    /// A preflight-refused chest break has no visual cue in the world (the
-    /// chest is still there), so it owns the one readable notice. Every other
-    /// rejection is already visible and must not post a message.
+    /// A preflight-refused break has no visual cue in the world (the block is
+    /// still there), so each full-inventory refusal owns a readable notice.
+    /// Every other rejection is already visible and must not post a message.
     #[test]
-    fn break_rejection_notice_names_only_the_full_inventory_chest_refusal() {
+    fn break_rejection_notice_names_the_full_inventory_refusals() {
         assert_eq!(
             break_rejection_notice(BreakRejection::ChestNoRoom),
             Some("Not enough inventory space to break the chest")
+        );
+        assert_eq!(
+            break_rejection_notice(BreakRejection::HarvestNoRoom),
+            Some("Not enough inventory space to harvest the wheat")
         );
         assert_eq!(break_rejection_notice(BreakRejection::Unbreakable), None);
         assert_eq!(break_rejection_notice(BreakRejection::StaleTarget), None);
@@ -15962,5 +16087,512 @@ mod tests {
         }
 
         assert_eq!(drops, vec![1, 1], "the same seed and position agree");
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T04: production farming wiring (till, plant, tick, harvest)
+    // -----------------------------------------------------------------------
+
+    /// Stands east of `pos` and looks horizontally west, so the ray enters the
+    /// block's +X side face rather than its top. Keeps player and camera in
+    /// sync because the farm seams reach-check against the eye.
+    fn aim_side_face_at(session: &mut WorldSession, pos: IVec3) {
+        session.player.position = Vec3::new(
+            pos.x as f32 + 3.5,
+            pos.y as f32 + 0.5 - PLAYER_EYE_HEIGHT,
+            pos.z as f32 + 0.5,
+        );
+        session.player.yaw = std::f32::consts::PI;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+    }
+
+    fn wood_hoe() -> Item {
+        use opencraft::player::inventory::ToolTier;
+
+        Item::tool_with_durability(ToolKind::Hoe, ToolTier::Wood, 59).expect("wood hoe")
+    }
+
+    #[test]
+    fn hoe_tills_top_face_grass_to_farmland_and_wears_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            30,
+            dir.path().join("hoe-till.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Tilled(ref remeshed) if !remeshed.is_empty()),
+            "a top-face hoe click must report the proven till edit"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "tilling never places the held tool as a block"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "the proven edit wears exactly one point"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(1),
+            "the hoe is never consumed"
+        );
+    }
+
+    #[test]
+    fn hoe_tilling_refuses_side_face_and_non_soil_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            31,
+            dir.path().join("hoe-refuse.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        // A side face is refused before the session seam: the top-face rule
+        // lives in the interaction layer.
+        aim_side_face_at(&mut session, IVec3::new(0, 5, 0));
+        let side = right_click_interaction(&mut session);
+        assert!(matches!(side, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Grass);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "a side-face refusal spends no durability"
+        );
+
+        // A top-face non-soil block passes the face rule but is refused by the
+        // session's live soil re-check, also without mutation.
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        let stone = right_click_interaction(&mut session);
+        assert!(matches!(stone, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Stone);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "a non-soil refusal spends no durability"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "refusals leave the inventory byte-identical"
+        );
+    }
+
+    #[test]
+    fn planting_wheat_seeds_on_farmland_consumes_exactly_one_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("wheat-plant.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 5).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Planted(ref remeshed) if !remeshed.is_empty()),
+            "a top-face seed click on farmland must plant"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::Farmland,
+            "planting never edits the support block"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(4),
+            "exactly one seed is consumed"
+        );
+    }
+
+    #[test]
+    fn wheat_planting_refuses_occupied_and_non_farmland_targets_without_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("wheat-plant-refuse.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        session.world.set_block_immediate(0, 6, 0, BlockId::Stone);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 3).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        // The ray hits Stone's top face; the adjacent cell has Air but its
+        // support is Stone, never Farmland.
+        let occupied = right_click_interaction(&mut session);
+        assert!(matches!(occupied, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(session.world.get_block(0, 7, 0), BlockId::Air);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+
+        // A grass top face is not a planting surface either.
+        session.world.set_block_immediate(0, 6, 0, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        let grass = right_click_interaction(&mut session);
+        assert!(matches!(grass, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Grass);
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(3),
+            "no refusal consumes a seed"
+        );
+    }
+
+    #[test]
+    fn farming_priority_prefers_stations_and_food_and_works_in_creative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Chest targeting wins over a held hoe and neither edits nor wears.
+        let mut chest_session = WorldSession::new_session(
+            34,
+            dir.path().join("farm-priority-chest.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut chest_session, BlockId::Air);
+        chest_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Chest);
+        chest_session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(chest_session.player.select_slot(0));
+        aim_table_interaction_at(&mut chest_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut chest_session),
+            RightClickOutcome::ChestOpened(pos) if pos == IVec3::new(0, 5, 0)
+        ));
+        assert_eq!(chest_session.world.get_block(0, 5, 0), BlockId::Chest);
+        assert_eq!(
+            chest_session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "opening a station never wears the held tool"
+        );
+
+        // Table targeting wins over a held hoe.
+        let mut table_session = WorldSession::new_session(
+            35,
+            dir.path().join("farm-priority-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut table_session, BlockId::Air);
+        table_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        table_session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(table_session.player.select_slot(0));
+        aim_table_interaction_at(&mut table_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut table_session),
+            RightClickOutcome::TableOpened
+        ));
+        assert_eq!(
+            table_session.world.get_block(0, 5, 0),
+            BlockId::CraftingTable
+        );
+
+        // Survival food wins over a farmable target: the click starts the meal
+        // instead of tilling the grass below it.
+        let mut food_session =
+            survival_food_session(dir.path(), 36, "farm-priority-food.mcvx", apple_item(2), 10);
+        food_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Grass);
+        aim_table_interaction_at(&mut food_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut food_session),
+            RightClickOutcome::EatingStarted
+        ));
+        assert_eq!(
+            food_session.world.get_block(0, 5, 0),
+            BlockId::Grass,
+            "food is interpreted before farming"
+        );
+
+        // Creative still farms: only Survival food is mode-gated.
+        let mut creative = WorldSession::new_session(
+            37,
+            dir.path().join("farm-priority-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(creative.player.mode(), GameMode::Creative);
+        insert_test_chunk_with_face_neighbors(&mut creative, BlockId::Air);
+        creative.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        creative
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(creative.player.select_slot(0));
+        aim_table_interaction_at(&mut creative, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut creative),
+            RightClickOutcome::Tilled(_)
+        ));
+        assert_eq!(creative.world.get_block(0, 5, 0), BlockId::Farmland);
+    }
+
+    #[test]
+    fn breaking_mature_wheat_yields_one_wheat_and_two_seeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            40,
+            dir.path().join("wheat-harvest-mature.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::WheatStage3);
+
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::WheatStage3));
+
+        assert!(!remeshed.is_empty(), "the harvest edit remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            1,
+            "mature wheat yields exactly one wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+            2,
+            "mature wheat yields exactly two seeds"
+        );
+    }
+
+    #[test]
+    fn breaking_immature_wheat_yields_one_seed() {
+        for (index, block) in [
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut session = WorldSession::new_session(
+                41 + index as u32,
+                dir.path()
+                    .join(format!("wheat-harvest-immature-{index}.mcvx")),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            );
+            insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+            let pos = IVec3::new(0, 5, 0);
+            session
+                .world
+                .set_block_immediate(pos.x, pos.y, pos.z, block);
+
+            let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, block));
+
+            assert!(!remeshed.is_empty(), "{block:?} harvest applies");
+            assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+            assert_eq!(
+                player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+                0,
+                "{block:?} must not yield wheat"
+            );
+            assert_eq!(
+                player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+                1,
+                "{block:?} yields exactly one seed"
+            );
+        }
+    }
+
+    #[test]
+    fn wheat_harvest_refusal_leaves_block_inventory_and_durability_untouched_and_retries() {
+        use opencraft::player::inventory::ToolTier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            45,
+            dir.path().join("wheat-harvest-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::WheatStage3);
+
+        // 36 non-stackable tools leave no room for 1 wheat plus 2 seeds.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::WheatStage3);
+
+        assert!(
+            matches!(
+                outcome,
+                BreakOutcome::Rejected(BreakRejection::HarvestNoRoom)
+            ),
+            "a full inventory must refuse the harvest"
+        );
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::WheatStage3,
+            "the refused harvest edits nothing"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "the refused harvest inserts nothing"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "the refused harvest spends no durability"
+        );
+
+        // Retrying from an empty inventory succeeds without duplicating loot.
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts([None; INVENTORY_SLOTS], None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::WheatStage3));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Nothing);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            1
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+            2
+        );
+    }
+
+    #[test]
+    fn breaking_farmland_removes_the_crop_candidate_above() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            46,
+            dir.path().join("farmland-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 2).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(_)
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 5, 0),
+            BlockId::Farmland,
+        ));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::Dirt)),
+            1,
+            "farmland still drops dirt"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "the floating crop block itself is not edited"
+        );
+        assert!(
+            session.tick_crops(0.1, 600.0).is_empty(),
+            "the removed candidate produces no advance"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "a floating crop never advances past stage 0"
+        );
     }
 }

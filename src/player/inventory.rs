@@ -3104,7 +3104,7 @@ mod tests {
     #[test]
     fn bread_recipe_rejects_short_gapped_and_cramped_grids() {
         // Two wheat is not a loaf.
-        let mut two = grid_from_pattern(GridKind::Table, &["WW"]);
+        let two = grid_from_pattern(GridKind::Table, &["WW"]);
         assert_eq!(two.preview(), None);
 
         // Three wheat with a hole keeps a three-wide bounding box but fails
