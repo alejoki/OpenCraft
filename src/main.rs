@@ -29,6 +29,10 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
+use opencraft::ui::chest::{
+    hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
+    screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
+};
 use opencraft::ui::hud::{
     hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
     selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
@@ -67,6 +71,7 @@ use opencraft::world::persistence::{
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Weather};
+use opencraft::world::session::ChestCommandError;
 use opencraft::world::terrain::{
     biome_at_seeded, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
 };
@@ -347,16 +352,23 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 
 /// Outcome of one production right-click world interaction.
 ///
-/// Table targeting runs first and is a pure session decision: a successfully
-/// targeted crafting table neither edits the world nor consumes the selected
-/// stack. Anything else falls through to the pre-existing placement path, so
-/// non-table clicks stay byte-compatible with the placement-only behavior.
+/// Chest and table targeting run before placement and are pure session
+/// decisions: a successfully targeted storage block or crafting table neither
+/// edits the world nor consumes the selected stack. Anything else falls
+/// through to the pre-existing placement path, so non-station clicks stay
+/// byte-compatible with the placement-only behavior.
 ///
-/// `sync_open_table` runs at the interaction boundary so a stale open station
-/// (the table was removed/replaced or the player walked away) is closed before
-/// the click is interpreted — replaced tables fall through to placement.
+/// Both station syncs run at the interaction boundary so a stale open station
+/// (removed/replaced or out of reach) is closed before the click is
+/// interpreted — replaced stations fall through to placement. Chest targeting
+/// runs before table targeting so one shared ray can only ever open the block
+/// the player is actually looking at.
 fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
+    session.sync_open_chest();
     session.sync_open_table();
+    if let Some(pos) = session.try_open_targeted_chest() {
+        return RightClickOutcome::ChestOpened(pos);
+    }
     if session.try_open_targeted_table().is_some() {
         return RightClickOutcome::TableOpened;
     }
@@ -367,6 +379,9 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
 }
 
 enum RightClickOutcome {
+    /// A chest was opened; the authoritative position is exposed by
+    /// [`WorldSession::open_chest_position`], not duplicated in this outcome.
+    ChestOpened(IVec3),
     /// A table was opened; the authoritative position is exposed by
     /// [`WorldSession::open_table_position`], not duplicated in this outcome.
     TableOpened,
@@ -604,6 +619,137 @@ fn revalidate_inventory_station(screen: &mut InventoryScreen, session: &mut Worl
     screen.close();
     session.close_table();
     true
+}
+
+// ---------------------------------------------------------------------------
+// Chest-screen adapter (S03-T05)
+//
+// The pure geometry lives in `ui::chest` (T04) and every mutation lives in
+// `WorldSession`'s narrow chest command (T03). This layer only translates
+// winit input into one of those commands and back into a status line; the
+// screen never performs stack arithmetic and gameplay input never leaks
+// through an open chest.
+// ---------------------------------------------------------------------------
+
+/// Opens the chest screen attached to the live chest station opened by
+/// [`right_click_interaction`], releasing the cursor and dropping every
+/// gameplay hold so the screen owns the pointer.
+///
+/// Defensive: the inventory panel and its crafting station are closed first,
+/// so two gameplay panels can never share the pointer. A free function
+/// because `window_event` already holds disjoint `gpu`/`window` borrows,
+/// making a `&mut self` method unusable there (P005).
+#[allow(clippy::too_many_arguments)]
+fn open_chest_screen(
+    screen: &mut ChestScreen,
+    session: &mut WorldSession,
+    inventory: &mut InventoryScreen,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    drag: &mut Option<InventoryTarget>,
+    mining: &mut MiningState,
+    cursor_grabbed: &mut bool,
+    status: &mut Option<String>,
+    window: &Window,
+) {
+    inventory.close();
+    session.close_table();
+    screen.open();
+    input.reset();
+    mining.reset();
+    *left_mouse_held = false;
+    *drag = None;
+    *cursor_grabbed = false;
+    *status = None;
+    set_cursor_grab(window, false);
+}
+
+/// Closes the chest screen from the E/Escape paths and restores gameplay
+/// input ownership: the cursor is re-grabbed, holds are cleared, and the
+/// session station is closed so the 27-slot view cannot outlive the screen.
+#[allow(clippy::too_many_arguments)]
+fn close_chest_screen(
+    screen: &mut ChestScreen,
+    session: &mut WorldSession,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.close();
+    session.close_chest();
+    input.reset();
+    mining.reset();
+    *left_mouse_held = false;
+    *cursor_grabbed = true;
+    set_cursor_grab(window, true);
+}
+
+/// Translates one clicked chest-screen target into exactly one domain command:
+/// a chest slot goes through the station-aware session command (which
+/// revalidates the chest and owns record lifecycle), while a player slot goes
+/// through the shared inventory façade. Neither branch reads or computes stack
+/// counts, and neither can touch the other aggregate.
+pub fn apply_chest_click(
+    session: &mut WorldSession,
+    target: ChestTarget,
+) -> Result<(), ChestCommandError> {
+    match target {
+        ChestTarget::ChestSlot(index) => session.click_open_chest_slot(index),
+        ChestTarget::InventorySlot(index) => session
+            .player
+            .click_inventory_slot(index)
+            .map_err(ChestCommandError::Slot),
+    }
+}
+
+/// One-line status for the chest footer: what moved, or the typed rejection
+/// (warnings-as-data, never a log — D006/MEM009).
+fn chest_status_text(result: Result<(), ChestCommandError>) -> String {
+    match result {
+        Ok(()) => "Moved".to_string(),
+        Err(ChestCommandError::NotOpen) => "Chest closed".to_string(),
+        Err(ChestCommandError::Slot(error)) => format!("Inventory: {error:?}"),
+    }
+}
+
+/// True only when the chest screen is open but its live station has vanished
+/// (broken, replaced, or out of reach). Delegates to the pure T04 state.
+fn chest_should_close(screen: &ChestScreen, open_chest: Option<IVec3>) -> bool {
+    screen.station_lost(open_chest)
+}
+
+/// True only on the surface that accepts gameplay input: Playing with neither
+/// gameplay panel open. One helper keeps the redraw `gameplay` gate and every
+/// input guard in agreement, so a panel can never leak a key, wheel, or click
+/// into the world while still freezing movement.
+fn gameplay_surface(playing: bool, inventory_open: bool, chest_open: bool) -> bool {
+    playing && !inventory_open && !chest_open
+}
+
+/// Backing-panel rect for the transient gameplay notice, in physical pixels.
+///
+/// Centered horizontally and placed just above the hotbar, then clamped so a
+/// long message or a tiny surface always stays on screen. Pure so the layout
+/// is provable without GPU/window state.
+fn gameplay_notice_rect(surface_w: u32, surface_h: u32, text_width: f32) -> (f32, f32, f32, f32) {
+    let w_px = surface_w.max(1) as f32;
+    let h_px = surface_h.max(1) as f32;
+    let text_width = if text_width.is_finite() {
+        text_width.max(0.0)
+    } else {
+        0.0
+    };
+    let width = (text_width + 16.0).min(w_px);
+    let height = (LINE_HEIGHT + 8.0).min(h_px);
+    let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
+        .iter()
+        .map(|rect| rect.1)
+        .fold(h_px, f32::min);
+    let x = ((w_px - width) * 0.5).clamp(0.0, (w_px - width).max(0.0));
+    let y = (hotbar_top - height - 6.0).clamp(0.0, (h_px - height).max(0.0));
+    (x, y, width, height)
 }
 
 /// Where a press-drag-release ends: only a different cell than the press origin
@@ -1216,6 +1362,9 @@ struct Ready {
     /// first `n` buffers are drawn for an `n`-label frame; a closed screen
     /// draws none and never re-shapes anything.
     inventory_labels: Vec<StatsOverlay>,
+    /// Chest panel labels (S03-T05): same change-gated pattern, sized once to
+    /// the pure `MAX_CHEST_LABELS` bound so no frame allocates a text buffer.
+    chest_labels: Vec<StatsOverlay>,
 }
 
 /// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
@@ -2063,6 +2212,18 @@ struct GameApp {
     /// stack from. Cleared by any non-pick press, release, close, and screen
     /// change so a stale origin can never move a later stack.
     inventory_drag: Option<InventoryTarget>,
+    /// Chest screen state (S03-T05): open only while the lifecycle screen is
+    /// Playing. The live station lives in `WorldSession`, so this screen never
+    /// duplicates a chest position.
+    chest: ChestScreen,
+    /// Last chest-click status line, read by the T04 renderer as the footer
+    /// message; `None` until the first click of a session.
+    chest_status: Option<String>,
+    /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
+    /// under the player is reported here while still Playing. Same tick-counter
+    /// pattern as the screen messages, but it renders above the hotbar instead
+    /// of on a menu panel.
+    game_message: Option<MenuMessage>,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -2329,6 +2490,9 @@ impl GameApp {
             inventory: InventoryScreen::new(),
             inventory_status: None,
             inventory_drag: None,
+            chest: ChestScreen::new(),
+            chest_status: None,
+            game_message: None,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -2570,12 +2734,17 @@ impl GameApp {
         self.input.reset();
         self.left_mouse_held = false;
         self.mining.reset();
-        // The inventory panel is a Playing-only surface. Any lifecycle screen
-        // entry drops it (with its transient drag/status) so a stale panel can
-        // never keep absorbing clicks meant for a menu.
+        // The inventory and chest screens are Playing-only surfaces. Any
+        // lifecycle screen entry drops them (with their transient drag/status)
+        // and closes the ephemeral chest station so no stale panel can keep
+        // absorbing clicks meant for a menu.
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        self.chest.close();
+        self.chest_status = None;
+        self.game_message = None;
+        self.session.close_chest();
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, false);
@@ -2669,6 +2838,10 @@ impl GameApp {
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        self.chest.close();
+        self.chest_status = None;
+        self.game_message = None;
+        self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
@@ -3316,6 +3489,17 @@ impl ApplicationHandler for GameApp {
                 )
             })
             .collect();
+        // Chest panel labels (S03-T05): same overlay type and metrics, sized
+        // once to the pure chest label bound.
+        let chest_labels = (0..MAX_CHEST_LABELS)
+            .map(|_| {
+                StatsOverlay::with_metrics(
+                    &mut ui.font_system,
+                    HOTBAR_COUNT_FONT_SIZE,
+                    HOTBAR_COUNT_LINE_HEIGHT,
+                )
+            })
+            .collect();
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -3350,6 +3534,7 @@ impl ApplicationHandler for GameApp {
             load_delete_text,
             hotbar_counts,
             inventory_labels,
+            chest_labels,
         });
     }
 
@@ -3512,6 +3697,29 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Chest panel owns the keyboard while open (S03-T05):
+                    // every key and release is consumed, so E can never open
+                    // the inventory, a digit cannot select a hotbar slot, and
+                    // Escape cannot pause through the chest. E and Escape close
+                    // it.
+                    if self.chest.is_open() {
+                        if pressed
+                            && !event.repeat
+                            && matches!(code, KeyCode::KeyE | KeyCode::Escape)
+                        {
+                            close_chest_screen(
+                                &mut self.chest,
+                                &mut self.session,
+                                &mut self.input,
+                                &mut self.left_mouse_held,
+                                &mut self.mining,
+                                &mut self.cursor_grabbed,
+                                window,
+                            );
+                        }
+                        return;
+                    }
+
                     match code {
                         // E opens the 9+27 inventory with the 2x2 player grid
                         // (S03-T03). When a table station is already open the
@@ -3603,10 +3811,13 @@ impl ApplicationHandler for GameApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Route-before-gameplay: while a screen is open the wheel is
                 // consumed — the hotbar is gameplay state and no screen has
-                // a scroll action in this slice. The inventory panel consumes
-                // it for the same reason (S03-T03): no hotbar selection may
-                // change from inside the panel.
-                if self.lifecycle.screen() != LifecycleScreen::Playing || self.inventory.is_open() {
+                // a scroll action in this slice. Both gameplay panels consume
+                // it for the same reason (S03-T03/T05): no hotbar selection may
+                // change from inside a panel.
+                if self.lifecycle.screen() != LifecycleScreen::Playing
+                    || self.inventory.is_open()
+                    || self.chest.is_open()
+                {
                     return;
                 }
                 let step: isize = match delta {
@@ -3674,6 +3885,28 @@ impl ApplicationHandler for GameApp {
                             destination,
                         );
                         self.inventory_status = Some(inventory_status_text(result));
+                    }
+                    self.left_mouse_held = false;
+                    self.mining.reset();
+                    return;
+                }
+                // Chest panel (S03-T05): a release never transfers a stack
+                // (chest clicks are whole-stack on press), but it must still
+                // be revalidated, clear the hold/partial mining progress, and
+                // be consumed instead of reaching gameplay.
+                if self.chest.is_open() {
+                    let open_chest = self.session.sync_open_chest();
+                    if chest_should_close(&self.chest, open_chest) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
                     }
                     self.left_mouse_held = false;
                     self.mining.reset();
@@ -3833,6 +4066,47 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
 
+                // Chest panel (S03-T05): while open it owns every press.
+                // Left routes exactly one whole-stack command through the
+                // station-aware session (chest slots) or the shared inventory
+                // façade (player slots); right is inert. Returning here keeps
+                // the click away from the re-grab branch, station targeting,
+                // placement, and hold-to-mine arming. The station is synced
+                // first so a between-redraw invalidation closes the screen
+                // before a command can hit a stale 27-slot view.
+                if self.chest.is_open() {
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let open_chest = self.session.sync_open_chest();
+                    if chest_should_close(&self.chest, open_chest) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.mining.reset();
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                        return;
+                    }
+                    if button == MouseButton::Left {
+                        let layout = chest_layout(surface_w, surface_h);
+                        let target = self
+                            .cursor_pos
+                            .and_then(|cursor| chest_hit_test(&self.chest, &layout, cursor));
+                        if let Some(target) = target {
+                            let result = apply_chest_click(&mut self.session, target);
+                            self.chest_status = Some(chest_status_text(result));
+                        }
+                    }
+                    self.left_mouse_held = false;
+                    self.mining.reset();
+                    return;
+                }
+
                 if !self.cursor_grabbed {
                     self.cursor_grabbed = true;
                     set_cursor_grab(window, true);
@@ -3870,6 +4144,24 @@ impl ApplicationHandler for GameApp {
                                         &mesh,
                                     );
                                 }
+                            }
+                            RightClickOutcome::ChestOpened(_pos) => {
+                                // A successful chest interaction opens the pure
+                                // chest screen attached to the live station
+                                // (S03-T05). The helper defensively closes the
+                                // inventory panel and crafting station first.
+                                open_chest_screen(
+                                    &mut self.chest,
+                                    &mut self.session,
+                                    &mut self.inventory,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.inventory_drag,
+                                    &mut self.mining,
+                                    &mut self.cursor_grabbed,
+                                    &mut self.chest_status,
+                                    window,
+                                );
                             }
                             RightClickOutcome::TableOpened => {
                                 // A successful table interaction opens the
@@ -3913,12 +4205,14 @@ impl ApplicationHandler for GameApp {
                         || self.load_message.is_some()
                         || self.main_menu_message.is_some()
                         || self.pause_message.is_some()
+                        || self.game_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
                         tick_transient_message(&mut self.load_message);
                         tick_transient_message(&mut self.main_menu_message);
                         tick_transient_message(&mut self.pause_message);
+                        tick_transient_message(&mut self.game_message);
                     }
                 }
 
@@ -3932,12 +4226,13 @@ impl ApplicationHandler for GameApp {
                 // real gameplay work; the digest is printed once on demo
                 // shutdown (see `about_to_wait`).
                 sample_frame_budget(&mut self.frame_budget, playing, frame_dt);
-                // Gameplay vs. world-liveness (S03-T03): the inventory panel
-                // freezes player movement, camera aim, the target raycast, and
-                // hold-to-mine, but NOT the world: time, table revalidation,
-                // streaming, and saves keep running so a panel opened next to a
-                // table cannot freeze the chunk pipeline.
-                let gameplay = playing && !self.inventory.is_open();
+                // Gameplay vs. world-liveness (S03-T03/T05): either gameplay
+                // panel freezes player movement, camera aim, the target
+                // raycast, and hold-to-mine, but NOT the world: time, station
+                // revalidation, streaming, and saves keep running so a panel
+                // opened next to a station cannot freeze the chunk pipeline.
+                let gameplay =
+                    gameplay_surface(playing, self.inventory.is_open(), self.chest.is_open());
                 // Game time (S02-T04): advance only on Playing frames, before
                 // the player update, with the app-owned acceleration scale.
                 // The same two lines as `GameApp::tick_clock` (which the
@@ -4002,11 +4297,12 @@ impl ApplicationHandler for GameApp {
                         self.session.camera.yaw = self.session.player.yaw;
                         self.session.camera.pitch = self.session.player.pitch;
                     }
-                    // Open-table state is a world fact (S02-T02): close the
-                    // station as soon as its block is removed/replaced or
-                    // the player steps out of reach. One bounded lookup per
-                    // playing frame, never a scan.
+                    // Open-station state is a world fact (S02-T02/S03-T03):
+                    // close a station as soon as its block is removed/replaced
+                    // or the player steps out of reach. One bounded lookup per
+                    // station per playing frame, never a scan.
                     self.session.sync_open_table();
+                    self.session.sync_open_chest();
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -4016,6 +4312,23 @@ impl ApplicationHandler for GameApp {
                         self.session.close_table();
                         self.inventory_drag = None;
                         self.inventory_status = Some("Crafting Table closed".to_string());
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                    }
+                    // Chest-loss close (S03-T05): same rule for the 27-slot
+                    // station, with a transient notice so the player sees why
+                    // the screen vanished instead of a silent close.
+                    if chest_should_close(&self.chest, self.session.open_chest_position()) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.mining.reset();
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                     }
@@ -4335,6 +4648,31 @@ impl ApplicationHandler for GameApp {
                             Some(gpu.load_delete_text.text_area(delete_x, play_y));
                     }
                 }
+                // Gameplay transient notice (S03-T05): a station that vanished
+                // under the player while Playing is reported above the hotbar
+                // through the existing menu text buffer and the same UI pass —
+                // no new pipeline and no logging (D006/MEM009).
+                if active_screen == LifecycleScreen::Playing {
+                    if let Some(message) = self.game_message.as_ref() {
+                        let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        gpu.menu_text.update(
+                            &mut gpu.ui.font_system,
+                            surface_w as f32,
+                            surface_h as f32,
+                            &message.text,
+                        );
+                        let measured = gpu.menu_text.measured_width();
+                        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, measured);
+                        quads.push(Quad {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color: [0.0, 0.0, 0.0, 0.7],
+                        });
+                        menu_text_area = Some(gpu.menu_text.text_area(x + 8.0, y + 4.0));
+                    }
+                }
                 if playing {
                     if let Some(progress) = self.mining.progress() {
                         quads.extend(mining_progress_quads(
@@ -4360,6 +4698,26 @@ impl ApplicationHandler for GameApp {
                         self.session.player.inventory(),
                         self.session.player.player_grid(),
                         self.session.player.table_grid(),
+                        self.session.player.inventory().cursor(),
+                        self.cursor_pos,
+                    ));
+                    Some(layout)
+                } else {
+                    None
+                };
+                // Chest panel (S03-T05): extend the same CPU quad list, after
+                // the inventory panel and before the single `set_quads`
+                // upload, so the 27+36 grid draws above the world and HUD with
+                // no new pipeline. Geometry comes only from the pure T04
+                // module; a closed screen extends nothing and a missing record
+                // renders as empty slots.
+                let chest_layout_value = if self.chest.is_open() {
+                    let layout = chest_layout(gpu.ctx.config.width, gpu.ctx.config.height);
+                    quads.extend(chest_screen_quads(
+                        &self.chest,
+                        &layout,
+                        self.session.open_chest_contents(),
+                        self.session.player.inventory(),
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                     ));
@@ -4420,6 +4778,27 @@ impl ApplicationHandler for GameApp {
                     );
                 }
 
+                // Chest panel labels (S03-T05): same two-pass borrow pattern,
+                // bounded by the pure `MAX_CHEST_LABELS` and the pool length.
+                let chest_panel_labels = match chest_layout_value {
+                    Some(layout) => chest_screen_labels(
+                        &self.chest,
+                        &layout,
+                        self.session.open_chest_contents(),
+                        self.session.player.inventory(),
+                        self.chest_status.as_deref(),
+                    ),
+                    None => Vec::new(),
+                };
+                for (buffer, label) in gpu.chest_labels.iter_mut().zip(chest_panel_labels.iter()) {
+                    buffer.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &label.text,
+                    );
+                }
+
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
                 // (the crate is log-free by convention). The menu's text
@@ -4463,6 +4842,11 @@ impl ApplicationHandler for GameApp {
                     .iter()
                     .zip(inventory_panel_labels.iter())
                 {
+                    areas.push(buffer.text_area(label.left, label.top));
+                }
+                // Chest panel labels ride the same UI pass above the HUD.
+                debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
+                for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
                     areas.push(buffer.text_area(label.left, label.top));
                 }
                 let prepare_ok = gpu
@@ -13028,5 +13412,264 @@ mod tests {
             jump_or_up: KeyCode::ArrowUp,
             ..opencraft::settings::Keybinds::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T05: chest screen adapter, station priority, and gameplay notice
+    // -----------------------------------------------------------------------
+
+    /// A session with an empty air chunk (and face neighbours) ready for a
+    /// chest fixture at `(0, 5, 0)`.
+    fn chest_test_session(dir: &Path, seed: u32, name: &str) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+    }
+
+    /// Places a chest at `(0, 5, 0)`, aims the player at it, and opens the
+    /// live station through the same raycast path the frame loop uses.
+    fn open_chest_fixture(session: &mut WorldSession) -> IVec3 {
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(session, pos);
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        pos
+    }
+
+    #[test]
+    fn chest_screen_state_and_station_loss_helpers() {
+        let mut screen = ChestScreen::new();
+        let pos = IVec3::new(1, 5, -2);
+        assert!(!screen.is_open());
+        assert!(!screen.station_lost(None));
+        assert!(!chest_should_close(&screen, None));
+
+        screen.open();
+        assert!(screen.is_open());
+        assert!(
+            chest_should_close(&screen, None),
+            "an open screen with no live station must close"
+        );
+        assert!(!chest_should_close(&screen, Some(pos)));
+
+        screen.close();
+        assert!(!screen.is_open());
+        assert!(!chest_should_close(&screen, None));
+    }
+
+    #[test]
+    fn enter_screen_retires_the_chest_screen_station_status_and_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+        let pos = open_chest_fixture(&mut app.session);
+        app.chest.open();
+        app.chest_status = Some("Moved".to_string());
+        app.game_message = Some(MenuMessage {
+            text: "Chest closed".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        });
+
+        app.enter_screen(LifecycleScreen::Pause);
+
+        assert!(!app.chest.is_open(), "a menu retires the chest screen");
+        assert!(app.chest_status.is_none());
+        assert!(app.game_message.is_none());
+        assert_eq!(
+            app.session.open_chest_position(),
+            None,
+            "the ephemeral station cannot outlive the screen"
+        );
+        assert_eq!(
+            app.session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Chest
+        );
+    }
+
+    #[test]
+    fn apply_chest_click_routes_chest_and_player_slots_without_cross_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 51, "chest-route.mcvx");
+        let pos = open_chest_fixture(&mut session);
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 1).expect("valid stone stack");
+
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+        assert_eq!(session.player.inventory().hotbar(0), Some(stone));
+        assert!(session.chests.is_empty(), "opening alone creates no record");
+
+        // Player-slot routing goes through the shared inventory façade.
+        apply_chest_click(&mut session, ChestTarget::InventorySlot(0))
+            .expect("the player slot click is accepted");
+        assert_eq!(session.player.inventory().cursor(), Some(stone));
+        assert!(session.player.inventory().hotbar(0).is_none());
+        assert!(
+            session.chests.is_empty(),
+            "a player-slot click can never touch the chest aggregate"
+        );
+
+        // Chest-slot routing goes through the station-aware session command.
+        apply_chest_click(&mut session, ChestTarget::ChestSlot(0))
+            .expect("the chest slot click is accepted");
+        assert_eq!(session.player.inventory().cursor(), None);
+        assert_eq!(
+            session.chest_at(pos).and_then(|chest| chest.slot(0)),
+            Some(stone)
+        );
+        assert!(
+            session.player.inventory().hotbar(0).is_none(),
+            "a chest-slot click can never touch the player slots"
+        );
+
+        // Out-of-range chest slots are rejected before any mutation.
+        let record_before = session.chest_at(pos).cloned();
+        assert_eq!(
+            apply_chest_click(&mut session, ChestTarget::ChestSlot(27)),
+            Err(ChestCommandError::Slot(InventoryError::OutOfBounds))
+        );
+        assert_eq!(session.chest_at(pos), record_before.as_ref());
+
+        // Losing the station is reported, never silently routed elsewhere.
+        session.close_chest();
+        assert_eq!(
+            apply_chest_click(&mut session, ChestTarget::ChestSlot(0)),
+            Err(ChestCommandError::NotOpen)
+        );
+    }
+
+    #[test]
+    fn chest_status_text_covers_success_and_every_error_shape() {
+        assert_eq!(chest_status_text(Ok(())), "Moved");
+        assert_eq!(
+            chest_status_text(Err(ChestCommandError::NotOpen)),
+            "Chest closed"
+        );
+        assert_eq!(
+            chest_status_text(Err(ChestCommandError::Slot(InventoryError::OutOfBounds))),
+            format!("Inventory: {:?}", InventoryError::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn gameplay_surface_excludes_inventory_and_chest_panels() {
+        assert!(gameplay_surface(true, false, false));
+        assert!(!gameplay_surface(true, true, false));
+        assert!(!gameplay_surface(true, false, true));
+        assert!(!gameplay_surface(true, true, true));
+        assert!(!gameplay_surface(false, false, false));
+        assert!(!gameplay_surface(false, true, true));
+    }
+
+    #[test]
+    fn gameplay_notice_rect_stays_centered_and_on_screen_above_the_hotbar() {
+        let (surface_w, surface_h) = (1280, 720);
+        let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
+            .iter()
+            .map(|rect| rect.1)
+            .fold(f32::INFINITY, f32::min);
+
+        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, 200.0);
+        assert!((x + w * 0.5 - surface_w as f32 * 0.5).abs() < 0.001);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(x + w <= surface_w as f32);
+        assert!(
+            y + h <= hotbar_top,
+            "notice bottom {} must stay above hotbar top {hotbar_top}",
+            y + h
+        );
+
+        // Huge text clamps to the surface instead of leaving the screen.
+        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, 5_000.0);
+        assert_eq!(w, surface_w as f32);
+        assert_eq!(x, 0.0);
+        assert!(y >= 0.0 && y + h <= surface_h as f32);
+
+        // Tiny surfaces keep every coordinate finite and on screen.
+        let (x, y, w, h) = gameplay_notice_rect(1, 1, 50.0);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(x + w <= 1.0 && y + h <= 1.0);
+    }
+
+    #[test]
+    fn gameplay_notice_message_ticks_and_expires_through_tick_transient_message() {
+        let mut message = Some(MenuMessage {
+            text: "Chest closed".to_string(),
+            ticks_left: 2,
+        });
+        assert!(tick_transient_message(&mut message));
+        assert_eq!(message.as_ref().map(|msg| msg.ticks_left), Some(1));
+        assert!(!tick_transient_message(&mut message));
+        assert!(message.is_none(), "the notice expires exactly at zero");
+    }
+
+    #[test]
+    fn right_click_on_a_live_chest_opens_chest_opened_without_placing_or_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 52, "chest-open.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut session, pos);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::ChestOpened(opened) if opened == pos),
+            "a targeted chest must open through the chest clause first"
+        );
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert_eq!(session.open_table_position(), None);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "opening a chest must not place the selected block"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "opening a chest must not consume the selected stack"
+        );
+        assert!(session.chests.is_empty(), "opening alone creates no record");
+    }
+
+    #[test]
+    fn right_click_on_a_non_chest_target_still_falls_through_to_placement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 53, "chest-fallback.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut session, pos);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "a non-chest, non-table target must use the placement path"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            }),
+            "placement consumes exactly one selected item"
+        );
     }
 }
