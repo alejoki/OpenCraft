@@ -109,6 +109,33 @@ impl PauseRow {
     }
 }
 
+/// One death-screen row, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathRow {
+    Respawn,
+    Quit,
+}
+
+/// All death rows, top-to-bottom in display order.
+pub const DEATH_ROWS: [DeathRow; 2] = [DeathRow::Respawn, DeathRow::Quit];
+
+/// Total number of death rows.
+pub const DEATH_ROW_COUNT: usize = DEATH_ROWS.len();
+
+/// Title line shown above the death rows. It occupies text line 0, so the
+/// clickable rows start at line 1.
+pub const DEATH_TITLE: &str = "You Died";
+
+impl DeathRow {
+    /// Human-facing row label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            DeathRow::Respawn => "Respawn",
+            DeathRow::Quit => "Quit",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
@@ -192,6 +219,28 @@ pub fn hovered_pause_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> 
             pause_row_rect(surface_w, surface_h, index).is_some_and(|r| hit_test(cursor, r))
         })
         .map(|index| PAUSE_ROWS[index])
+}
+
+/// Geometry of death row `index`, or `None` out of range. The title
+/// occupies text line 0, so row 0 sits on text line 1 and row 1 on line 2.
+pub fn death_row_rect(surface_w: u32, surface_h: u32, index: usize) -> Option<Rect> {
+    let _ = surface_h;
+    (index < DEATH_ROW_COUNT).then(|| fixed_row_rect(surface_w, index + 1, SCREEN_WIDTH))
+}
+
+/// The dark panel rect behind the death title and all death rows.
+pub fn death_panel_rect(surface_w: u32, surface_h: u32) -> Rect {
+    let _ = surface_h;
+    fixed_panel_rect(surface_w, SCREEN_WIDTH, DEATH_ROW_COUNT + 1)
+}
+
+/// Which death row the cursor is over, if any.
+pub fn hovered_death_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> Option<DeathRow> {
+    (0..DEATH_ROW_COUNT)
+        .find(|&index| {
+            death_row_rect(surface_w, surface_h, index).is_some_and(|r| hit_test(cursor, r))
+        })
+        .map(|index| DEATH_ROWS[index])
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +975,9 @@ pub fn screen_key_action(
             KeyCode::Escape => ScreenKeyAction::Back,
             _ => ScreenKeyAction::None,
         },
+        // The death screen is click-only: the player must choose Respawn or
+        // Quit explicitly, so no key (Escape and Enter included) may act.
+        LifecycleScreen::Death => ScreenKeyAction::None,
         LifecycleScreen::MainMenu | LifecycleScreen::Playing | LifecycleScreen::Settings(_) => {
             ScreenKeyAction::None
         }
@@ -975,6 +1027,92 @@ mod tests {
     }
 
     #[test]
+    fn death_rows_are_in_display_order_with_labels_and_title() {
+        assert_eq!(DEATH_ROW_COUNT, 2);
+        assert_eq!(DEATH_ROWS, [DeathRow::Respawn, DeathRow::Quit]);
+        assert_eq!(DEATH_TITLE, "You Died");
+        assert_eq!(DeathRow::Respawn.label(), "Respawn");
+        assert_eq!(DeathRow::Quit.label(), "Quit");
+    }
+
+    #[test]
+    fn death_geometry_is_contiguous_with_the_title_line() {
+        // The title is text line 0; row 0 starts on line 1 and row 1 on line 2.
+        let (title_x, title_y, title_w, title_h) = fixed_row_rect(SW, 0, SCREEN_WIDTH);
+        let (x0, y0, w0, h0) = death_row_rect(SW, SH, 0).unwrap();
+        assert_eq!(x0, title_x);
+        assert_eq!(w0, title_w);
+        assert_eq!(h0, LINE_HEIGHT);
+        assert_eq!(y0, title_y + title_h, "row 0 sits directly under the title");
+
+        let (x1, y1, w1, h1) = death_row_rect(SW, SH, 1).unwrap();
+        assert_eq!((x1, w1, h1), (x0, w0, h0));
+        assert_eq!(y1, y0 + h0, "row 1 sits directly under row 0");
+        assert_eq!(death_row_rect(SW, SH, DEATH_ROW_COUNT), None);
+        assert_eq!(death_row_rect(SW, SH, 99), None);
+
+        // The panel covers the title plus both rows with symmetric padding.
+        let (px, py, pw, ph) = death_panel_rect(SW, SH);
+        assert_eq!(px, title_x - MENU_PAD);
+        assert_eq!(py, MENU_TOP);
+        assert_eq!(pw, SCREEN_WIDTH + 2.0 * MENU_PAD);
+        assert_eq!(
+            ph,
+            2.0 * MENU_PAD + (DEATH_ROW_COUNT + 1) as f32 * LINE_HEIGHT
+        );
+        assert_eq!(title_y - py, MENU_PAD);
+        assert_eq!(py + ph - (y1 + h1), MENU_PAD);
+
+        // Narrow/zero surfaces clamp exactly like the other fixed screens.
+        assert_eq!(death_row_rect(200, SH, 0).unwrap().0, 0.0);
+        assert_eq!(death_panel_rect(200, SH).0, 0.0 - MENU_PAD);
+    }
+
+    #[test]
+    fn death_hover_hit_tests_the_rows_half_open_and_misses_the_title() {
+        let (x, y, w, h) = death_row_rect(SW, SH, 0).unwrap();
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, y + h / 2.0), SW, SH),
+            Some(DeathRow::Respawn)
+        );
+        assert_eq!(
+            hovered_death_row((x, y), SW, SH),
+            Some(DeathRow::Respawn),
+            "top-left corner is inside"
+        );
+        assert_eq!(
+            hovered_death_row((x + w, y + h / 2.0), SW, SH),
+            None,
+            "right edge is outside"
+        );
+        let (x1, y1, w1, _) = death_row_rect(SW, SH, 1).unwrap();
+        assert_eq!(
+            hovered_death_row((x1 + w1 / 2.0, y1 + h / 2.0), SW, SH),
+            Some(DeathRow::Quit)
+        );
+        assert_eq!(
+            hovered_death_row((x1, y1), SW, SH),
+            Some(DeathRow::Quit),
+            "the Respawn/Quit boundary belongs to the lower row"
+        );
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, y - 1.0), SW, SH),
+            None,
+            "the title line is not clickable"
+        );
+        assert_eq!(
+            hovered_death_row((0.0, 0.0), SW, SH),
+            None,
+            "above the panel"
+        );
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, SW as f32 + 500.0), SW, SH),
+            None,
+            "below the last row"
+        );
+    }
+
+    #[test]
     fn every_row_and_target_label_is_non_empty() {
         for row in MAIN_MENU_ROWS {
             assert!(!row.label().is_empty());
@@ -982,6 +1120,10 @@ mod tests {
         for row in PAUSE_ROWS {
             assert!(!row.label().is_empty());
         }
+        for row in DEATH_ROWS {
+            assert!(!row.label().is_empty());
+        }
+        assert!(!DEATH_TITLE.is_empty());
         for target in NEW_GAME_ROWS {
             assert!(!target.label().is_empty());
         }
@@ -1896,6 +2038,22 @@ mod tests {
             screen_key_action(LifecycleScreen::Pause, KeyCode::Enter, false),
             ScreenKeyAction::None
         );
+
+        // death: click-only, so no key acts — Escape and Enter included
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Tab,
+            KeyCode::Space,
+            KeyCode::ArrowDown,
+        ] {
+            assert_eq!(
+                screen_key_action(LifecycleScreen::Death, key, false),
+                ScreenKeyAction::None,
+                "{key:?} must not act on the death screen"
+            );
+        }
 
         // main menu: nothing to back out to — a documented no-op
         assert_eq!(

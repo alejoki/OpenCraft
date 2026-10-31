@@ -15,19 +15,20 @@ pub use inventory::{
     InventoryMode, InventoryScreen, InventoryTarget, MAX_LABELS,
 };
 pub use lifecycle::{
-    decide as decide_lifecycle, LifecycleDecision, LifecycleError, LifecycleIntent,
+    decide as decide_lifecycle, DeathIntent, LifecycleDecision, LifecycleError, LifecycleIntent,
     LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
     NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
 };
 pub use screens::{
-    delete_prompt_line, format_modified_secs, format_row_line, hovered_load_target,
-    hovered_main_menu_row, hovered_new_game_target, hovered_pause_row, load_back_rect,
-    load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect,
-    load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
-    new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
-    validate_create, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameFormError,
-    NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, LOAD_SCREEN_WIDTH, MAIN_MENU_ROWS,
-    NEW_GAME_ROWS, PAUSE_ROWS, SCREEN_WIDTH, SEED_MAX_CHARS,
+    death_panel_rect, death_row_rect, delete_prompt_line, format_modified_secs, format_row_line,
+    hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
+    hovered_pause_row, load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect,
+    load_panel_rect, load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect,
+    new_game_panel_rect, new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect,
+    screen_key_action, validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow,
+    NewGameFormError, NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS,
+    DEATH_TITLE, LOAD_SCREEN_WIDTH, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS, SCREEN_WIDTH,
+    SEED_MAX_CHARS,
 };
 pub use text_input::{TextInput, TextInputAction, TextInputOutcome};
 

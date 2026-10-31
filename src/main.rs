@@ -44,17 +44,18 @@ use opencraft::ui::inventory::{
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
-    delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
-    hovered_new_game_target, hovered_pause_row, load_back_rect, load_cancel_rect,
-    load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect, load_row_rect,
-    main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect, new_game_row_lines,
-    new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action, validate_create,
-    FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
-    ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
+    death_panel_rect, death_row_rect, delete_prompt_line, format_row_line, hovered_death_row,
+    hovered_load_target, hovered_main_menu_row, hovered_new_game_target, hovered_pause_row,
+    load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect,
+    load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
+    new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
+    validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen,
+    NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE, MAIN_MENU_ROWS,
+    NEW_GAME_ROWS, PAUSE_ROWS,
 };
 use opencraft::ui::{
-    LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
-    MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
+    DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
+    LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
@@ -1204,6 +1205,11 @@ fn compose_screen_text(
             }
             lines
         }
+        LifecycleScreen::Death => {
+            let mut lines = vec![DEATH_TITLE.to_string()];
+            lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
+            lines
+        }
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => return String::new(),
     };
     lines.join("\n")
@@ -1243,6 +1249,7 @@ fn screen_panel_rect(
         LifecycleScreen::Pause => pause_panel_rect(surface_w, surface_h),
         LifecycleScreen::NewGame => new_game_panel_rect(surface_w, surface_h),
         LifecycleScreen::LoadGame => load_panel_rect(surface_w, load.row_count()),
+        LifecycleScreen::Death => death_panel_rect(surface_w, surface_h),
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
             menu::panel_rect(surface_w, surface_h)
         }
@@ -1295,6 +1302,11 @@ fn hovered_target_rect(
                     .then(|| load_cancel_rect(surface_w, row_count)),
             }
         }
+        LifecycleScreen::Death => {
+            let row = hovered_death_row(cursor, surface_w, surface_h)?;
+            let index = DEATH_ROWS.iter().position(|&r| r == row)?;
+            death_row_rect(surface_w, surface_h, index)
+        }
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
     }
 }
@@ -1308,6 +1320,7 @@ fn screen_title_tag(screen: LifecycleScreen) -> &'static str {
         LifecycleScreen::NewGame => " | New Game",
         LifecycleScreen::LoadGame => " | Load Game",
         LifecycleScreen::Pause => " | Paused",
+        LifecycleScreen::Death => " | Dead",
         LifecycleScreen::Settings(_) => " | Settings",
         LifecycleScreen::Playing => "",
     }
@@ -3014,6 +3027,14 @@ impl GameApp {
         match decision {
             LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
             LifecycleDecision::ResumeGame => self.enter_playing(),
+            LifecycleDecision::Respawn => {
+                // The death screen's only resumable action: restore the
+                // deterministic spawn and full vitals, then return to
+                // gameplay. The inventory and selected slot are preserved by
+                // `WorldSession::respawn` by design.
+                self.session.respawn();
+                self.enter_playing();
+            }
             LifecycleDecision::StartNewGame
             | LifecycleDecision::LoadWorld
             | LifecycleDecision::EditBackground => {}
@@ -3379,6 +3400,19 @@ impl GameApp {
                     PauseRow::Resume => LifecycleIntent::Pause(PauseIntent::Resume),
                     PauseRow::Settings => LifecycleIntent::Pause(PauseIntent::Settings),
                     PauseRow::SaveAndQuit => LifecycleIntent::Pause(PauseIntent::SaveAndQuit),
+                };
+                self.dispatch_screen_intent(event_loop, intent);
+                self.audio.play(SoundSlot::UiClick, self.settings.volume);
+            }
+            LifecycleScreen::Death => {
+                // Click-only screen: the player must choose a row. A miss
+                // (including the title line) is a silent no-op.
+                let Some(row) = hovered_death_row(cursor, surface_w, surface_h) else {
+                    return;
+                };
+                let intent = match row {
+                    DeathRow::Respawn => LifecycleIntent::Death(DeathIntent::Respawn),
+                    DeathRow::Quit => LifecycleIntent::Death(DeathIntent::Quit),
                 };
                 self.dispatch_screen_intent(event_loop, intent);
                 self.audio.play(SoundSlot::UiClick, self.settings.volume);
