@@ -8184,6 +8184,32 @@ mod tests {
             .collect()
     }
 
+    /// Takes every non-empty slot of the open chest into the inventory through
+    /// the production click seam, leaving the chest present-empty.
+    fn take_all_open_chest_items(session: &mut WorldSession) {
+        use opencraft::player::inventory::CHEST_SLOTS;
+
+        for index in 0..CHEST_SLOTS {
+            let occupied = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(index))
+                .is_some();
+            if !occupied {
+                continue;
+            }
+            session
+                .click_open_chest_slot(index)
+                .expect("chest slot into the cursor");
+            let empty = (0..INVENTORY_SLOTS)
+                .find(|&slot| session.player.inventory().slot(slot).is_none())
+                .expect("an empty inventory slot accepts the stack");
+            session
+                .player
+                .click_inventory_slot(empty)
+                .expect("cursor into the inventory");
+        }
+    }
+
     /// Camera looking straight down at the stone placed by the placement tests.
     fn aim_placement_camera(session: &mut WorldSession) {
         session.camera.position = Vec3::new(0.5, 10.0, 0.5);
@@ -14962,6 +14988,211 @@ mod tests {
             stored,
             vec![Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item is valid")],
             "a looted chest drops only the chest item"
+        );
+    }
+
+    #[test]
+    fn generated_ruin_loot_chest_chain_survives_save_reload_and_break() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{ToolKind, ToolTier};
+        use opencraft::player::physics::Player;
+        use opencraft::world::chunk::linear_index;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = DEFAULT_WORLD_SEED;
+        let pos = find_generated_loot_chest(seed, 3);
+        let expected_loot = generated_loot_stacks(pos, seed);
+        assert!(!expected_loot.is_empty(), "the ruin table is non-empty");
+
+        // Session A: open/take/save/reload/reopen. The first open materializes
+        // the deterministic table; taking everything must persist a
+        // present-empty record so a reloaded reopen never re-rolls loot.
+        let path_a = dir.path().join("ruin-loot-chain-a.mcvx");
+        let mut session =
+            WorldSession::new_session(seed, path_a.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        aim_table_interaction_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        let opened = session
+            .open_chest_contents()
+            .expect("a generated LootChest materializes on first open");
+        assert_eq!(
+            opened.contents(),
+            expected_loot,
+            "first open yields exactly the deterministic ruin table"
+        );
+
+        take_all_open_chest_items(&mut session);
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "taking everything leaves a present-empty record"
+        );
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the transfer is a player content change"
+        );
+        let looted: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(looted, expected_loot, "every stack landed in the inventory");
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&path_a).expect("load succeeds");
+        assert_eq!(loaded.chests.len(), 1, "only the touched chest is stored");
+        assert_eq!(
+            loaded.chests.get(&pos),
+            Some(&Container::empty()),
+            "the present-empty record round-trips through the save writer"
+        );
+
+        let mut restored = WorldSession::session_from_save(loaded, path_a.clone());
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        restored.world.insert_chunk_for_test(
+            chunk_pos,
+            generate_chunk_seeded(chunk_pos, seed, Season::Summer),
+        );
+        aim_table_interaction_at(&mut restored, pos);
+        assert!(restored.open_chest_at(pos), "the live chest reopens");
+        assert_eq!(
+            restored.open_chest_contents(),
+            Some(&Container::empty()),
+            "a reloaded emptied chest never re-rolls its loot"
+        );
+
+        // Session B: a never-opened chest spills its derived table plus one
+        // chest item, and both the absent record and the Air block edit
+        // survive the save writer.
+        let path_b = dir.path().join("ruin-loot-chain-b.mcvx");
+        let mut spill_session =
+            WorldSession::new_session(seed, path_b.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut spill_session, pos);
+        assert!(
+            spill_session.chest_at(pos).is_none(),
+            "an unopened generated chest has no record"
+        );
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut spill_session,
+            pos,
+            BlockId::LootChest,
+        ));
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(
+            spill_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Air
+        );
+        assert!(
+            spill_session.chest_at(pos).is_none(),
+            "breaking an unopened chest creates no record"
+        );
+
+        let mut expected_spill = expected_loot.clone();
+        expected_spill.push(Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item"));
+        let spilled: Vec<Item> = spill_session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            spilled, expected_spill,
+            "the unopened break spills the derived table plus exactly one chest"
+        );
+
+        save_current_world(&mut spill_session).expect("save succeeds");
+        let loaded = load_world_from_path(&path_b).expect("load succeeds");
+        assert!(
+            !loaded.chests.contains_key(&pos),
+            "the unopened break persisted no chest record"
+        );
+        let (edit_chunk, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        assert_eq!(
+            loaded.chunk_edits[&edit_chunk][&(linear_index(lx, ly, lz) as u16)],
+            BlockId::Air,
+            "the persisted break edit wins over regenerated LootChest terrain"
+        );
+
+        // Session C: a full inventory refuses the break untouched, and the
+        // same chest can still be broken once room exists.
+        let path_c = dir.path().join("ruin-loot-chain-c.mcvx");
+        let mut full_session =
+            WorldSession::new_session(seed, path_c.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut full_session, pos);
+
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        full_session.player = Player::with_inventory(
+            full_session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(full_session.player.select_slot(0));
+        let inventory_before = full_session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut full_session, pos, BlockId::LootChest);
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the derived batch"
+        );
+        assert_eq!(
+            full_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest,
+            "the refused break edits nothing"
+        );
+        assert!(
+            full_session.chest_at(pos).is_none(),
+            "the refused break creates no record"
+        );
+        assert_eq!(
+            full_session.player.inventory(),
+            &inventory_before,
+            "the refused break leaves the inventory byte-identical"
+        );
+
+        full_session.player = Player::with_inventory(
+            full_session.player.position,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut full_session,
+            pos,
+            BlockId::LootChest,
+        ));
+        assert!(!remeshed.is_empty(), "the retried break applies");
+        assert_eq!(
+            full_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Air
+        );
+        let retried: Vec<Item> = full_session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            retried, expected_spill,
+            "the retried break derives the same deterministic batch"
         );
     }
 
