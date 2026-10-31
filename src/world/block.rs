@@ -113,6 +113,21 @@ impl BlockId {
         }
     }
 
+    /// The next wheat growth stage, or `None` when this is the mature stage
+    /// or not wheat at all.
+    ///
+    /// Growth consumes this helper instead of re-deriving stage order at the
+    /// call site, and the chain is kept consistent with [`WHEAT_STAGES`].
+    #[inline]
+    pub const fn next_wheat_stage(self) -> Option<BlockId> {
+        match self {
+            BlockId::WheatStage0 => Some(BlockId::WheatStage1),
+            BlockId::WheatStage1 => Some(BlockId::WheatStage2),
+            BlockId::WheatStage2 => Some(BlockId::WheatStage3),
+            _ => None,
+        }
+    }
+
     /// Whether right-clicking this block opens a crafting station interface.
     ///
     /// Deliberately narrow: the crafting table is the only interactive
@@ -286,7 +301,9 @@ impl BlockId {
     /// wheat stages and the ordinary chest, drops itself here. The oak-leaf
     /// apple secondary drop is resolved at the break site through
     /// [`crate::world::loot::oak_leaves_apple`], not in this single-identity
-    /// mapping; wheat-harvest drops belong to a later survival slice.
+    /// mapping; the wheat harvest (wheat and seeds) is likewise resolved at
+    /// the break site through [`crate::world::loot::wheat_harvest`] rather
+    /// than through the stage block's identity drop.
     ///
     /// Drops are inventory state only and are never persisted, and the wire
     /// format keeps Cobblestone's id 4 unchanged, so save compatibility is
@@ -397,6 +414,41 @@ mod tests {
                         .unwrap_or_else(|| panic!("{block:?} must be breakable"));
                     assert!(duration > 0.0, "{block:?} duration must be positive");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_next_wheat_stage_chain_and_non_wheat_none() {
+        assert_eq!(
+            BlockId::WheatStage0.next_wheat_stage(),
+            Some(BlockId::WheatStage1)
+        );
+        assert_eq!(
+            BlockId::WheatStage1.next_wheat_stage(),
+            Some(BlockId::WheatStage2)
+        );
+        assert_eq!(
+            BlockId::WheatStage2.next_wheat_stage(),
+            Some(BlockId::WheatStage3)
+        );
+        assert_eq!(BlockId::WheatStage3.next_wheat_stage(), None);
+
+        // The helper and the public stage list must describe one chain.
+        for pair in WHEAT_STAGES.windows(2) {
+            assert_eq!(pair[0].next_wheat_stage(), Some(pair[1]));
+        }
+        assert_eq!(
+            WHEAT_STAGES[WHEAT_STAGES.len() - 1].next_wheat_stage(),
+            None
+        );
+
+        for raw in 0..=u8::MAX {
+            let Some(block) = BlockId::from_u8(raw) else {
+                continue;
+            };
+            if !block.is_wheat_stage() {
+                assert_eq!(block.next_wheat_stage(), None, "{block:?} is not wheat");
             }
         }
     }

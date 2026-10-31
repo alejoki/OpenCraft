@@ -17,8 +17,15 @@
 //! produces more entries than one chest has slots. It owns a private mixer
 //! with its own constants: terrain hashing is tuned for noise and must never
 //! move a drop table when it is retuned.
+//!
+//! [`wheat_harvest`] is the deterministic crop break table: mature wheat
+//! yields one `Wheat` plus two `WheatSeeds`, immature wheat returns one seed
+//! instead of destroying the planting investment, and every other block has no
+//! crop harvest. Its counts are fixed, so the break path never needs an RNG.
 
 use glam::IVec3;
+
+use crate::world::block::BlockId;
 
 /// Slot capacity of one chest, duplicated world-locally so worldgen can bound
 /// its own table without importing `player::inventory` (D094).
@@ -88,6 +95,47 @@ pub struct LootEntry {
     pub min_count: u16,
     /// Inclusive upper bound on the stack size of one roll.
     pub max_count: u16,
+}
+
+/// Deterministic harvest from a mature wheat crop.
+///
+/// Two seeds recover the planting investment and keep the loop sustainable;
+/// one wheat plus those seeds satisfies the "wheat and seeds" harvest promise.
+static WHEAT_MATURE_HARVEST: [LootEntry; 2] = [
+    LootEntry {
+        item: LootItem::Wheat,
+        min_count: 1,
+        max_count: 1,
+    },
+    LootEntry {
+        item: LootItem::WheatSeeds,
+        min_count: 2,
+        max_count: 2,
+    },
+];
+
+/// Deterministic harvest from an immature wheat crop: one seed back.
+static WHEAT_IMMATURE_HARVEST: [LootEntry; 1] = [LootEntry {
+    item: LootItem::WheatSeeds,
+    min_count: 1,
+    max_count: 1,
+}];
+
+/// Deterministic break-site yield for `block`, or `None` when breaking it
+/// yields no crop loot.
+///
+/// Mature [`BlockId::WheatStage3`] yields one wheat and two seeds; immature
+/// stages 0-2 return one seed; every other block has no harvest table. The
+/// session maps entries through its fail-closed `loot_items` helper, so the
+/// degenerate counts here are consumed exactly as written.
+pub fn wheat_harvest(block: BlockId) -> Option<&'static [LootEntry]> {
+    match block {
+        BlockId::WheatStage3 => Some(&WHEAT_MATURE_HARVEST[..]),
+        BlockId::WheatStage0 | BlockId::WheatStage1 | BlockId::WheatStage2 => {
+            Some(&WHEAT_IMMATURE_HARVEST[..])
+        }
+        _ => None,
+    }
 }
 
 /// Extras a ruin may also contain, with their inclusive count ranges.
@@ -492,5 +540,111 @@ mod tests {
         deduped.dedup();
         assert_eq!(deduped.len(), names.len(), "no two variants share a name");
         assert_eq!(M008_LOOT.len(), 7);
+    }
+
+    #[test]
+    fn wheat_harvest_mature_yields_wheat_and_two_seeds() {
+        let entries = wheat_harvest(BlockId::WheatStage3).expect("mature wheat must yield");
+        assert_eq!(
+            entries,
+            &[
+                LootEntry {
+                    item: LootItem::Wheat,
+                    min_count: 1,
+                    max_count: 1,
+                },
+                LootEntry {
+                    item: LootItem::WheatSeeds,
+                    min_count: 2,
+                    max_count: 2,
+                },
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.min_count == entry.max_count && entry.min_count > 0),
+            "the harvest table must be degenerate and non-empty"
+        );
+    }
+
+    #[test]
+    fn wheat_harvest_immature_stages_return_one_seed() {
+        for stage in [
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+        ] {
+            let entries = wheat_harvest(stage).unwrap_or_else(|| panic!("{stage:?} must yield"));
+            assert_eq!(entries.len(), 1, "{stage:?} yields one entry");
+            assert_eq!(
+                entries[0],
+                LootEntry {
+                    item: LootItem::WheatSeeds,
+                    min_count: 1,
+                    max_count: 1,
+                },
+                "{stage:?} must return exactly one seed"
+            );
+        }
+    }
+
+    #[test]
+    fn wheat_harvest_is_none_for_every_non_wheat_block() {
+        for raw in 0..=u8::MAX {
+            let Some(block) = BlockId::from_u8(raw) else {
+                continue;
+            };
+            if block.is_wheat_stage() {
+                continue;
+            }
+            assert_eq!(
+                wheat_harvest(block),
+                None,
+                "{block:?} must not have a crop harvest table"
+            );
+        }
+        // Explicit anchors around the wheat ids.
+        assert_eq!(wheat_harvest(BlockId::Air), None);
+        assert_eq!(wheat_harvest(BlockId::Farmland), None);
+        assert_eq!(wheat_harvest(BlockId::Grass), None);
+        assert_eq!(wheat_harvest(BlockId::Chest), None);
+        assert_eq!(wheat_harvest(BlockId::LootChest), None);
+    }
+
+    #[test]
+    fn wheat_harvest_is_stable_and_fits_a_chest() {
+        let first = wheat_harvest(BlockId::WheatStage3).expect("mature wheat must yield");
+        let second = wheat_harvest(BlockId::WheatStage3).expect("mature wheat must yield");
+        assert_eq!(first, second, "the table must not depend on call order");
+        assert!(!first.is_empty() && first.len() <= RUIN_LOOT_MAX_SLOTS);
+        assert!(!wheat_harvest(BlockId::WheatStage0)
+            .expect("immature wheat must yield")
+            .is_empty());
+    }
+
+    #[test]
+    fn wheat_harvest_entries_map_through_item_construction() {
+        use crate::player::inventory::{Item, ItemId, Material};
+
+        let mature = wheat_harvest(BlockId::WheatStage3).expect("mature wheat must yield");
+        let items: Vec<Item> = mature
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count)
+                    .expect("a degenerate non-zero entry must build a real item")
+            })
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id(), ItemId::Material(Material::Wheat));
+        assert_eq!(items[0].count(), 1);
+        assert_eq!(items[1].id(), ItemId::Material(Material::WheatSeeds));
+        assert_eq!(items[1].count(), 2);
+
+        let immature = wheat_harvest(BlockId::WheatStage1).expect("immature wheat must yield");
+        let seed = Item::new(ItemId::from(immature[0].item), immature[0].min_count)
+            .expect("the immature entry must build a real item");
+        assert_eq!(seed.id(), ItemId::Material(Material::WheatSeeds));
+        assert_eq!(seed.count(), 1);
     }
 }
