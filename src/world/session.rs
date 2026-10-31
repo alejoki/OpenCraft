@@ -2029,6 +2029,17 @@ mod tests {
         assert_eq!(session.open_chest_position(), None);
         assert_eq!(session.player.inventory(), &inventory);
         assert_eq!(session.player.selected_slot(), selected);
+
+        // Respawn re-arms the one-shot first-contact immunity: a 5-block drop
+        // onto a fresh scratch floor would otherwise cost 2 health.
+        lay_scratch_floor(&mut session, 36);
+        session.player.position = Vec3::new(16.5, 42.0, 16.5);
+        session.sync_camera();
+        assert!(session.settle_spawn());
+        run_physics(&mut session, 60);
+        assert!(session.player.on_ground, "the respawned player landed");
+        assert_eq!(session.tick_survival(0.1, 10.0, false).damage, 0);
+        assert_eq!(session.player.survival.health(), 20);
     }
 
     #[test]
