@@ -12,7 +12,7 @@
 # settings.toml, and packs/ are never touched):
 #   0. Doc reader-test gate, no launch: docs/TEXTURE-PACKS.md exists, its
 #      `## Quickstart` ```toml block extracts non-empty with `name =` and
-#      `overlay_tint`, and all 16 layer file names appear in the guide.
+#      `overlay_tint`, and all 23 layer file names appear in the guide.
 #   1. Selected pack + persistence: a `[packs]`-only settings.toml selects
 #      "demo", whose pack.toml is the extracted Quickstart block verbatim.
 #      The pack also ships a valid hand-crafted break.wav and a corrupt
@@ -155,12 +155,19 @@ LAYERS=(
     snow_side.png
     coal_ore.png
     iron_ore.png
+    farmland.png
+    wheat_stage0.png
+    wheat_stage1.png
+    wheat_stage2.png
+    wheat_stage3.png
+    chest.png
+    loot_chest.png
 )
 for layer in "${LAYERS[@]}"; do
     grep -Fq "$layer" "$DOC" || fail "scenario 0: guide does not document layer '$layer'"
 done
 
-echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with name/overlay_tint and all 16 layer names documented"
+echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with name/overlay_tint and all 23 layer names documented"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: selected pack + persistence across relaunch.
