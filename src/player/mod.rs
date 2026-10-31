@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod container;
+pub mod eating;
 pub mod inventory;
 pub mod mining;
 pub mod physics;
