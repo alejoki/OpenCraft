@@ -1468,6 +1468,87 @@ mod tests {
         let _ = c_neg_x;
     }
 
+    /// A wheat stage is an ordinary chunk edit, so a forced unload and
+    /// regeneration must reapply it exactly like any other player edit. The
+    /// pump uses the same bounded `update_streaming` pattern as the brick test,
+    /// but pins a real before/after unload so the test cannot pass vacuously.
+    #[test]
+    fn wheat_edit_survives_forced_unload_and_regeneration() {
+        let _heavy = lock_heavy_streaming();
+        let seed = 1337;
+        let origin = ChunkPos::new(0, 0, 0);
+        let (lx, ly, lz) = (5usize, 10usize, 5usize);
+        let mut edits = ChunkEditMap::default();
+        edits
+            .entry(origin)
+            .or_default()
+            .insert(linear_index(lx, ly, lz) as u16, BlockId::WheatStage1);
+        let (wx, wy, wz) = (lx as i32, ly as i32, lz as i32);
+
+        let mut mgr = WorldManager::with_seed_and_edits(4, seed, edits.clone());
+
+        // Warm the origin chunk in until the persisted stage is live.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while mgr.get_block(wx, wy, wz) != BlockId::WheatStage1
+            && std::time::Instant::now() < deadline
+        {
+            mgr.update_streaming(origin, Season::Summer);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            mgr.get_block(wx, wy, wz),
+            BlockId::WheatStage1,
+            "the persisted stage never loaded"
+        );
+        assert!(
+            mgr.is_resident(origin),
+            "the warm pump must make the origin chunk resident"
+        );
+
+        // Force a real unload by moving far outside the unload radius.
+        let far = ChunkPos::new(1000, 0, 1000);
+        let (_, unloaded) = mgr.update_streaming(far, Season::Summer);
+        assert!(
+            unloaded.contains(&origin),
+            "the far pump must unload the origin chunk"
+        );
+        assert!(
+            !mgr.is_resident(origin),
+            "the unload must actually remove the chunk, not just report it"
+        );
+        assert_eq!(mgr.get_block(wx, wy, wz), BlockId::Air);
+
+        // Pump back until the chunk regenerates with its edit applied.
+        while !mgr.is_resident(origin) && std::time::Instant::now() < deadline {
+            mgr.update_streaming(origin, Season::Summer);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            mgr.is_resident(origin),
+            "the return pump must regenerate the origin chunk"
+        );
+        assert_eq!(
+            mgr.get_block(wx, wy, wz),
+            BlockId::WheatStage1,
+            "the wheat stage edit must survive unload/regeneration"
+        );
+        assert_eq!(
+            mgr.chunk_edits(),
+            &edits,
+            "unload/regeneration must not mutate the persisted edit map"
+        );
+
+        // Drain the shared rayon pipeline before releasing the heavy lock.
+        while !streaming_is_idle(&mgr) && std::time::Instant::now() < deadline {
+            mgr.update_streaming(origin, Season::Summer);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            streaming_is_idle(&mgr),
+            "the streaming pipeline must drain before the heavy lock is released"
+        );
+    }
+
     #[test]
     fn test_uniform_air_chunks_do_not_consume_mesh_budget() {
         let mut mgr = WorldManager::new(4);

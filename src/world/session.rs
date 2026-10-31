@@ -11,18 +11,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
+use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
 use crate::player::container::Container;
-use crate::player::inventory::{ChestSlots, InventoryError, Item, ItemId, CHEST_SLOTS};
+use crate::player::inventory::{
+    ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, CHEST_SLOTS,
+};
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
     GameMode, SurvivalContext, SurvivalRuntime, SurvivalState, SurvivalTick,
 };
 use crate::world::block::BlockId;
-use crate::world::chunk::world_to_chunk_and_local;
+use crate::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use crate::world::daycycle::GameClock;
-use crate::world::loot::LootEntry;
+use crate::world::farming::CropRuntime;
+use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
@@ -67,6 +71,12 @@ pub struct WorldSession {
     /// Pure game-time survival rules and their fractional accumulators.
     /// Ephemeral: a load or respawn starts from a fresh runtime.
     survival_runtime: SurvivalRuntime,
+    /// Ephemeral wheat growth progress. Only the visible stage block is
+    /// persisted, as an ordinary chunk edit in `WorldManager::chunk_edits`;
+    /// growth progress itself is never saved. Constructors start empty and
+    /// [`WorldSession::session_from_save`] rebuilds candidates from the saved
+    /// edits at progress zero.
+    crops: CropRuntime,
     /// Set only for a fresh Survival session (and respawn): player physics is
     /// gated until the chunks containing the feet and four blocks below are
     /// resident. Ephemeral and never saved.
@@ -115,6 +125,7 @@ impl WorldSession {
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
+            crops: CropRuntime::default(),
             spawn_settle: mode == GameMode::Survival,
         };
         session.sync_camera();
@@ -158,6 +169,7 @@ impl WorldSession {
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
+            crops: CropRuntime::default(),
             // Edit Background is a Creative-rules editor and is never gated.
             spawn_settle: false,
         };
@@ -208,6 +220,10 @@ impl WorldSession {
         player.set_mode(mode);
         player.survival = saved.survival;
         player.restore_selected_slot(saved.selected_slot as usize);
+        // Rebuild growth candidates from the persisted stage edits *before*
+        // the edit map is moved into the world manager. Progress restarts at
+        // zero: only the visible stage survives a save.
+        let crops = CropRuntime::from_edits(&chunk_edits);
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 saved.render_distance as i32,
@@ -224,6 +240,7 @@ impl WorldSession {
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
+            crops,
             // A restored player is never spawn-gated: the visible world state
             // is the save's, and a mid-air fall must still hurt.
             spawn_settle: false,
@@ -294,6 +311,152 @@ impl WorldSession {
         };
         self.survival_runtime
             .tick(&mut self.player.survival, ctx, game_dt)
+    }
+
+    /// Tills a live `Grass` or `Dirt` block into `Farmland` when a Hoe is
+    /// selected.
+    ///
+    /// The caller owns the top-face rule (the session has no raycast normal),
+    /// but every other guard is re-checked against live state: the selected
+    /// item must be a Hoe of any tier, the block must still be soil, and the
+    /// block must be within [`TABLE_INTERACT_REACH`]. The edit is applied only
+    /// when it can produce remesh work; the tool is worn exactly once after
+    /// that proven edit, so a refusal never mutates the world or the
+    /// inventory. Returns the remesh work the caller uploads.
+    pub fn till_at(&mut self, pos: IVec3) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+        let selected = self.player.selected_item()?;
+        match selected.id() {
+            ItemId::Tool {
+                kind: ToolKind::Hoe,
+                ..
+            } => {}
+            _ => return None,
+        }
+        let live = self.world.get_block(pos.x, pos.y, pos.z);
+        if !matches!(live, BlockId::Grass | BlockId::Dirt) {
+            return None;
+        }
+        if !self.station_within_reach(pos) || !self.edit_will_remesh(pos) {
+            return None;
+        }
+
+        let remeshed = self
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Farmland);
+        debug_assert!(
+            !remeshed.is_empty(),
+            "edit_will_remesh proved the chunk and its face neighbours resident"
+        );
+        // The edit is visible; spend exactly one durability point. The
+        // selected-slot check above guarantees the Hoe is still there, so a
+        // failure here is a state bug rather than a user error.
+        debug_assert!(self.player.wear_selected_tool().is_ok());
+        Some(remeshed)
+    }
+
+    /// Plants `WheatStage0` on live `Farmland` when `WheatSeeds` are selected.
+    ///
+    /// Every guard is re-checked against live state: the selected item must
+    /// be seeds, the target cell must be `Air`, the support block directly
+    /// below must still be `Farmland`, the cell must be within
+    /// [`TABLE_INTERACT_REACH`], and the player's AABB must not overlap the
+    /// cell (no planting inside yourself). The edit is applied only when it
+    /// can produce remesh work; exactly one seed is consumed and the crop
+    /// candidate is tracked after that proven edit, so a refusal never
+    /// mutates the world or the inventory. Farming is mode-independent.
+    pub fn plant_wheat_at(&mut self, pos: IVec3) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+        let selected = self.player.selected_item()?;
+        if selected.id() != ItemId::Material(Material::WheatSeeds) {
+            return None;
+        }
+        if self.world.get_block(pos.x, pos.y, pos.z) != BlockId::Air {
+            return None;
+        }
+        let below = pos - IVec3::Y;
+        if self.world.get_block(below.x, below.y, below.z) != BlockId::Farmland {
+            return None;
+        }
+        if !self.station_within_reach(pos)
+            || self.player.aabb().intersects_block(pos.x, pos.y, pos.z)
+            || !self.edit_will_remesh(pos)
+        {
+            return None;
+        }
+
+        let remeshed = self
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::WheatStage0);
+        debug_assert!(
+            !remeshed.is_empty(),
+            "edit_will_remesh proved the chunk and its face neighbours resident"
+        );
+        // The edit is visible; consume exactly one seed and track the new
+        // crop. The selected-slot check above guarantees seeds are still held.
+        debug_assert!(self.player.consume_selected().is_some());
+        self.crops.insert(pos);
+        Some(remeshed)
+    }
+
+    /// Advances every tracked crop by one frame of game time.
+    ///
+    /// Mirrors [`Self::tick_survival`]: `dt` is clamped to `0..=0.1`, then
+    /// scaled by `time_scale` (negative scales become zero), and non-finite or
+    /// non-positive game time is a no-op. Winter pauses growth while keeping
+    /// each crop's banked progress. The pure runtime owns residency, support,
+    /// maturity, and deterministic ordering; this seam applies each resulting
+    /// stage only when the live block still equals the stage the runtime saw,
+    /// so a stale advance can never overwrite a replaced crop. Returns the
+    /// remesh work the caller uploads.
+    pub fn tick_crops(&mut self, dt: f32, time_scale: f32) -> Vec<(ChunkPos, ChunkMesh)> {
+        let dt = dt.clamp(0.0, 0.1);
+        let game_dt = dt * time_scale.max(0.0);
+        if !game_dt.is_finite() || game_dt <= 0.0 {
+            return Vec::new();
+        }
+
+        let paused = self.season() == Season::Winter;
+        let advances = self.crops.tick(
+            game_dt,
+            paused,
+            |p| {
+                let (chunk, _) = world_to_chunk_and_local(p.x, p.y, p.z);
+                self.world.is_resident(chunk)
+            },
+            |p| self.world.get_block(p.x, p.y, p.z),
+        );
+
+        let mut remeshed = Vec::new();
+        for advance in advances {
+            if self
+                .world
+                .get_block(advance.pos.x, advance.pos.y, advance.pos.z)
+                != advance.from
+            {
+                continue;
+            }
+            remeshed.extend(self.world.set_block_immediate(
+                advance.pos.x,
+                advance.pos.y,
+                advance.pos.z,
+                advance.to,
+            ));
+        }
+        remeshed
+    }
+
+    /// The validated items a broken wheat block yields, or `None` when the
+    /// block is not a wheat stage.
+    ///
+    /// The deterministic world/local harvest table is the only source of
+    /// truth; this seam maps it into inventory-validated [`Item`]s and fails
+    /// closed on a malformed table rather than inventing partial loot.
+    pub fn wheat_harvest_items(&self, block: BlockId) -> Option<Vec<Item>> {
+        loot_items(wheat_harvest(block)?)
+    }
+
+    /// Forgets a crop candidate, e.g. after its block was broken or replaced.
+    pub fn remove_crop(&mut self, pos: IVec3) {
+        self.crops.remove(pos);
     }
 
     /// Restores the player to the deterministic spawn with full vitals.
@@ -589,6 +752,42 @@ impl WorldSession {
         eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
     }
 
+    /// Whether a block edit at `pos` can produce remesh work right now.
+    ///
+    /// [`WorldManager::set_block_immediate`] edits a resident chunk even when
+    /// its face neighbours are missing, but then returns no remesh work. The
+    /// till/plant seams check this first so a refusal is never a silent world
+    /// mutation: the edit, the tool wear / seed consume, and the returned
+    /// remesh work always agree.
+    fn edit_will_remesh(&self, pos: IVec3) -> bool {
+        use crate::world::manager::{MAX_CHUNK_Y, MIN_CHUNK_Y};
+
+        let (chunk, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        if !self.world.is_resident(chunk) {
+            return false;
+        }
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let ny = chunk.y + dy;
+            if !(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny) {
+                continue;
+            }
+            if !self
+                .world
+                .is_resident(ChunkPos::new(chunk.x + dx, ny, chunk.z + dz))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The deterministic loot a generated ruin chest at `pos` would hold, in
     /// slot order, or `None` when `pos` is not a live generated LootChest.
     ///
@@ -674,7 +873,9 @@ pub fn random_seed() -> u32 {
 mod tests {
     use super::*;
     use crate::player::container::Container;
-    use crate::player::inventory::{InventoryError, Item, ItemId, Material, CHEST_SLOTS};
+    use crate::player::inventory::{
+        InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
+    };
     use crate::player::physics::InputState;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
@@ -2605,5 +2806,643 @@ mod tests {
         assert_eq!(session.player.inventory(), &inventory);
         assert_eq!(session.player.selected_slot(), selected);
         assert!(!session.player.can_fly());
+    }
+
+    // -----------------------------------------------------------------------
+    // Hoe and wheat farming seams
+    // -----------------------------------------------------------------------
+
+    /// Inserts an all-air chunk plus its six face neighbours, so
+    /// `set_block_immediate` returns remesh work for edits inside `chunk`.
+    fn insert_air_chunk_with_face_neighbors(session: &mut WorldSession, chunk: ChunkPos) {
+        use crate::world::chunk::Chunk;
+
+        session
+            .world
+            .insert_chunk_for_test(chunk, Chunk::new_uniform(BlockId::Air));
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let neighbor = ChunkPos::new(chunk.x + dx, chunk.y + dy, chunk.z + dz);
+            session
+                .world
+                .insert_chunk_for_test(neighbor, Chunk::new_uniform(BlockId::Air));
+        }
+    }
+
+    /// A Creative session with a deterministic all-air origin chunk and faces.
+    fn farm_session(seed: u32, season_length_days: u32) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, PathBuf::from("/tmp/farm.mcvx"), season_length_days);
+        insert_air_chunk_with_face_neighbors(&mut session, ChunkPos::new(0, 0, 0));
+        session
+    }
+
+    /// Stands the player two blocks above `pos`, inside the shared reach budget
+    /// and outside the target cell's AABB.
+    fn stand_above(session: &mut WorldSession, pos: IVec3) {
+        session.player.position =
+            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 2.0, pos.z as f32 + 0.5);
+        session.sync_camera();
+    }
+
+    fn wood_hoe() -> Item {
+        Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Hoe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood hoe is a valid tool")
+    }
+
+    fn wheat_seeds(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::WheatSeeds), count).expect("valid seed stack")
+    }
+
+    #[test]
+    fn till_at_converts_grass_and_dirt_and_wears_exactly_one_point() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let grass = IVec3::new(5, 10, 5);
+        let dirt = IVec3::new(7, 10, 5);
+        session
+            .world
+            .set_block_immediate(grass.x, grass.y, grass.z, BlockId::Grass);
+        session
+            .world
+            .set_block_immediate(dirt.x, dirt.y, dirt.z, BlockId::Dirt);
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("the empty inventory accepts the hoe");
+        assert!(session.player.select_slot(0));
+        stand_above(&mut session, grass);
+
+        let remeshed = session.till_at(grass).expect("a held hoe tills live grass");
+        assert!(!remeshed.is_empty(), "a resident chunk with faces remeshes");
+        assert_eq!(
+            session.world.get_block(grass.x, grass.y, grass.z),
+            BlockId::Farmland
+        );
+        let worn = session
+            .player
+            .inventory()
+            .hotbar(0)
+            .expect("tilling never consumes the tool");
+        assert_eq!(
+            worn.durability(),
+            Some(ToolTier::Wood.max_durability() - 1),
+            "exactly one durability point is spent"
+        );
+        assert_eq!(worn.count(), 1);
+
+        // A second, fresh Hoe proves Dirt is tilled the same way.
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("slot 1 accepts the second hoe");
+        assert!(session.player.select_slot(1));
+        stand_above(&mut session, dirt);
+        assert!(session.till_at(dirt).is_some());
+        assert_eq!(
+            session.world.get_block(dirt.x, dirt.y, dirt.z),
+            BlockId::Farmland
+        );
+        let second = session
+            .player
+            .inventory()
+            .hotbar(1)
+            .expect("the second hoe survives");
+        assert_eq!(
+            second.durability(),
+            Some(ToolTier::Wood.max_durability() - 1)
+        );
+    }
+
+    #[test]
+    fn till_at_refuses_without_hoe_wrong_block_out_of_reach_and_unloaded() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 10, 5);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Grass);
+        stand_above(&mut session, pos);
+
+        // No hoe selected.
+        session
+            .player
+            .insert_items(&[wheat_seeds(3)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        let before = session.player.inventory().clone();
+        assert!(session.till_at(pos).is_none());
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Grass);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Hoe selected, wrong live block.
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(1));
+        let stone = IVec3::new(6, 10, 5);
+        session
+            .world
+            .set_block_immediate(stone.x, stone.y, stone.z, BlockId::Stone);
+        stand_above(&mut session, stone);
+        let before = session.player.inventory().clone();
+        assert!(session.till_at(stone).is_none());
+        assert_eq!(
+            session.world.get_block(stone.x, stone.y, stone.z),
+            BlockId::Stone
+        );
+        assert_eq!(session.player.inventory(), &before);
+
+        // Hoe selected, live grass out of reach.
+        session.player.position = Vec3::new(40.5, 12.0, 40.5);
+        session.sync_camera();
+        let before = session.player.inventory().clone();
+        assert!(session.till_at(pos).is_none());
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Grass);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Unloaded chunk: no edit and no wear.
+        let unloaded = IVec3::new(200, 10, 200);
+        session.player.position = Vec3::new(200.5, 12.0, 200.5);
+        session.sync_camera();
+        let before = session.player.inventory().clone();
+        assert!(session.till_at(unloaded).is_none());
+        assert_eq!(
+            session.world.get_block(unloaded.x, unloaded.y, unloaded.z),
+            BlockId::Air
+        );
+        assert_eq!(session.player.inventory(), &before);
+    }
+
+    #[test]
+    fn till_at_breaks_a_one_durability_hoe_after_the_edit() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 10, 5);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Grass);
+        stand_above(&mut session, pos);
+        session
+            .player
+            .insert_items(
+                &[Item::tool_with_durability(ToolKind::Hoe, ToolTier::Wood, 1)
+                    .expect("one durability point is valid")],
+            )
+            .expect("fits");
+        assert!(session.player.select_slot(0));
+
+        assert!(session.till_at(pos).is_some());
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Farmland
+        );
+        assert_eq!(
+            session.player.inventory().hotbar(0),
+            None,
+            "the last point breaks the hoe only after the edit landed"
+        );
+    }
+
+    #[test]
+    fn plant_wheat_at_places_stage_zero_and_consumes_one_seed() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(5)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+
+        assert!(session.plant_wheat_at(crop).is_some());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage0
+        );
+        assert_eq!(
+            session
+                .player
+                .inventory()
+                .hotbar(0)
+                .map(|item| item.count()),
+            Some(4),
+            "exactly one seed is consumed"
+        );
+        assert_eq!(session.crops.progress(crop), Some(0.0));
+        assert_eq!(session.crops.len(), 1);
+
+        // The cell is occupied now, so a second planting is refused untouched.
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(crop).is_none());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage0
+        );
+        assert_eq!(session.player.inventory(), &before);
+        assert_eq!(session.crops.len(), 1);
+    }
+
+    #[test]
+    fn plant_wheat_at_refuses_without_seeds_occupied_non_farmland_overlap_out_of_reach_and_unloaded(
+    ) {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+
+        // No seeds selected.
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(0));
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(crop).is_none());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::Air
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Seeds selected, but the target cell is occupied.
+        session
+            .player
+            .insert_items(&[wheat_seeds(4)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(1));
+        session
+            .world
+            .set_block_immediate(crop.x, crop.y, crop.z, BlockId::Stone);
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(crop).is_none());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::Stone
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Air target above non-farmland support.
+        session
+            .world
+            .set_block_immediate(crop.x, crop.y, crop.z, BlockId::Air);
+        let grass_support = IVec3::new(7, 10, 5);
+        session.world.set_block_immediate(
+            grass_support.x,
+            grass_support.y,
+            grass_support.z,
+            BlockId::Grass,
+        );
+        let other_crop = grass_support + IVec3::Y;
+        stand_above(&mut session, grass_support);
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(other_crop).is_none());
+        assert_eq!(
+            session
+                .world
+                .get_block(other_crop.x, other_crop.y, other_crop.z),
+            BlockId::Air
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Player AABB overlaps the target cell.
+        session.player.position =
+            Vec3::new(crop.x as f32 + 0.5, crop.y as f32, crop.z as f32 + 0.5);
+        session.sync_camera();
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(crop).is_none());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::Air
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Seeds selected, target out of reach.
+        session.player.position = Vec3::new(40.5, 12.0, 40.5);
+        session.sync_camera();
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(crop).is_none());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::Air
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+
+        // Unloaded chunk.
+        let unloaded_crop = IVec3::new(200, 11, 200);
+        session.player.position = Vec3::new(200.5, 13.0, 200.5);
+        session.sync_camera();
+        let before = session.player.inventory().clone();
+        assert!(session.plant_wheat_at(unloaded_crop).is_none());
+        assert_eq!(
+            session
+                .world
+                .get_block(unloaded_crop.x, unloaded_crop.y, unloaded_crop.z),
+            BlockId::Air
+        );
+        assert_eq!(session.crops.len(), 0);
+        assert_eq!(session.player.inventory(), &before);
+    }
+
+    #[test]
+    fn tick_crops_advances_all_four_stages_and_never_past_mature() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        assert_eq!(session.season(), Season::Spring);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(3)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        assert!(session.plant_wheat_at(crop).is_some());
+
+        for (stage, expected) in [
+            (1, BlockId::WheatStage1),
+            (2, BlockId::WheatStage2),
+            (3, BlockId::WheatStage3),
+        ] {
+            let remeshed = session.tick_crops(0.1, 600.0);
+            assert!(
+                !remeshed.is_empty(),
+                "stage {stage} must remesh the crop chunk"
+            );
+            assert_eq!(session.world.get_block(crop.x, crop.y, crop.z), expected);
+        }
+        assert_eq!(session.crops.len(), 0, "maturity removes the candidate");
+
+        // A fourth tick must not advance or rewrite the mature block.
+        assert!(session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage3
+        );
+    }
+
+    #[test]
+    fn tick_crops_pauses_in_winter_and_resumes_in_spring() {
+        use crate::world::daycycle::{GameClock, DEFAULT_TIME_OF_DAY};
+
+        let mut session = farm_session(1, 1);
+        assert_eq!(session.season(), Season::Spring);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(2)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        assert!(session.plant_wheat_at(crop).is_some());
+
+        // Bank 30 game seconds of Spring progress without a stage change.
+        assert!(session.tick_crops(0.05, 600.0).is_empty());
+        assert_eq!(session.crops.progress(crop), Some(30.0));
+
+        session.clock = GameClock::from_day_and_time(3, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Winter);
+        assert!(
+            session.tick_crops(0.1, 600.0).is_empty(),
+            "winter pauses growth"
+        );
+        assert_eq!(
+            session.crops.progress(crop),
+            Some(30.0),
+            "winter retains banked progress"
+        );
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage0
+        );
+
+        session.clock = GameClock::from_day_and_time(0, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Spring);
+        assert!(!session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage1
+        );
+    }
+
+    #[test]
+    fn tick_crops_skips_unloaded_chunks_and_resumes_when_resident() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let chunk = ChunkPos::new(2, 0, 2);
+        let crop = IVec3::new(2 * 32 + 5, 11, 2 * 32 + 5);
+        assert!(!session.world.is_resident(chunk));
+
+        // A candidate without resident block data is retained but paused.
+        session.crops.insert(crop);
+        assert!(session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(session.crops.progress(crop), Some(0.0));
+        assert_eq!(session.crops.len(), 1);
+
+        // Load the chunk with live wheat on farmland: growth resumes.
+        insert_air_chunk_with_face_neighbors(&mut session, chunk);
+        session
+            .world
+            .set_block_immediate(crop.x, crop.y - 1, crop.z, BlockId::Farmland);
+        session
+            .world
+            .set_block_immediate(crop.x, crop.y, crop.z, BlockId::WheatStage0);
+        let remeshed = session.tick_crops(0.1, 600.0);
+        assert!(!remeshed.is_empty());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage1
+        );
+    }
+
+    #[test]
+    fn crop_stage_survives_save_reload_and_candidate_rebuilds_at_zero_progress() {
+        use crate::world::chunk::linear_index;
+        use crate::world::persistence::{
+            load_world_from_path, save_world_to_path, SavedPlayerState,
+        };
+
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(3)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        assert!(session.plant_wheat_at(crop).is_some());
+        assert!(!session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage1
+        );
+
+        let data = WorldSaveData {
+            seed: session.world.seed(),
+            time_of_day: session.clock.time_of_day,
+            day_index: session.clock.day_index,
+            season_length_days: session.season_length_days,
+            mode: session.save_mode,
+            player: SavedPlayerState {
+                position: session.player.position.to_array(),
+                yaw: session.player.yaw,
+                pitch: session.player.pitch,
+                fly_mode: session.player.fly_mode,
+                selected_slot: session.player.selected_slot() as u8,
+                render_distance: session.world.render_distance() as u16,
+                inventory: session.player.inventory().clone(),
+                player_grid: session.player.player_grid().clone(),
+                table_grid: session.player.table_grid().clone(),
+                survival: session.player.survival,
+            },
+            chests: session.chests.clone(),
+            chunk_edits: session.world.chunk_edits().clone(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crop.mcvx");
+        save_world_to_path(&path, &data).expect("the save writes");
+        let loaded = load_world_from_path(&path).expect("the save loads");
+        let mut restored = WorldSession::session_from_save(loaded, path.clone());
+
+        let (chunk, (lx, ly, lz)) = world_to_chunk_and_local(crop.x, crop.y, crop.z);
+        assert_eq!(
+            restored
+                .world
+                .chunk_edits()
+                .get(&chunk)
+                .and_then(|edits| edits.get(&(linear_index(lx, ly, lz) as u16))),
+            Some(&BlockId::WheatStage1),
+            "the visible stage stays an ordinary v6 chunk edit"
+        );
+        assert_eq!(restored.crops.progress(crop), Some(0.0));
+        assert_eq!(restored.crops.len(), 1);
+
+        // Materialize the saved chunk and reapply its persisted stage, then one
+        // tick proves the candidate rebuilt from the edit map grows.
+        insert_air_chunk_with_face_neighbors(&mut restored, chunk);
+        restored
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        restored
+            .world
+            .set_block_immediate(crop.x, crop.y, crop.z, BlockId::WheatStage1);
+        let remeshed = restored.tick_crops(0.1, 600.0);
+        assert!(!remeshed.is_empty());
+        assert_eq!(
+            restored.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage2
+        );
+    }
+
+    #[test]
+    fn session_constructors_start_with_no_crop_candidates() {
+        use crate::world::chunk::linear_index;
+        use crate::world::daycycle::{GameClock, DEFAULT_TIME_OF_DAY};
+
+        let fresh = WorldSession::new_session_with_mode(
+            1,
+            PathBuf::from("/tmp/fresh-crops.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        assert!(fresh.crops.is_empty());
+
+        let edited = WorldSession::new_at(
+            1,
+            PathBuf::from("/tmp/edit-crops.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(0.5, 20.0, 0.5),
+            GameClock::from_day_and_time(0, DEFAULT_TIME_OF_DAY),
+        );
+        assert!(edited.crops.is_empty());
+
+        let mut edits = ChunkEditMap::default();
+        let chunk = ChunkPos::new(0, 0, 0);
+        let inner = edits.entry(chunk).or_default();
+        for (index, block) in [
+            (linear_index(1, 2, 3), BlockId::WheatStage0),
+            (linear_index(2, 2, 3), BlockId::WheatStage1),
+            (linear_index(3, 2, 3), BlockId::WheatStage2),
+            (linear_index(4, 2, 3), BlockId::WheatStage3),
+            (linear_index(5, 2, 3), BlockId::Farmland),
+        ] {
+            inner.insert(index as u16, block);
+        }
+        let mut data = make_save(1);
+        data.chunk_edits = edits;
+        let restored =
+            WorldSession::session_from_save(data, PathBuf::from("/tmp/restored-crops.mcvx"));
+        assert_eq!(restored.crops.len(), 3);
+        assert_eq!(restored.crops.progress(IVec3::new(1, 2, 3)), Some(0.0));
+        assert_eq!(restored.crops.progress(IVec3::new(2, 2, 3)), Some(0.0));
+        assert_eq!(restored.crops.progress(IVec3::new(3, 2, 3)), Some(0.0));
+        assert_eq!(restored.crops.progress(IVec3::new(4, 2, 3)), None);
+        assert_eq!(restored.crops.progress(IVec3::new(5, 2, 3)), None);
+    }
+
+    #[test]
+    fn wheat_harvest_items_maps_every_wheat_stage_and_remove_crop_clears() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+
+        let mature = session
+            .wheat_harvest_items(BlockId::WheatStage3)
+            .expect("mature wheat yields");
+        assert_eq!(mature.len(), 2);
+        assert_eq!(mature[0].id(), ItemId::Material(Material::Wheat));
+        assert_eq!(mature[0].count(), 1);
+        assert_eq!(mature[1].id(), ItemId::Material(Material::WheatSeeds));
+        assert_eq!(mature[1].count(), 2);
+
+        for stage in [
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+        ] {
+            let items = session
+                .wheat_harvest_items(stage)
+                .unwrap_or_else(|| panic!("{stage:?} yields"));
+            assert_eq!(items.len(), 1, "{stage:?} yields one entry");
+            assert_eq!(items[0].id(), ItemId::Material(Material::WheatSeeds));
+            assert_eq!(items[0].count(), 1);
+        }
+        assert_eq!(session.wheat_harvest_items(BlockId::Air), None);
+        assert_eq!(session.wheat_harvest_items(BlockId::Farmland), None);
+
+        let pos = IVec3::new(5, 11, 5);
+        session.crops.insert(pos);
+        assert_eq!(session.crops.progress(pos), Some(0.0));
+        session.remove_crop(pos);
+        assert_eq!(session.crops.progress(pos), None);
     }
 }
