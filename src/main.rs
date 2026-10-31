@@ -13405,8 +13405,9 @@ mod tests {
             ToolKind::Pickaxe => &[0, 1, 2],
             ToolKind::Axe => &[0, 1, 4],
             ToolKind::Shovel => &[0],
-            // Hoe recipes belong to S07; this S05 matrix deliberately covers
-            // only the nine Pickaxe/Axe/Shovel combinations.
+            // Hoe recipes now exist (S07), but this S05 matrix intentionally
+            // covers only the nine Pickaxe/Axe/Shovel break-centric
+            // combinations.
             ToolKind::Hoe => &[],
         }
     }
@@ -13416,8 +13417,9 @@ mod tests {
         match kind {
             ToolKind::Pickaxe | ToolKind::Axe => &[5, 9],
             ToolKind::Shovel => &[4, 8],
-            // Hoe recipes belong to S07; this S05 matrix deliberately covers
-            // only the nine Pickaxe/Axe/Shovel combinations.
+            // Hoe recipes now exist (S07), but this S05 matrix intentionally
+            // covers only the nine Pickaxe/Axe/Shovel break-centric
+            // combinations.
             ToolKind::Hoe => &[],
         }
     }

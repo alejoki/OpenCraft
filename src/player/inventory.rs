@@ -1104,6 +1104,10 @@ pub enum RecipeId {
     IronPickaxe,
     IronAxe,
     IronShovel,
+    Bread,
+    WoodHoe,
+    StoneHoe,
+    IronHoe,
 }
 
 /// Read-only recipe evaluation result.
@@ -1263,9 +1267,48 @@ const RECIPES: &[Recipe] = &[
         },
         output_count: 1,
     },
+    Recipe {
+        id: RecipeId::Bread,
+        pattern: &["WWW"],
+        output: ItemId::Material(Material::Bread),
+        output_count: 1,
+    },
+    // Hoes are 2 wide and 3 tall, so they only fit the 4x4 table and stay
+    // visually distinct from the 3-wide pickaxe/axe heads and the 1-wide
+    // shovel column.
+    Recipe {
+        id: RecipeId::WoodHoe,
+        pattern: &["PP", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::StoneHoe,
+        pattern: &["CC", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Stone,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::IronHoe,
+        pattern: &["II", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Iron,
+        },
+        output_count: 1,
+    },
 ];
 
 /// Pattern character to item identity. Unknown characters never match.
+///
+/// Known characters: `L` oak log, `P` oak planks, `C` cobblestone,
+/// `I` iron ore, `S` stick, `W` wheat.
 fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
@@ -1273,6 +1316,7 @@ fn pattern_item(byte: u8) -> Option<ItemId> {
         b'C' => Some(ItemId::Block(BlockId::Cobblestone)),
         b'I' => Some(ItemId::Block(BlockId::IronOre)),
         b'S' => Some(ItemId::Material(Material::Stick)),
+        b'W' => Some(ItemId::Material(Material::Wheat)),
         _ => None,
     }
 }
@@ -1523,6 +1567,10 @@ mod tests {
 
     fn stick(count: u16) -> Item {
         item(ItemId::Material(Material::Stick), count)
+    }
+
+    fn wheat(count: u16) -> Item {
+        item(ItemId::Material(Material::Wheat), count)
     }
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {
@@ -2890,7 +2938,7 @@ mod tests {
 
     #[test]
     fn every_tool_recipe_is_shaped_and_produces_a_full_durability_instance() {
-        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 9] = [
+        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 12] = [
             (
                 RecipeId::WoodPickaxe,
                 ToolKind::Pickaxe,
@@ -2944,6 +2992,24 @@ mod tests {
                 ToolKind::Shovel,
                 ToolTier::Iron,
                 &["I", "S", "S"],
+            ),
+            (
+                RecipeId::WoodHoe,
+                ToolKind::Hoe,
+                ToolTier::Wood,
+                &["PP", " S", " S"],
+            ),
+            (
+                RecipeId::StoneHoe,
+                ToolKind::Hoe,
+                ToolTier::Stone,
+                &["CC", " S", " S"],
+            ),
+            (
+                RecipeId::IronHoe,
+                ToolKind::Hoe,
+                ToolTier::Iron,
+                &["II", " S", " S"],
             ),
         ];
 
@@ -3020,6 +3086,61 @@ mod tests {
     }
 
     #[test]
+    fn bread_recipe_requires_one_three_wheat_row_in_the_table() {
+        let mut grid = grid_from_pattern(GridKind::Table, &["WWW"]);
+        let preview = grid.preview().expect("three wheat in a row match bread");
+        assert_eq!(preview.recipe, RecipeId::Bread);
+        assert_eq!(preview.output, ItemId::Material(Material::Bread));
+        assert_eq!(preview.output_count, 1);
+
+        let mut inventory = Inventory::empty();
+        let crafted = grid.take_result(&mut inventory).expect("bread craft");
+        assert_eq!(crafted.id(), ItemId::Material(Material::Bread));
+        assert_eq!(crafted.count(), 1);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Wheat)), 0);
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn bread_recipe_rejects_short_gapped_and_cramped_grids() {
+        // Two wheat is not a loaf.
+        let mut two = grid_from_pattern(GridKind::Table, &["WW"]);
+        assert_eq!(two.preview(), None);
+
+        // Three wheat with a hole keeps a three-wide bounding box but fails
+        // the inner-space check.
+        let mut gapped = CraftingGrid::new(GridKind::Table);
+        for index in [0, 2] {
+            gapped.set(index, Some(wheat(1))).expect("cell in range");
+        }
+        assert_eq!(gapped.preview(), None);
+
+        // The 2x2 player grid cannot hold a three-wide row: packing three
+        // wheat into an L leaves no recipe match.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        for index in [0, 1, 2] {
+            player.set(index, Some(wheat(1))).expect("cell in range");
+        }
+        assert_eq!(player.preview(), None);
+    }
+
+    #[test]
+    fn player_grid_cannot_fit_the_two_by_three_hoe_pattern() {
+        // The hoe bounding box is 2 wide and 3 tall, so the 2x2 player grid
+        // can at most hold its top row plus one stick below. That prefix must
+        // stay recipe-less; the full pattern is table-only.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(0, Some(block(BlockId::OakPlanks, 1)))
+            .expect("cell 0");
+        player
+            .set(1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("cell 1");
+        player.set(3, Some(stick(1))).expect("cell 3");
+        assert_eq!(player.preview(), None);
+    }
+
+    #[test]
     fn take_result_revalidates_a_stale_preview() {
         let mut grid = grid_from_pattern(GridKind::Player, &["P", "P"]);
         let stale = grid.preview().expect("initial preview");
@@ -3092,6 +3213,7 @@ mod tests {
 
     #[test]
     fn recipe_table_patterns_are_unambiguous() {
+        assert_eq!(RECIPES.len(), 17, "13 pre-farming recipes plus 4 new ones");
         for recipe in RECIPES {
             let mut grid = CraftingGrid::new(GridKind::Table);
             for (row, line) in recipe.pattern.iter().enumerate() {
