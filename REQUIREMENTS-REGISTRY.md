@@ -329,13 +329,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R033 — Deterministic surface ruins with the present-but-empty loot seam
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M008/S06
 - Description: Small surface ruins generate deterministically per seed on grass plains and forest columns, are cleared from spawn footprints, and expose a named loot seam that is present but deliberately empty in M007.
 - Why it matters: Structures make exploration pay off structurally, and the empty seam lets M008 add survival loot without a worldgen signature change.
 - Source: M007 / S07 surface ruins
 - Primary owning slice: M007/S07
 - Supporting slices: None
 - Validation: cargo test --locked --lib -- ruin; cargo test --locked --lib -- ruin_loot
+- Note: Deliberately superseded by M008/S06 (deterministic ruin LootChests): the surface-ruin shell, spawn-footprint clearing, named loot seam, and seed-determinism contract all survive, while the empty M007 loot seam is now filled.
 
 ### R034 — Streaming budget proof and the M007 closure surface
 - Class: admin/support
@@ -346,6 +348,106 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Primary owning slice: M007/S08
 - Supporting slices: M007/S01, M007/S03, M007/S05, M007/S06, M007/S07
 - Validation: cargo test --locked --release --lib -- --ignored streaming_budget --nocapture; bash scripts/swim_smoke.sh; bash scripts/winter_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
+### R035 — Persisted per-world Survival and Creative modes
+- Class: core-capability
+- Status: active
+- Description: New Game defaults to Survival and offers Creative; a fresh command-line world defaults to Creative and accepts --creative/--survival last-wins; a loaded world keeps its stored mode, the mode is locked after creation, Creative flies and is invulnerable/never hungry, and Edit Background uses effective Creative without rewriting the stored mode.
+- Why it matters: Mode drives damage, hunger, flight, and background isolation, and must not silently change old worlds or leak Survival rules into the menu background.
+- Source: M008 / S01 modes
+- Primary owning slice: M008/S01
+- Supporting slices: M008/S04
+- Validation: cargo test --locked --lib -- player::survival; cargo test --locked --lib -- ui::screens; cargo test --locked --bin opencraft; bash scripts/survival_smoke.sh
+
+### R036 — Survival vitals and environmental damage
+- Class: core-capability
+- Status: active
+- Description: Persisted health, hunger, and air drive fall, drowning, and starvation damage, hunger drain, and regeneration only at high hunger; Creative is immune, never hungry, and never loses air.
+- Why it matters: These rules are the survival loop's core state machine and must be deterministic and headless-testable.
+- Source: M008 / S04 survival loop
+- Primary owning slice: M008/S04
+- Supporting slices: M008/S01, M008/S05
+- Validation: cargo test --locked --lib -- player::survival; cargo test --locked --lib -- player::physics; cargo test --locked --lib -- world::session; bash scripts/survival_smoke.sh
+
+### R037 — Death and respawn with inventory kept
+- Class: primary-user-loop
+- Status: active
+- Description: The Death screen offers Respawn and Quit; Respawn returns to the deterministic spawn with full vitals and the inventory kept; a health-zero save opens the Death screen; Quit saves and returns to the menu.
+- Why it matters: Death needs a readable endpoint that does not destroy progression.
+- Source: M008 / S04 death and respawn
+- Primary owning slice: M008/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::lifecycle; cargo test --locked --lib -- world::session; cargo test --locked --bin opencraft; bash scripts/survival_smoke.sh
+
+### R038 — Survival HUD and hold-to-eat food
+- Class: primary-user-loop
+- Status: active
+- Description: The HUD shows hearts, hunger, and air; oak leaves deterministically drop apples; holding right-click for 1.6 s eats an apple or bread with a progress bar, cancels on release or movement, refuses at full hunger, and restores the item's hunger value.
+- Why it matters: Visible vitals and food make the survival loop playable and give the human UAT its primary sensory subject.
+- Source: M008 / S04 HUD and S05 food
+- Primary owning slice: M008/S05
+- Supporting slices: M008/S04
+- Validation: cargo test --locked --lib -- ui::hud; cargo test --locked --lib -- player::eating; cargo test --locked --lib -- world::loot; cargo test --locked --bin opencraft
+
+### R039 — 27-slot chests with lossless break preflight
+- Class: core-capability
+- Status: active
+- Description: A Chest crafts from eight planks, places, opens a 27-slot screen with the 36-slot inventory, moves stacks through the cursor, persists contents per position, and breaks only when all contents plus one Chest item fit in the inventory; a refusal leaves the chest and inventory unchanged.
+- Why it matters: Storage must be usable and lossless, including under a full inventory.
+- Source: M008 / S03 chests
+- Primary owning slice: M008/S03
+- Supporting slices: M008/S06
+- Validation: cargo test --locked --lib -- player::container; cargo test --locked --lib -- ui::chest; cargo test --locked --lib -- world::persistence; cargo test --locked --bin opencraft; bash scripts/content_smoke.sh
+
+### R040 — Deterministic ruin LootChests
+- Class: core-capability
+- Status: active
+- Description: A complete surface ruin contains one 27-slot LootChest whose contents are deterministic from seed and ruin and capacity-bound; a touched-empty record persists without re-rolling; breaking the LootChest yields one ordinary Chest item and its preflighted contents.
+- Why it matters: Exploration must pay off deterministically and without duplication or re-rolls.
+- Source: M008 / S06 ruins and loot
+- Primary owning slice: M008/S06
+- Supporting slices: M008/S03
+- Validation: cargo test --locked --lib -- ruin; cargo test --locked --lib -- ruin_loot; cargo test --locked --lib -- world::loot; cargo test --locked --lib -- world::session; bash scripts/content_smoke.sh
+
+### R041 — Hoe and wheat farming with Winter pause
+- Class: core-capability
+- Status: active
+- Description: Wood/Stone/Iron hoes till grass or dirt into Farmland with durability; WheatSeeds plant on Farmland and advance through four Wheat stages on game time; Winter pauses growth; mature harvest yields Wheat and seeds, immature harvest returns a seed; Bread crafts from wheat; crop stages persist as chunk edits while growth progress does not.
+- Why it matters: The farm chain is the durable food source and must survive save/reload and chunk unload/regeneration.
+- Source: M008 / S07 farming
+- Primary owning slice: M008/S07
+- Supporting slices: M008/S05, M008/S06
+- Validation: cargo test --locked --lib -- world::farming; cargo test --locked --lib -- world::manager; cargo test --locked --lib -- player::inventory; cargo test --locked --bin opencraft; bash scripts/content_smoke.sh
+
+### R042 — 32-layer texture and pack extension
+- Class: differentiator
+- Status: active
+- Description: The texture array has 32 layers with procedural Farmland, four Wheat stages, Chest, and LootChest art; 23 layer names are authorable; layers 23-31 are reserved; existing 16-layer packs fall back per layer, and optional new-layer overrides work.
+- Why it matters: New blocks must read distinctly and remain moddable without breaking old packs.
+- Source: M008 / S02 texture packs
+- Primary owning slice: M008/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- render::texture; cargo test --locked --lib -- pack::; bash scripts/pack_smoke.sh
+
+### R043 — Save v6 fail-closed continuity
+- Class: continuity
+- Status: active
+- Description: Save v6 round-trips mode, health, hunger, air, and sorted 27-slot chest records; v1-v5 saves load as Creative with full vitals and no chests; unknown block, item, mode, and chest data and water are rejected in both directions.
+- Why it matters: Old worlds must load and corrupt or newer saves must fail closed rather than corrupt a world.
+- Source: M008 / S01 save v6 and S03 chest persistence
+- Primary owning slice: M008/S01
+- Supporting slices: M008/S03
+- Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::session; bash scripts/survival_smoke.sh; bash scripts/content_smoke.sh
+
+### R044 — M008 closure surface
+- Class: admin/support
+- Status: active
+- Description: README and SAVE-NOTES document the M008 survival layer; the registry carries the M008 rows and criterion trace; the full gate and all 12 real-binary smokes pass; and a recorded human windowed UAT with screenshots covers the HUD, chest screen, four wheat stages, hold-to-eat progress, and Death screen.
+- Why it matters: Closure must trace every criterion, and the sensory outcomes need recorded human judgment rather than inferred claims.
+- Source: M008 / S09 closure
+- Primary owning slice: M008/S09
+- Supporting slices: M008/S08
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo fmt --all -- --check; cargo clippy --all-targets -- -D warnings; cargo test --locked; bash scripts/survival_smoke.sh; bash scripts/content_smoke.sh; recorded human windowed UAT
 
 ## M003 Criterion Trace
 
@@ -393,3 +495,16 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 5 | R028 | S02 | cargo test --locked --lib -- world::persistence && bash scripts/season_smoke.sh |
 | 6 | R033 | S07 | cargo test --locked --lib -- ruin && cargo test --locked --lib -- ruin_loot |
 | 7 | R034 | S08 | cargo test --locked --lib -- world::manager && bash scripts/winter_smoke.sh && grep -q SAVE-NOTES README.md |
+
+## M008 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R036, R037, R038 | S01, S04, S05 | cargo test --locked --lib -- player::survival && cargo test --locked --lib -- ui::hud && cargo test --locked --lib -- player::eating && bash scripts/survival_smoke.sh |
+| 2 | R041 | S02, S05, S06, S07 | cargo test --locked --lib -- world::farming && cargo test --locked --lib -- world::manager && bash scripts/content_smoke.sh |
+| 3 | R039, R040 | S03, S06 | cargo test --locked --lib -- player::container && cargo test --locked --lib -- ruin_loot && bash scripts/content_smoke.sh |
+| 4 | R035, R043 | S01, S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session && bash scripts/survival_smoke.sh |
+| 5 | R042 | S02 | cargo test --locked --lib -- render::texture && bash scripts/pack_smoke.sh |
+| 6 | R043 | S01, S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session |
+| 7 | R044 | S08, S09 | cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --locked && bash scripts/requirements_check.sh && bash scripts/survival_smoke.sh && bash scripts/content_smoke.sh |
+| 8 | R044 | S04, S05, S06, S07, S09 | recorded human windowed UAT with screenshots |
