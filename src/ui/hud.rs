@@ -101,11 +101,20 @@ pub fn hotbar_count_text_origin(rect: (f32, f32, f32, f32)) -> (f32, f32) {
     (x + 4.0, y + h - HOTBAR_COUNT_LINE_HEIGHT - 2.0)
 }
 
-/// Build the two quads that draw the mining progress bar: an always-visible
-/// dark background followed by the amber fill scaled to `progress`.
+/// Fill color of the eating progress bar, distinct from the mining amber.
+pub const EATING_FILL_COLOR: [f32; 4] = [0.55, 0.85, 0.35, 0.95];
+
+/// Shared crosshair progress-bar geometry: an always-visible dark background
+/// followed by a fill of `fill_color` scaled to `progress`.
 ///
+/// NaN collapses to zero and every other value clamps to `0.0..=1.0`.
 /// Returns `[background, fill]` so the fill is drawn on top.
-pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
+fn progress_bar_quads(
+    progress: f32,
+    surface_w: u32,
+    surface_h: u32,
+    fill_color: [f32; 4],
+) -> [Quad; 2] {
     let progress = if progress.is_nan() {
         0.0
     } else {
@@ -129,10 +138,27 @@ pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [
         y,
         w: PROGRESS_BAR_WIDTH * progress,
         h: PROGRESS_BAR_HEIGHT,
-        color: [0.95, 0.85, 0.25, 0.95],
+        color: fill_color,
     };
 
     [background, fill]
+}
+
+/// Build the two quads that draw the mining progress bar: an always-visible
+/// dark background followed by the amber fill scaled to `progress`.
+///
+/// Returns `[background, fill]` so the fill is drawn on top.
+pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
+    progress_bar_quads(progress, surface_w, surface_h, [0.95, 0.85, 0.25, 0.95])
+}
+
+/// Build the two quads that draw the eating progress bar in the same
+/// crosshair-anchored slot as the mining bar, with a green fill.
+///
+/// Sharing the geometry keeps only one bar visible at a time and means a
+/// release-cancelled meal never leaves a stale bar shape behind.
+pub fn eating_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
+    progress_bar_quads(progress, surface_w, surface_h, EATING_FILL_COLOR)
 }
 
 /// Fill fraction of one heart icon: ten hearts of two health points each.
@@ -352,6 +378,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Eating progress bar (S05-T02)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eating_and_mining_bars_share_the_same_geometry() {
+        for progress in [0.0, 0.25, 0.5, 1.0, 1.5, -1.0] {
+            let [eat_bg, eat_fill] = eating_progress_quads(progress, 1280, 720);
+            let [mine_bg, mine_fill] = mining_progress_quads(progress, 1280, 720);
+            for (name, eat, mine) in [
+                ("background", eat_bg, mine_bg),
+                ("fill", eat_fill, mine_fill),
+            ] {
+                assert_close(eat.x, mine.x, &format!("{name} x at {progress}"));
+                assert_close(eat.y, mine.y, &format!("{name} y at {progress}"));
+                assert_close(eat.w, mine.w, &format!("{name} w at {progress}"));
+                assert_close(eat.h, mine.h, &format!("{name} h at {progress}"));
+            }
+        }
+    }
+
+    #[test]
+    fn eating_fill_color_is_distinct_and_valid() {
+        let [eat_bg, eat_fill] = eating_progress_quads(0.5, 1280, 720);
+        let [mine_bg, mine_fill] = mining_progress_quads(0.5, 1280, 720);
+
+        assert_eq!(eat_fill.color, EATING_FILL_COLOR, "eating fill color");
+        assert_eq!(
+            mine_fill.color,
+            [0.95, 0.85, 0.25, 0.95],
+            "mining stays amber"
+        );
+        assert_eq!(eat_bg.color, mine_bg.color, "shared dark background");
+        assert_eq!(eat_bg.color, [0.0, 0.0, 0.0, 0.55], "background stays dark");
+
+        assert_ne!(EATING_FILL_COLOR, mine_fill.color, "distinct from mining");
+        for (name, other) in [
+            ("heart", HEART_FILL_COLOR),
+            ("hunger", HUNGER_FILL_COLOR),
+            ("air", AIR_FILL_COLOR),
+            ("vitals background", VITALS_BACKGROUND_COLOR),
+            ("progress background", eat_bg.color),
+        ] {
+            assert_ne!(EATING_FILL_COLOR, other, "eating fill differs from {name}");
+        }
+        for channel in EATING_FILL_COLOR {
+            assert!(
+                (0.0..=1.0).contains(&channel),
+                "eating channel {channel} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn eating_progress_clamps_to_unit_range() {
+        let [_, full] = eating_progress_quads(1.5, 1280, 720);
+        assert_close(full.w, PROGRESS_BAR_WIDTH, "1.5 is full width");
+
+        let [_, infinite] = eating_progress_quads(f32::INFINITY, 1280, 720);
+        assert_close(infinite.w, PROGRESS_BAR_WIDTH, "infinity is full width");
+
+        let [_, negative] = eating_progress_quads(-1.0, 1280, 720);
+        assert_close(negative.w, 0.0, "-1.0 is zero width");
+
+        let [_, nan] = eating_progress_quads(f32::NAN, 1280, 720);
+        assert_close(nan.w, 0.0, "NaN is zero width");
+    }
+
+    #[test]
+    fn eating_bar_stays_finite_on_degenerate_surfaces() {
+        for (w, h) in [(0, 0), (1, 1)] {
+            for quad in eating_progress_quads(0.5, w, h) {
+                for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+                    assert!(value.is_finite(), "{name} finite on {w}x{h}");
+                }
+            }
+        }
+
+        let [zero, _] = eating_progress_quads(0.5, 0, 0);
+        let [one, _] = eating_progress_quads(0.5, 1, 1);
+        assert_close(zero.x, one.x, "0x0 centers like 1x1");
+        assert_close(zero.y, one.y, "0x0 centers like 1x1");
+        assert_close(zero.x, (1.0 - PROGRESS_BAR_WIDTH) / 2.0, "max(1) x");
+        assert_close(zero.y, 0.5 + CROSSHAIR_BAR_OFFSET_Y, "max(1) y");
+        assert_close(zero.w, PROGRESS_BAR_WIDTH, "background width intact");
+        assert_close(zero.h, PROGRESS_BAR_HEIGHT, "background height intact");
     }
 
     #[test]
