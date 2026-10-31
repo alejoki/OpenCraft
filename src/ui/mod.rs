@@ -1,3 +1,4 @@
+pub mod chest;
 pub mod hud;
 pub mod inventory;
 pub mod lifecycle;

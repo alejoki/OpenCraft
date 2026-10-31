@@ -2221,7 +2221,7 @@ mod tests {
             Some(&Container::empty())
         );
         assert!(
-            loaded.chests.get(&IVec3::new(0, 0, 0)).is_none(),
+            !loaded.chests.contains_key(&IVec3::new(0, 0, 0)),
             "a position without a record stays missing"
         );
         // The present-empty record still occupies its full 12 + 27 bytes and
