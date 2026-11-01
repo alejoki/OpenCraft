@@ -3893,6 +3893,15 @@ pub const COMBAT_NIGHT_TICK: u32 = 18_000;
 /// [`daycycle::is_day`] is true and surface hostiles must burn.
 pub const COMBAT_DAY_TICK: u32 = 6_000;
 
+/// Hard cap on the `Hostile` stage's fixed-step observations.
+///
+/// 400 x 0.1 s = 40 s of game time. The stage needs 7 landed zombie hits at a
+/// 1.0 s cadence (six seconds) plus the walk-in and knockback settle, so this
+/// leaves a wide margin while staying inside the demo's own 120 s wall-clock
+/// deadline. It is bounded rather than "until dead" so a steering or cadence
+/// regression latches a self-describing abort instead of hanging the run.
+pub const COMBAT_HOSTILE_ABORT_TICKS: u32 = 400;
+
 /// Minimum Ambient spawn-phase observations before the stage may advance.
 ///
 /// 60 observations x 0.1 s of game time = 6 s, i.e. 24 fixed spawn attempts at
@@ -3963,8 +3972,15 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 162;
 /// uses (night surface spawning, the safe radius, the global cap, the despawn
 /// radius, and daylight burning), then restores the pinned dusk clock and
 /// closes the ambient gate so the pinned quartet stages below are never
-/// perturbed. Full order: `Settle -> Ambient -> Spawn -> Walk -> Fight -> Drops
-/// -> Save -> Restore -> Done`.
+/// perturbed.
+///
+/// The Hostile stage (M009/S06-T06) sits between Drops and Save: it proves the
+/// hostile steering brain and the zombie melee seam on the two surviving
+/// records (line-of-sight aggro, a chase, 3-damage hits with knockback, a
+/// mob-caused death, and a respawn that keeps the inventory), then restores the
+/// pinned player pose and closes the hostile gate so the Save witness and the
+/// 204-byte v7 layout never move. Full order: `Settle -> Ambient -> Spawn ->
+/// Walk -> Fight -> Drops -> Hostile -> Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
@@ -3973,6 +3989,7 @@ enum CombatStage {
     Walk,
     Fight,
     Drops,
+    Hostile,
     Save,
     Restore,
     Done,
@@ -4069,6 +4086,22 @@ struct CombatDemo {
     /// The latched `combat_spawn:` line, printed immediately after the pinned
     /// `combat_demo:` line on the demo-shutdown path.
     spawn_digest: Option<String>,
+    /// Zombie melee hits the Hostile stage accepted (`7` on success: 3 damage
+    /// each, the last saturating 2 -> 0).
+    hostile_attacks: u32,
+    /// Applied damage across those hits (`20` = the player's whole health bar).
+    hostile_damage: u16,
+    /// Whether the last damage event before the death was tagged `Zombie`.
+    hostile_cause: bool,
+    /// Whether the stage respawned the player at the deterministic spawn.
+    hostile_respawn: bool,
+    /// Whether the inventory total survived the respawn unchanged.
+    hostile_inventory_kept: bool,
+    /// Whether at least one accepted hit left a live knockback impulse.
+    hostile_knockback: bool,
+    /// The latched `combat_hostile:` line, printed immediately after the
+    /// pinned `combat_spawn:` line on the demo-shutdown path.
+    hostile_digest: Option<String>,
 }
 
 impl CombatDemo {
@@ -4106,6 +4139,13 @@ impl CombatDemo {
             spawn_despawned: 0,
             spawn_burned: 0,
             spawn_digest: None,
+            hostile_attacks: 0,
+            hostile_damage: 0,
+            hostile_cause: false,
+            hostile_respawn: false,
+            hostile_inventory_kept: false,
+            hostile_knockback: false,
+            hostile_digest: None,
         }
     }
 
@@ -4140,6 +4180,22 @@ impl CombatDemo {
             self.spawn_phase_report.cap_blocked,
             self.ambient_safe,
             self.ambient_peak
+        )
+    }
+
+    /// The exact `combat_hostile:` digest printed once on the demo-shutdown
+    /// path (immediately after the pinned `combat_spawn:` line).
+    ///
+    /// Only latched after the Hostile stage proved aggro, the 3-damage
+    /// i-frame-gated hits, knockback, the mob-caused death, the respawn, and the
+    /// kept inventory, so the trailing literals are the latching contract: the
+    /// harness pins the literal shape (`cause=zombie respawn=spawn
+    /// knockback=true inventory=kept ok=true`) rather than four computed
+    /// words. `attacks` and `damage` are the measured values.
+    fn hostile_digest(&self) -> String {
+        format!(
+            "combat_hostile: seed={} attacks={} damage={} cause=zombie respawn=spawn knockback=true inventory=kept ok=true",
+            self.seed, self.hostile_attacks, self.hostile_damage
         )
     }
 
@@ -4324,6 +4380,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
         }
         CombatStage::Fight => combat_fight_stage(demo, session),
         CombatStage::Drops => combat_drops_stage(demo, session),
+        CombatStage::Hostile => combat_hostile_stage(demo, session),
         CombatStage::Save => combat_save_stage(demo, session),
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
@@ -5307,6 +5364,246 @@ fn combat_drops_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool
     demo.killed = 2;
     demo.drops = accepted;
     demo.drops_lost = lost;
+    demo.stage = CombatStage::Hostile;
+    false
+}
+
+/// Total item units across all 36 inventory slots plus the cursor stack.
+///
+/// [`combat_inventory_units`] answers "how much of this item id"; this answers
+/// "how much of anything", which is what the Hostile stage needs to prove a
+/// respawn keeps the whole inventory instead of only the sword.
+fn combat_inventory_units_total(session: &WorldSession) -> u32 {
+    let inventory = session.player.inventory();
+    let slots: u32 = inventory
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .map(|item| u32::from(item.count()))
+        .sum();
+    slots + inventory.cursor().map_or(0, |item| u32::from(item.count()))
+}
+
+/// Whether a zombie can be pinned with its feet at `feet` and still see the
+/// player's eyes from `eye`.
+///
+/// The stage's spot rule: the feet and head blocks must be air, the block below
+/// must be solid, and the eye-to-eye ray must be clear. It is a demo placement
+/// guard, not a gameplay rule — the production steering brain re-checks LOS
+/// every step and would refuse the aggro on its own.
+fn combat_hostile_spot_ok(session: &WorldSession, feet: Vec3, eye: Vec3) -> bool {
+    if !feet.is_finite() {
+        return false;
+    }
+    let x = feet.x.floor() as i32;
+    let y = feet.y.floor() as i32;
+    let z = feet.z.floor() as i32;
+    if session.world.get_block(x, y, z) != BlockId::Air
+        || session.world.get_block(x, y + 1, z) != BlockId::Air
+        || !session.world.get_block(x, y - 1, z).is_solid()
+    {
+        return false;
+    }
+    opencraft::world::mob_ai::has_line_of_sight(&session.world, feet + Vec3::Y * 1.5, eye)
+}
+
+/// The Hostile stage: the slice's real-binary proof that a Zombie acquires the
+/// player through line of sight, closes to melee range, and lands repeated
+/// 3-damage hits at a 1.0 s cadence with knockback until the player dies with a
+/// `Zombie` cause; then that `respawn()` returns to the deterministic spawn
+/// with the whole inventory kept.
+///
+/// Runs entirely in ONE call, like Fight and Drops: every number here is
+/// observable, and a redraw between two partial phases would let the mob
+/// runtime move a record the next check describes. Every mutation goes through
+/// a production seam — [`WorldSession::set_hostile_ai_enabled`],
+/// [`WorldSession::tick_mobs`] (the same fixed 20 Hz runtime the frame loop
+/// owns, which builds the `MobTarget`, runs the steering brain, decides the
+/// melee swing and applies it), [`WorldSession::is_dead`],
+/// [`WorldSession::last_damage_cause`], [`WorldSession::respawn`] and
+/// [`WorldSession::spawn_position`] — so the demo proves the shipped path
+/// instead of a parallel copy of it.
+///
+/// Two documented demo pins, not gameplay rules:
+///
+/// * the live Zombie is re-pinned at a chosen spot next to the player (the
+///   Drops stage leaves the quartet pose, and the stage needs a measured
+///   starting distance);
+/// * the player pose is restored afterwards, so the Save witness and the
+///   pinned 204-byte v7 layout do not move.
+///
+/// The Skeleton is left where Drops left it: it is hostile and will chase, but
+/// it has no attack profile, so it can never add a damage event.
+fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    if mobs != 2 || zombies != 1 {
+        demo.abort("hostile", &format!("mobs={mobs} zombies={zombies}"));
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("hostile", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+
+    // The respawn assertion compares against the pose the Save witness expects,
+    // and the inventory total is the one number a respawn must not disturb.
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+
+    // Spot selection: two blocks along the player's yaw forward axis first,
+    // then the same radius at 45-degree yaw offsets in a fixed order, so a
+    // terrain edge cannot make the stage flaky while the choice stays
+    // deterministic. The seed-1 demo pose is measured against this list.
+    let feet_y = session.player.position.y;
+    let eye = session.player.eye_position();
+    let mut spot = None;
+    for step in 0..8u32 {
+        let angle = session.player.yaw + step as f32 * std::f32::consts::FRAC_PI_4;
+        let candidate = Vec3::new(
+            session.player.position.x + angle.cos() * 2.0,
+            feet_y,
+            session.player.position.z + angle.sin() * 2.0,
+        );
+        if combat_hostile_spot_ok(session, candidate, eye) {
+            spot = Some(candidate);
+            break;
+        }
+    }
+    let Some(spot) = spot else {
+        demo.abort("hostile", "observed=spot");
+        return true;
+    };
+
+    let player = session.player.position;
+    let Some(zombie_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.kind == MobKind::Zombie)
+    else {
+        demo.abort("hostile", "observed=zombie_missing");
+        return true;
+    };
+    {
+        let mob = &mut session.mobs_mut()[zombie_index];
+        mob.position = spot;
+        // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns it toward the player.
+        mob.yaw = (player.x - spot.x).atan2(player.z - spot.z);
+        mob.health = MobKind::Zombie.max_health();
+        mob.state = MobAiState::Wander;
+        mob.aggro = 0.0;
+        mob.stuck = 0.0;
+        mob.reaggro = 0.0;
+        mob.cooldown = 0.0;
+        mob.velocity = Vec3::ZERO;
+        mob.knockback = Vec3::ZERO;
+    }
+
+    session.set_hostile_ai_enabled(true);
+    let mut attacks = 0u32;
+    let mut damage = 0u16;
+    let mut knockback = false;
+    for _ in 0..COMBAT_HOSTILE_ABORT_TICKS {
+        let before = session.player.survival.health();
+        session.tick_mobs(0.1, 1.0);
+        let lost = before.saturating_sub(session.player.survival.health());
+        if lost > 0 {
+            // One accepted hit per player i-frame window, never more: a single
+            // 20 Hz frame cannot land two 3-damage hits. The only accepted
+            // shortfall is the saturating final hit (2 hp left, 3 requested),
+            // which is also the hit that kills.
+            if lost != 3 && !(session.is_dead() && lost < 3) {
+                demo.abort("hostile", &format!("damage={lost}"));
+                return true;
+            }
+            attacks += 1;
+            damage = damage.saturating_add(lost);
+            if session.player.combat.knockback().length_squared() > 1e-6 {
+                knockback = true;
+            }
+        }
+        if session.is_dead() {
+            break;
+        }
+    }
+
+    // 7 requested hits x 3 damage = 21, but the applied total is 20 because the
+    // last hit saturates the 2 hp left. Report APPLIED damage, not requested.
+    let cause = session.last_damage_cause();
+    if !session.is_dead()
+        || attacks != 7
+        || damage != 20
+        || !knockback
+        || cause != Some(DamageCause::Zombie)
+    {
+        demo.abort(
+            "hostile",
+            &format!(
+                "dead={} attacks={attacks} damage={damage} knockback={knockback} cause={:?}",
+                session.is_dead(),
+                cause
+            ),
+        );
+        return true;
+    }
+
+    // Respawn through the production seam, then prove every post-condition the
+    // Death screen and the HUD depend on.
+    let spawn = WorldSession::spawn_position(demo.seed);
+    session.respawn();
+    let items_after = combat_inventory_units_total(session);
+    let chasing = session
+        .mobs()
+        .iter()
+        .any(|mob| mob.state == MobAiState::Chase);
+    let alive = !session.is_dead();
+    let health = session.player.survival.health();
+    let position = session.player.position;
+    let cause_cleared = session.last_damage_cause().is_none();
+    let flash = session.player_hurt_intensity();
+    if !alive
+        || health != 20
+        || position != spawn
+        || !cause_cleared
+        || flash != 0.0
+        || items_after != items_before
+        || chasing
+    {
+        demo.abort(
+            "hostile",
+            &format!(
+                "respawn alive={alive} health={health} spawn={} cause={cause_cleared} flash={flash} items={items_after}/{items_before} chase={chasing}",
+                position == spawn
+            ),
+        );
+        return true;
+    }
+
+    // Documented demo pin: restore the pose the Save stage's witness and the
+    // reload leg's quartet recomputation depend on. `respawn()` moved the body
+    // to the world spawn; the saved player state must stay byte-identical.
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.sync_camera();
+    session.set_hostile_ai_enabled(false);
+    session.player.combat.reset();
+
+    demo.hostile_attacks = attacks;
+    demo.hostile_damage = damage;
+    demo.hostile_knockback = knockback;
+    demo.hostile_cause = true;
+    demo.hostile_respawn = true;
+    demo.hostile_inventory_kept = true;
+    demo.hostile_digest = Some(demo.hostile_digest());
     demo.stage = CombatStage::Save;
     false
 }
@@ -9120,6 +9417,16 @@ impl ApplicationHandler for GameApp {
             {
                 let _ = writeln!(stdout, "{line}");
             }
+            // The Hostile stage's digest follows the Ambient line for the same
+            // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
+            // 204-byte v7 witness keep their exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.hostile_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
             drop(stdout);
             self.shutdown(event_loop);
             return;
@@ -11299,6 +11606,13 @@ mod tests {
         while !ended && updates < 600 {
             updates += 1;
             session.tick_mobs(0.05, 1.0);
+            if demo.stage == CombatStage::Hostile {
+                // This test pins Walk/Fight/Drops/Save; the hostile proof has
+                // its own dedicated test (and needs a lit synthetic world).
+                // Hand straight to Save so the pinned `combat_demo:` digest
+                // stays byte-identical.
+                demo.stage = CombatStage::Save;
+            }
             ended = combat_demo_step(&mut demo, &mut session);
         }
         assert!(
@@ -11389,6 +11703,20 @@ mod tests {
         );
     }
 
+    /// The `combat_hostile:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the measured attack count and applied damage
+    /// may vary with the seed.
+    #[test]
+    fn combat_hostile_digest_format_is_pinned() {
+        let mut demo = CombatDemo::new(7, true, None);
+        demo.hostile_attacks = 7;
+        demo.hostile_damage = 20;
+        assert_eq!(
+            demo.hostile_digest(),
+            "combat_hostile: seed=7 attacks=7 damage=20 cause=zombie respawn=spawn knockback=true inventory=kept ok=true"
+        );
+    }
+
     /// The Ambient stage proved against a lit synthetic world: a pinned midnight
     /// clock spawns surface hostiles through the production `tick_mobs` seam but
     /// never inside the safe radius, a record moved past the despawn radius is
@@ -11459,6 +11787,216 @@ mod tests {
         );
     }
 
+    /// The Hostile stage proved against a lit synthetic world: a Zombie placed
+    /// eight blocks out acquires the player through line of sight and closes to
+    /// melee range, then the production melee seam lands 3 damage per i-frame
+    /// window with knockback until the player dies with a `Zombie` cause. The
+    /// stage then respawns to the deterministic spawn with the inventory kept,
+    /// restores the pinned pose, and hands over to Save.
+    #[test]
+    fn combat_hostile_stage_proves_chase_damage_death_and_respawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-hostile.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        // Only the two records this test places may exist: an ambient spawn
+        // during the chase probe would change the stage's shape check.
+        session.set_ambient_spawning(false);
+
+        // A non-empty inventory makes the "kept across respawn" assertion mean
+        // something instead of comparing 0 to 0.
+        let item = Item::new(ItemId::Material(Material::Stick), 5).expect("stick stack");
+        assert!(
+            session.player.collect_item(item),
+            "the witness inventory must be non-empty"
+        );
+
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        let zombie_feet = player + forward * 8.0;
+        let skeleton_feet = player + forward * 30.0;
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, zombie_feet, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, skeleton_feet, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        let horizontal = |a: Vec3, b: Vec3| {
+            let dx = a.x - b.x;
+            let dz = a.z - b.z;
+            (dx * dx + dz * dz).sqrt()
+        };
+        assert!(horizontal(zombie_feet, player) > 7.0);
+
+        // Chase proof through the production seam: with the hostile gate open
+        // the Zombie must close from eight blocks to three. The probe stops
+        // before melee range (2.0), so the damage proof below starts from full
+        // health and its seven hits are the stage's own.
+        session.set_hostile_ai_enabled(true);
+        let mut closed = 0u32;
+        let mut distance = horizontal(zombie_feet, player);
+        while distance > 3.0 && closed < 200 {
+            closed += 1;
+            session.tick_mobs(0.1, 1.0);
+            let index = session
+                .mobs()
+                .iter()
+                .position(|mob| mob.kind == MobKind::Zombie)
+                .expect("zombie record");
+            distance = horizontal(session.mobs()[index].position, player);
+        }
+        let zombie_index = session
+            .mobs()
+            .iter()
+            .position(|mob| mob.kind == MobKind::Zombie)
+            .expect("zombie record");
+        assert_eq!(
+            session.mobs()[zombie_index].state,
+            MobAiState::Chase,
+            "line of sight at eight blocks must open a chase"
+        );
+        assert!(
+            distance <= 3.0,
+            "the zombie must close from eight blocks: distance={distance} steps={closed}"
+        );
+        assert_eq!(
+            session.player.survival.health(),
+            20,
+            "the chase probe must stop short of melee range"
+        );
+        session.set_hostile_ai_enabled(false);
+
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Hostile;
+        let mut calls = 0u32;
+        while demo.stage == CombatStage::Hostile && !demo.finished() && calls < 200 {
+            calls += 1;
+            assert!(
+                !combat_demo_step(&mut demo, &mut session),
+                "the hostile stage hands over instead of ending the run: {:?}",
+                demo.digest
+            );
+        }
+        assert!(calls < 200, "the hostile stage must finish in one call");
+        assert!(!demo.failed, "unexpected hostile abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.hostile_attacks, 7);
+        assert_eq!(demo.hostile_damage, 20);
+        assert!(demo.hostile_cause, "the death must be tagged Zombie");
+        assert!(demo.hostile_respawn);
+        assert!(demo.hostile_inventory_kept);
+        assert!(
+            demo.hostile_knockback,
+            "an accepted hit must push the player"
+        );
+        assert_eq!(
+            demo.hostile_digest.as_deref(),
+            Some("combat_hostile: seed=12345 attacks=7 damage=20 cause=zombie respawn=spawn knockback=true inventory=kept ok=true")
+        );
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert_eq!(session.mobs().len(), 2);
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+        assert!(!session.is_dead(), "respawn revives the player");
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert_eq!(combat_inventory_units_total(&session), items_before);
+
+        // The Save stage that follows still ends the leg on the pinned witness.
+        assert!(
+            combat_demo_step(&mut demo, &mut session),
+            "the save stage ends the leg"
+        );
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert!(!demo.failed, "unexpected save abort: {:?}", demo.digest);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
+    }
+
+    /// The Hostile stage refuses a world it does not own: a record shape other
+    /// than exactly one Zombie plus one Skeleton, and a non-Survival player,
+    /// both latch a self-describing abort before any tick, any damage, or any
+    /// save write.
+    #[test]
+    fn combat_hostile_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-hostile-abort.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let zombie_feet = session.player.position + Vec3::X;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, zombie_feet, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Hostile;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=hostile"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert!(!save_path.exists(), "an aborted stage writes no save");
+
+        // Creative is never a valid Hostile-stage subject: production builds no
+        // target at all, so the stage refuses before ticking.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-hostile-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let creative_feet = creative.player.position;
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, creative_feet + Vec3::X, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, creative_feet - Vec3::X, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Hostile;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+    }
+
     /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Save) to
     /// completion and return the session plus its finished demo. Both save-leg
     /// tests use this so the fresh save is always produced by the production
@@ -11512,6 +12050,13 @@ mod tests {
         while !ended && updates < 600 {
             updates += 1;
             session.tick_mobs(0.05, 1.0);
+            if demo.stage == CombatStage::Hostile {
+                // The hostile proof has its own dedicated test (and needs a lit
+                // synthetic world); this helper pins the fresh
+                // Walk/Fight/Drops/Save leg, so hand straight to Save and keep
+                // the pinned `combat_demo:` digest byte-identical.
+                demo.stage = CombatStage::Save;
+            }
             ended = combat_demo_step(&mut demo, &mut session);
         }
         assert!(
@@ -11696,14 +12241,19 @@ mod tests {
         // The Drops stage kills the Pig and the Cow and delivers their drops.
         assert!(
             !combat_demo_step(&mut demo, &mut session),
-            "the drops stage advances to Save"
+            "the drops stage advances to Hostile"
         );
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.stage, CombatStage::Hostile);
         assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
         assert_eq!(demo.killed, 2);
         assert_eq!(demo.drops, 5, "pig 2 units + cow 3 units");
         assert_eq!(demo.drops_lost, 0);
         assert_eq!(session.mobs().len(), 2, "both passive records were reaped");
+
+        // The hostile proof has its own dedicated test, and this fixture has no
+        // lit plain; skip the stage so the pinned save witness is produced by
+        // the same Save stage as before.
+        demo.stage = CombatStage::Save;
 
         // The immediately following Save stage pins the two survivors and
         // writes the damaged-health witness the reload leg asserts.
@@ -11819,13 +12369,16 @@ mod tests {
 
         assert!(
             !combat_drops_stage(&mut demo, &mut session),
-            "the drops stage advances to Save"
+            "the drops stage advances to Hostile"
         );
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.stage, CombatStage::Hostile);
         assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
         assert_eq!(demo.killed, 2);
         assert_eq!(demo.drops, 5);
         assert_eq!(demo.drops_lost, 0);
+        // The hostile proof has its own dedicated test; hand straight to Save so
+        // this test still ends on the pinned save witness.
+        demo.stage = CombatStage::Save;
 
         // Both passive records were reaped; only the hostiles remain.
         assert_eq!(session.mobs().len(), 2);
