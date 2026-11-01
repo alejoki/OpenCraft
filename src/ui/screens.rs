@@ -24,6 +24,7 @@ use super::lifecycle::LifecycleScreen;
 use super::menu::{hit_test, MenuMessage, Rect, MENU_PAD, MENU_TOP, MESSAGE_TICKS};
 use super::text_input::{TextInput, TextInputAction, TextInputOutcome};
 use super::LINE_HEIGHT;
+use crate::player::combat::DamageCause;
 use crate::player::survival::GameMode;
 use crate::world::catalog::{
     is_duplicate_name, validate_world_name, CatalogRow, ConfirmOutcome, DeleteConfirmation,
@@ -122,9 +123,26 @@ pub const DEATH_ROWS: [DeathRow; 2] = [DeathRow::Respawn, DeathRow::Quit];
 /// Total number of death rows.
 pub const DEATH_ROW_COUNT: usize = DEATH_ROWS.len();
 
-/// Title line shown above the death rows. It occupies text line 0, so the
-/// clickable rows start at line 1.
+/// Title line shown above the death cause line and the death rows. It
+/// occupies text line 0.
 pub const DEATH_TITLE: &str = "You Died";
+
+/// Prefix of the death-screen cause line, which occupies text line 1.
+pub const DEATH_CAUSE_PREFIX: &str = "Cause: ";
+
+/// Render the death screen's cause line (text line 1).
+///
+/// The UI owns the display strings while the domain owns
+/// [`DamageCause::label`]. `None` — a loaded dead save, which never persists a
+/// cause (see [`crate::player::combat`]) — renders the fixed
+/// `Cause: Unknown`, so the death panel is never conditional on state that is
+/// not persisted.
+pub fn death_cause_line(cause: Option<DamageCause>) -> String {
+    format!(
+        "{DEATH_CAUSE_PREFIX}{}",
+        cause.map(DamageCause::label).unwrap_or("Unknown")
+    )
+}
 
 impl DeathRow {
     /// Human-facing row label.
@@ -221,17 +239,19 @@ pub fn hovered_pause_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> 
         .map(|index| PAUSE_ROWS[index])
 }
 
-/// Geometry of death row `index`, or `None` out of range. The title
-/// occupies text line 0, so row 0 sits on text line 1 and row 1 on line 2.
+/// Geometry of death row `index`, or `None` out of range. The title occupies
+/// text line 0 and the cause line text line 1, so row 0 sits on text line 2
+/// and row 1 on line 3.
 pub fn death_row_rect(surface_w: u32, surface_h: u32, index: usize) -> Option<Rect> {
     let _ = surface_h;
-    (index < DEATH_ROW_COUNT).then(|| fixed_row_rect(surface_w, index + 1, SCREEN_WIDTH))
+    (index < DEATH_ROW_COUNT).then(|| fixed_row_rect(surface_w, index + 2, SCREEN_WIDTH))
 }
 
-/// The dark panel rect behind the death title and all death rows.
+/// The dark panel rect behind the death title, the cause line, and all death
+/// rows.
 pub fn death_panel_rect(surface_w: u32, surface_h: u32) -> Rect {
     let _ = surface_h;
-    fixed_panel_rect(surface_w, SCREEN_WIDTH, DEATH_ROW_COUNT + 1)
+    fixed_panel_rect(surface_w, SCREEN_WIDTH, DEATH_ROW_COUNT + 2)
 }
 
 /// Which death row the cursor is over, if any.
@@ -1031,19 +1051,40 @@ mod tests {
         assert_eq!(DEATH_ROW_COUNT, 2);
         assert_eq!(DEATH_ROWS, [DeathRow::Respawn, DeathRow::Quit]);
         assert_eq!(DEATH_TITLE, "You Died");
+        assert_eq!(DEATH_CAUSE_PREFIX, "Cause: ");
         assert_eq!(DeathRow::Respawn.label(), "Respawn");
         assert_eq!(DeathRow::Quit.label(), "Quit");
     }
 
     #[test]
-    fn death_geometry_is_contiguous_with_the_title_line() {
-        // The title is text line 0; row 0 starts on line 1 and row 1 on line 2.
+    fn death_cause_line_labels_every_cause_and_the_unknown_default() {
+        assert_eq!(death_cause_line(Some(DamageCause::Zombie)), "Cause: Zombie");
+        assert_eq!(death_cause_line(Some(DamageCause::Fall)), "Cause: Fall");
+        assert_eq!(
+            death_cause_line(Some(DamageCause::Drowning)),
+            "Cause: Drowning"
+        );
+        assert_eq!(
+            death_cause_line(Some(DamageCause::Starvation)),
+            "Cause: Starvation"
+        );
+        assert_eq!(death_cause_line(None), "Cause: Unknown");
+    }
+
+    #[test]
+    fn death_geometry_is_contiguous_with_the_title_and_cause_lines() {
+        // The title is text line 0, the cause line text line 1; row 0 starts
+        // on line 2 and row 1 on line 3.
         let (title_x, title_y, title_w, title_h) = fixed_row_rect(SW, 0, SCREEN_WIDTH);
+        let (cause_x, cause_y, cause_w, cause_h) = fixed_row_rect(SW, 1, SCREEN_WIDTH);
+        assert_eq!((cause_x, cause_w, cause_h), (title_x, title_w, title_h));
+        assert_eq!(cause_y, title_y + title_h, "the cause sits under the title");
+
         let (x0, y0, w0, h0) = death_row_rect(SW, SH, 0).unwrap();
         assert_eq!(x0, title_x);
         assert_eq!(w0, title_w);
         assert_eq!(h0, LINE_HEIGHT);
-        assert_eq!(y0, title_y + title_h, "row 0 sits directly under the title");
+        assert_eq!(y0, cause_y + cause_h, "row 0 sits under the cause line");
 
         let (x1, y1, w1, h1) = death_row_rect(SW, SH, 1).unwrap();
         assert_eq!((x1, w1, h1), (x0, w0, h0));
@@ -1051,14 +1092,15 @@ mod tests {
         assert_eq!(death_row_rect(SW, SH, DEATH_ROW_COUNT), None);
         assert_eq!(death_row_rect(SW, SH, 99), None);
 
-        // The panel covers the title plus both rows with symmetric padding.
+        // The panel covers the title, the cause line, plus both rows with
+        // symmetric padding.
         let (px, py, pw, ph) = death_panel_rect(SW, SH);
         assert_eq!(px, title_x - MENU_PAD);
         assert_eq!(py, MENU_TOP);
         assert_eq!(pw, SCREEN_WIDTH + 2.0 * MENU_PAD);
         assert_eq!(
             ph,
-            2.0 * MENU_PAD + (DEATH_ROW_COUNT + 1) as f32 * LINE_HEIGHT
+            2.0 * MENU_PAD + (DEATH_ROW_COUNT + 2) as f32 * LINE_HEIGHT
         );
         assert_eq!(title_y - py, MENU_PAD);
         assert_eq!(py + ph - (y1 + h1), MENU_PAD);
@@ -1097,6 +1139,18 @@ mod tests {
         );
         assert_eq!(
             hovered_death_row((x + w / 2.0, y - 1.0), SW, SH),
+            None,
+            "the cause line directly above row 0 is not clickable"
+        );
+        let (cause_x, cause_y, cause_w, cause_h) = fixed_row_rect(SW, 1, SCREEN_WIDTH);
+        assert_eq!(
+            hovered_death_row((cause_x + cause_w / 2.0, cause_y + cause_h / 2.0), SW, SH),
+            None,
+            "the cause line is not clickable"
+        );
+        let (_, title_y, _, title_h) = fixed_row_rect(SW, 0, SCREEN_WIDTH);
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, title_y + title_h / 2.0), SW, SH),
             None,
             "the title line is not clickable"
         );

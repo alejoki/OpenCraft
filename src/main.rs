@@ -15,6 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
+use opencraft::player::combat::DamageCause;
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
@@ -54,14 +55,14 @@ use opencraft::ui::inventory::{
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
-    death_panel_rect, death_row_rect, delete_prompt_line, format_row_line, hovered_death_row,
-    hovered_load_target, hovered_main_menu_row, hovered_new_game_target, hovered_pause_row,
-    load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect,
-    load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
-    new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
-    validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen,
-    NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE, MAIN_MENU_ROWS,
-    NEW_GAME_ROWS, PAUSE_ROWS,
+    death_cause_line, death_panel_rect, death_row_rect, delete_prompt_line, format_row_line,
+    hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
+    hovered_pause_row, load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect,
+    load_panel_rect, load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect,
+    new_game_panel_rect, new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect,
+    screen_key_action, validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow,
+    NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE,
+    MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
 use opencraft::ui::{
     DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
@@ -1530,6 +1531,11 @@ fn tick_transient_message(message: &mut Option<MenuMessage>) -> bool {
 /// main menu appends its transient message (the S03-T03 Save-and-Quit
 /// save-failure note) as its last line when present; with no message it
 /// lists exactly its five rows.
+///
+/// The Death screen renders `DEATH_TITLE` on line 0, the cause line (from
+/// the session's ambient, never-persisted [`DamageCause`]) on line 1, then
+/// the [`DEATH_ROWS`] labels — matching `death_row_rect`'s `index + 2`
+/// shift exactly.
 fn compose_screen_text(
     screen: LifecycleScreen,
     new_game: &NewGameScreen,
@@ -1537,6 +1543,7 @@ fn compose_screen_text(
     load_message: Option<&MenuMessage>,
     main_menu_message: Option<&MenuMessage>,
     pause_message: Option<&MenuMessage>,
+    death_cause: Option<DamageCause>,
 ) -> String {
     let lines: Vec<String> = match screen {
         LifecycleScreen::MainMenu => {
@@ -1610,6 +1617,7 @@ fn compose_screen_text(
         }
         LifecycleScreen::Death => {
             let mut lines = vec![DEATH_TITLE.to_string()];
+            lines.push(death_cause_line(death_cause));
             lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
             lines
         }
@@ -8542,6 +8550,7 @@ impl ApplicationHandler for GameApp {
                             self.load_message.as_ref(),
                             self.main_menu_message.as_ref(),
                             self.pause_message.as_ref(),
+                            self.session.last_damage_cause(),
                         )
                     };
                     gpu.menu_text.update(
@@ -15985,6 +15994,7 @@ mod tests {
             None,
             app.main_menu_message.as_ref(),
             None,
+            None,
         );
         assert_eq!(text.lines().count(), 5 + 1, "five rows plus the message");
         assert!(text.ends_with(message.text.as_str()));
@@ -16025,6 +16035,7 @@ mod tests {
                 LifecycleScreen::MainMenu,
                 &app.new_game,
                 &app.load,
+                None,
                 None,
                 None,
                 None
@@ -17358,12 +17369,21 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "New Game\nLoad Game\nSettings\nEdit Background\nExit Game"
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None, None, None),
+            compose_screen_text(
+                LifecycleScreen::Pause,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                None
+            ),
             "Resume\nSettings\nSave and Quit"
         );
         // With no message the main menu lists exactly its five rows; a
@@ -17380,7 +17400,7 @@ mod tests {
                 &load,
                 None,
                 Some(&message),
-                None
+                None, None
             ),
             "New Game\nLoad Game\nSettings\nEdit Background\nExit Game\ncould not save world: blocked"
         );
@@ -17396,7 +17416,8 @@ mod tests {
                 &load,
                 None,
                 None,
-                Some(&pause_message)
+                Some(&pause_message),
+                None
             ),
             "Resume\nSettings\nSave and Quit\ncould not save menu background: blocked"
         );
@@ -17410,20 +17431,27 @@ mod tests {
         // unfocused blank seed renders the random hint
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None, None),
             "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None, None),
             "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
-        let text =
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None);
+        let text = compose_screen_text(
+            LifecycleScreen::NewGame,
+            &new_game,
+            &load,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(text.ends_with("World name cannot be empty."));
     }
 
@@ -17460,6 +17488,7 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "(no saved worlds)\nBack"
@@ -17483,6 +17512,7 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack"
@@ -17495,6 +17525,7 @@ mod tests {
                 LifecycleScreen::LoadGame,
                 &new_game,
                 &load,
+                None,
                 None,
                 None,
                 None
@@ -17514,6 +17545,7 @@ mod tests {
             Some(&message),
             None,
             None,
+            None,
         );
         assert!(text.ends_with("Could not load world \"alpha\""));
 
@@ -17526,12 +17558,21 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             String::new()
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None, None, None),
+            compose_screen_text(
+                LifecycleScreen::Playing,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                None
+            ),
             String::new()
         );
     }
@@ -17860,9 +17901,10 @@ mod tests {
                 &app.load,
                 None,
                 None,
+                None,
                 None
             ),
-            "You Died\nRespawn\nQuit"
+            "You Died\nCause: Unknown\nRespawn\nQuit"
         );
         assert_eq!(screen_title_tag(LifecycleScreen::Death), " | Dead");
         assert_eq!(
@@ -17883,6 +17925,71 @@ mod tests {
             None,
             "the title line is not clickable"
         );
+    }
+
+    #[test]
+    fn compose_screen_text_names_the_zombie_cause() {
+        let new_game = NewGameScreen::new();
+        let load = LoadScreen::new();
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::Death,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                Some(DamageCause::Zombie)
+            ),
+            "You Died\nCause: Zombie\nRespawn\nQuit"
+        );
+    }
+
+    #[test]
+    fn compose_screen_text_ignores_the_cause_on_non_death_screens() {
+        let new_game = NewGameScreen::new();
+        let mut load = LoadScreen::new();
+        load.set_rows(vec![CatalogRow::loadable(
+            "alpha".into(),
+            "alpha.mcvx".into(),
+            Some(100),
+        )]);
+        let message = MenuMessage {
+            text: "could not save world: blocked".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+        let screens = [
+            LifecycleScreen::MainMenu,
+            LifecycleScreen::Pause,
+            LifecycleScreen::NewGame,
+            LifecycleScreen::LoadGame,
+            LifecycleScreen::Playing,
+            LifecycleScreen::Settings(SettingsCaller::MainMenu),
+        ];
+        for screen in screens {
+            let with_cause = compose_screen_text(
+                screen,
+                &new_game,
+                &load,
+                Some(&message),
+                Some(&message),
+                Some(&message),
+                Some(DamageCause::Zombie),
+            );
+            let without_cause = compose_screen_text(
+                screen,
+                &new_game,
+                &load,
+                Some(&message),
+                Some(&message),
+                Some(&message),
+                None,
+            );
+            assert_eq!(
+                with_cause, without_cause,
+                "{screen:?} must ignore the death cause"
+            );
+        }
     }
 
     #[test]
