@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real-binary mid-winter save round-trip smoke (M007/S08-T03).
 #
-# Proves the v6 save's pinned v5 calendar tail survives a cold process restart
+# Proves the v7 save's pinned v5 calendar tail survives a cold process restart
 # through the real event loop, and that the season derived from it really is Winter:
 #
 #   Run A: `--new --seed 1 --season-length 1 --save P --time-scale 60
@@ -12,8 +12,8 @@
 #         a `timeout` kill surfaces as 124 and is an explicit failure here).
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 6 — the SAVE_VERSION that appends the survival header after the
-#         calendar tail.
+#         is 7 — the SAVE_VERSION that appends the v6 survival header and the
+#         v7 mob count after the calendar tail.
 #     (d) day_index (u32 LE at byte offset 130) is exactly 3 — the mid-winter
 #         save.
 #     (e) season_length_days (u32 LE at byte offset 134) is the chosen 1.
@@ -31,13 +31,14 @@
 # zero edit count and the layout is the header (36 + 27) + time_of_day (4) +
 # chunk count (4) + v4 inventory extension (59) = 130 bytes before the v5
 # calendar tail. The v6 survival header (mode u8, health/hunger/air u16 each,
-# chest count u32 = 11 bytes) is appended after that tail, so the calendar
-# offsets 130/134 stay pinned. Those offsets are pinned by
+# chest count u32 = 11 bytes) and the v7 mob count (u32 = 4 bytes) are
+# appended after that tail, so the calendar offsets 130/134 stay pinned. Those
+# offsets are pinned by
 # `V5_SEASON_OFFSET`/`V5_SEASON_LEN` in src/world/persistence.rs, so this
 # script and the unit tests cannot drift apart silently; the size check also
-# requires the v6 survival header to be present. Any header change before the
-# chunk section invalidates those offsets: update the persistence test consts
-# first, then copy them here.
+# requires the v6 survival header and v7 mob count to be present. Any header
+# change before the chunk section invalidates those offsets: update the
+# persistence test consts first, then copy them here.
 #
 # Why day 3 after run A: the default clock starts at noon (tick 6000) and the
 # T5 multi-cycle watch completes only after three summed 24,000-tick cycles,
@@ -89,6 +90,10 @@ V5_SEASON_LENGTH_OFFSET=$((V5_SEASON_OFFSET + 4))
 # v6 survival tail appended after the calendar: mode u8 + health u16 +
 # hunger u16 + air u16 + chest count u32.
 V6_HEADER_LEN=11
+# v7 mob tail: a u32 count. These runs are edit-free with an empty inventory,
+# so the count sits at 149 and a fresh world writes 0.
+V7_MOB_COUNT_LEN=4
+V7_MOB_COUNT_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN))
 
 SEED=1
 SEASON_LENGTH=1
@@ -136,8 +141,8 @@ if [[ ! -f "$SAVE" ]]; then
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN)) ]]; then
-    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header after the v5 calendar tail"
+if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN)) ]]; then
+    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header and v7 mob count after the v5 calendar tail"
     exit 1
 fi
 
@@ -148,8 +153,14 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 6 ]]; then
-    echo "WINTER SMOKE FAIL: save version is $VERSION (expected 6)"
+if [[ "$VERSION" -ne 7 ]]; then
+    echo "WINTER SMOKE FAIL: save version is $VERSION (expected 7)"
+    exit 1
+fi
+
+MOB_COUNT=$(read_u32_le "$SAVE" "$V7_MOB_COUNT_OFFSET")
+if [[ "$MOB_COUNT" -ne 0 ]]; then
+    echo "WINTER SMOKE FAIL: v7 mob count is $MOB_COUNT (expected 0 in an edit-free fresh world)"
     exit 1
 fi
 

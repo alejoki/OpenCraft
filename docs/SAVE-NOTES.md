@@ -36,6 +36,7 @@ The file stores:
 - The contents of every chest you placed, stored by position as 27 slots.
 - The world clock: the time of day and the number of whole days elapsed.
 - The calendar: the day index and the length of one season (stored as `day_index` and `season_length_days`).
+- The live mobs: each mob's kind, feet position, facing, and remaining health, written after every chest record.
 
 The file does not store terrain. Terrain is produced from the seed every time a chunk is needed. That is why a save is small, and it is why terrain can be regenerated on load.
 
@@ -65,6 +66,10 @@ Saves written before version 6 carry no game mode and no vitals. They load as:
 
 The mode is chosen when a world is created and cannot be changed afterwards. A migrated world therefore keeps its Creative mode for the rest of its life, and a newer build reads it as Creative every time. The file is upgraded on the next save, as described below.
 
+### An older save loads with no mobs
+
+Saves written before version 7 carry no mob records. They load with an empty mob list, and the world resumes without the animals or hostiles that a version 7 save would have preserved. New mobs spawn from the world seed as usual, so the world is playable immediately; it simply starts with no persisted mobs. The mob tail is written the next time the world is saved.
+
 ### Terrain you never edited is regenerated
 
 Only your edits are in the file. On load, the game regenerates every chunk from the seed and then reapplies your edits on top.
@@ -88,9 +93,11 @@ On the next save, the world is written in the current format and gains the calen
 
 Loading a world does not rewrite its file by itself. The upgrade happens only when the world is next saved.
 
-The previous release wrote save format version 5; this build writes version 6. The addition sits at the end of the file: the world's game mode, your health, hunger, and breath, and one record per chest with its position and 27 slots. A version 5 file has no such tail, which is exactly why it loads as Creative with full vitals and no chest records. A file that claims a version newer than this build understands is rejected instead of guessed at.
+The previous release wrote save format version 6; this build writes version 7. The version 6 addition sits at the end of the file: the world's game mode, your health, hunger, and breath, and one record per chest with its position and 27 slots. A version 5 file has no such tail, which is exactly why it loads as Creative with full vitals and no chest records. A file that claims a version newer than this build understands is rejected instead of guessed at.
 
-A scripted demo save pins one concrete v6 layout. The `--demo-survival` run is edit-free and its `inventory_kept=true` path keeps one Apple and one Stick, so that save is exactly 155 bytes with the v6 header at offset 144: mode at 144, health at 145, hunger at 147, air at 149, and chest count at 151. The general empty-inventory v6 constants are 138, 139, 141, 143, and 145. Ordinary content saves are variable-length because chunk edits shift the tail. Unknown block, item, mode, or chest data and water fail closed.
+Version 7 appends the mobs after the last chest record: a `u32` mob count followed by one 19-byte record per mob — kind (`u8`), feet `x`/`y`/`z` (`f32` each), facing (`yaw` as `f32`), and remaining health (`u16`). Records are sorted by kind and then by position, so the same world always writes the same tail. Version 1-6 saves have no mob tail and load with no mobs. A malformed mob section fails the whole load closed: an unknown kind, a non-finite position or facing, health above the kind's maximum, a duplicate `(kind, position)` record, or an out-of-bound count is rejected rather than skipped.
+
+A scripted demo save pins one concrete v7 layout. An edit-free save with an empty inventory is 153 bytes: the version word is at offset 4 and the mob count is at 149. The `--demo-survival` run is edit-free and its `inventory_kept=true` path keeps one Apple and one Stick, so that save is exactly 159 bytes with the v6 header at offset 144: mode at 144, health at 145, hunger at 147, air at 149, chest count at 151, and mob count at 155. The general empty-inventory v6 constants are 138, 139, 141, 143, and 145, and the general v7 mob count is at 149. The `--demo-combat` save is exactly 229 bytes: its mob count is at 149 and its four 19-byte records occupy 153..229. Ordinary content saves are variable-length because chunk edits shift the tail. Unknown block, item, mode, chest, or mob data and water fail closed.
 
 A damaged or unreadable save is not repaired by the game. When the game is launched directly into a world and the file cannot be read, that launch starts a new world at the same path instead of failing. Keep the copy before experimenting.
 
@@ -250,5 +257,5 @@ These guarantees survived the terrain rewrite:
 - A save with an out-of-range render distance is rejected rather than guessed at.
 - Hand-editing a save file is not supported. Corrupt or unknown data either fails the load with a named error or falls back to a safe default, depending on the field.
 - The menu background's viewpoint is wherever you stood when you last saved the editor. Building across that spot can put geometry in front of or around the camera; move before saving to reframe it.
-- Development flags for demos and smoke tests (`--new`, `--seed`, `--save`, `--time-scale`, `--season-length`, `--demo-days`, `--demo-swim`, `--demo-survival`, `--demo-content`) are not part of the normal player flow. They change how a launch runs (some demos advance the calendar and save before exiting), not how an existing save file is interpreted. `--demo-survival` and `--demo-content` are bounded scripted demo switches that save and exit for the smokes. `--creative` and `--survival` select the mode of a fresh world only (the last flag wins); a loaded world keeps its stored mode.
+- Development flags for demos and smoke tests (`--new`, `--seed`, `--save`, `--time-scale`, `--season-length`, `--demo-days`, `--demo-swim`, `--demo-survival`, `--demo-content`, `--demo-combat`) are not part of the normal player flow. They change how a launch runs (some demos advance the calendar and save before exiting), not how an existing save file is interpreted. `--demo-survival` and `--demo-content` are bounded scripted demo switches that save and exit for the smokes. `--creative` and `--survival` select the mode of a fresh world only (the last flag wins); a loaded world keeps its stored mode.
 - There are no item-drop entities and no death drops; death keeps your inventory. There is no creative inventory palette. Chest overflow is refused rather than dropping items. Crop growth progress is ephemeral and is not saved. There is no saturation, and no water or fertilizer farming.

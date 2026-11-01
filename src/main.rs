@@ -4001,8 +4001,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
 /// assignment and the write. Any failure latches `stage=save` with the named
 /// observed value instead of leaving a half-written world.
 fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
-    let (positions, _) =
-        combat_quartet(session.player.position, session.player.yaw, demo.seed);
+    let (positions, _) = combat_quartet(session.player.position, session.player.yaw, demo.seed);
     {
         let mobs = session.mobs_mut();
         if mobs.len() != 4 {
@@ -9858,15 +9857,18 @@ mod tests {
 
         let loaded = load_world_from_path(&save_path).expect("load save");
         assert_eq!(loaded.mobs.len(), 4);
-        let (positions, _) =
-            combat_quartet(session.player.position, session.player.yaw, seed);
+        let (positions, _) = combat_quartet(session.player.position, session.player.yaw, seed);
         for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
             let record = loaded
                 .mobs
                 .iter()
                 .find(|record| record.kind == kind)
                 .unwrap_or_else(|| panic!("missing {kind:?} record"));
-            assert_eq!(record.position, positions[index].to_array(), "feet {kind:?}");
+            assert_eq!(
+                record.position,
+                positions[index].to_array(),
+                "feet {kind:?}"
+            );
             assert_eq!(record.yaw, COMBAT_PINNED_YAW[index], "yaw {kind:?}");
             assert_eq!(
                 record.health, COMBAT_PINNED_HEALTH[index],
