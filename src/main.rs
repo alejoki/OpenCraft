@@ -20,6 +20,9 @@ use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
     ToolWear, HOTBAR_SLOTS,
 };
+use opencraft::player::melee::{
+    attack_damage, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH,
+};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
@@ -291,6 +294,25 @@ enum ToolWearOutcome {
     Nothing,
 }
 
+/// Spends exactly one durability point after an edit or hit actually applied.
+///
+/// One mapping serves both production mutation sites — the mining break and the
+/// melee hit — so the two paths can never diverge on what a wear reports. The
+/// caller owns the ordering (mutate first, wear second); this helper only
+/// classifies the result.
+fn wear_after_proven_action(session: &mut WorldSession) -> ToolWearOutcome {
+    match session.player.wear_selected_tool() {
+        Ok(ToolWear::Worn(item)) => ToolWearOutcome::Worn {
+            remaining: item
+                .durability()
+                .expect("a successfully worn tool still reports durability"),
+        },
+        Ok(ToolWear::Broke) => ToolWearOutcome::Broke,
+        // Empty slot / non-tool / out-of-range selection: no mutation.
+        Err(_) => ToolWearOutcome::Nothing,
+    }
+}
+
 /// Outcome of one production mining break.
 ///
 /// `Applied` is the only arm that carries remesh work, and it is produced
@@ -383,16 +405,7 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         return BreakOutcome::Rejected(BreakRejection::EditRejected);
     }
 
-    let wear = match session.player.wear_selected_tool() {
-        Ok(ToolWear::Worn(item)) => ToolWearOutcome::Worn {
-            remaining: item
-                .durability()
-                .expect("a successfully worn tool still reports durability"),
-        },
-        Ok(ToolWear::Broke) => ToolWearOutcome::Broke,
-        // Empty slot / non-tool / out-of-range selection: no mutation.
-        Err(_) => ToolWearOutcome::Nothing,
-    };
+    let wear = wear_after_proven_action(session);
     if let Some(items) = chest_items {
         // The preflight proved capacity, and wearing only ever frees room, so
         // this batch cannot fail. The record is removed with the block, and an
@@ -634,6 +647,27 @@ fn eating_candidate(
     }
     let item = player.selected_item()?;
     EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
+}
+
+/// Attack-before-mining priority for one Playing frame.
+///
+/// A resident mob under the crosshair within melee reach is the frame's
+/// action: it suppresses the mining candidate entirely, so one left press can
+/// never both hit a mob and start breaking the block behind it. With no attack
+/// candidate the mining candidate passes through unchanged — the 8.0-block
+/// raycast reach and every duration rule stay owned by
+/// [`MiningTarget::from_block`]. Suppression is free because
+/// [`MiningState::tick`] resets its own progress on `None`; do not add a second
+/// reset call at the call site.
+fn mining_after_attack(
+    attack: Option<MeleeHit>,
+    mining: Option<MiningTarget>,
+) -> Option<MiningTarget> {
+    if attack.is_some() {
+        None
+    } else {
+        mining
+    }
 }
 
 /// Crosshair progress bar for this frame.
@@ -4314,6 +4348,12 @@ struct GameApp {
     /// dt and reset by every left-hold/mining reset boundary so a menu, panel,
     /// focus loss, or session swap can never resume an invisible meal.
     eating: EatingState,
+    /// Melee swing-cooldown accumulator (M009/S03-T05): driven once per
+    /// Playing frame with raw frame dt, never `dt * time_scale` (input
+    /// latency is real time, exactly like mining and eating). Every left-hold
+    /// reset boundary clears it so a stale cooldown can never survive a
+    /// session swap, panel, or focus loss.
+    melee: MeleeState,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -4693,6 +4733,7 @@ impl GameApp {
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
             eating: EatingState::new(),
+            melee: MeleeState::new(),
             audio,
             left_mouse_held: false,
             right_mouse_held: false,
@@ -4949,6 +4990,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.melee.reset();
         // The inventory and chest screens are Playing-only surfaces. Any
         // lifecycle screen entry drops them (with their transient drag/status)
         // and closes the ephemeral chest station so no stale panel can keep
@@ -4996,6 +5038,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.melee.reset();
         self.pause_message = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
@@ -5146,6 +5189,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.melee.reset();
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
@@ -5902,6 +5946,7 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.melee.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -6211,6 +6256,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -6236,6 +6282,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.melee.reset();
                     return;
                 }
                 // Chest panel (S03-T05): a release never transfers a stack
@@ -6251,6 +6298,7 @@ impl ApplicationHandler for GameApp {
                         self.inventory_drag = None;
                         self.right_mouse_held = false;
                         self.eating.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -6262,6 +6310,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.melee.reset();
                     return;
                 }
                 // A release can arrive while a menu owns the input, so this
@@ -6271,6 +6320,7 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.melee.reset();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -6284,6 +6334,7 @@ impl ApplicationHandler for GameApp {
                 // so no generic Released branch can swallow the button.
                 self.right_mouse_held = false;
                 self.eating.reset();
+                self.melee.reset();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -6373,6 +6424,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -6455,6 +6507,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -6477,6 +6530,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.melee.reset();
                     return;
                 }
 
@@ -6785,6 +6839,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -6868,11 +6923,27 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Melee candidate (M009/S03-T05): derived once per held Left
+                // frame after the mob runtime and before the mining candidate,
+                // so a resident mob under the crosshair always wins the
+                // press. Only the two plain index/distance words are carried
+                // forward, never a borrow of the session, and the list can
+                // still change before the swing resolves (streaming, death),
+                // so every later step re-reads live state by index.
+                let attack_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
+                    self.session.melee_candidate(
+                        self.session.camera.position,
+                        self.session.camera.forward(),
+                        MELEE_REACH,
+                    )
+                } else {
+                    None
+                };
                 // Hold-to-mine candidate: only a held Left button on the
                 // grabbed gameplay surface feeds the accumulator. Every
                 // other frame passes None, which resets stale progress
                 // (released, paused, or cursor not grabbed).
-                let candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
+                let mining_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
                     // T01: the target carries its effective duration, derived
                     // once from the block's hardness and the selected item,
                     // so tool rules live in `player::tools` and the
@@ -6892,6 +6963,41 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Player melee (M009/S03-T05): re-read the live health by
+                // index because the record may have died or streamed out since
+                // the candidate was captured; `MeleeTarget::new` fail-closes on
+                // a dead mob. Raw frame dt, never `dt * time_scale`: a swing
+                // cooldown is input latency, not game time (D013).
+                let melee_target = attack_candidate.and_then(|hit| {
+                    let health = self.session.mobs().get(hit.index)?.health;
+                    MeleeTarget::new(hit.index, health)
+                });
+                if let MeleeTick::Swing { index } = self.melee.tick(dt, melee_target) {
+                    // The swing itself is the only mutation site: damage is
+                    // derived from the live item/mode/health, the session
+                    // re-checks residency and the i-frame window, and only a
+                    // proven hit wears the selected item once. A miss and an
+                    // i-frame-blocked swing mutate nothing (MEM392).
+                    let target_health = self.session.mobs().get(index).map(|mob| mob.health);
+                    if let Some(target_health) = target_health {
+                        let damage = attack_damage(
+                            self.session.player.selected_item(),
+                            self.session.player.mode(),
+                            target_health,
+                        );
+                        if self
+                            .session
+                            .attack_mob(index, damage, self.session.camera.position)
+                            .is_some()
+                        {
+                            let _wear = wear_after_proven_action(&mut self.session);
+                        }
+                    }
+                }
+                // Attack-before-mining: a resident mob in reach owns the left
+                // press, so mining never starts behind it. With no attack the
+                // mining candidate is untouched.
+                let candidate = mining_after_attack(attack_candidate, mining_candidate);
                 let mut target_block = hit.map(|h| h.block_pos);
                 if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
                     // The only production break site (S02): hardness
@@ -11905,6 +12011,169 @@ mod tests {
                 .map(|mob| mob.yaw)
                 .collect::<Vec<_>>(),
             pinned.iter().map(|(_, _, yaw, _)| *yaw).collect::<Vec<_>>()
+        );
+    }
+
+    /// A session whose chunk `(0, 0, 0)` is resident air, so the melee tests
+    /// can place mobs and the crosshair ray without terrain generating.
+    fn melee_test_session(dir: &std::path::Path, seed: u32, name: &str) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+    }
+
+    /// Aim the test camera east from a head-height origin carving through the
+    /// resident air chunk, so a mob placed on the +X axis is directly ahead.
+    fn aim_camera_east(session: &mut WorldSession) {
+        session.camera.position = Vec3::new(0.5, 9.65, 0.5);
+        session.camera.yaw = 0.0;
+        session.camera.pitch = 0.0;
+    }
+
+    #[test]
+    fn melee_candidate_uses_the_camera_ray_reach_and_residency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A pig centred 2.0 blocks ahead: its box entry is 0.35 before the
+        // centre, so the hit is 1.65 blocks from the eye and inside reach.
+        let mut session = melee_test_session(dir.path(), 4101, "melee-near.mcvx");
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0));
+        let hit = session
+            .melee_candidate(
+                session.camera.position,
+                session.camera.forward(),
+                MELEE_REACH,
+            )
+            .expect("a pig 2.0 blocks ahead is inside reach");
+        assert_eq!(hit.index, 0);
+        assert!(
+            (hit.distance - 1.65).abs() < 1e-4,
+            "entry distance was {}",
+            hit.distance
+        );
+
+        // The same pig geometry 5.0 blocks ahead is outside MELEE_REACH.
+        let mut far = melee_test_session(dir.path(), 4102, "melee-far.mcvx");
+        aim_camera_east(&mut far);
+        far.mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        assert_eq!(
+            far.melee_candidate(far.camera.position, far.camera.forward(), MELEE_REACH),
+            None,
+            "a pig outside MELEE_REACH must not be selected"
+        );
+
+        // A mob in an unloaded chunk is filtered by the same residency gate
+        // rendering and the fixed-rate runtime use.
+        let mut unloaded = melee_test_session(dir.path(), 4103, "melee-unloaded.mcvx");
+        aim_camera_east(&mut unloaded);
+        unloaded
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(100.5, 9.0, 0.5), 0.0));
+        assert!(!unloaded.mob_is_resident(&unloaded.mobs()[0]));
+        assert_eq!(
+            unloaded.melee_candidate(
+                unloaded.camera.position,
+                unloaded.camera.forward(),
+                MELEE_REACH,
+            ),
+            None,
+            "an unloaded mob can never be hit through missing terrain"
+        );
+    }
+
+    #[test]
+    fn attack_mob_applies_damage_flash_knockback_and_refuses_repeats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = melee_test_session(dir.path(), 4104, "melee-hit.mcvx");
+        aim_camera_east(&mut session);
+        let origin = session.camera.position;
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0);
+        pig.health = 10;
+        session.mobs_mut().push(pig);
+
+        let hit = session.attack_mob(0, 4, origin).expect("first hit lands");
+        assert_eq!(hit.damage, 4);
+        assert_eq!(hit.health_after, 6);
+        assert!(!hit.killed);
+        let mob = &session.mobs()[0];
+        assert_eq!(mob.health, 6, "10 - 4 = 6");
+        assert!(mob.hurt > 0.0, "the hurt flash is armed");
+        assert!(
+            mob.knockback.length_squared() > 0.0,
+            "the knockback impulse is non-zero"
+        );
+
+        assert_eq!(
+            session.attack_mob(0, 4, origin),
+            None,
+            "an immediate second hit is inside the i-frame window"
+        );
+        assert_eq!(
+            session.mobs()[0].health,
+            6,
+            "the blocked hit changed nothing"
+        );
+
+        // A dead record stays in the list and can never be hit again.
+        session.mobs_mut()[0].health = 0;
+        session.mobs_mut()[0].hurt_iframe = 0.0;
+        assert_eq!(session.attack_mob(0, 4, origin), None);
+        assert_eq!(session.mobs().len(), 1, "melee never removes a record");
+        assert_eq!(
+            session.attack_mob(9, 4, origin),
+            None,
+            "a missing index is refused"
+        );
+
+        // A non-resident record is refused even with a clear i-frame window.
+        let mut unloaded = melee_test_session(dir.path(), 4105, "melee-hit-unloaded.mcvx");
+        unloaded
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(100.5, 9.0, 0.5), 0.0));
+        assert_eq!(unloaded.attack_mob(0, 4, Vec3::ZERO), None);
+    }
+
+    #[test]
+    fn mining_after_attack_gives_any_attack_priority_over_mining() {
+        let target = MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None)
+            .expect("stone is minable");
+        let attack = Some(MeleeHit {
+            index: 0,
+            distance: 1.0,
+        });
+        assert_eq!(mining_after_attack(attack, Some(target)), None);
+        assert_eq!(mining_after_attack(None, Some(target)), Some(target));
+        assert_eq!(mining_after_attack(attack, None), None);
+        assert_eq!(mining_after_attack(None, None), None);
+    }
+
+    #[test]
+    fn left_press_over_empty_ground_with_no_mob_in_reach_still_mines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = melee_test_session(dir.path(), 4106, "melee-no-target.mcvx");
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        let attack = session.melee_candidate(
+            session.camera.position,
+            session.camera.forward(),
+            MELEE_REACH,
+        );
+        assert_eq!(attack, None, "the only mob is outside reach");
+        let mining = MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None)
+            .expect("stone is minable");
+        assert_eq!(
+            mining_after_attack(attack, Some(mining)),
+            Some(mining),
+            "no attack candidate leaves the mining path unchanged"
         );
     }
 

@@ -17,6 +17,7 @@ use crate::player::container::Container;
 use crate::player::inventory::{
     ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, CHEST_SLOTS,
 };
+use crate::player::melee::MeleeHit;
 use crate::player::physics::Player;
 use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
@@ -28,7 +29,7 @@ use crate::world::daycycle::GameClock;
 use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
-use crate::world::mob::{Mob, MobRuntime, MobTick};
+use crate::world::mob::{Mob, MobHit, MobRuntime, MobTick};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
@@ -375,6 +376,43 @@ impl WorldSession {
     /// [`WorldSession::mobs`], so render batch and entity list stay aligned.
     pub fn resident_mobs(&self) -> impl Iterator<Item = &Mob> + '_ {
         self.mobs.iter().filter(|mob| self.mob_is_resident(mob))
+    }
+
+    /// The nearest resident mob the crosshair ray enters within `reach`.
+    ///
+    /// This is the one melee hit-test seam: it walks the live mob list once
+    /// through [`crate::player::melee::nearest_mob_hit`] and applies the exact
+    /// same residency gate as rendering and the fixed-rate runtime, so a mob
+    /// in an unloaded chunk can never be hit through terrain that is not
+    /// loaded. No candidate `Vec` is allocated.
+    pub fn melee_candidate(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<MeleeHit> {
+        crate::player::melee::nearest_mob_hit(
+            origin,
+            dir,
+            reach,
+            self.mobs
+                .iter()
+                .enumerate()
+                .filter(|(_, mob)| self.mob_is_resident(mob)),
+        )
+    }
+
+    /// Applies one melee hit to mob `index` and reports the outcome.
+    ///
+    /// Every guard lives in one place: a missing index and a non-resident mob
+    /// are refused here, while a dead record (`health == 0`), an open i-frame
+    /// window, and zero damage are refused by [`Mob::take_hit`]. A successful
+    /// hit never removes or reorders a record: S04 owns death collapse,
+    /// removal, and drops, so a mob whose health reached zero stays in
+    /// [`WorldSession::mobs`] with [`MobHit::killed`] `== true` until then.
+    pub fn attack_mob(&mut self, index: usize, damage: u16, from: Vec3) -> Option<MobHit> {
+        let mob = self.mobs.get(index)?;
+        if !self.mob_is_resident(mob) {
+            return None;
+        }
+        // The immutable borrow ends here; the index is re-checked against the
+        // same list, which neither hit test nor this call can change shape.
+        self.mobs.get_mut(index)?.take_hit(damage, from)
     }
 
     /// Whether the fresh Survival spawn gate is still waiting for chunks.
