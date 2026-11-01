@@ -75,8 +75,9 @@ use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::mob::{Mob, MobKind};
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
-    WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
+    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
+    DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -230,7 +231,10 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             survival: session.player.survival,
         },
         chests: session.chests.clone(),
-        mobs: Vec::new(),
+        // Persist the live mob records here, at the one production save site.
+        // The codec sorts by (kind, position), so the session's list order
+        // never leaks into the file layout.
+        mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -11482,6 +11486,125 @@ mod tests {
                 session.player.hotbar_stack(slot)
             );
         }
+    }
+
+    /// The production save site must persist live mobs: a Survival session's
+    /// four damaged, non-round-yaw mobs go through `save_current_world`,
+    /// decode back in `(kind, position)` order, and restore through
+    /// `session_from_save` with identical kinds and health.
+    #[test]
+    fn mob_persistence_roundtrips_through_the_production_save_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("mobs.mcvx");
+        let seed = 24680u32;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let base = Vec3::new(spawn.x.floor() + 0.5, spawn.y, spawn.z.floor() + 0.5);
+        let pinned: [(MobKind, Vec3, f32, u16); 4] = [
+            (MobKind::Pig, base + Vec3::new(2.5, 0.0, -1.25), 0.25, 4),
+            (MobKind::Cow, base + Vec3::new(-3.0, 0.0, 4.5), 0.75, 7),
+            (MobKind::Zombie, base + Vec3::new(1.0, 0.0, 8.0), -1.25, 11),
+            (MobKind::Skeleton, base + Vec3::new(6.5, 0.0, -4.5), 2.5, 14),
+        ];
+        for (kind, position, yaw, health) in pinned {
+            let mut mob = Mob::new(kind, position, yaw);
+            mob.health = health; // simulated combat damage, never max health
+            session.mobs_mut().push(mob);
+        }
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let expected: Vec<SavedMob> = pinned
+            .iter()
+            .map(|(kind, position, yaw, health)| SavedMob {
+                kind: *kind,
+                position: position.to_array(),
+                yaw: *yaw,
+                health: *health,
+            })
+            .collect();
+        assert_eq!(
+            loaded.mobs, expected,
+            "the production save site writes all four mobs in (kind, position) order"
+        );
+
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(restored.mobs().len(), 4);
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>(),
+            pinned.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.health)
+                .collect::<Vec<_>>(),
+            vec![4, 7, 11, 14],
+            "damaged health survives the save/relaunch boundary"
+        );
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.yaw)
+                .collect::<Vec<_>>(),
+            pinned.iter().map(|(_, _, yaw, _)| *yaw).collect::<Vec<_>>()
+        );
+    }
+
+    /// A live mob with a non-finite position must fail the save closed: the
+    /// codec rejects it before the atomic write, the file is never created,
+    /// and the world keeps its unsaved-changes flag for a later retry.
+    #[test]
+    fn mob_persistence_rejects_a_non_finite_live_mob_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("bad-mobs.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            24681,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 24681, Season::Summer));
+        session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(session.world.has_unsaved_changes());
+
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(f32::NAN, 64.0, 0.0), 0.0));
+        let result = save_current_world(&mut session);
+
+        assert!(
+            matches!(result, Err(PersistenceError::InvalidMobState)),
+            "a non-finite mob position is a codec rejection, got {result:?}"
+        );
+        assert!(!save_path.exists(), "no bytes are written on rejection");
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the failed save keeps the retry flag set"
+        );
     }
 
     #[test]

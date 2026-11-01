@@ -995,7 +995,8 @@ mod tests {
     use crate::player::physics::InputState;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
-    use crate::world::mob::MobKind;
+    use crate::world::mob::{MobAiState, MobKind};
+    use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
     fn make_save(seed: u32) -> WorldSaveData {
@@ -3712,6 +3713,121 @@ mod tests {
             assert!(mob.velocity.is_finite());
             assert!(mob.walk_phase.is_finite());
         }
+    }
+
+    fn pinned_saved_mobs() -> Vec<SavedMob> {
+        vec![
+            SavedMob {
+                kind: MobKind::Pig,
+                position: [1.5, 64.0, -3.25],
+                yaw: 0.25,
+                health: 4,
+            },
+            SavedMob {
+                kind: MobKind::Skeleton,
+                position: [-7.0, 70.5, 2.0],
+                yaw: -1.25,
+                health: 14,
+            },
+        ]
+    }
+
+    fn mob_save(mobs: Vec<SavedMob>) -> WorldSaveData {
+        let mut data = make_save(9182u32);
+        data.mobs = mobs;
+        data
+    }
+
+    #[test]
+    fn restored_session_rebuilds_mob_records_exactly() {
+        let records = pinned_saved_mobs();
+        let session = WorldSession::session_from_save(
+            mob_save(records.clone()),
+            PathBuf::from("/tmp/mob-restore.mcvx"),
+        );
+
+        assert_eq!(session.mobs().len(), records.len());
+        for (mob, record) in session.mobs().iter().zip(records.iter()) {
+            assert_eq!(mob.kind, record.kind);
+            assert_eq!(mob.position, Vec3::from_array(record.position));
+            assert_eq!(mob.yaw, record.yaw);
+            assert_eq!(mob.health, record.health);
+            assert_eq!(mob.home, mob.position, "home re-anchors to the saved feet");
+            assert_eq!(mob.velocity, Vec3::ZERO);
+            assert_eq!(mob.state, MobAiState::Wander);
+            assert_eq!(mob.hurt, 0.0);
+            assert_eq!(mob.cooldown, 0.0);
+            assert_eq!(mob.walk_phase, 0.0);
+        }
+    }
+
+    #[test]
+    fn restored_session_resaves_byte_identically() {
+        use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
+
+        let original = mob_save(pinned_saved_mobs());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &original).expect("mob save encodes");
+
+        let loaded = load_world_from_bytes(&bytes).expect("mob save decodes");
+        let session =
+            WorldSession::session_from_save(loaded.clone(), PathBuf::from("/tmp/mob-resave.mcvx"));
+
+        let mut rebuilt = loaded;
+        rebuilt.mobs = session.mobs().iter().map(SavedMob::from).collect();
+        let mut resaved = Vec::new();
+        save_world_to_bytes(&mut resaved, &rebuilt).expect("restored mobs re-encode");
+
+        assert_eq!(resaved, bytes, "restore then save is byte-identical");
+    }
+
+    #[test]
+    fn restored_mobs_tick_from_a_restarted_runtime() {
+        let mut session = WorldSession::session_from_save(
+            mob_save(pinned_saved_mobs()),
+            PathBuf::from("/tmp/mob-tick.mcvx"),
+        );
+        let feet = session.mobs()[0].position;
+        let (chunk, _) = world_to_chunk_and_local(
+            feet.x.floor() as i32,
+            feet.y.floor() as i32,
+            feet.z.floor() as i32,
+        );
+        session
+            .world
+            .insert_chunk_for_test(chunk, crate::world::chunk::Chunk::new_uniform(BlockId::Air));
+
+        let before = session.mobs()[0].position;
+        let tick = session.tick_mobs(0.05, 1.0);
+
+        assert!(
+            tick.ai_steps >= 1,
+            "the restored runtime restarts at tick 0 and still steps"
+        );
+        assert_ne!(
+            session.mobs()[0].position,
+            before,
+            "a resident restored mob walks again"
+        );
+    }
+
+    #[test]
+    fn empty_mob_save_keeps_the_153_byte_edit_free_length() {
+        use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
+
+        let data = make_save(9183u32);
+        assert!(data.mobs.is_empty());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("empty mob save encodes");
+
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(
+            &bytes[149..153],
+            &0u32.to_le_bytes(),
+            "the v7 mob count sits at offset 149"
+        );
+        let loaded = load_world_from_bytes(&bytes).expect("empty mob save decodes");
+        assert!(loaded.mobs.is_empty());
     }
 
     #[test]
