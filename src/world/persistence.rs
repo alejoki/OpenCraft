@@ -2830,8 +2830,7 @@ mod tests {
         for (index, (material, _)) in V7_MELEE_MATERIALS.iter().enumerate() {
             slots[index] = Some(v7_melee_item(*material, 2 + index as u16));
         }
-        slots[6] =
-            Some(Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap());
+        slots[6] = Some(Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap());
         slots[7] = Some(Item::tool_with_durability(ToolKind::Bow, ToolTier::Wood, 3).unwrap());
 
         let mut chest_slots: ChestSlots = [None; CHEST_SLOTS];
@@ -2880,7 +2879,10 @@ mod tests {
 
         let mut again = Vec::new();
         save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
-        assert_eq!(again, bytes, "a loaded v7 item save re-saves byte-identically");
+        assert_eq!(
+            again, bytes,
+            "a loaded v7 item save re-saves byte-identically"
+        );
     }
 
     #[test]

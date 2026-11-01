@@ -23,6 +23,21 @@ pub const MOB_TICK_SECS: f32 = 1.0 / MOB_TICK_HZ as f32;
 /// stall cannot spiral into an unbounded catch-up loop.
 pub const MAX_MOB_STEPS_PER_CALL: u32 = 4;
 
+/// Seconds the hurt flash stays at full intensity after a hit.
+///
+/// [`Mob::hurt`] is both the countdown and the render intensity, so there is
+/// no second flash field to keep in sync.
+pub const MOB_HURT_FLASH_SECS: f32 = 0.5;
+/// Seconds a mob ignores further hits after one lands (i-frames).
+pub const MOB_IFRAME_SECS: f32 = 0.5;
+/// Initial horizontal speed of the knockback impulse, in blocks/second.
+pub const MOB_KNOCKBACK_SPEED: f32 = 4.0;
+/// Per-fixed-step multiplier applied to the remaining knockback impulse.
+pub const MOB_KNOCKBACK_DECAY: f32 = 0.6;
+/// Squared speed below which the impulse is dropped to exactly zero, so a mob
+/// provably comes to rest instead of creeping forever.
+pub const MOB_KNOCKBACK_EPSILON_SQ: f32 = 1e-4;
+
 /// Horizontal distance from `home` at which a wandering mob turns back.
 const HOME_LEASH: f32 = 4.0;
 /// How often (in fixed steps) a wandering mob re-rolls its yaw/state.
@@ -132,6 +147,17 @@ pub struct Mob {
     pub state: MobAiState,
     /// Remaining hurt-flash time in seconds; decays only while resident.
     pub hurt: f32,
+    /// Remaining hit-invulnerability time in seconds (i-frames).
+    ///
+    /// Deliberately separate from [`Mob::cooldown`]: S06 needs `cooldown` as
+    /// the hostile attack cadence, and a player hit must never delay it.
+    pub hurt_iframe: f32,
+    /// Remaining horizontal knockback impulse in blocks/second.
+    ///
+    /// Integrated on top of the AI velocity by [`MobRuntime::step_mob`] and
+    /// decayed geometrically; never written into [`Mob::velocity`], which both
+    /// AI arms assign every fixed step.
+    pub knockback: Vec3,
     /// Generic action cooldown in seconds; S02+ uses it.
     pub cooldown: f32,
     /// Walk cycle phase (radians), advanced while wandering.
@@ -150,6 +176,8 @@ impl Mob {
             health: kind.max_health(),
             state: MobAiState::Wander,
             hurt: 0.0,
+            hurt_iframe: 0.0,
+            knockback: Vec3::ZERO,
             cooldown: 0.0,
             walk_phase: 0.0,
         }
@@ -169,9 +197,54 @@ impl Mob {
             health,
             state: MobAiState::Wander,
             hurt: 0.0,
+            hurt_iframe: 0.0,
+            knockback: Vec3::ZERO,
             cooldown: 0.0,
             walk_phase: 0.0,
         }
+    }
+
+    /// Applies one melee hit: saturated damage, hurt flash, i-frames, and a
+    /// horizontal knockback impulse away from `away_from`.
+    ///
+    /// Returns `None` — and mutates nothing at all — when the record is
+    /// already dead (`health == 0`), when the i-frame window is open
+    /// ([`Mob::hurt_iframe`] `> 0.0`), or when `damage == 0`. `health` is
+    /// unsigned and `0` is a legal wire value, so the subtraction saturates:
+    /// no negative or wrapped health can ever be stored.
+    ///
+    /// The knockback direction is the horizontal vector from `away_from` to
+    /// the mob. A degenerate or non-finite direction (attacker inside the mob,
+    /// corrupted positions) falls back to the mob's own yaw forward, then to
+    /// +Z, so the impulse is always finite and non-zero.
+    pub fn take_hit(&mut self, damage: u16, away_from: Vec3) -> Option<MobHit> {
+        if self.health == 0 || self.hurt_iframe > 0.0 || damage == 0 {
+            return None;
+        }
+
+        let health_after = self.health.saturating_sub(damage);
+        self.health = health_after;
+        self.hurt = MOB_HURT_FLASH_SECS;
+        self.hurt_iframe = MOB_IFRAME_SECS;
+
+        let delta = self.position - away_from;
+        let horizontal = Vec3::new(delta.x, 0.0, delta.z);
+        let mut dir = horizontal.normalize_or_zero();
+        if dir.length_squared() < 1e-6 {
+            // Deterministic degenerate fallback: the mob's own facing.
+            dir = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
+        }
+        if !dir.is_finite() || dir.length_squared() < 1e-6 {
+            // A corrupted yaw must still not produce a zero or NaN impulse.
+            dir = Vec3::Z;
+        }
+        self.knockback = dir * MOB_KNOCKBACK_SPEED;
+
+        Some(MobHit {
+            damage,
+            health_after,
+            killed: health_after == 0,
+        })
     }
 
     /// World-space AABB as `(min, max)`. Feet are at `position.y`, so the
@@ -192,6 +265,20 @@ impl Mob {
             ),
         )
     }
+}
+
+/// Outcome of one applied [`Mob::take_hit`].
+///
+/// A killed mob is *reported*, never removed: S04 owns death collapse,
+/// removal, and drops, so the record stays in the list with `health == 0`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MobHit {
+    /// Damage actually applied (equal to the requested damage).
+    pub damage: u16,
+    /// Health after the saturating subtraction.
+    pub health_after: u16,
+    /// Whether this hit dropped health to zero.
+    pub killed: bool,
 }
 
 /// Deterministic pseudo-random draw for one mob slot at one fixed tick.
@@ -298,6 +385,7 @@ impl MobRuntime {
 
     fn step_mob(&self, mob: &mut Mob, slot: u32) {
         mob.hurt = (mob.hurt - MOB_TICK_SECS).max(0.0);
+        mob.hurt_iframe = (mob.hurt_iframe - MOB_TICK_SECS).max(0.0);
         mob.cooldown = (mob.cooldown - MOB_TICK_SECS).max(0.0);
 
         if !mob.position.length_squared().is_finite() {
@@ -347,6 +435,25 @@ impl MobRuntime {
                 }
             }
         }
+
+        // Knockback is integrated *after* the AI arms because both of them
+        // assign `velocity`; writing the impulse there would be erased on the
+        // next fixed step. Keeping it in its own field means an Idle mob still
+        // slides, and the fixed 20 Hz cadence makes the slide deterministic.
+        if !mob.knockback.is_finite() {
+            mob.knockback = Vec3::ZERO;
+        }
+        if mob.knockback.length_squared() > 0.0 {
+            mob.position += mob.knockback * MOB_TICK_SECS;
+            mob.knockback *= MOB_KNOCKBACK_DECAY;
+            if mob.knockback.length_squared() < MOB_KNOCKBACK_EPSILON_SQ {
+                mob.knockback = Vec3::ZERO;
+            }
+            if !mob.position.is_finite() {
+                mob.position = mob.home;
+                mob.knockback = Vec3::ZERO;
+            }
+        }
     }
 }
 
@@ -394,6 +501,8 @@ mod tests {
         assert_eq!(mob.health, MobKind::Cow.max_health());
         assert_eq!(mob.state, MobAiState::Wander);
         assert_eq!(mob.hurt, 0.0);
+        assert_eq!(mob.hurt_iframe, 0.0);
+        assert_eq!(mob.knockback, Vec3::ZERO);
         assert_eq!(mob.cooldown, 0.0);
         assert_eq!(mob.walk_phase, 0.0);
     }
@@ -413,6 +522,8 @@ mod tests {
         assert_eq!(mob.health, 3, "damage must survive a reload");
         assert_eq!(mob.state, MobAiState::Wander);
         assert_eq!(mob.hurt, 0.0);
+        assert_eq!(mob.hurt_iframe, 0.0);
+        assert_eq!(mob.knockback, Vec3::ZERO);
         assert_eq!(mob.cooldown, 0.0);
         assert_eq!(mob.walk_phase, 0.0);
 
@@ -558,6 +669,259 @@ mod tests {
             assert!(mob.position.is_finite(), "position became non-finite");
             assert!(mob.velocity.is_finite());
             assert!(mob.walk_phase.is_finite());
+            assert!(mob.knockback.is_finite());
         }
+    }
+
+    // ---- take_hit: damage, i-frames, flash, knockback -------------------
+
+    /// A fresh Pig at +Z of an attacker standing at -Z, so "away" is +Z.
+    fn pig_at_origin() -> Mob {
+        Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 0.0)
+    }
+
+    fn attacker_behind() -> Vec3 {
+        Vec3::new(0.0, 5.0, -2.0)
+    }
+
+    #[test]
+    fn take_hit_arithmetic_is_ten_to_six_to_two() {
+        let mut mob = pig_at_origin();
+        let first = mob.take_hit(4, attacker_behind()).expect("first hit lands");
+        assert_eq!(
+            first,
+            MobHit {
+                damage: 4,
+                health_after: 6,
+                killed: false
+            }
+        );
+        assert_eq!(mob.health, 6);
+        assert_eq!(mob.hurt, MOB_HURT_FLASH_SECS, "the flash is armed");
+        assert_eq!(mob.hurt_iframe, MOB_IFRAME_SECS, "i-frames are armed");
+        assert!((mob.knockback.length() - MOB_KNOCKBACK_SPEED).abs() < 1e-5);
+        assert!(
+            mob.knockback.z > 0.0,
+            "knockback points away from the attacker"
+        );
+        assert!((mob.knockback.x).abs() < 1e-6 && (mob.knockback.y).abs() < 1e-6);
+
+        // Elapse the window and hit again: 6 -> 2, still alive.
+        mob.hurt_iframe = 0.0;
+        let second = mob
+            .take_hit(4, attacker_behind())
+            .expect("second hit lands");
+        assert_eq!(
+            second,
+            MobHit {
+                damage: 4,
+                health_after: 2,
+                killed: false
+            }
+        );
+        assert_eq!(mob.health, 2);
+    }
+
+    #[test]
+    fn second_hit_inside_iframes_is_none_and_mutates_nothing() {
+        let mut mob = pig_at_origin();
+        mob.take_hit(4, attacker_behind()).expect("first hit lands");
+        let snapshot = mob.clone();
+        assert_eq!(mob.take_hit(4, attacker_behind()), None);
+        assert_eq!(
+            mob, snapshot,
+            "a blocked hit must leave every field identical"
+        );
+        assert_eq!(mob.health, 6);
+        // A larger hit cannot sneak through the window either.
+        assert_eq!(mob.take_hit(200, attacker_behind()), None);
+        assert_eq!(mob, snapshot);
+    }
+
+    #[test]
+    fn take_hit_saturates_at_zero_and_reports_a_kill() {
+        let mut mob = pig_at_origin();
+        let hit = mob
+            .take_hit(200, attacker_behind())
+            .expect("a lethal hit lands");
+        assert_eq!(hit.health_after, 0);
+        assert!(hit.killed);
+        assert_eq!(hit.damage, 200);
+        assert_eq!(mob.health, 0, "health must saturate, never wrap");
+
+        // A dead record refuses every further hit and stays at zero.
+        mob.hurt_iframe = 0.0;
+        assert_eq!(mob.take_hit(1, attacker_behind()), None);
+        assert_eq!(mob.health, 0);
+        assert!(mob.take_hit(1, attacker_behind()).is_none());
+
+        // An exactly-lethal hit also reports a kill.
+        let mut exact = pig_at_origin();
+        let hit = exact.take_hit(10, attacker_behind()).expect("lethal hit");
+        assert!(hit.killed);
+        assert_eq!(hit.health_after, 0);
+
+        // A record restored at zero health is dead on arrival.
+        let mut dead = Mob::restored(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 0.0, 0);
+        assert_eq!(dead.take_hit(1, attacker_behind()), None);
+        assert_eq!(dead.health, 0);
+    }
+
+    #[test]
+    fn zero_damage_is_a_complete_no_op() {
+        let mut mob = pig_at_origin();
+        let snapshot = mob.clone();
+        assert_eq!(mob.take_hit(0, attacker_behind()), None);
+        assert_eq!(mob, snapshot, "zero damage must not arm anything");
+        assert_eq!(mob.health, MobKind::Pig.max_health());
+        assert_eq!(mob.hurt, 0.0);
+        assert_eq!(mob.hurt_iframe, 0.0);
+        assert_eq!(mob.knockback, Vec3::ZERO);
+    }
+
+    #[test]
+    fn knockback_direction_is_horizontal_and_away_from_the_attacker() {
+        let mut mob = Mob::new(MobKind::Cow, Vec3::new(3.0, 5.0, 4.0), 0.0);
+        // Attacker has a vertical offset: the impulse must stay horizontal.
+        let hit = mob
+            .take_hit(1, Vec3::new(3.0, 70.0, 1.0))
+            .expect("hit lands");
+        assert!(!hit.killed);
+        assert!(mob.knockback.y.abs() < 1e-6, "knockback must be horizontal");
+        assert!(mob.knockback.z > 0.0, "away from the attacker is +Z here");
+        assert!((mob.knockback.length() - MOB_KNOCKBACK_SPEED).abs() < 1e-5);
+
+        // Attacker on the opposite side flips the direction.
+        mob.hurt_iframe = 0.0;
+        mob.take_hit(1, Vec3::new(3.0, 5.0, 9.0))
+            .expect("second hit lands");
+        assert!(mob.knockback.z < 0.0);
+    }
+
+    #[test]
+    fn degenerate_knockback_direction_uses_the_mob_yaw_and_stays_finite() {
+        // Attacker exactly at the mob's feet: no horizontal direction exists.
+        let mut mob = Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 0.0);
+        assert!(mob.take_hit(1, Vec3::new(0.0, 5.0, 0.0)).is_some());
+        assert!(mob.knockback.is_finite());
+        assert!(
+            mob.knockback.length() > 0.0,
+            "the impulse must never be zero"
+        );
+        assert!(mob.knockback.z > 0.0, "yaw 0 faces +Z");
+
+        // Yaw 90 degrees: the fallback faces +X.
+        let mut side = Mob::new(
+            MobKind::Pig,
+            Vec3::new(0.0, 5.0, 0.0),
+            std::f32::consts::FRAC_PI_2,
+        );
+        assert!(side.take_hit(1, Vec3::new(0.0, 5.0, 0.0)).is_some());
+        assert!(side.knockback.x > 0.0);
+        assert!((side.knockback.length() - MOB_KNOCKBACK_SPEED).abs() < 1e-5);
+
+        // A corrupted (non-finite) attacker position still yields a finite,
+        // non-zero impulse.
+        let mut corrupt = Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), f32::NAN);
+        assert!(corrupt.take_hit(1, Vec3::new(f32::NAN, 5.0, 0.0)).is_some());
+        assert!(corrupt.knockback.is_finite());
+        assert_eq!(corrupt.knockback, Vec3::Z * MOB_KNOCKBACK_SPEED);
+    }
+
+    #[test]
+    fn knockback_moves_an_idle_mob_and_decays_to_rest() {
+        let mut runtime = MobRuntime::new(7);
+        let mut mobs = vec![pig_at_origin()];
+        mobs[0].take_hit(4, attacker_behind()).expect("hit lands");
+        let start = mobs[0].position;
+
+        // 14 steps is enough to drain a 4.0 impulse at 0.6 per step (it is
+        // dropped below the epsilon floor on step 12), and stays below the
+        // 16-step yaw reroll so the Idle pose is ours.
+        let mut rest_position = None;
+        for step in 0..14 {
+            mobs[0].state = MobAiState::Idle;
+            runtime.tick(0.05, &mut mobs, resident);
+            if step == 12 {
+                rest_position = Some(mobs[0].position);
+            }
+        }
+
+        assert_eq!(mobs[0].state, MobAiState::Idle);
+        assert_eq!(
+            mobs[0].knockback,
+            Vec3::ZERO,
+            "the impulse must be dropped below the epsilon floor"
+        );
+        let displacement = mobs[0].position.z - start.z;
+        assert!(
+            displacement > 0.0,
+            "an Idle mob must still slide, moved {displacement}"
+        );
+        // Geometric series bound: speed * dt / (1 - decay) = 0.5 blocks.
+        let bound = MOB_KNOCKBACK_SPEED * MOB_TICK_SECS / (1.0 - MOB_KNOCKBACK_DECAY);
+        assert!(
+            displacement < bound + 1e-4,
+            "displacement {displacement} exceeded the decay bound {bound}"
+        );
+        assert!(mobs[0].position.is_finite());
+
+        // Once at rest, the position stops changing for the remaining steps.
+        assert_eq!(
+            Some(mobs[0].position),
+            rest_position,
+            "a mob at rest must not keep creeping"
+        );
+    }
+
+    #[test]
+    fn knockback_is_not_written_into_velocity() {
+        let mut runtime = MobRuntime::new(3);
+        let mut mobs = vec![pig_at_origin()];
+        mobs[0].take_hit(4, attacker_behind()).expect("hit lands");
+        // The AI arm assigns velocity every step; the impulse must survive in
+        // its own field and never be installed as velocity.
+        mobs[0].state = MobAiState::Idle;
+        runtime.tick(0.05, &mut mobs, resident);
+        assert_eq!(mobs[0].velocity, Vec3::ZERO);
+        assert!(mobs[0].knockback.z > 0.0);
+        assert!(mobs[0].position.z > 0.0);
+    }
+
+    #[test]
+    fn hurt_iframe_decays_only_while_resident() {
+        let mut runtime = MobRuntime::new(5);
+        let mut mobs = vec![pig_at_origin()];
+        mobs[0].hurt_iframe = 0.2;
+
+        runtime.tick(0.05, &mut mobs, |_| false);
+        assert!((mobs[0].hurt_iframe - 0.2).abs() < 1e-6);
+
+        for _ in 0..4 {
+            runtime.tick(0.05, &mut mobs, resident);
+        }
+        assert!(mobs[0].hurt_iframe <= 1e-5);
+
+        // A full 0.5 s window elapses after ten 0.05 s steps.
+        let mut full = vec![pig_at_origin()];
+        full[0].take_hit(4, attacker_behind()).expect("hit lands");
+        for _ in 0..10 {
+            runtime.tick(0.05, &mut full, resident);
+        }
+        assert_eq!(full[0].hurt_iframe, 0.0);
+        assert_eq!(full[0].hurt, 0.0);
+    }
+
+    #[test]
+    fn non_resident_mob_keeps_iframes_and_knockback_frozen() {
+        let mut runtime = MobRuntime::new(9);
+        let mut mobs = vec![Mob::new(MobKind::Cow, Vec3::new(100.0, 5.0, 0.5), 0.0)];
+        mobs[0].hurt = 0.4;
+        mobs[0].hurt_iframe = 0.4;
+        mobs[0].knockback = Vec3::Z * MOB_KNOCKBACK_SPEED;
+        let snapshot = mobs[0].clone();
+
+        runtime.tick(0.05, &mut mobs, |_| false);
+        assert_eq!(mobs[0], snapshot, "a non-resident mob must freeze entirely");
     }
 }

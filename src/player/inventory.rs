@@ -249,9 +249,11 @@ impl ToolKind {
     pub const fn allowed_tiers(self) -> &'static [ToolTier] {
         match self {
             ToolKind::Bow => &[ToolTier::Wood],
-            ToolKind::Pickaxe | ToolKind::Axe | ToolKind::Shovel | ToolKind::Hoe | ToolKind::Sword => {
-                &[ToolTier::Wood, ToolTier::Stone, ToolTier::Iron]
-            }
+            ToolKind::Pickaxe
+            | ToolKind::Axe
+            | ToolKind::Shovel
+            | ToolKind::Hoe
+            | ToolKind::Sword => &[ToolTier::Wood, ToolTier::Stone, ToolTier::Iron],
         }
     }
 }
@@ -2168,7 +2170,13 @@ mod tests {
         // constructors and surface as TierNotAllowed, never InvalidDurability.
         for tier in [ToolTier::Stone, ToolTier::Iron] {
             assert_eq!(
-                Item::new(ItemId::Tool { kind: ToolKind::Bow, tier }, 1),
+                Item::new(
+                    ItemId::Tool {
+                        kind: ToolKind::Bow,
+                        tier
+                    },
+                    1
+                ),
                 Err(ItemError::TierNotAllowed)
             );
             assert_eq!(
@@ -3379,9 +3387,7 @@ mod tests {
             // sword recipe.
             let mut packed = CraftingGrid::new(GridKind::Player);
             for (index, id) in ids.into_iter().enumerate() {
-                packed
-                    .set(index, Some(item(id, 1)))
-                    .expect("player cell");
+                packed.set(index, Some(item(id, 1))).expect("player cell");
             }
             assert_eq!(
                 packed.preview(),
@@ -3407,8 +3413,7 @@ mod tests {
             .expect("first head cell");
         grid.set(2 * dim + 1, Some(block(BlockId::OakPlanks, 1)))
             .expect("second head cell");
-        grid.set(3 * dim + 1, Some(stick(1)))
-            .expect("handle cell");
+        grid.set(3 * dim + 1, Some(stick(1))).expect("handle cell");
         assert_eq!(
             grid.preview().map(|preview| preview.recipe),
             Some(RecipeId::WoodSword)
@@ -3460,10 +3465,7 @@ mod tests {
         assert_eq!(planks.id(), ItemId::Block(BlockId::OakPlanks));
         assert_eq!(planks.count(), 4);
         assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
-        assert_eq!(
-            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
-            4
-        );
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakPlanks)), 4);
         assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 0);
         assert!(player.is_empty());
 
@@ -3544,10 +3546,7 @@ mod tests {
         // Conservation: the log and both head planks are gone, the handle
         // consumed exactly one stick, and the sword is the only new stack.
         assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
-        assert_eq!(
-            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
-            0
-        );
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakPlanks)), 0);
         assert_eq!(
             total_of(&inventory, ItemId::Material(Material::Stick)),
             3,
