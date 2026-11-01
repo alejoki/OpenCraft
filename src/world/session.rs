@@ -31,7 +31,7 @@ use crate::world::daycycle::GameClock;
 use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
-use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobTick};
+use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
@@ -557,12 +557,13 @@ impl WorldSession {
     /// Pushes an already-built arrow into the session list, returning its
     /// index.
     ///
-    /// This is the shared spawn seam S08 reuses for skeleton arrows. It
-    /// refuses (and mutates nothing) when the arrow is already
-    /// [`Arrow::finished`] — a lifetime already spent, or non-finite
-    /// position/velocity — or when the list is at [`ARROW_CAP`]. Embedded
-    /// arrows count toward the cap until they expire, so the cap bounds both
-    /// motion and render work.
+    /// The shared spawn seam for both the player's bow and skeleton arrows
+    /// (S08): [`WorldSession::apply_mob_shots`] funnels every decided shot
+    /// through here rather than pushing into the list itself. It refuses (and
+    /// mutates nothing) when the arrow is already [`Arrow::finished`] — a
+    /// lifetime already spent, or non-finite position/velocity — or when the
+    /// list is at [`ARROW_CAP`]. Embedded arrows count toward the cap until
+    /// they expire, so the cap bounds both motion and render work.
     pub fn spawn_arrow(&mut self, arrow: Arrow) -> Option<usize> {
         if arrow.finished() || self.arrows.len() >= ARROW_CAP {
             return None;
@@ -1037,11 +1038,13 @@ impl WorldSession {
             )
         };
         // Fixed order: move -> age the player's combat timers by the steps that
-        // actually executed -> apply the damage those steps decided ->
-        // spawn/cull. A zero-step or paused frame returns above, so it can
-        // neither age the i-frame window nor damage the player.
+        // actually executed -> apply the melee damage those steps decided ->
+        // spawn the arrows those steps decided -> spawn/cull. A zero-step or
+        // paused frame returns above, so it can neither age the i-frame window,
+        // damage the player, nor emit a shot.
         self.player.combat.advance(report.ai_steps);
         self.apply_mob_attacks(&report.attacks);
+        self.apply_mob_shots(&report.shots);
         {
             // Same split-borrow shape as the AI driver above: `world` is
             // immutable while the runtime and the mob list are mutable.
@@ -1079,7 +1082,8 @@ impl WorldSession {
     /// The cause is the literal [`DamageCause::Zombie`] because this seam is
     /// mob melee only: [`MobKind::attack_profile`] already returns `None` for
     /// every kind without a melee attack, so a Skeleton attack applies
-    /// nothing. S08 extends the attack payload for skeleton arrows.
+    /// nothing. Skeleton arrows are a disjoint payload applied by
+    /// [`WorldSession::apply_mob_shots`], never through this seam.
     pub fn apply_mob_attacks(&mut self, attacks: &[MobAttack]) -> u16 {
         if self.player.mode() != GameMode::Survival {
             return 0;
@@ -1106,6 +1110,40 @@ impl WorldSession {
             }
         }
         0
+    }
+
+    /// Turns the ranged shot decisions of [`WorldSession::tick_mobs`] into
+    /// real skeleton arrows through the shared spawn seam.
+    ///
+    /// This is the **single** place a skeleton shot enters the projectile
+    /// list; the AI emits geometry only ([`MobShot`]) and this method owns the
+    /// conversion to [`Arrow::skeleton`], so the 28 b/s / 2 damage pair and
+    /// every ballistics rule stay in the projectile domain. Returns the number
+    /// of arrows actually pushed.
+    ///
+    /// The Creative guard mirrors [`WorldSession::apply_mob_attacks`], the
+    /// second of the two Creative authority sites: a non-Survival player
+    /// spawns nothing and the return is `0`. That is defense in depth — the
+    /// closed target build in `tick_mobs` already emits no shots.
+    ///
+    /// Refusals are inherited, never re-implemented: a shot whose geometry
+    /// [`Arrow::skeleton`] rejects, a finished arrow, and the [`ARROW_CAP`]
+    /// ceiling all simply do not count. One refused shot never stops the
+    /// remaining shots in the same slice from being applied.
+    pub fn apply_mob_shots(&mut self, shots: &[MobShot]) -> u32 {
+        if self.player.mode() != GameMode::Survival {
+            return 0;
+        }
+        let mut spawned: u32 = 0;
+        for shot in shots {
+            let Some(arrow) = Arrow::skeleton(shot.origin, shot.dir) else {
+                continue;
+            };
+            if self.spawn_arrow(arrow).is_some() {
+                spawned = spawned.saturating_add(1);
+            }
+        }
+        spawned
     }
 
     /// Tills a live `Grass` or `Dirt` block into `Farmland` when a Hoe is
@@ -6266,6 +6304,188 @@ mod tests {
         assert_eq!(tick.player_hits, 0);
         assert_eq!(tick.player_damage, 0);
         assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert!(session.arrows().is_empty(), "the inert hit still spends it");
+    }
+
+    // -- Skeleton shot seam (S08-T02) --------------------------------------
+
+    /// A Survival session with one Skeleton `distance` blocks in front of the
+    /// player on an all-air resident chunk, inside its 5..=12 fire band.
+    /// Ambient spawning is closed so the mob list is exactly the fixture.
+    fn skeleton_shot_session(seed: u32, distance: f32) -> WorldSession {
+        let mut session = arrow_survival_session(seed);
+        session.mobs_mut().push(Mob::new(
+            MobKind::Skeleton,
+            Vec3::new(8.5, 5.0, 8.5 + distance),
+            0.0,
+        ));
+        session
+    }
+
+    /// A synthetic geometry-only decision, used to exercise the session seam
+    /// without depending on the brain's aggro state.
+    fn skeleton_shot(origin: Vec3, dir: Vec3) -> MobShot {
+        MobShot {
+            kind: MobKind::Skeleton,
+            origin,
+            dir,
+        }
+    }
+
+    #[test]
+    fn tick_mobs_spawns_one_skeleton_arrow_at_the_pinned_pair() {
+        let mut session = skeleton_shot_session(81, 6.0);
+
+        let tick = session.tick_mobs(0.05, 1.0);
+
+        assert_eq!(tick.ai_steps, 1);
+        assert!(tick.attacks.is_empty(), "a skeleton never melees");
+        assert_eq!(tick.shots.len(), 1, "one step, one decided shot");
+        assert_eq!(tick.shots[0].kind, MobKind::Skeleton);
+        assert_eq!(session.arrows().len(), 1, "the seam spawns the arrow");
+
+        let arrow = session.arrows()[0];
+        assert_eq!(arrow.owner, ArrowOwner::Skeleton);
+        assert_eq!(arrow.damage, 2, "skeleton arrows are the pinned pair");
+        assert!(
+            (arrow.velocity.length() - 28.0).abs() < 1e-3,
+            "skeleton arrows fly at 28 b/s, got {}",
+            arrow.velocity.length()
+        );
+        assert_eq!(arrow.state, ArrowState::Flying);
+    }
+
+    #[test]
+    fn no_shots_without_survival_or_time() {
+        // Creative: the target build emits nothing, and the explicit seam
+        // guard refuses a shot produced anywhere else.
+        let mut creative = WorldSession::new_session(
+            82,
+            PathBuf::from("/tmp/session-skeleton-shots-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        add_resident_air(&mut creative);
+        creative.set_ambient_spawning(false);
+        creative.player.position = Vec3::new(8.5, 5.0, 8.5);
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, Vec3::new(8.5, 5.0, 14.5), 0.0));
+        for _ in 0..10 {
+            assert!(creative.tick_mobs(0.05, 1.0).shots.is_empty());
+        }
+        assert!(creative.arrows().is_empty());
+        assert_eq!(
+            creative.apply_mob_shots(&[skeleton_shot(Vec3::new(8.5, 6.53, 14.5), -Vec3::Z)]),
+            0,
+            "Creative refuses the seam even for an externally built shot"
+        );
+        assert!(creative.arrows().is_empty());
+
+        // Closed hostile gate: no target, so no shot decision at all.
+        let mut gated = skeleton_shot_session(83, 6.0);
+        gated.set_hostile_ai_enabled(false);
+        for _ in 0..10 {
+            assert!(gated.tick_mobs(0.05, 1.0).shots.is_empty());
+        }
+        assert!(gated.arrows().is_empty());
+
+        // Paused / degenerate frames return before the AI and the seam.
+        let mut frozen = skeleton_shot_session(84, 6.0);
+        assert!(frozen.tick_mobs(0.0, 1.0).shots.is_empty());
+        assert!(frozen.tick_mobs(0.05, 0.0).shots.is_empty());
+        assert!(frozen.tick_mobs(0.05, -2.0).shots.is_empty());
+        assert!(frozen.tick_mobs(f32::NAN, 1.0).shots.is_empty());
+        assert!(frozen.tick_mobs(-1.0, 1.0).shots.is_empty());
+        assert!(frozen.arrows().is_empty());
+    }
+
+    #[test]
+    fn the_arrow_cap_refuses_skeleton_shots_without_mutating_the_list() {
+        let mut session = skeleton_shot_session(85, 6.0);
+        let filler = Arrow::skeleton(shot_origin(), Vec3::Z).expect("skeleton filler");
+        while session.arrows().len() < ARROW_CAP {
+            assert!(session.spawn_arrow(filler).is_some());
+        }
+        assert_eq!(session.arrows().len(), ARROW_CAP);
+
+        let spawned =
+            session.apply_mob_shots(&[skeleton_shot(Vec3::new(8.5, 6.53, 14.5), -Vec3::Z)]);
+
+        assert_eq!(spawned, 0, "a full list accepts no new shot");
+        assert_eq!(
+            session.arrows().len(),
+            ARROW_CAP,
+            "a refused shot mutates nothing"
+        );
+    }
+
+    #[test]
+    fn a_skeleton_arrow_inside_its_owners_box_never_hits_the_owner() {
+        let mut session = skeleton_shot_session(86, 6.0);
+        let owner = session.mobs()[0].position;
+        let health = session.mobs()[0].health;
+        let arrow =
+            Arrow::skeleton(owner + Vec3::new(0.0, 0.5, 0.0), Vec3::Z).expect("point-blank arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.05, 1.0);
+
+        assert_eq!(tick.mob_hits, 0, "the owner is never its own target");
+        assert_eq!(session.mobs()[0].health, health);
+        assert_eq!(session.mobs()[0].state, MobAiState::Wander);
+    }
+
+    #[test]
+    fn one_tick_mobs_and_tick_arrows_pass_lands_one_skeleton_arrow_hit() {
+        let mut session = skeleton_shot_session(87, 6.0);
+        let health = session.player.survival.health();
+
+        let fired = session.tick_mobs(0.05, 1.0);
+        assert_eq!(fired.shots.len(), 1, "the brain decides, the seam spawns");
+        assert_eq!(session.arrows().len(), 1);
+
+        let mut hits = 0u32;
+        let mut damage = 0u16;
+        for _ in 0..20 {
+            let tick = session.tick_arrows(0.05, 1.0);
+            hits += tick.player_hits;
+            damage += tick.player_damage;
+        }
+
+        assert_eq!(hits, 1, "the arc lands exactly one hit");
+        assert_eq!(damage, 2);
+        assert_eq!(session.player.survival.health(), health - 2);
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::SkeletonArrow)
+        );
+        assert!(session.arrows().is_empty(), "the hit spends the arrow");
+    }
+
+    #[test]
+    fn a_dead_player_emits_no_shots_and_takes_no_arrow_damage() {
+        let mut session = skeleton_shot_session(88, 6.0);
+        session.player.survival.damage(20);
+        assert!(session.is_dead());
+
+        for _ in 0..10 {
+            assert!(
+                session.tick_mobs(0.05, 1.0).shots.is_empty(),
+                "a dead player is never a target, so nothing is fired"
+            );
+        }
+        assert!(session.arrows().is_empty());
+
+        // An arrow already in flight is still swept and spent, but the combat
+        // authority refuses the damage.
+        let arrow = Arrow::skeleton(Vec3::new(8.5, 5.5, 6.5), Vec3::Z).expect("skeleton arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.player_hits, 0);
+        assert_eq!(tick.player_damage, 0);
+        assert_eq!(session.player.survival.health(), 0);
         assert_eq!(session.last_damage_cause(), None);
         assert!(session.arrows().is_empty(), "the inert hit still spends it");
     }

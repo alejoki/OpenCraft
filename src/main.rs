@@ -12786,6 +12786,12 @@ mod tests {
                 spawn.z.floor() as i32,
             ),
         );
+        // Mirror the production scripted startup: the pinned quartet sits
+        // inside the 16-block aggro, so hostile AI stays off until the
+        // dedicated Hostile stage reopens it. Without this parity the new
+        // skeleton shot seam (S08-T02) fires during Walk and leaves arrows for
+        // the Shot stage's empty-list pin.
+        session.set_hostile_ai_enabled(false);
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session), "settle");
