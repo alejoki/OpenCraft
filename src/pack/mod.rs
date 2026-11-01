@@ -5,11 +5,12 @@
 //!
 //! The [`LoadedPack`] contract is the boundary later slices consume: it always
 //! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
-//! RGBA layers plus optional presentation data. Layers 0..=[`AUTHORABLE_TEX_LAYERS`]
-//! - 1 are block art from [`LAYER_FILES`], layers 23..=31 are reserved block
-//! placeholders, layers 32..=44 are mob part art from [`MOB_LAYER_FILES`], and
-//! layers 45..=47 are reserved spares. Loading never fails and never panics on
-//! bad input; every fallback is reported as a structured [`SettingsWarning`].
+//! RGBA layers plus optional presentation data. The first
+//! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layers
+//! 23..=31 are reserved block placeholders, layers 32..=44 are mob part art
+//! from [`MOB_LAYER_FILES`], and layers 45..=47 are reserved spares. Loading
+//! never fails and never panics on bad input; every fallback is reported as a
+//! structured [`SettingsWarning`].
 
 use std::path::Path;
 

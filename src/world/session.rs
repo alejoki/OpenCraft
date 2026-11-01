@@ -3545,12 +3545,11 @@ mod tests {
     }
 
     fn make_mob_session(seed: u32) -> WorldSession {
-        let session = WorldSession::new_session(
+        WorldSession::new_session(
             seed,
             PathBuf::from("/tmp/session-mobs.mcvx"),
             DEFAULT_SEASON_LENGTH_DAYS,
-        );
-        session
+        )
     }
 
     fn add_resident_air(session: &mut WorldSession) {
@@ -3637,11 +3636,9 @@ mod tests {
         session
             .mobs_mut()
             .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0));
-        session.mobs_mut().push(Mob::new(
-            MobKind::Skeleton,
-            Vec3::new(-8.5, 5.0, -8.5),
-            0.0,
-        ));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, Vec3::new(-8.5, 5.0, -8.5), 0.0));
         session
             .mobs_mut()
             .push(Mob::new(MobKind::Cow, Vec3::new(33.5, 5.0, 8.5), 0.0));
@@ -3661,11 +3658,9 @@ mod tests {
         session
             .mobs_mut()
             .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0));
-        session.mobs_mut().push(Mob::new(
-            MobKind::Zombie,
-            Vec3::new(100.5, 5.0, 100.5),
-            0.0,
-        ));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, Vec3::new(100.5, 5.0, 100.5), 0.0));
         session.mobs_mut()[0].hurt = 0.2;
         session.mobs_mut()[1].hurt = 0.2;
 
@@ -3682,11 +3677,9 @@ mod tests {
         let mut session = make_mob_session(36);
         add_resident_air(&mut session);
         for (i, kind) in MobKind::ALL.iter().copied().enumerate() {
-            session.mobs_mut().push(Mob::new(
-                kind,
-                Vec3::new(8.5 + i as f32, 5.0, 8.5),
-                0.0,
-            ));
+            session
+                .mobs_mut()
+                .push(Mob::new(kind, Vec3::new(8.5 + i as f32, 5.0, 8.5), 0.0));
         }
         for _ in 0..100 {
             session.tick_mobs(0.05, 1.0);

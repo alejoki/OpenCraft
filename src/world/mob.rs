@@ -288,7 +288,7 @@ impl MobRuntime {
             mob.velocity = Vec3::ZERO;
         }
 
-        if self.tick_index % YAW_REROLL_STEPS == 0 {
+        if self.tick_index.is_multiple_of(YAW_REROLL_STEPS) {
             let roll = mob_roll(self.seed, self.tick_index, slot);
             let unit = (roll & 0xFFFF) as f32 / 65_535.0;
             mob.yaw = unit * std::f32::consts::TAU;

@@ -92,7 +92,7 @@ fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
 /// layer. Opposing shades keep it opaque and visibly distinct from real art.
 fn reserved_checker(index: u32) -> Vec<u8> {
     make_layer(100 + index, move |x, y, j| {
-        if (x / 2 + y / 2 + index) % 2 == 0 {
+        if (x / 2 + y / 2 + index).is_multiple_of(2) {
             [
                 clamp_u8(236 + j / 4),
                 clamp_u8(32 + j / 4),
@@ -349,7 +349,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
     // 23..32: reserved block layers. They are not authorable (no pack file
     // name maps to them). A deterministic magenta checker, offset per layer,
     // keeps each one opaque and visibly distinct from every authored layer.
-    layers.extend((23..MOB_LAYER_BASE).map(|index| reserved_checker(index)));
+    layers.extend((23..MOB_LAYER_BASE).map(reserved_checker));
 
     // 32..=44: the 13 authorable mob part layers, in `MOB_LAYER_FILES` order.
     // Each is deterministic, opaque (make_layer forces alpha 255), and
@@ -493,7 +493,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
     ]);
 
     // 45..48: reserved spare layers, same magenta checker rule as 23..32.
-    layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(|index| reserved_checker(index)));
+    layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(reserved_checker));
 
     debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
     debug_assert_eq!(
