@@ -7,9 +7,9 @@
 //!
 //! Every table is a fixed list of `(item, count)` pairs, so a kill is
 //! deterministic: there is no RNG, no ranged roll, and no wall clock in this
-//! module. S06 adds the zombie table and S08 the skeleton table to this same
-//! module, which is why both hostile tables exist here already as empty
-//! arrays rather than being absent.
+//! module. S06 fills the zombie table (one rotten flesh) and S08 still owns
+//! the skeleton table, which stays an empty array here rather than being
+//! absent.
 //!
 //! [`MobKind::ALL`] is four kinds today; [`mob_drops`] matches every one so a
 //! new kind is a compile error instead of a silent empty drop.
@@ -25,6 +25,7 @@ pub enum MobDropItem {
     RawPorkchop,
     RawBeef,
     Leather,
+    RottenFlesh,
 }
 
 /// What caused a mob's death, as far as drop attribution is concerned.
@@ -97,8 +98,11 @@ static COW_DROPS: [MobDrop; 2] = [
     MobDrop::new(MobDropItem::Leather, 2),
 ];
 
-/// Zombie drops stay empty until S06 fills them in.
-static ZOMBIE_DROPS: [MobDrop; 0] = [];
+/// Zombie drops: exactly one rotten flesh.
+///
+/// One unit, not a range: a kill is deterministic and the count has to fit a
+/// material stack, so the drop path needs no RNG and no overflow rule.
+static ZOMBIE_DROPS: [MobDrop; 1] = [MobDrop::new(MobDropItem::RottenFlesh, 1)];
 
 /// Skeleton drops stay empty until S08 fills them in.
 static SKELETON_DROPS: [MobDrop; 0] = [];
@@ -169,6 +173,19 @@ mod tests {
     }
 
     #[test]
+    fn zombie_drops_exactly_one_rotten_flesh() {
+        assert_eq!(
+            mob_drops(MobKind::Zombie),
+            [expected(MobDropItem::RottenFlesh, 1)]
+        );
+    }
+
+    #[test]
+    fn skeleton_table_stays_empty_until_s08() {
+        assert!(mob_drops(MobKind::Skeleton).is_empty());
+    }
+
+    #[test]
     fn every_pinned_count_is_a_valid_material_stack() {
         for kind in MobKind::ALL {
             for drop in mob_drops(kind) {
@@ -183,9 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn hostile_tables_are_empty_until_their_slices() {
-        assert!(mob_drops(MobKind::Zombie).is_empty());
-        assert!(mob_drops(MobKind::Skeleton).is_empty());
+    fn mob_drops_is_total_over_every_kind() {
+        for kind in MobKind::ALL {
+            // A missing arm would not compile; this pins that every kind is
+            // reachable and that only the hostile skeleton is still empty.
+            let drops = mob_drops(kind);
+            match kind {
+                MobKind::Pig | MobKind::Cow | MobKind::Zombie => assert!(!drops.is_empty()),
+                MobKind::Skeleton => assert!(drops.is_empty()),
+            }
+        }
     }
 
     #[test]
@@ -203,18 +227,5 @@ mod tests {
         assert_ne!(MobKillCause::Player, MobKillCause::Environment);
         assert_eq!(MobKillCause::Player, MobKillCause::Player);
         assert_eq!(MobKillCause::Environment, MobKillCause::Environment);
-    }
-
-    #[test]
-    fn mob_drops_is_total_over_every_kind() {
-        for kind in MobKind::ALL {
-            // A missing arm would not compile; this pins that every kind is
-            // reachable and that only the passive kinds drop anything yet.
-            let drops = mob_drops(kind);
-            match kind {
-                MobKind::Pig | MobKind::Cow => assert!(!drops.is_empty()),
-                MobKind::Zombie | MobKind::Skeleton => assert!(drops.is_empty()),
-            }
-        }
     }
 }

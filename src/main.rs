@@ -43,9 +43,9 @@ use opencraft::ui::chest::{
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
 };
 use opencraft::ui::hud::{
-    eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects,
-    mining_progress_quads, selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE,
-    HOTBAR_COUNT_LINE_HEIGHT,
+    damage_flash_quad, eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin,
+    hotbar_slot_rects, mining_progress_quads, selected_item_label, vitals_quads,
+    HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -1321,15 +1321,25 @@ fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
 /// live eye submersion and hands the player's vitals and effective mode to the
 /// pure [`vitals_quads`]. Only the Playing block calls it — menu, pause, and
 /// death screens never draw the Survival HUD.
+///
+/// The red damage flash is appended AFTER the vitals quads so it tints the HUD
+/// too, and it is drawn only while the player's hurt timer is live: a
+/// quiescent player yields the vitals quads alone. Creative yields nothing at
+/// all, because `vitals_quads` is structurally empty there and a Creative
+/// player can never arm the hurt timer (mob damage is refused).
 fn playing_hud_quads(session: &WorldSession, surface_w: u32, surface_h: u32) -> Vec<Quad> {
     let head_submerged = eye_is_submerged(&session.world, session.camera.position);
-    vitals_quads(
+    let mut quads = vitals_quads(
         &session.player.survival,
         session.player.mode(),
         head_submerged,
         surface_w,
         surface_h,
-    )
+    );
+    if let Some(flash) = damage_flash_quad(session.player_hurt_intensity(), surface_w, surface_h) {
+        quads.push(flash);
+    }
+    quads
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -18451,6 +18461,126 @@ mod tests {
                 .count(),
             30,
             "hearts + hunger + air backgrounds"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S06-T04: the red damage flash quad on the Playing frame
+    // -----------------------------------------------------------------------
+
+    /// A Survival hit arms the player's hurt timer, so the Playing frame draws
+    /// one extra full-surface translucent red quad AFTER the vitals quads; a
+    /// healed player draws the vitals alone and Creative draws nothing.
+    #[test]
+    fn playing_hud_quads_draws_the_damage_flash_only_while_hurt() {
+        use opencraft::player::combat::DamageCause;
+        use opencraft::ui::hud::{DAMAGE_FLASH_ALPHA, HEART_FILL_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("hurt-flash.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        let baseline = playing_hud_quads(&session, 1280, 720).len();
+        assert_eq!(
+            baseline, 40,
+            "full vitals draw ten heart pairs plus ten hunger pairs"
+        );
+        assert_eq!(
+            session.player_hurt_intensity(),
+            0.0,
+            "a fresh session has no flash"
+        );
+
+        let feet = session.player.position;
+        let hit = session.player.combat.take_hit(
+            &mut session.player.survival,
+            3,
+            GameMode::Survival,
+            DamageCause::Zombie,
+            feet,
+            feet + Vec3::Z,
+        );
+        assert!(hit.is_some(), "a Survival hit must land");
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            quads.len(),
+            40,
+            "the hurt frame is 39 vitals quads (17 hp) plus one flash quad"
+        );
+        let flash = quads.last().expect("the flash is appended last");
+        assert_eq!(flash.x, 0.0);
+        assert_eq!(flash.y, 0.0);
+        assert_eq!(flash.w, 1280.0, "the flash covers the surface width");
+        assert_eq!(flash.h, 720.0, "the flash covers the surface height");
+        assert_eq!(
+            flash.color[3], DAMAGE_FLASH_ALPHA,
+            "a fresh hit draws at peak alpha"
+        );
+        assert!(flash.color[3] > 0.0, "the flash is visible");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.w == 1280.0 && quad.h == 720.0)
+                .count(),
+            1,
+            "exactly one full-surface quad (the flash) is drawn"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .count(),
+            9,
+            "the 3-damage hit leaves 17 hp, so nine and a half hearts draw"
+        );
+
+        // Age the flash through the production fixed-step carrier: 12 steps of
+        // 0.05 s is past the 0.5 s window.
+        session.player.combat.advance(12);
+        assert_eq!(session.player_hurt_intensity(), 0.0, "the flash expires");
+        let healed = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            healed.len(),
+            39,
+            "17 hp draws nine heart fills plus ten hunger pairs"
+        );
+        assert!(
+            healed
+                .iter()
+                .all(|quad| quad.w != 1280.0 || quad.h != 720.0),
+            "a healed player draws only the vitals quads"
+        );
+
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("hurt-flash-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        let feet = creative.player.position;
+        assert!(
+            creative
+                .player
+                .combat
+                .take_hit(
+                    &mut creative.player.survival,
+                    3,
+                    GameMode::Creative,
+                    DamageCause::Zombie,
+                    feet,
+                    feet + Vec3::Z,
+                )
+                .is_none(),
+            "Creative can never be hurt"
+        );
+        assert!(
+            playing_hud_quads(&creative, 1280, 720).is_empty(),
+            "Creative draws neither vitals nor a flash"
         );
     }
 

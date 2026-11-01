@@ -13,6 +13,7 @@ use glam::{IVec3, Vec3};
 
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
+use crate::player::combat::DamageCause;
 use crate::player::container::Container;
 use crate::player::inventory::{
     ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, CHEST_SLOTS,
@@ -30,7 +31,7 @@ use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobTick};
-use crate::world::mob_ai::MobTarget;
+use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
@@ -116,6 +117,16 @@ pub struct WorldSession {
     /// stay the *world* spawn: it deliberately does not follow the player, the
     /// Edit Background anchor, or a saved player position.
     world_spawn: Vec3,
+    /// The single ambient cause writer for the last player damage event.
+    ///
+    /// Ephemeral and **never persisted** (the v7 wire format has no cause
+    /// byte): a loaded dead save therefore has no cause and the Death screen
+    /// renders "Unknown". Written in exactly two places —
+    /// [`WorldSession::apply_mob_attacks`] (always `Zombie`, the mob-melee
+    /// seam) and [`WorldSession::tick_survival`] (the survival rules' own
+    /// `Fall`/`Drowning`/`Starvation`) — and cleared by
+    /// [`WorldSession::respawn`]. Two writers, never two authorities.
+    last_damage_cause: Option<DamageCause>,
 }
 
 impl WorldSession {
@@ -170,6 +181,9 @@ impl WorldSession {
             hostile_ai: true,
             spawn_runtime: SpawnRuntime::new(),
             world_spawn,
+            // A fresh session has taken no damage: no cause is recorded, so a
+            // Death screen can never name a cause the player did not earn.
+            last_damage_cause: None,
         };
         session.sync_camera();
         session
@@ -223,6 +237,7 @@ impl WorldSession {
             // protect the seed's deterministic spawn pad, so a load pays the
             // same single pure land search a fresh session already pays.
             world_spawn: Self::spawn_position(seed),
+            last_damage_cause: None,
         };
         session.sync_camera();
         session
@@ -326,6 +341,9 @@ impl WorldSession {
             // must protect the seed's deterministic spawn pad, exactly like
             // `new_at`. One pure land search at construction is the cost.
             world_spawn: Self::spawn_position(seed),
+            // The cause is deliberately NOT restored: it has no wire byte, so
+            // a loaded dead save starts causeless and renders "Unknown".
+            last_damage_cause: None,
         };
         session.sync_camera();
         session
@@ -391,8 +409,19 @@ impl WorldSession {
             head_submerged,
             fall_distance: self.player.take_landing_fall(),
         };
-        self.survival_runtime
-            .tick(&mut self.player.survival, ctx, game_dt)
+        let tick = self
+            .survival_runtime
+            .tick(&mut self.player.survival, ctx, game_dt);
+        // The survival rules are the ONLY writers of the `Fall`/`Drowning`/
+        // `Starvation` causes (the mob-melee seam is the only writer of
+        // `Zombie`). A tick that applied no damage never touches the tag, so an
+        // idle tick leaves the last real cause intact.
+        if tick.damage > 0 {
+            if let Some(cause) = tick.cause {
+                self.last_damage_cause = Some(cause);
+            }
+        }
+        tick
     }
 
     /// The session's flat mob list (D131). Renderer and diagnostics read it.
@@ -543,6 +572,28 @@ impl WorldSession {
         self.world_spawn
     }
 
+    /// The ambient cause of the last player damage event, or `None` when the
+    /// player has taken no damage since construction or respawn.
+    ///
+    /// Ephemeral: never persisted, so a restored session always starts `None`
+    /// even if it was saved dead. The Death screen renders
+    /// [`crate::player::combat::DamageCause::label`] when this is `Some` and
+    /// "Unknown" otherwise.
+    #[inline]
+    pub fn last_damage_cause(&self) -> Option<DamageCause> {
+        self.last_damage_cause
+    }
+
+    /// The player's current red damage-flash intensity in `0.0..=1.0`.
+    ///
+    /// Delegates to the pure [`crate::player::combat::PlayerCombat`] carrier,
+    /// so the HUD and the demo read the same number the physics integration
+    /// uses. Exactly `0.0` when no flash is active.
+    #[inline]
+    pub fn player_hurt_intensity(&self) -> f32 {
+        self.player.combat.hurt_intensity()
+    }
+
     /// Whether the population layer may create mobs and burn them in daylight.
     ///
     /// The distance cull is **not** covered by this gate: a record that drifts
@@ -658,6 +709,12 @@ impl WorldSession {
                 world,
             )
         };
+        // Fixed order: move -> age the player's combat timers by the steps that
+        // actually executed -> apply the damage those steps decided ->
+        // spawn/cull. A zero-step or paused frame returns above, so it can
+        // neither age the i-frame window nor damage the player.
+        self.player.combat.advance(report.ai_steps);
+        self.apply_mob_attacks(&report.attacks);
         {
             // Same split-borrow shape as the AI driver above: `world` is
             // immutable while the runtime and the mob list are mutable.
@@ -675,6 +732,53 @@ impl WorldSession {
         }
         self.retain_live_mobs();
         report
+    }
+
+    /// Applies the melee attacks decided by [`WorldSession::tick_mobs`].
+    ///
+    /// This is the **single** place a mob may change the player's health, and
+    /// the second of exactly two Creative authority sites (the first is the
+    /// target build inside `tick_mobs`; S09 pins both). A non-Survival player
+    /// returns `0` immediately and records no cause, so Creative can never be
+    /// hurt by a mob even if an attack list were produced some other way.
+    ///
+    /// Attacks are consumed in order and **at most one lands per call**: the
+    /// first accepted hit opens the player's 0.5 s i-frame window, so every
+    /// later attack in the same slice is refused by
+    /// [`crate::player::combat::PlayerCombat::take_hit`]. That is exactly the
+    /// "one hit per i-frame window, no matter how many zombies are adjacent"
+    /// rule. Returns the damage actually applied (`0` when nothing landed).
+    ///
+    /// The cause is the literal [`DamageCause::Zombie`] because this seam is
+    /// mob melee only: [`MobKind::attack_profile`] already returns `None` for
+    /// every kind without a melee attack, so a Skeleton attack applies
+    /// nothing. S08 extends the attack payload for skeleton arrows.
+    pub fn apply_mob_attacks(&mut self, attacks: &[MobAttack]) -> u16 {
+        if self.player.mode() != GameMode::Survival {
+            return 0;
+        }
+        for attack in attacks {
+            let Some(profile) = attack.kind.attack_profile() else {
+                continue;
+            };
+            // Read the player's own state BEFORE the disjoint mutable borrows
+            // of `combat` and `survival` below.
+            let mode = self.player.mode();
+            let feet = self.player.position;
+            let applied = self.player.combat.take_hit(
+                &mut self.player.survival,
+                profile.damage,
+                mode,
+                DamageCause::Zombie,
+                feet,
+                attack.from,
+            );
+            if let Some(applied) = applied {
+                self.last_damage_cause = Some(DamageCause::Zombie);
+                return applied.damage;
+            }
+        }
+        0
     }
 
     /// Tills a live `Grass` or `Dirt` block into `Farmland` when a Hoe is
@@ -859,6 +963,11 @@ impl WorldSession {
         self.player.on_ground = false;
         self.player.survival = SurvivalState::full();
         self.player.arm_spawn_immunity();
+        // The player respawns unhurt: the flash, the i-frame window, and the
+        // knockback impulse all clear, and the ambient cause is forgotten so a
+        // new death cannot inherit the previous one's label.
+        self.player.combat.reset();
+        self.last_damage_cause = None;
         self.survival_runtime.reset();
         self.spawn_settle = true;
         for mob in &mut self.mobs {
@@ -4117,6 +4226,260 @@ mod tests {
         assert!((a.mobs()[0].cooldown - b.mobs()[0].cooldown).abs() < 1e-5);
     }
 
+    // -----------------------------------------------------------------------
+    // S06-T04: session damage authority, causes, and the hurt flash
+    // -----------------------------------------------------------------------
+
+    fn zombie_attack(from: Vec3) -> MobAttack {
+        MobAttack {
+            kind: MobKind::Zombie,
+            from,
+        }
+    }
+
+    #[test]
+    fn zombie_melee_applies_three_and_records_the_zombie_cause() {
+        let mut session = survival_hostile_session(51, MobKind::Zombie);
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+
+        let applied = session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]);
+
+        assert_eq!(applied, 3, "a zombie hit is exactly 3 damage");
+        assert_eq!(session.player.survival.health(), health - 3);
+        assert_eq!(session.last_damage_cause(), Some(DamageCause::Zombie));
+        assert!(session.player_hurt_intensity() > 0.0, "the flash is armed");
+    }
+
+    #[test]
+    fn a_second_slice_inside_the_iframe_window_applies_nothing() {
+        let mut session = survival_hostile_session(52, MobKind::Zombie);
+        let feet = session.player.position;
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        let health = session.player.survival.health();
+
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            0,
+            "the 0.5 s i-frame window refuses the second slice"
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::Zombie),
+            "a refused hit never rewrites the cause"
+        );
+    }
+
+    #[test]
+    fn two_adjacent_zombies_land_one_hit_per_iframe_window() {
+        let mut session = survival_hostile_session(53, MobKind::Zombie);
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+        let attacks = [zombie_attack(feet + Vec3::Z), zombie_attack(feet - Vec3::Z)];
+
+        assert_eq!(
+            session.apply_mob_attacks(&attacks),
+            3,
+            "two attacks in one slice apply one hit"
+        );
+        assert_eq!(session.player.survival.health(), health - 3);
+    }
+
+    #[test]
+    fn creative_melee_applies_nothing_and_records_no_cause() {
+        let mut session = WorldSession::new_session(
+            54,
+            PathBuf::from("/tmp/session-hostile-creative-damage.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            0
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+    }
+
+    #[test]
+    fn a_dead_player_takes_no_further_melee_damage() {
+        let mut session = survival_hostile_session(55, MobKind::Zombie);
+        session.player.survival.damage(20);
+        assert!(session.is_dead());
+        let feet = session.player.position;
+
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            0
+        );
+        assert_eq!(session.player.survival.health(), 0);
+        assert_eq!(
+            session.last_damage_cause(),
+            None,
+            "a refused hit on a corpse records no cause"
+        );
+    }
+
+    #[test]
+    fn skeleton_attacks_apply_no_melee_damage() {
+        let mut session = survival_hostile_session(56, MobKind::Zombie);
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+        let attack = MobAttack {
+            kind: MobKind::Skeleton,
+            from: feet + Vec3::Z,
+        };
+
+        assert_eq!(
+            session.apply_mob_attacks(&[attack]),
+            0,
+            "Skeleton melee must never exist (S08 owns ranged)"
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.last_damage_cause(), None);
+    }
+
+    #[test]
+    fn tick_mobs_applies_zombie_melee_and_records_the_cause() {
+        let mut session = survival_hostile_session(57, MobKind::Zombie);
+        let health = session.player.survival.health();
+
+        for _ in 0..30 {
+            session.tick_mobs(0.05, 1.0);
+        }
+
+        assert!(
+            session.player.survival.health() < health,
+            "an adjacent zombie must actually damage the player"
+        );
+        assert_eq!(session.last_damage_cause(), Some(DamageCause::Zombie));
+    }
+
+    #[test]
+    fn tick_mobs_at_zero_time_scale_can_neither_age_nor_damage() {
+        let mut session = survival_hostile_session(58, MobKind::Zombie);
+        let feet = session.player.position;
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        let health = session.player.survival.health();
+        let iframe = session.player.combat.iframe();
+
+        for _ in 0..10 {
+            assert_eq!(session.tick_mobs(0.05, 0.0).ai_steps, 0);
+        }
+
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.player.combat.iframe(), iframe);
+    }
+
+    #[test]
+    fn a_restored_session_has_no_damage_cause_even_when_saved_dead() {
+        let mut data = make_save(59);
+        data.mode = GameMode::Survival;
+        data.player.survival = SurvivalState::new(0, 10, FULL_AIR).expect("valid dead vitals");
+
+        let session =
+            WorldSession::session_from_save(data, PathBuf::from("/tmp/session-restored-dead.mcvx"));
+
+        assert!(session.is_dead());
+        assert_eq!(
+            session.last_damage_cause(),
+            None,
+            "the cause is ephemeral: a loaded dead save has none"
+        );
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+    }
+
+    #[test]
+    fn respawn_clears_the_cause_and_every_player_combat_timer() {
+        let mut session = survival_hostile_session(60, MobKind::Zombie);
+        let feet = session.player.position;
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        assert!(session.player.combat.iframe() > 0.0);
+        assert!(session.player.combat.knockback().length_squared() > 0.0);
+
+        session.respawn();
+
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert_eq!(session.player.combat.iframe(), 0.0);
+        assert_eq!(session.player.combat.knockback(), Vec3::ZERO);
+        assert_eq!(session.player.survival, SurvivalState::full());
+        assert_eq!(
+            session.player.position,
+            WorldSession::spawn_position(session.world.seed())
+        );
+    }
+
+    #[test]
+    fn player_hurt_intensity_rises_on_a_hit_and_decays_over_fixed_steps() {
+        let mut session = survival_hostile_session(61, MobKind::Zombie);
+        let feet = session.player.position;
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        assert_eq!(
+            session.player_hurt_intensity(),
+            1.0,
+            "a fresh hit is a full-intensity flash"
+        );
+
+        // Twelve executed fixed steps (> the 0.5 s window) must fully decay it;
+        // the zombie's own 1.0 s cadence keeps it from landing a second hit.
+        let mut steps = 0u32;
+        while steps < 12 {
+            steps += session.tick_mobs(0.05, 1.0).ai_steps;
+        }
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+    }
+
+    #[test]
+    fn tick_survival_records_the_survival_cause_and_keeps_it_across_idle_ticks() {
+        let mut session = survival_session(62);
+        session.player.survival =
+            SurvivalState::new(crate::player::survival::MAX_HEALTH, 0, FULL_AIR)
+                .expect("valid vitals");
+        assert_eq!(session.last_damage_cause(), None);
+
+        let mut damaged = false;
+        for _ in 0..4 {
+            damaged |= session.tick_survival(0.1, 10.0, false).damage > 0;
+        }
+
+        assert!(damaged, "zero hunger must starve after the 4 s interval");
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::Starvation),
+            "the survival rules are the starvation cause writer"
+        );
+
+        assert_eq!(
+            session.tick_survival(0.0, 1.0, false).damage,
+            0,
+            "an idle tick damages nothing"
+        );
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::Starvation),
+            "an idle tick keeps the last real cause"
+        );
+    }
+
     #[test]
     fn respawn_drops_a_live_chase_without_moving_the_body() {
         let mut session = survival_hostile_session(47, MobKind::Zombie);
@@ -4944,7 +5307,7 @@ mod tests {
 
     #[test]
     fn hostile_kind_with_an_empty_table_grants_nothing() {
-        let (mut session, index) = mob_session_with(MobKind::Zombie, 66);
+        let (mut session, index) = mob_session_with(MobKind::Skeleton, 66);
         let hit = lethal_hit(&mut session, index);
 
         assert_eq!(
@@ -4956,7 +5319,7 @@ mod tests {
     }
 
     #[test]
-    fn mob_drop_items_resolves_the_t01_bridge_for_every_passive_kind() {
+    fn mob_drop_items_resolves_the_t01_bridge_for_every_kind() {
         assert_eq!(
             mob_drop_items(MobKind::Pig),
             Some(vec![
@@ -4971,7 +5334,28 @@ mod tests {
                 Item::new(ItemId::Material(Material::Leather), 2).expect("leather"),
             ])
         );
-        assert_eq!(mob_drop_items(MobKind::Zombie), Some(Vec::new()));
+        assert_eq!(
+            mob_drop_items(MobKind::Zombie),
+            Some(vec![
+                Item::new(ItemId::Material(Material::RottenFlesh), 1).expect("rotten flesh"),
+            ])
+        );
         assert_eq!(mob_drop_items(MobKind::Skeleton), Some(Vec::new()));
+    }
+
+    #[test]
+    fn player_zombie_kill_grants_exactly_one_rotten_flesh() {
+        let (mut session, index) = mob_session_with(MobKind::Zombie, 67);
+        let hit = lethal_hit(&mut session, index);
+
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(1, 0));
+        assert!(!report.lost_any());
+        assert_eq!(
+            session.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::RottenFlesh), 1).ok(),
+            "a zombie kill yields one rotten flesh"
+        );
     }
 }

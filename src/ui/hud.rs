@@ -35,6 +35,13 @@ pub const HUNGER_FILL_COLOR: [f32; 4] = [0.95, 0.65, 0.15, 0.95];
 /// Fill color of an air bubble.
 pub const AIR_FILL_COLOR: [f32; 4] = [0.25, 0.6, 0.95, 0.9];
 
+/// Peak alpha of the full-screen red damage flash.
+///
+/// Deliberately translucent: the flash tints the whole frame (HUD included)
+/// without hiding what the player is looking at, and it rides the existing
+/// alpha-blended quad pass, so no new pipeline or texture is needed.
+pub const DAMAGE_FLASH_ALPHA: f32 = 0.35;
+
 /// Icons per vitals row: ten two-point hearts / hunger pips.
 const VITALS_ICON_COUNT: usize = (MAX_HEALTH / 2) as usize;
 /// Full width of one ten-icon vitals row, including its interior gaps.
@@ -276,6 +283,35 @@ pub fn vitals_quads(
     }
 
     quads
+}
+
+/// Build the optional full-screen red damage flash quad for `intensity`.
+///
+/// `intensity` is the player combat carrier's `hurt_intensity()` (the
+/// remaining 0.5 s flash scaled to `0.0..=1.0`). A non-finite or non-positive
+/// intensity returns `None`, so a quiescent or corrupted timer draws nothing
+/// rather than a stray black/NaN rectangle; every other value clamps into
+/// `0.0..=1.0` before it scales [`DAMAGE_FLASH_ALPHA`].
+///
+/// The quad covers the whole surface in physical pixels (`x/y = 0`), the same
+/// coordinate space as every other HUD quad. It is appended after the vitals
+/// quads by the caller, so the tint covers the HUD too.
+pub fn damage_flash_quad(intensity: f32, surface_w: u32, surface_h: u32) -> Option<Quad> {
+    if !intensity.is_finite() || intensity <= 0.0 {
+        return None;
+    }
+    Some(Quad {
+        x: 0.0,
+        y: 0.0,
+        w: surface_w.max(1) as f32,
+        h: surface_h.max(1) as f32,
+        color: [
+            0.8,
+            0.05,
+            0.05,
+            DAMAGE_FLASH_ALPHA * intensity.clamp(0.0, 1.0),
+        ],
+    })
 }
 
 /// One vitals icon: an always-present dark background plus an optional colored
@@ -790,5 +826,60 @@ mod tests {
         for quad in quads {
             assert!(quad.x.is_finite() && quad.y.is_finite());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Damage flash quad (S06-T04)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn damage_flash_is_absent_for_quiescent_and_non_finite_intensities() {
+        for intensity in [0.0, -0.5, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                damage_flash_quad(intensity, 1280, 720).is_none(),
+                "intensity {intensity} must draw nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_flash_covers_the_whole_surface_at_peak_alpha() {
+        let quad = damage_flash_quad(1.0, 1280, 720).expect("a full hit draws the flash");
+        assert_close(quad.x, 0.0, "flash x");
+        assert_close(quad.y, 0.0, "flash y");
+        assert_close(quad.w, 1280.0, "flash w covers the surface");
+        assert_close(quad.h, 720.0, "flash h covers the surface");
+        assert_close(quad.color[3], DAMAGE_FLASH_ALPHA, "peak alpha");
+        assert_close(quad.color[3], 0.35, "pinned peak alpha");
+        for channel in &quad.color[..3] {
+            assert!(
+                (0.0..=1.0).contains(channel),
+                "flash channel {channel} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_flash_intensity_clamps_and_scales_alpha() {
+        let over = damage_flash_quad(5.0, 640, 480).expect("5.0 still draws");
+        assert_close(
+            over.color[3],
+            DAMAGE_FLASH_ALPHA,
+            "above 1.0 clamps to peak alpha",
+        );
+
+        let half = damage_flash_quad(0.5, 640, 480).expect("0.5 draws");
+        assert_close(half.color[3], 0.175, "half intensity is half alpha");
+        assert_close(half.w, 640.0, "half intensity still covers the surface");
+    }
+
+    #[test]
+    fn damage_flash_stays_finite_on_degenerate_surfaces() {
+        let quad = damage_flash_quad(1.0, 0, 0).expect("a zero surface still yields a quad");
+        for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+            assert!(value.is_finite(), "{name} finite on 0x0");
+        }
+        assert_close(quad.w, 1.0, "max(1) keeps the width finite");
+        assert_close(quad.h, 1.0, "max(1) keeps the height finite");
     }
 }

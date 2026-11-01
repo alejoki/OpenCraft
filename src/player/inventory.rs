@@ -382,12 +382,16 @@ impl From<LootItem> for ItemId {
 /// This is the only bridge from [`MobDropItem`] into this module — the world
 /// layer's drop tables never import the player layer (D094). Every mob drop is
 /// a material, so each identity resolves to an [`ItemId::Material`].
+///
+/// The match is exhaustive by construction: a new [`MobDropItem`] variant is a
+/// compile error here until it is given a real item identity.
 impl From<MobDropItem> for ItemId {
     fn from(item: MobDropItem) -> Self {
         match item {
             MobDropItem::RawPorkchop => ItemId::Material(Material::RawPorkchop),
             MobDropItem::RawBeef => ItemId::Material(Material::RawBeef),
             MobDropItem::Leather => ItemId::Material(Material::Leather),
+            MobDropItem::RottenFlesh => ItemId::Material(Material::RottenFlesh),
         }
     }
 }
@@ -2171,11 +2175,25 @@ mod tests {
     fn mob_drop_vocabulary_maps_to_valid_item_identities() {
         use crate::world::mob_loot::MobDropItem;
 
+        // Exhaustive on purpose: adding a `MobDropItem` variant must fail this
+        // test (and the `From` match) until it has a pinned identity.
         let cases = [
             (MobDropItem::RawPorkchop, Material::RawPorkchop),
             (MobDropItem::RawBeef, Material::RawBeef),
             (MobDropItem::Leather, Material::Leather),
+            (MobDropItem::RottenFlesh, Material::RottenFlesh),
         ];
+        let every_variant = [
+            MobDropItem::RawPorkchop,
+            MobDropItem::RawBeef,
+            MobDropItem::Leather,
+            MobDropItem::RottenFlesh,
+        ];
+        assert_eq!(
+            cases.len(),
+            every_variant.len(),
+            "every MobDropItem variant must appear in the mapping table"
+        );
 
         for (drop, material) in cases {
             let expected = ItemId::Material(material);
