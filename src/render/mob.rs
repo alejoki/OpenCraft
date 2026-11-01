@@ -568,10 +568,12 @@ pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -
 /// Build the world-space vertex batch for every visible mob in `session`.
 ///
 /// A mob is included only when its feet chunk is resident and its AABB
-/// intersects the camera frustum. Light is read once from the feet block,
-/// folded into `shade`, and the model vertices are rotated by the mob yaw and
-/// translated to the world position. This is intentionally pure: no wgpu
-/// calls and no allocations beyond the returned output vector.
+/// intersects the camera frustum. A dying mob is still included (it remains a
+/// record until the session reaper removes it) and is rendered collapsed by
+/// its own [`crate::world::mob::Mob::death_progress`]. Light is read once from
+/// the feet block, folded into `shade`, and the model vertices are rotated by
+/// the mob yaw and translated to the world position. This is intentionally
+/// pure: no wgpu calls and no allocations beyond the returned output vector.
 pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> Vec<MobVertex> {
     let frustum = Frustum::from_view_proj(&camera.view_proj(aspect));
     let mut out = Vec::new();
@@ -603,7 +605,7 @@ pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> 
             light: light as f32 / 15.0,
         };
         let rotation = Quat::from_rotation_y(mob.yaw);
-        for vertex in build_mob_vertices(mob.kind, anim, mob.hurt, 0.0) {
+        for vertex in build_mob_vertices(mob.kind, anim, mob.hurt, mob.death_progress()) {
             let mut world = vertex;
             world.position = (rotation * Vec3::from(vertex.position) + mob.position).to_array();
             out.push(world);
@@ -621,7 +623,7 @@ mod tests {
     use crate::player::survival::GameMode;
     use crate::world::block::BlockId;
     use crate::world::chunk::{Chunk, ChunkPos};
-    use crate::world::mob::Mob;
+    use crate::world::mob::{Mob, MOB_DEATH_SECS};
 
     fn rest_anim() -> MobAnim {
         MobAnim {
@@ -656,6 +658,29 @@ mod tests {
             .iter()
             .map(|vertex| vertex.position[1])
             .fold(f32::INFINITY, f32::min)
+    }
+
+    fn max_y(vertices: &[MobVertex]) -> f32 {
+        vertices
+            .iter()
+            .map(|vertex| vertex.position[1])
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// A session with chunk (0, 0, 0) resident, the given mobs pushed onto
+    /// the list, and the batch those mobs produce from a camera at `eye`
+    /// looking toward +Z.
+    fn scene_and_batch(mobs: &[Mob], eye: Vec3) -> (WorldSession, Vec<MobVertex>) {
+        let mut session = session();
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        for mob in mobs {
+            session.mobs_mut().push(mob.clone());
+        }
+        let camera = camera_looking_at_plus_z(eye);
+        let batch = build_mob_batch(&session, &camera, 16.0 / 9.0);
+        (session, batch)
     }
 
     fn session() -> WorldSession {
@@ -939,6 +964,124 @@ mod tests {
         assert!((max.x - (position.x + MobKind::Pig.width() * 0.5)).abs() < 1e-3);
         assert!((min.y - position.y).abs() < 1e-3);
         assert!((max.y - (position.y + MobKind::Pig.height())).abs() < 1e-3);
+    }
+
+    #[test]
+    fn batch_renders_a_half_collapsed_cow_shorter_than_its_living_pose() {
+        let position = Vec3::new(0.5, 0.0, 0.5);
+        let eye = position + Vec3::new(0.0, 1.6, -3.5);
+        let living = Mob::new(MobKind::Cow, position, 0.0);
+        let (_, living_batch) = scene_and_batch(std::slice::from_ref(&living), eye);
+        assert_eq!(living_batch.len(), MOB_VERTS_PER_MOB);
+        let living_max_y = max_y(&living_batch);
+        assert!((living_max_y - (position.y + MobKind::Cow.height())).abs() < 1e-3);
+
+        let mut dying = Mob::new(MobKind::Cow, position, 0.0);
+        dying.health = 0;
+        dying.death = MOB_DEATH_SECS * 0.5;
+        assert_eq!(dying.death_progress(), 0.5);
+        let (_, dying_batch) = scene_and_batch(std::slice::from_ref(&dying), eye);
+        assert_eq!(dying_batch.len(), MOB_VERTS_PER_MOB);
+
+        // Halfway through the collapse the head is still the tallest part.
+        // The squash curve pins its ceiling at
+        // `0.65 * height * cos(0.25)` (~60% of the standing height), so the
+        // proof bound is 0.7x — strictly enough to show the pose is squashed,
+        // not a copy of the standing silhouette.
+        let dying_max_y = max_y(&dying_batch);
+        assert!(
+            dying_max_y <= 0.7 * living_max_y,
+            "half-collapse max y {dying_max_y} must stay below 0.7x the living {living_max_y}"
+        );
+        assert!(
+            living_max_y - dying_max_y > 0.2,
+            "the body must visibly drop: living {living_max_y}, collapsing {dying_max_y}"
+        );
+        // Some vertex must actually have moved: the standing pose is not reused.
+        assert!(dying_batch
+            .iter()
+            .zip(living_batch.iter())
+            .any(|(collapsing, standing)| collapsing.position != standing.position));
+    }
+
+    #[test]
+    fn batch_renders_a_finished_corpse_flat_on_the_ground() {
+        let position = Vec3::new(0.5, 0.0, 0.5);
+        let eye = position + Vec3::new(0.0, 1.6, -3.5);
+        let living = Mob::new(MobKind::Cow, position, 0.0);
+        let (_, living_batch) = scene_and_batch(std::slice::from_ref(&living), eye);
+        let living_max_y = max_y(&living_batch);
+
+        let mut corpse = Mob::new(MobKind::Cow, position, 0.0);
+        corpse.health = 0;
+        corpse.death = 0.0;
+        assert_eq!(corpse.death_progress(), 1.0);
+        let (_, corpse_batch) = scene_and_batch(std::slice::from_ref(&corpse), eye);
+        assert_eq!(corpse_batch.len(), MOB_VERTS_PER_MOB);
+
+        let corpse_max_y = max_y(&corpse_batch);
+        assert!(
+            corpse_max_y < living_max_y - 0.5,
+            "a finished corpse must collapse: living {living_max_y}, corpse {corpse_max_y}"
+        );
+        assert!(
+            corpse_max_y >= position.y,
+            "the corpse must still have height above the feet: {corpse_max_y}"
+        );
+        assert!(
+            corpse_batch
+                .iter()
+                .all(|vertex| vertex.position[1] >= position.y - 1e-3),
+            "no corpse vertex may sink below the ground plane"
+        );
+    }
+
+    #[test]
+    fn batch_leaves_a_living_mob_at_the_standing_pose() {
+        let position = Vec3::new(0.5, 0.0, 0.5);
+        let mob = Mob::new(MobKind::Pig, position, 0.0);
+        let eye = position + Vec3::new(0.0, 1.6, -3.5);
+        let (session, batch) = scene_and_batch(std::slice::from_ref(&mob), eye);
+        assert_eq!(batch.len(), MOB_VERTS_PER_MOB);
+
+        let light = session.world.light_at_world(
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        );
+        let anim = MobAnim {
+            walk_phase: mob.walk_phase,
+            walk_amount: 0.0,
+            light: light as f32 / 15.0,
+        };
+        let standing = build_mob_vertices(mob.kind, anim, mob.hurt, 0.0);
+        assert_eq!(batch.len(), standing.len());
+        for (actual, model) in batch.iter().zip(standing.iter()) {
+            let expected =
+                Quat::from_rotation_y(mob.yaw) * Vec3::from(model.position) + mob.position;
+            assert!(
+                (Vec3::from(actual.position) - expected).length() < 1e-5,
+                "living vertex {:?} != standing {:?}",
+                actual.position,
+                expected
+            );
+            assert_eq!(actual.uv, model.uv);
+            assert_eq!(actual.tex_layer, model.tex_layer);
+            assert_eq!(actual.shade, model.shade);
+            assert_eq!(actual.flash, model.flash);
+        }
+    }
+
+    #[test]
+    fn batch_emits_216_vertices_per_included_mob_including_a_corpse() {
+        let living = Mob::new(MobKind::Pig, Vec3::new(0.2, 0.0, 0.5), 0.0);
+        let mut corpse = Mob::new(MobKind::Cow, Vec3::new(0.8, 0.0, 0.5), 0.0);
+        corpse.health = 0;
+        corpse.death = MOB_DEATH_SECS * 0.5;
+
+        let (_, batch) = scene_and_batch(&[living, corpse], Vec3::new(0.5, 1.6, -3.0));
+        assert_eq!(batch.len(), 2 * MOB_VERTS_PER_MOB);
+        assert_eq!(MOB_VERTS_PER_MOB, 216);
     }
 
     #[test]
