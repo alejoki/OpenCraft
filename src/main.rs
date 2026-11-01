@@ -16725,6 +16725,10 @@ mod tests {
             // covers only the nine Pickaxe/Axe/Shovel break-centric
             // combinations.
             ToolKind::Hoe => &[],
+            // Swords and bows have no recipes in this S05 matrix, which
+            // deliberately covers only the nine mining combinations (same
+            // precedent as the Hoe arm above).
+            ToolKind::Sword | ToolKind::Bow => &[],
         }
     }
 
@@ -16737,6 +16741,8 @@ mod tests {
             // covers only the nine Pickaxe/Axe/Shovel break-centric
             // combinations.
             ToolKind::Hoe => &[],
+            // See `tool_head_cells`: combat tools are outside this matrix.
+            ToolKind::Sword | ToolKind::Bow => &[],
         }
     }
 
@@ -17276,6 +17282,9 @@ mod tests {
                 ToolKind::Axe => BlockId::Stone,
                 ToolKind::Shovel => BlockId::OakLog,
                 ToolKind::Hoe => unreachable!("hoe recipes are S07"),
+                ToolKind::Sword | ToolKind::Bow => {
+                    unreachable!("sword and bow are not mining tools")
+                }
             };
             let wrong = MiningTarget::from_block(IVec3::new(7, 8, 0), wrong_block, Some(tool))
                 .expect("a mismatched block is still breakable");
@@ -17325,6 +17334,9 @@ mod tests {
                     },
                 ),
                 ToolKind::Hoe => unreachable!("hoe recipes are S07"),
+                ToolKind::Sword | ToolKind::Bow => {
+                    unreachable!("sword and bow are not mining tools")
+                }
             };
             assert_eq!(target_block.break_duration_secs(), Some(base_duration));
             let drop_id = ItemId::Block(target_block.mined_drop());

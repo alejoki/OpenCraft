@@ -33,6 +33,9 @@ pub const SURVIVAL_VERSION: u32 = 6;
 /// First save version that carries the append-only mob tail: a `u32` count
 /// followed by one fixed-size [`SAVED_MOB_LEN`] record per live mob.
 pub const MOB_VERSION: u32 = 7;
+/// The save version that introduced the current item vocabulary. New
+/// identities take the next free discriminant and are gated to this version.
+pub const ITEM_VOCAB_VERSION: u32 = MOB_VERSION;
 /// Upper bound on persisted mob records. This is a defensive wire bound (a
 /// forged count must never drive an unbounded decode pass), deliberately
 /// unrelated to any future gameplay spawn cap.
@@ -69,10 +72,19 @@ const MATERIAL_APPLE: u8 = 1;
 const MATERIAL_WHEAT: u8 = 2;
 const MATERIAL_WHEAT_SEEDS: u8 = 3;
 const MATERIAL_BREAD: u8 = 4;
+// Append-only: the melee/drop vocabulary (M009) takes the next free tags.
+const MATERIAL_LEATHER: u8 = 5;
+const MATERIAL_RAW_PORKCHOP: u8 = 6;
+const MATERIAL_RAW_BEEF: u8 = 7;
+const MATERIAL_ROTTEN_FLESH: u8 = 8;
+const MATERIAL_BONE: u8 = 9;
+const MATERIAL_ARROW: u8 = 10;
 const TOOL_KIND_PICKAXE: u8 = 0;
 const TOOL_KIND_AXE: u8 = 1;
 const TOOL_KIND_SHOVEL: u8 = 2;
 const TOOL_KIND_HOE: u8 = 3;
+const TOOL_KIND_SWORD: u8 = 4;
+const TOOL_KIND_BOW: u8 = 5;
 const TOOL_TIER_WOOD: u8 = 0;
 const TOOL_TIER_STONE: u8 = 1;
 const TOOL_TIER_IRON: u8 = 2;
@@ -721,6 +733,12 @@ fn material_tag(material: Material) -> u8 {
         Material::Wheat => MATERIAL_WHEAT,
         Material::WheatSeeds => MATERIAL_WHEAT_SEEDS,
         Material::Bread => MATERIAL_BREAD,
+        Material::Leather => MATERIAL_LEATHER,
+        Material::RawPorkchop => MATERIAL_RAW_PORKCHOP,
+        Material::RawBeef => MATERIAL_RAW_BEEF,
+        Material::RottenFlesh => MATERIAL_ROTTEN_FLESH,
+        Material::Bone => MATERIAL_BONE,
+        Material::Arrow => MATERIAL_ARROW,
     }
 }
 
@@ -731,6 +749,12 @@ fn material_from_tag(tag: u8) -> Option<Material> {
         MATERIAL_WHEAT => Some(Material::Wheat),
         MATERIAL_WHEAT_SEEDS => Some(Material::WheatSeeds),
         MATERIAL_BREAD => Some(Material::Bread),
+        MATERIAL_LEATHER => Some(Material::Leather),
+        MATERIAL_RAW_PORKCHOP => Some(Material::RawPorkchop),
+        MATERIAL_RAW_BEEF => Some(Material::RawBeef),
+        MATERIAL_ROTTEN_FLESH => Some(Material::RottenFlesh),
+        MATERIAL_BONE => Some(Material::Bone),
+        MATERIAL_ARROW => Some(Material::Arrow),
         _ => None,
     }
 }
@@ -741,6 +765,8 @@ fn tool_kind_tag(kind: ToolKind) -> u8 {
         ToolKind::Axe => TOOL_KIND_AXE,
         ToolKind::Shovel => TOOL_KIND_SHOVEL,
         ToolKind::Hoe => TOOL_KIND_HOE,
+        ToolKind::Sword => TOOL_KIND_SWORD,
+        ToolKind::Bow => TOOL_KIND_BOW,
     }
 }
 
@@ -750,6 +776,8 @@ fn tool_kind_from_tag(tag: u8) -> Option<ToolKind> {
         TOOL_KIND_AXE => Some(ToolKind::Axe),
         TOOL_KIND_SHOVEL => Some(ToolKind::Shovel),
         TOOL_KIND_HOE => Some(ToolKind::Hoe),
+        TOOL_KIND_SWORD => Some(ToolKind::Sword),
+        TOOL_KIND_BOW => Some(ToolKind::Bow),
         _ => None,
     }
 }
@@ -1201,6 +1229,9 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             if version < SURVIVAL_VERSION && is_survival_only_material_tag(material_raw) {
                 return Err(PersistenceError::InvalidMaterial(material_raw));
             }
+            if version < ITEM_VOCAB_VERSION && is_melee_only_material_tag(material_raw) {
+                return Err(PersistenceError::InvalidMaterial(material_raw));
+            }
             let material = material_from_tag(material_raw)
                 .ok_or(PersistenceError::InvalidMaterial(material_raw))?;
             Item::new(ItemId::Material(material), count)
@@ -1212,6 +1243,11 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             let tier_raw = read_u8(r)?;
             let durability = read_u16(r)?;
             if version < SURVIVAL_VERSION && kind_raw == TOOL_KIND_HOE {
+                return Err(PersistenceError::InvalidToolKind(kind_raw));
+            }
+            if version < ITEM_VOCAB_VERSION
+                && (kind_raw == TOOL_KIND_SWORD || kind_raw == TOOL_KIND_BOW)
+            {
                 return Err(PersistenceError::InvalidToolKind(kind_raw));
             }
             let kind =
@@ -1246,6 +1282,22 @@ fn is_survival_only_material_tag(tag: u8) -> bool {
     matches!(
         tag,
         MATERIAL_APPLE | MATERIAL_WHEAT | MATERIAL_WHEAT_SEEDS | MATERIAL_BREAD
+    )
+}
+
+/// Materials appended in v7 (M009); a pre-v7 payload may not contain them.
+///
+/// Deliberately separate from [`is_survival_only_material_tag`]: that one is
+/// named for, and gated at, the v6 introduction and must not widen.
+fn is_melee_only_material_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        MATERIAL_LEATHER
+            | MATERIAL_RAW_PORKCHOP
+            | MATERIAL_RAW_BEEF
+            | MATERIAL_ROTTEN_FLESH
+            | MATERIAL_BONE
+            | MATERIAL_ARROW
     )
 }
 
@@ -2944,10 +2996,11 @@ mod tests {
         let mut material_slot: ChestSlots = [None; CHEST_SLOTS];
         material_slot[0] = Some(Item::new(ItemId::Material(Material::Bread), 1).unwrap());
         let mut bytes = v6_bytes_with_chest(Container::from_slots(material_slot));
-        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
+        // 11 is the first tag past the v7 melee/drop vocabulary.
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 11;
         assert!(matches!(
             load_world_from_bytes(&bytes),
-            Err(PersistenceError::InvalidMaterial(9))
+            Err(PersistenceError::InvalidMaterial(11))
         ));
 
         // Unknown tool kind inside a chest slot.
@@ -3201,10 +3254,11 @@ mod tests {
         let material_record =
             v4_bytes_with_slot0(Item::new(ItemId::Material(Material::Stick), 4).unwrap());
         let mut bytes = material_record.clone();
-        bytes[V4_EXTENSION_OFFSET + 1] = 9;
+        // 11 is the first tag past the v7 melee/drop vocabulary.
+        bytes[V4_EXTENSION_OFFSET + 1] = 11;
         assert!(matches!(
             load_world_from_bytes(&bytes),
-            Err(PersistenceError::InvalidMaterial(9))
+            Err(PersistenceError::InvalidMaterial(11))
         ));
 
         // Materials cap at MATERIAL_STACK_LIMIT (64).
@@ -3233,12 +3287,28 @@ mod tests {
         assert_eq!(MATERIAL_BREAD, 4);
         assert_eq!(TOOL_KIND_HOE, 3);
 
+        // M009 appends the melee/drop vocabulary at the next free tags too.
+        assert_eq!(MATERIAL_LEATHER, 5);
+        assert_eq!(MATERIAL_RAW_PORKCHOP, 6);
+        assert_eq!(MATERIAL_RAW_BEEF, 7);
+        assert_eq!(MATERIAL_ROTTEN_FLESH, 8);
+        assert_eq!(MATERIAL_BONE, 9);
+        assert_eq!(MATERIAL_ARROW, 10);
+        assert_eq!(TOOL_KIND_SWORD, 4);
+        assert_eq!(TOOL_KIND_BOW, 5);
+
         for (material, tag) in [
             (Material::Stick, MATERIAL_STICK),
             (Material::Apple, MATERIAL_APPLE),
             (Material::Wheat, MATERIAL_WHEAT),
             (Material::WheatSeeds, MATERIAL_WHEAT_SEEDS),
             (Material::Bread, MATERIAL_BREAD),
+            (Material::Leather, MATERIAL_LEATHER),
+            (Material::RawPorkchop, MATERIAL_RAW_PORKCHOP),
+            (Material::RawBeef, MATERIAL_RAW_BEEF),
+            (Material::RottenFlesh, MATERIAL_ROTTEN_FLESH),
+            (Material::Bone, MATERIAL_BONE),
+            (Material::Arrow, MATERIAL_ARROW),
         ] {
             assert_eq!(material_tag(material), tag, "{material:?} tag moved");
             assert_eq!(material_from_tag(tag), Some(material));
@@ -3249,14 +3319,16 @@ mod tests {
             (ToolKind::Axe, TOOL_KIND_AXE),
             (ToolKind::Shovel, TOOL_KIND_SHOVEL),
             (ToolKind::Hoe, TOOL_KIND_HOE),
+            (ToolKind::Sword, TOOL_KIND_SWORD),
+            (ToolKind::Bow, TOOL_KIND_BOW),
         ] {
             assert_eq!(tool_kind_tag(kind), tag, "{kind:?} tag moved");
             assert_eq!(tool_kind_from_tag(tag), Some(kind));
         }
 
         // The next unused discriminants still fail closed.
-        assert_eq!(material_from_tag(5), None);
-        assert_eq!(tool_kind_from_tag(4), None);
+        assert_eq!(material_from_tag(11), None);
+        assert_eq!(tool_kind_from_tag(6), None);
     }
 
     #[test]

@@ -189,6 +189,14 @@ pub enum Material {
     Wheat,
     WheatSeeds,
     Bread,
+    // Appended in this exact order: it is the append-only wire-tag order the
+    // persistence layer depends on. Never reorder these variants.
+    Leather,
+    RawPorkchop,
+    RawBeef,
+    RottenFlesh,
+    Bone,
+    Arrow,
 }
 
 impl Material {
@@ -199,6 +207,12 @@ impl Material {
             Material::Wheat => "Wheat",
             Material::WheatSeeds => "Wheat Seeds",
             Material::Bread => "Bread",
+            Material::Leather => "Leather",
+            Material::RawPorkchop => "Raw Porkchop",
+            Material::RawBeef => "Raw Beef",
+            Material::RottenFlesh => "Rotten Flesh",
+            Material::Bone => "Bone",
+            Material::Arrow => "Arrow",
         }
     }
 }
@@ -210,6 +224,9 @@ pub enum ToolKind {
     Axe,
     Shovel,
     Hoe,
+    // Appended after Hoe; these are the trades the melee/bow slices need.
+    Sword,
+    Bow,
 }
 
 impl ToolKind {
@@ -219,6 +236,22 @@ impl ToolKind {
             ToolKind::Axe => "Axe",
             ToolKind::Shovel => "Shovel",
             ToolKind::Hoe => "Hoe",
+            ToolKind::Sword => "Sword",
+            ToolKind::Bow => "Bow",
+        }
+    }
+
+    /// Tiers this kind is constructible in.
+    ///
+    /// The bow is deliberately wood-only (D133/MEM396): there is no stone or
+    /// iron bow, so `(Bow, Stone)` and `(Bow, Iron)` must never become a valid
+    /// [`Item`]. Swords exist in all three tiers.
+    pub const fn allowed_tiers(self) -> &'static [ToolTier] {
+        match self {
+            ToolKind::Bow => &[ToolTier::Wood],
+            ToolKind::Pickaxe | ToolKind::Axe | ToolKind::Shovel | ToolKind::Hoe | ToolKind::Sword => {
+                &[ToolTier::Wood, ToolTier::Stone, ToolTier::Iron]
+            }
         }
     }
 }
@@ -283,23 +316,40 @@ impl ItemId {
     }
 
     /// Human-readable label for HUD/log surfaces.
+    ///
+    /// The match is kind-first so only constructible identities are nameable:
+    /// a bow has exactly one tier, and its name does not pretend otherwise.
     pub fn name(self) -> &'static str {
         match self {
             ItemId::Block(block) => block.name(),
             ItemId::Material(material) => material.name(),
-            ItemId::Tool { kind, tier } => match (tier, kind) {
-                (ToolTier::Wood, ToolKind::Pickaxe) => "Wood Pickaxe",
-                (ToolTier::Wood, ToolKind::Axe) => "Wood Axe",
-                (ToolTier::Wood, ToolKind::Shovel) => "Wood Shovel",
-                (ToolTier::Wood, ToolKind::Hoe) => "Wood Hoe",
-                (ToolTier::Stone, ToolKind::Pickaxe) => "Stone Pickaxe",
-                (ToolTier::Stone, ToolKind::Axe) => "Stone Axe",
-                (ToolTier::Stone, ToolKind::Shovel) => "Stone Shovel",
-                (ToolTier::Stone, ToolKind::Hoe) => "Stone Hoe",
-                (ToolTier::Iron, ToolKind::Pickaxe) => "Iron Pickaxe",
-                (ToolTier::Iron, ToolKind::Axe) => "Iron Axe",
-                (ToolTier::Iron, ToolKind::Shovel) => "Iron Shovel",
-                (ToolTier::Iron, ToolKind::Hoe) => "Iron Hoe",
+            ItemId::Tool { kind, tier } => match kind {
+                ToolKind::Pickaxe => match tier {
+                    ToolTier::Wood => "Wood Pickaxe",
+                    ToolTier::Stone => "Stone Pickaxe",
+                    ToolTier::Iron => "Iron Pickaxe",
+                },
+                ToolKind::Axe => match tier {
+                    ToolTier::Wood => "Wood Axe",
+                    ToolTier::Stone => "Stone Axe",
+                    ToolTier::Iron => "Iron Axe",
+                },
+                ToolKind::Shovel => match tier {
+                    ToolTier::Wood => "Wood Shovel",
+                    ToolTier::Stone => "Stone Shovel",
+                    ToolTier::Iron => "Iron Shovel",
+                },
+                ToolKind::Hoe => match tier {
+                    ToolTier::Wood => "Wood Hoe",
+                    ToolTier::Stone => "Stone Hoe",
+                    ToolTier::Iron => "Iron Hoe",
+                },
+                ToolKind::Sword => match tier {
+                    ToolTier::Wood => "Wood Sword",
+                    ToolTier::Stone => "Stone Sword",
+                    ToolTier::Iron => "Iron Sword",
+                },
+                ToolKind::Bow => "Wood Bow",
             },
         }
     }
@@ -340,6 +390,22 @@ pub enum ItemError {
     NotATool,
     /// Tool durability must be `1..=tier.max_durability()`.
     InvalidDurability,
+    /// The `(kind, tier)` pair is not a constructible tool identity, e.g. a
+    /// stone or iron bow.
+    TierNotAllowed,
+}
+
+/// Shared tier gate for every tool constructor.
+///
+/// Both [`Item::new`] and [`Item::tool_with_durability`] route through this,
+/// so an unconstructible pair such as `(Bow, Stone)` cannot be represented
+/// even by a forged save record.
+fn check_tool_tier(kind: ToolKind, tier: ToolTier) -> Result<(), ItemError> {
+    if kind.allowed_tiers().contains(&tier) {
+        Ok(())
+    } else {
+        Err(ItemError::TierNotAllowed)
+    }
 }
 
 /// A validated item instance: identity, count, and (for tools) remaining
@@ -366,7 +432,8 @@ impl Item {
             ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
-            ItemId::Tool { tier, .. } => {
+            ItemId::Tool { kind, tier } => {
+                check_tool_tier(kind, tier)?;
                 if count != 1 {
                     return Err(ItemError::StackableTool);
                 }
@@ -402,6 +469,7 @@ impl Item {
         tier: ToolTier,
         durability: u16,
     ) -> Result<Self, ItemError> {
+        check_tool_tier(kind, tier)?;
         if durability == 0 || durability > tier.max_durability() {
             return Err(ItemError::InvalidDurability);
         }
@@ -1932,19 +2000,33 @@ mod tests {
     }
 
     #[test]
-    fn food_and_hoe_identities_have_stable_names_and_limits() {
+    fn item_identities_have_stable_names_and_limits() {
         assert_eq!(Material::Stick.name(), "Stick");
         assert_eq!(Material::Apple.name(), "Apple");
         assert_eq!(Material::Wheat.name(), "Wheat");
         assert_eq!(Material::WheatSeeds.name(), "Wheat Seeds");
         assert_eq!(Material::Bread.name(), "Bread");
+        assert_eq!(Material::Leather.name(), "Leather");
+        assert_eq!(Material::RawPorkchop.name(), "Raw Porkchop");
+        assert_eq!(Material::RawBeef.name(), "Raw Beef");
+        assert_eq!(Material::RottenFlesh.name(), "Rotten Flesh");
+        assert_eq!(Material::Bone.name(), "Bone");
+        assert_eq!(Material::Arrow.name(), "Arrow");
         assert_eq!(ToolKind::Hoe.name(), "Hoe");
+        assert_eq!(ToolKind::Sword.name(), "Sword");
+        assert_eq!(ToolKind::Bow.name(), "Bow");
 
         for material in [
             Material::Apple,
             Material::Wheat,
             Material::WheatSeeds,
             Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+            Material::Bone,
+            Material::Arrow,
         ] {
             let id = ItemId::Material(material);
             assert_eq!(id.name(), material.name());
@@ -1991,6 +2073,44 @@ mod tests {
                     .expect("full durability is valid")
                     .durability(),
                 Some(tier.max_durability())
+            );
+        }
+
+        for (tier, name) in [
+            (ToolTier::Wood, "Wood Sword"),
+            (ToolTier::Stone, "Stone Sword"),
+            (ToolTier::Iron, "Iron Sword"),
+        ] {
+            let id = ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier,
+            };
+            assert_eq!(id.name(), name);
+            assert_eq!(id.stack_limit(), 1);
+            let fresh = item(id, 1);
+            assert!(!fresh.is_stackable());
+            assert_eq!(fresh.durability(), Some(tier.max_durability()));
+        }
+
+        let bow = ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        };
+        assert_eq!(ToolKind::Bow.allowed_tiers(), &[ToolTier::Wood]);
+        assert_eq!(bow.name(), "Wood Bow");
+        assert_eq!(bow.stack_limit(), 1);
+        assert!(!item(bow, 1).is_stackable());
+
+        // Forged (bow, stone/iron) records are unrepresentable in both
+        // constructors and surface as TierNotAllowed, never InvalidDurability.
+        for tier in [ToolTier::Stone, ToolTier::Iron] {
+            assert_eq!(
+                Item::new(ItemId::Tool { kind: ToolKind::Bow, tier }, 1),
+                Err(ItemError::TierNotAllowed)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Bow, tier, tier.max_durability()),
+                Err(ItemError::TierNotAllowed)
             );
         }
 

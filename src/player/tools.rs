@@ -109,16 +109,17 @@ mod tests {
         BlockId::LootChest,
     ];
 
-    const ALL_KINDS: [ToolKind; 4] = [
+    const ALL_KINDS: [ToolKind; 6] = [
         ToolKind::Pickaxe,
         ToolKind::Axe,
         ToolKind::Shovel,
-        // Hoe is a real tool identity but has no block class: it is mined
-        // with but never accelerates a block, so the exhaustive matrix below
-        // correctly expects base hardness for it.
+        // Hoe, Sword, and Bow are real tool identities but have no block
+        // class: they are mined with but never accelerate a block, so the
+        // exhaustive matrix below correctly expects base hardness for them.
         ToolKind::Hoe,
+        ToolKind::Sword,
+        ToolKind::Bow,
     ];
-    const ALL_TIERS: [ToolTier; 3] = [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron];
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {
         Item::new(ItemId::Tool { kind, tier }, 1).expect("valid tool")
@@ -202,7 +203,7 @@ mod tests {
         for block in [BlockId::Air, BlockId::Bedrock, BlockId::Water] {
             assert_eq!(break_duration(block, None), None);
             for kind in ALL_KINDS {
-                for tier in ALL_TIERS {
+                for &tier in kind.allowed_tiers() {
                     assert_eq!(
                         break_duration(block, Some(tool(kind, tier))),
                         None,
@@ -280,7 +281,7 @@ mod tests {
             let base = block.break_duration_secs();
             let class = block_tool_class(block);
             for kind in ALL_KINDS {
-                for tier in ALL_TIERS {
+                for &tier in kind.allowed_tiers() {
                     let expected = match base {
                         None => None,
                         Some(base) if class == Some(kind) => {
@@ -297,6 +298,28 @@ mod tests {
                         ),
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn sword_and_bow_never_accelerate_any_block() {
+        // Swords and bows are combat trades: no block in the catalogue may
+        // ever get a shorter break from holding one, at any tier.
+        for block in ALL_BLOCKS {
+            let base = block.break_duration_secs();
+            for item in [
+                tool(ToolKind::Sword, ToolTier::Wood),
+                tool(ToolKind::Sword, ToolTier::Stone),
+                tool(ToolKind::Sword, ToolTier::Iron),
+                tool(ToolKind::Bow, ToolTier::Wood),
+            ] {
+                assert_eq!(
+                    break_duration(block, Some(item)),
+                    base,
+                    "{block:?} must keep base hardness with {:?}",
+                    item.id()
+                );
             }
         }
     }
@@ -340,7 +363,7 @@ mod tests {
                 continue;
             };
             for kind in ALL_KINDS {
-                for tier in ALL_TIERS {
+                for &tier in kind.allowed_tiers() {
                     let duration = break_duration(block, Some(tool(kind, tier)))
                         .expect("breakable block always has a duration");
                     assert!(

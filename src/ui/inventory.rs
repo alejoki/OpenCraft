@@ -429,6 +429,12 @@ fn material_color(material: Material) -> [f32; 4] {
         Material::Wheat => [0.85, 0.73, 0.24, 1.0],
         Material::WheatSeeds => [0.53, 0.58, 0.22, 1.0],
         Material::Bread => [0.85, 0.55, 0.24, 1.0],
+        Material::Leather => [0.62, 0.36, 0.18, 1.0],
+        Material::RawPorkchop => [0.90, 0.52, 0.52, 1.0],
+        Material::RawBeef => [0.75, 0.20, 0.22, 1.0],
+        Material::RottenFlesh => [0.47, 0.52, 0.30, 1.0],
+        Material::Bone => [0.90, 0.87, 0.78, 1.0],
+        Material::Arrow => [0.35, 0.35, 0.40, 1.0],
     }
 }
 
@@ -443,6 +449,10 @@ fn tool_color(kind: ToolKind, tier: ToolTier) -> [f32; 4] {
         ToolKind::Axe => (0.07, -0.05, -0.07),
         ToolKind::Shovel => (-0.05, 0.05, -0.02),
         ToolKind::Hoe => (-0.09, -0.02, 0.06),
+        ToolKind::Sword => (0.12, -0.03, -0.10),
+        // Only Wood is constructible; the offset is total so the palette map
+        // stays total for any future readout.
+        ToolKind::Bow => (-0.12, 0.08, 0.05),
     };
     [base[0] + dr, base[1] + dg, base[2] + db, 1.0]
 }
@@ -1210,16 +1220,26 @@ mod tests {
             Material::Wheat,
             Material::WheatSeeds,
             Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+            Material::Bone,
+            Material::Arrow,
         ] {
             identities.push(ItemId::Material(material));
         }
-        for tier in [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron] {
-            for kind in [
-                ToolKind::Pickaxe,
-                ToolKind::Axe,
-                ToolKind::Shovel,
-                ToolKind::Hoe,
-            ] {
+        for kind in [
+            ToolKind::Pickaxe,
+            ToolKind::Axe,
+            ToolKind::Shovel,
+            ToolKind::Hoe,
+            ToolKind::Sword,
+            ToolKind::Bow,
+        ] {
+            // `(Bow, Stone)` is not a constructible identity, so it must not
+            // be pushed; every other kind accepts all three tiers.
+            for &tier in kind.allowed_tiers() {
                 identities.push(ItemId::Tool { kind, tier });
             }
         }
