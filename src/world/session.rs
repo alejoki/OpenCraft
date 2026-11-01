@@ -30,6 +30,7 @@ use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobTick};
+use crate::world::mob_ai::MobTarget;
 use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
@@ -92,6 +93,16 @@ pub struct WorldSession {
     /// Fixed-rate 20 Hz mob driver, seeded from the session's world seed.
     /// Ephemeral like `survival_runtime`.
     mob_runtime: MobRuntime,
+    /// Ephemeral hostile-AI demo switch, never persisted. Enabled by default
+    /// for every production session; the `--demo-combat` seam closes it at
+    /// startup and reopens it only inside its dedicated `Hostile` stage.
+    ///
+    /// It stops target selection (and therefore acquisition and attacks) but
+    /// deliberately does **not** stop wandering, the distance cull, or the
+    /// ambient gate. It is explicitly **not** the Creative rule: Creative
+    /// inertness is a game-mode authority owned by S09, while this switch is
+    /// demo sequencing state.
+    hostile_ai: bool,
     /// Deterministic mob population layer (M009/S05): spawn attempts, the
     /// global and per-region caps, the distance cull, and daylight burning.
     /// Ephemeral like `mob_runtime` — a reload restarts the attempt sequence,
@@ -156,6 +167,7 @@ impl WorldSession {
             spawn_settle: mode == GameMode::Survival,
             mobs: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
+            hostile_ai: true,
             spawn_runtime: SpawnRuntime::new(),
             world_spawn,
         };
@@ -205,6 +217,7 @@ impl WorldSession {
             spawn_settle: false,
             mobs: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
+            hostile_ai: true,
             spawn_runtime: SpawnRuntime::new(),
             // The editor anchor is not the world spawn: the safe radius must
             // protect the seed's deterministic spawn pad, so a load pays the
@@ -304,6 +317,7 @@ impl WorldSession {
             // is a deterministic restart of the AI clock, not a continuation
             // of the pre-save tick index.
             mob_runtime: MobRuntime::new(seed),
+            hostile_ai: true,
             // The population layer restarts too (ephemeral gate, accumulators,
             // attempt cursor, report), so a reload never resumes a spawn
             // sequence or inherits a closed demo gate.
@@ -553,6 +567,28 @@ impl WorldSession {
         self.spawn_runtime.set_enabled(enabled);
     }
 
+    /// Whether hostile steering may select the player as a target.
+    ///
+    /// Enabled for every production session. The `--demo-combat` seam closes
+    /// it at startup and reopens it only inside its dedicated `Hostile` stage,
+    /// so the pinned quartet stages keep their pre-S06 behaviour. The switch
+    /// affects target selection (and therefore attacks) only; the distance
+    /// cull and the ambient population gate are independent.
+    #[inline]
+    pub fn hostile_ai_enabled(&self) -> bool {
+        self.hostile_ai
+    }
+
+    /// Enables or disables hostile target selection for this session.
+    ///
+    /// Ephemeral demo sequencing state, never persisted. Closing it makes
+    /// `tick_mobs` build no [`MobTarget`], so no hostile can acquire, chase,
+    /// or attack; a chase already in progress is dropped on the next step.
+    /// It is deliberately not the Creative rule: S09 owns mode inertness.
+    pub fn set_hostile_ai_enabled(&mut self, enabled: bool) {
+        self.hostile_ai = enabled;
+    }
+
     /// Cumulative population counters since construction or
     /// [`WorldSession::reset_spawn_report`]: spawned, despawn-marked, burned, and
     /// cap-blocked records.
@@ -590,18 +626,37 @@ impl WorldSession {
             return MobTick::default();
         }
 
+        // The FIRST of the two Creative authority sites (the second is
+        // `apply_mob_attacks`, S06-T04): a non-Survival player, the closed
+        // demo gate, or a dead player builds no target at all, so no hostile
+        // can acquire and no attack can be decided. The target is built once
+        // per call, not per fixed step, because the player does not move
+        // between the steps of one frame.
+        let target = (self.player.mode() == GameMode::Survival
+            && self.hostile_ai
+            && !self.is_dead())
+        .then(|| MobTarget {
+            feet: self.player.position,
+            eye: self.player.eye_position(),
+        });
         let report = {
             let world = &self.world;
             let runtime = &mut self.mob_runtime;
             let mobs = &mut self.mobs;
-            runtime.tick(game_dt, mobs, |position| {
-                let (chunk, _) = world_to_chunk_and_local(
-                    position.x.floor() as i32,
-                    position.y.floor() as i32,
-                    position.z.floor() as i32,
-                );
-                world.is_resident(chunk)
-            })
+            runtime.tick(
+                game_dt,
+                mobs,
+                |position| {
+                    let (chunk, _) = world_to_chunk_and_local(
+                        position.x.floor() as i32,
+                        position.y.floor() as i32,
+                        position.z.floor() as i32,
+                    );
+                    world.is_resident(chunk)
+                },
+                target,
+                world,
+            )
         };
         {
             // Same split-borrow shape as the AI driver above: `world` is
@@ -792,6 +847,12 @@ impl WorldSession {
     /// both open stations. The durable inventory aggregate (slots, cursor,
     /// grids), selected slot, clock, chest records, and `save_mode` are
     /// deliberately untouched.
+    ///
+    /// Every mob also drops its hostile-chase bookkeeping. Without this a
+    /// zombie that was chasing the old position would keep its `Chase` state
+    /// and aggro memory across the respawn and re-attack the player at the
+    /// world spawn before they can move. Positions, health, yaw, and the
+    /// attack cooldown are left alone, so the body and its cadence survive.
     pub fn respawn(&mut self) {
         self.player.position = Self::spawn_position(self.world.seed());
         self.player.velocity = Vec3::ZERO;
@@ -800,6 +861,9 @@ impl WorldSession {
         self.player.arm_spawn_immunity();
         self.survival_runtime.reset();
         self.spawn_settle = true;
+        for mob in &mut self.mobs {
+            mob.reset_hostile_tracking();
+        }
         self.close_table();
         self.close_chest();
         self.sync_camera();
@@ -3892,6 +3956,204 @@ mod tests {
         // A resident mob still advances when time is allowed to flow.
         assert_eq!(session.tick_mobs(0.05, 1.0).ai_steps, 1);
         assert_ne!(session.mobs()[0].position, after_clamp);
+    }
+
+    /// A Survival session with one hostile two blocks in front of the player
+    /// on an all-air resident chunk. Ambient spawning is closed so the mob
+    /// list (and therefore every attack count) is exactly what the test put
+    /// there.
+    fn survival_hostile_session(seed: u32, kind: MobKind) -> WorldSession {
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/session-hostile.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        add_resident_air(&mut session);
+        session.set_ambient_spawning(false);
+        session.player.position = Vec3::new(8.5, 5.0, 8.5);
+        session.sync_camera();
+        session
+            .mobs_mut()
+            .push(Mob::new(kind, Vec3::new(8.5, 5.0, 10.5), 0.0));
+        session
+    }
+
+    #[test]
+    fn survival_zombie_attacks_through_the_session_once_per_cooldown() {
+        let mut session = survival_hostile_session(41, MobKind::Zombie);
+
+        let first = session.tick_mobs(0.05, 1.0);
+        assert_eq!(first.ai_steps, 1);
+        assert_eq!(first.attacks.len(), 1, "one fixed step, one zombie swing");
+        assert_eq!(first.attacks[0].kind, MobKind::Zombie);
+        let cooldown = session.mobs()[0].cooldown;
+        assert!(
+            (cooldown - 1.0).abs() < 1e-5,
+            "the attack must arm the 1.0 s cadence, got {cooldown}"
+        );
+
+        // Inside the cooldown window: no second swing even though the zombie
+        // keeps chasing.
+        let inside = session.tick_mobs(0.05, 1.0);
+        assert!(inside.attacks.is_empty(), "cooldown must gate the swing");
+        assert!(session.mobs()[0].cooldown < cooldown);
+
+        // Over the rest of a 1.5 s window the cadence fires again.
+        let mut attacks = 1u32;
+        for _ in 0..28 {
+            attacks += session.tick_mobs(0.05, 1.0).attacks.len() as u32;
+        }
+        assert!(
+            attacks >= 2,
+            "the 1.0 s cadence must fire again, got {attacks} attacks"
+        );
+    }
+
+    #[test]
+    fn creative_builds_no_target_so_no_hostile_ever_chases_or_attacks() {
+        let mut session = WorldSession::new_session(
+            42,
+            PathBuf::from("/tmp/session-hostile-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        add_resident_air(&mut session);
+        session.set_ambient_spawning(false);
+        session.player.position = Vec3::new(8.5, 5.0, 8.5);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, Vec3::new(8.5, 5.0, 10.5), 0.0));
+        let start = session.mobs()[0].position;
+
+        for _ in 0..30 {
+            let tick = session.tick_mobs(0.05, 1.0);
+            assert!(tick.attacks.is_empty(), "Creative must never be attacked");
+            assert_ne!(
+                session.mobs()[0].state,
+                MobAiState::Chase,
+                "Creative must never be targeted"
+            );
+        }
+        // A hostile with no target keeps its pre-S06 wander (the pinned demo
+        // quartet must keep walking while the demo gate is closed), but never
+        // turns that motion into a chase or an attack.
+        assert_ne!(session.mobs()[0].position, start);
+    }
+
+    #[test]
+    fn closed_hostile_gate_disables_targeting_in_survival() {
+        let mut session = survival_hostile_session(43, MobKind::Zombie);
+        session.set_hostile_ai_enabled(false);
+        assert!(!session.hostile_ai_enabled());
+        let start = session.mobs()[0].position;
+
+        for _ in 0..30 {
+            let tick = session.tick_mobs(0.05, 1.0);
+            assert!(tick.attacks.is_empty(), "a closed gate emits no attacks");
+            assert_ne!(session.mobs()[0].state, MobAiState::Chase);
+        }
+        // The pinned `--demo-combat` quartet must keep walking with the gate
+        // closed: the gate stops targeting, not the pre-S06 wander.
+        assert_ne!(session.mobs()[0].position, start);
+        assert_eq!(
+            session.mobs()[0].cooldown,
+            0.0,
+            "no swing means the cadence is never armed"
+        );
+    }
+
+    #[test]
+    fn dead_player_builds_no_target() {
+        let mut session = survival_hostile_session(44, MobKind::Zombie);
+        session.player.survival.damage(20);
+        assert!(session.is_dead());
+
+        for _ in 0..30 {
+            assert!(
+                session.tick_mobs(0.05, 1.0).attacks.is_empty(),
+                "a dead player must never be attacked again"
+            );
+        }
+        assert_ne!(session.mobs()[0].state, MobAiState::Chase);
+    }
+
+    #[test]
+    fn skeleton_chases_but_never_melees_through_the_session() {
+        let mut session = survival_hostile_session(45, MobKind::Skeleton);
+        let mut attacked = false;
+        let mut chased = false;
+        for _ in 0..30 {
+            let tick = session.tick_mobs(0.05, 1.0);
+            attacked |= !tick.attacks.is_empty();
+            chased |= session.mobs()[0].state == MobAiState::Chase;
+        }
+        assert!(
+            !attacked,
+            "Skeleton melee must never exist (S08 owns ranged)"
+        );
+        assert!(chased, "the shared steering still lets it chase");
+        assert_eq!(session.mobs()[0].cooldown, 0.0);
+    }
+
+    #[test]
+    fn hostile_attacks_are_frame_rate_independent_through_the_session() {
+        let mut a = survival_hostile_session(46, MobKind::Zombie);
+        let mut b = survival_hostile_session(46, MobKind::Zombie);
+
+        let mut a_attacks = 0u32;
+        for _ in 0..10 {
+            a_attacks += a.tick_mobs(0.05, 1.0).attacks.len() as u32;
+        }
+        let mut b_attacks = 0u32;
+        for _ in 0..50 {
+            b_attacks += b.tick_mobs(0.01, 1.0).attacks.len() as u32;
+        }
+
+        assert_eq!(a_attacks, b_attacks, "attack counts must match exactly");
+        assert!(a_attacks >= 1);
+        assert_eq!(a.mobs()[0].kind, b.mobs()[0].kind);
+        assert!((a.mobs()[0].position - b.mobs()[0].position).length() < 1e-3);
+        assert!((a.mobs()[0].yaw - b.mobs()[0].yaw).abs() < 1e-3);
+        assert!((a.mobs()[0].cooldown - b.mobs()[0].cooldown).abs() < 1e-5);
+    }
+
+    #[test]
+    fn respawn_drops_a_live_chase_without_moving_the_body() {
+        let mut session = survival_hostile_session(47, MobKind::Zombie);
+        // Put the record in a live chase with an armed aggro memory.
+        {
+            let zombie = &mut session.mobs_mut()[0];
+            zombie.state = MobAiState::Chase;
+            zombie.aggro = 1.5;
+            zombie.stuck = 0.4;
+            zombie.reaggro = 0.25;
+        }
+        let position = session.mobs()[0].position;
+        let health = session.mobs()[0].health;
+
+        session.respawn();
+
+        let zombie = &session.mobs()[0];
+        assert_eq!(zombie.state, MobAiState::Idle);
+        assert_eq!(zombie.aggro, 0.0);
+        assert_eq!(zombie.stuck, 0.0);
+        assert_eq!(zombie.reaggro, 0.0);
+        assert_eq!(zombie.position, position, "the body must not be moved");
+        assert_eq!(zombie.health, health);
+        assert_eq!(
+            session.player.position,
+            WorldSession::spawn_position(session.world.seed()),
+            "respawn still returns to the deterministic spawn"
+        );
+    }
+
+    #[test]
+    fn session_from_save_restores_the_hostile_gate_enabled() {
+        let session = WorldSession::session_from_save(
+            make_save(48),
+            PathBuf::from("/tmp/session-hostile-restored.mcvx"),
+        );
+        assert!(session.hostile_ai_enabled());
     }
 
     #[test]

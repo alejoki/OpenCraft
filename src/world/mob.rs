@@ -15,6 +15,8 @@
 
 use glam::Vec3;
 
+use crate::world::mob_ai::{MobAttack, MobTarget, MobWorld};
+
 /// Fixed simulation rate of every mob AI step (D134).
 pub const MOB_TICK_HZ: u32 = 20;
 /// Seconds per fixed mob step.
@@ -483,10 +485,16 @@ pub fn mob_roll(seed: u32, tick_index: u64, slot: u32) -> u32 {
 }
 
 /// What one [`MobRuntime::tick`] call actually executed.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MobTick {
     /// Number of fixed 20 Hz steps executed this call.
     pub ai_steps: u32,
+    /// Melee attacks decided by the same fixed steps that moved the mobs,
+    /// emitted in mob-list order.
+    ///
+    /// The session is the only consumer: it applies them through its single
+    /// damage seam (S06-T04), so the world layer never names a player type.
+    pub attacks: Vec<MobAttack>,
 }
 
 /// Fixed-rate accumulator driving every mob at exactly [`MOB_TICK_HZ`],
@@ -522,11 +530,20 @@ impl MobRuntime {
     /// `is_resident` is consulted per mob per step. A non-resident mob keeps
     /// its record and its list slot but does not move, decay, or animate for
     /// that step (D131).
+    ///
+    /// `target` is the single player pose authority for hostile steering:
+    /// `None` (Creative, the closed `--demo-combat` gate, or a dead player)
+    /// means no hostile can acquire, chase, or attack. `world` is the one
+    /// capability the steering brain needs (three integers in, one block id
+    /// out). Attacks are collected in mob-list order across the executed
+    /// steps and returned in [`MobTick::attacks`].
     pub fn tick(
         &mut self,
         game_dt: f32,
         mobs: &mut [Mob],
         is_resident: impl Fn(Vec3) -> bool,
+        target: Option<MobTarget>,
+        world: &impl MobWorld,
     ) -> MobTick {
         if !game_dt.is_finite() || game_dt <= 0.0 {
             return MobTick::default();
@@ -549,13 +566,14 @@ impl MobRuntime {
             return MobTick::default();
         }
 
+        let mut attacks = Vec::new();
         for _ in 0..steps {
             self.tick_index += 1;
             for (index, mob) in mobs.iter_mut().enumerate() {
                 if !is_resident(mob.position) {
                     continue;
                 }
-                self.step_mob(mob, index as u32);
+                self.step_mob(mob, index as u32, target, world, &mut attacks);
             }
         }
 
@@ -564,10 +582,20 @@ impl MobRuntime {
         self.accum = (self.accum - f64::from(steps) * tick_secs).max(0.0);
         self.accum = self.accum.min(tick_secs);
 
-        MobTick { ai_steps: steps }
+        MobTick {
+            ai_steps: steps,
+            attacks,
+        }
     }
 
-    fn step_mob(&self, mob: &mut Mob, slot: u32) {
+    fn step_mob(
+        &self,
+        mob: &mut Mob,
+        slot: u32,
+        target: Option<MobTarget>,
+        world: &impl MobWorld,
+        attacks: &mut Vec<MobAttack>,
+    ) {
         mob.hurt = (mob.hurt - MOB_TICK_SECS).max(0.0);
         mob.hurt_iframe = (mob.hurt_iframe - MOB_TICK_SECS).max(0.0);
         mob.cooldown = (mob.cooldown - MOB_TICK_SECS).max(0.0);
@@ -611,50 +639,76 @@ impl MobRuntime {
             // below may move the body while it collapses.
             mob.velocity = Vec3::ZERO;
         } else {
-            match mob.state {
-                MobAiState::Idle => {
-                    mob.velocity = Vec3::ZERO;
+            // Hostiles run the world-aware brain on every step. It owns chase
+            // movement and the melee decision, never moves a passive, and
+            // never touches a dead mob (the branch above excludes those).
+            //
+            // With `target == None` (Creative, the closed `--demo-combat`
+            // gate, a dead player) or with no line of sight, `step_hostile`
+            // returns without moving the mob. The passive-style arms below
+            // then still give an idle/wandering hostile its pre-S06 wander,
+            // which keeps the pinned demo quartet walking while the demo gate
+            // is closed. Once `step_hostile` puts a hostile into `Chase`, it
+            // owns movement for that step and the arms are skipped.
+            let hostile_chasing = if mob.kind.is_hostile() {
+                if let Some(attack) = crate::world::mob_ai::step_hostile(
+                    mob,
+                    target,
+                    world,
+                    mob_roll(self.seed, self.tick_index, slot),
+                ) {
+                    attacks.push(attack);
                 }
-                MobAiState::Wander => {
-                    let offset = Vec3::new(
-                        mob.position.x - mob.home.x,
-                        0.0,
-                        mob.position.z - mob.home.z,
-                    );
-                    let leash = offset.x * offset.x + offset.z * offset.z;
-                    if leash > HOME_LEASH * HOME_LEASH {
-                        // Steer back toward the anchor instead of escaping.
-                        mob.yaw = offset.x.atan2(offset.z) + std::f32::consts::PI;
-                    }
+                mob.state == MobAiState::Chase
+            } else {
+                false
+            };
 
-                    let speed = mob.kind.walk_speed();
-                    mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
-                    mob.position += mob.velocity * MOB_TICK_SECS;
-                    mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
-
-                    if !mob.position.is_finite() {
-                        mob.position = mob.home;
+            if !hostile_chasing {
+                match mob.state {
+                    MobAiState::Idle => {
                         mob.velocity = Vec3::ZERO;
                     }
-                }
-                MobAiState::Chase => {
-                    // S06-T01 hold arm: the world-aware `mob_ai::step_hostile`
-                    // call lands in T02. Nothing in production enters Chase
-                    // yet, so this only keeps a manually-set chase from
-                    // drifting while the reroll gate is exercised.
-                    mob.velocity = Vec3::ZERO;
-                }
-                MobAiState::Flee => {
-                    // Flee ignores the home leash: the whole point is to put
-                    // distance between the mob and its attacker.
-                    let speed = mob.kind.walk_speed() * MOB_FLEE_SPEED_FACTOR;
-                    mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
-                    mob.position += mob.velocity * MOB_TICK_SECS;
-                    mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+                    MobAiState::Wander => {
+                        let offset = Vec3::new(
+                            mob.position.x - mob.home.x,
+                            0.0,
+                            mob.position.z - mob.home.z,
+                        );
+                        let leash = offset.x * offset.x + offset.z * offset.z;
+                        if leash > HOME_LEASH * HOME_LEASH {
+                            // Steer back toward the anchor instead of escaping.
+                            mob.yaw = offset.x.atan2(offset.z) + std::f32::consts::PI;
+                        }
 
-                    if !mob.position.is_finite() {
-                        mob.position = mob.home;
+                        let speed = mob.kind.walk_speed();
+                        mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
+                        mob.position += mob.velocity * MOB_TICK_SECS;
+                        mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+
+                        if !mob.position.is_finite() {
+                            mob.position = mob.home;
+                            mob.velocity = Vec3::ZERO;
+                        }
+                    }
+                    MobAiState::Chase => {
+                        // Only a manually-set passive can reach this arm:
+                        // `step_hostile` owns every hostile chase and nothing
+                        // in production puts a passive in `Chase`.
                         mob.velocity = Vec3::ZERO;
+                    }
+                    MobAiState::Flee => {
+                        // Flee ignores the home leash: the whole point is to
+                        // put distance between the mob and its attacker.
+                        let speed = mob.kind.walk_speed() * MOB_FLEE_SPEED_FACTOR;
+                        mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
+                        mob.position += mob.velocity * MOB_TICK_SECS;
+                        mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+
+                        if !mob.position.is_finite() {
+                            mob.position = mob.home;
+                            mob.velocity = Vec3::ZERO;
+                        }
                     }
                 }
             }
@@ -684,6 +738,18 @@ impl MobRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::block::BlockId;
+
+    /// A world with no solid blocks: LOS is always clear and every step is
+    /// passable. These runtime tests exercise timing and passive arms, not
+    /// world-aware steering (which has its own suite in `mob_ai`).
+    struct NoWorld;
+
+    impl MobWorld for NoWorld {
+        fn block(&self, _x: i32, _y: i32, _z: i32) -> BlockId {
+            BlockId::Air
+        }
+    }
 
     fn resident(_: Vec3) -> bool {
         true
@@ -788,11 +854,14 @@ mod tests {
         let mut mobs_b = mobs_a.clone();
 
         for _ in 0..10 {
-            assert_eq!(a.tick(0.05, &mut mobs_a, resident).ai_steps, 1);
+            assert_eq!(
+                a.tick(0.05, &mut mobs_a, resident, None, &NoWorld).ai_steps,
+                1
+            );
         }
         let mut b_steps = 0;
         for _ in 0..50 {
-            b_steps += b.tick(0.01, &mut mobs_b, resident).ai_steps;
+            b_steps += b.tick(0.01, &mut mobs_b, resident, None, &NoWorld).ai_steps;
         }
         assert_eq!(b_steps, 10, "50 small frames still run ten fixed steps");
 
@@ -806,13 +875,20 @@ mod tests {
     fn runtime_caps_steps_per_call_and_clamps_leftover() {
         let mut runtime = MobRuntime::new(3);
         let mut mobs = vec![Mob::new(MobKind::Zombie, Vec3::new(0.5, 5.0, 0.5), 0.0)];
-        let report = runtime.tick(1.0, &mut mobs, resident);
+        let report = runtime.tick(1.0, &mut mobs, resident, None, &NoWorld);
         assert_eq!(report.ai_steps, MAX_MOB_STEPS_PER_CALL);
         assert_eq!(runtime.tick_index(), u64::from(MAX_MOB_STEPS_PER_CALL));
         // The backlog is clamped to one pending step, not 16.
-        assert_eq!(runtime.tick(0.0, &mut mobs, resident).ai_steps, 0);
         assert_eq!(
-            runtime.tick(0.05, &mut mobs, resident).ai_steps,
+            runtime
+                .tick(0.0, &mut mobs, resident, None, &NoWorld)
+                .ai_steps,
+            0
+        );
+        assert_eq!(
+            runtime
+                .tick(0.05, &mut mobs, resident, None, &NoWorld)
+                .ai_steps,
             2,
             "leftover accum is clamped to one step, plus the new 0.05 s"
         );
@@ -822,9 +898,24 @@ mod tests {
     fn runtime_ignores_non_positive_and_non_finite_dt() {
         let mut runtime = MobRuntime::new(3);
         let mut mobs = vec![Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0)];
-        assert_eq!(runtime.tick(0.0, &mut mobs, resident).ai_steps, 0);
-        assert_eq!(runtime.tick(-1.0, &mut mobs, resident).ai_steps, 0);
-        assert_eq!(runtime.tick(f32::NAN, &mut mobs, resident).ai_steps, 0);
+        assert_eq!(
+            runtime
+                .tick(0.0, &mut mobs, resident, None, &NoWorld)
+                .ai_steps,
+            0
+        );
+        assert_eq!(
+            runtime
+                .tick(-1.0, &mut mobs, resident, None, &NoWorld)
+                .ai_steps,
+            0
+        );
+        assert_eq!(
+            runtime
+                .tick(f32::NAN, &mut mobs, resident, None, &NoWorld)
+                .ai_steps,
+            0
+        );
         assert_eq!(runtime.tick_index(), 0);
     }
 
@@ -836,7 +927,7 @@ mod tests {
             Mob::new(MobKind::Pig, anchor, 0.0),
             Mob::new(MobKind::Cow, Vec3::new(100.5, 5.0, 0.5), 0.0),
         ];
-        runtime.tick(0.05, &mut mobs, |pos| pos.x < 50.0);
+        runtime.tick(0.05, &mut mobs, |pos| pos.x < 50.0, None, &NoWorld);
         assert_eq!(mobs.len(), 2);
         assert_eq!(mobs[1].position, Vec3::new(100.5, 5.0, 0.5));
         assert_eq!(mobs[1].walk_phase, 0.0);
@@ -851,12 +942,12 @@ mod tests {
         mobs[0].hurt = 0.2;
         mobs[0].cooldown = 0.2;
 
-        runtime.tick(0.05, &mut mobs, |_| false);
+        runtime.tick(0.05, &mut mobs, |_| false, None, &NoWorld);
         assert!((mobs[0].hurt - 0.2).abs() < 1e-6);
         assert!((mobs[0].cooldown - 0.2).abs() < 1e-6);
 
         for _ in 0..4 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
         assert!(mobs[0].hurt <= 1e-5);
         assert!(mobs[0].cooldown <= 1e-5);
@@ -869,7 +960,7 @@ mod tests {
         let mut mobs = vec![Mob::new(MobKind::Skeleton, home, 0.0)];
         // Straight +Z for many steps should trip the 4-block leash.
         for _ in 0..200 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
             mobs[0].state = MobAiState::Wander;
         }
         let dx = mobs[0].position.x - home.x;
@@ -892,7 +983,7 @@ mod tests {
             Mob::new(MobKind::Skeleton, Vec3::new(2.0, 0.0, -2.0), 3.0),
         ];
         for _ in 0..100 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
         for mob in &mobs {
             assert!(mob.position.is_finite(), "position became non-finite");
@@ -1070,7 +1161,7 @@ mod tests {
         let mut rest_position = None;
         for step in 0..14 {
             mobs[0].state = MobAiState::Idle;
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
             if step == 12 {
                 rest_position = Some(mobs[0].position);
             }
@@ -1111,7 +1202,7 @@ mod tests {
         // The AI arm assigns velocity every step; the impulse must survive in
         // its own field and never be installed as velocity.
         mobs[0].state = MobAiState::Idle;
-        runtime.tick(0.05, &mut mobs, resident);
+        runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         assert_eq!(mobs[0].velocity, Vec3::ZERO);
         assert!(mobs[0].knockback.z > 0.0);
         assert!(mobs[0].position.z > 0.0);
@@ -1123,11 +1214,11 @@ mod tests {
         let mut mobs = vec![pig_at_origin()];
         mobs[0].hurt_iframe = 0.2;
 
-        runtime.tick(0.05, &mut mobs, |_| false);
+        runtime.tick(0.05, &mut mobs, |_| false, None, &NoWorld);
         assert!((mobs[0].hurt_iframe - 0.2).abs() < 1e-6);
 
         for _ in 0..4 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
         assert!(mobs[0].hurt_iframe <= 1e-5);
 
@@ -1135,7 +1226,7 @@ mod tests {
         let mut full = vec![pig_at_origin()];
         full[0].take_hit(4, attacker_behind()).expect("hit lands");
         for _ in 0..10 {
-            runtime.tick(0.05, &mut full, resident);
+            runtime.tick(0.05, &mut full, resident, None, &NoWorld);
         }
         assert_eq!(full[0].hurt_iframe, 0.0);
         assert_eq!(full[0].hurt, 0.0);
@@ -1150,7 +1241,7 @@ mod tests {
         mobs[0].knockback = Vec3::Z * MOB_KNOCKBACK_SPEED;
         let snapshot = mobs[0].clone();
 
-        runtime.tick(0.05, &mut mobs, |_| false);
+        runtime.tick(0.05, &mut mobs, |_| false, None, &NoWorld);
         assert_eq!(mobs[0], snapshot, "a non-resident mob must freeze entirely");
     }
 
@@ -1233,7 +1324,7 @@ mod tests {
         // Exactly sixteen fixed steps: the reroll boundary that would erase a
         // naive flee.
         for _ in 0..16 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
         assert_eq!(runtime.tick_index(), 16);
         assert_eq!(mobs[0].state, MobAiState::Flee);
@@ -1249,7 +1340,7 @@ mod tests {
 
         let mut previous = mobs[0].flee;
         for _ in 0..52 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
             let flee = mobs[0].flee;
             assert!(flee >= 0.0, "the flee timer went negative: {flee}");
             assert!(flee <= previous, "the flee timer must not grow");
@@ -1274,7 +1365,7 @@ mod tests {
         let mut mobs = vec![mob];
 
         for _ in 0..10 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
         let distance = (mobs[0].position - mobs[0].home).length();
         assert!(
@@ -1318,7 +1409,7 @@ mod tests {
         let mut previous = mobs[0].death_progress();
         let mut saw_mid_collapse = false;
         for _ in 0..18 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
             let progress = mobs[0].death_progress();
             assert!((0.0..=1.0).contains(&progress), "progress {progress}");
             assert!(progress >= previous, "progress must be monotonic");
@@ -1378,7 +1469,7 @@ mod tests {
         let start_walk_phase = mobs[0].walk_phase;
 
         for _ in 0..4 {
-            runtime.tick(0.05, &mut mobs, resident);
+            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
         }
 
         assert_eq!(mobs[0].velocity, Vec3::ZERO, "a dying mob never walks");
@@ -1403,7 +1494,7 @@ mod tests {
         let snapshot = mob.clone();
         let mut mobs = vec![mob];
 
-        runtime.tick(0.05, &mut mobs, |_| false);
+        runtime.tick(0.05, &mut mobs, |_| false, None, &NoWorld);
         assert_eq!(mobs[0], snapshot, "an unloaded corpse freezes entirely");
     }
 }

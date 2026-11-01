@@ -1397,6 +1397,14 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
             if cli.time_scale > DEFAULT_TIME_SCALE {
                 session.set_ambient_spawning(false);
             }
+            if cli.demo_combat {
+                // The pinned quartet sits 3.5 blocks from the player, inside
+                // the 16-block aggro, so hostile AI must stay off until the
+                // dedicated `Hostile` stage reopens it. The load branch is a
+                // one-call Restore leg, but the gate is ephemeral state the
+                // session must still start closed for the scripted run.
+                session.set_hostile_ai_enabled(false);
+            }
             return session;
         }
     }
@@ -1428,6 +1436,13 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {
         session.set_ambient_spawning(false);
+    }
+    // The pinned quartet sits 3.5 blocks from the player, inside the
+    // 16-block aggro, so hostile AI must stay off until the dedicated
+    // `Hostile` stage reopens it. Guarded on `demo_combat` alone: the other
+    // scripted demos and the accelerated watch must keep their behaviour.
+    if cli.demo_combat {
+        session.set_hostile_ai_enabled(false);
     }
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
@@ -11044,6 +11059,50 @@ mod tests {
         assert!(
             loaded.ambient_spawning(),
             "only the fresh scripted branch closes the population gate"
+        );
+    }
+
+    #[test]
+    fn startup_session_closes_the_hostile_ai_gate_for_demo_combat_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let demo_path = dir.path().join("hostile-gate-demo.mcvx");
+        let demo_str = demo_path.to_str().expect("utf8 path");
+
+        let fresh = startup_session(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-combat",
+            "--save",
+            demo_str,
+        ]));
+        assert!(
+            !fresh.hostile_ai_enabled(),
+            "a fresh --demo-combat launch must close the hostile gate"
+        );
+
+        save_world_to_path(&demo_path, &sample_save(1)).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            demo_str,
+            "--demo-combat",
+        ]));
+        assert!(
+            !loaded.hostile_ai_enabled(),
+            "a loaded --demo-combat leg must close the hostile gate too"
+        );
+
+        let plain_path = dir.path().join("hostile-gate-plain.mcvx");
+        let plain = startup_session(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--save",
+            plain_path.to_str().expect("utf8 path"),
+        ]));
+        assert!(
+            plain.hostile_ai_enabled(),
+            "production launches keep hostile AI enabled"
         );
     }
 

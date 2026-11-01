@@ -340,6 +340,15 @@ mod tests {
         }
     }
 
+    /// An empty world for the runtime-level checks that do not steer.
+    struct NoWorld;
+
+    impl MobWorld for NoWorld {
+        fn block(&self, _x: i32, _y: i32, _z: i32) -> BlockId {
+            BlockId::Air
+        }
+    }
+
     /// Solid slab with its top face at y = 5.0 (feet level in these tests).
     fn floor_world() -> FakeWorld {
         let mut world = FakeWorld::new();
@@ -681,16 +690,17 @@ mod tests {
 
     #[test]
     fn chase_survives_the_sixteen_step_yaw_reroll() {
+        // T02 drives the real brain from the runtime: a Zombie that acquires
+        // through LOS must keep its Chase state, heading, and forward motion
+        // across two 16-step reroll boundaries.
+        let world = floor_world();
         let mut runtime = MobRuntime::new(31);
         let mut mobs = vec![Mob::new(MobKind::Zombie, Vec3::new(0.5, 5.0, 0.5), 0.7)];
-        mobs[0].state = MobAiState::Chase;
-        mobs[0].aggro = 10.0;
+        let target = target(8.5, 5.0, 0.5);
         let start = mobs[0].position;
-        let yaw = mobs[0].yaw;
 
-        // Two reroll boundaries: 32 fixed steps.
         for _ in 0..32 {
-            runtime.tick(0.05, &mut mobs, |_| true);
+            runtime.tick(0.05, &mut mobs, |_| true, Some(target), &world);
         }
         assert_eq!(runtime.tick_index(), 32);
         assert_eq!(
@@ -698,8 +708,16 @@ mod tests {
             MobAiState::Chase,
             "the 16-step yaw reroll must not erase a chase"
         );
-        assert_eq!(mobs[0].yaw, yaw);
-        assert_eq!(mobs[0].position, start, "the T01 hold arm must not move");
+        let dx = target.feet.x - mobs[0].position.x;
+        let dz = target.feet.z - mobs[0].position.z;
+        assert!(
+            (mobs[0].yaw - dx.atan2(dz)).abs() < 1e-4,
+            "a chasing yaw must keep facing the target, not be rerolled"
+        );
+        assert!(
+            mobs[0].position.x > start.x,
+            "the wired runtime must move a chasing hostile"
+        );
     }
 
     #[test]
@@ -750,7 +768,12 @@ mod tests {
         let mut runtime = MobRuntime::new(1);
         let mut mobs = vec![Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0)];
         for _ in 0..10 {
-            assert_eq!(runtime.tick(0.05, &mut mobs, |_| true).ai_steps, 1);
+            assert_eq!(
+                runtime
+                    .tick(0.05, &mut mobs, |_| true, None, &NoWorld)
+                    .ai_steps,
+                1
+            );
         }
         assert_eq!(runtime.tick_index(), 10);
         assert_eq!(mobs[0].state, MobAiState::Wander);
