@@ -341,8 +341,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// `fog_start_end.z`) so water geometry lands exactly where the opaque mesher
 /// put it. The fragment stage is deliberately texture-free: it outputs a
 /// procedural deep-blue RGBA and never samples the block texture array
-/// (MEM230 shader-colored water; MEM232 all 32 layers are consumed, no 33rd
-/// layer). The water quads carry placeholder tex layer 0 (Grass Top) purely
+/// (MEM230 shader-colored water; MEM232 the block texture array is fully
+/// consumed by the opaque pass, so the water pass never samples it). The water quads carry placeholder tex layer 0 (Grass Top) purely
 /// because the packed format requires a byte — it must never be sampled.
 ///
 /// Only `group(0) binding(0)` (camera) and `group(1) binding(0)` (chunk
@@ -1017,13 +1017,13 @@ impl VoxelRenderer {
         }
     }
 
-    /// Re-upload all 32 block texture layers (base mip plus mip chain) into
+    /// Re-upload all texture-array layers (base mip plus mip chain) into
     /// the existing texture array. Never recreates the texture, its view, or
     /// the camera bind group (MEM111).
     pub fn write_block_layers(&self, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
         debug_assert!(
             block_layers_match_shape(layers),
-            "block texture layers must be 32 layers of 16x16 RGBA bytes"
+            "texture array must match NUM_TEX_LAYERS of 16x16 RGBA bytes"
         );
         upload_block_layers(&self.block_texture, queue, layers);
     }

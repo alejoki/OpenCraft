@@ -73,7 +73,7 @@ Save each block texture directly inside the pack folder, using these exact file 
 22. `chest.png`
 23. `loot_chest.png`
 
-The block texture array has 32 layers. Layers 0 to 22 are the twenty-three authorable names above, in the order listed. Layers 23 to 31 are reserved built-in layers that cannot be overridden; a file named `reserved_23.png` or any other name that is not in the list above is ignored.
+The texture array has 48 layers. Layers 0 to 22 are the twenty-three block names above, in the order listed. Layers 23 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_23.png` or any other name that is not in one of the two lists is ignored.
 
 A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. Partial packs may add one texture or all twenty-three.
 
@@ -84,6 +84,34 @@ Image rules:
 - A missing file is fine and silently keeps the built-in texture for that block.
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
 - Partial packs always work — add one texture or all twenty-three.
+
+## Mob textures
+
+Mob part art shares the same texture array as block art, starting at layer 32. To give the pig your own hide, override one mob part file — for example `pig_body.png` — and leave the other twelve alone. Save each file directly in the pack folder, using these exact names and in this order:
+
+| File | Array layer | Mob part |
+|------|-------------|----------|
+| `pig_body.png` | 32 | Pig body |
+| `pig_head.png` | 33 | Pig head |
+| `pig_leg.png` | 34 | Pig legs |
+| `cow_body.png` | 35 | Cow body |
+| `cow_head.png` | 36 | Cow head |
+| `cow_leg.png` | 37 | Cow legs |
+| `zombie_body.png` | 38 | Zombie body |
+| `zombie_head.png` | 39 | Zombie head |
+| `zombie_leg.png` | 40 | Zombie legs |
+| `skeleton_body.png` | 41 | Skeleton body |
+| `skeleton_head.png` | 42 | Skeleton head |
+| `skeleton_leg.png` | 43 | Skeleton legs |
+| `arrow.png` | 44 | Arrow projectile |
+
+The same image rules as block textures apply to every mob file: square PNG, 16 to 256 pixels per side, resampled to 16x16.
+
+- Each file is optional and overrides only its own layer.
+- A missing file silently keeps the built-in procedural art for that part.
+- A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
+- A pack may add one mob file or all thirteen. Mob files and block files are independent.
+- Layers 23 to 31 and 45 to 47 are reserved and cannot be overridden. Files named after them, such as `reserved_45.png`, are ignored silently.
 
 ## Title logo and menu tint
 

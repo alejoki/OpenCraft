@@ -1,11 +1,21 @@
 pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
 ///
-/// Layers 0..=22 are authored art (23 layers, see
-/// [`crate::pack::LAYER_FILES`]); layers 23..=31 are reserved built-in
-/// placeholders no pack can override. The WGSL `w1 & 255` pack stays the
-/// wire format because 32 fits in a byte with room to spare.
-pub const NUM_TEX_LAYERS: u32 = 32;
+/// Layers 0..=22 are authored block art (23 layers, see
+/// [`crate::pack::LAYER_FILES`]); 23..=31 are reserved block placeholders no
+/// pack can override. Layers 32..=44 are the 13 authorable mob part layers
+/// (see [`crate::pack::MOB_LAYER_FILES`]) and 45..=47 are reserved spares.
+/// The WGSL `w1 & 255` wire format still holds because all 48 layers fit in
+/// a byte with room to spare.
+pub const NUM_TEX_LAYERS: u32 = 48;
+/// First array layer holding mob part art ([`MOB_LAYER_BASE`]..=[`MOB_ARROW_TEX_LAYER`]).
+pub const MOB_LAYER_BASE: u32 = 32;
+/// Count of mob part layers a texture pack may author.
+pub const MOB_AUTHORABLE_TEX_LAYERS: usize = 13;
+/// Array layer for the arrow projectile texture (last authorable mob layer).
+pub const MOB_ARROW_TEX_LAYER: u32 = 44;
+/// First of the three reserved spare layers after the mob range.
+pub const MOB_SPARE_LAYER_BASE: u32 = 45;
 pub const MIP_LEVELS: u32 = 5;
 
 #[inline]
@@ -73,6 +83,26 @@ fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
                 clamp_u8(92 + d + j),
                 clamp_u8(68 + d + j),
                 clamp_u8(46 + d + j),
+            ]
+        }
+    })
+}
+
+/// Deterministic magenta checker used by every reserved (non-authorable)
+/// layer. Opposing shades keep it opaque and visibly distinct from real art.
+fn reserved_checker(index: u32) -> Vec<u8> {
+    make_layer(100 + index, move |x, y, j| {
+        if (x / 2 + y / 2 + index) % 2 == 0 {
+            [
+                clamp_u8(236 + j / 4),
+                clamp_u8(32 + j / 4),
+                clamp_u8(214 + j / 4),
+            ]
+        } else {
+            [
+                clamp_u8(24 + j / 4),
+                clamp_u8(8 + j / 4),
+                clamp_u8(40 + j / 4),
             ]
         }
     })
@@ -316,29 +346,160 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         }),
     ];
 
-    // 23..32: reserved built-in layers. They are not authorable (no pack file
-    // name maps to them) and exist so the array is a round 32 layers. A
-    // deterministic magenta checker, offset per layer, keeps each one opaque
-    // and visibly distinct from every authored layer.
-    layers.extend((23..NUM_TEX_LAYERS).map(|index| {
-        make_layer(100 + index, move |x, y, j| {
-            if (x / 2 + y / 2 + index) % 2 == 0 {
-                [
-                    clamp_u8(236 + j / 4),
-                    clamp_u8(32 + j / 4),
-                    clamp_u8(214 + j / 4),
-                ]
+    // 23..32: reserved block layers. They are not authorable (no pack file
+    // name maps to them). A deterministic magenta checker, offset per layer,
+    // keeps each one opaque and visibly distinct from every authored layer.
+    layers.extend((23..MOB_LAYER_BASE).map(|index| reserved_checker(index)));
+
+    // 32..=44: the 13 authorable mob part layers, in `MOB_LAYER_FILES` order.
+    // Each is deterministic, opaque (make_layer forces alpha 255), and
+    // patterned so it is never a flat color.
+    layers.extend([
+        // 32: pig_body - pink hide with horizontal banding.
+        make_layer(200, |_, y, j| {
+            let band = if y % 4 == 0 { -10 } else { 0 };
+            [
+                clamp_u8(236 + j + band),
+                clamp_u8(154 + j / 2 + band),
+                clamp_u8(162 + j / 2 + band),
+            ]
+        }),
+        // 33: pig_head - lighter pink with a darker snout block.
+        make_layer(201, |x, y, j| {
+            let snout = (5..=10).contains(&x) && (6..=11).contains(&y);
+            if snout {
+                [clamp_u8(212 + j), clamp_u8(118 + j), clamp_u8(126 + j)]
             } else {
                 [
-                    clamp_u8(24 + j / 4),
-                    clamp_u8(8 + j / 4),
-                    clamp_u8(40 + j / 4),
+                    clamp_u8(244 + j),
+                    clamp_u8(164 + j / 2),
+                    clamp_u8(170 + j / 2),
                 ]
             }
-        })
-    }));
+        }),
+        // 34: pig_leg - darker pink with vertical seams.
+        make_layer(202, |x, _, j| {
+            let seam = if x % 4 == 0 { -14 } else { 0 };
+            [
+                clamp_u8(222 + j + seam),
+                clamp_u8(132 + j / 2 + seam),
+                clamp_u8(142 + j / 2 + seam),
+            ]
+        }),
+        // 35: cow_body - off-white hide with brown patches.
+        make_layer(203, |x, y, j| {
+            let patch = (x / 6 + y / 5) % 3 == 0;
+            if patch {
+                [clamp_u8(112 + j), clamp_u8(76 + j), clamp_u8(52 + j)]
+            } else {
+                [clamp_u8(238 + j), clamp_u8(234 + j), clamp_u8(226 + j)]
+            }
+        }),
+        // 36: cow_head - white face with a tan muzzle.
+        make_layer(204, |x, y, j| {
+            let muzzle = (4..=11).contains(&x) && (8..=13).contains(&y);
+            if muzzle {
+                [clamp_u8(204 + j), clamp_u8(164 + j), clamp_u8(148 + j)]
+            } else {
+                [clamp_u8(242 + j), clamp_u8(238 + j), clamp_u8(232 + j)]
+            }
+        }),
+        // 37: cow_leg - white with dark hooves at the bottom.
+        make_layer(205, |_, y, j| {
+            if y >= 13 {
+                [
+                    clamp_u8(62 + j / 2),
+                    clamp_u8(48 + j / 2),
+                    clamp_u8(42 + j / 2),
+                ]
+            } else {
+                [clamp_u8(232 + j), clamp_u8(226 + j), clamp_u8(216 + j)]
+            }
+        }),
+        // 38: zombie_body - green skin with torn darker patches.
+        make_layer(206, |x, y, j| {
+            let torn = (x / 5 + y / 4) % 4 == 0;
+            if torn {
+                [clamp_u8(54 + j), clamp_u8(94 + j), clamp_u8(46 + j)]
+            } else {
+                [clamp_u8(84 + j), clamp_u8(136 + j), clamp_u8(72 + j)]
+            }
+        }),
+        // 39: zombie_head - green face with two dark eye sockets.
+        make_layer(207, |x, y, j| {
+            let eye = (3..=5).contains(&x) || (10..=12).contains(&x);
+            if eye && (5..=8).contains(&y) {
+                [
+                    clamp_u8(24 + j / 2),
+                    clamp_u8(34 + j / 2),
+                    clamp_u8(22 + j / 2),
+                ]
+            } else {
+                [clamp_u8(100 + j), clamp_u8(154 + j), clamp_u8(84 + j)]
+            }
+        }),
+        // 40: zombie_leg - dark green with a vertical seam.
+        make_layer(208, |x, _, j| {
+            let seam = if x % 5 == 0 { -18 } else { 0 };
+            [
+                clamp_u8(68 + j + seam),
+                clamp_u8(108 + j + seam),
+                clamp_u8(60 + j + seam),
+            ]
+        }),
+        // 41: skeleton_body - bone grey with rib striping.
+        make_layer(209, |_, y, j| {
+            let rib = if y % 3 == 0 { -22 } else { 0 };
+            [
+                clamp_u8(198 + j + rib),
+                clamp_u8(198 + j + rib),
+                clamp_u8(190 + j + rib),
+            ]
+        }),
+        // 42: skeleton_head - bone grey with two dark eye sockets.
+        make_layer(210, |x, y, j| {
+            let eye = (3..=5).contains(&x) || (10..=12).contains(&x);
+            if eye && (6..=8).contains(&y) {
+                [
+                    clamp_u8(48 + j / 2),
+                    clamp_u8(48 + j / 2),
+                    clamp_u8(44 + j / 2),
+                ]
+            } else {
+                [clamp_u8(206 + j), clamp_u8(206 + j), clamp_u8(198 + j)]
+            }
+        }),
+        // 43: skeleton_leg - bone grey with joint segments.
+        make_layer(211, |_, y, j| {
+            let joint = if y % 5 == 4 { -20 } else { 0 };
+            [
+                clamp_u8(190 + j + joint),
+                clamp_u8(190 + j + joint),
+                clamp_u8(182 + j + joint),
+            ]
+        }),
+        // 44: arrow - wooden shaft, grey head, pale fletching.
+        make_layer(212, |x, y, j| {
+            if y <= 3 {
+                [clamp_u8(150 + j), clamp_u8(150 + j), clamp_u8(146 + j)]
+            } else if y >= 12 {
+                [clamp_u8(226 + j), clamp_u8(222 + j), clamp_u8(206 + j)]
+            } else if (7..=8).contains(&x) {
+                [clamp_u8(124 + j), clamp_u8(82 + j), clamp_u8(48 + j)]
+            } else {
+                [clamp_u8(96 + j), clamp_u8(64 + j), clamp_u8(38 + j)]
+            }
+        }),
+    ]);
+
+    // 45..48: reserved spare layers, same magenta checker rule as 23..32.
+    layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(|index| reserved_checker(index)));
 
     debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
+    debug_assert_eq!(
+        MOB_LAYER_BASE as usize + MOB_AUTHORABLE_TEX_LAYERS,
+        MOB_ARROW_TEX_LAYER as usize + 1
+    );
     layers
 }
 
@@ -475,7 +636,7 @@ mod tests {
     fn test_procedural_texture_layers_non_empty() {
         let layers = generate_all_texture_layers_rgba();
         assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
-        assert_eq!(layers.len(), 32);
+        assert_eq!(layers.len(), 48);
         for layer in &layers {
             assert_eq!(layer.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
             let (pixels, remainder) = layer.as_chunks::<4>();
@@ -549,39 +710,105 @@ mod tests {
     fn test_reserved_texture_layers_are_distinct_opaque_placeholders() {
         let layers = generate_all_texture_layers_rgba();
         let authorable = 23usize;
-        assert_eq!(NUM_TEX_LAYERS as usize, 32);
+        assert_eq!(NUM_TEX_LAYERS as usize, 48);
 
-        for reserved in authorable..NUM_TEX_LAYERS as usize {
+        // Block-reserved 23..32 and spare 45..48 both use the reserved rule;
+        // neither range may alias authored art or mob art.
+        let reserved: Vec<usize> = (authorable..MOB_LAYER_BASE as usize)
+            .chain(MOB_SPARE_LAYER_BASE as usize..NUM_TEX_LAYERS as usize)
+            .collect();
+        assert_eq!(reserved.len(), 9 + 3);
+
+        for &index in &reserved {
             for authored in 0..authorable {
                 assert_ne!(
-                    layers[reserved], layers[authored],
-                    "reserved layer {reserved} must differ from authored layer {authored}"
+                    layers[index], layers[authored],
+                    "reserved layer {index} must differ from authored layer {authored}"
                 );
             }
-            let (pixels, remainder) = layers[reserved].as_chunks::<4>();
+            for mob in (MOB_LAYER_BASE..=MOB_ARROW_TEX_LAYER).map(|i| i as usize) {
+                assert_ne!(
+                    layers[index], layers[mob],
+                    "reserved layer {index} must differ from mob layer {mob}"
+                );
+            }
+            let (pixels, remainder) = layers[index].as_chunks::<4>();
             assert!(remainder.is_empty());
             assert!(
                 pixels.iter().all(|px| px[3] == 255),
-                "reserved layer {reserved} must stay opaque"
+                "reserved layer {index} must stay opaque"
             );
             let first = &pixels[0];
             assert!(
                 pixels.iter().any(|px| px != first),
-                "reserved layer {reserved} must not be a flat color"
+                "reserved layer {index} must not be a flat color"
             );
+        }
+
+        for (offset, a) in reserved.iter().enumerate() {
+            for b in &reserved[offset + 1..] {
+                assert_ne!(
+                    layers[*a], layers[*b],
+                    "reserved layers {a} and {b} must differ"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_block_layer_shape_rejects_31_and_33_layers() {
+    fn test_mob_texture_layers_are_distinct_opaque_and_indexed() {
+        let layers = generate_all_texture_layers_rgba();
+        assert_eq!(MOB_LAYER_BASE, 32);
+        assert_eq!(MOB_AUTHORABLE_TEX_LAYERS, 13);
+        assert_eq!(MOB_ARROW_TEX_LAYER, 44);
+        assert_eq!(MOB_SPARE_LAYER_BASE, 45);
+        assert_eq!(
+            MOB_LAYER_BASE as usize + MOB_AUTHORABLE_TEX_LAYERS,
+            MOB_ARROW_TEX_LAYER as usize + 1
+        );
+
+        let mob: Vec<usize> = (MOB_LAYER_BASE..=MOB_ARROW_TEX_LAYER)
+            .map(|i| i as usize)
+            .collect();
+        assert_eq!(mob.len(), MOB_AUTHORABLE_TEX_LAYERS);
+
+        for &index in &mob {
+            let (pixels, remainder) = layers[index].as_chunks::<4>();
+            assert!(remainder.is_empty(), "mob layer {index} shape");
+            assert!(
+                pixels.iter().all(|px| px[3] == 255),
+                "mob layer {index} must be opaque"
+            );
+            let first = &pixels[0];
+            assert!(
+                pixels.iter().any(|px| px != first),
+                "mob layer {index} must not be a flat color"
+            );
+            for authored in 0..23usize {
+                assert_ne!(
+                    layers[index], layers[authored],
+                    "mob layer {index} must differ from authored layer {authored}"
+                );
+            }
+        }
+
+        for (offset, a) in mob.iter().enumerate() {
+            for b in &mob[offset + 1..] {
+                assert_ne!(layers[*a], layers[*b], "mob layers {a} and {b} must differ");
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_layer_shape_rejects_num_tex_layers_plus_or_minus_one() {
         let mut fewer = generate_all_texture_layers_rgba();
         fewer.pop();
-        assert_eq!(fewer.len(), 31);
+        assert_eq!(fewer.len(), NUM_TEX_LAYERS as usize - 1);
         assert!(!block_layers_match_shape(&fewer));
 
         let mut more = generate_all_texture_layers_rgba();
         more.push(vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize]);
-        assert_eq!(more.len(), 33);
+        assert_eq!(more.len(), NUM_TEX_LAYERS as usize + 1);
         assert!(!block_layers_match_shape(&more));
     }
 
