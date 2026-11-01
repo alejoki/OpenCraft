@@ -16,7 +16,7 @@ use crate::player::camera::Camera;
 use crate::player::combat::DamageCause;
 use crate::player::container::Container;
 use crate::player::inventory::{
-    ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, CHEST_SLOTS,
+    ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
 };
 use crate::player::melee::MeleeHit;
 use crate::player::physics::Player;
@@ -24,6 +24,7 @@ use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
     GameMode, SurvivalContext, SurvivalRuntime, SurvivalState, SurvivalTick,
 };
+use crate::world::arrow::{Arrow, ArrowState, ARROW_CAP};
 use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use crate::world::daycycle::GameClock;
@@ -42,6 +43,48 @@ use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_heigh
 /// reachable. Shared with the placement/mining ray length so every world
 /// interaction uses one reach budget.
 pub const TABLE_INTERACT_REACH: f32 = 8.0;
+
+/// Why [`WorldSession::fire_bow`] refused a shot.
+///
+/// Every variant is returned with **zero mutation**: the refusal matrix is
+/// checked in full before the arrow list, the inventory, or the bow's
+/// durability can change.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BowFireError {
+    /// The player has zero health.
+    Dead,
+    /// The selected hotbar item is not a wood bow.
+    NotHoldingBow,
+    /// The 36 inventory slots hold no `Arrow` to spend.
+    NoAmmo,
+    /// [`ARROW_CAP`] projectiles are already resident (embedded ones count).
+    ArrowCapReached,
+    /// [`Arrow::player`] rejected the origin, direction, or charge.
+    InvalidShot,
+}
+
+/// Counters for one [`WorldSession::tick_arrows`] call.
+///
+/// The entity-facing fields are filled by S08/T03 (mob, player, kill and drop
+/// resolution); they live in the struct from the start so the shape never
+/// changes twice.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArrowTick {
+    /// Arrows that embedded into a solid block this tick.
+    pub block_hits: u32,
+    /// Arrows that hit a mob this tick.
+    pub mob_hits: u32,
+    /// Arrows that hit the player this tick.
+    pub player_hits: u32,
+    /// Mob kills credited to a player-fired arrow this tick.
+    pub kills: u32,
+    /// Units delivered (or lost) by this tick's attributed mob kills.
+    pub drops: MobDropReport,
+    /// Damage applied to the player by skeleton arrows this tick.
+    pub player_damage: u16,
+    /// Arrows removed because their lifetime (flying or embedded) ran out.
+    pub expired: u32,
+}
 
 /// The active world session GameApp holds (S03-T02). One always-present
 /// session is swapped atomically at the `start_world_session` boundary.
@@ -91,6 +134,11 @@ pub struct WorldSession {
     /// v7 save tail and restored by [`WorldSession::session_from_save`].
     /// Records are never dropped by simulation.
     mobs: Vec<Mob>,
+    /// Ephemeral in-flight and embedded projectiles, owned for the lifetime of
+    /// the session. **Never persisted**: the v7 save tail is mob-only and an
+    /// arrow in flight is ephemeral exactly like a mob's knockback impulse, so
+    /// a reload always starts with an empty list.
+    arrows: Vec<Arrow>,
     /// Fixed-rate 20 Hz mob driver, seeded from the session's world seed.
     /// Ephemeral like `survival_runtime`.
     mob_runtime: MobRuntime,
@@ -177,6 +225,7 @@ impl WorldSession {
             crops: CropRuntime::default(),
             spawn_settle: mode == GameMode::Survival,
             mobs: Vec::new(),
+            arrows: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
             hostile_ai: true,
             spawn_runtime: SpawnRuntime::new(),
@@ -230,6 +279,7 @@ impl WorldSession {
             // Edit Background is a Creative-rules editor and is never gated.
             spawn_settle: false,
             mobs: Vec::new(),
+            arrows: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
             hostile_ai: true,
             spawn_runtime: SpawnRuntime::new(),
@@ -328,6 +378,9 @@ impl WorldSession {
             // is the save's, and a mid-air fall must still hurt.
             spawn_settle: false,
             mobs,
+            // Projectiles are never persisted: a reload starts in flight-free
+            // air, exactly like a fresh session.
+            arrows: Vec::new(),
             // The fixed-rate driver deliberately restarts at tick 0: a reload
             // is a deterministic restart of the AI clock, not a continuation
             // of the pre-save tick index.
@@ -477,6 +530,185 @@ impl WorldSession {
     /// [`WorldSession::mobs`], so render batch and entity list stay aligned.
     pub fn resident_mobs(&self) -> impl Iterator<Item = &Mob> + '_ {
         self.mobs.iter().filter(|mob| self.mob_is_resident(mob))
+    }
+
+    // -----------------------------------------------------------------------
+    // Projectiles (S07)
+    // -----------------------------------------------------------------------
+
+    /// The session-owned projectile list: flying and embedded arrows alike.
+    ///
+    /// Ordering is spawn order. The renderer batches this list directly, and
+    /// embedded arrows stay in it until their embed timer drains.
+    #[inline]
+    pub fn arrows(&self) -> &[Arrow] {
+        &self.arrows
+    }
+
+    /// Whether the chunk containing the arrow's floor cell is resident.
+    ///
+    /// The exact gate [`WorldSession::mob_is_resident`] uses: an arrow whose
+    /// position is in an unloaded chunk is frozen in place rather than
+    /// colliding with the world manager's implicit Air, so it can never tunnel
+    /// through terrain that simply has not streamed in yet.
+    pub fn arrow_is_resident(&self, arrow: &Arrow) -> bool {
+        let (chunk, _) = world_to_chunk_and_local(
+            arrow.position.x.floor() as i32,
+            arrow.position.y.floor() as i32,
+            arrow.position.z.floor() as i32,
+        );
+        self.world.is_resident(chunk)
+    }
+
+    /// Pushes an already-built arrow into the session list, returning its
+    /// index.
+    ///
+    /// This is the shared spawn seam S08 reuses for skeleton arrows. It
+    /// refuses (and mutates nothing) when the arrow is already
+    /// [`Arrow::finished`] — a lifetime already spent, or non-finite
+    /// position/velocity — or when the list is at [`ARROW_CAP`]. Embedded
+    /// arrows count toward the cap until they expire, so the cap bounds both
+    /// motion and render work.
+    pub fn spawn_arrow(&mut self, arrow: Arrow) -> Option<usize> {
+        if arrow.finished() || self.arrows.len() >= ARROW_CAP {
+            return None;
+        }
+        self.arrows.push(arrow);
+        Some(self.arrows.len() - 1)
+    }
+
+    /// Fires one arrow from the player's wood bow, returning the spawned
+    /// arrow.
+    ///
+    /// Every guard runs **before** the first mutation, so each refusal leaves
+    /// the arrow list, the inventory, and the bow's durability untouched. The
+    /// checks are ordered from cheapest/most authoritative to most work:
+    ///
+    /// 1. [`WorldSession::is_dead`] → [`BowFireError::Dead`];
+    /// 2. the selected item must be a wood bow →
+    ///    [`BowFireError::NotHoldingBow`] (there is deliberately no game-mode
+    ///    gate: a Creative player may fire, and S09 owns Creative damage);
+    /// 3. [`Arrow::player`] must accept the origin/direction/charge →
+    ///    [`BowFireError::InvalidShot`];
+    /// 4. the list must be below [`ARROW_CAP`] →
+    ///    [`BowFireError::ArrowCapReached`] (a refused shot spends no ammo and
+    ///    no wear);
+    /// 5. exactly one `Arrow` must be consumed by identity from the 36 slots
+    ///    → [`BowFireError::NoAmmo`].
+    ///
+    /// Only then is the arrow pushed and the bow worn exactly once. The wear
+    /// result is ignored (MEM392): the shot is already in flight, so a bow
+    /// that breaks on its last durability point still fired. Ammo may come
+    /// from any slot, never the cursor or either crafting grid.
+    pub fn fire_bow(
+        &mut self,
+        origin: Vec3,
+        dir: Vec3,
+        charge: f32,
+    ) -> Result<Arrow, BowFireError> {
+        if self.is_dead() {
+            return Err(BowFireError::Dead);
+        }
+        let holding_bow = matches!(
+            self.player.selected_item().map(|item| item.id()),
+            Some(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            })
+        );
+        if !holding_bow {
+            return Err(BowFireError::NotHoldingBow);
+        }
+        let arrow = Arrow::player(origin, dir, charge).ok_or(BowFireError::InvalidShot)?;
+        if self.arrows.len() >= ARROW_CAP {
+            return Err(BowFireError::ArrowCapReached);
+        }
+        if self
+            .player
+            .consume_item(ItemId::Material(Material::Arrow))
+            .is_none()
+        {
+            return Err(BowFireError::NoAmmo);
+        }
+        self.arrows.push(arrow);
+        // Mutate-then-wear (MEM392): the arrow exists now, so a bow that
+        // breaks on this point of wear must not roll the shot back.
+        let _ = self.player.wear_selected_tool();
+        Ok(arrow)
+    }
+
+    /// Advances every projectile by one frame of game time.
+    ///
+    /// Exactly the [`WorldSession::tick_mobs`] clamp contract: `dt` is clamped
+    /// to `0.0..=0.1`, then scaled by `time_scale` (negative becomes zero), and
+    /// non-finite/non-positive game time is a no-op.
+    ///
+    /// The list is taken out with [`std::mem::take`] so `&self.world` stays
+    /// immutably borrowable while arrows are mutated. Per arrow:
+    ///
+    /// * non-resident → kept unchanged (frozen at the chunk boundary, never
+    ///   collided against unloaded Air);
+    /// * `Embedded` → one `advance(game_dt)`, draining the embed timer;
+    /// * `Flying` → [`Arrow::substeps`] substeps of `game_dt / substeps`. A
+    ///   32 b/s arrow moves 3.2 blocks in a 0.1 s frame, so point sampling
+    ///   would tunnel through a one-block wall; 0.25-block substeps cannot.
+    ///   After each substep, a destination in a non-resident chunk restores
+    ///   the previous position and freezes the arrow; a solid destination
+    ///   block embeds it and counts one block hit.
+    ///
+    /// Finished arrows (spent lifetime, or non-finite from a corrupt advance)
+    /// are dropped and counted into [`ArrowTick::expired`]. Embedded arrows
+    /// still count toward [`ARROW_CAP`] until they expire.
+    pub fn tick_arrows(&mut self, dt: f32, time_scale: f32) -> ArrowTick {
+        let dt = dt.clamp(0.0, 0.1);
+        let game_dt = dt * time_scale.max(0.0);
+        let mut report = ArrowTick::default();
+        if !game_dt.is_finite() || game_dt <= 0.0 {
+            return report;
+        }
+
+        let arrows = std::mem::take(&mut self.arrows);
+        let mut kept = Vec::with_capacity(arrows.len());
+        for mut arrow in arrows {
+            if !self.arrow_is_resident(&arrow) {
+                kept.push(arrow);
+                continue;
+            }
+            match arrow.state {
+                ArrowState::Embedded => arrow.advance(game_dt),
+                ArrowState::Flying => {
+                    let substeps = arrow.substeps(game_dt);
+                    let sub_dt = game_dt / substeps as f32;
+                    for _ in 0..substeps {
+                        let before = arrow.position;
+                        arrow.advance(sub_dt);
+                        if !self.arrow_is_resident(&arrow) {
+                            // The next cell lives in a chunk that has not
+                            // streamed in: restore the last known-good point
+                            // and freeze instead of colliding with Air.
+                            arrow.position = before;
+                            break;
+                        }
+                        let cell = arrow.position.floor();
+                        let block =
+                            self.world
+                                .get_block(cell.x as i32, cell.y as i32, cell.z as i32);
+                        if block.is_solid() {
+                            arrow.embed();
+                            report.block_hits += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if arrow.finished() {
+                report.expired += 1;
+            } else {
+                kept.push(arrow);
+            }
+        }
+        self.arrows = kept;
+        report
     }
 
     /// The nearest resident, *live* mob the crosshair ray enters within
@@ -970,6 +1202,9 @@ impl WorldSession {
         self.last_damage_cause = None;
         self.survival_runtime.reset();
         self.spawn_settle = true;
+        // Projectiles are ephemeral session-owned state: a respawn starts in
+        // flight-free air, never inheriting a shot fired before death.
+        self.arrows.clear();
         for mob in &mut self.mobs {
             mob.reset_hostile_tracking();
         }
@@ -5357,5 +5592,327 @@ mod tests {
             Item::new(ItemId::Material(Material::RottenFlesh), 1).ok(),
             "a zombie kill yields one rotten flesh"
         );
+    }
+
+    // -- Projectiles (S07-T02) ---------------------------------------------
+
+    fn arrow_session(seed: u32) -> WorldSession {
+        let mut session = make_mob_session(seed);
+        add_resident_air(&mut session);
+        session.set_ambient_spawning(false);
+        session
+    }
+
+    fn give_bow(session: &mut WorldSession) {
+        let bow = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("wood bow");
+        session
+            .player
+            .insert_items(&[bow])
+            .expect("empty inventory accepts a bow");
+        assert!(session.player.select_slot(0), "select the bow slot");
+    }
+
+    fn give_arrows(session: &mut WorldSession, count: u16) {
+        let arrows = Item::new(ItemId::Material(Material::Arrow), count).expect("arrows");
+        session
+            .player
+            .insert_items(&[arrows])
+            .expect("empty inventory accepts arrows");
+    }
+
+    fn arrow_count(session: &WorldSession) -> u32 {
+        session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Material(Material::Arrow))
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    fn bow_durability(session: &WorldSession) -> Option<u16> {
+        session
+            .player
+            .selected_item()
+            .and_then(|item| item.durability())
+    }
+
+    fn shot_origin() -> Vec3 {
+        Vec3::new(8.5, 5.5, 8.5)
+    }
+
+    #[test]
+    fn fire_bow_consumes_one_arrow_and_wears_the_bow_once() {
+        let mut session = arrow_session(51);
+        give_bow(&mut session);
+        give_arrows(&mut session, 4);
+
+        let fired = session
+            .fire_bow(shot_origin(), Vec3::X, 1.0)
+            .expect("a full charge fires");
+
+        assert_eq!(session.arrows().len(), 1);
+        assert_eq!(session.arrows()[0], fired);
+        assert_eq!(arrow_count(&session), 3, "exactly one arrow is spent");
+        assert_eq!(bow_durability(&session), Some(58), "one point of wear");
+        assert_eq!(fired.damage, 4, "full charge deals 4");
+        assert!((fired.velocity.length() - 32.0).abs() < 1e-4);
+        assert_eq!(fired.owner, crate::world::arrow::ArrowOwner::Player);
+    }
+
+    #[test]
+    fn fire_bow_refusals_mutate_nothing() {
+        // No ammo: the shot is refused after the bow and geometry checks, and
+        // neither durability nor the arrow list changes.
+        let mut no_ammo = arrow_session(52);
+        give_bow(&mut no_ammo);
+        assert_eq!(
+            no_ammo.fire_bow(shot_origin(), Vec3::X, 1.0),
+            Err(BowFireError::NoAmmo)
+        );
+        assert!(no_ammo.arrows().is_empty());
+        assert_eq!(bow_durability(&no_ammo), Some(59));
+
+        // Not holding the bow: a sword in the selected slot refuses before
+        // ammo is even consulted.
+        let mut sword = arrow_session(53);
+        give_bow(&mut sword);
+        give_arrows(&mut sword, 2);
+        let sword_item = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("wood sword");
+        sword
+            .player
+            .insert_items(&[sword_item])
+            .expect("empty slot for the sword");
+        assert!(sword.player.select_slot(2));
+        assert_eq!(
+            sword.fire_bow(shot_origin(), Vec3::X, 1.0),
+            Err(BowFireError::NotHoldingBow)
+        );
+        assert!(sword.arrows().is_empty());
+        assert_eq!(arrow_count(&sword), 2);
+
+        // Dead player.
+        let mut dead = arrow_session(54);
+        give_bow(&mut dead);
+        give_arrows(&mut dead, 2);
+        dead.player.survival.damage(20);
+        assert!(dead.is_dead());
+        assert_eq!(
+            dead.fire_bow(shot_origin(), Vec3::X, 1.0),
+            Err(BowFireError::Dead)
+        );
+        assert!(dead.arrows().is_empty());
+        assert_eq!(arrow_count(&dead), 2);
+
+        // Bad geometry / charge.
+        let mut invalid = arrow_session(55);
+        give_bow(&mut invalid);
+        give_arrows(&mut invalid, 2);
+        assert_eq!(
+            invalid.fire_bow(shot_origin(), Vec3::new(f32::NAN, 0.0, 0.0), 1.0),
+            Err(BowFireError::InvalidShot)
+        );
+        assert_eq!(
+            invalid.fire_bow(shot_origin(), Vec3::X, 1.5),
+            Err(BowFireError::InvalidShot)
+        );
+        assert_eq!(
+            invalid.fire_bow(shot_origin(), Vec3::X, -0.1),
+            Err(BowFireError::InvalidShot)
+        );
+        assert!(invalid.arrows().is_empty());
+        assert_eq!(arrow_count(&invalid), 2);
+        assert_eq!(bow_durability(&invalid), Some(59));
+
+        // Cap reached: no ammo and no wear are spent on a refused shot.
+        let mut capped = arrow_session(56);
+        let filler = Arrow::player(shot_origin(), Vec3::X, 0.0).expect("filler");
+        for _ in 0..ARROW_CAP {
+            assert!(capped.spawn_arrow(filler).is_some());
+        }
+        give_bow(&mut capped);
+        give_arrows(&mut capped, 2);
+        assert_eq!(
+            capped.fire_bow(shot_origin(), Vec3::X, 1.0),
+            Err(BowFireError::ArrowCapReached)
+        );
+        assert_eq!(capped.arrows().len(), ARROW_CAP);
+        assert_eq!(arrow_count(&capped), 2);
+        assert_eq!(bow_durability(&capped), Some(59));
+    }
+
+    #[test]
+    fn arrow_cap_is_64_and_embedded_arrows_count() {
+        let mut session = arrow_session(57);
+        let mut embedded = Arrow::player(shot_origin(), Vec3::X, 0.0).expect("filler");
+        embedded.embed();
+        assert!(session.spawn_arrow(embedded).is_some());
+        let filler = Arrow::player(shot_origin(), Vec3::X, 0.0).expect("filler");
+        while session.arrows().len() < ARROW_CAP {
+            assert!(session.spawn_arrow(filler).is_some());
+        }
+
+        assert_eq!(ARROW_CAP, 64);
+        assert_eq!(session.arrows().len(), 64);
+        assert_eq!(
+            session.spawn_arrow(filler),
+            None,
+            "the 65th arrow is refused"
+        );
+        assert_eq!(session.arrows().len(), 64);
+        assert_eq!(session.arrows()[0].state, ArrowState::Embedded);
+
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+        assert_eq!(
+            session.fire_bow(shot_origin(), Vec3::X, 1.0),
+            Err(BowFireError::ArrowCapReached)
+        );
+        assert_eq!(session.arrows().len(), 64);
+        assert_eq!(arrow_count(&session), 1);
+    }
+
+    #[test]
+    fn arrow_embeds_in_a_wall_then_expires() {
+        let mut session = arrow_session(58);
+        // Flat floor under the flight path plus a one-block wall ahead of the
+        // origin (2.5, 5.5, 8.5) heading +X.
+        for x in 1..=8 {
+            for z in 7..=10 {
+                place_block(&mut session, IVec3::new(x, 4, z), BlockId::Stone);
+            }
+        }
+        place_block(&mut session, IVec3::new(4, 5, 8), BlockId::Stone);
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+
+        let fired = session
+            .fire_bow(Vec3::new(2.5, 5.5, 8.5), Vec3::X, 1.0)
+            .expect("full charge");
+        assert_eq!(fired.state, ArrowState::Flying);
+
+        let tick = session.tick_arrows(0.1, 1.0);
+        assert_eq!(tick.block_hits, 1, "the wall stops the arrow");
+        assert_eq!(session.arrows().len(), 1);
+        let embedded = session.arrows()[0];
+        assert_eq!(embedded.state, ArrowState::Embedded);
+        assert_eq!(embedded.life, crate::world::arrow::ARROW_EMBED_SECS);
+        assert!(embedded.position.x >= 4.0 && embedded.position.x < 5.0);
+
+        let mut expired = 0;
+        for _ in 0..20 {
+            expired += session.tick_arrows(0.1, 1.0).expired;
+        }
+        assert!(session.arrows().is_empty(), "the embed timer despawns it");
+        assert!(expired >= 1);
+    }
+
+    #[test]
+    fn a_full_charge_arrow_cannot_tunnel_a_one_block_wall() {
+        let mut session = arrow_session(59);
+        place_block(&mut session, IVec3::new(4, 5, 8), BlockId::Stone);
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+        session
+            .fire_bow(Vec3::new(2.5, 5.5, 8.5), Vec3::X, 1.0)
+            .expect("full charge");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.block_hits, 1, "the wall is detected inside the sweep");
+        assert_eq!(session.arrows().len(), 1);
+        assert_eq!(session.arrows()[0].state, ArrowState::Embedded);
+        assert!(
+            session.arrows()[0].position.x < 5.0,
+            "a 3.2-block frame must not tunnel through the one-block wall"
+        );
+    }
+
+    #[test]
+    fn arrow_flight_is_frame_rate_independent() {
+        let mut single = arrow_session(60);
+        give_bow(&mut single);
+        give_arrows(&mut single, 1);
+        single
+            .fire_bow(shot_origin(), Vec3::X, 1.0)
+            .expect("full charge");
+
+        let mut split = arrow_session(60);
+        give_bow(&mut split);
+        give_arrows(&mut split, 1);
+        split
+            .fire_bow(shot_origin(), Vec3::X, 1.0)
+            .expect("full charge");
+
+        single.tick_arrows(0.1, 1.0);
+        split.tick_arrows(0.05, 1.0);
+        split.tick_arrows(0.05, 1.0);
+
+        assert_eq!(single.arrows().len(), 1);
+        assert_eq!(split.arrows().len(), 1);
+        assert!(
+            (single.arrows()[0].position - split.arrows()[0].position).length() < 1e-3,
+            "one 0.1 s tick and two 0.05 s ticks must agree"
+        );
+    }
+
+    #[test]
+    fn non_resident_arrow_freezes_instead_of_colliding() {
+        let mut session = arrow_session(61);
+        // Chunk (0,0,0) is the only resident chunk and spans x 0..32: one
+        // 32 b/s substep from x = 31.9 crosses into chunk (1,0,0), which is
+        // unloaded.
+        let arrow = Arrow::player(Vec3::new(31.9, 5.5, 8.5), Vec3::X, 1.0).expect("arrow");
+        let index = session.spawn_arrow(arrow).expect("not finished");
+        let before = session.arrows()[index];
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.block_hits, 0, "unloaded Air is never a collision");
+        assert_eq!(session.arrows().len(), 1, "the frozen arrow is retained");
+        assert_eq!(session.arrows()[index].position, before.position);
+        assert_eq!(session.arrows()[index].state, ArrowState::Flying);
+    }
+
+    #[test]
+    fn respawn_clears_arrows_and_a_reload_starts_with_none() {
+        use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
+
+        let mut session = arrow_session(62);
+        session
+            .spawn_arrow(Arrow::player(shot_origin(), Vec3::X, 1.0).expect("arrow"))
+            .expect("arrow fits");
+        assert_eq!(session.arrows().len(), 1);
+
+        session.respawn();
+        assert!(session.arrows().is_empty(), "respawn clears projectiles");
+
+        // Arrows have no wire representation: the v7 save stays the same
+        // 153-byte edit-free layout and a reload starts in flight-free air.
+        let data = make_save(62);
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("save encodes");
+        assert_eq!(bytes.len(), 153, "arrows add no save bytes");
+        let restored = WorldSession::session_from_save(
+            load_world_from_bytes(&bytes).expect("save decodes"),
+            PathBuf::from("/tmp/arrow-reload.mcvx"),
+        );
+        assert!(restored.arrows().is_empty());
     }
 }

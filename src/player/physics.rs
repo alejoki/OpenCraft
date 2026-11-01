@@ -410,6 +410,18 @@ impl Player {
         self.inventory.consume_one(self.selected_slot)
     }
 
+    /// Consumes exactly one unit of `id` from the first matching slot.
+    ///
+    /// Thin forwarder over [`Inventory::consume_item`]. A bow lives in the
+    /// selected hotbar slot, so its ammo cannot be spent by slot index: this
+    /// primitive spends a projectile identity from any of the 36 slots in
+    /// hotbar-then-main order and never touches the cursor or either grid.
+    /// Returns the consumed unit and the slot it came from, or `None` with no
+    /// mutation when the identity is absent.
+    pub fn consume_item(&mut self, id: ItemId) -> Option<(usize, Item)> {
+        self.inventory.consume_item(id)
+    }
+
     /// Completes one hold-to-eat meal: consumes exactly one `expected` item
     /// from `slot` and restores its food value, returning the hunger actually
     /// applied.

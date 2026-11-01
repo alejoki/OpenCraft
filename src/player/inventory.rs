@@ -1023,6 +1023,30 @@ impl Inventory {
         Some(consumed)
     }
 
+    /// Consumes one unit of `id` from the first matching slot, returning the
+    /// consumed unit and its slot index.
+    ///
+    /// Slots are scanned in their existing flat hotbar-then-main order, so a
+    /// stack sitting in the hotbar is always spent before an identical stack
+    /// in main storage. Exactly one unit is removed: a multi-unit stack shrinks
+    /// by one, and a single-unit slot is cleared. Neither
+    /// [`Inventory::cursor`] nor either crafting grid (which live outside this
+    /// aggregate) is ever a source or a destination.
+    ///
+    /// An identity held nowhere in the 36 slots returns `None` with every
+    /// slot unchanged. This is the by-identity sibling of
+    /// [`Inventory::consume_one`], which requires an already-known index: the
+    /// bow occupies the selected hotbar slot, so spending an arrow must not
+    /// disturb the selection.
+    pub fn consume_item(&mut self, id: ItemId) -> Option<(usize, Item)> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_some_and(|item| item.id() == id))?;
+        let consumed = self.consume_one(index)?;
+        Some((index, consumed))
+    }
+
     /// Picks the whole slot stack up onto the cursor.
     ///
     /// - Empty cursor: the stack moves to the cursor.
@@ -2883,6 +2907,74 @@ mod tests {
         assert_eq!(inventory.hotbar(0), None);
         assert_eq!(inventory.consume_one(0), None);
         assert_eq!(inventory.consume_one(INVENTORY_SLOTS), None);
+    }
+
+    #[test]
+    fn consume_item_spends_one_unit_and_leaves_the_rest() {
+        let mut inventory = Inventory::empty();
+        inventory.insert(arrow(4)).expect("stack fits");
+
+        let (index, consumed) = inventory.consume_item(arrow_id()).expect("one unit");
+        assert_eq!(index, 0);
+        assert_eq!(consumed, arrow(1));
+        assert_eq!(inventory.slot(0).map(|item| item.count()), Some(3));
+        assert_eq!(total_of(&inventory, arrow_id()), 3);
+    }
+
+    #[test]
+    fn consume_item_clears_a_single_unit_slot_and_then_reports_none() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(arrow(1));
+
+        assert_eq!(inventory.consume_item(arrow_id()), Some((0, arrow(1))));
+        assert_eq!(inventory.slot(0), None);
+        assert_eq!(inventory.consume_item(arrow_id()), None);
+        assert_eq!(inventory.slot(0), None);
+    }
+
+    #[test]
+    fn consume_item_picks_the_earliest_matching_slot_in_flat_order() {
+        let mut inventory = Inventory::empty();
+        // Main storage first (slot 12), then hotbar (slot 3): the hotbar copy
+        // must win because the scan is hotbar-then-main.
+        inventory.slots[12] = Some(arrow(2));
+        inventory.slots[3] = Some(arrow(5));
+
+        assert_eq!(inventory.consume_item(arrow_id()).map(|(i, _)| i), Some(3));
+        assert_eq!(inventory.slot(3).map(|item| item.count()), Some(4));
+        assert_eq!(inventory.slot(12).map(|item| item.count()), Some(2));
+    }
+
+    #[test]
+    fn consume_item_never_touches_the_cursor_or_the_crafting_grids() {
+        let mut inventory = Inventory::empty();
+        inventory.insert(arrow(2)).expect("stack fits");
+        inventory.cursor = Some(arrow(9));
+        let before_cursor = inventory.cursor();
+
+        assert!(inventory.consume_item(arrow_id()).is_some());
+        assert_eq!(inventory.cursor(), before_cursor);
+        assert_eq!(inventory.slot(0).map(|item| item.count()), Some(1));
+    }
+
+    #[test]
+    fn consume_item_returns_none_without_mutation_for_an_absent_identity() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(stick(3));
+        inventory.slots[9] = Some(block(BlockId::Stone, 1));
+        inventory.cursor = Some(arrow(1));
+        let before = inventory.clone();
+
+        assert_eq!(inventory.consume_item(arrow_id()), None);
+        assert_eq!(inventory, before, "an absent identity mutates nothing");
+    }
+
+    fn arrow(count: u16) -> Item {
+        item(ItemId::Material(Material::Arrow), count)
+    }
+
+    fn arrow_id() -> ItemId {
+        ItemId::Material(Material::Arrow)
     }
 
     // -- Cursor transfers ---------------------------------------------------

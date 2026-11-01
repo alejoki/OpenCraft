@@ -36,7 +36,7 @@ pub enum MobDropItem {
 /// drop path only needs to know whether a player earned the table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MobKillCause {
-    /// The killing blow was a player's melee hit.
+    /// The killing blow was a player's melee hit or a player-fired arrow.
     Player,
     /// Anything else killed the mob; no drops are granted.
     Environment,
