@@ -70,7 +70,7 @@ use opencraft::ui::{
     LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
-use opencraft::world::arrow::ArrowState;
+use opencraft::world::arrow::{ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
@@ -80,7 +80,7 @@ use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind};
-use opencraft::world::mob_loot::{MobDropReport, MobKillCause};
+use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
     SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
@@ -3999,6 +3999,16 @@ pub const COMBAT_DAY_TICK: u32 = 6_000;
 /// regression latches a self-describing abort instead of hanging the run.
 pub const COMBAT_HOSTILE_ABORT_TICKS: u32 = 400;
 
+/// Hard cap on each Skeleton stage phase's fixed-step observations.
+///
+/// 400 x 0.1 s = 40 s of game time. The fire phase needs one skeleton shot
+/// (the brain fires on its first step) plus ~0.4 s of arrow flight; the
+/// death-cause phase needs the next 2.0 s shot plus flight; the kill proof
+/// needs one arrow flight. Bounded rather than "until dead" so a regression in
+/// the ranged brain or the projectile sweep latches a self-describing abort
+/// instead of hanging the demo's 120 s deadline.
+pub const COMBAT_SKELETON_ABORT_TICKS: u32 = 400;
+
 /// Minimum Ambient spawn-phase observations before the stage may advance.
 ///
 /// 60 observations x 0.1 s of game time = 6 s, i.e. 24 fixed spawn attempts at
@@ -4046,12 +4056,12 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 211;
+const COMBAT_SAVE_BYTES: usize = 218;
 /// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
 /// record starts 4 bytes later and the Skeleton record follows it, so the tail
 /// ends at [`COMBAT_SAVE_BYTES`].
 #[cfg(test)]
-const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 169;
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
 
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
@@ -4083,8 +4093,16 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 169;
 /// bow charge/cancel curve through [`BowState`], the `fire_bow` ammo/wear seam,
 /// a full-charge arrow hitting a body with knockback, and a straight-down shot
 /// embedding then expiring. It earns the real wood bow and arrows the save
-/// witness now carries. Full order: `Settle -> Ambient -> Spawn -> Walk ->
-/// Fight -> Drops -> Hostile -> Shot -> Save -> Restore -> Done`.
+/// witness now carries.
+///
+/// The Skeleton stage (M009/S08-T04) sits between Shot and Save: it proves the
+/// stand-off ranged brain on one synthetic skeleton pinned at a spot whose
+/// [`drop_roll`] lands the rare bow, the skeleton arrow's 2-damage player hit
+/// and `SkeletonArrow` death cause, the respawn, and the player-attributed
+/// bone/arrow/bow drops. It removes its synthetic victim before Save, so the
+/// two-record witness and every earlier digest stay byte-identical. Full
+/// order: `Settle -> Ambient -> Spawn -> Walk -> Fight -> Drops -> Hostile ->
+/// Shot -> Skeleton -> Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
@@ -4095,6 +4113,7 @@ enum CombatStage {
     Drops,
     Hostile,
     Shot,
+    Skeleton,
     Save,
     Restore,
     Done,
@@ -4235,6 +4254,31 @@ struct CombatDemo {
     /// The latched `combat_shot:` line, printed immediately after the
     /// `combat_hostile:` line on the demo-shutdown path.
     shot_digest: Option<String>,
+    /// Skeleton shots the Skeleton stage observed the brain decide (the digest's
+    /// `fired`; `1` on the pinned leg because the stage stops at the first hit).
+    skeleton_fired: u32,
+    /// Player hits the skeleton arrows landed (`1`: the stage stops at the
+    /// first accepted hit).
+    skeleton_player_hits: u32,
+    /// Applied skeleton-arrow damage across those hits (`2`).
+    skeleton_damage: u16,
+    /// Whether the first observed shot's direction pointed above the straight
+    /// line to the player eye (the gravity-compensation proof, `true`).
+    skeleton_arc: bool,
+    /// Mob records the Skeleton stage's player-fired arrow killed (`1`).
+    skeleton_killed: u32,
+    /// Bone units the kill delivered (`1`).
+    skeleton_bones: u32,
+    /// Arrow units the kill delivered (`2`).
+    skeleton_arrows: u32,
+    /// Whether the kill delivered the rare full-durability bow (`true` on the
+    /// pinned leg: the spot search only accepts a cell whose roll lands it).
+    skeleton_bow: bool,
+    /// Whether the respawn returned the player to the deterministic spawn.
+    skeleton_respawn: bool,
+    /// The latched `combat_skeleton:` line, printed immediately after the
+    /// `combat_shot:` line on the demo-shutdown path.
+    skeleton_digest: Option<String>,
 }
 
 impl CombatDemo {
@@ -4290,6 +4334,16 @@ impl CombatDemo {
             shot_ammo: 0,
             shot_bow: None,
             shot_digest: None,
+            skeleton_fired: 0,
+            skeleton_player_hits: 0,
+            skeleton_damage: 0,
+            skeleton_arc: false,
+            skeleton_killed: 0,
+            skeleton_bones: 0,
+            skeleton_arrows: 0,
+            skeleton_bow: false,
+            skeleton_respawn: false,
+            skeleton_digest: None,
         }
     }
 
@@ -4365,6 +4419,31 @@ impl CombatDemo {
             self.shot_expired,
             self.shot_ammo,
             self.shot_bow.unwrap_or(0)
+        )
+    }
+
+    /// The exact `combat_skeleton:` digest printed once on the demo-shutdown
+    /// path (immediately after the `combat_shot:` line).
+    ///
+    /// Only latched after the Skeleton stage proved the gravity-compensated
+    /// shot, the 2-damage player hit with the `SkeletonArrow` cause, the
+    /// `Skeleton arrow` death-screen line, the respawn, and the
+    /// player-attributed bone/arrow/bow drops, so the trailing literals are the
+    /// latching contract. `fired`, `player_hits`, `damage`, and `bow` are the
+    /// measured values the stage asserts before latching.
+    fn skeleton_digest(&self) -> String {
+        format!(
+            "combat_skeleton: seed={} fired={} player_hits={} damage={} cause=skeleton_arrow arc={} killed={} bones={} arrows={} bow={} respawn={} ok=true",
+            self.seed,
+            self.skeleton_fired,
+            self.skeleton_player_hits,
+            self.skeleton_damage,
+            self.skeleton_arc,
+            self.skeleton_killed,
+            self.skeleton_bones,
+            self.skeleton_arrows,
+            self.skeleton_bow,
+            if self.skeleton_respawn { "spawn" } else { "none" }
         )
     }
 
@@ -4551,6 +4630,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
         CombatStage::Drops => combat_drops_stage(demo, session),
         CombatStage::Hostile => combat_hostile_stage(demo, session),
         CombatStage::Shot => combat_shot_stage(demo, session),
+        CombatStage::Skeleton => combat_skeleton_stage(demo, session),
         CombatStage::Save => combat_save_stage(demo, session),
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
@@ -6133,6 +6213,559 @@ fn combat_shot_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool 
     demo.shot_ammo = ammo_after;
     demo.shot_bow = bow_after;
     demo.shot_digest = Some(demo.shot_digest());
+    demo.stage = CombatStage::Skeleton;
+    false
+}
+
+/// One pinned survivor snapshot the Skeleton stage parks, re-pins, and restores.
+///
+/// The stage keys every write on `home` (never a list index): the synthetic
+/// victim is removed by its `home`, so a reaped corpse or a record that streams
+/// in can never shift the record the stage is proving.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct CombatSkeletonSurvivor {
+    kind: MobKind,
+    position: Vec3,
+    home: Vec3,
+    yaw: f32,
+    health: u16,
+}
+
+/// Write one survivor snapshot onto the record whose `home` is `key`.
+///
+/// Returns false when no record carries that key, so the caller latches an abort
+/// instead of silently proving a world it does not own.
+fn combat_skeleton_pin(
+    session: &mut WorldSession,
+    key: Vec3,
+    survivor: &CombatSkeletonSurvivor,
+) -> bool {
+    let Some(mob) = session
+        .mobs_mut()
+        .iter_mut()
+        .find(|mob| mob.home.distance_squared(key) <= 1e-6)
+    else {
+        return false;
+    };
+    mob.position = survivor.position;
+    mob.home = survivor.home;
+    mob.yaw = survivor.yaw;
+    mob.health = survivor.health;
+    mob.state = MobAiState::Wander;
+    mob.velocity = Vec3::ZERO;
+    mob.knockback = Vec3::ZERO;
+    mob.hurt = 0.0;
+    mob.hurt_iframe = 0.0;
+    mob.cooldown = 0.0;
+    mob.flee = 0.0;
+    mob.death = 0.0;
+    mob.aggro = 0.0;
+    mob.stuck = 0.0;
+    mob.stuck_anchor = survivor.position;
+    mob.reaggro = 0.0;
+    true
+}
+
+/// The Skeleton stage's deterministic stand-off spot finder.
+///
+/// Scans 16 angles around the player's facing, the five fire-band radii, and a
+/// four-block vertical window for a cell that is a legal skeleton standing
+/// place *and* whose rare-bow [`drop_roll`] lands the one-in-sixteen gate. The
+/// scan order is fixed and no RNG or clock enters it, so the same world always
+/// proves the same spot.
+///
+/// Acceptance is the production placement contract the brain re-checks every
+/// step: feet and head blocks air, a solid block under the feet, an open eye
+/// cell, and a clear ray from the skeleton's eye (feet + 1.5) to the player's
+/// eye. The rare-bow clause is what lets the kill proof below exercise the real
+/// drop table's rare branch instead of asserting a `false` the harness would
+/// never see.
+fn combat_skeleton_spot(session: &WorldSession, seed: u32) -> Option<Vec3> {
+    let player_feet = session.player.position;
+    let player_eye = session.player.eye_position();
+    let bow = mob_drops(MobKind::Skeleton)
+        .iter()
+        .find(|drop| drop.item == MobDropItem::Bow)?;
+    for step in 0..16u32 {
+        let angle = session.player.yaw + step as f32 * (std::f32::consts::TAU / 16.0);
+        for radius in [5.5_f32, 6.5, 7.5, 8.5, 9.5] {
+            for offset in [-1.0_f32, 0.0, 1.0, 2.0] {
+                let feet = Vec3::new(
+                    player_feet.x + angle.cos() * radius,
+                    player_feet.y + offset,
+                    player_feet.z + angle.sin() * radius,
+                );
+                if !feet.is_finite() {
+                    continue;
+                }
+                let cell = IVec3::new(
+                    feet.x.floor() as i32,
+                    feet.y.floor() as i32,
+                    feet.z.floor() as i32,
+                );
+                if session.world.get_block(cell.x, cell.y, cell.z) != BlockId::Air
+                    || session.world.get_block(cell.x, cell.y + 1, cell.z) != BlockId::Air
+                    || !session
+                        .world
+                        .get_block(cell.x, cell.y - 1, cell.z)
+                        .is_solid()
+                {
+                    continue;
+                }
+                let eye = feet + Vec3::Y * 1.5;
+                let eye_cell = IVec3::new(
+                    eye.x.floor() as i32,
+                    eye.y.floor() as i32,
+                    eye.z.floor() as i32,
+                );
+                if session
+                    .world
+                    .get_block(eye_cell.x, eye_cell.y, eye_cell.z)
+                    .is_solid()
+                {
+                    continue;
+                }
+                if !opencraft::world::mob_ai::has_line_of_sight(&session.world, eye, player_eye) {
+                    continue;
+                }
+                if bow.rolls(drop_roll(seed, MobKind::Skeleton, cell)) {
+                    return Some(feet);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The Skeleton stage: the slice's real-binary proof that a stand-off skeleton
+/// fires a gravity-compensated arrow that damages the player and names
+/// `Skeleton arrow` as the death cause, that the respawn keeps the inventory,
+/// and that a player-killed skeleton delivers its bone/arrow/rare-bow table.
+///
+/// Runs entirely in ONE call, like every other stage: every number here is
+/// observable, and a redraw between two partial phases could let the mob
+/// runtime move a record the next check describes. Every mutation goes through
+/// a production seam — [`WorldSession::set_hostile_ai_enabled`],
+/// [`WorldSession::mobs_mut`], [`WorldSession::tick_mobs`] (the same fixed 20 Hz
+/// runtime the frame loop owns), [`WorldSession::tick_arrows`],
+/// [`WorldSession::fire_bow`], [`opencraft::player::survival::SurvivalState::damage`],
+/// [`WorldSession::respawn`], [`WorldSession::spawn_position`],
+/// [`WorldSession::last_damage_cause`], and
+/// [`opencraft::ui::screens::death_cause_line`] — so the demo proves the shipped
+/// path instead of a parallel copy of it.
+///
+/// Three documented demo pins, not gameplay rules:
+///
+/// * the two surviving pinned hostiles are parked 20 blocks behind the camera
+///   and re-pinned at the top of every observation, so a wander can never bring
+///   one inside the 16-block aggro range and steal the damage or death cause
+///   the stage is proving;
+/// * one synthetic victim `Mob::new(Skeleton, ..)` is pushed at a spot whose
+///   [`drop_roll`] lands the rare bow, with `home` fixed at that spot (the drop
+///   roll key) even when the kill proof re-pins its body two blocks forward;
+/// * the player is dropped to 1 hp from 18 through
+///   [`opencraft::player::survival::SurvivalState::damage`] so the *next*
+///   skeleton arrow is the killing blow and the death cause is unambiguous.
+///
+/// Every mismatch latches `stage=skeleton` with the named observed fact and ends
+/// the run non-zero, so a partial proof can never be mistaken for a pass.
+fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive, holding
+    // the bow the Shot stage earned.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "skeleton",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("skeleton", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "skeleton",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+    let bow_id = ItemId::Tool {
+        kind: ToolKind::Bow,
+        tier: ToolTier::Wood,
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id) {
+        demo.abort("skeleton", "observed=bow_not_selected");
+        return true;
+    }
+
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+    let player_feet = session.player.position;
+    let player_eye = session.player.eye_position();
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+
+    // Demo pin 1: snapshot both survivors, then park them 20 blocks behind the
+    // camera. The loop below re-pins the parked snapshot before every
+    // observation, so their wander can never walk them into aggro range.
+    let survivors: Vec<CombatSkeletonSurvivor> = session
+        .mobs()
+        .iter()
+        .map(|mob| CombatSkeletonSurvivor {
+            kind: mob.kind,
+            position: mob.position,
+            home: mob.home,
+            yaw: mob.yaw,
+            health: mob.health,
+        })
+        .collect();
+    let parked: Vec<CombatSkeletonSurvivor> = survivors
+        .iter()
+        .map(|survivor| {
+            let behind = player_feet - forward * 20.0;
+            CombatSkeletonSurvivor {
+                position: behind,
+                home: behind,
+                yaw: 0.0,
+                ..*survivor
+            }
+        })
+        .collect();
+    for (survivor, pin) in survivors.iter().zip(parked.iter()) {
+        if !combat_skeleton_pin(session, survivor.home, pin) {
+            demo.abort("skeleton", "observed=survivor");
+            return true;
+        }
+    }
+
+    let Some(spot) = combat_skeleton_spot(session, demo.seed) else {
+        demo.abort("skeleton", "observed=spot");
+        return true;
+    };
+    let victim_home = spot;
+    let victim_yaw = (player_feet.x - spot.x).atan2(player_feet.z - spot.z);
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Skeleton, spot, victim_yaw));
+    {
+        let victim = session
+            .mobs_mut()
+            .last_mut()
+            .expect("the victim was just pushed");
+        victim.home = victim_home;
+        victim.health = MobKind::Skeleton.max_health();
+        victim.state = MobAiState::Wander;
+        victim.cooldown = 0.0;
+        victim.aggro = 0.0;
+        victim.stuck = 0.0;
+        victim.stuck_anchor = spot;
+        victim.reaggro = 0.0;
+        victim.velocity = Vec3::ZERO;
+        victim.knockback = Vec3::ZERO;
+    }
+
+    // 1. Fire proof: open the gate and alternate the production mob and arrow
+    //    ticks until one shot is decided and one accepted player hit lands.
+    session.set_hostile_ai_enabled(true);
+    let mut fired = 0u32;
+    let mut player_hits = 0u32;
+    let mut damage = 0u16;
+    let mut arc = false;
+    let mut arrow_ok = false;
+    let mut pinned_ok = true;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        for pin in &parked {
+            pinned_ok &= combat_skeleton_pin(session, pin.home, pin);
+        }
+        let mob_tick = session.tick_mobs(0.1, 1.0);
+        if !mob_tick.shots.is_empty() {
+            fired = fired.saturating_add(mob_tick.shots.len() as u32);
+            if let Some(shot) = mob_tick.shots.first() {
+                // The aim is gravity-compensated, so the direction points above
+                // the straight line to the player eye.
+                let straight = (player_eye - shot.origin).normalize_or_zero();
+                let aimed = shot.dir.normalize_or_zero();
+                arc |= aimed.y > straight.y + 1e-4;
+            }
+            arrow_ok |= session.arrows().iter().any(|arrow| {
+                arrow.owner == ArrowOwner::Skeleton && arrow.damage == ARROW_DAMAGE_SKELETON
+            });
+        }
+        let arrow_tick = session.tick_arrows(0.1, 1.0);
+        player_hits = player_hits.saturating_add(arrow_tick.player_hits);
+        damage = damage.saturating_add(arrow_tick.player_damage);
+        if fired > 0 && player_hits >= 1 {
+            break;
+        }
+    }
+    let cause = session.last_damage_cause();
+    if !pinned_ok
+        || fired == 0
+        || player_hits != 1
+        || damage != ARROW_DAMAGE_SKELETON
+        || !arc
+        || !arrow_ok
+        || cause != Some(DamageCause::SkeletonArrow)
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "fired={fired} player_hits={player_hits} damage={damage} arc={arc} arrow={arrow_ok} cause={cause:?} pinned={pinned_ok}"
+            ),
+        );
+        return true;
+    }
+
+    // 2. Death-cause pin: drop the player to 1 hp and let the next skeleton
+    //    arrow kill. The applied damage of the killing blow is 1, so the death
+    //    itself is the assertion here, not a second full-size hit.
+    let health = session.player.survival.health();
+    if health != 20 - ARROW_DAMAGE_SKELETON {
+        demo.abort("skeleton", &format!("health={health}"));
+        return true;
+    }
+    let dropped = session.player.survival.damage(health - 1);
+    if dropped != health - 1 || session.player.survival.health() != 1 {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "drop applied={dropped} health={}",
+                session.player.survival.health()
+            ),
+        );
+        return true;
+    }
+    let mut died = false;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        for pin in &parked {
+            pinned_ok &= combat_skeleton_pin(session, pin.home, pin);
+        }
+        session.tick_mobs(0.1, 1.0);
+        session.tick_arrows(0.1, 1.0);
+        if session.is_dead() {
+            died = true;
+            break;
+        }
+    }
+    let cause = session.last_damage_cause();
+    let cause_line = death_cause_line(cause);
+    if !died
+        || !pinned_ok
+        || cause != Some(DamageCause::SkeletonArrow)
+        || cause_line != "Cause: Skeleton arrow"
+    {
+        demo.abort(
+            "skeleton",
+            &format!("death dead={died} cause={cause:?} line={cause_line}"),
+        );
+        return true;
+    }
+
+    // 3. Respawn through the production seam, then prove every post-condition
+    //    the Death screen and the HUD depend on. A respawn clears in-flight
+    //    projectiles, so the empty-list assert is part of the contract.
+    let spawn = WorldSession::spawn_position(demo.seed);
+    session.respawn();
+    let respawned = session.player.position;
+    let items_after = combat_inventory_units_total(session);
+    let alive = !session.is_dead();
+    let respawn_health = session.player.survival.health();
+    let cause_cleared = session.last_damage_cause().is_none();
+    let flash = session.player_hurt_intensity();
+    let arrows_empty = session.arrows().is_empty();
+    if !alive
+        || respawn_health != 20
+        || respawned != spawn
+        || !cause_cleared
+        || flash != 0.0
+        || items_after != items_before
+        || !arrows_empty
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "respawn alive={alive} health={respawn_health} spawn={} cause={cause_cleared} flash={flash} items={items_after}/{items_before} arrows={}",
+                respawned == spawn,
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.sync_camera();
+
+    // 4. Kill proof: re-pin the victim's body two blocks forward (its `home`
+    //    stays at the rare spot, the drop-roll key), give it 4 health so one
+    //    full-charge arrow kills it, and let the real projectile sweep deliver
+    //    the player-attributed drop table.
+    let arrow_id = ItemId::Material(Material::Arrow);
+    let bones_before = combat_inventory_units(session, ItemId::Material(Material::Bone));
+    let arrows_before = combat_inventory_units(session, arrow_id);
+    if bones_before != 0 || arrows_before != 2 {
+        demo.abort(
+            "skeleton",
+            &format!("ammo bones={bones_before} arrows={arrows_before}"),
+        );
+        return true;
+    }
+    let victim_feet = Vec3::new(
+        pose.0.x + forward.x * 2.0,
+        pose.0.y,
+        pose.0.z + forward.z * 2.0,
+    );
+    let Some(victim) = session
+        .mobs_mut()
+        .iter_mut()
+        .find(|mob| mob.home.distance_squared(victim_home) <= 1e-6)
+    else {
+        demo.abort("skeleton", "observed=victim_missing");
+        return true;
+    };
+    victim.position = victim_feet;
+    victim.yaw = (pose.0.x - victim_feet.x).atan2(pose.0.z - victim_feet.z);
+    victim.health = 4;
+    victim.state = MobAiState::Wander;
+    victim.cooldown = 0.0;
+    victim.aggro = 0.0;
+    victim.stuck = 0.0;
+    victim.stuck_anchor = victim_feet;
+    victim.reaggro = 0.0;
+    victim.velocity = Vec3::ZERO;
+    victim.knockback = Vec3::ZERO;
+    victim.hurt = 0.0;
+    victim.hurt_iframe = 0.0;
+    victim.death = 0.0;
+
+    let Some(bow_slot) = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .position(|slot| slot.as_ref().map(|item| item.id()) == Some(bow_id))
+    else {
+        demo.abort("skeleton", "observed=bow_slot");
+        return true;
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+        && (!session.player.select_slot(bow_slot)
+            || session.player.selected_item().map(|item| item.id()) != Some(bow_id))
+    {
+        demo.abort("skeleton", &format!("held=slot{bow_slot}"));
+        return true;
+    }
+    let origin = session.camera.position;
+    let centre = victim_feet + Vec3::Y * (MobKind::Skeleton.height() * 0.5);
+    let dir = (centre - origin).normalize_or_zero();
+    match session.fire_bow(origin, dir, 1.0) {
+        Ok(arrow) if arrow.damage == 4 => {}
+        Ok(arrow) => {
+            demo.abort("skeleton", &format!("arrow damage={}", arrow.damage));
+            return true;
+        }
+        Err(error) => {
+            demo.abort("skeleton", &format!("fire={error:?}"));
+            return true;
+        }
+    }
+    let arrows_after_fire = combat_inventory_units(session, arrow_id);
+    if arrows_after_fire != 1 {
+        demo.abort("skeleton", &format!("arrows={arrows_after_fire}"));
+        return true;
+    }
+    let mut kills = 0u32;
+    let mut lost = 0u32;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        let tick = session.tick_arrows(0.1, 1.0);
+        kills = kills.saturating_add(tick.kills);
+        lost = lost.saturating_add(tick.drops.lost);
+        if kills >= 1 {
+            break;
+        }
+    }
+    let bones_after = combat_inventory_units(session, ItemId::Material(Material::Bone));
+    let arrows_after = combat_inventory_units(session, arrow_id);
+    let bows: Vec<Option<u16>> = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .filter(|item| item.id() == bow_id)
+        .map(|item| item.durability())
+        .collect();
+    let mut bows_sorted = bows.clone();
+    bows_sorted.sort();
+    // Three player shots wear the earned bow by one point each: two in the Shot
+    // stage (59 -> 57) and this kill shot (57 -> 56). The dropped bow enters at
+    // full durability, so the pair is exactly `[56, 59]`.
+    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(3);
+    let expected_bows = vec![Some(worn_bow), Some(ToolTier::Wood.max_durability())];
+    if kills != 1
+        || lost != 0
+        || bones_after != 1
+        || arrows_after != 3
+        || bows_sorted != expected_bows
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "kill kills={kills} lost={lost} bones={bones_after} arrows={arrows_after} bows={bows:?}"
+            ),
+        );
+        return true;
+    }
+
+    // Demo pin 3: remove the synthetic victim by its `home` (never an index),
+    // close the gate, and restore the two pinned survivors byte for byte so the
+    // Save stage owns a world it expects.
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(victim_home) > 1e-6);
+    session.set_hostile_ai_enabled(false);
+    for (survivor, pin) in survivors.iter().zip(parked.iter()) {
+        if !combat_skeleton_pin(session, pin.home, survivor) {
+            demo.abort("skeleton", "observed=restore");
+            return true;
+        }
+    }
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.player.combat.reset();
+    session.sync_camera();
+    if session.mobs().len() != 2 {
+        demo.abort("skeleton", &format!("mobs={}", session.mobs().len()));
+        return true;
+    }
+
+    demo.skeleton_fired = fired;
+    demo.skeleton_player_hits = player_hits;
+    demo.skeleton_damage = damage;
+    demo.skeleton_arc = arc;
+    demo.skeleton_killed = kills;
+    demo.skeleton_bones = bones_after.saturating_sub(bones_before);
+    demo.skeleton_arrows = arrows_after.saturating_sub(arrows_after_fire);
+    demo.skeleton_bow = bows_sorted.len() == 2;
+    demo.skeleton_respawn = true;
+    demo.skeleton_digest = Some(demo.skeleton_digest());
     demo.stage = CombatStage::Save;
     false
 }
@@ -6296,17 +6929,20 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
 
     // The earned inventory is part of the witness: the wood sword the player
     // crafted (a full 59 durability), the wood bow the Shot stage earned and
-    // wore twice (57 durability), the two arrows left from the granted four,
-    // one raw porkchop, one raw beef, and the pair's three leather units —
-    // exactly six non-empty stacks, scanned order-independently across all 36
-    // slots.
+    // wore twice (57) plus the full 59 the Skeleton stage's rare drop delivered
+    // (worn to 56 by the kill shot), the three arrows left (two from the grant
+    // minus the Shot stage's two shots, then the skeleton's two dropped), one
+    // raw porkchop, one raw beef, the pair's three leather units, and the
+    // skeleton's one bone — exactly eight non-empty stacks, scanned
+    // order-independently across all 36 slots.
     let mut stacks = 0u32;
     let mut sword_durability: Option<Option<u16>> = None;
-    let mut bow_durability: Option<Option<u16>> = None;
+    let mut bow_durabilities: Vec<Option<u16>> = Vec::new();
     let mut arrows = 0u32;
     let mut porkchop = 0u32;
     let mut beef = 0u32;
     let mut leather = 0u32;
+    let mut bone = 0u32;
     for item in loaded
         .player
         .inventory
@@ -6330,23 +6966,26 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
                 kind: ToolKind::Bow,
                 tier: ToolTier::Wood,
             } => {
-                if bow_durability.is_some() {
+                // Two bows are expected: the earned, worn one and the
+                // skeleton's rare full-durability drop. A third is drift.
+                if bow_durabilities.len() >= 2 {
                     demo.abort("restore", "items=duplicate_bow");
                     return true;
                 }
-                bow_durability = Some(item.durability());
+                bow_durabilities.push(item.durability());
             }
             ItemId::Material(Material::Arrow) => arrows += u32::from(item.count()),
             ItemId::Material(Material::RawPorkchop) => porkchop += u32::from(item.count()),
             ItemId::Material(Material::RawBeef) => beef += u32::from(item.count()),
             ItemId::Material(Material::Leather) => leather += u32::from(item.count()),
+            ItemId::Material(Material::Bone) => bone += u32::from(item.count()),
             other => {
                 demo.abort("restore", &format!("items=unexpected={other:?}"));
                 return true;
             }
         }
     }
-    if stacks != 6 {
+    if stacks != 8 {
         demo.abort("restore", &format!("items={stacks}"));
         return true;
     }
@@ -6354,16 +6993,22 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
         demo.abort("restore", &format!("items=sword={sword_durability:?}"));
         return true;
     }
-    // Two shots wear the bow by exactly one point each (MEM392 ordering).
-    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(2);
-    if bow_durability != Some(Some(worn_bow)) {
-        demo.abort("restore", &format!("items=bow={bow_durability:?}"));
+    // Three player shots wear the earned bow by exactly one point each (two in
+    // the Shot stage, one on the Skeleton stage's victim); the dropped bow
+    // enters at full durability (MEM392 ordering).
+    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(3);
+    bow_durabilities.sort();
+    let expected_bows = vec![Some(worn_bow), Some(ToolTier::Wood.max_durability())];
+    if bow_durabilities != expected_bows {
+        demo.abort("restore", &format!("items=bows={bow_durabilities:?}"));
         return true;
     }
-    if arrows != 2 || porkchop != 1 || beef != 1 || leather != 3 {
+    if arrows != 3 || porkchop != 1 || beef != 1 || leather != 3 || bone != 1 {
         demo.abort(
             "restore",
-            &format!("items=arrows={arrows} porkchop={porkchop} beef={beef} leather={leather}"),
+            &format!(
+                "items=arrows={arrows} porkchop={porkchop} beef={beef} leather={leather} bone={bone}"
+            ),
         );
         return true;
     }
@@ -10050,7 +10695,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 211-byte v7 witness keep their exact bytes.
+            // measured 218-byte v7 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -10066,6 +10711,15 @@ impl ApplicationHandler for GameApp {
                 .combat_demo
                 .as_ref()
                 .and_then(|demo| demo.shot_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Skeleton stage's digest follows the Shot line for the same
+            // reason: every earlier line keeps its exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.skeleton_digest.as_deref())
             {
                 let _ = writeln!(stdout, "{line}");
             }
@@ -12707,9 +13361,9 @@ mod tests {
         demo.stage = CombatStage::Shot;
         assert!(
             !combat_shot_stage(&mut demo, &mut session),
-            "the shot stage advances to Save"
+            "the shot stage advances to the skeleton proof"
         );
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.stage, CombatStage::Skeleton);
         assert!(!demo.failed, "unexpected shot abort: {:?}", demo.digest);
         assert!(demo.shot_charged);
         assert!(demo.shot_canceled);
@@ -12759,10 +13413,239 @@ mod tests {
         assert_eq!(bow.durability(), Some(57));
     }
 
-    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot -> Save)
-    /// to completion and return the session plus its finished demo. Both save-leg
-    /// tests use this so the fresh save is always produced by the production
-    /// Save stage rather than hand-built wire data.
+    /// The Skeleton stage proved against a lit synthetic plain: the two pinned
+    /// survivors are parked out of range, the synthetic victim fires a
+    /// gravity-compensated arrow that damages the player for exactly 2 and the
+    /// Death screen names `Skeleton arrow`, the respawn returns to the
+    /// deterministic spawn with the inventory kept and the projectiles cleared,
+    /// and one full-charge player arrow kills the victim for its bone, two
+    /// arrows, and the rare full-durability bow it was pinned to roll.
+    #[test]
+    fn combat_demo_skeleton_stage_proves_shot_damage_cause_and_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-skeleton.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, player + forward * 2.0, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, player - forward * 20.0, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        // The Shot stage earns the bow and arrows the kill proof spends; running
+        // it for real keeps this test on the production path instead of a
+        // hand-built inventory.
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Shot;
+        assert!(
+            !combat_shot_stage(&mut demo, &mut session),
+            "the shot proof hands over to the skeleton proof"
+        );
+        assert_eq!(demo.stage, CombatStage::Skeleton);
+        assert!(!demo.failed, "unexpected shot abort: {:?}", demo.digest);
+
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+
+        assert!(
+            !combat_skeleton_stage(&mut demo, &mut session),
+            "the skeleton proof hands over to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(!demo.failed, "unexpected skeleton abort: {:?}", demo.digest);
+        assert_eq!(demo.skeleton_fired, 1, "one decided shot, one hit");
+        assert_eq!(demo.skeleton_player_hits, 1);
+        assert_eq!(demo.skeleton_damage, 2, "the fixed skeleton-arrow damage");
+        assert!(
+            demo.skeleton_arc,
+            "the aim must point above the straight line"
+        );
+        assert_eq!(demo.skeleton_killed, 1);
+        assert_eq!(demo.skeleton_bones, 1);
+        assert_eq!(demo.skeleton_arrows, 2);
+        assert!(demo.skeleton_bow, "the pinned spot must roll the rare bow");
+        assert!(demo.skeleton_respawn);
+        assert_eq!(
+            demo.skeleton_digest.as_deref(),
+            Some(
+                "combat_skeleton: seed=12345 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+            )
+        );
+
+        // The stage restores the world it borrowed: the two pinned hostiles are
+        // back at their pre-stage pose, the synthetic victim is gone, the gate is
+        // closed, and the player pose is the one the Save witness expects.
+        assert_eq!(session.mobs().len(), 2);
+        assert!(
+            session
+                .mobs()
+                .iter()
+                .all(|mob| matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "the synthetic victim must be removed by its home"
+        );
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert!(!session.is_dead());
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert!(
+            session.arrows().is_empty(),
+            "the respawn clears projectiles"
+        );
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+
+        // The player-attributed drop table landed whole: the bone stack, the two
+        // dropped arrows on top of the one left, and both bows (the earned one
+        // worn by three shots, the dropped one at full durability). The kill
+        // shot spends one of the two arrows the Shot stage left, so the net
+        // change is +3 units.
+        assert_eq!(
+            combat_inventory_units_total(&session),
+            items_before + 3,
+            "one bone + two arrows + one bow, minus the spent kill arrow"
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Bone)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Arrow)),
+            3
+        );
+        let bow_id = ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        };
+        let mut bows: Vec<Option<u16>> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|item| item.id() == bow_id)
+            .map(|item| item.durability())
+            .collect();
+        bows.sort();
+        assert_eq!(
+            bows,
+            vec![
+                Some(ToolTier::Wood.max_durability() - 3),
+                Some(ToolTier::Wood.max_durability())
+            ]
+        );
+    }
+
+    /// The `combat_skeleton:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the seed and the measured fire/hit numbers may
+    /// vary. The arc, drop counts, rare-bow fact, and respawn are latching
+    /// literals the stage asserts before it prints them.
+    #[test]
+    fn combat_skeleton_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.skeleton_fired = 1;
+        demo.skeleton_player_hits = 1;
+        demo.skeleton_damage = 2;
+        demo.skeleton_arc = true;
+        demo.skeleton_killed = 1;
+        demo.skeleton_bones = 1;
+        demo.skeleton_arrows = 2;
+        demo.skeleton_bow = true;
+        demo.skeleton_respawn = true;
+        assert_eq!(
+            demo.skeleton_digest(),
+            "combat_skeleton: seed=1 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+        );
+    }
+
+    /// The Skeleton stage refuses a world it does not own before any tick, any
+    /// damage, any push, or any drop: a record shape other than exactly one
+    /// Zombie plus one Skeleton and a non-Survival player both latch a
+    /// self-describing abort.
+    #[test]
+    fn combat_skeleton_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-skeleton-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let feet = session.player.position;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Skeleton;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=skeleton"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(combat_inventory_units_total(&session), 0);
+        assert_eq!(session.mobs().len(), 1, "the abort mutates nothing");
+
+        // Creative is never a valid Skeleton-stage subject: production builds no
+        // target and spawns no arrow, so the stage refuses before ticking.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-skeleton-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let feet = creative.player.position;
+        let forward = Vec3::new(creative.player.yaw.cos(), 0.0, creative.player.yaw.sin());
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + forward * 2.0, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, feet - forward * 20.0, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Skeleton;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
+    }
+
+    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot ->
+    /// Skeleton -> Save) to completion and return the session plus its finished
+    /// demo. Both save-leg tests use this so the fresh save is always produced by
+    /// the production Save stage rather than hand-built wire data.
     fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
         let mut session = WorldSession::new_session_with_mode(
             seed,
@@ -12793,6 +13676,25 @@ mod tests {
         // skeleton shot seam (S08-T02) fires during Walk and leaves arrows for
         // the Shot stage's empty-list pin.
         session.set_hostile_ai_enabled(false);
+
+        // Ground the player like the real Playing frames do during Settle: the
+        // deterministic spawn is four blocks above the terrain surface, and a
+        // headless leg never runs player physics. The Skeleton stage's spot
+        // search requires a supported standing cell next to the player, so this
+        // is fixture parity, not a gameplay change.
+        let feet = terrain_height_at_seeded(spawn.x.floor() as i32, spawn.z.floor() as i32, seed)
+            as f32
+            + 1.0;
+        session.player.position.y = feet;
+        session.sync_camera();
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                feet.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session), "settle");
@@ -13230,7 +14132,7 @@ mod tests {
             .expect("restore digest");
         assert_eq!(
             digest,
-            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=6 ok=true"
+            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=8 ok=true"
         );
         assert!(!app.exit_failure);
     }
