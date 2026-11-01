@@ -230,6 +230,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             survival: session.player.survival,
         },
         chests: session.chests.clone(),
+        mobs: Vec::new(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -15033,6 +15034,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: rustc_hash::FxHashMap::default(),
+            mobs: Vec::new(),
             chunk_edits: ChunkEditMap::default(),
         }
     }

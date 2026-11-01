@@ -117,7 +117,7 @@ pub enum MobAiState {
 
 /// One live mob record. `home` is the spawn anchor used for the leash and
 /// reused by S05's spawn/bed rules.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Mob {
     pub kind: MobKind,
     /// Spawn anchor (feet position at spawn).
@@ -148,6 +148,25 @@ impl Mob {
             velocity: Vec3::ZERO,
             yaw,
             health: kind.max_health(),
+            state: MobAiState::Wander,
+            hurt: 0.0,
+            cooldown: 0.0,
+            walk_phase: 0.0,
+        }
+    }
+
+    /// A mob restored from a save record: anchors `home` at the persisted
+    /// position and takes the persisted health verbatim. Never routed through
+    /// [`Mob::new`], which forces the kind's maximum health and would erase
+    /// damage across a reload.
+    pub fn restored(kind: MobKind, position: Vec3, yaw: f32, health: u16) -> Mob {
+        Mob {
+            kind,
+            home: position,
+            position,
+            velocity: Vec3::ZERO,
+            yaw,
+            health,
             state: MobAiState::Wander,
             hurt: 0.0,
             cooldown: 0.0,
@@ -377,6 +396,28 @@ mod tests {
         assert_eq!(mob.hurt, 0.0);
         assert_eq!(mob.cooldown, 0.0);
         assert_eq!(mob.walk_phase, 0.0);
+    }
+
+    #[test]
+    fn restored_keeps_saved_health_and_resets_ephemeral_fields() {
+        let pos = Vec3::new(-7.0, 70.5, 2.0);
+        let mob = Mob::restored(MobKind::Skeleton, pos, -1.25, 3);
+        assert_eq!(mob.kind, MobKind::Skeleton);
+        assert_eq!(
+            mob.home, pos,
+            "home re-anchors to the persisted feet position"
+        );
+        assert_eq!(mob.position, pos);
+        assert_eq!(mob.velocity, Vec3::ZERO);
+        assert_eq!(mob.yaw, -1.25);
+        assert_eq!(mob.health, 3, "damage must survive a reload");
+        assert_eq!(mob.state, MobAiState::Wander);
+        assert_eq!(mob.hurt, 0.0);
+        assert_eq!(mob.cooldown, 0.0);
+        assert_eq!(mob.walk_phase, 0.0);
+
+        // `Mob::new` would force max health; `restored` must not.
+        assert!(mob.health < MobKind::Skeleton.max_health());
     }
 
     #[test]

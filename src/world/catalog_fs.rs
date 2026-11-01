@@ -369,6 +369,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: crate::world::persistence::ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits,
         }
     }

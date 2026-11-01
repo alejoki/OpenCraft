@@ -168,6 +168,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits,
         }
     }

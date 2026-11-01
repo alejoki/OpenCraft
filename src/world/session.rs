@@ -82,9 +82,9 @@ pub struct WorldSession {
     /// gated until the chunks containing the feet and four blocks below are
     /// resident. Ephemeral and never saved.
     spawn_settle: bool,
-    /// Flat session-owned mob list (D131). Ephemeral in S01: every
-    /// construction starts empty and saves do not round-trip mobs yet; S02
-    /// adds persistence. Records are never dropped by simulation.
+    /// Flat session-owned mob list (D131). Live records are persisted in the
+    /// v7 save tail and restored by [`WorldSession::session_from_save`].
+    /// Records are never dropped by simulation.
     mobs: Vec<Mob>,
     /// Fixed-rate 20 Hz mob driver, seeded from the session's world seed.
     /// Ephemeral like `survival_runtime`.
@@ -211,6 +211,7 @@ impl WorldSession {
             mode,
             player: saved,
             chests,
+            mobs: saved_mobs,
             chunk_edits,
         } = data;
 
@@ -236,6 +237,22 @@ impl WorldSession {
         // the edit map is moved into the world manager. Progress restarts at
         // zero: only the visible stage survives a save.
         let crops = CropRuntime::from_edits(&chunk_edits);
+        // Restore the live mob records from the v7 tail. Each record re-anchors
+        // `home` at the saved feet position and keeps the saved health, so
+        // damage survives a reload; every ephemeral runtime field (velocity,
+        // AI state, hurt/cooldown timers, walk phase) restarts at its neutral
+        // value.
+        let mobs: Vec<Mob> = saved_mobs
+            .into_iter()
+            .map(|record| {
+                Mob::restored(
+                    record.kind,
+                    Vec3::from_array(record.position),
+                    record.yaw,
+                    record.health,
+                )
+            })
+            .collect();
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 saved.render_distance as i32,
@@ -256,8 +273,10 @@ impl WorldSession {
             // A restored player is never spawn-gated: the visible world state
             // is the save's, and a mid-air fall must still hurt.
             spawn_settle: false,
-            // S01 does not persist mob records yet; S02 owns that.
-            mobs: Vec::new(),
+            mobs,
+            // The fixed-rate driver deliberately restarts at tick 0: a reload
+            // is a deterministic restart of the AI clock, not a continuation
+            // of the pre-save tick index.
             mob_runtime: MobRuntime::new(seed),
         };
         session.sync_camera();
@@ -1003,6 +1022,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: crate::world::persistence::ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: ChunkEditMap::default(),
         }
     }
@@ -1339,6 +1359,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: crate::world::persistence::ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits.clone(),
         };
         let session = WorldSession::session_from_save(data, PathBuf::from("/tmp/keep.mcvx"));
@@ -2462,6 +2483,7 @@ mod tests {
                 survival: session.player.survival,
             },
             chests: session.chests.clone(),
+            mobs: Vec::new(),
             chunk_edits: session.world.chunk_edits().clone(),
         };
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3425,6 +3447,7 @@ mod tests {
                 survival: session.player.survival,
             },
             chests: session.chests.clone(),
+            mobs: Vec::new(),
             chunk_edits: session.world.chunk_edits().clone(),
         };
         let dir = tempfile::tempdir().expect("tempdir");
