@@ -24,7 +24,9 @@ use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
     GameMode, SurvivalContext, SurvivalRuntime, SurvivalState, SurvivalTick,
 };
-use crate::world::arrow::{segment_aabb, Arrow, ArrowOwner, ArrowState, ARROW_CAP};
+use crate::world::arrow::{
+    arrow_hit_damage, segment_aabb, Arrow, ArrowOwner, ArrowState, ARROW_CAP,
+};
 use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use crate::world::daycycle::GameClock;
@@ -680,6 +682,17 @@ impl WorldSession {
     /// hit this method is also the single writer of the
     /// [`DamageCause::SkeletonArrow`] cause tag.
     ///
+    /// **Creative one-shot rule.** The effective mode is read once per tick
+    /// (`player.mode()`, not the stored `save_mode`) and applied only to
+    /// player-owned arrows through [`arrow_hit_damage`]: a Creative player's
+    /// arrow lands the mob's remaining health instead of its charge damage, so
+    /// every surviving mob dies in one hit. Skeleton arrows are deliberately
+    /// outside the rule — the entity sweep does not filter by owner, so an
+    /// unscoped rule would one-shot a skeleton's friendly fire in a Creative
+    /// session — and keep their pinned 2 damage. The kill still flows through
+    /// [`WorldSession::resolve_mob_kill`] exactly like a melee kill, so the
+    /// pinned drop table is granted unchanged.
+    ///
     /// Finished arrows (spent lifetime, or non-finite from a corrupt advance)
     /// are dropped and counted into [`ArrowTick::expired`]. Embedded arrows
     /// still count toward [`ARROW_CAP`] until they expire.
@@ -696,6 +709,11 @@ impl WorldSession {
         // Kills are buffered, not granted, while the mob list is mutably
         // borrowed; `resolve_mob_kill` needs `&mut self` for the drop grant.
         let mut pending_kills: Vec<(usize, MobHit)> = Vec::new();
+
+        // Read the effective mode once: the rule is a hit-time property, not
+        // something stored on the arrow, and `save_mode` may differ under Edit
+        // Background. Scoped to player arrows at the call site.
+        let creative_player = self.player.mode() == GameMode::Creative;
 
         // Split-borrow shape, exactly like `tick_mobs`: terrain is immutable
         // while the entity lists and the player's combat/vitals are mutable.
@@ -730,7 +748,12 @@ impl WorldSession {
                         // 1. Entity sweep. A body consumes the arrow, so the
                         //    block test below is skipped entirely.
                         if let Some(index) = nearest_arrow_mob(mobs, world, before, delta) {
-                            let hit = mobs[index].take_hit(arrow.damage, before);
+                            let damage = arrow_hit_damage(
+                                arrow.damage,
+                                creative_player && arrow.owner == ArrowOwner::Player,
+                                mobs[index].health,
+                            );
+                            let hit = mobs[index].take_hit(damage, before);
                             report.mob_hits += 1;
                             // Only a player's arrow earns the drop table; the
                             // hit itself lands for either owner.
@@ -5935,7 +5958,14 @@ mod tests {
     // -- Projectiles (S07-T02) ---------------------------------------------
 
     fn arrow_session(seed: u32) -> WorldSession {
-        let mut session = make_mob_session(seed);
+        // Arrow damage assertions pin the Survival charge rule, so the fixture
+        // is Survival; Creative-specific tests opt in with `use_creative_rules`.
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/session-arrows.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
         add_resident_air(&mut session);
         session.set_ambient_spawning(false);
         session
@@ -6350,6 +6380,71 @@ mod tests {
             &session,
             Item::new(ItemId::Material(Material::Leather), 1).expect("leather")
         ));
+    }
+
+    #[test]
+    fn creative_player_arrow_one_shot_kills_a_full_health_zombie() {
+        let mut session = arrow_session(74);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, Vec3::new(4.5, 5.0, 8.5), 0.0));
+        session.use_creative_rules();
+        let arrow = Arrow::player(Vec3::new(2.5, 5.5, 8.5), Vec3::X, 1.0).expect("full charge");
+        assert_eq!(arrow.damage, 4, "the charge damage stays on the arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.mob_hits, 1);
+        assert_eq!(tick.kills, 1, "the kill is player-attributed");
+        assert_eq!(
+            session.mobs()[0].health,
+            0,
+            "a Creative arrow lands the remaining 20 hp, not its 4"
+        );
+        assert!(!tick.drops.lost_any(), "the pinned drop table still lands");
+    }
+
+    #[test]
+    fn survival_player_arrow_damages_by_charge() {
+        let mut session = arrow_session(75);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, Vec3::new(4.5, 5.0, 8.5), 0.0));
+        let arrow = Arrow::player(Vec3::new(2.5, 5.5, 8.5), Vec3::X, 1.0).expect("full charge");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.mob_hits, 1);
+        assert_eq!(tick.kills, 0, "4 damage cannot kill a 20 hp zombie");
+        assert_eq!(
+            session.mobs()[0].health,
+            16,
+            "Survival keeps the charge-scaled damage"
+        );
+    }
+
+    #[test]
+    fn skeleton_arrow_friendly_fire_keeps_its_two_damage_in_a_creative_session() {
+        let mut session = arrow_session(76);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, Vec3::new(4.5, 5.0, 8.5), 0.0));
+        session.use_creative_rules();
+        let arrow = Arrow::skeleton(Vec3::new(2.5, 5.5, 8.5), Vec3::X).expect("skeleton shot");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.mob_hits, 1);
+        assert_eq!(tick.kills, 0, "a skeleton earns no kill credit");
+        assert_eq!(
+            session.mobs()[0].health,
+            18,
+            "the Creative rule is scoped to player-owned arrows"
+        );
+        assert_eq!(tick.drops, MobDropReport::default());
     }
 
     #[test]

@@ -234,6 +234,34 @@ impl Arrow {
     }
 }
 
+/// Damage an arrow lands on a mob, given the effective game mode.
+///
+/// Survival passes `base` through unchanged. Creative returns the
+/// target's **remaining** health, so any surviving mob dies to a single
+/// player arrow. The rule takes a plain `bool` rather than a
+/// [`crate::player::GameMode`] so this module keeps its no-player-import
+/// invariant, exactly like [`crate::player::melee::attack_damage`].
+///
+/// The flag is the *effective* mode read at hit time, never stored on
+/// [`Arrow`]: a shot's geometry must not depend on the mode, and the mode
+/// can change between fire and hit (Edit Background). The caller must also
+/// scope it to player-owned arrows; a skeleton arrow's friendly fire keeps
+/// its pinned damage.
+///
+/// [`Mob::take_hit`]: crate::world::mob::Mob::take_hit
+///
+/// The returned value never exceeds `target_health` in Creative, and
+/// `damage == 0` is unreachable from the entity sweep because a dead
+/// record (`health == 0`) is skipped before the hit test. `take_hit`
+/// saturates the subtraction regardless.
+pub const fn arrow_hit_damage(base: u16, creative: bool, target_health: u16) -> u16 {
+    if creative {
+        target_health
+    } else {
+        base
+    }
+}
+
 /// Swept segment versus AABB, returning the hit parameter `t` in `0.0..=1.0`.
 ///
 /// `delta` is the whole segment displacement for the step being resolved, so
@@ -349,6 +377,44 @@ mod tests {
         assert_eq!(arrow.damage, 2);
         assert_eq!(arrow.state, ArrowState::Flying);
         assert_eq!(arrow.life, ARROW_LIFETIME_SECS);
+    }
+
+    // -- hit damage rule ----------------------------------------------------
+
+    #[test]
+    fn arrow_hit_damage_passes_the_survival_base_through_unchanged() {
+        for base in [1, 4, 255] {
+            assert_eq!(
+                arrow_hit_damage(base, false, 20),
+                base,
+                "Survival must never amplify the shot's own damage"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_hit_damage_returns_the_targets_remaining_health_in_creative() {
+        for (base, health) in [(1, 1), (4, 4), (4, 20)] {
+            assert_eq!(
+                arrow_hit_damage(base, true, health),
+                health,
+                "a Creative arrow one-shots a {health} hp mob whatever its charge"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_hit_damage_never_exceeds_the_targets_health() {
+        for health in [0, 1, 7, 20, u16::MAX] {
+            let damage = arrow_hit_damage(ARROW_DAMAGE_MAX, true, health);
+            assert_eq!(damage, health);
+            assert!(damage <= health);
+        }
+        assert_eq!(
+            arrow_hit_damage(ARROW_DAMAGE_MAX, true, 0),
+            0,
+            "a dead record can never be over-damaged"
+        );
     }
 
     // -- construction validation -------------------------------------------
