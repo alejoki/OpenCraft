@@ -2789,6 +2789,160 @@ mod tests {
         assert_eq!(loaded, data);
     }
 
+    // ------------------------------------------------------------------
+    // v7 item vocabulary: new materials and Sword/Bow save records
+    // ------------------------------------------------------------------
+
+    /// The six material identities appended in v7 (M009) with their tags.
+    const V7_MELEE_MATERIALS: [(Material, u8); 6] = [
+        (Material::Leather, MATERIAL_LEATHER),
+        (Material::RawPorkchop, MATERIAL_RAW_PORKCHOP),
+        (Material::RawBeef, MATERIAL_RAW_BEEF),
+        (Material::RottenFlesh, MATERIAL_ROTTEN_FLESH),
+        (Material::Bone, MATERIAL_BONE),
+        (Material::Arrow, MATERIAL_ARROW),
+    ];
+
+    fn v7_melee_item(material: Material, count: u16) -> Item {
+        Item::new(ItemId::Material(material), count).expect("material count is in range")
+    }
+
+    /// Rebuilds a byte-valid v6 payload from an edit-free, chest-free v7
+    /// payload: patch the version back and drop the four-byte mob count.
+    fn v6_bytes_from_v7(bytes: &[u8]) -> Vec<u8> {
+        let mob_count_at = bytes.len() - V7_MOB_COUNT_LEN;
+        assert_eq!(
+            &bytes[mob_count_at..],
+            &0u32.to_le_bytes(),
+            "helper only rewrites a chest-free v7 save with no mobs"
+        );
+        let mut bytes = bytes.to_vec();
+        bytes.truncate(mob_count_at);
+        bytes[4..8].copy_from_slice(&SURVIVAL_VERSION.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn test_v7_roundtrips_new_materials_and_combat_tools_byte_stably() {
+        // Every new material sits in one hotbar slot and one chest slot, and
+        // both combat tool identities carry non-full durability.
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (index, (material, _)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            slots[index] = Some(v7_melee_item(*material, 2 + index as u16));
+        }
+        slots[6] =
+            Some(Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap());
+        slots[7] = Some(Item::tool_with_durability(ToolKind::Bow, ToolTier::Wood, 3).unwrap());
+
+        let mut chest_slots: ChestSlots = [None; CHEST_SLOTS];
+        for (index, (material, _)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            chest_slots[index] = Some(v7_melee_item(*material, 5));
+        }
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(7, 65, -3), Container::from_slots(chest_slots));
+
+        let mut data = sample_data(sample_player());
+        data.player.inventory = Inventory::from_parts(slots, None);
+        data.chests = chests;
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v7 item vocabulary must save");
+        assert_eq!(&bytes[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
+
+        let loaded = load_world_from_bytes(&bytes).expect("v7 item vocabulary must load");
+        assert_eq!(loaded, data);
+
+        for (index, (material, tag)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            // Slot-0 layout for a material record: tag, material tag, count.
+            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4], ITEM_TAG_MATERIAL);
+            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4 + 1], *tag);
+            assert_eq!(
+                loaded.player.inventory.slot(index),
+                Some(v7_melee_item(*material, 2 + index as u16))
+            );
+            assert_eq!(
+                loaded.chests[&IVec3::new(7, 65, -3)].slot(index),
+                Some(v7_melee_item(*material, 5))
+            );
+        }
+
+        // Slot-6/7 layout for a tool record: tag, kind, tier, durability u16.
+        let sword = V4_EXTENSION_OFFSET + 6 * 4;
+        assert_eq!(bytes[sword], ITEM_TAG_TOOL);
+        assert_eq!(bytes[sword + 1], TOOL_KIND_SWORD);
+        assert_eq!(bytes[sword + 2], TOOL_TIER_WOOD);
+        assert_eq!(&bytes[sword + 3..sword + 5], &17u16.to_le_bytes());
+        let bow = sword + 5;
+        assert_eq!(bytes[bow], ITEM_TAG_TOOL);
+        assert_eq!(bytes[bow + 1], TOOL_KIND_BOW);
+        assert_eq!(bytes[bow + 2], TOOL_TIER_WOOD);
+        assert_eq!(&bytes[bow + 3..bow + 5], &3u16.to_le_bytes());
+
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
+        assert_eq!(again, bytes, "a loaded v7 item save re-saves byte-identically");
+    }
+
+    #[test]
+    fn test_v6_rejects_v7_only_material_and_combat_tool_records() {
+        // Material tag 9 (Bone) was appended in v7: a pre-v7 payload that
+        // claims it fails closed, while the identical v7 payload loads.
+        let bone = v4_bytes_with_slot0(v7_melee_item(Material::Bone, 1));
+        assert!(load_world_from_bytes(&bone).is_ok());
+        assert!(matches!(
+            load_world_from_bytes(&v6_bytes_from_v7(&bone)),
+            Err(PersistenceError::InvalidMaterial(9))
+        ));
+
+        // Tool kind 4 (Sword) is likewise v7-only, and its v6 rejection is
+        // independent of the v6-only Hoe gate.
+        let sword = v4_bytes_with_slot0(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
+        );
+        assert!(load_world_from_bytes(&sword).is_ok());
+        assert!(matches!(
+            load_world_from_bytes(&v6_bytes_from_v7(&sword)),
+            Err(PersistenceError::InvalidToolKind(4))
+        ));
+    }
+
+    #[test]
+    fn test_v7_rejects_forged_stone_bow_record() {
+        // `(Bow, Stone)` is not a constructible tool identity; persistence
+        // decode must funnel through the checked constructor and report the
+        // tier gate instead of accepting the forged pair.
+        let sword = v4_bytes_with_slot0(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
+        );
+        let mut bytes = sword;
+        bytes[V4_EXTENSION_OFFSET + 1] = TOOL_KIND_BOW;
+        bytes[V4_EXTENSION_OFFSET + 2] = TOOL_TIER_STONE;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::TierNotAllowed))
+        ));
+    }
+
+    #[test]
+    fn test_v7_edit_free_item_vocabulary_save_keeps_the_153_byte_baseline() {
+        assert_eq!(ITEM_VOCAB_VERSION, MOB_VERSION);
+
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("edit-free v7 save must succeed");
+
+        assert_eq!(bytes.len(), V7_FIRST_MOB_OFFSET);
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(&bytes[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
+        assert_eq!(
+            &bytes[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET],
+            &0u32.to_le_bytes()
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("baseline must load");
+        assert_eq!(loaded, data);
+    }
+
     #[test]
     fn test_v6_save_loads_with_zero_mobs() {
         let data = v7_data_with_mobs(pinned_mobs());
