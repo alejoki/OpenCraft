@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod combat;
 pub mod container;
 pub mod eating;
 pub mod inventory;

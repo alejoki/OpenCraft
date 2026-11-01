@@ -1,5 +1,6 @@
 use glam::Vec3;
 
+use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
 use crate::player::eating::food_value;
 use crate::player::inventory::{
@@ -183,6 +184,9 @@ pub struct Player {
     table_grid: CraftingGrid,
     /// Dry-land fall measurement and one-shot spawn immunity (S04).
     fall: FallState,
+    /// Player combat carrier: cause-tagged hits, i-frames, hurt flash, and the
+    /// one decaying hostile knockback impulse (S06). Ephemeral — never saved.
+    pub combat: PlayerCombat,
 }
 
 /// Thin player-side wrapper over the shared box-vs-solid predicate.
@@ -213,6 +217,7 @@ impl Player {
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
             fall: FallState::default(),
+            combat: PlayerCombat::default(),
         }
     }
 
@@ -245,6 +250,8 @@ impl Player {
         }
         // A mode change never carries an in-flight fall or spawn immunity.
         self.fall.clear();
+        // A mode change must not carry a hostile impulse or i-frame window.
+        self.combat.reset();
     }
 
     /// Whether the player can actually fly right now.
@@ -763,6 +770,13 @@ impl Player {
         }
         self.velocity.x = move_dir.x * walk_speed;
         self.velocity.z = move_dir.z * walk_speed;
+        // Hostile knockback is integrated *after* the input assignment above.
+        // Input reassigns `velocity.x/z` every frame, so this is deliberately
+        // not a second owner of the velocity: the impulse itself lives only in
+        // `combat.knockback`, is never persisted, and has no vertical
+        // component so the player is never pushed into the floor or ceiling.
+        self.velocity.x += self.combat.knockback().x;
+        self.velocity.z += self.combat.knockback().z;
 
         // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
         // only (positions, sink/rise, on_ground). Fall distance is measured by
