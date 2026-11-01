@@ -1,3 +1,4 @@
+pub mod arrow;
 pub mod background;
 pub mod block;
 pub mod catalog;

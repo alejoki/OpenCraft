@@ -1288,6 +1288,8 @@ pub enum RecipeId {
     WoodSword,
     StoneSword,
     IronSword,
+    Shortbow,
+    Arrows,
 }
 
 /// Read-only recipe evaluation result.
@@ -1513,12 +1515,36 @@ const RECIPES: &[Recipe] = &[
         },
         output_count: 1,
     },
+    // Ranged entry points. The bow is 3 wide and 3 tall (2 leather, 3 sticks)
+    // so it is table-only by shape, exactly like the hoes and swords. Arrows
+    // are a 1x2 column so the same recipe also fits the 2x2 player grid: a
+    // player who has never placed a table can still make ammo.
+    Recipe {
+        id: RecipeId::Shortbow,
+        pattern: &[" SE", "S E", " S "],
+        output: ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::Arrows,
+        pattern: &["S", "K"],
+        output: ItemId::Material(Material::Arrow),
+        output_count: 4,
+    },
 ];
 
 /// Pattern character to item identity. Unknown characters never match.
 ///
 /// Known characters: `L` oak log, `P` oak planks, `C` cobblestone,
-/// `I` iron ore, `S` stick, `W` wheat.
+/// `I` iron ore, `S` stick, `W` wheat, `E` leather, `K` coal ore.
+///
+/// There is no `Material::Coal` in this codebase, so the coal ore block is the
+/// only coal identity available — the same convention `I` already uses for
+/// iron ore. Smelting can later swap both head materials without touching the
+/// shaped-recipe machinery.
 fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
@@ -1527,6 +1553,8 @@ fn pattern_item(byte: u8) -> Option<ItemId> {
         b'I' => Some(ItemId::Block(BlockId::IronOre)),
         b'S' => Some(ItemId::Material(Material::Stick)),
         b'W' => Some(ItemId::Material(Material::Wheat)),
+        b'E' => Some(ItemId::Material(Material::Leather)),
+        b'K' => Some(ItemId::Block(BlockId::CoalOre)),
         _ => None,
     }
 }
@@ -3488,7 +3516,7 @@ mod tests {
 
     #[test]
     fn every_tool_recipe_is_shaped_and_produces_a_full_durability_instance() {
-        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 15] = [
+        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 16] = [
             (
                 RecipeId::WoodPickaxe,
                 ToolKind::Pickaxe,
@@ -3578,6 +3606,12 @@ mod tests {
                 ToolKind::Sword,
                 ToolTier::Iron,
                 &["I", "I", "S"],
+            ),
+            (
+                RecipeId::Shortbow,
+                ToolKind::Bow,
+                ToolTier::Wood,
+                &[" SE", "S E", " S "],
             ),
         ];
 
@@ -3986,11 +4020,208 @@ mod tests {
     }
 
     #[test]
+    fn ranged_recipes_are_reachable_without_a_furnace() {
+        // -- Shortbow: 3 sticks + 2 leather, table-only by shape ------------
+        let bow_pattern = [" SE", "S E", " S "];
+        assert_eq!(bow_pattern.len(), 3);
+        assert!(GridKind::Player.dim() < bow_pattern.len());
+
+        let bow_grid = grid_from_pattern(GridKind::Table, &bow_pattern);
+        let preview = bow_grid.preview().expect("shortbow pattern matches");
+        assert_eq!(preview.recipe, RecipeId::Shortbow);
+        assert_eq!(
+            preview.output,
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(preview.output_count, 1);
+
+        // The 2x2 player grid is only two rows tall, so the bow can never be
+        // completed there even when every cell is filled with a bow material.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid.set(0, Some(stick(1))).expect("cell 0");
+        player_grid
+            .set(1, Some(item(ItemId::Material(Material::Leather), 1)))
+            .expect("cell 1");
+        player_grid.set(2, Some(stick(1))).expect("cell 2");
+        player_grid
+            .set(3, Some(item(ItemId::Material(Material::Leather), 1)))
+            .expect("cell 3");
+        assert_ne!(
+            player_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Shortbow),
+            "the shortbow must stay table-only"
+        );
+
+        // -- Arrows: 1 stick + 1 coal ore -> 4 arrows -----------------------
+        let arrow_grid = grid_from_pattern(GridKind::Player, &["S", "K"]);
+        let preview = arrow_grid
+            .preview()
+            .expect("arrow pattern matches on the 2x2 player grid");
+        assert_eq!(preview.recipe, RecipeId::Arrows);
+        assert_eq!(preview.output, ItemId::Material(Material::Arrow));
+        assert_eq!(preview.output_count, 4);
+
+        let table_arrow_grid = grid_from_pattern(GridKind::Table, &["S", "K"]);
+        assert_eq!(
+            table_arrow_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Arrows),
+            "the same arrow shape also matches on the table"
+        );
+
+        // -- Full chain: one oak log + 2 leather + 1 coal ore ---------------
+        //
+        // Every step moves items between the inventory and a grid, so the
+        // totals account for every unit: nothing is spawned.
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(block(BlockId::OakLog, 1))
+            .expect("inventory holds the starting log");
+        inventory
+            .insert(item(ItemId::Material(Material::Leather), 2))
+            .expect("inventory holds the leather");
+        inventory
+            .insert(item(ItemId::Block(BlockId::CoalOre), 1))
+            .expect("inventory holds the coal ore");
+
+        // Step 1: the single oak log becomes four planks in the 2x2 grid.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(
+                0,
+                Some(withdraw(&mut inventory, ItemId::Block(BlockId::OakLog), 1)),
+            )
+            .expect("player cell");
+        let planks = player.take_result(&mut inventory).expect("planks craft");
+        assert_eq!(planks.id(), ItemId::Block(BlockId::OakPlanks));
+        assert_eq!(planks.count(), 4);
+        assert!(player.is_empty());
+
+        // Step 2: two rounds of two planks become four sticks each.
+        for round in 0..2 {
+            let mut sticks_grid = CraftingGrid::new(GridKind::Player);
+            for index in [0, GridKind::Player.dim()] {
+                sticks_grid
+                    .set(
+                        index,
+                        Some(withdraw(
+                            &mut inventory,
+                            ItemId::Block(BlockId::OakPlanks),
+                            1,
+                        )),
+                    )
+                    .expect("plank cell");
+            }
+            let crafted = sticks_grid
+                .take_result(&mut inventory)
+                .expect("planks craft into sticks");
+            assert_eq!(crafted.id(), ItemId::Material(Material::Stick));
+            assert_eq!(crafted.count(), 4, "round {round}");
+            assert!(sticks_grid.is_empty());
+        }
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            0,
+            "one log is exactly four planks and eight sticks"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 8);
+
+        // Step 3: three sticks plus two leather become one shortbow.
+        let mut table = CraftingGrid::new(GridKind::Table);
+        let dim = table.dim();
+        let bow_cells = [
+            (1, ItemId::Material(Material::Stick)),
+            (2, ItemId::Material(Material::Leather)),
+            (dim, ItemId::Material(Material::Stick)),
+            (dim + 2, ItemId::Material(Material::Leather)),
+            (2 * dim + 1, ItemId::Material(Material::Stick)),
+        ];
+        for (index, id) in bow_cells {
+            let ingredient = withdraw(&mut inventory, id, 1);
+            table.set(index, Some(ingredient)).expect("bow cell");
+        }
+        assert_eq!(
+            table.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Shortbow)
+        );
+        let bow_item = table.take_result(&mut inventory).expect("bow craft");
+        assert_eq!(
+            bow_item.id(),
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(bow_item.count(), 1);
+        assert_eq!(
+            bow_item.durability(),
+            Some(59),
+            "a wood bow starts at the full wood-tier durability"
+        );
+        assert!(table.is_empty(), "the bow consumes all five cells");
+
+        // Step 4: one stick plus the coal ore become four arrows, entirely in
+        // the 2x2 player grid.
+        let mut arrow_cells = CraftingGrid::new(GridKind::Player);
+        arrow_cells
+            .set(
+                0,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Material(Material::Stick),
+                    1,
+                )),
+            )
+            .expect("stick cell");
+        arrow_cells
+            .set(
+                GridKind::Player.dim(),
+                Some(withdraw(&mut inventory, ItemId::Block(BlockId::CoalOre), 1)),
+            )
+            .expect("coal cell");
+        assert_eq!(
+            arrow_cells.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Arrows)
+        );
+        let arrows = arrow_cells
+            .take_result(&mut inventory)
+            .expect("arrow craft");
+        assert_eq!(arrows.id(), ItemId::Material(Material::Arrow));
+        assert_eq!(arrows.count(), 4);
+        assert!(arrow_cells.is_empty(), "the arrows consume both cells");
+
+        // Exact unit conservation: eight sticks paid 3 for the bow and 1 for
+        // the arrows, so four remain; both leather and the coal ore are spent.
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 4);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Arrow)), 4);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Leather)), 0);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::CoalOre)), 0);
+        assert_eq!(total_of(&inventory, bow_item.id()), 1);
+        let tools: Vec<ItemId> = inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id().is_tool())
+            .map(|item| item.id())
+            .collect();
+        assert_eq!(
+            tools,
+            vec![ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }],
+            "the chain produces exactly one tool: the shortbow"
+        );
+    }
+
+    #[test]
     fn recipe_table_patterns_are_unambiguous() {
         assert_eq!(
             RECIPES.len(),
-            20,
-            "13 pre-farming recipes plus 4 farming recipes plus 3 swords"
+            22,
+            "13 pre-farming + 4 farming + 3 swords + 2 ranged"
         );
         for recipe in RECIPES {
             let mut grid = CraftingGrid::new(GridKind::Table);

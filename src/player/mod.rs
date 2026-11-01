@@ -1,3 +1,4 @@
+pub mod bow;
 pub mod camera;
 pub mod combat;
 pub mod container;
