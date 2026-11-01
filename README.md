@@ -94,7 +94,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | Key | Action |
 | --- | --- |
 | **Left Click** | Attack a mob under the crosshair within reach; otherwise break the targeted block, and harvest mature wheat. A left press over empty ground still mines. |
-| **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food. |
+| **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food or draw a selected bow. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
 | **Escape** | Open the pause menu (settings are available from there). |
@@ -106,7 +106,11 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | **Right Click (hoe)** | Till the top face of grass or dirt into Farmland. |
 | **Craft (wood sword)** | At a crafting table, stack 2 Oak Planks over 1 Stick in a single vertical column. Each swing deals 4 damage. |
 | **Craft (stone / iron sword)** | Swap the two planks for 2 Cobblestone (5 damage) or 2 Iron Ore (6 damage), keeping the Stick at the bottom. Swords do not shorten block-breaking time. |
-| **Left Click (mob)** | Attack the mob under the crosshair within reach. The hit shows a hurt flash and knocks the mob away; one swing per ~0.6 s, and the same mob ignores further hits for ~0.5 s. A mob in reach takes priority over the block behind it. |
+| **Craft (shortbow)** | At a crafting table, stack 3 Sticks and 2 Leather in a bow shape: a Stick in the middle and bottom of the middle column, Leather at the top-right and middle-right, and a Stick at the top-middle. The bow wears out after 59 shots. |
+| **Craft (arrows)** | Stack 1 Stick over 1 Coal Ore in a single vertical column; a batch makes 4 Arrows. It is a 1x2 shape, so it also fits the 2x2 player crafting grid. |
+| **Hold Right Click (bow)** | With a bow selected, hold Right Click to draw. A full draw takes about 1.0 s; releasing at or after 0.2 s fires one arrow, and releasing earlier cancels without spending an arrow or any bow durability. Each shot spends exactly one arrow and one bow durability. |
+| **Fired arrows** | An arrow arcs under gravity, deals 1-4 damage scaled by how long it was drawn, and knocks a mob away from you. An arrow that hits a block sticks there for about 2 s and then vanishes; arrows are never pickups. An empty inventory shows the notice `No arrows`. |
+| **Left Click (mob)** | Attack the mob under the crosshair within reach. The hit shows a hurt flash and knocks the mob away; one swing per ~0.6 s, and the same mob ignores further hits for ~0.5 s. A mob in reach takes priority over the block behind it; Left Click always attacks even while a bow is selected. |
 | **Hit a pig or cow** | The mob turns and runs away from you for a couple of seconds; a wounded animal keeps its distance instead of standing still. |
 | **A zombie spots you** | A Zombie notices a Survival player through line of sight within 16 blocks and chases by walking. It steps up and down one block at a time but never walks off a bigger drop; if it cannot make progress it gives up, idles, and re-targets after a short cooldown. Creative players are never targeted or damaged. |
 | **Zombie attack** | Each zombie hit deals 3 damage and knocks you back. After a hit you are invulnerable for 0.5 s and the screen flashes red. The Death screen names the cause: Zombie, Fall, Drowning, or Starvation. |

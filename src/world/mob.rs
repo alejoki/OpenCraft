@@ -15,7 +15,7 @@
 
 use glam::Vec3;
 
-use crate::world::mob_ai::{MobAttack, MobTarget, MobWorld};
+use crate::world::mob_ai::{MobAction, MobAttack, MobTarget, MobWorld};
 
 /// Fixed simulation rate of every mob AI step (D134).
 pub const MOB_TICK_HZ: u32 = 20;
@@ -150,9 +150,10 @@ impl MobKind {
 
     /// Melee profile for this kind, or `None` when it has no melee attack.
     ///
-    /// Only the Zombie melees in S06. Skeleton melee must never exist: S08
-    /// owns ranged combat, so returning `None` here keeps the combat demo's
-    /// damage sources exactly one.
+    /// Only the Zombie melees in S06. Skeleton melee must never exist: its
+    /// ranged bow lives in [`MobKind::ranged_profile`], so returning `None`
+    /// here keeps a skeleton from ever swinging and keeps the combat demo's
+    /// melee damage sources exactly one.
     pub const fn attack_profile(self) -> Option<MobAttackProfile> {
         match self {
             MobKind::Zombie => Some(MobAttackProfile {
@@ -161,6 +162,25 @@ impl MobKind {
                 cooldown_secs: 1.0,
             }),
             MobKind::Pig | MobKind::Cow | MobKind::Skeleton => None,
+        }
+    }
+
+    /// Stand-off ranged profile for this kind, or `None` when it has no bow.
+    ///
+    /// Only the Skeleton shoots (S08). Between `min_range` (5.0) and
+    /// `fire_range` (12.0) blocks it stands still and fires one
+    /// gravity-compensated arrow every 2.0 s; closer than `min_range` it backs
+    /// away with the same one-block step mover, and beyond `fire_range` it
+    /// closes the distance. It never melees: [`MobKind::attack_profile`] stays
+    /// `None` for it.
+    pub const fn ranged_profile(self) -> Option<MobRangedProfile> {
+        match self {
+            MobKind::Skeleton => Some(MobRangedProfile {
+                fire_range: 12.0,
+                min_range: 5.0,
+                cooldown_secs: 2.0,
+            }),
+            MobKind::Pig | MobKind::Cow | MobKind::Zombie => None,
         }
     }
 }
@@ -174,6 +194,27 @@ pub struct MobAttackProfile {
     /// Maximum horizontal distance at which the attack can land, in blocks.
     pub range: f32,
     /// Seconds between landed hits (`Mob::cooldown` is armed to this value).
+    pub cooldown_secs: f32,
+}
+
+/// One stand-off ranged shape. The mirror of [`MobAttackProfile`] for a kind
+/// that shoots instead of swinging.
+///
+/// The mob domain owns the numbers so the hostile brain stays kind-agnostic;
+/// the brain only asks "does this kind have a bow?" and reads the three
+/// distances. A skeleton is the only ranged kind today.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MobRangedProfile {
+    /// Maximum horizontal distance at which a shot is taken, in blocks.
+    ///
+    /// Beyond this the mob closes the distance first.
+    pub fire_range: f32,
+    /// Minimum horizontal distance at which a shot is taken, in blocks.
+    ///
+    /// Inside this the mob backs away instead of firing (and never stands
+    /// inside the player's body).
+    pub min_range: f32,
+    /// Seconds between shots (`Mob::cooldown` is armed to this value).
     pub cooldown_secs: f32,
 }
 
@@ -484,6 +525,24 @@ pub fn mob_roll(seed: u32, tick_index: u64, slot: u32) -> u32 {
     (z ^ (z >> 32)) as u32
 }
 
+/// One ranged shot decision emitted by the hostile brain.
+///
+/// Geometry only: *where* the arrow starts and *which way* it points, plus the
+/// shooter's kind. Speed, damage and gravity stay in the projectile domain
+/// ([`crate::world::arrow::Arrow::skeleton`]) so there is exactly one
+/// implementation of arrow ballistics.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MobShot {
+    /// The shooter's kind.
+    pub kind: MobKind,
+    /// Arrow launch position: the shooter's eye, the same rule line of sight
+    /// uses, so a shot leaves from a cell the brain proved open.
+    pub origin: Vec3,
+    /// Aim direction; deliberately not normalized — the arrow constructor
+    /// normalizes it.
+    pub dir: Vec3,
+}
+
 /// What one [`MobRuntime::tick`] call actually executed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MobTick {
@@ -495,6 +554,13 @@ pub struct MobTick {
     /// The session is the only consumer: it applies them through its single
     /// damage seam (S06-T04), so the world layer never names a player type.
     pub attacks: Vec<MobAttack>,
+    /// Ranged shot decisions from the same fixed steps, emitted in mob-list
+    /// order.
+    ///
+    /// Geometry only (see [`MobShot`]): the session turns each one into a real
+    /// [`crate::world::arrow::Arrow::skeleton`] projectile through its shared
+    /// spawn seam, so the AI never owns ballistics or damage.
+    pub shots: Vec<MobShot>,
 }
 
 /// Fixed-rate accumulator driving every mob at exactly [`MOB_TICK_HZ`],
@@ -567,13 +633,14 @@ impl MobRuntime {
         }
 
         let mut attacks = Vec::new();
+        let mut shots = Vec::new();
         for _ in 0..steps {
             self.tick_index += 1;
             for (index, mob) in mobs.iter_mut().enumerate() {
                 if !is_resident(mob.position) {
                     continue;
                 }
-                self.step_mob(mob, index as u32, target, world, &mut attacks);
+                self.step_mob(mob, index as u32, target, world, &mut attacks, &mut shots);
             }
         }
 
@@ -585,6 +652,7 @@ impl MobRuntime {
         MobTick {
             ai_steps: steps,
             attacks,
+            shots,
         }
     }
 
@@ -595,6 +663,7 @@ impl MobRuntime {
         target: Option<MobTarget>,
         world: &impl MobWorld,
         attacks: &mut Vec<MobAttack>,
+        shots: &mut Vec<MobShot>,
     ) {
         mob.hurt = (mob.hurt - MOB_TICK_SECS).max(0.0);
         mob.hurt_iframe = (mob.hurt_iframe - MOB_TICK_SECS).max(0.0);
@@ -651,13 +720,15 @@ impl MobRuntime {
             // is closed. Once `step_hostile` puts a hostile into `Chase`, it
             // owns movement for that step and the arms are skipped.
             let hostile_chasing = if mob.kind.is_hostile() {
-                if let Some(attack) = crate::world::mob_ai::step_hostile(
+                match crate::world::mob_ai::step_hostile(
                     mob,
                     target,
                     world,
                     mob_roll(self.seed, self.tick_index, slot),
                 ) {
-                    attacks.push(attack);
+                    Some(MobAction::Melee(attack)) => attacks.push(attack),
+                    Some(MobAction::Shot(shot)) => shots.push(shot),
+                    None => {}
                 }
                 mob.state == MobAiState::Chase
             } else {
@@ -778,6 +849,101 @@ mod tests {
         assert!((MobKind::Cow.walk_speed() - 0.9).abs() < 1e-6);
         assert!((MobKind::Zombie.walk_speed() - 1.6).abs() < 1e-6);
         assert!((MobKind::Skeleton.walk_speed() - 1.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ranged_profiles_are_skeleton_only_and_never_imply_melee() {
+        for kind in MobKind::ALL {
+            let ranged = kind.ranged_profile();
+            assert_eq!(
+                ranged.is_some(),
+                kind == MobKind::Skeleton,
+                "only the Skeleton carries a bow ({kind:?})"
+            );
+            if let Some(profile) = ranged {
+                assert!(profile.min_range < profile.fire_range);
+                assert!(profile.cooldown_secs > 0.0);
+                assert_eq!(
+                    kind.attack_profile(),
+                    None,
+                    "a ranged kind must never also melee"
+                );
+            }
+        }
+        assert_eq!(
+            MobKind::Skeleton.ranged_profile(),
+            Some(MobRangedProfile {
+                fire_range: 12.0,
+                min_range: 5.0,
+                cooldown_secs: 2.0,
+            })
+        );
+        assert_eq!(MobKind::Zombie.ranged_profile(), None);
+        assert_eq!(MobKind::Pig.ranged_profile(), None);
+        assert_eq!(MobKind::Cow.ranged_profile(), None);
+    }
+
+    #[test]
+    fn runtime_collects_skeleton_shots_on_the_two_second_cadence() {
+        let mut runtime = MobRuntime::new(17);
+        let mut mobs = vec![Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0)];
+        let target = MobTarget {
+            feet: Vec3::new(0.5, 5.0, 8.5),
+            eye: Vec3::new(0.5, 6.62, 8.5),
+        };
+
+        let mut shot_steps = Vec::new();
+        for step in 1..=81u32 {
+            let report = runtime.tick(0.05, &mut mobs, resident, Some(target), &NoWorld);
+            assert_eq!(report.ai_steps, 1);
+            assert!(
+                report.attacks.is_empty(),
+                "a skeleton never melees through the runtime"
+            );
+            if !report.shots.is_empty() {
+                assert_eq!(report.shots.len(), 1, "one shot per fixed step at most");
+                let shot = report.shots[0];
+                assert_eq!(shot.kind, MobKind::Skeleton);
+                assert!(shot.origin.is_finite() && shot.dir.is_finite());
+                assert!(shot.dir.length_squared() > 0.0);
+                shot_steps.push(step);
+            }
+            assert_eq!(
+                mobs[0].position,
+                Vec3::new(0.5, 5.0, 0.5),
+                "a firing skeleton stands still"
+            );
+        }
+
+        assert_eq!(
+            shot_steps,
+            vec![1, 41, 81],
+            "one shot per 2.0 s, i.e. every 40 fixed 20 Hz steps"
+        );
+    }
+
+    #[test]
+    fn runtime_reports_melee_and_shots_side_by_side_in_mob_list_order() {
+        let mut runtime = MobRuntime::new(19);
+        let mut mobs = vec![
+            Mob::new(MobKind::Zombie, Vec3::new(2.5, 5.0, 9.0), 0.0),
+            Mob::new(MobKind::Skeleton, Vec3::new(2.5, 5.0, 2.5), 0.0),
+        ];
+        let target = MobTarget {
+            feet: Vec3::new(2.5, 5.0, 10.5),
+            eye: Vec3::new(2.5, 6.62, 10.5),
+        };
+
+        let report = runtime.tick(0.05, &mut mobs, resident, Some(target), &NoWorld);
+        assert_eq!(report.ai_steps, 1);
+        assert_eq!(report.attacks.len(), 1, "the adjacent zombie melees");
+        assert_eq!(report.attacks[0].kind, MobKind::Zombie);
+        assert_eq!(report.shots.len(), 1, "the stand-off skeleton shoots");
+        assert_eq!(report.shots[0].kind, MobKind::Skeleton);
+
+        // A default report carries neither vector: an idle frame emits nothing.
+        let idle = MobTick::default();
+        assert!(idle.attacks.is_empty() && idle.shots.is_empty());
     }
 
     #[test]

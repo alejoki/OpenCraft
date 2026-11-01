@@ -1,8 +1,9 @@
-//! World-aware hostile steering (M009/S06-T01).
+//! World-aware hostile steering (M009/S06-T01, ranged S08-T01).
 //!
 //! This module is the whole hostile brain: line-of-sight aggro, direct chase,
-//! one-block step-up/down, a cliff guard, and the stuck fallback. It is pure
-//! lib code — no wgpu, no winit, no `Instant`, no wall clock, and no
+//! one-block step-up/down, a cliff guard, the stuck fallback, and (S08) the
+//! skeleton's stand-off ranged decision with a gravity-compensated aim. It is
+//! pure lib code — no wgpu, no winit, no `Instant`, no wall clock, and no
 //! `crate::player::*` types beyond the shared voxel raycast. All of it is
 //! headlessly testable on a synthetic block grid.
 //!
@@ -20,22 +21,35 @@
 //! * **Movement is one block up, one block down, else refuse.** A blocked
 //!   candidate tries a one-block step-up; a candidate whose column has no
 //!   support drops at most one block. A larger drop is refused (cliff guard),
-//!   so a hostile never walks off a two-block ledge.
+//!   so a hostile never walks off a two-block ledge. Closing and retreating
+//!   share the same mover ([`move_in`]) — there is exactly one steering
+//!   implementation.
+//! * **Skeleton stand-off (S08).** A kind with a
+//!   [`MobKind::ranged_profile`] never melees: beyond `fire_range` it closes,
+//!   inside `min_range` it backs away, and in the band it stands still and
+//!   fires. A shot needs line of sight, a live target within
+//!   [`MOB_FIRE_VERTICAL`], a drained cooldown, and an open eye cell. The aim
+//!   is gravity-compensated: it targets the player's eye plus the drop the
+//!   arrow will accumulate over its flight time, so the shot arcs instead of
+//!   landing short.
 //! * **Stuck fallback.** A chase that makes less than
 //!   [`MOB_STUCK_MIN_PROGRESS`] in [`MOB_STUCK_TIMEOUT_SECS`] drops aggro and
 //!   opens a [`MOB_STUCK_REAGGRO_SECS`] cooldown, so a zombie boxed in a wall
-//!   re-targets or idles instead of grinding forever.
+//!   re-targets or idles instead of grinding forever. A skeleton standing in
+//!   its fire band is deliberately stationary, not stuck, so that arm clears
+//!   the timer.
 //! * **AI state is never saved.** [`crate::world::persistence::SavedMob`] has
 //!   no state field: a reload restores every mob in `Wander`, and hostiles
 //!   re-aggro from line of sight once more.
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::player::raycast::raycast_voxels;
+use crate::world::arrow::{ARROW_GRAVITY, ARROW_SPEED_SKELETON};
 use crate::world::block::BlockId;
 use crate::world::collision::solid_overlaps;
 use crate::world::manager::WorldManager;
-use crate::world::mob::{Mob, MobAiState, MobKind};
+use crate::world::mob::{Mob, MobAiState, MobKind, MobShot};
 
 /// Horizontal distance at which a hostile notices a target, in blocks.
 ///
@@ -51,6 +65,13 @@ pub const MOB_STUCK_TIMEOUT_SECS: f32 = 1.0;
 pub const MOB_STUCK_MIN_PROGRESS: f32 = 0.25;
 /// Re-aggro cooldown opened by the stuck fallback, in seconds.
 pub const MOB_STUCK_REAGGRO_SECS: f32 = 2.0;
+/// The largest feet-height difference a skeleton will shoot across, in
+/// blocks.
+///
+/// A 4-block band keeps a hill shot plausible (the aim compensates the drop)
+/// while refusing the extreme angle that would need a lob the gravity model
+/// can no longer hit.
+pub const MOB_FIRE_VERTICAL: f32 = 4.0;
 /// Height of the one allowed step up, in blocks.
 pub const MOB_STEP_UP_HEIGHT: f32 = 1.0;
 /// The largest feet drop a hostile may walk off, in blocks.
@@ -59,6 +80,14 @@ pub const MOB_CLIFF_DROP_BLOCKS: i32 = 1;
 /// Same inward epsilon as the shared collision predicate, used to turn a
 /// float feet position into block coordinates without boundary jitter.
 const SUPPORT_EPS: f32 = 1e-4;
+/// Slack on the ranged cooldown gate, in seconds.
+///
+/// [`MobRuntime::step_mob`] drains `mob.cooldown` by [`MOB_TICK_SECS`] with
+/// repeated f32 subtraction, which can leave a few ulps of residual above zero
+/// after the intended 40 steps and stretch the 2.0 s cadence to 41. A
+/// thousandth of a second is far below one fixed step (0.05 s), so this makes
+/// the shot cadence tick-exact without ever letting a shot fire early.
+const MOB_FIRE_COOLDOWN_EPS: f32 = 1e-3;
 /// Eye height as a fraction of the kind's full height. Matches the player's
 /// 1.62 / 1.8 eye ratio closely enough for a fair line of sight.
 const EYE_HEIGHT_FRACTION: f32 = 0.85;
@@ -91,6 +120,21 @@ pub struct MobAttack {
     pub from: Vec3,
 }
 
+/// One attack decision produced by [`step_hostile`].
+///
+/// The two arms are disjoint by kind: [`MobKind::attack_profile`] and
+/// [`MobKind::ranged_profile`] never both return `Some`, so a Zombie can only
+/// ever produce [`MobAction::Melee`] and a Skeleton only [`MobAction::Shot`].
+/// Wrapping both in one return value is what lets the runtime collect the two
+/// report vectors from a single brain call without matching on the kind twice.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MobAction {
+    /// A melee swing that landed this step.
+    Melee(MobAttack),
+    /// A shot decision; geometry only, no ballistics or damage.
+    Shot(MobShot),
+}
+
 /// Whether the eye-to-eye ray reaches the target without crossing a solid
 /// block.
 ///
@@ -119,14 +163,17 @@ pub fn has_line_of_sight(world: &impl MobWorld, from_eye: Vec3, to_eye: Vec3) ->
 /// fallback is fully deterministic and does not need a tie-break, but the
 /// parameter is kept so the AI never reaches for `rand` or a wall clock.
 ///
-/// Returns `Some` when a Zombie lands an attack this step. Non-hostile kinds,
-/// dead mobs, and non-targetable players never mutate anything.
+/// Returns `Some(MobAction::Melee(..))` when a Zombie lands a swing this step
+/// and `Some(MobAction::Shot(..))` when a Skeleton fires one. Non-hostile
+/// kinds, dead mobs, and non-targetable players never mutate anything. A
+/// Skeleton never melees ([`MobKind::attack_profile`] is `None` for it) and a
+/// Zombie never shoots ([`MobKind::ranged_profile`] is `None` for it).
 pub fn step_hostile(
     mob: &mut Mob,
     target: Option<MobTarget>,
     world: &impl MobWorld,
     roll: u32,
-) -> Option<MobAttack> {
+) -> Option<MobAction> {
     if !mob.kind.is_hostile() || mob.health == 0 || !mob.position.is_finite() {
         return None;
     }
@@ -196,18 +243,83 @@ pub fn step_hostile(
         mob.yaw = dx.atan2(dz);
     }
 
+    // The mob now faces the target, so `forward` is exactly the direction it
+    // would close in. A retreat is the same direction negated, which is what
+    // keeps both motions on one mover.
+    let forward = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos());
+
+    if let Some(profile) = mob.kind.ranged_profile() {
+        // Stand-off brain (S08). The melee block below is deliberately
+        // unreachable for this kind: a ranged kind's `attack_profile()` is
+        // `None`, and this arm returns before the shared mover.
+        if horizontal >= profile.min_range && horizontal <= profile.fire_range {
+            // In the band: stand still and shoot when the shot is legal.
+            // Standing is deliberate, so it must never accumulate the stuck
+            // timer that a refused step would.
+            mob.velocity = Vec3::ZERO;
+            mob.stuck = 0.0;
+            mob.stuck_anchor = mob.position;
+
+            let eye_cell = IVec3::new(
+                eye.x.floor() as i32,
+                eye.y.floor() as i32,
+                eye.z.floor() as i32,
+            );
+            let eye_open = !world.block(eye_cell.x, eye_cell.y, eye_cell.z).is_solid();
+            if mob.cooldown <= MOB_FIRE_COOLDOWN_EPS
+                && visible
+                && vertical.abs() <= MOB_FIRE_VERTICAL
+                && eye_open
+            {
+                // Gravity-compensated aim: lead the player's eye upward by the
+                // drop the arrow will accumulate over its horizontal flight
+                // time (`t = horizontal / speed`). The shot therefore arcs and
+                // lands on the eye instead of short at long range.
+                let flight = horizontal / ARROW_SPEED_SKELETON;
+                let aim = target.eye + Vec3::Y * (0.5 * ARROW_GRAVITY * flight * flight);
+                mob.cooldown = profile.cooldown_secs;
+                return Some(MobAction::Shot(MobShot {
+                    kind: mob.kind,
+                    origin: eye,
+                    dir: aim - eye,
+                }));
+            }
+
+            return None;
+        }
+
+        if horizontal > profile.fire_range {
+            move_in(mob, world, forward);
+        } else {
+            // Closer than `min_range`: back away with the same one-block
+            // step-up/down, cliff guard, support and stuck rules.
+            move_in(mob, world, -forward);
+        }
+
+        if mob.stuck >= MOB_STUCK_TIMEOUT_SECS {
+            mob.state = MobAiState::Idle;
+            mob.velocity = Vec3::ZERO;
+            mob.aggro = 0.0;
+            mob.reaggro = MOB_STUCK_REAGGRO_SECS;
+            mob.stuck = 0.0;
+            mob.stuck_anchor = mob.position;
+        }
+
+        return None;
+    }
+
     if let Some(profile) = mob.kind.attack_profile() {
         if horizontal <= profile.range && vertical.abs() <= 2.0 && visible && mob.cooldown <= 0.0 {
             mob.cooldown = profile.cooldown_secs;
             mob.velocity = Vec3::ZERO;
-            return Some(MobAttack {
+            return Some(MobAction::Melee(MobAttack {
                 kind: mob.kind,
                 from: mob.position,
-            });
+            }));
         }
     }
 
-    move_toward(mob, world);
+    move_in(mob, world, forward);
 
     if mob.stuck >= MOB_STUCK_TIMEOUT_SECS {
         mob.state = MobAiState::Idle;
@@ -221,26 +333,36 @@ pub fn step_hostile(
     None
 }
 
-/// The shared step-up/down/cliff mover. Updates `position`, `velocity`,
-/// `walk_phase`, and the stuck timer; never changes yaw or state.
-fn move_toward(mob: &mut Mob, world: &impl MobWorld) {
+/// The shared step-up/down/cliff mover, in any horizontal direction.
+///
+/// Updates `position`, `velocity`, `walk_phase`, and the stuck timer; never
+/// changes yaw or state. Closing passes the facing vector and retreating passes
+/// its negation, so both motions share the one-block step-up, one-block drop,
+/// cliff guard, footprint support and stuck rules. `dir` must be a finite
+/// horizontal direction (the callers pass the unit yaw vector or its
+/// negation); a degenerate or non-finite direction refuses the step.
+fn move_in(mob: &mut Mob, world: &impl MobWorld, dir: Vec3) {
+    let dir = Vec3::new(dir.x, 0.0, dir.z);
+    if !dir.is_finite() || dir.length_squared() < 1e-12 {
+        refuse(mob);
+        return;
+    }
     let speed = mob.kind.walk_speed();
-    let forward = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos());
-    let candidate = mob.position + forward * speed * crate::world::mob::MOB_TICK_SECS;
+    let candidate = mob.position + dir * speed * crate::world::mob::MOB_TICK_SECS;
 
     // Flat continuation: the candidate box must be clear and the destination
     // footprint must still have ground under it.
     if mob_box_clear(mob, candidate, world) {
         let support = support_level(candidate);
         if footprint_supported(mob, candidate, support, world) {
-            commit_move(mob, candidate, forward, speed);
+            commit_move(mob, candidate, dir, speed);
             return;
         }
         // One-block step down, but never a larger drop (cliff guard).
         if MOB_CLIFF_DROP_BLOCKS >= 1 && footprint_supported(mob, candidate, support - 1, world) {
             let lowered = candidate - Vec3::Y * MOB_CLIFF_DROP_BLOCKS as f32;
             if mob_box_clear(mob, lowered, world) {
-                commit_move(mob, lowered, forward, speed);
+                commit_move(mob, lowered, dir, speed);
                 return;
             }
         }
@@ -254,7 +376,7 @@ fn move_toward(mob: &mut Mob, world: &impl MobWorld) {
     if mob_box_clear(mob, raised, world)
         && footprint_supported(mob, raised, support_level(raised), world)
     {
-        commit_move(mob, raised, forward, speed);
+        commit_move(mob, raised, dir, speed);
         return;
     }
 
@@ -262,9 +384,9 @@ fn move_toward(mob: &mut Mob, world: &impl MobWorld) {
     refuse(mob);
 }
 
-fn commit_move(mob: &mut Mob, position: Vec3, forward: Vec3, speed: f32) {
+fn commit_move(mob: &mut Mob, position: Vec3, dir: Vec3, speed: f32) {
     mob.position = position;
-    mob.velocity = forward * speed;
+    mob.velocity = dir * speed;
     mob.walk_phase += speed * crate::world::mob::MOB_TICK_SECS * 4.0;
 }
 
@@ -310,8 +432,8 @@ fn footprint_supported(mob: &Mob, feet: Vec3, level: i32, world: &impl MobWorld)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::arrow::Arrow;
     use crate::world::mob::{MobRuntime, MOB_TICK_SECS};
-    use glam::IVec3;
     use std::collections::HashMap;
 
     /// Synthetic block grid: absent cells are air.
@@ -643,8 +765,10 @@ mod tests {
         let world = floor_world();
         let in_range = target(0.5, 5.0, 1.5);
         let mut zombie = Mob::new(MobKind::Zombie, Vec3::new(0.5, 5.0, 0.5), 0.0);
-        let attack = step_hostile(&mut zombie, Some(in_range), &world, 0)
-            .expect("an in-range zombie lands one attack");
+        let Some(MobAction::Melee(attack)) = step_hostile(&mut zombie, Some(in_range), &world, 0)
+        else {
+            panic!("an in-range zombie lands one melee attack");
+        };
         assert_eq!(attack.kind, MobKind::Zombie);
         assert_eq!(attack.from, zombie.position);
         assert_eq!(
@@ -667,12 +791,15 @@ mod tests {
             "the cooldown must gate the next swing"
         );
 
-        // Same geometry, Skeleton: shared steering may chase but never melee.
+        // Same geometry, Skeleton: no melee ever. Because 1.0 block is inside
+        // its 5.0-block stand-off floor, the shared brain makes it back away
+        // (S08) instead of swinging.
         let mut skeleton = Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0);
         assert_eq!(step_hostile(&mut skeleton, Some(in_range), &world, 0), None);
         assert_eq!(skeleton.cooldown, 0.0);
         assert_eq!(skeleton.state, MobAiState::Chase);
         assert_eq!(MobKind::Skeleton.attack_profile(), None);
+        assert!(MobKind::Skeleton.ranged_profile().is_some());
 
         // Out of melee range: no attack.
         let mut far = Mob::new(MobKind::Zombie, Vec3::new(0.5, 5.0, 0.5), 0.0);
@@ -777,5 +904,221 @@ mod tests {
         }
         assert_eq!(runtime.tick_index(), 10);
         assert_eq!(mobs[0].state, MobAiState::Wander);
+    }
+
+    // -----------------------------------------------------------------
+    // S08: the skeleton stand-off ranged brain
+    // -----------------------------------------------------------------
+
+    /// Builds a skeleton shot at `distance` blocks horizontally by running the
+    /// real decision layer, never by re-evaluating the aim formula.
+    fn shot_at(world: &FakeWorld, distance: f32, target_feet_y: f32) -> (MobShot, MobTarget) {
+        let target = target(0.5, target_feet_y, 0.5 + distance);
+        let mut mob = Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        for _ in 0..4 {
+            match step_hostile(&mut mob, Some(target), world, 0) {
+                Some(MobAction::Shot(shot)) => return (shot, target),
+                Some(MobAction::Melee(_)) => panic!("a skeleton must never melee"),
+                None => {}
+            }
+        }
+        panic!("a skeleton in its fire band must fire within four steps");
+    }
+
+    /// Flies the shot through the real [`Arrow`] with the session's substep
+    /// rule and reports whether it passes inside the target AABB
+    /// (`± 0.35` on x/z, `feet..feet + 1.8` on y).
+    fn shot_passes_through_target(shot: &MobShot, target: MobTarget) -> bool {
+        let mut arrow =
+            Arrow::skeleton(shot.origin, shot.dir).expect("the shot must build an arrow");
+        let frame = 0.05f32;
+        for _ in 0..200 {
+            let substeps = arrow.substeps(frame);
+            let sub_dt = frame / substeps as f32;
+            for _ in 0..substeps {
+                arrow.advance(sub_dt);
+                let p = arrow.position;
+                if (p.x - target.feet.x).abs() <= 0.35
+                    && (p.z - target.feet.z).abs() <= 0.35
+                    && p.y >= target.feet.y
+                    && p.y <= target.feet.y + 1.8
+                {
+                    return true;
+                }
+            }
+            if arrow.finished() || arrow.position.z > target.feet.z + 1.0 {
+                break;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn skeleton_shots_arc_through_the_target_at_six_eight_and_twelve_blocks() {
+        let world = floor_world();
+        for distance in [6.0f32, 8.0, 12.0] {
+            let (shot, target) = shot_at(&world, distance, 5.0);
+            assert_eq!(shot.kind, MobKind::Skeleton);
+            assert_eq!(
+                shot.origin,
+                Vec3::new(0.5, 5.0 + MobKind::Skeleton.height() * 0.85, 0.5),
+                "the arrow must leave from the same eye rule line of sight uses"
+            );
+            assert!(
+                shot.dir.y > 0.0,
+                "the aim must point above the straight line at {distance} blocks"
+            );
+            assert!(
+                shot_passes_through_target(&shot, target),
+                "the simulated arrow must pass through the target AABB at {distance} blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn skeleton_shots_arc_through_the_target_uphill_and_downhill() {
+        let world = floor_world();
+
+        // Target feet one block above the skeleton's feet.
+        let (up, up_target) = shot_at(&world, 8.0, 6.0);
+        assert!(
+            shot_passes_through_target(&up, up_target),
+            "an uphill shot must still land in the target AABB"
+        );
+
+        // Target feet one block below the skeleton's feet.
+        let (down, down_target) = shot_at(&world, 8.0, 4.0);
+        assert!(
+            shot_passes_through_target(&down, down_target),
+            "a downhill shot must still land in the target AABB"
+        );
+        assert!(
+            down.dir.y < up.dir.y,
+            "the downhill aim must point lower than the uphill aim"
+        );
+    }
+
+    #[test]
+    fn skeleton_under_min_range_retreats_without_firing() {
+        let world = floor_world();
+        let min_range = MobKind::Skeleton
+            .ranged_profile()
+            .expect("skeleton bow")
+            .min_range;
+        let mut mob = Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        let target = target(0.5, 5.0, 4.5);
+        let mut previous = horizontal(mob.position, target.feet);
+        assert!(
+            previous < min_range,
+            "the fixture must start inside the floor"
+        );
+
+        for _ in 0..10 {
+            assert_eq!(
+                step_hostile(&mut mob, Some(target), &world, 0),
+                None,
+                "inside min_range the skeleton retreats, never fires"
+            );
+            let current = horizontal(mob.position, target.feet);
+            assert!(
+                current > previous,
+                "retreat must grow the distance: {current} !> {previous}"
+            );
+            previous = current;
+        }
+        assert_eq!(mob.cooldown, 0.0, "a retreat never arms the shot cooldown");
+        assert_eq!(mob.state, MobAiState::Chase);
+        assert!(
+            (mob.velocity.z + MobKind::Skeleton.walk_speed()).abs() < 1e-4,
+            "the retreat must move away from the target at walk speed, got {}",
+            mob.velocity
+        );
+    }
+
+    #[test]
+    fn a_wall_between_skeleton_and_target_suppresses_the_shot() {
+        let target = target(0.5, 5.0, 8.5);
+
+        // Control: the same chasing skeleton with a clear ray fires at once.
+        let open_world = floor_world();
+        let mut clear = chasing_mob(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5));
+        assert!(
+            matches!(
+                step_hostile(&mut clear, Some(target), &open_world, 0),
+                Some(MobAction::Shot(_))
+            ),
+            "control: an unobstructed skeleton in its band fires"
+        );
+
+        // Wall the eye ray half-way: no shot, and the skeleton holds still.
+        let mut world = floor_world();
+        world.set(0, 6, 4, BlockId::Stone);
+        let mut mob = chasing_mob(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5));
+        let held = mob.position;
+        for _ in 0..4 {
+            assert_eq!(step_hostile(&mut mob, Some(target), &world, 0), None);
+        }
+        assert_eq!(
+            mob.position, held,
+            "a suppressed shot must not make the skeleton wander"
+        );
+        assert_eq!(mob.cooldown, 0.0, "a suppressed shot arms no cooldown");
+        assert!(
+            mob.aggro > 0.0,
+            "the wall must suppress the shot, not aggro"
+        );
+    }
+
+    #[test]
+    fn a_solid_eye_cell_suppresses_the_shot() {
+        // Control: the same geometry with an open eye cell fires.
+        let world = floor_world();
+        let target = target(0.5, 5.0, 8.5);
+        let mut clear = Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        assert!(
+            matches!(
+                step_hostile(&mut clear, Some(target), &world, 0),
+                Some(MobAction::Shot(_))
+            ),
+            "control: an open eye cell fires"
+        );
+
+        // A solid block in the skeleton's own eye cell suppresses the shot.
+        // The ray also fails from inside that cell, but the explicit eye-cell
+        // guard is what keeps the rule a property of the decision layer, so the
+        // observable result is pinned here: no shot, no cooldown armed.
+        let mut blocked_world = floor_world();
+        blocked_world.set(0, 6, 0, BlockId::Stone);
+        let mut mob = chasing_mob(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5));
+        for _ in 0..4 {
+            assert_eq!(
+                step_hostile(&mut mob, Some(target), &blocked_world, 0),
+                None
+            );
+        }
+        assert_eq!(mob.cooldown, 0.0, "a blocked eye cell never arms a shot");
+        assert_eq!(mob.velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn a_skeleton_closes_from_beyond_fire_range_before_it_shoots() {
+        let world = floor_world();
+        let mut mob = Mob::new(MobKind::Skeleton, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        let target = target(0.5, 5.0, 15.5); // 15 blocks: inside aggro, outside fire
+        let start = horizontal(mob.position, target.feet);
+        let mut closed = None;
+        for _ in 0..60 {
+            if let Some(MobAction::Shot(shot)) = step_hostile(&mut mob, Some(target), &world, 0) {
+                closed = Some(horizontal(mob.position, target.feet));
+                assert_eq!(shot.kind, MobKind::Skeleton);
+                break;
+            }
+        }
+        let fired_at = closed.expect("a closing skeleton must eventually reach its band");
+        assert!(fired_at < start, "it must close distance before firing");
+        assert!(
+            fired_at <= 12.0 + 1e-3,
+            "the first shot must come from inside fire_range, got {fired_at}"
+        );
     }
 }

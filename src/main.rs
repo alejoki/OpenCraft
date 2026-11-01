@@ -15,7 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::bow::{BowState, BowTarget};
+use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
@@ -70,6 +70,7 @@ use opencraft::ui::{
     LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
+use opencraft::world::arrow::ArrowState;
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
@@ -4036,20 +4037,21 @@ const COMBAT_PINNED_HEALTH: [u16; 4] = [4, 7, 11, 14];
 const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 
 /// Measured byte length of the fresh `--demo-combat` save (seed 12345), after
-/// the Drops stage earns the wood sword plus the pig/cow drops and the Save
-/// stage writes the two surviving hostile records.
+/// the Drops stage earns the wood sword plus the pig/cow drops and the Shot
+/// stage earns the wood bow and its arrows, and the Save stage writes the two
+/// surviving hostile records.
 ///
 /// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v7_save`)
 /// and reading the file back, never computed by hand: every earned stack changes
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 204;
+const COMBAT_SAVE_BYTES: usize = 211;
 /// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
-/// record starts at 166 and the Skeleton record at 185, so the tail ends at
-/// [`COMBAT_SAVE_BYTES`].
+/// record starts 4 bytes later and the Skeleton record follows it, so the tail
+/// ends at [`COMBAT_SAVE_BYTES`].
 #[cfg(test)]
-const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 162;
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 169;
 
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
@@ -4070,13 +4072,19 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 162;
 /// closes the ambient gate so the pinned quartet stages below are never
 /// perturbed.
 ///
-/// The Hostile stage (M009/S06-T06) sits between Drops and Save: it proves the
+/// The Hostile stage (M009/S06-T06) sits between Drops and Shot: it proves the
 /// hostile steering brain and the zombie melee seam on the two surviving
 /// records (line-of-sight aggro, a chase, 3-damage hits with knockback, a
 /// mob-caused death, and a respawn that keeps the inventory), then restores the
-/// pinned player pose and closes the hostile gate so the Save witness and the
-/// 204-byte v7 layout never move. Full order: `Settle -> Ambient -> Spawn ->
-/// Walk -> Fight -> Drops -> Hostile -> Save -> Restore -> Done`.
+/// pinned player pose and closes the hostile gate so the Shot proof and the
+/// Save witness start from a known state.
+///
+/// The Shot stage (M009/S07-T06) sits between Hostile and Save: it proves the
+/// bow charge/cancel curve through [`BowState`], the `fire_bow` ammo/wear seam,
+/// a full-charge arrow hitting a body with knockback, and a straight-down shot
+/// embedding then expiring. It earns the real wood bow and arrows the save
+/// witness now carries. Full order: `Settle -> Ambient -> Spawn -> Walk ->
+/// Fight -> Drops -> Hostile -> Shot -> Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
@@ -4086,6 +4094,7 @@ enum CombatStage {
     Fight,
     Drops,
     Hostile,
+    Shot,
     Save,
     Restore,
     Done,
@@ -4198,6 +4207,34 @@ struct CombatDemo {
     /// The latched `combat_hostile:` line, printed immediately after the
     /// pinned `combat_spawn:` line on the demo-shutdown path.
     hostile_digest: Option<String>,
+    /// Whether the Shot stage reached a full draw before releasing (`true` on
+    /// success).
+    shot_charged: bool,
+    /// Whether a sub-threshold release canceled with no ammo or wear (`true`).
+    shot_canceled: bool,
+    /// Fully charged shots the Shot stage fired through
+    /// [`WorldSession::fire_bow`] (`1` on success: the embed probe below is
+    /// proven by `embed`/`expired` instead).
+    shot_fired: u32,
+    /// Mob hits the charged shot's first tick reported (`1`).
+    shot_mob_hits: u32,
+    /// Damage that arrow applied to the Zombie (`4` at full charge).
+    shot_damage: u16,
+    /// Whether the mob hit left a knockback impulse pointing away from the
+    /// shooter.
+    shot_knockback: bool,
+    /// Whether the straight-down shot was observed embedded after a block hit.
+    shot_embed: bool,
+    /// Whether the embedded arrow later expired and left the list.
+    shot_expired: bool,
+    /// Arrow units after both shots (`2`: four granted minus two fired).
+    shot_ammo: u32,
+    /// Bow durability after both shots (`Some(57)`: 59 minus one wear per
+    /// shot).
+    shot_bow: Option<u16>,
+    /// The latched `combat_shot:` line, printed immediately after the
+    /// `combat_hostile:` line on the demo-shutdown path.
+    shot_digest: Option<String>,
 }
 
 impl CombatDemo {
@@ -4242,6 +4279,17 @@ impl CombatDemo {
             hostile_inventory_kept: false,
             hostile_knockback: false,
             hostile_digest: None,
+            shot_charged: false,
+            shot_canceled: false,
+            shot_fired: 0,
+            shot_mob_hits: 0,
+            shot_damage: 0,
+            shot_knockback: false,
+            shot_embed: false,
+            shot_expired: false,
+            shot_ammo: 0,
+            shot_bow: None,
+            shot_digest: None,
         }
     }
 
@@ -4292,6 +4340,31 @@ impl CombatDemo {
         format!(
             "combat_hostile: seed={} attacks={} damage={} cause=zombie respawn=spawn knockback=true inventory=kept ok=true",
             self.seed, self.hostile_attacks, self.hostile_damage
+        )
+    }
+
+    /// The exact `combat_shot:` digest printed once on the demo-shutdown path
+    /// (immediately after the `combat_hostile:` line).
+    ///
+    /// Only latched after the Shot stage proved the sub-threshold cancel, the
+    /// full draw, the fired arrow, the mob hit with away knockback, and the
+    /// block embed that expired, so the trailing literal `ok=true` is the
+    /// latching contract. `fired` counts the fully charged shot; the
+    /// straight-down embed probe is reported by `embed`/`expired`.
+    fn shot_digest(&self) -> String {
+        format!(
+            "combat_shot: seed={} charged={} canceled={} fired={} mob_hits={} damage={} knockback={} embed={} expired={} ammo={} bow={} ok=true",
+            self.seed,
+            self.shot_charged,
+            self.shot_canceled,
+            self.shot_fired,
+            self.shot_mob_hits,
+            self.shot_damage,
+            self.shot_knockback,
+            self.shot_embed,
+            self.shot_expired,
+            self.shot_ammo,
+            self.shot_bow.unwrap_or(0)
         )
     }
 
@@ -4477,6 +4550,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
         CombatStage::Fight => combat_fight_stage(demo, session),
         CombatStage::Drops => combat_drops_stage(demo, session),
         CombatStage::Hostile => combat_hostile_stage(demo, session),
+        CombatStage::Shot => combat_shot_stage(demo, session),
         CombatStage::Save => combat_save_stage(demo, session),
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
@@ -5525,8 +5599,9 @@ fn combat_hostile_spot_ok(session: &WorldSession, feet: Vec3, eye: Vec3) -> bool
 /// * the live Zombie is re-pinned at a chosen spot next to the player (the
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
-/// * the player pose is restored afterwards, so the Save witness and the
-///   pinned 204-byte v7 layout do not move.
+/// * the player pose is restored afterwards, so the Shot stage and the Save
+///   witness start from the same pinned pose (the v7 layout itself is measured
+///   by the fresh-leg test, never by this stage).
 ///
 /// The Skeleton is left where Drops left it: it is hostile and will chase, but
 /// it has no attack profile, so it can never add a damage event.
@@ -5700,6 +5775,363 @@ fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
     demo.hostile_respawn = true;
     demo.hostile_inventory_kept = true;
     demo.hostile_digest = Some(demo.hostile_digest());
+    demo.stage = CombatStage::Shot;
+    false
+}
+
+/// The Shot stage: the real-binary proof that a bow charge fires through the
+/// shipped ammo/wear seam and that the projectile resolves against both a body
+/// and a block.
+///
+/// Runs entirely in ONE call, like Fight/Drops/Hostile: every number here is
+/// observable, and a redraw between two partial phases could let the mob
+/// runtime move a record the next check describes. The draw curve is driven by
+/// the same pure [`BowState`] the input path owns, and the only host mutations
+/// go through [`WorldSession::fire_bow`] and [`WorldSession::tick_arrows`] —
+/// the exact seams the Playing frame calls — so the stage proves the shipped
+/// path instead of a parallel copy.
+///
+/// Two documented demo pins, not gameplay rules:
+///
+/// * a real wood bow and four real arrows are granted through
+///   [`opencraft::player::physics::Player::collect_items`] (the demo has no
+///   crafting step of its own, and the save witness must carry the earned
+///   bow);
+/// * the Zombie is re-pinned two blocks along the yaw forward axis at the
+///   player's feet height (the Fight stage's pig pin) with every combat timer
+///   cleared, and the Skeleton is parked 20 blocks behind the camera so the
+///   shot ray is unambiguous. [`combat_save_stage`] re-pins both survivors
+///   afterwards, so nothing here can leak into the witness.
+///
+/// Every mismatch latches `stage=shot` with the named observed fact and ends
+/// the run non-zero, so a partial proof can never be mistaken for a pass.
+fn combat_shot_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "shot",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("shot", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "shot",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+
+    // Grant the real bow and arrows through the production pickup seam.
+    let bow_id = ItemId::Tool {
+        kind: ToolKind::Bow,
+        tier: ToolTier::Wood,
+    };
+    let arrow_id = ItemId::Material(Material::Arrow);
+    let (Ok(bow), Ok(arrows)) = (Item::new(bow_id, 1), Item::new(arrow_id, 4)) else {
+        demo.abort("shot", "observed=item");
+        return true;
+    };
+    let grant = session.player.collect_items(&[bow, arrows]);
+    if grant.lost != 0 {
+        demo.abort("shot", &format!("grant_lost={}", grant.lost));
+        return true;
+    }
+    let ammo_before = combat_inventory_units(session, arrow_id);
+    if ammo_before != 4 {
+        demo.abort("shot", &format!("ammo={ammo_before}"));
+        return true;
+    }
+    let Some(bow_slot) = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .position(|slot| slot.as_ref().map(|item| item.id()) == Some(bow_id))
+    else {
+        demo.abort("shot", "observed=bow_slot");
+        return true;
+    };
+    if !session.player.select_slot(bow_slot)
+        || session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+    {
+        demo.abort("shot", &format!("held=slot{bow_slot}"));
+        return true;
+    }
+    let bow_before = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if bow_before != Some(ToolTier::Wood.max_durability()) {
+        demo.abort("shot", &format!("bow={bow_before:?}"));
+        return true;
+    }
+
+    // Demo pose pin: the Zombie two blocks forward at the player's feet height,
+    // the Skeleton far behind the camera. Both records start at full health with
+    // every combat timer cleared.
+    let player_position = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+    let zombie_feet = Vec3::new(
+        player_position.x + forward.x * 2.0,
+        player_position.y,
+        player_position.z + forward.z * 2.0,
+    );
+    {
+        let mobs = session.mobs_mut();
+        let Some(zombie) = mobs.iter_mut().find(|mob| mob.kind == MobKind::Zombie) else {
+            demo.abort("shot", "observed=zombie_missing");
+            return true;
+        };
+        zombie.position = zombie_feet;
+        zombie.home = zombie_feet;
+        zombie.health = MobKind::Zombie.max_health();
+        zombie.state = MobAiState::Wander;
+        zombie.velocity = Vec3::ZERO;
+        zombie.knockback = Vec3::ZERO;
+        zombie.hurt = 0.0;
+        zombie.hurt_iframe = 0.0;
+        zombie.cooldown = 0.0;
+        zombie.flee = 0.0;
+        zombie.death = 0.0;
+        zombie.aggro = 0.0;
+        zombie.stuck = 0.0;
+        zombie.reaggro = 0.0;
+        let Some(skeleton) = mobs.iter_mut().find(|mob| mob.kind == MobKind::Skeleton) else {
+            demo.abort("shot", "observed=skeleton_missing");
+            return true;
+        };
+        skeleton.position = player_position - forward * 20.0;
+        skeleton.home = skeleton.position;
+        skeleton.health = MobKind::Skeleton.max_health();
+        skeleton.state = MobAiState::Wander;
+        skeleton.velocity = Vec3::ZERO;
+        skeleton.knockback = Vec3::ZERO;
+        skeleton.hurt = 0.0;
+        skeleton.hurt_iframe = 0.0;
+        skeleton.cooldown = 0.0;
+        skeleton.flee = 0.0;
+        skeleton.death = 0.0;
+        skeleton.aggro = 0.0;
+        skeleton.stuck = 0.0;
+        skeleton.reaggro = 0.0;
+    }
+    session.sync_camera();
+
+    let Some(target) = session
+        .player
+        .selected_item()
+        .and_then(|item| BowTarget::new(bow_slot, item))
+    else {
+        demo.abort("shot", "observed=bow_target");
+        return true;
+    };
+
+    // 1. Sub-threshold release: a 0.1 s draw is below the 0.2 s minimum, so the
+    //    release cancels and nothing is spent.
+    let mut bow = BowState::new();
+    let partial = bow.tick(0.1, Some(target));
+    if partial != (BowTick::Charging { progress: 0.1 }) {
+        demo.abort("shot", &format!("partial={partial:?}"));
+        return true;
+    }
+    if bow.release().is_some() {
+        demo.abort("shot", "observed=cancel_fired");
+        return true;
+    }
+    let ammo_after_cancel = combat_inventory_units(session, arrow_id);
+    let bow_after_cancel = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if !session.arrows().is_empty()
+        || ammo_after_cancel != ammo_before
+        || bow_after_cancel != bow_before
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "cancel arrows={} ammo={ammo_after_cancel} bow={bow_after_cancel:?}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 2. Full draw at ten 0.1 s ticks, then one real shot.
+    let mut last = BowTick::Idle;
+    for _ in 0..10 {
+        last = bow.tick(0.1, Some(target));
+    }
+    if last != BowTick::Full {
+        demo.abort("shot", &format!("charge={last:?}"));
+        return true;
+    }
+    let Some(charge) = bow.release() else {
+        demo.abort("shot", "observed=release");
+        return true;
+    };
+    if (charge - 1.0).abs() > 1e-6 {
+        demo.abort("shot", &format!("charge={charge}"));
+        return true;
+    }
+    let origin = session.camera.position;
+    let centre = zombie_feet + Vec3::Y * (MobKind::Zombie.height() * 0.5);
+    let dir = (centre - origin).normalize_or_zero();
+    let fired = match session.fire_bow(origin, dir, charge) {
+        Ok(arrow) => arrow,
+        Err(error) => {
+            demo.abort("shot", &format!("fire={error:?}"));
+            return true;
+        }
+    };
+    let speed = fired.velocity.length();
+    if fired.damage != 4 || (speed - 32.0).abs() > 1e-3 {
+        demo.abort(
+            "shot",
+            &format!("arrow damage={} speed={speed}", fired.damage),
+        );
+        return true;
+    }
+    let ammo_after_first = combat_inventory_units(session, arrow_id);
+    let bow_after_first = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if session.arrows().len() != 1
+        || ammo_after_first != 3
+        || bow_after_first != Some(ToolTier::Wood.max_durability() - 1)
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "first arrows={} ammo={ammo_after_first} bow={bow_after_first:?}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 3. One 0.1 s tick: the arrow reaches the Zombie, damages it, knocks it
+    //    away from the shooter, and is spent.
+    let hit_tick = session.tick_arrows(0.1, 1.0);
+    let Some(zombie) = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.kind == MobKind::Zombie)
+    else {
+        demo.abort("shot", "observed=zombie_missing");
+        return true;
+    };
+    let expected_health = MobKind::Zombie.max_health() - fired.damage;
+    let away = Vec3::new(
+        zombie.position.x - origin.x,
+        0.0,
+        zombie.position.z - origin.z,
+    );
+    if hit_tick.mob_hits != 1
+        || !session.arrows().is_empty()
+        || zombie.health != expected_health
+        || zombie.hurt <= 0.0
+        || zombie.knockback.length_squared() <= 1e-6
+        || zombie.knockback.dot(away) <= 0.0
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "hit hits={} arrows={} health={} hurt={} knockback={}",
+                hit_tick.mob_hits,
+                session.arrows().len(),
+                zombie.health,
+                zombie.hurt,
+                zombie.knockback.length_squared() > 1e-6
+            ),
+        );
+        return true;
+    }
+    let damage = fired.damage;
+
+    // 4. A straight-down shot embeds in the ground and expires ~2 s later. The
+    //    loop is bounded so a broken block test fails instead of hanging, and
+    //    it requires both halves: an observed Embedded arrow after a block hit,
+    //    and an empty list with a counted expiry.
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+        && (!session.player.select_slot(bow_slot)
+            || session.player.selected_item().map(|item| item.id()) != Some(bow_id))
+    {
+        demo.abort("shot", "observed=bow_reselect");
+        return true;
+    }
+    if let Err(error) = session.fire_bow(session.camera.position, -Vec3::Y, 1.0) {
+        demo.abort("shot", &format!("embed_fire={error:?}"));
+        return true;
+    }
+    let mut embed_seen = false;
+    let mut expired = 0u32;
+    let mut emptied = false;
+    for _ in 0..60 {
+        let tick = session.tick_arrows(0.1, 1.0);
+        if tick.block_hits >= 1
+            && session
+                .arrows()
+                .iter()
+                .any(|arrow| arrow.state == ArrowState::Embedded)
+        {
+            embed_seen = true;
+        }
+        expired = expired.saturating_add(tick.expired);
+        if session.arrows().is_empty() {
+            emptied = true;
+            break;
+        }
+    }
+    if !embed_seen || !emptied || expired == 0 {
+        demo.abort(
+            "shot",
+            &format!(
+                "embed seen={embed_seen} emptied={emptied} expired={expired} arrows={}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    let ammo_after = combat_inventory_units(session, arrow_id);
+    let bow_after = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if ammo_after != 2 || bow_after != Some(ToolTier::Wood.max_durability() - 2) {
+        demo.abort("shot", &format!("ammo={ammo_after} bow={bow_after:?}"));
+        return true;
+    }
+
+    demo.shot_charged = true;
+    demo.shot_canceled = true;
+    demo.shot_fired = 1;
+    demo.shot_mob_hits = hit_tick.mob_hits;
+    demo.shot_damage = damage;
+    demo.shot_knockback = true;
+    demo.shot_embed = true;
+    demo.shot_expired = true;
+    demo.shot_ammo = ammo_after;
+    demo.shot_bow = bow_after;
+    demo.shot_digest = Some(demo.shot_digest());
     demo.stage = CombatStage::Save;
     false
 }
@@ -5862,11 +6294,15 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
     }
 
     // The earned inventory is part of the witness: the wood sword the player
-    // crafted (a full 59 durability), one raw porkchop, one raw beef, and the
-    // pair's three leather units — exactly four non-empty stacks, scanned
-    // order-independently across all 36 slots.
+    // crafted (a full 59 durability), the wood bow the Shot stage earned and
+    // wore twice (57 durability), the two arrows left from the granted four,
+    // one raw porkchop, one raw beef, and the pair's three leather units —
+    // exactly six non-empty stacks, scanned order-independently across all 36
+    // slots.
     let mut stacks = 0u32;
     let mut sword_durability: Option<Option<u16>> = None;
+    let mut bow_durability: Option<Option<u16>> = None;
+    let mut arrows = 0u32;
     let mut porkchop = 0u32;
     let mut beef = 0u32;
     let mut leather = 0u32;
@@ -5889,6 +6325,17 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
                 }
                 sword_durability = Some(item.durability());
             }
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            } => {
+                if bow_durability.is_some() {
+                    demo.abort("restore", "items=duplicate_bow");
+                    return true;
+                }
+                bow_durability = Some(item.durability());
+            }
+            ItemId::Material(Material::Arrow) => arrows += u32::from(item.count()),
             ItemId::Material(Material::RawPorkchop) => porkchop += u32::from(item.count()),
             ItemId::Material(Material::RawBeef) => beef += u32::from(item.count()),
             ItemId::Material(Material::Leather) => leather += u32::from(item.count()),
@@ -5898,7 +6345,7 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
             }
         }
     }
-    if stacks != 4 {
+    if stacks != 6 {
         demo.abort("restore", &format!("items={stacks}"));
         return true;
     }
@@ -5906,10 +6353,16 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
         demo.abort("restore", &format!("items=sword={sword_durability:?}"));
         return true;
     }
-    if porkchop != 1 || beef != 1 || leather != 3 {
+    // Two shots wear the bow by exactly one point each (MEM392 ordering).
+    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(2);
+    if bow_durability != Some(Some(worn_bow)) {
+        demo.abort("restore", &format!("items=bow={bow_durability:?}"));
+        return true;
+    }
+    if arrows != 2 || porkchop != 1 || beef != 1 || leather != 3 {
         demo.abort(
             "restore",
-            &format!("items=porkchop={porkchop} beef={beef} leather={leather}"),
+            &format!("items=arrows={arrows} porkchop={porkchop} beef={beef} leather={leather}"),
         );
         return true;
     }
@@ -9596,11 +10049,22 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // 204-byte v7 witness keep their exact bytes.
+            // measured 211-byte v7 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
                 .and_then(|demo| demo.hostile_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Shot stage's digest follows the Hostile line for the same
+            // reason: the pinned `combat_demo:` / `combat_spawn:` /
+            // `combat_hostile:` lines and the v7 witness keep their exact
+            // bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.shot_digest.as_deref())
             {
                 let _ = writeln!(stdout, "{line}");
             }
@@ -11894,6 +12358,28 @@ mod tests {
         );
     }
 
+    /// The Shot digest is pinned byte for byte: the four proven facts plus the
+    /// measured ammo (four granted minus two fired) and the bow's worn
+    /// durability (59 minus one per shot).
+    #[test]
+    fn combat_shot_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.shot_charged = true;
+        demo.shot_canceled = true;
+        demo.shot_fired = 1;
+        demo.shot_mob_hits = 1;
+        demo.shot_damage = 4;
+        demo.shot_knockback = true;
+        demo.shot_embed = true;
+        demo.shot_expired = true;
+        demo.shot_ammo = 2;
+        demo.shot_bow = Some(57);
+        assert_eq!(
+            demo.shot_digest(),
+            "combat_shot: seed=1 charged=true canceled=true fired=1 mob_hits=1 damage=4 knockback=true embed=true expired=true ammo=2 bow=57 ok=true"
+        );
+    }
+
     /// The Ambient stage proved against a lit synthetic world: a pinned midnight
     /// clock spawns surface hostiles through the production `tick_mobs` seam but
     /// never inside the safe radius, a record moved past the despawn radius is
@@ -12072,7 +12558,11 @@ mod tests {
         }
         assert!(calls < 200, "the hostile stage must finish in one call");
         assert!(!demo.failed, "unexpected hostile abort: {:?}", demo.digest);
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(
+            demo.stage,
+            CombatStage::Shot,
+            "the hostile stage hands over to the shot proof"
+        );
         assert_eq!(demo.hostile_attacks, 7);
         assert_eq!(demo.hostile_damage, 20);
         assert!(demo.hostile_cause, "the death must be tagged Zombie");
@@ -12104,6 +12594,9 @@ mod tests {
         assert_eq!(combat_inventory_units_total(&session), items_before);
 
         // The Save stage that follows still ends the leg on the pinned witness.
+        // The Shot proof has its own dedicated test above; hand straight to Save
+        // so this test keeps pinning the hostile verdict plus the witness.
+        demo.stage = CombatStage::Save;
         assert!(
             combat_demo_step(&mut demo, &mut session),
             "the save stage ends the leg"
@@ -12174,8 +12667,99 @@ mod tests {
         assert!(demo.failed);
     }
 
-    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Save) to
-    /// completion and return the session plus its finished demo. Both save-leg
+    /// The Shot stage against a headless session: the sub-threshold release
+    /// cancels with nothing spent, ten 0.1 s ticks reach a full draw, the fired
+    /// arrow damages the Zombie 20 -> 16 and knocks it away, and a straight-down
+    /// shot embeds in the ground and expires. It also pins the earned inventory
+    /// state the save witness carries (two arrows left, bow worn twice).
+    #[test]
+    fn combat_demo_shot_stage_proves_charge_cancel_fire_hit_and_embed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-shot.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        for y in [spawn.y, spawn.y - 4.0] {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    spawn.x.floor() as i32,
+                    y.floor() as i32,
+                    spawn.z.floor() as i32,
+                ),
+            );
+        }
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, spawn, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, spawn - Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Shot;
+        assert!(
+            !combat_shot_stage(&mut demo, &mut session),
+            "the shot stage advances to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(!demo.failed, "unexpected shot abort: {:?}", demo.digest);
+        assert!(demo.shot_charged);
+        assert!(demo.shot_canceled);
+        assert_eq!(demo.shot_fired, 1);
+        assert_eq!(demo.shot_mob_hits, 1);
+        assert_eq!(demo.shot_damage, 4);
+        assert!(demo.shot_knockback);
+        assert!(demo.shot_embed);
+        assert!(demo.shot_expired);
+        assert_eq!(demo.shot_ammo, 2);
+        assert_eq!(demo.shot_bow, Some(57));
+        assert_eq!(
+            demo.shot_digest.as_deref(),
+            Some(
+                "combat_shot: seed=12345 charged=true canceled=true fired=1 mob_hits=1 damage=4 knockback=true embed=true expired=true ammo=2 bow=57 ok=true"
+            )
+        );
+
+        // Production-seam state after the stage: the shot damaged the Zombie
+        // but did not kill or reap it, and both arrows are gone.
+        let zombie = session
+            .mobs()
+            .iter()
+            .find(|mob| mob.kind == MobKind::Zombie)
+            .expect("the Zombie survives the shot");
+        assert_eq!(zombie.health, 16, "20 -> 16 at full charge");
+        assert!(zombie.hurt > 0.0);
+        assert!(session.arrows().is_empty());
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Arrow)),
+            2
+        );
+        let bow = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .find(|item| {
+                item.id()
+                    == ItemId::Tool {
+                        kind: ToolKind::Bow,
+                        tier: ToolTier::Wood,
+                    }
+            })
+            .expect("the earned bow stays in the inventory");
+        assert_eq!(bow.durability(), Some(57));
+    }
+
+    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot -> Save)
+    /// to completion and return the session plus its finished demo. Both save-leg
     /// tests use this so the fresh save is always produced by the production
     /// Save stage rather than hand-built wire data.
     fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
@@ -12230,9 +12814,10 @@ mod tests {
             if demo.stage == CombatStage::Hostile {
                 // The hostile proof has its own dedicated test (and needs a lit
                 // synthetic world); this helper pins the fresh
-                // Walk/Fight/Drops/Save leg, so hand straight to Save and keep
-                // the pinned `combat_demo:` digest byte-identical.
-                demo.stage = CombatStage::Save;
+                // Walk/Fight/Drops/Shot/Save leg, so hand straight to Shot (which
+                // earns the bow and arrows the save witness carries) and keep the
+                // pinned `combat_demo:` digest byte-identical.
+                demo.stage = CombatStage::Shot;
             }
             ended = combat_demo_step(&mut demo, &mut session);
         }
@@ -12638,7 +13223,7 @@ mod tests {
             .expect("restore digest");
         assert_eq!(
             digest,
-            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=4 ok=true"
+            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=6 ok=true"
         );
         assert!(!app.exit_failure);
     }
