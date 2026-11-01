@@ -53,8 +53,11 @@ const MIN_DIRECTION_LEN_SQ: f32 = 1e-6;
 /// Ambient, never-persisted reason for a player damage event.
 ///
 /// The tag is produced at the single damage site and rendered on the Death
-/// screen (T05). It is not part of the v7 wire format: a loaded dead save has
-/// no cause and renders "Unknown". S08 appends the skeleton's arrow cause.
+/// screen (T05). It is **not** part of the v7 wire format: a loaded dead save
+/// has no cause and renders "Unknown". The declaration order is the order the
+/// first four labels shipped in (S06) and that order must never change;
+/// [`DamageCause::SkeletonArrow`] was appended by S07-T03 and is the fifth and
+/// last label the Death screen can show.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DamageCause {
     /// Melee from a hostile zombie.
@@ -65,16 +68,26 @@ pub enum DamageCause {
     Drowning,
     /// Hunger reached zero.
     Starvation,
+    /// A skeleton's arrow, applied through the single player-damage authority.
+    ///
+    /// Exactly like the other four tags it is ephemeral: it lives in the
+    /// session's `last_damage_cause` for the current death and never gains a
+    /// save byte.
+    SkeletonArrow,
 }
 
 impl DamageCause {
     /// Stable human-readable label, also the Death-screen text.
+    ///
+    /// The first four strings are byte-identical to their S06 values; S07 only
+    /// appended the fifth arm.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Zombie => "Zombie",
             Self::Fall => "Fall",
             Self::Drowning => "Drowning",
             Self::Starvation => "Starvation",
+            Self::SkeletonArrow => "Skeleton arrow",
         }
     }
 }
@@ -623,11 +636,12 @@ mod tests {
 
     #[test]
     fn damage_cause_labels_are_stable() {
-        // T05 renders these strings and S08 extends the enum; the existing
-        // four must never move.
+        // T05 renders these strings. The first four are byte-identical to
+        // their S06 values and must never move; S07-T03 appended the fifth.
         assert_eq!(DamageCause::Zombie.label(), "Zombie");
         assert_eq!(DamageCause::Fall.label(), "Fall");
         assert_eq!(DamageCause::Drowning.label(), "Drowning");
         assert_eq!(DamageCause::Starvation.label(), "Starvation");
+        assert_eq!(DamageCause::SkeletonArrow.label(), "Skeleton arrow");
     }
 }

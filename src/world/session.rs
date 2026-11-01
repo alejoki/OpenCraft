@@ -24,7 +24,7 @@ use crate::player::raycast::raycast_voxels;
 use crate::player::survival::{
     GameMode, SurvivalContext, SurvivalRuntime, SurvivalState, SurvivalTick,
 };
-use crate::world::arrow::{Arrow, ArrowState, ARROW_CAP};
+use crate::world::arrow::{segment_aabb, Arrow, ArrowOwner, ArrowState, ARROW_CAP};
 use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use crate::world::daycycle::GameClock;
@@ -65,9 +65,10 @@ pub enum BowFireError {
 
 /// Counters for one [`WorldSession::tick_arrows`] call.
 ///
-/// The entity-facing fields are filled by S08/T03 (mob, player, kill and drop
-/// resolution); they live in the struct from the start so the shape never
-/// changes twice.
+/// The entity-facing fields are filled by the entity sweep inside
+/// [`WorldSession::tick_arrows`]: a body consumes the arrow before the block
+/// test runs, so `mob_hits`/`player_hits` and `block_hits` are mutually
+/// exclusive for a single arrow on a single substep.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrowTick {
     /// Arrows that embedded into a solid block this tick.
@@ -169,11 +170,14 @@ pub struct WorldSession {
     ///
     /// Ephemeral and **never persisted** (the v7 wire format has no cause
     /// byte): a loaded dead save therefore has no cause and the Death screen
-    /// renders "Unknown". Written in exactly two places —
+    /// renders "Unknown". Written in exactly three places —
     /// [`WorldSession::apply_mob_attacks`] (always `Zombie`, the mob-melee
-    /// seam) and [`WorldSession::tick_survival`] (the survival rules' own
-    /// `Fall`/`Drowning`/`Starvation`) — and cleared by
-    /// [`WorldSession::respawn`]. Two writers, never two authorities.
+    /// seam), [`WorldSession::tick_survival`] (the survival rules' own
+    /// `Fall`/`Drowning`/`Starvation`), and [`WorldSession::tick_arrows`]
+    /// (`SkeletonArrow`, the projectile seam) — and cleared by
+    /// [`WorldSession::respawn`]. Three writers, never three authorities: the
+    /// last one is a different damage path, not a second writer for the same
+    /// one.
     last_damage_cause: Option<DamageCause>,
 }
 
@@ -518,12 +522,7 @@ impl WorldSession {
     /// Whether the chunk containing the mob's feet is resident. A mob in an
     /// unloaded chunk stays in the list but is frozen until it streams in.
     pub fn mob_is_resident(&self, mob: &Mob) -> bool {
-        let (chunk, _) = world_to_chunk_and_local(
-            mob.position.x.floor() as i32,
-            mob.position.y.floor() as i32,
-            mob.position.z.floor() as i32,
-        );
-        self.world.is_resident(chunk)
+        position_is_resident(&self.world, mob.position)
     }
 
     /// Every mob whose feet chunk is currently resident. Ordering matches
@@ -552,12 +551,7 @@ impl WorldSession {
     /// colliding with the world manager's implicit Air, so it can never tunnel
     /// through terrain that simply has not streamed in yet.
     pub fn arrow_is_resident(&self, arrow: &Arrow) -> bool {
-        let (chunk, _) = world_to_chunk_and_local(
-            arrow.position.x.floor() as i32,
-            arrow.position.y.floor() as i32,
-            arrow.position.z.floor() as i32,
-        );
-        self.world.is_resident(chunk)
+        position_is_resident(&self.world, arrow.position)
     }
 
     /// Pushes an already-built arrow into the session list, returning its
@@ -643,8 +637,9 @@ impl WorldSession {
     /// to `0.0..=0.1`, then scaled by `time_scale` (negative becomes zero), and
     /// non-finite/non-positive game time is a no-op.
     ///
-    /// The list is taken out with [`std::mem::take`] so `&self.world` stays
-    /// immutably borrowable while arrows are mutated. Per arrow:
+    /// The list is taken out with [`std::mem::take`] so the world and the
+    /// entity lists stay independently borrowable while arrows are mutated.
+    /// Per arrow:
     ///
     /// * non-resident → kept unchanged (frozen at the chunk boundary, never
     ///   collided against unloaded Air);
@@ -652,9 +647,37 @@ impl WorldSession {
     /// * `Flying` → [`Arrow::substeps`] substeps of `game_dt / substeps`. A
     ///   32 b/s arrow moves 3.2 blocks in a 0.1 s frame, so point sampling
     ///   would tunnel through a one-block wall; 0.25-block substeps cannot.
-    ///   After each substep, a destination in a non-resident chunk restores
-    ///   the previous position and freezes the arrow; a solid destination
-    ///   block embeds it and counts one block hit.
+    ///
+    /// **Substep order: move, then entities, then blocks.** Each substep
+    /// saves `before`, advances, restores the position and freezes when the
+    /// destination chunk is not resident, sweeps every resident live mob (and
+    /// the player for a skeleton arrow), and only tests the destination block
+    /// when no body was hit — "hit the body, not the wall". A body consumes
+    /// the arrow whether or not the target accepted the damage: an
+    /// i-frame-refused arrow still hit the body and is spent.
+    ///
+    /// Two exclusions are deliberate:
+    ///
+    /// * a mob whose AABB **contains `before`** is skipped, so an arrow can
+    ///   never hit the body it starts inside. This stops a shooter from
+    ///   self-hitting through its own target and is the rule S08 relies on;
+    /// * a player-owned arrow never tests the player, so only skeletons hurt
+    ///   the player with projectiles.
+    ///
+    /// Mobs killed by a player-fired arrow are resolved after the arrow list
+    /// is restored: [`WorldSession::resolve_mob_kill`] needs `&mut self` for
+    /// the inventory grant, so it cannot run while `&mut self.mobs` is held.
+    /// A player-fired arrow is player-attributed exactly like a melee swing, so
+    /// [`crate::player::physics::Player::collect_items`] and its overflow
+    /// notice are reused unchanged. A skeleton arrow killing a mob grants
+    /// nothing: only a player earns the table.
+    ///
+    /// Skeleton-arrow player damage goes through
+    /// [`crate::player::combat::PlayerCombat::take_hit`], the session's only
+    /// player-damage authority, so i-frames, the hurt flash, the knockback
+    /// impulse and the Creative/Survival gate all come from S06. On an applied
+    /// hit this method is also the single writer of the
+    /// [`DamageCause::SkeletonArrow`] cause tag.
     ///
     /// Finished arrows (spent lifetime, or non-finite from a corrupt advance)
     /// are dropped and counted into [`ArrowTick::expired`]. Embedded arrows
@@ -669,11 +692,23 @@ impl WorldSession {
 
         let arrows = std::mem::take(&mut self.arrows);
         let mut kept = Vec::with_capacity(arrows.len());
+        // Kills are buffered, not granted, while the mob list is mutably
+        // borrowed; `resolve_mob_kill` needs `&mut self` for the drop grant.
+        let mut pending_kills: Vec<(usize, MobHit)> = Vec::new();
+
+        // Split-borrow shape, exactly like `tick_mobs`: terrain is immutable
+        // while the entity lists and the player's combat/vitals are mutable.
+        // `last_damage_cause` is a disjoint field and stays writable here.
+        let world = &self.world;
+        let mobs = &mut self.mobs;
+        let player = &mut self.player;
+
         for mut arrow in arrows {
-            if !self.arrow_is_resident(&arrow) {
+            if !position_is_resident(world, arrow.position) {
                 kept.push(arrow);
                 continue;
             }
+            let mut consumed = false;
             match arrow.state {
                 ArrowState::Embedded => arrow.advance(game_dt),
                 ArrowState::Flying => {
@@ -682,17 +717,65 @@ impl WorldSession {
                     for _ in 0..substeps {
                         let before = arrow.position;
                         arrow.advance(sub_dt);
-                        if !self.arrow_is_resident(&arrow) {
+                        if !position_is_resident(world, arrow.position) {
                             // The next cell lives in a chunk that has not
                             // streamed in: restore the last known-good point
                             // and freeze instead of colliding with Air.
                             arrow.position = before;
                             break;
                         }
+                        let delta = arrow.position - before;
+
+                        // 1. Entity sweep. A body consumes the arrow, so the
+                        //    block test below is skipped entirely.
+                        if let Some(index) = nearest_arrow_mob(mobs, world, before, delta) {
+                            let hit = mobs[index].take_hit(arrow.damage, before);
+                            report.mob_hits += 1;
+                            // Only a player's arrow earns the drop table; the
+                            // hit itself lands for either owner.
+                            if arrow.owner == ArrowOwner::Player {
+                                if let Some(hit) = hit {
+                                    if hit.killed {
+                                        pending_kills.push((index, hit));
+                                    }
+                                }
+                            }
+                            consumed = true;
+                            break;
+                        }
+
+                        // 2. Player sweep, skeleton arrows only.
+                        if arrow.owner == ArrowOwner::Skeleton {
+                            let target = player.aabb();
+                            if segment_aabb(before, delta, target.min, target.max).is_some() {
+                                // Read the player's own state before the
+                                // disjoint mutable borrows below.
+                                let mode = player.mode();
+                                let feet = player.position;
+                                let applied = player.combat.take_hit(
+                                    &mut player.survival,
+                                    arrow.damage,
+                                    mode,
+                                    DamageCause::SkeletonArrow,
+                                    feet,
+                                    before,
+                                );
+                                if let Some(applied) = applied {
+                                    self.last_damage_cause = Some(DamageCause::SkeletonArrow);
+                                    report.player_damage =
+                                        report.player_damage.saturating_add(applied.damage);
+                                    report.player_hits += 1;
+                                }
+                                // A refused hit (Creative, dead, i-frame, zero
+                                // damage) still spends the arrow.
+                                consumed = true;
+                                break;
+                            }
+                        }
+
+                        // 3. Block test at the destination only.
                         let cell = arrow.position.floor();
-                        let block =
-                            self.world
-                                .get_block(cell.x as i32, cell.y as i32, cell.z as i32);
+                        let block = world.get_block(cell.x as i32, cell.y as i32, cell.z as i32);
                         if block.is_solid() {
                             arrow.embed();
                             report.block_hits += 1;
@@ -701,6 +784,9 @@ impl WorldSession {
                     }
                 }
             }
+            if consumed {
+                continue;
+            }
             if arrow.finished() {
                 report.expired += 1;
             } else {
@@ -708,6 +794,15 @@ impl WorldSession {
             }
         }
         self.arrows = kept;
+
+        // Borrow-safe kill attribution: the entity sweep is over, so each
+        // buffered kill can be granted through the single loot seam.
+        for (index, hit) in pending_kills {
+            let grant = self.resolve_mob_kill(index, hit, MobKillCause::Player);
+            report.drops.accepted = report.drops.accepted.saturating_add(grant.accepted);
+            report.drops.lost = report.drops.lost.saturating_add(grant.lost);
+            report.kills += 1;
+        }
         report
     }
 
@@ -1555,6 +1650,62 @@ impl WorldSession {
         }
         self.chests.insert(pos, Container::from_slots(slots));
     }
+}
+
+/// Whether the chunk containing `position` is resident.
+///
+/// The one residency gate shared by mobs, arrows, the AI driver and the
+/// renderer: a position's floor cell decides the chunk, so an entity whose
+/// feet are exactly on a chunk boundary is attributed to the upper chunk.
+fn position_is_resident(world: &WorldManager, position: Vec3) -> bool {
+    let (chunk, _) = world_to_chunk_and_local(
+        position.x.floor() as i32,
+        position.y.floor() as i32,
+        position.z.floor() as i32,
+    );
+    world.is_resident(chunk)
+}
+
+/// The nearest resident, live mob whose AABB the swept segment enters.
+///
+/// Returns the mob's index, so the caller mutates exactly one record. Two
+/// exclusion rules keep projectile collision honest:
+///
+/// * the mob's feet chunk must be resident — the same gate the AI and the
+///   renderer use, so an arrow can never damage a mob that has not streamed
+///   in;
+/// * a mob whose AABB **contains `origin`** is skipped. Without this, an arrow
+///   that starts inside a body (e.g. a shot fired from inside the target at
+///   point-blank range) would land a zero-distance hit. The arrow must enter
+///   the body from outside, which is the rule S08 relies on.
+///
+/// The smallest segment parameter wins, so when two bodies overlap the closer
+/// one takes the arrow. Non-finite geometry is rejected by
+/// [`segment_aabb`], which yields no hit at all.
+fn nearest_arrow_mob(
+    mobs: &[Mob],
+    world: &WorldManager,
+    origin: Vec3,
+    delta: Vec3,
+) -> Option<usize> {
+    let mut nearest: Option<(usize, f32)> = None;
+    for (index, mob) in mobs.iter().enumerate() {
+        if mob.health == 0 || !position_is_resident(world, mob.position) {
+            continue;
+        }
+        let (min, max) = mob.aabb();
+        if origin.cmpge(min).all() && origin.cmple(max).all() {
+            // The arrow starts inside this body: never a hit on it.
+            continue;
+        }
+        let Some(t) = segment_aabb(origin, delta, min, max) else {
+            continue;
+        };
+        if nearest.is_none_or(|(_, best)| t < best) {
+            nearest = Some((index, t));
+        }
+    }
+    nearest.map(|(index, _)| index)
 }
 
 /// Maps a world-local loot table onto validated inventory items.
@@ -5890,6 +6041,235 @@ mod tests {
         assert_eq!(session.arrows()[index].state, ArrowState::Flying);
     }
 
+    /// A Survival session whose player stands in the resident air chunk.
+    /// Needed by the skeleton-arrow tests: the projectile path is the only
+    /// thing under test, but the damage authority deliberately gates on mode.
+    fn arrow_survival_session(seed: u32) -> WorldSession {
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/session-arrows-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        add_resident_air(&mut session);
+        session.set_ambient_spawning(false);
+        session.player.position = Vec3::new(8.5, 5.0, 8.5);
+        session
+    }
+
+    fn pig_at(session: &mut WorldSession, position: Vec3) {
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, position, 0.0));
+    }
+
+    fn inventory_has(session: &WorldSession, item: Item) -> bool {
+        session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .any(|held| *held == item)
+    }
+
+    #[test]
+    fn arrow_hits_a_mob_for_damage_and_away_knockback() {
+        let mut session = arrow_session(70);
+        let mob_position = Vec3::new(4.5, 5.0, 8.5);
+        pig_at(&mut session, mob_position);
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+        let origin = Vec3::new(2.5, 5.5, 8.5);
+        session
+            .fire_bow(origin, Vec3::X, 1.0)
+            .expect("a full charge fires");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.mob_hits, 1, "the body, not the air, stops the arrow");
+        assert_eq!(tick.block_hits, 0, "a body hit pre-empts the block test");
+        let mob = &session.mobs()[0];
+        assert_eq!(mob.health, 6, "10 hp pig takes the full-charge 4");
+        assert!(mob.hurt > 0.0, "the hurt flash is armed");
+        assert!(mob.hurt_iframe > 0.0, "the mob i-frame window is open");
+        let away = (mob_position - origin).normalize();
+        assert!(
+            mob.knockback.dot(away) > 0.0,
+            "knockback points away from the arrow, got {}",
+            mob.knockback
+        );
+        assert!(session.arrows().is_empty(), "a body consumes the arrow");
+    }
+
+    #[test]
+    fn an_iframe_blocked_arrow_is_spent_without_damage() {
+        let mut session = arrow_session(71);
+        pig_at(&mut session, Vec3::new(4.5, 5.0, 8.5));
+        give_bow(&mut session);
+        give_arrows(&mut session, 2);
+        let origin = Vec3::new(2.5, 5.5, 8.5);
+
+        session.fire_bow(origin, Vec3::X, 1.0).expect("first shot");
+        let first = session.tick_arrows(0.1, 1.0);
+        assert_eq!(first.mob_hits, 1);
+        let health_after_first = session.mobs()[0].health;
+        let iframe_after_first = session.mobs()[0].hurt_iframe;
+
+        // No `tick_mobs` in between, so the mob window is still open.
+        session.fire_bow(origin, Vec3::X, 1.0).expect("second shot");
+        let second = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(second.mob_hits, 1, "an i-frame-refused arrow still hit");
+        assert_eq!(
+            first.mob_hits + second.mob_hits,
+            2,
+            "both arrows reached the body"
+        );
+        assert_eq!(
+            session.mobs()[0].health,
+            health_after_first,
+            "the refused hit costs no health"
+        );
+        assert_eq!(session.mobs()[0].hurt_iframe, iframe_after_first);
+        assert!(session.arrows().is_empty(), "both arrows are spent");
+    }
+
+    #[test]
+    fn arrow_kill_grants_the_drop_table() {
+        let mut session = arrow_session(72);
+        pig_at(&mut session, Vec3::new(4.5, 5.0, 8.5));
+        session.mobs_mut()[0].health = 2;
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+
+        session
+            .fire_bow(Vec3::new(2.5, 5.5, 8.5), Vec3::X, 1.0)
+            .expect("full charge");
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.kills, 1, "the kill is credited to the player");
+        assert_eq!(
+            tick.drops,
+            MobDropReport::new(2, 0),
+            "one porkchop and one leather land"
+        );
+        assert_eq!(session.mobs()[0].health, 0, "the record stays for the fade");
+        assert!(inventory_has(
+            &session,
+            Item::new(ItemId::Material(Material::RawPorkchop), 1).expect("porkchop")
+        ));
+        assert!(inventory_has(
+            &session,
+            Item::new(ItemId::Material(Material::Leather), 1).expect("leather")
+        ));
+    }
+
+    #[test]
+    fn an_arrow_starting_inside_a_mob_does_not_hit_it() {
+        let mut session = arrow_session(73);
+        pig_at(&mut session, Vec3::new(4.5, 5.0, 8.5));
+        // Inside the pig's AABB (x 4.15..4.85, y 5.0..5.9), heading outward.
+        let arrow = Arrow::player(Vec3::new(4.5, 5.4, 8.5), Vec3::X, 1.0).expect("arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(
+            tick.mob_hits, 0,
+            "a body the arrow starts inside is skipped"
+        );
+        assert_eq!(session.mobs()[0].health, 10, "no self-hit damage");
+        assert_eq!(session.arrows().len(), 1, "the arrow flies on");
+    }
+
+    #[test]
+    fn player_owned_arrows_never_hit_the_player() {
+        let mut session = arrow_survival_session(74);
+        // Straight down from inside the player's own AABB: ownership alone
+        // must keep it inert against the shooter.
+        let arrow = Arrow::player(Vec3::new(8.5, 5.8, 8.5), -Vec3::Y, 1.0).expect("arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.player_hits, 0);
+        assert_eq!(tick.player_damage, 0);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+    }
+
+    #[test]
+    fn skeleton_arrow_damages_a_survival_player_once_per_iframe() {
+        let mut session = arrow_survival_session(75);
+        let arrow = Arrow::skeleton(Vec3::new(8.5, 5.5, 6.5), Vec3::Z).expect("skeleton arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let first = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(first.player_hits, 1);
+        assert_eq!(
+            first.player_damage, 2,
+            "skeleton arrows are the 2-damage pair"
+        );
+        assert_eq!(session.player.survival.health(), 18);
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::SkeletonArrow)
+        );
+        assert!(
+            session.player.combat.iframe() > 0.0,
+            "the arrow shares the single player i-frame window"
+        );
+        assert!(session.arrows().is_empty());
+
+        // A second arrow inside the window: no damage, no cause rewrite, and
+        // the arrow is still spent.
+        let blocked = Arrow::skeleton(Vec3::new(8.5, 5.5, 6.5), Vec3::Z).expect("skeleton arrow");
+        session.spawn_arrow(blocked).expect("arrow fits");
+        let second = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(second.player_hits, 0);
+        assert_eq!(second.player_damage, 0);
+        assert_eq!(session.player.survival.health(), 18);
+        assert_eq!(
+            session.last_damage_cause(),
+            Some(DamageCause::SkeletonArrow),
+            "a refused hit cannot rewrite the cause"
+        );
+        assert!(session.arrows().is_empty(), "the refused arrow is spent");
+
+        // Let the fixed-rate authority close the window, then a third arrow
+        // lands again. `tick_mobs` owns combat-timer aging.
+        for _ in 0..10 {
+            session.tick_mobs(0.1, 1.0);
+        }
+        assert_eq!(session.player.combat.iframe(), 0.0);
+        let third = Arrow::skeleton(Vec3::new(8.5, 5.5, 6.5), Vec3::Z).expect("skeleton arrow");
+        session.spawn_arrow(third).expect("arrow fits");
+        let third_tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(third_tick.player_hits, 1);
+        assert_eq!(third_tick.player_damage, 2);
+        assert_eq!(session.player.survival.health(), 16);
+    }
+
+    #[test]
+    fn skeleton_arrow_is_inert_against_a_creative_player() {
+        let mut session = arrow_survival_session(76);
+        session.player.set_mode(GameMode::Creative);
+        let arrow = Arrow::skeleton(Vec3::new(8.5, 5.5, 6.5), Vec3::Z).expect("skeleton arrow");
+        session.spawn_arrow(arrow).expect("arrow fits");
+
+        let tick = session.tick_arrows(0.1, 1.0);
+
+        assert_eq!(tick.player_hits, 0);
+        assert_eq!(tick.player_damage, 0);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert!(session.arrows().is_empty(), "the inert hit still spends it");
+    }
+
     #[test]
     fn respawn_clears_arrows_and_a_reload_starts_with_none() {
         use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
@@ -5898,10 +6278,16 @@ mod tests {
         session
             .spawn_arrow(Arrow::player(shot_origin(), Vec3::X, 1.0).expect("arrow"))
             .expect("arrow fits");
+        session.last_damage_cause = Some(DamageCause::SkeletonArrow);
         assert_eq!(session.arrows().len(), 1);
 
         session.respawn();
         assert!(session.arrows().is_empty(), "respawn clears projectiles");
+        assert_eq!(
+            session.last_damage_cause(),
+            None,
+            "respawn forgets the projectile cause too"
+        );
 
         // Arrows have no wire representation: the v7 save stays the same
         // 153-byte edit-free layout and a reload starts in flight-free air.
