@@ -676,8 +676,14 @@ fn try_spawn_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::persistence::SavedMob;
+    use crate::player::survival::GameMode;
+    use crate::world::chunk::Chunk;
+    use crate::world::daycycle::GameClock;
+    use crate::world::persistence::{ChunkEditMap, SavedMob};
+    use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
+    use crate::world::session::WorldSession;
     use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
 
     /// Feet height of the synthetic plain.
     const SURFACE_Y: i32 = 64;
@@ -1550,5 +1556,523 @@ mod tests {
         let mut clean = mob.clone();
         clean.despawn_pending = false;
         assert_eq!(SavedMob::from(&clean), saved);
+    }
+
+    // ---- S05-T04: headless harness over a synthetic lit WorldManager -----
+
+    /// Fixed seed for every harness pin.
+    const HARNESS_SEED: u32 = 12_345;
+    /// Mid-night tick: the sun is below the horizon and surface sky light is
+    /// still 15, so a lit grass plain produces surface hostiles.
+    const HARNESS_NIGHT_TICK: u32 = 18_000;
+    /// Morning tick: daylight, so surface hostiles burn and passives spawn.
+    const HARNESS_DAY_TICK: u32 = 6_000;
+
+    // Pins measured on 2026-11-01 by these very tests. A change here means the
+    // spawn mixer, an eligibility rule, or the world/light fixture moved.
+    const NIGHT_SPAWN_PIN: u32 = 8;
+    const NIGHT_SPAWN_MOB_PIN: usize = 8;
+    const NIGHT_CAP_SPAWN_PIN: u32 = 32;
+    const DAY_SPAWN_PIN: u32 = 8;
+
+    /// Carves the 3x3x2 cave air pocket at `surface - 10 ..= surface - 9` into
+    /// whichever chunk of the column it falls in.
+    fn carve_cave_into_chunk(
+        chunk: &mut Chunk,
+        cx: i32,
+        cz: i32,
+        cy: i32,
+        cave_x: i32,
+        cave_z: i32,
+        surface: i32,
+    ) {
+        let cs = CHUNK_SIZE as i32;
+        let base_y = cy * cs;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let wx = cave_x + dx;
+                let wz = cave_z + dz;
+                if wx.div_euclid(cs) != cx || wz.div_euclid(cs) != cz {
+                    continue;
+                }
+                for dy in 0..=1 {
+                    let ly = surface - 10 + dy - base_y;
+                    if !(0..cs).contains(&ly) {
+                        continue;
+                    }
+                    chunk.set(
+                        wx.rem_euclid(cs) as usize,
+                        ly as usize,
+                        wz.rem_euclid(cs) as usize,
+                        BlockId::Air,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Builds a 5x5 chunk-column lit grass plain centred on the seeded spawn
+    /// column with the grass surface at `spawn_position(seed).y - 4` (the +4
+    /// spawn rule). That puts the cached `world_spawn` three blocks above the
+    /// player's feet on the same column, so the world-spawn safe radius is a
+    /// real constraint rather than a no-op.
+    ///
+    /// `cave` carves a 3x3x2 dark pocket ten blocks under the surface; when
+    /// `recompute_light` is false no light grids exist, which is the
+    /// `light_at_world` 15-default negative control.
+    fn build_flat_world(
+        seed: u32,
+        recompute_light: bool,
+        cave: Option<(i32, i32)>,
+    ) -> (WorldManager, Vec3) {
+        let anchor = WorldSession::spawn_position(seed);
+        let cs = CHUNK_SIZE as i32;
+        let cx0 = (anchor.x.floor() as i32).div_euclid(cs);
+        let cz0 = (anchor.z.floor() as i32).div_euclid(cs);
+        let surface = anchor.y as i32 - 4;
+        let surface_chunk_y = surface.div_euclid(cs);
+        let surface_local = surface.rem_euclid(cs) as usize;
+
+        let mut world = WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default());
+        for cx in (cx0 - 2)..=(cx0 + 2) {
+            for cz in (cz0 - 2)..=(cz0 + 2) {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let mut chunk = if cy < surface_chunk_y {
+                        Chunk::new_uniform(BlockId::Stone)
+                    } else if cy == surface_chunk_y {
+                        let mut chunk = Chunk::new_uniform(BlockId::Air);
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                for ly in 0..=surface_local {
+                                    chunk.set(lx, ly, lz, BlockId::Stone);
+                                }
+                                chunk.set(lx, surface_local, lz, BlockId::Grass);
+                            }
+                        }
+                        chunk
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    if let Some((cave_x, cave_z)) = cave {
+                        carve_cave_into_chunk(&mut chunk, cx, cz, cy, cave_x, cave_z, surface);
+                    }
+                    world.insert_chunk_for_test(ChunkPos::new(cx, cy, cz), chunk);
+                }
+            }
+        }
+        if recompute_light {
+            world.recompute_light_for_test();
+        }
+        (world, Vec3::new(anchor.x, (surface + 1) as f32, anchor.z))
+    }
+
+    fn flat_world(seed: u32) -> (WorldManager, Vec3) {
+        build_flat_world(seed, true, None)
+    }
+
+    fn harness_session_from(world: WorldManager, feet: Vec3, seed: u32) -> WorldSession {
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            PathBuf::from("/tmp/spawn-harness.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.world = world;
+        session.player.position = feet;
+        session.sync_camera();
+        assert_eq!(
+            session.world_spawn(),
+            WorldSession::spawn_position(seed),
+            "the cached anchor must stay the seeded world spawn"
+        );
+        session
+    }
+
+    fn harness_session(seed: u32) -> WorldSession {
+        let (world, feet) = flat_world(seed);
+        harness_session_from(world, feet, seed)
+    }
+
+    fn run_ticks(session: &mut WorldSession, ticks: u32, secs: f32) {
+        for _ in 0..ticks {
+            session.tick_mobs(secs, 1.0);
+        }
+    }
+
+    /// Advances the session but pins every body back onto its spawn anchor
+    /// after each tick. The per-region cap is enforced on *current* positions
+    /// while wander can legally move a body across a cell boundary after it
+    /// spawned, so this neutralizes AI drift to isolate the spawner's
+    /// placement invariant.
+    fn run_frozen_ticks(session: &mut WorldSession, ticks: u32, secs: f32) {
+        for _ in 0..ticks {
+            session.tick_mobs(secs, 1.0);
+            for mob in session.mobs_mut() {
+                mob.position = mob.home;
+                mob.velocity = Vec3::ZERO;
+            }
+        }
+    }
+
+    fn hdist(a: Vec3, b: Vec3) -> f32 {
+        horizontal_distance_sq(a, b).sqrt()
+    }
+
+    /// Per-region bucket counts are asserted against `home`, the immutable
+    /// spawn anchor: the spawner owns placement, while later wander may move a
+    /// body across a cell boundary.
+    fn assert_region_caps(session: &WorldSession) {
+        let mut buckets: HashMap<(i32, i32), usize> = HashMap::new();
+        for mob in session.mobs() {
+            *buckets
+                .entry(region_bucket(mob.home.x, mob.home.z))
+                .or_default() += 1;
+        }
+        for (bucket, count) in buckets {
+            assert!(
+                count <= SPAWN_REGION_CAP,
+                "region {bucket:?} holds {count} records, cap is {SPAWN_REGION_CAP}"
+            );
+        }
+    }
+
+    #[test]
+    fn night_spawn_pin() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        // 40 x 0.05 s = 2.0 s, exactly 8 spawn attempts at 0.25 s.
+        run_ticks(&mut session, 40, 0.05);
+
+        let report = session.spawn_report();
+        eprintln!(
+            "night_spawn_pin: spawned={} mobs={} cap_blocked={}",
+            report.spawned,
+            session.mobs().len(),
+            report.cap_blocked
+        );
+        assert_eq!(
+            report.spawned, NIGHT_SPAWN_PIN,
+            "measured night spawn count moved"
+        );
+        assert_eq!(session.mobs().len(), NIGHT_SPAWN_MOB_PIN);
+
+        let player = session.player.position;
+        let world_spawn = session.world_spawn();
+        for mob in session.mobs() {
+            assert!(
+                matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton),
+                "night spawned {:?}",
+                mob.kind
+            );
+            let from_player = hdist(mob.home, player);
+            assert!(
+                (SAFE_RADIUS..=SPAWN_MAX_RADIUS).contains(&from_player),
+                "{:?} home {from_player} outside [{SAFE_RADIUS}, {SPAWN_MAX_RADIUS}]",
+                mob.kind
+            );
+            let from_world_spawn = hdist(mob.home, world_spawn);
+            assert!(
+                from_world_spawn >= SAFE_RADIUS,
+                "{:?} home {from_world_spawn} inside the world-spawn safe radius",
+                mob.kind
+            );
+            let (cx, cz) = (
+                (mob.home.x.floor() as i32).div_euclid(CHUNK_SIZE as i32),
+                (mob.home.z.floor() as i32).div_euclid(CHUNK_SIZE as i32),
+            );
+            assert!(
+                session.world.has_column_light(cx, cz),
+                "{:?} spawned on an unlit column ({cx}, {cz})",
+                mob.kind
+            );
+        }
+        assert_region_caps(&session);
+    }
+
+    #[test]
+    fn night_cap_pin() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        // 400 x 0.05 s = 20 s = 80 attempts, enough to fill the global budget.
+        // Bodies are pinned to their anchors so the per-region assertion
+        // measures placement, not later wander.
+        run_frozen_ticks(&mut session, 400, 0.05);
+
+        let report = session.spawn_report();
+        eprintln!(
+            "night_cap_pin: spawned={} mobs={} cap_blocked={}",
+            report.spawned,
+            session.mobs().len(),
+            report.cap_blocked
+        );
+        assert_eq!(report.spawned, NIGHT_CAP_SPAWN_PIN);
+        assert_eq!(session.mobs().len(), MAX_MOBS_TOTAL);
+        assert!(report.cap_blocked > 0, "a full list must record blocks");
+        assert_region_caps(&session);
+    }
+
+    #[test]
+    fn day_spawn_pin() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_DAY_TICK);
+        run_ticks(&mut session, 40, 0.05);
+
+        let report = session.spawn_report();
+        eprintln!(
+            "day_spawn_pin: spawned={} mobs={}",
+            report.spawned,
+            session.mobs().len()
+        );
+        assert_eq!(report.spawned, DAY_SPAWN_PIN);
+        assert_eq!(session.mobs().len(), DAY_SPAWN_PIN as usize);
+        for mob in session.mobs() {
+            assert!(mob.kind.is_passive(), "day spawned {:?}", mob.kind);
+            let feet = IVec3::new(
+                mob.home.x.floor() as i32,
+                mob.home.y.floor() as i32,
+                mob.home.z.floor() as i32,
+            );
+            assert_eq!(
+                session.world.get_block(feet.x, feet.y - 1, feet.z),
+                BlockId::Grass,
+                "{:?} does not stand on grass",
+                mob.kind
+            );
+            assert_eq!(
+                session.world.light_at_world(feet.x, feet.y, feet.z),
+                PASSIVE_SURFACE_LIGHT,
+                "{:?} does not stand in full sky light",
+                mob.kind
+            );
+        }
+        assert_region_caps(&session);
+    }
+
+    #[test]
+    fn despawn_pin() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 40, 0.05);
+        let initial = session.mobs().len();
+        assert!(initial > 0, "the despawn proof needs a night population");
+
+        // Freeze creation/burning so the only list change is the cull. The
+        // cull is deliberately ungated, so this still exercises the one reap
+        // site inside `tick_mobs`.
+        session.set_ambient_spawning(false);
+        let far = session.player.position + Vec3::new(DESPAWN_RADIUS + 8.0, 0.0, 0.0);
+        session.mobs_mut()[0].position = far;
+        session.mobs_mut()[0].velocity = Vec3::ZERO;
+
+        // 22 x 0.05 s = 1.1 s, just past one 1.0 s despawn scan.
+        run_ticks(&mut session, 22, 0.05);
+
+        assert_eq!(
+            session.mobs().len(),
+            initial - 1,
+            "exactly one record must leave the list"
+        );
+        assert_eq!(
+            session.spawn_report().despawned,
+            1,
+            "the scan counts exactly one mark"
+        );
+        assert!(
+            session.mobs().iter().all(|mob| mob.position != far),
+            "the culled record is still in the list"
+        );
+    }
+
+    #[test]
+    fn burn_pin() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 40, 0.05);
+
+        let hostiles = session.mobs().len();
+        assert!(hostiles > 0, "the burn proof needs a night population");
+        assert!(session.mobs().iter().all(|mob| mob.kind.is_hostile()));
+        let before = session.spawn_report().burned;
+
+        session.clock = GameClock::from_time(HARNESS_DAY_TICK);
+        // 300 x 0.05 s = 15 s: 10 s to burn 20 hp, then the 0.8 s collapse.
+        run_ticks(&mut session, 300, 0.05);
+
+        let report = session.spawn_report();
+        eprintln!(
+            "burn_pin: hostiles={hostiles} burned={} remaining={}",
+            report.burned - before,
+            session.mobs().len()
+        );
+        assert_eq!(
+            report.burned - before,
+            hostiles as u32,
+            "every night hostile must burn exactly once"
+        );
+        assert!(
+            session.mobs().iter().all(|mob| mob.kind.is_passive()),
+            "a surface hostile survived 15 s of daylight"
+        );
+    }
+
+    fn night_sequence(seed: u32) -> WorldSession {
+        let mut session = harness_session(seed);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 40, 0.05);
+        session
+    }
+
+    #[test]
+    fn two_identical_runs_match() {
+        let left = night_sequence(HARNESS_SEED);
+        let right = night_sequence(HARNESS_SEED);
+
+        assert_eq!(left.spawn_report(), right.spawn_report());
+        assert_eq!(left.mobs().len(), right.mobs().len());
+        for (left, right) in left.mobs().iter().zip(right.mobs()) {
+            assert_eq!(left.kind, right.kind);
+            assert_eq!(left.home, right.home, "spawn anchors must match exactly");
+            assert_eq!(left.yaw, right.yaw, "deterministic yaw must match");
+            assert!(
+                (left.position - right.position).length() < 1e-4,
+                "wander positions diverged: {:?} vs {:?}",
+                left.position,
+                right.position
+            );
+        }
+    }
+
+    #[test]
+    fn no_light_means_no_spawns() {
+        // No light grids: `light_at_world` falls back to 15, so only the
+        // `column_ready` gate can keep this at zero spawns.
+        let (world, feet) = build_flat_world(HARNESS_SEED, false, None);
+        let mut session = harness_session_from(world, feet, HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 400, 0.05);
+
+        assert!(session.mobs().is_empty(), "an unlit column must not spawn");
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+    }
+
+    #[test]
+    fn unlit_enclosed_world_spawns_nothing() {
+        let anchor = WorldSession::spawn_position(HARNESS_SEED);
+        let cs = CHUNK_SIZE as i32;
+        let cx0 = (anchor.x.floor() as i32).div_euclid(cs);
+        let cz0 = (anchor.z.floor() as i32).div_euclid(cs);
+        let mut world =
+            WorldManager::with_seed_and_edits(16, HARNESS_SEED, ChunkEditMap::default());
+        for cx in (cx0 - 2)..=(cx0 + 2) {
+            for cz in (cz0 - 2)..=(cz0 + 2) {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    world.insert_chunk_for_test(
+                        ChunkPos::new(cx, cy, cz),
+                        Chunk::new_uniform(BlockId::Stone),
+                    );
+                }
+            }
+        }
+        world.recompute_light_for_test();
+        let feet = Vec3::new(anchor.x, (anchor.y as i32 - 3) as f32, anchor.z);
+        let mut session = harness_session_from(world, feet, HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 400, 0.05);
+
+        assert!(
+            session.mobs().is_empty(),
+            "a sealed stone world has no stand"
+        );
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+    }
+
+    #[test]
+    fn cave_hostile_does_not_burn() {
+        let anchor = WorldSession::spawn_position(HARNESS_SEED);
+        let surface = anchor.y as i32 - 4;
+        let cave_x = anchor.x.floor() as i32 + 30;
+        let cave_z = anchor.z.floor() as i32;
+        let (world, feet) = build_flat_world(HARNESS_SEED, true, Some((cave_x, cave_z)));
+        let mut session = harness_session_from(world, feet, HARNESS_SEED);
+
+        let cave_feet = Vec3::new(
+            cave_x as f32 + 0.5,
+            (surface - 10) as f32,
+            cave_z as f32 + 0.5,
+        );
+        assert!(
+            session.world.light_at_world(cave_x, surface - 10, cave_z) <= HOSTILE_CAVE_LIGHT,
+            "the carved pocket must be cave-dark"
+        );
+
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        run_ticks(&mut session, 40, 0.05);
+        let surface_hostiles = session.mobs().len();
+        assert!(surface_hostiles > 0);
+        assert!(session.mobs().iter().all(|mob| mob.kind.is_hostile()));
+
+        let cave_health = MobKind::Zombie.max_health();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, cave_feet, 0.0));
+
+        session.clock = GameClock::from_time(HARNESS_DAY_TICK);
+        run_ticks(&mut session, 300, 0.05);
+
+        let report = session.spawn_report();
+        assert_eq!(
+            report.burned, surface_hostiles as u32,
+            "only the surface hostiles may burn"
+        );
+        let cave = session
+            .mobs()
+            .iter()
+            .find(|mob| mob.home == cave_feet)
+            .expect("the cave hostile must survive daylight");
+        assert_eq!(
+            cave.health, cave_health,
+            "the cave hostile took burn damage"
+        );
+        assert_eq!(
+            session
+                .mobs()
+                .iter()
+                .filter(|mob| mob.kind.is_hostile())
+                .count(),
+            1,
+            "only the cave hostile may remain"
+        );
+    }
+
+    #[test]
+    fn world_spawn_exclusion_is_real() {
+        let mut session = harness_session(HARNESS_SEED);
+        session.clock = GameClock::from_time(HARNESS_NIGHT_TICK);
+        let world_spawn = session.world_spawn();
+        // Shift the player 40 blocks east: part of the ring now falls inside
+        // the world-spawn safe radius and must be excluded, while the rest
+        // still populates.
+        session.player.position = world_spawn + Vec3::new(40.0, 0.0, 0.0);
+        session.sync_camera();
+        let player = session.player.position;
+
+        run_ticks(&mut session, 400, 0.05);
+
+        let report = session.spawn_report();
+        assert!(report.spawned > 0, "the shifted ring must still populate");
+        for mob in session.mobs() {
+            let from_spawn = hdist(mob.home, world_spawn);
+            assert!(
+                from_spawn >= SAFE_RADIUS,
+                "{:?} home {from_spawn} inside the world-spawn safe radius",
+                mob.kind
+            );
+            let from_player = hdist(mob.home, player);
+            assert!(
+                (SAFE_RADIUS..=SPAWN_MAX_RADIUS).contains(&from_player),
+                "{:?} home {from_player} outside the spawn ring",
+                mob.kind
+            );
+        }
     }
 }
