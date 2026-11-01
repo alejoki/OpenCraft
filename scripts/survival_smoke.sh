@@ -51,11 +51,33 @@
 # The content smoke deliberately does not use fixed offsets: its chunk edits
 # shift the variable-length chunk section (see scripts/content_smoke.sh).
 #
-# The script builds the debug binary itself with `cargo build --locked`, and
-# everything runs inside a mktemp working directory, so the crate root's real
-# saves/ and settings.toml are never touched.
+# The script builds the debug binary itself with `cargo build --locked` and
+# runs target/debug/opencraft. `SMOKE_PROFILE=release` is the opt-in
+# real-binary release run: it builds with `cargo build --locked --release` and
+# runs target/release/opencraft instead. Debug stays the default, so every
+# existing gate command keeps its behavior. Everything runs inside a mktemp
+# working directory, so the crate root's real saves/ and settings.toml are
+# never touched.
 
 set -u
+
+# Profile switch (default debug). An invalid value fails closed here, before
+# any build, display setup, or binary launch, so a typo can never silently
+# exercise the wrong tree.
+PROFILE="${SMOKE_PROFILE:-debug}"
+case "$PROFILE" in
+    debug|release) ;;
+    *)
+        echo "SURVIVAL SMOKE FAIL: invalid SMOKE_PROFILE='$PROFILE' (expected debug or release)"
+        exit 1
+        ;;
+esac
+
+if [[ "$PROFILE" == "release" ]]; then
+    BUILD_ARGS=(build --locked --release)
+else
+    BUILD_ARGS=(build --locked)
+fi
 
 # Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
 # when a desktop session is live. Attach to the running session so winit can
@@ -75,7 +97,7 @@ fi
 # build runs from the crate root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$CRATE_ROOT/target/debug/opencraft"
+BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
 BUILD_LOG="$(mktemp /tmp/opencraft-survival-build.XXXXXX.log)" || {
     echo "SURVIVAL SMOKE FAIL: could not create a build log" >&2
     exit 1
@@ -84,15 +106,15 @@ BUILD_LOG="$(mktemp /tmp/opencraft-survival-build.XXXXXX.log)" || {
 cleanup_build_log() { rm -f "$BUILD_LOG"; }
 trap cleanup_build_log EXIT
 
-if ! (cd "$CRATE_ROOT" && cargo build --locked) >"$BUILD_LOG" 2>&1; then
-    echo "SURVIVAL SMOKE FAIL: cargo build --locked failed"
+if ! (cd "$CRATE_ROOT" && cargo "${BUILD_ARGS[@]}") >"$BUILD_LOG" 2>&1; then
+    echo "SURVIVAL SMOKE FAIL: cargo ${BUILD_ARGS[*]} failed (profile $PROFILE)"
     echo "--- captured build output ---"
     cat "$BUILD_LOG"
     exit 1
 fi
 
 if [[ ! -x "$BIN" ]]; then
-    echo "SURVIVAL SMOKE FAIL: $BIN not found after the debug build"
+    echo "SURVIVAL SMOKE FAIL: profile '$PROFILE' binary not found at $BIN after cargo ${BUILD_ARGS[*]}"
     exit 1
 fi
 
@@ -268,5 +290,5 @@ if [[ "$CHEST_COUNT" -ne 0 ]]; then
     exit 1
 fi
 
-echo "SURVIVAL SMOKE PASS: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote an edit-free ${SURVIVAL_SAVE_LEN}-byte v6 save (mode Survival, vitals 20/20/300, 0 chests, 0 chunk edits, 2 kept inventory stacks)"
+echo "SURVIVAL SMOKE PASS [profile=$PROFILE]: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote an edit-free ${SURVIVAL_SAVE_LEN}-byte v6 save (mode Survival, vitals 20/20/300, 0 chests, 0 chunk edits, 2 kept inventory stacks)"
 echo "SURVIVAL SMOKE EVIDENCE: $SURVIVAL_LINE"

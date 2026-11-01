@@ -417,7 +417,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M008 / S07 farming
 - Primary owning slice: M008/S07
 - Supporting slices: M008/S05, M008/S06
-- Validation: cargo test --locked --lib -- world::farming; cargo test --locked --lib -- world::manager; cargo test --locked --lib -- player::inventory; cargo test --locked --bin opencraft; bash scripts/content_smoke.sh
+- Validation: cargo test --locked --lib -- world::farming; cargo test --locked --lib -- world::manager; cargo test --locked --lib -- player::inventory; cargo test --locked --bin opencraft; bash scripts/content_smoke.sh; cargo test --release --locked --lib -- world::session; cargo test --release --locked --bin opencraft; SMOKE_PROFILE=release bash scripts/content_smoke.sh
 
 ### R042 — 32-layer texture and pack extension
 - Class: differentiator
@@ -447,7 +447,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M008 / S09 closure
 - Primary owning slice: M008/S09
 - Supporting slices: M008/S08
-- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo fmt --all -- --check; cargo clippy --all-targets -- -D warnings; cargo test --locked; bash scripts/survival_smoke.sh; bash scripts/content_smoke.sh; recorded human windowed UAT
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo fmt --all -- --check; cargo clippy --all-targets -- -D warnings; cargo test --locked; bash scripts/survival_smoke.sh; bash scripts/content_smoke.sh; cargo test --release --locked; SMOKE_PROFILE=release bash scripts/survival_smoke.sh; SMOKE_PROFILE=release bash scripts/content_smoke.sh; recorded human windowed UAT
 
 ## M003 Criterion Trace
 
@@ -501,10 +501,10 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | Criterion | Requirements | Slices | Evidence |
 | --- | --- | --- | --- |
 | 1 | R036, R037, R038 | S01, S04, S05 | cargo test --locked --lib -- player::survival && cargo test --locked --lib -- ui::hud && cargo test --locked --lib -- player::eating && bash scripts/survival_smoke.sh |
-| 2 | R041 | S02, S05, S06, S07 | cargo test --locked --lib -- world::farming && cargo test --locked --lib -- world::manager && bash scripts/content_smoke.sh |
+| 2 | R041 | S02, S05, S06, S07 | cargo test --locked --lib -- world::farming && cargo test --locked --lib -- world::manager && bash scripts/content_smoke.sh && cargo test --release --locked --lib -- world::session && SMOKE_PROFILE=release bash scripts/content_smoke.sh |
 | 3 | R039, R040 | S03, S06 | cargo test --locked --lib -- player::container && cargo test --locked --lib -- ruin_loot && bash scripts/content_smoke.sh |
 | 4 | R035, R043 | S01, S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session && bash scripts/survival_smoke.sh |
 | 5 | R042 | S02 | cargo test --locked --lib -- render::texture && bash scripts/pack_smoke.sh |
 | 6 | R043 | S01, S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session |
-| 7 | R044 | S08, S09 | cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --locked && bash scripts/requirements_check.sh && bash scripts/survival_smoke.sh && bash scripts/content_smoke.sh |
+| 7 | R044 | S08, S09 | cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --locked && bash scripts/requirements_check.sh && bash scripts/survival_smoke.sh && bash scripts/content_smoke.sh && cargo test --release --locked && bash scripts/requirements_check_selftest.sh && SMOKE_PROFILE=release bash scripts/survival_smoke.sh && SMOKE_PROFILE=release bash scripts/content_smoke.sh |
 | 8 | R044 | S04, S05, S06, S07, S09 | recorded human windowed UAT with screenshots |

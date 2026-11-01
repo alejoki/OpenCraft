@@ -321,8 +321,10 @@ impl WorldSession {
     /// item must be a Hoe of any tier, the block must still be soil, and the
     /// block must be within [`TABLE_INTERACT_REACH`]. The edit is applied only
     /// when it can produce remesh work; the tool is worn exactly once after
-    /// that proven edit, so a refusal never mutates the world or the
-    /// inventory. Returns the remesh work the caller uploads.
+    /// that proven edit in every profile (the call is not wrapped in a
+    /// `debug_assert!`, so release builds pay it too), so a refusal never
+    /// mutates the world or the inventory. Returns the remesh work the caller
+    /// uploads.
     pub fn till_at(&mut self, pos: IVec3) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
         let selected = self.player.selected_item()?;
         match selected.id() {
@@ -347,10 +349,16 @@ impl WorldSession {
             !remeshed.is_empty(),
             "edit_will_remesh proved the chunk and its face neighbours resident"
         );
-        // The edit is visible; spend exactly one durability point. The
-        // selected-slot check above guarantees the Hoe is still there, so a
-        // failure here is a state bug rather than a user error.
-        debug_assert!(self.player.wear_selected_tool().is_ok());
+        // The edit is visible; spend exactly one durability point. The wear is
+        // unconditional (release builds pay it too, unlike the old
+        // `debug_assert!` wrapper); only the invariant check is compiled out of
+        // release. The selected-slot check above guarantees the Hoe is still
+        // there, so a failure here is a state bug rather than a user error.
+        let worn = self.player.wear_selected_tool();
+        debug_assert!(
+            worn.is_ok(),
+            "the selected-slot guard proves the Hoe is still held"
+        );
         Some(remeshed)
     }
 
@@ -361,9 +369,11 @@ impl WorldSession {
     /// below must still be `Farmland`, the cell must be within
     /// [`TABLE_INTERACT_REACH`], and the player's AABB must not overlap the
     /// cell (no planting inside yourself). The edit is applied only when it
-    /// can produce remesh work; exactly one seed is consumed and the crop
-    /// candidate is tracked after that proven edit, so a refusal never
-    /// mutates the world or the inventory. Farming is mode-independent.
+    /// can produce remesh work; exactly one seed is consumed in every profile
+    /// (the call is not wrapped in a `debug_assert!`, so release builds pay it
+    /// too) and the crop candidate is tracked after that proven edit, so a
+    /// refusal never mutates the world or the inventory. Farming is
+    /// mode-independent.
     pub fn plant_wheat_at(&mut self, pos: IVec3) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
         let selected = self.player.selected_item()?;
         if selected.id() != ItemId::Material(Material::WheatSeeds) {
@@ -391,8 +401,15 @@ impl WorldSession {
             "edit_will_remesh proved the chunk and its face neighbours resident"
         );
         // The edit is visible; consume exactly one seed and track the new
-        // crop. The selected-slot check above guarantees seeds are still held.
-        debug_assert!(self.player.consume_selected().is_some());
+        // crop. The consume is unconditional (release builds pay it too,
+        // unlike the old `debug_assert!` wrapper); only the invariant check is
+        // compiled out of release. The selected-slot check above guarantees
+        // seeds are still held.
+        let consumed = self.player.consume_selected();
+        debug_assert!(
+            consumed.is_some(),
+            "the selected-slot guard proves seeds are still held"
+        );
         self.crops.insert(pos);
         Some(remeshed)
     }
