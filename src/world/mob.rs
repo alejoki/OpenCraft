@@ -197,6 +197,14 @@ pub struct Mob {
     /// Remaining death-collapse time in seconds; decays only while resident.
     /// Zero on a living mob and on a corpse whose collapse has finished.
     pub death: f32,
+    /// Set by the spawner when the record is beyond the despawn radius; the
+    /// session's single reap site removes it on the same tick, so a despawned
+    /// mob is never rendered as a corpse and never saved.
+    ///
+    /// Ephemeral: never persisted ([`crate::world::persistence::SavedMob`] has
+    /// no such field) and always initialised to `false`, including in
+    /// [`Mob::restored`], so a reload can never carry a stale marker.
+    pub despawn_pending: bool,
 }
 
 impl Mob {
@@ -217,6 +225,7 @@ impl Mob {
             walk_phase: 0.0,
             flee: 0.0,
             death: 0.0,
+            despawn_pending: false,
         }
     }
 
@@ -240,6 +249,7 @@ impl Mob {
             walk_phase: 0.0,
             flee: 0.0,
             death: 0.0,
+            despawn_pending: false,
         }
     }
 
@@ -632,6 +642,7 @@ mod tests {
         assert_eq!(mob.knockback, Vec3::ZERO);
         assert_eq!(mob.cooldown, 0.0);
         assert_eq!(mob.walk_phase, 0.0);
+        assert!(!mob.despawn_pending, "a fresh mob is never pre-culled");
     }
 
     #[test]
@@ -653,6 +664,10 @@ mod tests {
         assert_eq!(mob.knockback, Vec3::ZERO);
         assert_eq!(mob.cooldown, 0.0);
         assert_eq!(mob.walk_phase, 0.0);
+        assert!(
+            !mob.despawn_pending,
+            "a reload must never carry a stale despawn marker"
+        );
 
         // `Mob::new` would force max health; `restored` must not.
         assert!(mob.health < MobKind::Skeleton.max_health());

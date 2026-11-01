@@ -17,11 +17,22 @@
 //!
 //! ## The gate controls creation and burning, never culling
 //!
-//! [`SpawnRuntime::set_enabled`] stops *new mobs* and (from T02) daylight
-//! burning; it never stops the distance cull. That asymmetry is deliberate:
-//! the `--demo-combat` seam needs a quiet mob list for its pinned quartet,
-//! while a record that drifts out of range must still be culled as
-//! deterministically as it spawned.
+//! [`SpawnRuntime::set_enabled`] stops *new mobs* and daylight burning; it
+//! never stops the distance cull. That asymmetry is deliberate: the
+//! `--demo-combat` seam needs a quiet mob list for its pinned quartet, while a
+//! record that drifts out of range must still be culled as deterministically
+//! as it spawned. A cull only ever marks a record that is already outside the
+//! radius, so it cannot move a deterministic demo's mob list.
+//!
+//! ## Daylight burning
+//!
+//! Burning is a single global [`BURN_INTERVAL_SECS`] cadence, not a per-mob
+//! accumulator: there is no new `Mob` burn field, no phase drift between
+//! records, and a 20 hp hostile dies after exactly 20 cadences = 10 s of
+//! daylight. A cave hostile (`sky_light <= `[`HOSTILE_CAVE_LIGHT`]) or a
+//! hostile under cover (`< `[`PASSIVE_SURFACE_LIGHT`]) never burns, and water
+//! at the feet shields it too. [`Mob::kill`] is the only kill path, so a burn
+//! is an environmental death that drops nothing.
 //!
 //! ## Determinism
 //!
@@ -201,6 +212,12 @@ impl SpawnReport {
 pub struct SpawnRuntime {
     /// Fractional seconds carried toward the next spawn attempt.
     attempt_accum: f32,
+    /// Fractional seconds carried toward the next despawn scan. Unlike the
+    /// other two accumulators this one runs while disabled, because the cull
+    /// is not gated.
+    despawn_accum: f32,
+    /// Fractional seconds carried toward the next global burn cadence.
+    burn_accum: f32,
     /// Ephemeral attempt counter; not persisted, so a reload restarts the
     /// deterministic spawn sequence.
     attempt_index: u64,
@@ -215,6 +232,8 @@ impl SpawnRuntime {
     pub fn new() -> SpawnRuntime {
         SpawnRuntime {
             attempt_accum: 0.0,
+            despawn_accum: 0.0,
+            burn_accum: 0.0,
             attempt_index: 0,
             enabled: true,
             report: SpawnReport::default(),
@@ -229,15 +248,17 @@ impl SpawnRuntime {
 
     /// Enables or disables creation and burning.
     ///
-    /// Disabling clears the partial attempt interval so re-enabling starts a
-    /// fresh, deterministic attempt window instead of firing immediately on
-    /// the first tick after the gate opens. **The gate never stops the
-    /// distance cull**: culling a record that has drifted out of range is
-    /// safe regardless of the gate.
+    /// Disabling clears the partial attempt, despawn-scan, and burn intervals
+    /// so re-enabling starts a fresh, deterministic window instead of firing
+    /// immediately on the first tick after the gate opens. **The gate never
+    /// stops the distance cull**: culling a record that has drifted out of
+    /// range is safe regardless of the gate.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
             self.attempt_accum = 0.0;
+            self.despawn_accum = 0.0;
+            self.burn_accum = 0.0;
         }
     }
 
@@ -257,10 +278,15 @@ impl SpawnRuntime {
     ///
     /// `game_dt` must already be clamped and time-scaled by the caller. A
     /// non-finite or non-positive value is a no-op that returns a zero
-    /// report. While enabled the interval accumulates and at most
-    /// [`MAX_SPAWN_ATTEMPTS_PER_CALL`] whole [`SPAWN_ATTEMPT_SECS`] attempts
-    /// run per call; the leftover is clamped to at most half an interval so a
-    /// long stall cannot spiral into a catch-up burst.
+    /// report.
+    ///
+    /// Three cadences run here, and only two of them are gated:
+    /// * the despawn scan ([`DESPAWN_SCAN_SECS`]) **always** runs,
+    /// * daylight burning ([`BURN_INTERVAL_SECS`]) runs only while enabled,
+    /// * spawn attempts ([`SPAWN_ATTEMPT_SECS`]) run only while enabled, with
+    ///   at most [`MAX_SPAWN_ATTEMPTS_PER_CALL`] per call and the leftover
+    ///   clamped to at most half an interval so a long stall cannot spiral
+    ///   into a catch-up burst.
     ///
     /// Returns the delta for this call; [`SpawnRuntime::report`] accumulates
     /// every delta.
@@ -276,7 +302,23 @@ impl SpawnRuntime {
             return delta;
         }
 
+        // Ungated by design: a cull can only mark a record already outside
+        // the radius, so it can never move a deterministic demo's mob list,
+        // and leaving it ungated means the demo's despawn proof cannot be
+        // silently disabled by the seam.
+        self.despawn_accum += game_dt;
+        while self.despawn_accum + SPAWN_ACCUM_EPSILON >= DESPAWN_SCAN_SECS {
+            self.despawn_accum = (self.despawn_accum - DESPAWN_SCAN_SECS).max(0.0);
+            scan_despawn(ctx, mobs, &mut delta);
+        }
+
         if self.enabled {
+            self.burn_accum += game_dt;
+            while self.burn_accum + SPAWN_ACCUM_EPSILON >= BURN_INTERVAL_SECS {
+                self.burn_accum = (self.burn_accum - BURN_INTERVAL_SECS).max(0.0);
+                scan_burn(ctx, world, mobs, &mut delta);
+            }
+
             self.attempt_accum += game_dt;
             let mut executed = 0;
             while executed < MAX_SPAWN_ATTEMPTS_PER_CALL
@@ -475,6 +517,87 @@ fn horizontal_distance_sq(a: Vec3, b: Vec3) -> f32 {
     dx * dx + dz * dz
 }
 
+/// One coarse despawn scan: mark every record beyond [`DESPAWN_RADIUS`].
+///
+/// **Horizontal** distance only, for the same reason the safe ring uses it: a
+/// mob deep in a cave below the player is still nearby on the only axis that
+/// matters, so a large `y` difference must not cull it.
+///
+/// Deliberately distance-only: no `column_ready`, no block or light read. A
+/// record in an unloaded chunk is exactly the one that must still be marked,
+/// because the mob runtime freezes it instead of moving it home.
+///
+/// Already-marked records are skipped so [`SpawnReport::despawned`] counts
+/// marks, not observations, and a repeated scan cannot double-count.
+fn scan_despawn(ctx: &SpawnContext, mobs: &mut [Mob], report: &mut SpawnReport) {
+    let radius_sq = DESPAWN_RADIUS * DESPAWN_RADIUS;
+    for mob in mobs.iter_mut() {
+        if mob.despawn_pending {
+            continue;
+        }
+        if horizontal_distance_sq(mob.position, ctx.player) > radius_sq {
+            mob.despawn_pending = true;
+            report.despawned += 1;
+        }
+    }
+}
+
+/// One global daylight-burn cadence.
+///
+/// Hostiles on the lit surface lose exactly 1 hp per [`BURN_INTERVAL_SECS`]
+/// while it is day. A cave hostile (`sky_light <= `[`HOSTILE_CAVE_LIGHT`]) or
+/// one under cover (`< `[`PASSIVE_SURFACE_LIGHT`]) never burns, and water at
+/// the feet shields too.
+///
+/// `column_ready` is checked before the light read for the same landmine
+/// documented on [`SpawnWorld::sky_light`]: a missing light grid reports full
+/// daylight.
+///
+/// The killing blow goes through [`Mob::kill`], so the 0.8 s collapse is armed
+/// and no drop is ever granted — [`MobKillCause::Environment`] is refused by
+/// the player-attributed grant seam.
+///
+/// [`MobKillCause::Environment`]: crate::world::mob::MobKillCause::Environment
+fn scan_burn(
+    ctx: &SpawnContext,
+    world: &impl SpawnWorld,
+    mobs: &mut [Mob],
+    report: &mut SpawnReport,
+) {
+    if daycycle::is_night(ctx.time_of_day) {
+        return;
+    }
+    for mob in mobs.iter_mut() {
+        if !mob.kind.is_hostile() || mob.health == 0 {
+            continue;
+        }
+        let feet = IVec3::new(
+            mob.position.x.floor() as i32,
+            mob.position.y.floor() as i32,
+            mob.position.z.floor() as i32,
+        );
+        let (cx, cz) = (
+            feet.x.div_euclid(CHUNK_SIZE as i32),
+            feet.z.div_euclid(CHUNK_SIZE as i32),
+        );
+        if !world.column_ready(cx, cz) {
+            continue;
+        }
+        if world.sky_light(feet) != PASSIVE_SURFACE_LIGHT {
+            continue;
+        }
+        if world.block(feet) == BlockId::Water {
+            continue;
+        }
+        if mob.health <= 1 {
+            mob.kill();
+            report.burned += 1;
+        } else {
+            mob.health -= 1;
+        }
+    }
+}
+
 /// Applies every eligibility and placement rule to an already-resolved
 /// candidate stand.
 ///
@@ -553,6 +676,7 @@ fn try_spawn_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::persistence::SavedMob;
     use std::collections::{HashMap, HashSet};
 
     /// Feet height of the synthetic plain.
@@ -1186,5 +1310,245 @@ mod tests {
         assert!(runtime.enabled());
         assert_eq!(runtime.report(), SpawnReport::default());
         assert_eq!(runtime.attempt_index, 0);
+    }
+
+    // ---- S05-T02: despawn marking and daylight burning ------------------
+
+    /// Feet position `dx` blocks east of the flat-context player, on the
+    /// synthetic plain's walking level.
+    fn feet_offset(dx: f32) -> Vec3 {
+        Vec3::new(0.5 + dx, (SURFACE_Y + 1) as f32, 0.5)
+    }
+
+    #[test]
+    fn despawn_scan_marks_only_beyond_the_radius_and_never_removes() {
+        // Light 10 makes every spawn attempt ineligible, isolating the cull.
+        let world = FakeWorld::flat().with_default_light(10);
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        let mut mobs = vec![
+            Mob::new(MobKind::Pig, feet_offset(DESPAWN_RADIUS - 0.5), 0.0),
+            Mob::new(MobKind::Pig, feet_offset(DESPAWN_RADIUS + 0.5), 0.0),
+            // Directly below the player: horizontal distance is zero, so a
+            // cave mob must never be culled just because `y` differs.
+            Mob::new(MobKind::Zombie, Vec3::new(0.5, -60.0, 0.5), 0.0),
+        ];
+
+        let first = runtime.tick(DESPAWN_SCAN_SECS, &ctx, &world, &mut mobs);
+        assert!(
+            !mobs[0].despawn_pending,
+            "{DESPAWN_RADIUS}-0.5 blocks must be kept"
+        );
+        assert!(
+            mobs[1].despawn_pending,
+            "{DESPAWN_RADIUS}+0.5 blocks must be marked"
+        );
+        assert!(
+            !mobs[2].despawn_pending,
+            "a mob straight below the player is not far horizontally"
+        );
+        assert_eq!(first.despawned, 1);
+        assert_eq!(
+            mobs.len(),
+            3,
+            "the runtime only marks; removal belongs to retain_live_mobs"
+        );
+
+        // A second scan cannot count the same record twice.
+        let second = runtime.tick(DESPAWN_SCAN_SECS, &ctx, &world, &mut mobs);
+        assert_eq!(second.despawned, 0, "a marked record is already counted");
+        assert!(mobs[1].despawn_pending);
+        assert_eq!(mobs.len(), 3);
+    }
+
+    #[test]
+    fn despawn_scan_is_distance_only_for_unready_unloaded_columns() {
+        let mut world = FakeWorld::flat().with_default_light(10);
+        // No resident column and no ground anywhere: any world read would
+        // fail the test by refusing to mark the record.
+        world.ready = Some(HashSet::new());
+        world.half_extent = 0;
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        let mut mobs = vec![Mob::new(MobKind::Cow, Vec3::new(500.5, -40.0, 500.5), 0.0)];
+
+        let delta = runtime.tick(DESPAWN_SCAN_SECS, &ctx, &world, &mut mobs);
+        assert_eq!(delta.despawned, 1);
+        assert!(mobs[0].despawn_pending);
+    }
+
+    #[test]
+    fn disabled_runtime_still_culls_but_never_spawns_or_burns() {
+        let world = FakeWorld::flat();
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        runtime.set_enabled(false);
+        let mut mobs = vec![
+            // Daytime, full light, lit surface: would burn if enabled.
+            Mob::new(MobKind::Zombie, feet_offset(30.0), 0.0),
+            // Far enough to be culled.
+            Mob::new(MobKind::Pig, feet_offset(DESPAWN_RADIUS + 0.5), 0.0),
+        ];
+        let expected_health = MobKind::Zombie.max_health();
+
+        let mut total = SpawnReport::default();
+        for _ in 0..20 {
+            total.add(runtime.tick(BURN_INTERVAL_SECS, &ctx, &world, &mut mobs));
+        }
+
+        assert!(mobs[1].despawn_pending, "the cull is never gated");
+        assert_eq!(total.despawned, 1);
+        assert_eq!(total.burned, 0, "disabled means no burn damage");
+        assert_eq!(total.spawned, 0, "disabled means no creation");
+        assert_eq!(mobs[0].health, expected_health);
+        assert_eq!(mobs.len(), 2);
+        assert_eq!(runtime.attempt_index, 0, "no attempt may even be rolled");
+        assert!(!runtime.enabled());
+    }
+
+    #[test]
+    fn daylight_burning_deals_one_hp_per_cadence_and_kills_in_ten_seconds() {
+        // A stone floor keeps the day spawn rules from adding passives.
+        let mut world = FakeWorld::flat();
+        world.surface_block = BlockId::Stone;
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        let mut mobs = vec![Mob::new(MobKind::Zombie, feet_offset(30.0), 0.0)];
+        assert_eq!(mobs[0].health, 20);
+
+        // 19 cadences take 20 hp down to exactly 1 hp, one per 0.5 s.
+        for i in 0..19 {
+            let delta = runtime.tick(BURN_INTERVAL_SECS, &ctx, &world, &mut mobs);
+            assert_eq!(delta.burned, 0, "burn {i} must not be lethal");
+            assert_eq!(mobs[0].health, 19 - i as u16);
+        }
+        assert_eq!(mobs[0].health, 1);
+
+        // The twentieth cadence is 10 s of daylight: 20 hp / 20 cadences.
+        let lethal = runtime.tick(BURN_INTERVAL_SECS, &ctx, &world, &mut mobs);
+        assert_eq!(lethal.burned, 1);
+        assert_eq!(mobs[0].health, 0);
+        assert!(mobs[0].death > 0.0, "Mob::kill must arm the 0.8 s collapse");
+        assert!(
+            !mobs[0].despawn_pending,
+            "burning is not a despawn; only the cull sets the marker"
+        );
+        assert_eq!(runtime.report().burned, 1);
+
+        // A corpse is never counted twice.
+        let after = runtime.tick(BURN_INTERVAL_SECS, &ctx, &world, &mut mobs);
+        assert_eq!(after.burned, 0);
+    }
+
+    /// Runs 20 s of enabled ticks and asserts the hostile never loses hp.
+    fn assert_never_burns(world: &FakeWorld, ctx: &SpawnContext, position: Vec3) {
+        let mut runtime = SpawnRuntime::new();
+        let mut mobs = vec![Mob::new(MobKind::Skeleton, position, 0.0)];
+        let expected = MobKind::Skeleton.max_health();
+        for _ in 0..40 {
+            let delta = runtime.tick(BURN_INTERVAL_SECS, ctx, world, &mut mobs);
+            assert_eq!(delta.burned, 0);
+            assert_eq!(mobs[0].health, expected);
+        }
+        assert_eq!(runtime.report().burned, 0);
+    }
+
+    #[test]
+    fn cave_light_night_twilight_and_water_never_burn() {
+        let position = feet_offset(30.0);
+        let day = flat_ctx(6_000);
+        let night = flat_ctx(18_000);
+
+        // Cave-dark: hostiles spawn there but never burn.
+        let cave = FakeWorld::flat().with_default_light(HOSTILE_CAVE_LIGHT);
+        assert_never_burns(&cave, &day, position);
+
+        // Twilight band sits below full sky light.
+        let twilight = FakeWorld::flat().with_default_light(PASSIVE_SURFACE_LIGHT - 1);
+        assert_never_burns(&twilight, &day, position);
+
+        // Full light but the clock says night.
+        let lit = FakeWorld::flat();
+        assert_never_burns(&lit, &night, position);
+
+        // Full light, day, but the feet are submerged.
+        let mut water = FakeWorld::flat();
+        water.blocks.insert(
+            (
+                position.x.floor() as i32,
+                position.y as i32,
+                position.z.floor() as i32,
+            ),
+            BlockId::Water,
+        );
+        assert_never_burns(&water, &day, position);
+    }
+
+    #[test]
+    fn an_unready_column_never_burns_even_in_full_light() {
+        let mut world = FakeWorld::flat();
+        world.ready = Some(HashSet::new());
+        let ctx = flat_ctx(6_000);
+        assert_never_burns(&world, &ctx, feet_offset(30.0));
+    }
+
+    #[test]
+    fn a_dead_record_is_never_burned_twice() {
+        let mut world = FakeWorld::flat();
+        world.surface_block = BlockId::Stone;
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        let mut mob = Mob::new(MobKind::Zombie, feet_offset(30.0), 0.0);
+        assert!(mob.kill());
+        mob.death = crate::world::mob::MOB_DEATH_SECS * 0.5;
+        let death_before = mob.death;
+        let mut mobs = vec![mob];
+
+        for _ in 0..40 {
+            assert_eq!(
+                runtime
+                    .tick(BURN_INTERVAL_SECS, &ctx, &world, &mut mobs)
+                    .burned,
+                0
+            );
+        }
+
+        assert_eq!(mobs[0].health, 0);
+        assert_eq!(
+            mobs[0].death, death_before,
+            "a corpse must never be re-killed"
+        );
+        assert_eq!(runtime.report().burned, 0);
+    }
+
+    #[test]
+    fn despawn_radius_stays_inside_the_minimum_render_distance() {
+        let min_render_blocks = crate::settings::RENDER_DISTANCE_MIN * CHUNK_SIZE as i32;
+        assert!(
+            DESPAWN_RADIUS_BLOCKS < min_render_blocks,
+            "despawn radius {DESPAWN_RADIUS_BLOCKS} blocks must stay inside the shortest \
+             rendered distance {min_render_blocks} blocks, or a culled record could still be \
+             visible"
+        );
+    }
+
+    #[test]
+    fn despawn_marker_defaults_false_and_never_reaches_the_wire() {
+        let feet = Vec3::new(3.5, 70.0, -2.5);
+        assert!(!Mob::new(MobKind::Pig, feet, 0.0).despawn_pending);
+        assert!(!Mob::restored(MobKind::Zombie, feet, 0.0, 4).despawn_pending);
+
+        let mut mob = Mob::new(MobKind::Zombie, feet, 1.5);
+        mob.despawn_pending = true;
+        let saved = SavedMob::from(&mob);
+        assert_eq!(saved.kind, mob.kind);
+        assert_eq!(saved.position, [3.5, 70.0, -2.5]);
+        assert_eq!(saved.yaw, 1.5);
+        assert_eq!(saved.health, mob.health);
+
+        // The wire value is identical with or without the ephemeral marker.
+        let mut clean = mob.clone();
+        clean.despawn_pending = false;
+        assert_eq!(SavedMob::from(&clean), saved);
     }
 }
