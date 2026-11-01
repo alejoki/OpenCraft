@@ -16,6 +16,7 @@
 
 use crate::world::block::BlockId;
 use crate::world::loot::LootItem;
+use crate::world::mob_loot::MobDropItem;
 
 /// Number of hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
@@ -372,6 +373,21 @@ impl From<LootItem> for ItemId {
             LootItem::Stick => ItemId::Material(Material::Stick),
             LootItem::CoalOre => ItemId::Block(BlockId::CoalOre),
             LootItem::IronOre => ItemId::Block(BlockId::IronOre),
+        }
+    }
+}
+
+/// Maps a mob drop identity onto the player item identity it yields.
+///
+/// This is the only bridge from [`MobDropItem`] into this module — the world
+/// layer's drop tables never import the player layer (D094). Every mob drop is
+/// a material, so each identity resolves to an [`ItemId::Material`].
+impl From<MobDropItem> for ItemId {
+    fn from(item: MobDropItem) -> Self {
+        match item {
+            MobDropItem::RawPorkchop => ItemId::Material(Material::RawPorkchop),
+            MobDropItem::RawBeef => ItemId::Material(Material::RawBeef),
+            MobDropItem::Leather => ItemId::Material(Material::Leather),
         }
     }
 }
@@ -2059,6 +2075,33 @@ mod tests {
             assert_eq!(id, expected, "{loot:?} maps to the wrong identity");
             let item = Item::new(id, 1)
                 .unwrap_or_else(|error| panic!("{loot:?} must build an item, got {error:?}"));
+            assert_eq!(item.id(), expected);
+            assert_eq!(item.count(), 1);
+        }
+    }
+
+    #[test]
+    fn mob_drop_vocabulary_maps_to_valid_item_identities() {
+        use crate::world::mob_loot::MobDropItem;
+
+        let cases = [
+            (MobDropItem::RawPorkchop, Material::RawPorkchop),
+            (MobDropItem::RawBeef, Material::RawBeef),
+            (MobDropItem::Leather, Material::Leather),
+        ];
+
+        for (drop, material) in cases {
+            let expected = ItemId::Material(material);
+            let id: ItemId = drop.into();
+            assert_eq!(id, expected, "{drop:?} maps to the wrong identity");
+            assert_eq!(
+                id.stack_limit(),
+                MATERIAL_STACK_LIMIT,
+                "{drop:?} must be a full material stack"
+            );
+            assert_eq!(MATERIAL_STACK_LIMIT, 64);
+            let item = Item::new(id, 1)
+                .unwrap_or_else(|error| panic!("{drop:?} must build an item, got {error:?}"));
             assert_eq!(item.id(), expected);
             assert_eq!(item.count(), 1);
         }

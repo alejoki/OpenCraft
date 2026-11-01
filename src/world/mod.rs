@@ -9,6 +9,7 @@ pub mod light;
 pub mod loot;
 pub mod manager;
 pub mod mob;
+pub mod mob_loot;
 pub mod persistence;
 pub mod season;
 pub mod session;
