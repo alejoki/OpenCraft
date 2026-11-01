@@ -1867,6 +1867,7 @@ mod tests {
     use crate::player::inventory::{
         InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
     };
+    use crate::player::melee::attack_damage;
     use crate::player::physics::InputState;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
@@ -6764,5 +6765,252 @@ mod tests {
             PathBuf::from("/tmp/arrow-reload.mcvx"),
         );
         assert!(restored.arrows().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // S09-T02: Creative inertness pins at both authority sites, one-shot drops
+    // -----------------------------------------------------------------------
+
+    /// Total `RottenFlesh` units held anywhere in the inventory. Zombie drops
+    /// are a single always-yielding entry, so this is an exact delta check.
+    fn rotten_flesh_count(session: &WorldSession) -> u32 {
+        session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Material(Material::RottenFlesh))
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn creative_skeleton_in_fire_band_emits_no_shots_or_chases() {
+        // The shared helper puts the record 2.0 blocks ahead (inside the
+        // skeleton's 5..=12 stand-off band it would immediately back away
+        // from). Move it to 6 blocks: squarely inside the fire band, still
+        // inside the all-air resident chunk, so only the mode can explain an
+        // empty decision list.
+        let mut session = survival_hostile_session(91, MobKind::Skeleton);
+        {
+            let mob = &mut session.mobs_mut()[0];
+            mob.position = Vec3::new(8.5, 5.0, 14.5);
+            mob.home = mob.position;
+        }
+        session.use_creative_rules();
+        let health = session.player.survival.health();
+
+        for _ in 0..30 {
+            let tick = session.tick_mobs(0.05, 1.0);
+            assert!(tick.attacks.is_empty(), "Creative is never meleed");
+            assert!(
+                tick.shots.is_empty(),
+                "a Creative player is never a ranged target"
+            );
+            assert_ne!(
+                session.mobs()[0].state,
+                MobAiState::Chase,
+                "Creative is never targeted"
+            );
+        }
+        assert!(
+            session.arrows().is_empty(),
+            "the ranged arm of authority site 1 spawns nothing"
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert_eq!(session.last_damage_cause(), None);
+    }
+
+    #[test]
+    fn creative_apply_mob_shots_spawns_nothing() {
+        let mut session = survival_hostile_session(92, MobKind::Zombie);
+        session.use_creative_rules();
+        let eye = session.player.eye_position();
+        let shot = MobShot {
+            kind: MobKind::Skeleton,
+            origin: eye,
+            dir: Vec3::Z,
+        };
+
+        assert_eq!(
+            session.apply_mob_shots(&[shot]),
+            0,
+            "authority site 2 refuses a ranged payload built anywhere else"
+        );
+        assert!(session.arrows().is_empty());
+
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            0,
+            "the melee arm of the same site refuses every attack"
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+    }
+
+    #[test]
+    fn creative_melee_one_shot_kills_and_grants_drops() {
+        let mut session = survival_hostile_session(93, MobKind::Zombie);
+        session.use_creative_rules();
+        let feet = session.player.position;
+        let before = rotten_flesh_count(&session);
+        assert_eq!(session.mobs()[0].health, 20, "a full-health zombie");
+
+        assert_eq!(attack_damage(None, GameMode::Creative, 20), 20);
+        let damage = attack_damage(None, session.player.mode(), session.mobs()[0].health);
+        let hit = session
+            .attack_mob(0, damage, feet)
+            .expect("a resident zombie accepts the swing");
+        assert_eq!(
+            hit,
+            MobHit {
+                damage: 20,
+                health_after: 0,
+                killed: true,
+            }
+        );
+
+        let report = session.resolve_mob_kill(0, hit, MobKillCause::Player);
+        assert_eq!(report, MobDropReport::new(1, 0));
+        assert_eq!(
+            rotten_flesh_count(&session) - before,
+            1,
+            "the pinned drop table still lands on a Creative kill"
+        );
+    }
+
+    #[test]
+    fn creative_arrow_one_shot_kills_and_grants_drops() {
+        let mut session = survival_hostile_session(94, MobKind::Zombie);
+        session.use_creative_rules();
+        let before = rotten_flesh_count(&session);
+        let arrow = Arrow::player(Vec3::new(8.5, 5.5, 8.5), Vec3::Z, 0.0)
+            .expect("a minimum-draw arrow is valid");
+        assert_eq!(
+            arrow.damage, 1,
+            "base damage, so a kill cannot be explained by charge"
+        );
+        session.spawn_arrow(arrow).expect("empty list accepts it");
+
+        let mut mob_hits = 0u32;
+        let mut kills = 0u32;
+        let mut drops = MobDropReport::default();
+        for _ in 0..10 {
+            let tick = session.tick_arrows(0.1, 1.0);
+            mob_hits += tick.mob_hits;
+            kills += tick.kills;
+            drops.accepted += tick.drops.accepted;
+            drops.lost += tick.drops.lost;
+            if mob_hits > 0 {
+                break;
+            }
+        }
+
+        assert_eq!(mob_hits, 1, "the single arrow reaches the body");
+        assert_eq!(kills, 1, "a Creative player arrow one-shots");
+        assert_eq!(drops, MobDropReport::new(1, 0));
+        assert_eq!(session.mobs()[0].health, 0);
+        assert_eq!(
+            rotten_flesh_count(&session) - before,
+            1,
+            "the shot kill grants the pinned drop table too"
+        );
+    }
+
+    #[test]
+    fn survival_arrow_still_damages_by_charge() {
+        let mut session = survival_hostile_session(95, MobKind::Zombie);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        let before = rotten_flesh_count(&session);
+        let arrow = Arrow::player(Vec3::new(8.5, 5.5, 8.5), Vec3::Z, 0.0)
+            .expect("a minimum-draw arrow is valid");
+        assert_eq!(arrow.damage, 1);
+        session.spawn_arrow(arrow).expect("empty list accepts it");
+
+        let mut mob_hits = 0u32;
+        let mut kills = 0u32;
+        let mut drops = MobDropReport::default();
+        for _ in 0..10 {
+            let tick = session.tick_arrows(0.1, 1.0);
+            mob_hits += tick.mob_hits;
+            kills += tick.kills;
+            drops.accepted += tick.drops.accepted;
+            drops.lost += tick.drops.lost;
+            if mob_hits > 0 {
+                break;
+            }
+        }
+
+        assert_eq!(mob_hits, 1);
+        assert_eq!(
+            session.mobs()[0].health,
+            19,
+            "Survival keeps the charge damage (20 - 1)"
+        );
+        assert_eq!(kills, 0, "1 damage cannot kill a full-health zombie");
+        assert_eq!(drops, MobDropReport::default());
+        assert_eq!(rotten_flesh_count(&session), before, "no kill, no drop");
+    }
+
+    #[test]
+    fn creative_rule_keys_on_the_effective_mode_not_save_mode() {
+        let mut session = survival_hostile_session(96, MobKind::Zombie);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(session.save_mode, GameMode::Survival);
+
+        session.use_creative_rules();
+
+        assert_eq!(session.player.mode(), GameMode::Creative);
+        assert_eq!(
+            session.save_mode,
+            GameMode::Survival,
+            "Edit Background must not rewrite the stored world mode"
+        );
+
+        // Inertness, read off the live mode while the save mode is Survival.
+        let feet = session.player.position;
+        let health = session.player.survival.health();
+        for _ in 0..30 {
+            let tick = session.tick_mobs(0.05, 1.0);
+            assert!(tick.attacks.is_empty());
+            assert!(tick.shots.is_empty());
+            assert_ne!(session.mobs()[0].state, MobAiState::Chase);
+        }
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            0
+        );
+        assert_eq!(
+            session.apply_mob_shots(&[MobShot {
+                kind: MobKind::Skeleton,
+                origin: feet + Vec3::Y,
+                dir: Vec3::Z,
+            }]),
+            0
+        );
+        assert_eq!(session.player.survival.health(), health);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert_eq!(session.last_damage_cause(), None);
+
+        // One-shot behaviour, also read off the live mode.
+        let remaining = session.mobs()[0].health;
+        let damage = attack_damage(None, session.player.mode(), remaining);
+        assert_eq!(damage, remaining, "Creative resolves the remaining health");
+        let hit = session
+            .attack_mob(0, damage, feet)
+            .expect("a resident zombie accepts the swing");
+        assert!(hit.killed);
+        assert_eq!(hit.health_after, 0);
+        assert_eq!(
+            session
+                .resolve_mob_kill(0, hit, MobKillCause::Player)
+                .accepted,
+            1
+        );
     }
 }
