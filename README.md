@@ -93,7 +93,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 ### Gameplay
 | Key | Action |
 | --- | --- |
-| **Left Click** | Break block; harvest mature wheat. |
+| **Left Click** | Attack a mob under the crosshair within reach; otherwise break the targeted block, and harvest mature wheat. A left press over empty ground still mines. |
 | **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
@@ -104,6 +104,9 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | --- | --- |
 | **Hold Right Click (food)** | Eat an apple or bread from the selected hotbar slot. The progress bar fills over 1.6 s; release or move to cancel. |
 | **Right Click (hoe)** | Till the top face of grass or dirt into Farmland. |
+| **Craft (wood sword)** | At a crafting table, stack 2 Oak Planks over 1 Stick in a single vertical column. Each swing deals 4 damage. |
+| **Craft (stone / iron sword)** | Swap the two planks for 2 Cobblestone (5 damage) or 2 Iron Ore (6 damage), keeping the Stick at the bottom. Swords do not shorten block-breaking time. |
+| **Left Click (mob)** | Attack the mob under the crosshair within reach. The hit shows a hurt flash and knocks the mob away; one swing per ~0.6 s, and the same mob ignores further hits for ~0.5 s. A mob in reach takes priority over the block behind it. |
 | **Right Click (Wheat Seeds)** | Plant seeds on Farmland. |
 | **Left Click (wheat)** | Harvest mature wheat for 1 Wheat and 2 Wheat Seeds; immature wheat returns 1 Wheat Seed. |
 | **Right Click (chest)** | Open the chest screen. |
