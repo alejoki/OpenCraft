@@ -111,6 +111,10 @@ pub fn hotbar_count_text_origin(rect: (f32, f32, f32, f32)) -> (f32, f32) {
 /// Fill color of the eating progress bar, distinct from the mining amber.
 pub const EATING_FILL_COLOR: [f32; 4] = [0.55, 0.85, 0.35, 0.95];
 
+/// Fill color of the bow-charge progress bar, distinct from both the eating
+/// green and the mining amber.
+pub const BOW_FILL_COLOR: [f32; 4] = [0.35, 0.85, 1.0, 0.95];
+
 /// Shared crosshair progress-bar geometry: an always-visible dark background
 /// followed by a fill of `fill_color` scaled to `progress`.
 ///
@@ -166,6 +170,17 @@ pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [
 /// release-cancelled meal never leaves a stale bar shape behind.
 pub fn eating_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
     progress_bar_quads(progress, surface_w, surface_h, EATING_FILL_COLOR)
+}
+
+/// Build the two quads that draw the bow-charge progress bar in the same
+/// crosshair-anchored slot as the mining and eating bars, with a cyan fill.
+///
+/// The slot is shared, so only one action bar is ever visible at a time: the
+/// caller's priority (eating, then bow, then mining) picks which action owns
+/// this frame. Sharing the geometry also means a cancelled draw never leaves
+/// a stale bar shape behind.
+pub fn bow_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
+    progress_bar_quads(progress, surface_w, surface_h, BOW_FILL_COLOR)
 }
 
 /// Fill fraction of one heart icon: ten hearts of two health points each.
@@ -502,6 +517,65 @@ mod tests {
         assert_close(zero.y, 0.5 + CROSSHAIR_BAR_OFFSET_Y, "max(1) y");
         assert_close(zero.w, PROGRESS_BAR_WIDTH, "background width intact");
         assert_close(zero.h, PROGRESS_BAR_HEIGHT, "background height intact");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bow-charge progress bar (S07-T05)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bow_bar_shares_the_geometry_and_scales_with_progress() {
+        for (progress, expected_w) in [(0.0, 0.0), (0.25, 30.0), (0.5, 60.0), (1.0, 120.0)] {
+            let [bow_bg, bow_fill] = bow_progress_quads(progress, 1280, 720);
+            let [mine_bg, mine_fill] = mining_progress_quads(progress, 1280, 720);
+            for (name, bow, mine) in [
+                ("background", bow_bg, mine_bg),
+                ("fill", bow_fill, mine_fill),
+            ] {
+                assert_close(bow.x, mine.x, &format!("{name} x at {progress}"));
+                assert_close(bow.y, mine.y, &format!("{name} y at {progress}"));
+                assert_close(bow.h, mine.h, &format!("{name} h at {progress}"));
+            }
+            assert_close(bow_fill.w, expected_w, &format!("fill w at {progress}"));
+        }
+    }
+
+    #[test]
+    fn bow_fill_color_is_distinct_from_eating_and_mining() {
+        let [bow_bg, bow_fill] = bow_progress_quads(0.5, 1280, 720);
+        let [mine_bg, mine_fill] = mining_progress_quads(0.5, 1280, 720);
+        let [eat_bg, eat_fill] = eating_progress_quads(0.5, 1280, 720);
+
+        assert_eq!(bow_fill.color, BOW_FILL_COLOR, "bow fill color");
+        assert_eq!(bow_bg.color, mine_bg.color, "shared dark background");
+        assert_eq!(bow_bg.color, eat_bg.color, "shared dark background");
+        assert_eq!(bow_bg.color, [0.0, 0.0, 0.0, 0.55], "background stays dark");
+
+        assert_ne!(BOW_FILL_COLOR, EATING_FILL_COLOR, "distinct from eating");
+        assert_ne!(BOW_FILL_COLOR, mine_fill.color, "distinct from mining");
+        assert_ne!(eat_fill.color, mine_fill.color, "eating stays distinct");
+        for channel in BOW_FILL_COLOR {
+            assert!(
+                (0.0..=1.0).contains(&channel),
+                "bow channel {channel} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn bow_bar_clamps_and_stays_finite_on_degenerate_surfaces() {
+        let [_, full] = bow_progress_quads(1.5, 1280, 720);
+        assert_close(full.w, PROGRESS_BAR_WIDTH, "1.5 is full width");
+        let [_, nan] = bow_progress_quads(f32::NAN, 1280, 720);
+        assert_close(nan.w, 0.0, "NaN is zero width");
+
+        for (w, h) in [(0, 0), (1, 1)] {
+            for quad in bow_progress_quads(0.5, w, h) {
+                for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+                    assert!(value.is_finite(), "{name} finite on {w}x{h}");
+                }
+            }
+        }
     }
 
     #[test]

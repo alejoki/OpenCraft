@@ -15,6 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
+use opencraft::player::bow::{BowState, BowTarget};
 use opencraft::player::combat::DamageCause;
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
@@ -44,9 +45,9 @@ use opencraft::ui::chest::{
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
 };
 use opencraft::ui::hud::{
-    damage_flash_quad, eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin,
-    hotbar_slot_rects, mining_progress_quads, selected_item_label, vitals_quads,
-    HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
+    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
+    vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -87,7 +88,7 @@ use opencraft::world::persistence::{
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Season, Weather};
-use opencraft::world::session::{mob_drop_items, ChestCommandError};
+use opencraft::world::session::{mob_drop_items, BowFireError, ChestCommandError};
 use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
 };
@@ -530,8 +531,8 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 
 /// Outcome of one production right-click world interaction.
 ///
-/// The full precedence is chest/table -> Survival food -> hoe/seed farming ->
-/// block placement. Stations and Survival food run before everything else and
+/// The full precedence is chest/table -> held bow -> Survival food -> hoe/seed
+/// farming -> block placement. Stations and Survival food run before everything else and
 /// are pure session decisions: a successfully targeted storage block or
 /// crafting table neither edits the world nor consumes the selected stack, and
 /// a food item never places a block. Farming follows because the top-face rule
@@ -547,6 +548,12 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 /// runs before table targeting so one shared ray can only ever open the block
 /// the player is actually looking at.
 ///
+/// A held bow comes after both station checks so a bow aimed at a chest still
+/// opens the chest, and before the Survival food branch so a bow press always
+/// arms a draw. It is mode-independent: a Creative player may draw and fire
+/// (S09 owns Creative damage). The press only arms the hold — charge and the
+/// actual shot happen on the frame tick and the release arm.
+///
 /// Survival food comes after both station checks and before farming/placement:
 /// holding a food item never places a block, a full-hunger click is refused
 /// through the transient notice channel instead of silently doing nothing, and
@@ -560,6 +567,15 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
     if session.try_open_targeted_table().is_some() {
         return RightClickOutcome::TableOpened;
+    }
+    if matches!(
+        session.player.selected_item().map(|item| item.id()),
+        Some(ItemId::Tool {
+            kind: ToolKind::Bow,
+            ..
+        })
+    ) {
+        return RightClickOutcome::BowChargeStarted;
     }
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
@@ -642,6 +658,9 @@ enum RightClickOutcome {
     /// press arm reports [`right_click_notice`] through the transient message
     /// channel.
     EatingRefused,
+    /// A held bow press started a charge. The press only arms the right hold;
+    /// progress and the shot are owned by the frame tick and the release arm.
+    BowChargeStarted,
     /// A hoe tilled soil into Farmland; carries the remesh work to upload.
     Tilled(Vec<(ChunkPos, ChunkMesh)>),
     /// Wheat seeds were planted; carries the remesh work to upload.
@@ -658,6 +677,18 @@ enum RightClickOutcome {
 fn right_click_notice(outcome: &RightClickOutcome) -> Option<&'static str> {
     match outcome {
         RightClickOutcome::EatingRefused => Some("Cannot eat while full"),
+        _ => None,
+    }
+}
+
+/// Transient notice for a bow-release refusal, if any.
+///
+/// Only [`BowFireError::NoAmmo`] needs words: it is the one refusal a player
+/// cannot infer from the world. Every other refusal (dead, not holding a bow,
+/// invalid shot, arrow cap) is already visible or is an ordinary non-event.
+fn bow_release_notice(error: Option<BowFireError>) -> Option<&'static str> {
+    match error {
+        Some(BowFireError::NoAmmo) => Some("No arrows"),
         _ => None,
     }
 }
@@ -688,6 +719,54 @@ fn eating_candidate(
     EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
 }
 
+/// The hold-to-draw candidate for this frame, or `None` when the draw must
+/// not progress.
+///
+/// Cancellation is structural exactly like [`eating_candidate`]: a released
+/// right button, a panel/menu frame, an ungrabbed cursor, a dead player, or a
+/// selection that is not a wood bow all produce `None`, which makes
+/// [`BowState::tick`] reset the accumulated charge. Unlike eating, movement
+/// deliberately does **not** cancel: a draw survives walking (see
+/// [`crate::player::bow`]). There is no separate cancellation switch that a
+/// reset site could forget.
+fn bow_charge_candidate(
+    session: &WorldSession,
+    right_mouse_held: bool,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> Option<BowTarget> {
+    if !(gameplay && cursor_grabbed && right_mouse_held) || session.is_dead() {
+        return None;
+    }
+    let player = &session.player;
+    BowTarget::new(player.selected_slot(), player.selected_item()?)
+}
+
+/// Releases the held bow: resets the charge unconditionally, then fires one
+/// arrow when this is a gameplay frame with a grabbed cursor.
+///
+/// A free function because `window_event` already holds disjoint
+/// `gpu`/`window` borrows, making a `&mut self` method unusable there (P005).
+/// The reset happens **before** the gameplay gate, so a release on a menu or
+/// panel frame can never leave a live charge behind. Only the returned error
+/// is significant to the caller: a sub-threshold tap is a silent cancel.
+fn release_bow(
+    bow: &mut BowState,
+    session: &mut WorldSession,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> Option<BowFireError> {
+    let charge = bow.release()?;
+    if !(gameplay && cursor_grabbed) {
+        return None;
+    }
+    // Copy the camera inputs before the mutable session borrow: argument
+    // evaluation would otherwise overlap with `fire_bow`'s receiver borrow.
+    let origin = session.camera.position;
+    let dir = session.camera.forward();
+    session.fire_bow(origin, dir, charge).err()
+}
+
 /// Attack-before-mining priority for one Playing frame.
 ///
 /// A resident mob under the crosshair within melee reach is the frame's
@@ -711,18 +790,23 @@ fn mining_after_attack(
 
 /// Crosshair progress bar for this frame.
 ///
-/// Eating owns the single sanctioned bar slot while a meal is in progress; a
-/// completed meal resets the eating state, so mining's amber bar comes back on
-/// the very next frame. `None` means neither action is progressing and no bar
-/// is drawn.
+/// One shared bar slot, so priority decides who owns it: eating -> bow ->
+/// mining. Eating consumes a real item, a bow draw is a held input the player
+/// must see, and mining is the fallback. A completed or cancelled action resets
+/// its own state, so the next-priority bar comes back on the very next frame.
+/// `None` means no action is progressing and no bar is drawn.
 fn frame_progress_bar(
     eating: Option<f32>,
+    bow: Option<f32>,
     mining: Option<f32>,
     surface_w: u32,
     surface_h: u32,
 ) -> Option<[Quad; 2]> {
     if let Some(progress) = eating {
         return Some(eating_progress_quads(progress, surface_w, surface_h));
+    }
+    if let Some(progress) = bow {
+        return Some(bow_progress_quads(progress, surface_w, surface_h));
     }
     mining.map(|progress| mining_progress_quads(progress, surface_w, surface_h))
 }
@@ -748,6 +832,18 @@ pub enum InventoryClickOutcome {
     Crafted(Item),
 }
 
+/// Clears the three hold accumulators shared by every panel open/close path.
+///
+/// The four panel helpers all reset the same set, so factoring it here means a
+/// new accumulator (the bow draw) is added once and every panel boundary picks
+/// it up. Melee is deliberately absent: panel opens never reset a swing
+/// cooldown today, and this refactor must not change that behaviour.
+fn reset_panel_holds(mining: &mut MiningState, eating: &mut EatingState, bow: &mut BowState) {
+    mining.reset();
+    eating.reset();
+    bow.reset();
+}
+
 /// Opens the inventory panel from either the E key (`via_table = false`) or a
 /// successful table interaction (`via_table = true`), releasing the cursor and
 /// dropping every gameplay hold so the panel owns the pointer.
@@ -765,6 +861,7 @@ fn open_inventory(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -774,8 +871,7 @@ fn open_inventory(
         screen.toggle(table_open);
     }
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -796,14 +892,14 @@ fn close_inventory(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
     screen.close();
     session.close_table();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -996,6 +1092,7 @@ fn open_chest_screen(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     status: &mut Option<String>,
     window: &Window,
@@ -1004,8 +1101,7 @@ fn open_chest_screen(
     session.close_table();
     screen.open();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -1026,14 +1122,14 @@ fn close_chest_screen(
     right_mouse_held: &mut bool,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
     screen.close();
     session.close_chest();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *cursor_grabbed = true;
@@ -6011,6 +6107,12 @@ struct GameApp {
     /// reset boundary clears it so a stale cooldown can never survive a
     /// session swap, panel, or focus loss.
     melee: MeleeState,
+    /// Bow draw accumulator (M009/S07-T05): driven once per Playing frame with
+    /// raw frame dt, never `dt * time_scale` (a draw is real time like mining,
+    /// eating, and the melee cooldown). Every hold/reset boundary clears it so
+    /// a partial or full draw can never survive a session swap, panel, focus
+    /// loss, death, or release.
+    bow: BowState,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -6391,6 +6493,7 @@ impl GameApp {
             mining: MiningState::new(),
             eating: EatingState::new(),
             melee: MeleeState::new(),
+            bow: BowState::new(),
             audio,
             left_mouse_held: false,
             right_mouse_held: false,
@@ -6647,6 +6750,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
         self.melee.reset();
         // The inventory and chest screens are Playing-only surfaces. Any
         // lifecycle screen entry drops them (with their transient drag/status)
@@ -6695,6 +6799,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
         self.melee.reset();
         self.pause_message = None;
         self.cursor_grabbed = true;
@@ -6846,6 +6951,7 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
         self.melee.reset();
         self.inventory.close();
         self.inventory_status = None;
@@ -7603,6 +7709,7 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.bow.reset();
                 self.melee.reset();
             }
             WindowEvent::Resized(new_size) => {
@@ -7732,6 +7839,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory_drag,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -7757,6 +7865,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.right_mouse_held,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -7780,6 +7889,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory_drag,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -7913,6 +8023,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
                         self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
@@ -7939,6 +8050,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
                     self.melee.reset();
                     return;
                 }
@@ -7955,6 +8067,7 @@ impl ApplicationHandler for GameApp {
                         self.inventory_drag = None;
                         self.right_mouse_held = false;
                         self.eating.reset();
+                        self.bow.reset();
                         self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
@@ -7967,6 +8080,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
                     self.melee.reset();
                     return;
                 }
@@ -7977,6 +8091,7 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.bow.reset();
                 self.melee.reset();
             }
             WindowEvent::MouseInput {
@@ -7989,9 +8104,27 @@ impl ApplicationHandler for GameApp {
                 // the Left release arm): clearing the right hold and any
                 // partial meal progress is always safe. It is a dedicated arm
                 // so no generic Released branch can swallow the button.
+                //
+                // `release_bow` resets the draw unconditionally (so a release
+                // on a menu or panel frame can never leave a live charge) and
+                // only fires on a Playing frame with a grabbed cursor. Only
+                // `NoAmmo` gets words: it is the one refusal a player cannot
+                // infer from the world, and every other refusal is silent.
                 self.right_mouse_held = false;
                 self.eating.reset();
                 self.melee.reset();
+                let bow_error = release_bow(
+                    &mut self.bow,
+                    &mut self.session,
+                    self.lifecycle.screen() == LifecycleScreen::Playing,
+                    self.cursor_grabbed,
+                );
+                if let Some(text) = bow_release_notice(bow_error) {
+                    self.game_message = Some(MenuMessage {
+                        text: text.to_string(),
+                        ticks_left: menu::MESSAGE_TICKS,
+                    });
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -8081,6 +8214,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
                         self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
@@ -8164,6 +8298,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
                         self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
@@ -8187,6 +8322,7 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
                     self.melee.reset();
                     return;
                 }
@@ -8246,6 +8382,7 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory_drag,
                                     &mut self.mining,
                                     &mut self.eating,
+                                    &mut self.bow,
                                     &mut self.cursor_grabbed,
                                     &mut self.chest_status,
                                     window,
@@ -8266,9 +8403,18 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory_drag,
                                     &mut self.mining,
                                     &mut self.eating,
+                                    &mut self.bow,
                                     &mut self.cursor_grabbed,
                                     window,
                                 );
+                            }
+                            RightClickOutcome::BowChargeStarted => {
+                                // The press only arms the hold, exactly like
+                                // eating. The draw accumulates on the redraw
+                                // tick and the release arm fires, so a press
+                                // can never shoot and a sub-threshold release
+                                // cancels without consuming ammo.
+                                self.right_mouse_held = true;
                             }
                             RightClickOutcome::EatingStarted => {
                                 // The press only arms the hold. Progress and
@@ -8445,6 +8591,21 @@ impl ApplicationHandler for GameApp {
                     // resulting records; this call is the only tick site, so
                     // the scripted `--demo-combat` seam never double-steps.
                     self.session.tick_mobs(dt, self.time_scale);
+                    // Projectile runtime (M009/S07-T05): the same game-time
+                    // rule as mobs. The session clamps/scales `dt`, freezes
+                    // arrows in unloaded chunks, resolves substepped block and
+                    // body hits, and reports every outcome. A player-attributed
+                    // arrow kill reuses the mob-drop overflow notice, so a
+                    // full inventory can never silently lose those drops.
+                    let arrow_tick = self.session.tick_arrows(dt, self.time_scale);
+                    if arrow_tick.drops.lost_any() {
+                        self.game_message = Some(MenuMessage {
+                            text: mob_drop_notice(arrow_tick.drops)
+                                .unwrap_or_default()
+                                .to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                    }
                     // Open-station state is a world fact (S02-T02/S03-T03):
                     // close a station as soon as its block is removed/replaced
                     // or the player steps out of reach. One bounded lookup per
@@ -8472,6 +8633,20 @@ impl ApplicationHandler for GameApp {
                     {
                         self.session.player.eat_selected(slot, item);
                     }
+                    // Hold-to-draw (M009/S07-T05): raw frame dt, never
+                    // `dt * time_scale`, exactly like eating and the melee
+                    // cooldown. `bow_charge_candidate` is structurally `None`
+                    // on panel frames, a released hold, an ungrabbed cursor,
+                    // death, or a non-bow selection — and movement
+                    // deliberately does NOT cancel a draw. The release arm is
+                    // the only firing site; this tick only accumulates charge.
+                    let bow_target = bow_charge_candidate(
+                        &self.session,
+                        self.right_mouse_held,
+                        gameplay,
+                        self.cursor_grabbed,
+                    );
+                    self.bow.tick(dt, bow_target);
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -8496,6 +8671,7 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
                         self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
@@ -8932,6 +9108,7 @@ impl ApplicationHandler for GameApp {
                     ));
                     if let Some(bar) = frame_progress_bar(
                         self.eating.progress(),
+                        self.bow.progress(),
                         self.mining.progress(),
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
@@ -22082,6 +22259,7 @@ mod tests {
         );
         for quiet in [
             RightClickOutcome::EatingStarted,
+            RightClickOutcome::BowChargeStarted,
             RightClickOutcome::Nothing,
             RightClickOutcome::TableOpened,
             RightClickOutcome::ChestOpened(IVec3::ZERO),
@@ -22095,19 +22273,19 @@ mod tests {
     fn eating_frame_progress_bar_prefers_eating_then_mining_then_none() {
         use opencraft::ui::hud::EATING_FILL_COLOR;
 
-        let eating = frame_progress_bar(Some(0.5), Some(0.5), 1280, 720)
-            .expect("eating wins when both bars exist");
+        let eating = frame_progress_bar(Some(0.5), None, Some(0.5), 1280, 720)
+            .expect("eating wins when eating and mining bars exist");
         assert_eq!(eating[1].color, EATING_FILL_COLOR);
 
-        let mining =
-            frame_progress_bar(None, Some(0.5), 1280, 720).expect("mining is the fallback bar");
+        let mining = frame_progress_bar(None, None, Some(0.5), 1280, 720)
+            .expect("mining is the fallback bar");
         assert_eq!(
             mining[1].color,
             mining_progress_quads(0.5, 1280, 720)[1].color
         );
         assert_ne!(eating[1].color, mining[1].color);
 
-        assert!(frame_progress_bar(None, None, 1280, 720).is_none());
+        assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
     }
 
     /// S05-T03: a lifecycle screen entry drops the right hold and any partial
@@ -23172,5 +23350,378 @@ mod tests {
             BlockId::WheatStage2,
             "the rebuilt crop resumes growing from the persisted stage"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T05: right-click bow wiring, release, reset boundaries, HUD bar
+    // -----------------------------------------------------------------------
+
+    fn bow_item() -> Item {
+        Item::tool_with_durability(
+            ToolKind::Bow,
+            ToolTier::Wood,
+            ToolTier::Wood.max_durability(),
+        )
+        .expect("a wood bow is constructible")
+    }
+
+    fn arrow_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Arrow), count).expect("valid arrow stack")
+    }
+
+    /// A session with a wood bow selected in slot 0 and `arrows` in slot 1.
+    fn bow_session(dir: &Path, seed: u32, name: &str, mode: GameMode) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(bow_item());
+        slots[1] = Some(arrow_item(3));
+        let mut player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(mode);
+        assert!(player.select_slot(0));
+        session.player = player;
+        session
+    }
+
+    fn bow_draw_to_full(bow: &mut BowState, session: &WorldSession) {
+        for _ in 0..10 {
+            let target = bow_charge_candidate(session, true, true, true);
+            bow.tick(0.1, target);
+        }
+    }
+
+    fn selected_bow_durability(session: &WorldSession) -> Option<u16> {
+        session
+            .player
+            .selected_item()
+            .and_then(|item| item.durability())
+    }
+
+    fn arrow_count(session: &WorldSession) -> u32 {
+        player_item_count(&session.player, ItemId::Material(Material::Arrow))
+    }
+
+    #[test]
+    fn bow_right_click_priority_matrix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut bow = bow_session(dir.path(), 90, "bow-priority.mcvx", GameMode::Survival);
+        assert!(matches!(
+            right_click_interaction(&mut bow),
+            RightClickOutcome::BowChargeStarted
+        ));
+        assert_eq!(
+            right_click_notice(&RightClickOutcome::BowChargeStarted),
+            None
+        );
+        assert_eq!(bow.world.get_block(0, 6, 0), BlockId::Air);
+
+        // A targeted chest still wins over a held bow.
+        let chest_pos = IVec3::new(0, 5, 0);
+        bow.world
+            .set_block_immediate(chest_pos.x, chest_pos.y, chest_pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut bow, chest_pos);
+        assert!(matches!(
+            right_click_interaction(&mut bow),
+            RightClickOutcome::ChestOpened(opened) if opened == chest_pos
+        ));
+
+        // Food keeps its own branches when no bow is selected.
+        let mut food =
+            survival_food_session(dir.path(), 91, "bow-priority-food.mcvx", apple_item(3), 10);
+        assert!(matches!(
+            right_click_interaction(&mut food),
+            RightClickOutcome::EatingStarted
+        ));
+        let mut full = survival_food_session(
+            dir.path(),
+            92,
+            "bow-priority-full.mcvx",
+            apple_item(3),
+            MAX_HUNGER,
+        );
+        assert!(matches!(
+            right_click_interaction(&mut full),
+            RightClickOutcome::EatingRefused
+        ));
+
+        // Blocks still fall through to placement.
+        let mut blocks = survival_food_session(
+            dir.path(),
+            93,
+            "bow-priority-block.mcvx",
+            Item::new(ItemId::Block(BlockId::Stone), 2).expect("stone stack"),
+            MAX_HUNGER,
+        );
+        let stone_pos = IVec3::new(0, 5, 0);
+        blocks
+            .world
+            .set_block_immediate(stone_pos.x, stone_pos.y, stone_pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut blocks, stone_pos);
+        assert!(matches!(
+            right_click_interaction(&mut blocks),
+            RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()
+        ));
+
+        // A bow works in Creative too (there is deliberately no mode gate).
+        let mut creative = bow_session(dir.path(), 94, "bow-creative.mcvx", GameMode::Creative);
+        assert!(matches!(
+            right_click_interaction(&mut creative),
+            RightClickOutcome::BowChargeStarted
+        ));
+    }
+
+    #[test]
+    fn bow_charge_candidate_gates_every_cancel_condition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = bow_session(dir.path(), 95, "bow-candidate.mcvx", GameMode::Survival);
+
+        assert_eq!(
+            bow_charge_candidate(&session, true, true, true).map(|target| target.slot()),
+            Some(0),
+            "an idle Survival player holding right click draws"
+        );
+        assert!(bow_charge_candidate(&session, false, true, true).is_none());
+        assert!(bow_charge_candidate(&session, true, false, true).is_none());
+        assert!(bow_charge_candidate(&session, true, true, false).is_none());
+
+        let creative = bow_session(
+            dir.path(),
+            96,
+            "bow-candidate-creative.mcvx",
+            GameMode::Creative,
+        );
+        assert!(
+            bow_charge_candidate(&creative, true, true, true).is_some(),
+            "Creative may draw"
+        );
+
+        let food =
+            survival_food_session(dir.path(), 97, "bow-candidate-food.mcvx", apple_item(1), 10);
+        assert!(
+            bow_charge_candidate(&food, true, true, true).is_none(),
+            "a non-bow selection never starts a draw"
+        );
+
+        let mut dead = bow_session(
+            dir.path(),
+            98,
+            "bow-candidate-dead.mcvx",
+            GameMode::Survival,
+        );
+        dead.player.survival.damage(MAX_HUNGER);
+        assert!(dead.is_dead(), "fixture kills the player");
+        assert!(bow_charge_candidate(&dead, true, true, true).is_none());
+    }
+
+    #[test]
+    fn bow_sub_threshold_release_cancels_without_ammo_or_wear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 99, "bow-tap.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        let target = bow_charge_candidate(&session, true, true, true).expect("bow target");
+
+        bow.tick(0.1, Some(target));
+        assert!(bow.progress().is_some(), "one frame is a live charge");
+        let durability_before = selected_bow_durability(&session);
+        let arrows_before = arrow_count(&session);
+
+        assert_eq!(release_bow(&mut bow, &mut session, true, true), None);
+        assert_eq!(bow.progress(), None, "release always resets the draw");
+        assert!(session.arrows().is_empty(), "a tap never fires");
+        assert_eq!(arrow_count(&session), arrows_before, "a tap spends no ammo");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before,
+            "a tap wears nothing"
+        );
+    }
+
+    #[test]
+    fn bow_full_charge_fires_exactly_one_arrow_and_wears_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 100, "bow-fire.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        bow_draw_to_full(&mut bow, &session);
+        assert_eq!(bow.progress(), Some(1.0));
+        let arrows_before = arrow_count(&session);
+        let durability_before = selected_bow_durability(&session).expect("tool durability");
+
+        let error = release_bow(&mut bow, &mut session, true, true);
+
+        assert_eq!(error, None, "a full draw fires");
+        assert_eq!(session.arrows().len(), 1, "exactly one arrow");
+        assert_eq!(
+            session.arrows()[0].owner,
+            opencraft::world::arrow::ArrowOwner::Player
+        );
+        assert_eq!(session.arrows()[0].damage, 4, "full draw is 4 damage");
+        assert_eq!(arrow_count(&session), arrows_before - 1, "one arrow spent");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before.checked_sub(1),
+            "one point of wear"
+        );
+        assert_eq!(bow.progress(), None);
+    }
+
+    #[test]
+    fn bow_release_on_a_panel_or_ungrabbed_cursor_resets_and_fires_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 101, "bow-release-gate.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        let arrows_before = arrow_count(&session);
+        let durability_before = selected_bow_durability(&session);
+
+        bow_draw_to_full(&mut bow, &session);
+        assert_eq!(release_bow(&mut bow, &mut session, false, true), None);
+        assert_eq!(bow.progress(), None, "panel frame still resets the draw");
+        assert!(session.arrows().is_empty(), "a panel frame never fires");
+
+        bow_draw_to_full(&mut bow, &session);
+        assert_eq!(release_bow(&mut bow, &mut session, true, false), None);
+        assert_eq!(bow.progress(), None, "ungrabbed cursor still resets");
+        assert!(
+            session.arrows().is_empty(),
+            "an ungrabbed cursor never fires"
+        );
+        assert_eq!(arrow_count(&session), arrows_before);
+        assert_eq!(selected_bow_durability(&session), durability_before);
+    }
+
+    #[test]
+    fn bow_release_notice_names_only_no_ammo() {
+        assert_eq!(
+            bow_release_notice(Some(BowFireError::NoAmmo)),
+            Some("No arrows")
+        );
+        for quiet in [
+            None,
+            Some(BowFireError::Dead),
+            Some(BowFireError::NotHoldingBow),
+            Some(BowFireError::ArrowCapReached),
+            Some(BowFireError::InvalidShot),
+        ] {
+            assert_eq!(bow_release_notice(quiet), None);
+        }
+    }
+
+    #[test]
+    fn bow_without_ammo_refuses_without_wear_and_reports_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 102, "bow-no-ammo.mcvx", GameMode::Survival);
+        for _ in 0..3 {
+            assert!(session
+                .player
+                .consume_item(ItemId::Material(Material::Arrow))
+                .is_some());
+        }
+        assert_eq!(arrow_count(&session), 0);
+        let durability_before = selected_bow_durability(&session);
+
+        let mut bow = BowState::new();
+        bow_draw_to_full(&mut bow, &session);
+        let error = release_bow(&mut bow, &mut session, true, true);
+
+        assert_eq!(error, Some(BowFireError::NoAmmo));
+        assert_eq!(bow_release_notice(error), Some("No arrows"));
+        assert!(session.arrows().is_empty(), "a refused shot spawns nothing");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before,
+            "a refused shot wears nothing"
+        );
+        assert_eq!(bow.progress(), None);
+    }
+
+    #[test]
+    fn bow_state_cleared_by_enter_screen_enter_playing_death_and_session_swap() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        let target = BowTarget::new(0, bow_item()).expect("bow target");
+
+        // Every lifecycle screen entry clears a live charge.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_screen(LifecycleScreen::MainMenu);
+        assert_eq!(app.bow.progress(), None, "screen entry clears the draw");
+
+        // Entering Playing clears a draw too (defensive trip-through-menu).
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_playing();
+        assert_eq!(app.bow.progress(), None, "Playing entry clears the draw");
+
+        // A Death entry routes through enter_screen.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_screen(LifecycleScreen::Death);
+        assert_eq!(app.bow.progress(), None, "Death entry clears the draw");
+
+        // A world swap (on_session_installed) clears the draw.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert_eq!(app.bow.progress(), None, "session swap clears the draw");
+    }
+
+    #[test]
+    fn reset_panel_holds_clears_a_live_draw_and_meal() {
+        let mut mining = MiningState::new();
+        let mut eating = EatingState::new();
+        let mut bow = BowState::new();
+        let meal = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        eating.tick(0.5, Some(meal));
+        let target = BowTarget::new(0, bow_item()).expect("bow target");
+        bow.tick(0.5, Some(target));
+        assert!(eating.progress().is_some());
+        assert!(bow.progress().is_some());
+
+        reset_panel_holds(&mut mining, &mut eating, &mut bow);
+
+        assert_eq!(eating.progress(), None, "meal cleared");
+        assert_eq!(bow.progress(), None, "draw cleared");
+        assert!(mining.progress().is_none());
+    }
+
+    #[test]
+    fn bow_frame_progress_bar_prefers_eating_then_bow_then_mining() {
+        use opencraft::ui::hud::{BOW_FILL_COLOR, EATING_FILL_COLOR};
+
+        let eating = frame_progress_bar(Some(0.5), Some(0.5), Some(0.5), 1280, 720)
+            .expect("eating wins when every bar exists");
+        assert_eq!(eating[1].color, EATING_FILL_COLOR);
+
+        let bow =
+            frame_progress_bar(None, Some(0.5), Some(0.5), 1280, 720).expect("bow beats mining");
+        assert_eq!(bow[1].color, BOW_FILL_COLOR);
+
+        let mining = frame_progress_bar(None, None, Some(0.5), 1280, 720)
+            .expect("mining is the fallback bar");
+        assert_eq!(
+            mining[1].color,
+            mining_progress_quads(0.5, 1280, 720)[1].color
+        );
+        assert_ne!(eating[1].color, bow[1].color);
+        assert_ne!(bow[1].color, mining[1].color);
+
+        assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
     }
 }
