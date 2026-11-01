@@ -3,8 +3,8 @@ use glam::Vec3;
 use crate::player::container::Container;
 use crate::player::eating::food_value;
 use crate::player::inventory::{
-    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemId,
-    ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
+    CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
+    InventoryError, Item, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
@@ -398,6 +398,16 @@ impl Player {
     /// on the ground.
     pub fn collect_item(&mut self, item: Item) -> bool {
         self.inventory.insert(item).is_ok()
+    }
+
+    /// Best-effort batch collection in hotbar-then-main order.
+    ///
+    /// Thin forwarder over [`Inventory::collect_items`]. M009 mob drops use
+    /// this instead of [`Player::collect_item`]: a full inventory accepts what
+    /// fits, reports the overflow as [`CollectBatchOutcome::lost`], and never
+    /// touches the cursor or either crafting grid.
+    pub fn collect_items(&mut self, items: &[Item]) -> CollectBatchOutcome {
+        self.inventory.collect_items(items)
     }
 
     /// Consumes exactly one item from the selected hotbar slot.
@@ -1069,6 +1079,50 @@ mod tests {
             &before,
             "a rejected item leaves every slot untouched"
         );
+    }
+
+    #[test]
+    fn collect_items_forwarder_reports_acceptance_and_leaves_cursor_and_grids_alone() {
+        // The forwarder really reaches the aggregate: an empty player accepts
+        // the whole batch in hotbar order.
+        let mut player = Player::new(Vec3::ZERO);
+        let sticks = stick_item(3);
+        let apple = apple_item(1);
+        let outcome = player.collect_items(&[sticks, apple]);
+        assert_eq!(outcome, CollectBatchOutcome::new(4, 0));
+        assert!(!outcome.lost_any());
+        assert_eq!(player.inventory().slot(0), Some(sticks));
+        assert_eq!(player.inventory().slot(1), Some(apple));
+
+        // A deliberately full player: 36 tool slots and a tool on the cursor.
+        // Nothing can merge, so the batch is entirely lost and every other
+        // storage surface must stay byte-identical.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(3, Some(stick_item(2)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::Stone, 5)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            full_tool_inventory_with_cursor(),
+            player_grid,
+            table_grid,
+        );
+        let inventory_before = player.inventory().clone();
+        let cursor_before = player.inventory().cursor();
+        let player_grid_before = player.player_grid().clone();
+        let table_grid_before = player.table_grid().clone();
+
+        let outcome = player.collect_items(&[stick_item(10), apple_item(1)]);
+        assert_eq!(outcome, CollectBatchOutcome::new(0, 11));
+        assert!(outcome.lost_any());
+        assert_eq!(player.inventory(), &inventory_before);
+        assert_eq!(player.inventory().cursor(), cursor_before);
+        assert_eq!(player.player_grid(), &player_grid_before);
+        assert_eq!(player.table_grid(), &table_grid_before);
     }
 
     #[test]

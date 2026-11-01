@@ -629,6 +629,31 @@ pub struct CollectOutcome {
     pub accepted: u16,
 }
 
+/// Result of [`Inventory::collect_items`]: a best-effort batch with an
+/// explicit accepted/lost report.
+///
+/// Unlike [`CollectOutcome`], this is not tied to a block identity and it
+/// accounts for the whole batch, so callers can decide what to do with the
+/// remainder instead of losing it silently.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CollectBatchOutcome {
+    /// Total units moved into the inventory across every item in the batch.
+    pub accepted: u32,
+    /// Total units that did not fit and stayed with the caller.
+    pub lost: u32,
+}
+
+impl CollectBatchOutcome {
+    pub const fn new(accepted: u32, lost: u32) -> Self {
+        Self { accepted, lost }
+    }
+
+    /// Whether any unit of the batch failed to fit.
+    pub fn lost_any(&self) -> bool {
+        self.lost > 0
+    }
+}
+
 /// Errors from inventory mutation. Every error leaves the inventory exactly
 /// as it was before the call.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -915,6 +940,68 @@ impl Inventory {
             first_slot,
             accepted: amount - remaining,
         })
+    }
+
+    /// Best-effort batch collection in flat hotbar-then-main order.
+    ///
+    /// This is the best-effort sibling of [`Inventory::insert`] and
+    /// [`Inventory::insert_all`], whose all-or-nothing contracts the chest
+    /// break and wheat-harvest preflights depend on. Every stackable item
+    /// merges into compatible existing stacks first (never past
+    /// [`ItemId::stack_limit`]) and then fills empty slots, splitting with
+    /// [`Item::with_count`]; a non-stackable tool takes at most one empty slot
+    /// as a whole. Whatever still does not fit is counted in
+    /// [`CollectBatchOutcome::lost`] and left for the caller, so a full
+    /// inventory loses only the overflow.
+    ///
+    /// This never touches [`Inventory::cursor`] and the crafting grids live
+    /// outside the aggregate, so neither can be a batch destination. Units are
+    /// conserved per batch: `accepted + lost == sum(items.count)`.
+    pub fn collect_items(&mut self, items: &[Item]) -> CollectBatchOutcome {
+        let mut accepted: u32 = 0;
+        let mut lost: u32 = 0;
+
+        for item in items {
+            if item.is_stackable() {
+                let limit = item.id.stack_limit();
+                let mut remaining = item.count;
+
+                for existing in self.slots.iter_mut().flatten() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if existing.mergeable_with(item) && existing.count < limit {
+                        let moved = remaining.min(limit - existing.count);
+                        existing.count += moved;
+                        remaining -= moved;
+                    }
+                }
+
+                for slot in self.slots.iter_mut() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if slot.is_none() {
+                        let moved = remaining.min(limit);
+                        *slot = Some(
+                            item.with_count(moved)
+                                .expect("partial count stays within the limit"),
+                        );
+                        remaining -= moved;
+                    }
+                }
+
+                accepted += u32::from(item.count - remaining);
+                lost += u32::from(remaining);
+            } else if let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(*item);
+                accepted += u32::from(item.count);
+            } else {
+                lost += u32::from(item.count);
+            }
+        }
+
+        CollectBatchOutcome::new(accepted, lost)
     }
 
     /// Consumes one unit from `index`, returning it. Clears the slot at zero.
@@ -2518,6 +2605,217 @@ mod tests {
         assert_eq!(inventory.collect_block(BlockId::Water, 1), None);
         assert_eq!(inventory.collect_block(BlockId::Stone, 0), None);
         assert_eq!(inventory, Inventory::empty());
+    }
+
+    // -- Best-effort batch collection ---------------------------------------
+
+    fn slot_units(inventory: &Inventory) -> u32 {
+        inventory
+            .slots()
+            .iter()
+            .flatten()
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn collect_items_accepts_everything_on_an_empty_inventory_like_insert_all() {
+        let items = [
+            block(BlockId::Stone, 900),
+            stick(30),
+            tool(ToolKind::Pickaxe, ToolTier::Iron),
+        ];
+        let total: u32 = items.iter().map(|item| u32::from(item.count())).sum();
+
+        let mut collected = Inventory::empty();
+        let outcome = collected.collect_items(&items);
+        assert_eq!(outcome, CollectBatchOutcome::new(total, 0));
+        assert!(!outcome.lost_any());
+
+        let mut inserted = Inventory::empty();
+        inserted.insert_all(&items).expect("all items fit");
+        assert_eq!(
+            collected.slots(),
+            inserted.slots(),
+            "a batch with room left produces the same slots insert_all would"
+        );
+        assert_eq!(slot_units(&collected), total);
+        assert_eq!(collected.cursor(), None, "the cursor is never a target");
+    }
+
+    #[test]
+    fn collect_items_accepts_the_remaining_room_and_reports_the_rest() {
+        // 35 full stick stacks plus one empty slot: only 64 units fit.
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(stick(MATERIAL_STACK_LIMIT));
+        }
+        let outcome =
+            inventory.collect_items(&[stick(MATERIAL_STACK_LIMIT), stick(MATERIAL_STACK_LIMIT)]);
+        assert_eq!(outcome.accepted, u32::from(MATERIAL_STACK_LIMIT));
+        assert_eq!(outcome.lost, u32::from(MATERIAL_STACK_LIMIT));
+        assert!(outcome.lost_any());
+        assert_eq!(
+            inventory.slot(INVENTORY_SLOTS - 1).map(|item| item.count()),
+            Some(MATERIAL_STACK_LIMIT)
+        );
+
+        // 35 full stacks plus one unit of room: exactly one unit is accepted.
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(stick(MATERIAL_STACK_LIMIT));
+        }
+        inventory.slots[INVENTORY_SLOTS - 1] = Some(stick(MATERIAL_STACK_LIMIT - 1));
+        let outcome = inventory.collect_items(&[stick(MATERIAL_STACK_LIMIT)]);
+        assert_eq!(
+            outcome,
+            CollectBatchOutcome::new(1, u32::from(MATERIAL_STACK_LIMIT) - 1)
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            u32::from(MATERIAL_STACK_LIMIT) * 35 + u32::from(MATERIAL_STACK_LIMIT)
+        );
+    }
+
+    #[test]
+    fn collect_items_merges_across_entries_before_using_an_empty_slot() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(stick(30));
+
+        let outcome = inventory.collect_items(&[stick(20), stick(20)]);
+        assert_eq!(outcome, CollectBatchOutcome::new(40, 0));
+        assert_eq!(
+            inventory.hotbar(0).map(|item| item.count()),
+            Some(MATERIAL_STACK_LIMIT),
+            "both entries top up the existing stack first"
+        );
+        assert_eq!(
+            inventory.hotbar(1).map(|item| item.count()),
+            Some(6),
+            "only the true remainder opens a new slot"
+        );
+        assert_eq!(inventory.hotbar(2), None);
+    }
+
+    #[test]
+    fn collect_items_never_exceeds_a_stack_limit_in_hotbar_or_main() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[HOTBAR_SLOTS] = Some(block(BlockId::Stone, MAX_STACK_COUNT - 2));
+
+        let items = [
+            block(BlockId::Stone, MAX_STACK_COUNT),
+            stick(MATERIAL_STACK_LIMIT),
+            stick(5),
+        ];
+        let outcome = inventory.collect_items(&items);
+        assert!(!outcome.lost_any());
+        for (index, slot) in inventory.slots().iter().enumerate() {
+            if let Some(item) = slot {
+                assert!(
+                    item.count() <= item.id().stack_limit(),
+                    "slot {index} holds {} above the limit {}",
+                    item.count(),
+                    item.id().stack_limit()
+                );
+            }
+        }
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Stone)),
+            u32::from(MAX_STACK_COUNT) - 2 + u32::from(MAX_STACK_COUNT)
+        );
+    }
+
+    #[test]
+    fn collect_items_on_a_full_inventory_loses_everything_without_mutation() {
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        let mut inventory = Inventory::from_parts(*inventory.slots(), Some(stick(3)));
+        let before = inventory.clone();
+
+        let outcome = inventory.collect_items(&[
+            stick(10),
+            tool(ToolKind::Pickaxe, ToolTier::Iron),
+            block(BlockId::Dirt, 5),
+        ]);
+        assert_eq!(outcome, CollectBatchOutcome::new(0, 16));
+        assert_eq!(inventory, before, "a full aggregate mutates nothing");
+        assert_eq!(inventory.cursor(), Some(stick(3)));
+    }
+
+    #[test]
+    fn collect_items_gives_a_tool_one_empty_slot_and_loses_the_second() {
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(block(BlockId::Brick, MAX_STACK_COUNT));
+        }
+
+        let pickaxe = tool(ToolKind::Pickaxe, ToolTier::Iron);
+        let axe = tool(ToolKind::Axe, ToolTier::Iron);
+        let outcome = inventory.collect_items(&[pickaxe, axe]);
+        assert_eq!(outcome, CollectBatchOutcome::new(1, 1));
+        assert_eq!(inventory.slot(INVENTORY_SLOTS - 1), Some(pickaxe));
+        assert_eq!(
+            inventory
+                .slots()
+                .iter()
+                .flatten()
+                .filter(|item| item.is_tool())
+                .count(),
+            1,
+            "tools never merge and the overflow is lost, not duplicated"
+        );
+    }
+
+    #[test]
+    fn collect_items_conserves_counts_across_hotbar_and_main() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, 10));
+        inventory.slots[HOTBAR_SLOTS] = Some(stick(60));
+        inventory.slots[HOTBAR_SLOTS + 3] = Some(block(BlockId::Dirt, MAX_STACK_COUNT));
+        let before = slot_units(&inventory);
+
+        let items = [stick(20), block(BlockId::Stone, 5), stick(3)];
+        let requested: u32 = items.iter().map(|item| u32::from(item.count())).sum();
+        let outcome = inventory.collect_items(&items);
+        let after = slot_units(&inventory);
+
+        assert_eq!(before + outcome.accepted, after, "no unit is duplicated");
+        assert_eq!(
+            before + requested - outcome.lost,
+            after,
+            "only the reported overflow is dropped"
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            60 + 20 + 3 - outcome.lost
+        );
+    }
+
+    #[test]
+    fn collect_items_leaves_the_cursor_untouched() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, MAX_STACK_COUNT));
+        let mut inventory =
+            Inventory::from_parts(*inventory.slots(), Some(block(BlockId::Stone, 7)));
+
+        let outcome = inventory.collect_items(&[block(BlockId::Stone, MAX_STACK_COUNT)]);
+        assert_eq!(outcome.accepted, u32::from(MAX_STACK_COUNT));
+        assert_eq!(
+            inventory.cursor(),
+            Some(block(BlockId::Stone, 7)),
+            "a matching cursor is never a batch destination"
+        );
+    }
+
+    #[test]
+    fn collect_items_accepts_an_empty_batch_without_mutation() {
+        let mut inventory = Inventory::empty();
+        inventory.cursor = Some(stick(2));
+        let before = inventory.clone();
+
+        assert_eq!(inventory.collect_items(&[]), CollectBatchOutcome::default());
+        assert!(!inventory.collect_items(&[]).lost_any());
+        assert_eq!(inventory, before);
     }
 
     #[test]
