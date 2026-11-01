@@ -28,6 +28,7 @@ use crate::world::daycycle::GameClock;
 use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
+use crate::world::mob::{Mob, MobRuntime, MobTick};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
@@ -81,6 +82,13 @@ pub struct WorldSession {
     /// gated until the chunks containing the feet and four blocks below are
     /// resident. Ephemeral and never saved.
     spawn_settle: bool,
+    /// Flat session-owned mob list (D131). Ephemeral in S01: every
+    /// construction starts empty and saves do not round-trip mobs yet; S02
+    /// adds persistence. Records are never dropped by simulation.
+    mobs: Vec<Mob>,
+    /// Fixed-rate 20 Hz mob driver, seeded from the session's world seed.
+    /// Ephemeral like `survival_runtime`.
+    mob_runtime: MobRuntime,
 }
 
 impl WorldSession {
@@ -127,6 +135,8 @@ impl WorldSession {
             survival_runtime: SurvivalRuntime::default(),
             crops: CropRuntime::default(),
             spawn_settle: mode == GameMode::Survival,
+            mobs: Vec::new(),
+            mob_runtime: MobRuntime::new(seed),
         };
         session.sync_camera();
         session
@@ -172,6 +182,8 @@ impl WorldSession {
             crops: CropRuntime::default(),
             // Edit Background is a Creative-rules editor and is never gated.
             spawn_settle: false,
+            mobs: Vec::new(),
+            mob_runtime: MobRuntime::new(seed),
         };
         session.sync_camera();
         session
@@ -244,6 +256,9 @@ impl WorldSession {
             // A restored player is never spawn-gated: the visible world state
             // is the save's, and a mid-air fall must still hurt.
             spawn_settle: false,
+            // S01 does not persist mob records yet; S02 owns that.
+            mobs: Vec::new(),
+            mob_runtime: MobRuntime::new(seed),
         };
         session.sync_camera();
         session
@@ -311,6 +326,71 @@ impl WorldSession {
         };
         self.survival_runtime
             .tick(&mut self.player.survival, ctx, game_dt)
+    }
+
+    /// The session's flat mob list (D131). Renderer and diagnostics read it.
+    #[inline]
+    pub fn mobs(&self) -> &[Mob] {
+        &self.mobs
+    }
+
+    /// Mutable access for spawning and (later) save restore. Simulation never
+    /// removes records on its own.
+    #[inline]
+    pub fn mobs_mut(&mut self) -> &mut Vec<Mob> {
+        &mut self.mobs
+    }
+
+    /// Whether the chunk containing the mob's feet is resident. A mob in an
+    /// unloaded chunk stays in the list but is frozen until it streams in.
+    pub fn mob_is_resident(&self, mob: &Mob) -> bool {
+        let (chunk, _) = world_to_chunk_and_local(
+            mob.position.x.floor() as i32,
+            mob.position.y.floor() as i32,
+            mob.position.z.floor() as i32,
+        );
+        self.world.is_resident(chunk)
+    }
+
+    /// Every mob whose feet chunk is currently resident. Ordering matches
+    /// [`WorldSession::mobs`], so render batch and entity list stay aligned.
+    pub fn resident_mobs(&self) -> impl Iterator<Item = &Mob> + '_ {
+        self.mobs.iter().filter(|mob| self.mob_is_resident(mob))
+    }
+
+    /// Whether the fresh Survival spawn gate is still waiting for chunks.
+    /// T05 uses this to tell a fresh `--demo-combat` session from a loaded
+    /// one without exposing the mutable flag.
+    #[inline]
+    pub fn spawn_settle_pending(&self) -> bool {
+        self.spawn_settle
+    }
+
+    /// Advances the fixed-rate 20 Hz mob runtime by one frame of game time.
+    ///
+    /// Exactly the [`WorldSession::tick_survival`] clamp contract: `dt` is
+    /// clamped to `0..=0.1`, then scaled by `time_scale` (negative becomes
+    /// zero), and non-finite/non-positive game time is a no-op. Residency is
+    /// resolved per mob from the live world manager, so a mob in an unloaded
+    /// chunk neither moves nor decays.
+    pub fn tick_mobs(&mut self, dt: f32, time_scale: f32) -> MobTick {
+        let dt = dt.clamp(0.0, 0.1);
+        let game_dt = dt * time_scale.max(0.0);
+        if !game_dt.is_finite() || game_dt <= 0.0 {
+            return MobTick::default();
+        }
+
+        let world = &self.world;
+        let runtime = &mut self.mob_runtime;
+        let mobs = &mut self.mobs;
+        runtime.tick(game_dt, mobs, |position| {
+            let (chunk, _) = world_to_chunk_and_local(
+                position.x.floor() as i32,
+                position.y.floor() as i32,
+                position.z.floor() as i32,
+            );
+            world.is_resident(chunk)
+        })
     }
 
     /// Tills a live `Grass` or `Dirt` block into `Farmland` when a Hoe is
@@ -896,6 +976,7 @@ mod tests {
     use crate::player::physics::InputState;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
+    use crate::world::mob::MobKind;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
     fn make_save(seed: u32) -> WorldSaveData {
@@ -3461,5 +3542,178 @@ mod tests {
         assert_eq!(session.crops.progress(pos), Some(0.0));
         session.remove_crop(pos);
         assert_eq!(session.crops.progress(pos), None);
+    }
+
+    fn make_mob_session(seed: u32) -> WorldSession {
+        let session = WorldSession::new_session(
+            seed,
+            PathBuf::from("/tmp/session-mobs.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        session
+    }
+
+    fn add_resident_air(session: &mut WorldSession) {
+        session.world.insert_chunk_for_test(
+            ChunkPos::new(0, 0, 0),
+            crate::world::chunk::Chunk::new_uniform(BlockId::Air),
+        );
+    }
+
+    #[test]
+    fn tick_mobs_moves_resident_and_freezes_unloaded_but_keeps_the_record() {
+        let mut session = make_mob_session(31);
+        add_resident_air(&mut session);
+        let resident_home = Vec3::new(8.5, 5.0, 8.5);
+        let unloaded_home = Vec3::new(100.5, 5.0, 100.5);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, resident_home, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Cow, unloaded_home, 0.0));
+
+        for _ in 0..10 {
+            assert_eq!(session.tick_mobs(0.05, 1.0).ai_steps, 1);
+        }
+
+        assert_eq!(session.mobs().len(), 2, "records are never dropped");
+        assert_ne!(session.mobs()[0].position, resident_home);
+        assert_eq!(session.mobs()[1].position, unloaded_home);
+        assert_eq!(session.mobs()[1].walk_phase, 0.0);
+    }
+
+    #[test]
+    fn tick_mobs_is_frame_rate_independent_through_the_session() {
+        let mut a = make_mob_session(32);
+        let mut b = make_mob_session(32);
+        add_resident_air(&mut a);
+        add_resident_air(&mut b);
+        let spawn = Vec3::new(8.5, 5.0, 8.5);
+        a.mobs_mut().push(Mob::new(MobKind::Zombie, spawn, 0.0));
+        b.mobs_mut().push(Mob::new(MobKind::Zombie, spawn, 0.0));
+
+        let mut a_steps = 0;
+        for _ in 0..10 {
+            a_steps += a.tick_mobs(0.05, 1.0).ai_steps;
+        }
+        let mut b_steps = 0;
+        for _ in 0..50 {
+            b_steps += b.tick_mobs(0.01, 1.0).ai_steps;
+        }
+
+        assert_eq!(a_steps, 10);
+        assert_eq!(b_steps, 10);
+        assert!((a.mobs()[0].position - b.mobs()[0].position).length() < 1e-3);
+        assert!((a.mobs()[0].walk_phase - b.mobs()[0].walk_phase).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tick_mobs_clamps_dt_and_freezes_at_zero_time_scale() {
+        let mut session = make_mob_session(33);
+        add_resident_air(&mut session);
+        let spawn = Vec3::new(8.5, 5.0, 8.5);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, spawn, 0.0));
+
+        // Raw dt 5.0 clamps to 0.1 s => exactly two fixed steps.
+        assert_eq!(session.tick_mobs(5.0, 1.0).ai_steps, 2);
+        let after_clamp = session.mobs()[0].position;
+
+        assert_eq!(session.tick_mobs(0.05, 0.0).ai_steps, 0);
+        assert_eq!(session.tick_mobs(0.05, -2.0).ai_steps, 0);
+        assert_eq!(session.mobs()[0].position, after_clamp);
+
+        // A resident mob still advances when time is allowed to flow.
+        assert_eq!(session.tick_mobs(0.05, 1.0).ai_steps, 1);
+        assert_ne!(session.mobs()[0].position, after_clamp);
+    }
+
+    #[test]
+    fn resident_mobs_filters_by_feet_chunk() {
+        let mut session = make_mob_session(34);
+        add_resident_air(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0));
+        session.mobs_mut().push(Mob::new(
+            MobKind::Skeleton,
+            Vec3::new(-8.5, 5.0, -8.5),
+            0.0,
+        ));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Cow, Vec3::new(33.5, 5.0, 8.5), 0.0));
+
+        assert!(session.mob_is_resident(&session.mobs()[0]));
+        assert!(!session.mob_is_resident(&session.mobs()[1]));
+        assert!(!session.mob_is_resident(&session.mobs()[2]));
+
+        let kinds: Vec<MobKind> = session.resident_mobs().map(|mob| mob.kind).collect();
+        assert_eq!(kinds, vec![MobKind::Pig]);
+    }
+
+    #[test]
+    fn hurt_decays_only_on_resident_mobs_through_the_session() {
+        let mut session = make_mob_session(35);
+        add_resident_air(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0));
+        session.mobs_mut().push(Mob::new(
+            MobKind::Zombie,
+            Vec3::new(100.5, 5.0, 100.5),
+            0.0,
+        ));
+        session.mobs_mut()[0].hurt = 0.2;
+        session.mobs_mut()[1].hurt = 0.2;
+
+        for _ in 0..6 {
+            session.tick_mobs(0.05, 1.0);
+        }
+
+        assert!(session.mobs()[0].hurt <= 1e-5);
+        assert!((session.mobs()[1].hurt - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mob_positions_stay_finite_over_100_session_steps() {
+        let mut session = make_mob_session(36);
+        add_resident_air(&mut session);
+        for (i, kind) in MobKind::ALL.iter().copied().enumerate() {
+            session.mobs_mut().push(Mob::new(
+                kind,
+                Vec3::new(8.5 + i as f32, 5.0, 8.5),
+                0.0,
+            ));
+        }
+        for _ in 0..100 {
+            session.tick_mobs(0.05, 1.0);
+        }
+        for mob in session.mobs() {
+            assert!(mob.position.is_finite());
+            assert!(mob.velocity.is_finite());
+            assert!(mob.walk_phase.is_finite());
+        }
+    }
+
+    #[test]
+    fn spawn_settle_pending_exposes_only_the_fresh_survival_gate() {
+        let survival = survival_session(37);
+        assert!(survival.spawn_settle_pending());
+
+        let creative = WorldSession::new_session(
+            38,
+            PathBuf::from("/tmp/session-mobs-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert!(!creative.spawn_settle_pending());
+
+        let restored = WorldSession::session_from_save(
+            make_save(39),
+            PathBuf::from("/tmp/session-mobs-restored.mcvx"),
+        );
+        assert!(!restored.spawn_settle_pending());
     }
 }

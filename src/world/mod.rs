@@ -8,6 +8,7 @@ pub mod farming;
 pub mod light;
 pub mod loot;
 pub mod manager;
+pub mod mob;
 pub mod persistence;
 pub mod season;
 pub mod session;
