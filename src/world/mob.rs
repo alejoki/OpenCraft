@@ -145,10 +145,38 @@ impl MobKind {
     pub const fn is_hostile(self) -> bool {
         matches!(self, MobKind::Zombie | MobKind::Skeleton)
     }
+
+    /// Melee profile for this kind, or `None` when it has no melee attack.
+    ///
+    /// Only the Zombie melees in S06. Skeleton melee must never exist: S08
+    /// owns ranged combat, so returning `None` here keeps the combat demo's
+    /// damage sources exactly one.
+    pub const fn attack_profile(self) -> Option<MobAttackProfile> {
+        match self {
+            MobKind::Zombie => Some(MobAttackProfile {
+                damage: 3,
+                range: 2.0,
+                cooldown_secs: 1.0,
+            }),
+            MobKind::Pig | MobKind::Cow | MobKind::Skeleton => None,
+        }
+    }
 }
 
-/// Mob AI states. S04 adds [`MobAiState::Flee`] for passive mobs; S06 owns
-/// hostile pursuit.
+/// One melee attack shape. Kept in the mob domain so the AI stays kind-agnostic
+/// and the session can look up damage without matching on [`MobKind`] again.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MobAttackProfile {
+    /// Damage applied per landed hit.
+    pub damage: u16,
+    /// Maximum horizontal distance at which the attack can land, in blocks.
+    pub range: f32,
+    /// Seconds between landed hits (`Mob::cooldown` is armed to this value).
+    pub cooldown_secs: f32,
+}
+
+/// Mob AI states. S04 adds [`MobAiState::Flee`] for passive mobs; S06 adds
+/// [`MobAiState::Chase`] for hostile pursuit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MobAiState {
     /// Standing still; `walk_phase` does not advance.
@@ -158,6 +186,13 @@ pub enum MobAiState {
     /// Moving away from the attacker for the flee window, ignoring the home
     /// leash.
     Flee,
+    /// Hostile pursuit (S06): steering toward a player that has line of sight
+    /// inside the aggro range.
+    ///
+    /// Deliberately ephemeral: [`crate::world::persistence::SavedMob`] carries
+    /// no state, so a reload always starts every mob in `Wander` and a
+    /// hostile re-aggros from line of sight once more.
+    Chase,
 }
 
 /// One live mob record. `home` is the spawn anchor used for the leash and
@@ -205,6 +240,20 @@ pub struct Mob {
     /// no such field) and always initialised to `false`, including in
     /// [`Mob::restored`], so a reload can never carry a stale marker.
     pub despawn_pending: bool,
+    /// Remaining chase memory in seconds. S06's hostile steering refreshes it
+    /// while line of sight holds and drops the mob back to `Idle` when it
+    /// drains. Ephemeral: never persisted.
+    pub aggro: f32,
+    /// Seconds spent blocked while chasing. Reaching
+    /// [`crate::world::mob_ai::MOB_STUCK_TIMEOUT_SECS`] triggers the stuck
+    /// fallback. Ephemeral: never persisted.
+    pub stuck: f32,
+    /// Last anchored feet position used to measure net chase progress.
+    /// Ephemeral: never persisted.
+    pub stuck_anchor: Vec3,
+    /// Remaining re-aggro cooldown after the stuck fallback, in seconds.
+    /// Ephemeral: never persisted.
+    pub reaggro: f32,
 }
 
 impl Mob {
@@ -226,6 +275,10 @@ impl Mob {
             flee: 0.0,
             death: 0.0,
             despawn_pending: false,
+            aggro: 0.0,
+            stuck: 0.0,
+            stuck_anchor: position,
+            reaggro: 0.0,
         }
     }
 
@@ -250,7 +303,28 @@ impl Mob {
             flee: 0.0,
             death: 0.0,
             despawn_pending: false,
+            aggro: 0.0,
+            stuck: 0.0,
+            stuck_anchor: position,
+            reaggro: 0.0,
         }
+    }
+
+    /// Clears every ephemeral hostile-chase bookkeeping field.
+    ///
+    /// Used by respawn (T02): a respawned player must not be chased by a mob
+    /// that still remembers the old position. Health, position, yaw, and the
+    /// attack cooldown are deliberately untouched, so the body and its cadence
+    /// survive. Dropping `Chase` to `Idle` also zeroes the AI velocity.
+    pub fn reset_hostile_tracking(&mut self) {
+        self.aggro = 0.0;
+        self.stuck = 0.0;
+        self.reaggro = 0.0;
+        self.stuck_anchor = self.position;
+        if self.state == MobAiState::Chase {
+            self.state = MobAiState::Idle;
+        }
+        self.velocity = Vec3::ZERO;
     }
 
     /// Applies one melee hit: saturated damage, hurt flash, i-frames, and a
@@ -511,9 +585,15 @@ impl MobRuntime {
             mob.velocity = Vec3::ZERO;
         }
 
-        // A fleeing or dying mob keeps the heading it was given; the reroll
-        // only owns unmolested wanderers.
-        if mob.health > 0 && mob.flee <= 0.0 && self.tick_index.is_multiple_of(YAW_REROLL_STEPS) {
+        // A fleeing, chasing, or dying mob keeps the heading it was given; the
+        // reroll only owns unmolested wanderers. Without the Chase gate a
+        // hostile would be re-yawed and reset to Idle/Wander every 0.8 s
+        // (MEM419).
+        if mob.health > 0
+            && mob.flee <= 0.0
+            && mob.state != MobAiState::Chase
+            && self.tick_index.is_multiple_of(YAW_REROLL_STEPS)
+        {
             let roll = mob_roll(self.seed, self.tick_index, slot);
             let unit = (roll & 0xFFFF) as f32 / 65_535.0;
             mob.yaw = unit * std::f32::consts::TAU;
@@ -556,6 +636,13 @@ impl MobRuntime {
                         mob.position = mob.home;
                         mob.velocity = Vec3::ZERO;
                     }
+                }
+                MobAiState::Chase => {
+                    // S06-T01 hold arm: the world-aware `mob_ai::step_hostile`
+                    // call lands in T02. Nothing in production enters Chase
+                    // yet, so this only keeps a manually-set chase from
+                    // drifting while the reroll gate is exercised.
+                    mob.velocity = Vec3::ZERO;
                 }
                 MobAiState::Flee => {
                     // Flee ignores the home leash: the whole point is to put

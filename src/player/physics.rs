@@ -185,25 +185,13 @@ pub struct Player {
     fall: FallState,
 }
 
+/// Thin player-side wrapper over the shared box-vs-solid predicate.
+///
+/// The epsilon/flooring rule lives in [`crate::world::collision::solid_overlaps`]
+/// so the player and every mob mover cannot drift apart. This wrapper keeps
+/// the existing player-sized [`Aabb`] call sites unchanged.
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
-    let eps = 1e-4;
-    let min_x = (aabb.min.x + eps).floor() as i32;
-    let max_x = (aabb.max.x - eps).floor() as i32;
-    let min_y = (aabb.min.y + eps).floor() as i32;
-    let max_y = (aabb.max.y - eps).floor() as i32;
-    let min_z = (aabb.min.z + eps).floor() as i32;
-    let max_z = (aabb.max.z - eps).floor() as i32;
-
-    for y in min_y..=max_y {
-        for z in min_z..=max_z {
-            for x in min_x..=max_x {
-                if get_block(x, y, z).is_solid() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    crate::world::collision::solid_overlaps(aabb.min, aabb.max, get_block)
 }
 
 impl Player {

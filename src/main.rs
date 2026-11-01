@@ -87,6 +87,9 @@ use opencraft::world::persistence::{
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Season, Weather};
 use opencraft::world::session::{mob_drop_items, ChestCommandError};
+use opencraft::world::spawning::{
+    SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
+};
 use opencraft::world::terrain::{
     biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
     DEFAULT_WORLD_SEED, SEA_LEVEL,
@@ -1353,6 +1356,24 @@ fn scripted_demo_requested(cli: &CliConfig) -> bool {
     cli.demo_swim || cli.demo_survival || cli.demo_content || cli.demo_combat
 }
 
+/// Whether this launch is a bounded demo/watch seam that owns its own world
+/// witness: the four scripted demos plus the accelerated multi-cycle watch.
+///
+/// The watch arms on exactly [`demo_shutdown_deadline`]'s condition
+/// (`time_scale > DEFAULT_TIME_SCALE`), never on `--demo-days` alone — that
+/// flag defaults to 1, so treating it as the arming signal would close the gate
+/// for every production launch.
+///
+/// Those runs pin exact save layouts — several real-binary scripts assert a
+/// zero v7 mob count on an "edit-free fresh world" — so the ambient population
+/// layer stays closed for their whole life. That is the same ephemeral demo
+/// switch `--demo-combat` uses around its own pinned stages (M009/S05-T03):
+/// creation and daylight burning are off, the distance cull still runs.
+/// Production launches never touch it, so the shipped game keeps spawning.
+fn demo_owns_world_witness(cli: &CliConfig) -> bool {
+    scripted_demo_requested(cli) || cli.time_scale > DEFAULT_TIME_SCALE
+}
+
 /// The startup world session, mirroring main()'s pre-S03 load-or-fresh
 /// block EXACTLY (byte-identical legacy behavior — including the
 /// default.mcvx launch and every CLI-flag direct launch — now testable
@@ -1366,7 +1387,17 @@ fn scripted_demo_requested(cli: &CliConfig) -> bool {
 fn startup_session(cli: &CliConfig) -> WorldSession {
     if !cli.force_new_world && cli.save_path.exists() {
         if let Ok(save) = load_world_from_path(&cli.save_path) {
-            return WorldSession::session_from_save(save, cli.save_path.clone());
+            let mut session = WorldSession::session_from_save(save, cli.save_path.clone());
+            // A bounded accelerated watch that reloads a save must keep the
+            // same pinned witness as its fresh leg: no ambient records may
+            // appear in the next saved tail. The scripted demos are
+            // deliberately excluded here: a loaded `--demo-combat` leg is a
+            // one-call Restore that re-saves nothing, and T03 pinned that only
+            // the fresh scripted branch closes the gate.
+            if cli.time_scale > DEFAULT_TIME_SCALE {
+                session.set_ambient_spawning(false);
+            }
+            return session;
         }
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
@@ -1390,10 +1421,12 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
         WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
     if cli.demo_combat {
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
-        // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-        // digest and the v7 save tail must describe the scripted quartet only,
-        // so ambient spawning and daylight burning stay off for the whole
-        // scripted run. Production sessions never touch this switch.
+    }
+    // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
+    // digest and every bounded demo's v7 save tail must describe only what that
+    // demo placed, so ambient spawning and daylight burning stay off for the
+    // whole run. Production sessions never touch this switch.
+    if demo_owns_world_witness(cli) {
         session.set_ambient_spawning(false);
     }
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
@@ -3806,7 +3839,52 @@ const COMBAT_WALK_ABORT_UPDATES: u32 = 600;
 /// The pinned clock for a fresh `--demo-combat` world. 12_000 ticks is late
 /// afternoon (just before dusk), so the demo proves the box-model path at a
 /// deterministic, mob-visible time of day. Never derived from the wall clock.
+///
+/// **12_000 is still DAY.** [`daycycle::is_night`] opens at
+/// [`daycycle::STAR_DUSK_CLEAR_TICK`] (12_306), the first tick whose sun
+/// brightness is exactly zero, so a dusk demo cannot spawn a hostile on the lit
+/// surface. That is exactly why the Ambient stage pins its own real night tick
+/// ([`COMBAT_NIGHT_TICK`]) instead of reusing this one.
 pub const COMBAT_DUSK_TICK: u32 = 12_000;
+
+/// The pinned night clock for the Ambient stage: 18_000 ticks is midnight.
+///
+/// The sun is exactly below the horizon there, so [`daycycle::is_night`] is true
+/// while the surface sky light is still [`PASSIVE_SURFACE_LIGHT`] (sky light is
+/// time-invariant in this engine): the surface-hostile night rule is what the
+/// stage proves, not the cave-light rule.
+pub const COMBAT_NIGHT_TICK: u32 = 18_000;
+
+/// The pinned daytime clock for the Ambient burn phase: 06_000 ticks is
+/// mid-morning, well clear of both night edges (12_306 and 23_694), so
+/// [`daycycle::is_day`] is true and surface hostiles must burn.
+pub const COMBAT_DAY_TICK: u32 = 6_000;
+
+/// Minimum Ambient spawn-phase observations before the stage may advance.
+///
+/// 60 observations x 0.1 s of game time = 6 s, i.e. 24 fixed spawn attempts at
+/// [`opencraft::world::spawning::SPAWN_ATTEMPT_SECS`]; measured night runs place
+/// at least one hostile well before that, so the stage proves sustained
+/// population rather than one lucky attempt.
+const COMBAT_AMBIENT_MIN_UPDATES: u32 = 60;
+/// Hard cap on Ambient spawn-phase observations before the stage aborts with a
+/// self-describing digest.
+///
+/// 3000 x 0.1 s = 300 s of game time (1200 attempts), but the real bound is
+/// wall time: with default settings the present mode is uncapped (~1000 fps
+/// here), so 600 observations elapsed in under a second of wall time before the
+/// streamer had lit the 24..48 block spawn ring — a measured zero-spawn abort.
+/// 3000 observations gives that warm-up room (a few seconds uncapped, ~50 s at
+/// 60 Hz) while staying inside the demo's own 120 s wall-clock deadline.
+const COMBAT_AMBIENT_ABORT_UPDATES: u32 = 3000;
+/// Ticks of `tick_mobs(0.05, 1.0)` the Ambient despawn phase runs after moving
+/// one record past [`DESPAWN_RADIUS`]. 22 x 0.05 s = 1.1 s, just past the 1.0 s
+/// despawn scan cadence, so the mark and the single reap site both run.
+const COMBAT_AMBIENT_DESPAWN_TICKS: u32 = 22;
+/// Hard cap on the Ambient burn phase's ticks. 400 x 0.05 s = 20 s of game
+/// time = 40 burn intervals of 0.5 s, twice the 20 intervals a full-health
+/// hostile needs, so a stuck burn is a real failure rather than a slow clock.
+const COMBAT_AMBIENT_BURN_TICKS: u32 = 400;
 
 /// Pinned damaged health for the demo quartet, in [`MobKind::ALL`] order.
 /// Every value is strictly below its kind's [`MobKind::max_health`] (Pig/Cow
@@ -3846,9 +3924,18 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 162;
 /// latches its verdict and advances to Save, which re-pins the two surviving
 /// hostile records, so neither the fight nor the kills can leak into the save.
 /// The Restore stage is the loaded-save leg's first and only stage.
+///
+/// The Ambient stage (M009/S05-T05) sits between Settle and Spawn: it proves
+/// the real population layer through the same session seams the shipped game
+/// uses (night surface spawning, the safe radius, the global cap, the despawn
+/// radius, and daylight burning), then restores the pinned dusk clock and
+/// closes the ambient gate so the pinned quartet stages below are never
+/// perturbed. Full order: `Settle -> Ambient -> Spawn -> Walk -> Fight -> Drops
+/// -> Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
+    Ambient,
     Spawn,
     Walk,
     Fight,
@@ -3856,6 +3943,20 @@ enum CombatStage {
     Save,
     Restore,
     Done,
+}
+
+/// The Ambient stage's three phases, in order.
+///
+/// `Spawn` pins midnight and lets the production population layer fill the
+/// night surface. `Despawn` moves one record past the despawn radius and proves
+/// the single reap site removes it. `Burn` pins morning and proves surface
+/// hostiles burn to death. Each phase latches its own counter so the printed
+/// digest can be re-measured against a fixed seed and clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbientPhase {
+    Spawn,
+    Despawn,
+    Burn,
 }
 
 /// The `--demo-combat` seam's whole state: the pinned seed, whether the world
@@ -3913,6 +4014,28 @@ struct CombatDemo {
     /// Rendered vertices at the walk verdict, frozen with
     /// [`CombatDemo::walk_mobs`].
     walk_verts: usize,
+    /// Cursor inside the Ambient stage (only meaningful while
+    /// `stage == CombatStage::Ambient`).
+    ambient_phase: AmbientPhase,
+    /// Ambient spawn-phase observations so far (see
+    /// [`COMBAT_AMBIENT_MIN_UPDATES`] / [`COMBAT_AMBIENT_ABORT_UPDATES`]).
+    ambient_updates: u32,
+    /// Largest live mob-list length seen during the Ambient spawn phase. The
+    /// global cap makes this `<= MAX_MOBS_TOTAL` by construction.
+    ambient_peak: usize,
+    /// Records observed inside the safe radius during the Ambient spawn phase.
+    /// Any value other than zero aborts the stage: the population layer must
+    /// never place a mob near the player or the world spawn.
+    ambient_safe: u32,
+    /// The spawn report snapshot latched when the Ambient spawn phase ended.
+    spawn_phase_report: SpawnReport,
+    /// Records the Ambient despawn phase proved removed (`1` on success).
+    spawn_despawned: u32,
+    /// Hostiles the Ambient burn phase proved killed by daylight.
+    spawn_burned: u32,
+    /// The latched `combat_spawn:` line, printed immediately after the pinned
+    /// `combat_demo:` line on the demo-shutdown path.
+    spawn_digest: Option<String>,
 }
 
 impl CombatDemo {
@@ -3942,6 +4065,14 @@ impl CombatDemo {
             walk_mobs: 0,
             walk_resident: 0,
             walk_verts: 0,
+            ambient_phase: AmbientPhase::Spawn,
+            ambient_updates: 0,
+            ambient_peak: 0,
+            ambient_safe: 0,
+            spawn_phase_report: SpawnReport::default(),
+            spawn_despawned: 0,
+            spawn_burned: 0,
+            spawn_digest: None,
         }
     }
 
@@ -3959,6 +4090,24 @@ impl CombatDemo {
             self.seed, stage, observed
         ));
         self.failed = true;
+    }
+
+    /// The exact `combat_spawn:` digest printed once on the demo-shutdown path
+    /// (immediately after the pinned `combat_demo:` line).
+    ///
+    /// Only latched after all three Ambient phases pass, so the literal
+    /// `ok=true` is the latching contract, not a computed value.
+    fn spawn_digest(&self) -> String {
+        format!(
+            "combat_spawn: seed={} spawned={} despawned={} burned={} cap_blocked={} safe={} peak={} ok=true",
+            self.seed,
+            self.spawn_phase_report.spawned,
+            self.spawn_despawned,
+            self.spawn_burned,
+            self.spawn_phase_report.cap_blocked,
+            self.ambient_safe,
+            self.ambient_peak
+        )
     }
 
     /// The exact success digest printed once on the demo-shutdown path.
@@ -4040,9 +4189,16 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
             if !session.settle_spawn() {
                 return false;
             }
-            demo.stage = CombatStage::Spawn;
+            // The Ambient stage owns the population gate from here: it opens
+            // it for its own night spawn / daylight burn proof and closes it
+            // again before handing over. Closing it now means a Settle frame
+            // that races the gate can never create a record the pinned quartet
+            // stages would have to reason about.
+            session.set_ambient_spawning(false);
+            demo.stage = CombatStage::Ambient;
             false
         }
+        CombatStage::Ambient => combat_ambient_stage(demo, session),
         CombatStage::Spawn => {
             // A demo run owns its mob list: clearing first makes a re-armed
             // seam deterministic instead of stacking two quartets.
@@ -4139,6 +4295,262 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
     }
+}
+
+/// The Ambient stage: the slice's real-binary proof that the deterministic
+/// population layer works through the shipped `WorldSession::tick_mobs` seam.
+///
+/// Three phases run in order, each re-measured from a fresh report baseline:
+///
+/// * [`AmbientPhase::Spawn`] pins [`COMBAT_NIGHT_TICK`], resets the report,
+///   opens the ambient gate and drives 0.1 s of game time per observation. It
+///   rejects any record inside [`SAFE_RADIUS`] of the player or the cached
+///   world spawn, rejects a peak above [`MAX_MOBS_TOTAL`], and advances once at
+///   least two records spawned AND at least two burn-eligible surface hostiles
+///   exist after [`COMBAT_AMBIENT_MIN_UPDATES`] observations: one record proves
+///   the despawn cull, the other proves daylight burning. Requiring the burn
+///   target up front is what makes the stage's own `burned >= 1` contract
+///   reachable — a run that spawned only one record would otherwise have the
+///   cull consume its only burn witness. [`COMBAT_AMBIENT_ABORT_UPDATES`] bounds
+///   a world that never populates enough.
+/// * [`AmbientPhase::Despawn`] closes the gate (the distance cull still runs),
+///   moves one record past [`DESPAWN_RADIUS`], and ages 1.1 s so the 1.0 s scan
+///   marks it and the single reap site removes it. It prefers a record that the
+///   burner would *not* touch, so the burn witness always survives the cull.
+/// * [`AmbientPhase::Burn`] pins [`COMBAT_DAY_TICK`] and reopens the gate: every
+///   surface hostile burns 1 hp per 0.5 s. It advances once no burnable hostile
+///   remains and at least one burned.
+///
+/// On success it restores the pinned dusk clock, closes the ambient gate, and
+/// latches [`CombatDemo::spawn_digest`], so the pinned quartet stages that
+/// follow are byte-for-byte what they were before this stage existed. Every
+/// mutation goes through a production seam (`session.clock`,
+/// [`WorldSession::set_ambient_spawning`], [`WorldSession::reset_spawn_report`],
+/// [`WorldSession::spawn_report`], [`WorldSession::mobs`],
+/// [`WorldSession::tick_mobs`]). Every abort names the observed value and exits
+/// the run non-zero through [`CombatDemo::abort`].
+fn combat_ambient_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    match demo.ambient_phase {
+        AmbientPhase::Spawn => {
+            if demo.ambient_updates == 0 {
+                // First entry: a known night clock, a zero report baseline, and
+                // an open gate. The attempt sequence is ephemeral, so this is
+                // deterministic from a fixed seed.
+                session.clock = GameClock::from_time(COMBAT_NIGHT_TICK);
+                session.reset_spawn_report();
+                session.set_ambient_spawning(true);
+                demo.ambient_peak = 0;
+                demo.ambient_safe = 0;
+            }
+            // 0.1 s of game time per observation keeps the stage headlessly
+            // driveable; the real frame loop adds its own Playing tick on top.
+            session.tick_mobs(0.05, 1.0);
+            session.tick_mobs(0.05, 1.0);
+            demo.ambient_updates += 1;
+            demo.ambient_peak = demo.ambient_peak.max(session.mobs().len());
+
+            // A record inside either safe radius is a hard contract failure:
+            // the layer must never place a mob on the player or the spawn pad.
+            let safe_violations = session
+                .mobs()
+                .iter()
+                .filter(|mob| {
+                    combat_horizontal_distance(mob.position, session.player.position) < SAFE_RADIUS
+                        || combat_horizontal_distance(mob.position, session.world_spawn())
+                            < SAFE_RADIUS
+                })
+                .count();
+            demo.ambient_safe += safe_violations as u32;
+            if safe_violations > 0 {
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "safe={} peak={} updates={}",
+                        demo.ambient_safe, demo.ambient_peak, demo.ambient_updates
+                    ),
+                );
+                return true;
+            }
+            if demo.ambient_peak > MAX_MOBS_TOTAL {
+                demo.abort(
+                    "ambient",
+                    &format!("peak={} cap={MAX_MOBS_TOTAL}", demo.ambient_peak),
+                );
+                return true;
+            }
+
+            let report = session.spawn_report();
+            // Two independent witnesses are needed downstream: one record for
+            // the despawn cull and one surface hostile for the daylight burn.
+            let burnable = session
+                .mobs()
+                .iter()
+                .filter(|mob| combat_mob_burn_eligible(session, mob))
+                .count();
+            if report.spawned >= 2
+                && demo.ambient_updates >= COMBAT_AMBIENT_MIN_UPDATES
+                && burnable >= 2
+            {
+                demo.spawn_phase_report = report;
+                demo.ambient_phase = AmbientPhase::Despawn;
+                return false;
+            }
+            if demo.ambient_updates >= COMBAT_AMBIENT_ABORT_UPDATES {
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "spawned={} burnable={burnable} updates={}",
+                        report.spawned, demo.ambient_updates
+                    ),
+                );
+                return true;
+            }
+            false
+        }
+        AmbientPhase::Despawn => {
+            // Spawns and burning stay off, but the despawn scan is ungated, so
+            // the radius proof still runs.
+            session.set_ambient_spawning(false);
+            let before = session.mobs().len();
+            let player = session.player.position;
+            // Prefer a record the burner would never touch (e.g. a cave-dark
+            // hostile) so the surface burn witness survives the cull. When every
+            // record is burn-eligible the spawn phase guaranteed at least two, so
+            // removing the first still leaves one.
+            let victim = session
+                .mobs()
+                .iter()
+                .position(|mob| !combat_mob_burn_eligible(session, mob))
+                .unwrap_or(0);
+            let Some(first) = session.mobs_mut().get_mut(victim) else {
+                demo.abort("ambient", "despawn_no_record");
+                return true;
+            };
+            first.position = player + Vec3::new(DESPAWN_RADIUS + 8.0, 0.0, 0.0);
+            first.velocity = Vec3::ZERO;
+            for _ in 0..COMBAT_AMBIENT_DESPAWN_TICKS {
+                session.tick_mobs(0.05, 1.0);
+            }
+            let after = session.mobs().len();
+            let marked = session.spawn_report().despawned;
+            if after + 1 != before || marked != 1 {
+                demo.abort(
+                    "ambient",
+                    &format!("despawn before={before} after={after} marked={marked}"),
+                );
+                return true;
+            }
+            demo.spawn_despawned = 1;
+            demo.ambient_phase = AmbientPhase::Burn;
+            false
+        }
+        AmbientPhase::Burn => {
+            session.clock = GameClock::from_time(COMBAT_DAY_TICK);
+            // Burning must be on. Day passives may also spawn here; every
+            // assertion below ignores them.
+            session.set_ambient_spawning(true);
+            let before = session.spawn_report().burned;
+            let start_burnable = session
+                .mobs()
+                .iter()
+                .filter(|mob| combat_mob_burn_eligible(session, mob))
+                .count();
+            let mut finished = false;
+            for _ in 0..COMBAT_AMBIENT_BURN_TICKS {
+                // Demo pin, not a spawn rule (same shape as the Drops stage's
+                // `combat_pin_mob_for_hit`): hold every record on its immutable
+                // spawn anchor so a wander under a tree canopy cannot pause the
+                // burn cadence mid-kill and leave the run without a witness.
+                // Cave-dark records stay dark at their anchor and the burner
+                // simply ignores them.
+                for mob in session.mobs_mut() {
+                    mob.position = mob.home;
+                    mob.velocity = Vec3::ZERO;
+                }
+                session.tick_mobs(0.05, 1.0);
+                if !session
+                    .mobs()
+                    .iter()
+                    .any(|mob| combat_mob_burn_eligible(session, mob))
+                {
+                    finished = true;
+                    break;
+                }
+            }
+            let burned = session.spawn_report().burned.saturating_sub(before);
+            if !finished || burned < 1 {
+                // Self-describing: name the observed population so a world that
+                // only produced cave-dark hostiles (which never burn) is
+                // distinguishable from a clock or gate failure.
+                let total = session.mobs().len();
+                let hostiles = session
+                    .mobs()
+                    .iter()
+                    .filter(|mob| mob.kind.is_hostile() && mob.health > 0)
+                    .count();
+                let burnable = session
+                    .mobs()
+                    .iter()
+                    .filter(|mob| combat_mob_burn_eligible(session, mob))
+                    .count();
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "burned={burned} finished={finished} start_burnable={start_burnable} mobs={total} hostiles={hostiles} burnable={burnable}"
+                    ),
+                );
+                return true;
+            }
+            demo.spawn_burned = burned;
+            // Restore the pinned dusk clock and close the gate before the
+            // quartet stages: at dusk (`COMBAT_DUSK_TICK` is still day) the
+            // Zombie/Skeleton quartet would otherwise burn during a slow Walk
+            // and break the pinned `total == 4` verdict.
+            session.clock.time_of_day = COMBAT_DUSK_TICK;
+            session.set_ambient_spawning(false);
+            demo.spawn_digest = Some(demo.spawn_digest());
+            demo.stage = CombatStage::Spawn;
+            false
+        }
+    }
+}
+
+/// Horizontal (XZ) distance between two feet positions. The population layer's
+/// safe and despawn radii are horizontal by design, so the demo's checks are
+/// too: a mob deep in a cave below the player is still nearby.
+fn combat_horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+    let dx = a.x - b.x;
+    let dz = a.z - b.z;
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// Whether the burner's own eligibility rule would burn this record while the
+/// clock is day: a live hostile standing on an evaluated, fully sky-lit,
+/// non-water surface.
+///
+/// Mirrors `spawning::scan_burn` (which is private) through the public
+/// [`SpawnWorld`] capability, including the `column_ready` gate before the light
+/// read; the day/clock half of that rule is checked by the caller. The Ambient
+/// stage uses it both to require a burn witness up front and to decide when the
+/// burn phase is finished.
+fn combat_mob_burn_eligible(session: &WorldSession, mob: &Mob) -> bool {
+    if !mob.kind.is_hostile() || mob.health == 0 {
+        return false;
+    }
+    let feet = IVec3::new(
+        mob.position.x.floor() as i32,
+        mob.position.y.floor() as i32,
+        mob.position.z.floor() as i32,
+    );
+    let (cx, cz) = (
+        feet.x.div_euclid(CHUNK_SIZE as i32),
+        feet.z.div_euclid(CHUNK_SIZE as i32),
+    );
+    if !SpawnWorld::column_ready(&session.world, cx, cz) {
+        return false;
+    }
+    SpawnWorld::sky_light(&session.world, feet) == PASSIVE_SURFACE_LIGHT
+        && SpawnWorld::block(&session.world, feet) != BlockId::Water
 }
 
 /// The Fight stage: the slice's real-binary proof that a crafted wood sword
@@ -8665,6 +9077,15 @@ impl ApplicationHandler for GameApp {
             {
                 let _ = writeln!(stdout, "{line}");
             }
+            // The Ambient stage's separate digest prints immediately after the
+            // pinned `combat_demo:` line so the S02/S04/S10 pins never move.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.spawn_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
             drop(stdout);
             self.shutdown(event_loop);
             return;
@@ -10765,7 +11186,11 @@ mod tests {
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session));
-        assert_eq!(demo.stage, CombatStage::Spawn, "the spawn gate settles");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
         assert!(!combat_demo_step(&mut demo, &mut session));
         assert_eq!(demo.stage, CombatStage::Walk);
         assert_eq!(session.mobs().len(), 4);
@@ -10813,6 +11238,149 @@ mod tests {
         );
     }
 
+    /// The synthetic population fixture: a 5x5 chunk-column lit grass plain
+    /// centred on the seeded spawn column, with the grass surface at
+    /// `spawn_position(seed).y - 4` (the +4 spawn rule) and a recomputed sky
+    /// light grid. Placing the player on that surface leaves the cached world
+    /// spawn three blocks above its feet, so both safe radii are real
+    /// constraints instead of no-ops.
+    ///
+    /// The chunks are inserted into the session's existing world rather than
+    /// replacing it, which keeps the session's own seed (the spawn roll's only
+    /// entropy source) intact.
+    fn insert_lit_grass_plain(session: &mut WorldSession, chunk_radius: i32) {
+        use opencraft::world::manager::{MAX_CHUNK_Y, MIN_CHUNK_Y};
+
+        let anchor = WorldSession::spawn_position(session.world.seed());
+        let cs = CHUNK_SIZE as i32;
+        let centre_x = (anchor.x.floor() as i32).div_euclid(cs);
+        let centre_z = (anchor.z.floor() as i32).div_euclid(cs);
+        let surface = anchor.y as i32 - 4;
+        let surface_chunk_y = surface.div_euclid(cs);
+        let surface_local = surface.rem_euclid(cs) as usize;
+
+        for cx in centre_x - chunk_radius..=centre_x + chunk_radius {
+            for cz in centre_z - chunk_radius..=centre_z + chunk_radius {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let chunk = if cy < surface_chunk_y {
+                        Chunk::new_uniform(BlockId::Stone)
+                    } else if cy == surface_chunk_y {
+                        let mut chunk = Chunk::new_uniform(BlockId::Air);
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                for ly in 0..=surface_local {
+                                    chunk.set(lx, ly, lz, BlockId::Stone);
+                                }
+                                chunk.set(lx, surface_local, lz, BlockId::Grass);
+                            }
+                        }
+                        chunk
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    session
+                        .world
+                        .insert_chunk_for_test(ChunkPos::new(cx, cy, cz), chunk);
+                }
+            }
+        }
+        session.world.recompute_light_for_test();
+        session.player.position = Vec3::new(anchor.x, (surface + 1) as f32, anchor.z);
+        session.sync_camera();
+    }
+
+    /// The `combat_spawn:` line is a pinned contract: every field, including the
+    /// trailing literal `ok=true`, must print in exactly this order so the
+    /// real-binary harness can match on one line.
+    #[test]
+    fn combat_spawn_digest_format_is_pinned() {
+        let mut demo = CombatDemo::new(7, true, None);
+        demo.spawn_phase_report = SpawnReport {
+            spawned: 3,
+            despawned: 0,
+            burned: 0,
+            cap_blocked: 2,
+        };
+        demo.spawn_despawned = 1;
+        demo.spawn_burned = 3;
+        demo.ambient_safe = 0;
+        demo.ambient_peak = 5;
+        assert_eq!(
+            demo.spawn_digest(),
+            "combat_spawn: seed=7 spawned=3 despawned=1 burned=3 cap_blocked=2 safe=0 peak=5 ok=true"
+        );
+    }
+
+    /// The Ambient stage proved against a lit synthetic world: a pinned midnight
+    /// clock spawns surface hostiles through the production `tick_mobs` seam but
+    /// never inside the safe radius, a record moved past the despawn radius is
+    /// removed by the single reap site, and a pinned morning clock burns every
+    /// surface hostile to death. On success the stage restores the pinned dusk
+    /// clock, closes the gate, and latches the exact digest.
+    #[test]
+    fn combat_demo_ambient_stage_proves_night_spawn_despawn_and_burn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-ambient.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        // Exactly the fresh-demo startup shape: dusk clock, gate closed.
+        session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
+        session.set_ambient_spawning(false);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Ambient;
+        let mut calls = 0u32;
+        // Drive only the Ambient stage; the quartet stages are pinned by the
+        // save-leg tests above and are not what this test proves.
+        while demo.stage == CombatStage::Ambient && !demo.finished() && calls < 2000 {
+            calls += 1;
+            combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            calls < 2000,
+            "the ambient stage must finish within 2000 calls"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert!(
+            !demo.finished(),
+            "the ambient stage hands over instead of ending the run: {:?}",
+            demo.digest
+        );
+        assert_eq!(
+            demo.stage,
+            CombatStage::Spawn,
+            "the ambient stage hands over to the quartet spawn"
+        );
+        assert_eq!(demo.ambient_safe, 0, "no record may enter the safe radius");
+        assert!(
+            demo.spawn_phase_report.spawned >= 1,
+            "ambient night spawning produced nothing: {:?}",
+            demo.spawn_phase_report
+        );
+        assert_eq!(demo.spawn_despawned, 1, "one record must be culled");
+        assert!(demo.spawn_burned >= 1, "no surface hostile burned at day");
+        assert!(demo.ambient_peak <= MAX_MOBS_TOTAL);
+        assert_eq!(
+            session.clock.time_of_day, COMBAT_DUSK_TICK,
+            "the pinned dusk clock is restored for the quartet stages"
+        );
+        assert!(
+            !session.ambient_spawning(),
+            "the ambient gate is closed again"
+        );
+        // Measured by running this test with placeholder constants and writing
+        // the observed values, never guessed.
+        assert_eq!(
+            demo.spawn_digest.as_deref(),
+            Some("combat_spawn: seed=12345 spawned=22 despawned=1 burned=21 cap_blocked=2 safe=0 peak=22 ok=true")
+        );
+    }
+
     /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Save) to
     /// completion and return the session plus its finished demo. Both save-leg
     /// tests use this so the fresh save is always produced by the production
@@ -10844,6 +11412,11 @@ mod tests {
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
         assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
         assert_eq!(demo.stage, CombatStage::Walk);
         for pos in demo.spawn_positions {
@@ -10989,6 +11562,11 @@ mod tests {
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
         assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
         assert_eq!(demo.stage, CombatStage::Walk);
         for pos in demo.spawn_positions {
@@ -11122,6 +11700,11 @@ mod tests {
 
         let mut demo = CombatDemo::new(seed, true, None);
         assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
         assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
         assert_eq!(demo.stage, CombatStage::Walk);
         for pos in demo.spawn_positions {
@@ -11304,6 +11887,10 @@ mod tests {
             !combat_demo_step(&mut demo, &mut session),
             "stays in Settle"
         );
+        assert_eq!(demo.stage, CombatStage::Ambient, "settle hands to ambient");
+        // This test pins the Walk timeout; the 7-chunk fixture has no light
+        // grids, so the Ambient proof lives in its own dedicated test.
+        demo.stage = CombatStage::Spawn;
         assert!(
             !combat_demo_step(&mut demo, &mut session),
             "spawns into Walk"
