@@ -354,11 +354,27 @@ impl WorldSession {
         &self.mobs
     }
 
-    /// Mutable access for spawning and (later) save restore. Simulation never
-    /// removes records on its own.
+    /// Mutable access for spawning and save restore. Simulation reaps only
+    /// finished corpses through [`WorldSession::retain_live_mobs`].
     #[inline]
     pub fn mobs_mut(&mut self) -> &mut Vec<Mob> {
         &mut self.mobs
+    }
+
+    /// Removes every mob whose death collapse has finished, returning how
+    /// many records were dropped.
+    ///
+    /// This is the one removal site for mob records. A record is reaped only
+    /// when it is dead (`health == 0`) and its collapse timer has fully
+    /// drained ([`Mob::death_finished`]). Because [`Mob::death`] decays only
+    /// while the mob's feet chunk is resident, a mid-fade corpse in an
+    /// unloaded chunk freezes and can legally be saved as a health-0 record;
+    /// it vanishes on the first tick after its chunk reloads. Drops are
+    /// granted by the killer, never by the reaper.
+    pub fn retain_live_mobs(&mut self) -> usize {
+        let before = self.mobs.len();
+        self.mobs.retain(|mob| !mob.death_finished());
+        before - self.mobs.len()
     }
 
     /// Whether the chunk containing the mob's feet is resident. A mob in an
@@ -378,13 +394,16 @@ impl WorldSession {
         self.mobs.iter().filter(|mob| self.mob_is_resident(mob))
     }
 
-    /// The nearest resident mob the crosshair ray enters within `reach`.
+    /// The nearest resident, *live* mob the crosshair ray enters within
+    /// `reach`.
     ///
     /// This is the one melee hit-test seam: it walks the live mob list once
     /// through [`crate::player::melee::nearest_mob_hit`] and applies the exact
     /// same residency gate as rendering and the fixed-rate runtime, so a mob
     /// in an unloaded chunk can never be hit through terrain that is not
-    /// loaded. No candidate `Vec` is allocated.
+    /// loaded. A dead record (`health == 0`) is skipped too, so a collapsing
+    /// corpse can never be selected and never suppresses mining. No candidate
+    /// `Vec` is allocated.
     pub fn melee_candidate(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<MeleeHit> {
         crate::player::melee::nearest_mob_hit(
             origin,
@@ -393,7 +412,7 @@ impl WorldSession {
             self.mobs
                 .iter()
                 .enumerate()
-                .filter(|(_, mob)| self.mob_is_resident(mob)),
+                .filter(|(_, mob)| mob.health > 0 && self.mob_is_resident(mob)),
         )
     }
 
@@ -401,10 +420,10 @@ impl WorldSession {
     ///
     /// Every guard lives in one place: a missing index and a non-resident mob
     /// are refused here, while a dead record (`health == 0`), an open i-frame
-    /// window, and zero damage are refused by [`Mob::take_hit`]. A successful
-    /// hit never removes or reorders a record: S04 owns death collapse,
-    /// removal, and drops, so a mob whose health reached zero stays in
-    /// [`WorldSession::mobs`] with [`MobHit::killed`] `== true` until then.
+    /// window, and zero damage are refused by [`Mob::take_hit`]. A hit never
+    /// removes or reorders a record: a lethal hit arms the collapse and leaves
+    /// the record in [`WorldSession::mobs`] until [`WorldSession::retain_live_mobs`]
+    /// reaps it after the fade.
     pub fn attack_mob(&mut self, index: usize, damage: u16, from: Vec3) -> Option<MobHit> {
         let mob = self.mobs.get(index)?;
         if !self.mob_is_resident(mob) {
@@ -429,7 +448,8 @@ impl WorldSession {
     /// clamped to `0..=0.1`, then scaled by `time_scale` (negative becomes
     /// zero), and non-finite/non-positive game time is a no-op. Residency is
     /// resolved per mob from the live world manager, so a mob in an unloaded
-    /// chunk neither moves nor decays.
+    /// chunk neither moves nor decays. Finished corpses are reaped at the end
+    /// through [`WorldSession::retain_live_mobs`].
     pub fn tick_mobs(&mut self, dt: f32, time_scale: f32) -> MobTick {
         let dt = dt.clamp(0.0, 0.1);
         let game_dt = dt * time_scale.max(0.0);
@@ -437,17 +457,21 @@ impl WorldSession {
             return MobTick::default();
         }
 
-        let world = &self.world;
-        let runtime = &mut self.mob_runtime;
-        let mobs = &mut self.mobs;
-        runtime.tick(game_dt, mobs, |position| {
-            let (chunk, _) = world_to_chunk_and_local(
-                position.x.floor() as i32,
-                position.y.floor() as i32,
-                position.z.floor() as i32,
-            );
-            world.is_resident(chunk)
-        })
+        let report = {
+            let world = &self.world;
+            let runtime = &mut self.mob_runtime;
+            let mobs = &mut self.mobs;
+            runtime.tick(game_dt, mobs, |position| {
+                let (chunk, _) = world_to_chunk_and_local(
+                    position.x.floor() as i32,
+                    position.y.floor() as i32,
+                    position.z.floor() as i32,
+                );
+                world.is_resident(chunk)
+            })
+        };
+        self.retain_live_mobs();
+        report
     }
 
     /// Tills a live `Grass` or `Dirt` block into `Farmland` when a Hoe is
@@ -1033,7 +1057,7 @@ mod tests {
     use crate::player::physics::InputState;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
-    use crate::world::mob::{MobAiState, MobKind};
+    use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 
@@ -3751,6 +3775,125 @@ mod tests {
             assert!(mob.velocity.is_finite());
             assert!(mob.walk_phase.is_finite());
         }
+    }
+
+    #[test]
+    fn tick_mobs_reaps_a_finished_corpse_and_keeps_a_mid_fade_one() {
+        let mut session = make_mob_session(41);
+        add_resident_air(&mut session);
+
+        // One step of collapse left: this one is reaped by the next tick.
+        let mut finished = Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0);
+        assert!(finished.kill());
+        finished.death = MOB_TICK_SECS;
+        // A full collapse duration: still fading, so it must survive.
+        let mut fading = Mob::new(MobKind::Cow, Vec3::new(9.5, 5.0, 8.5), 0.0);
+        assert!(fading.kill());
+        assert_eq!(fading.death, MOB_DEATH_SECS);
+        session.mobs_mut().push(finished);
+        session.mobs_mut().push(fading);
+
+        session.tick_mobs(0.05, 1.0);
+
+        assert_eq!(
+            session.mobs().len(),
+            1,
+            "only the finished corpse is reaped"
+        );
+        assert_eq!(session.mobs()[0].kind, MobKind::Cow);
+        assert!(session.mobs()[0].death > 0.0, "the mid-fade corpse stays");
+        assert!(!session.mobs()[0].death_finished());
+    }
+
+    #[test]
+    fn corpse_in_an_unloaded_chunk_keeps_its_record_and_death_timer() {
+        let mut session = make_mob_session(42);
+        add_resident_air(&mut session);
+        let mut corpse = Mob::new(MobKind::Pig, Vec3::new(100.5, 5.0, 100.5), 0.0);
+        assert!(corpse.kill());
+        corpse.death = MOB_TICK_SECS;
+        session.mobs_mut().push(corpse);
+
+        session.tick_mobs(0.05, 1.0);
+
+        assert_eq!(session.mobs().len(), 1, "an unloaded corpse is not reaped");
+        assert_eq!(
+            session.mobs()[0].death,
+            MOB_TICK_SECS,
+            "the collapse timer only decays while resident"
+        );
+    }
+
+    #[test]
+    fn melee_candidate_skips_a_corpse_and_finds_the_live_mob_behind() {
+        let mut session = make_mob_session(43);
+        add_resident_air(&mut session);
+        let origin = Vec3::new(8.5, 5.2, 8.5);
+        let dir = Vec3::Z;
+
+        let mut corpse = Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 10.5), 0.0);
+        assert!(corpse.kill());
+        assert!(!corpse.death_finished());
+        session.mobs_mut().push(corpse);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 12.5), 0.0));
+
+        let hit = session
+            .melee_candidate(origin, dir, 6.0)
+            .expect("the live mob behind the corpse is selectable");
+        assert_eq!(hit.index, 1, "the health-0 corpse must be skipped");
+        assert!(
+            (hit.distance - 3.65).abs() < 1e-4,
+            "entry distance was {}",
+            hit.distance
+        );
+    }
+
+    #[test]
+    fn attack_mob_on_a_corpse_returns_none_and_leaves_the_record_untouched() {
+        let mut session = make_mob_session(44);
+        add_resident_air(&mut session);
+        let mut corpse = Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0);
+        assert!(corpse.kill());
+        corpse.death = MOB_DEATH_SECS * 0.5;
+        corpse.hurt_iframe = 0.0;
+        session.mobs_mut().push(corpse);
+        let snapshot = session.mobs()[0].clone();
+
+        assert_eq!(session.attack_mob(0, 4, Vec3::new(8.5, 5.0, 6.5)), None);
+        assert_eq!(
+            session.mobs()[0],
+            snapshot,
+            "a corpse hit must mutate nothing"
+        );
+        assert_eq!(session.mobs().len(), 1, "melee never removes a record");
+    }
+
+    #[test]
+    fn retain_live_mobs_is_idempotent_and_returns_the_exact_count() {
+        let mut session = make_mob_session(45);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(8.5, 5.0, 8.5), 0.0));
+
+        let mut fading = Mob::new(MobKind::Cow, Vec3::new(9.5, 5.0, 8.5), 0.0);
+        assert!(fading.kill());
+        fading.death = MOB_DEATH_SECS * 0.5;
+        session.mobs_mut().push(fading);
+
+        // A restored dead record arrives with no collapse timer: finished.
+        session.mobs_mut().push(Mob::restored(
+            MobKind::Skeleton,
+            Vec3::new(10.5, 5.0, 8.5),
+            0.0,
+            0,
+        ));
+
+        assert_eq!(session.retain_live_mobs(), 1);
+        assert_eq!(session.mobs().len(), 2);
+        assert_eq!(session.retain_live_mobs(), 0, "a second pass is a no-op");
+        assert_eq!(session.mobs().len(), 2);
     }
 
     fn pinned_saved_mobs() -> Vec<SavedMob> {

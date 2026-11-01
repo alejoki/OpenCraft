@@ -38,6 +38,20 @@ pub const MOB_KNOCKBACK_DECAY: f32 = 0.6;
 /// provably comes to rest instead of creeping forever.
 pub const MOB_KNOCKBACK_EPSILON_SQ: f32 = 1e-4;
 
+/// Seconds a passive mob keeps fleeing after a non-lethal hit.
+///
+/// Long enough to survive several 16-step yaw-reroll boundaries (0.8 s each)
+/// and to read as a deliberate response rather than a one-step stumble.
+pub const MOB_FLEE_SECS: f32 = 2.5;
+/// Flee speed multiplier over [`MobKind::walk_speed`].
+///
+/// A fleeing mob moves faster than its wander pace without becoming
+/// impossible to catch on foot.
+pub const MOB_FLEE_SPEED_FACTOR: f32 = 1.6;
+/// Seconds a lethal hit spends collapsing the box model before the session
+/// reaper removes the record.
+pub const MOB_DEATH_SECS: f32 = 0.8;
+
 /// Horizontal distance from `home` at which a wandering mob turns back.
 const HOME_LEASH: f32 = 4.0;
 /// How often (in fixed steps) a wandering mob re-rolls its yaw/state.
@@ -118,16 +132,32 @@ impl MobKind {
             MobKind::Skeleton => 1.7,
         }
     }
+
+    /// Whether a non-lethal hit makes this kind flee (Pig and Cow).
+    pub const fn is_passive(self) -> bool {
+        matches!(self, MobKind::Pig | MobKind::Cow)
+    }
+
+    /// Whether this kind is hostile (Zombie and Skeleton).
+    ///
+    /// Hostile aggression is S06's concern; a hit never changes their state or
+    /// yaw in S04.
+    pub const fn is_hostile(self) -> bool {
+        matches!(self, MobKind::Zombie | MobKind::Skeleton)
+    }
 }
 
-/// The only two AI states S01 needs. S05 may add pursuit later without
-/// changing [`Mob`]'s layout contract drastically.
+/// Mob AI states. S04 adds [`MobAiState::Flee`] for passive mobs; S06 owns
+/// hostile pursuit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MobAiState {
     /// Standing still; `walk_phase` does not advance.
     Idle,
     /// Walking along `yaw` at [`MobKind::walk_speed`].
     Wander,
+    /// Moving away from the attacker for the flee window, ignoring the home
+    /// leash.
+    Flee,
 }
 
 /// One live mob record. `home` is the spawn anchor used for the leash and
@@ -162,6 +192,11 @@ pub struct Mob {
     pub cooldown: f32,
     /// Walk cycle phase (radians), advanced while wandering.
     pub walk_phase: f32,
+    /// Remaining flee time in seconds; decays only while resident.
+    pub flee: f32,
+    /// Remaining death-collapse time in seconds; decays only while resident.
+    /// Zero on a living mob and on a corpse whose collapse has finished.
+    pub death: f32,
 }
 
 impl Mob {
@@ -180,6 +215,8 @@ impl Mob {
             knockback: Vec3::ZERO,
             cooldown: 0.0,
             walk_phase: 0.0,
+            flee: 0.0,
+            death: 0.0,
         }
     }
 
@@ -201,6 +238,8 @@ impl Mob {
             knockback: Vec3::ZERO,
             cooldown: 0.0,
             walk_phase: 0.0,
+            flee: 0.0,
+            death: 0.0,
         }
     }
 
@@ -240,11 +279,72 @@ impl Mob {
         }
         self.knockback = dir * MOB_KNOCKBACK_SPEED;
 
+        if health_after == 0 {
+            // A lethal hit starts the collapse: the body stops walking and
+            // the reaper removes the record once `death` drains. The away
+            // knockback and hurt flash above still apply.
+            self.death = MOB_DEATH_SECS;
+            self.flee = 0.0;
+            self.velocity = Vec3::ZERO;
+        } else if self.kind.is_passive() {
+            // Passive mobs turn and run along the same away direction used
+            // for knockback. Hostile kinds keep their state/yaw untouched.
+            self.state = MobAiState::Flee;
+            self.flee = MOB_FLEE_SECS;
+            self.yaw = dir.x.atan2(dir.z);
+        }
+
         Some(MobHit {
             damage,
             health_after,
             killed: health_after == 0,
         })
+    }
+
+    /// Kills the mob for an environmental cause (S05 burning).
+    ///
+    /// Returns `false` and mutates nothing when the record is already dead.
+    /// Otherwise health drops to zero, the collapse is armed, and every
+    /// impulse is cleared so a corpse cannot keep sliding.
+    pub fn kill(&mut self) -> bool {
+        if self.health == 0 {
+            return false;
+        }
+        self.health = 0;
+        self.death = MOB_DEATH_SECS;
+        self.flee = 0.0;
+        self.velocity = Vec3::ZERO;
+        self.knockback = Vec3::ZERO;
+        true
+    }
+
+    /// Whether health has reached zero (collapsing or already finished).
+    #[inline]
+    pub fn is_dead(&self) -> bool {
+        self.health == 0
+    }
+
+    /// Whether this record's collapse timer has fully drained.
+    ///
+    /// A restored health-0 record arrives with `death == 0`, so it is already
+    /// finished for both rendering and reaping.
+    #[inline]
+    pub fn death_finished(&self) -> bool {
+        self.is_dead() && self.death <= 0.0
+    }
+
+    /// Collapse progress in `0..=1` for rendering.
+    ///
+    /// Exactly `0.0` while alive, `1.0` for a dead record whose timer reached
+    /// zero, and clamped so corrupted timers cannot escape the range.
+    pub fn death_progress(&self) -> f32 {
+        if !self.is_dead() {
+            return 0.0;
+        }
+        if self.death <= 0.0 {
+            return 1.0;
+        }
+        (1.0 - self.death / MOB_DEATH_SECS).clamp(0.0, 1.0)
     }
 
     /// World-space AABB as `(min, max)`. Feet are at `position.y`, so the
@@ -387,6 +487,12 @@ impl MobRuntime {
         mob.hurt = (mob.hurt - MOB_TICK_SECS).max(0.0);
         mob.hurt_iframe = (mob.hurt_iframe - MOB_TICK_SECS).max(0.0);
         mob.cooldown = (mob.cooldown - MOB_TICK_SECS).max(0.0);
+        mob.flee = (mob.flee - MOB_TICK_SECS).max(0.0);
+        mob.death = (mob.death - MOB_TICK_SECS).max(0.0);
+
+        if mob.flee <= 0.0 && mob.state == MobAiState::Flee {
+            mob.state = MobAiState::Wander;
+        }
 
         if !mob.position.length_squared().is_finite() {
             // A corrupted record self-heals instead of poisoning every
@@ -395,7 +501,9 @@ impl MobRuntime {
             mob.velocity = Vec3::ZERO;
         }
 
-        if self.tick_index.is_multiple_of(YAW_REROLL_STEPS) {
+        // A fleeing or dying mob keeps the heading it was given; the reroll
+        // only owns unmolested wanderers.
+        if mob.health > 0 && mob.flee <= 0.0 && self.tick_index.is_multiple_of(YAW_REROLL_STEPS) {
             let roll = mob_roll(self.seed, self.tick_index, slot);
             let unit = (roll & 0xFFFF) as f32 / 65_535.0;
             mob.yaw = unit * std::f32::consts::TAU;
@@ -408,30 +516,49 @@ impl MobRuntime {
             };
         }
 
-        match mob.state {
-            MobAiState::Idle => {
-                mob.velocity = Vec3::ZERO;
-            }
-            MobAiState::Wander => {
-                let offset = Vec3::new(
-                    mob.position.x - mob.home.x,
-                    0.0,
-                    mob.position.z - mob.home.z,
-                );
-                let leash = offset.x * offset.x + offset.z * offset.z;
-                if leash > HOME_LEASH * HOME_LEASH {
-                    // Steer back toward the anchor instead of escaping.
-                    mob.yaw = offset.x.atan2(offset.z) + std::f32::consts::PI;
-                }
-
-                let speed = mob.kind.walk_speed();
-                mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
-                mob.position += mob.velocity * MOB_TICK_SECS;
-                mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
-
-                if !mob.position.is_finite() {
-                    mob.position = mob.home;
+        if mob.health == 0 {
+            // Dying mobs never walk again; only the knockback integration
+            // below may move the body while it collapses.
+            mob.velocity = Vec3::ZERO;
+        } else {
+            match mob.state {
+                MobAiState::Idle => {
                     mob.velocity = Vec3::ZERO;
+                }
+                MobAiState::Wander => {
+                    let offset = Vec3::new(
+                        mob.position.x - mob.home.x,
+                        0.0,
+                        mob.position.z - mob.home.z,
+                    );
+                    let leash = offset.x * offset.x + offset.z * offset.z;
+                    if leash > HOME_LEASH * HOME_LEASH {
+                        // Steer back toward the anchor instead of escaping.
+                        mob.yaw = offset.x.atan2(offset.z) + std::f32::consts::PI;
+                    }
+
+                    let speed = mob.kind.walk_speed();
+                    mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
+                    mob.position += mob.velocity * MOB_TICK_SECS;
+                    mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+
+                    if !mob.position.is_finite() {
+                        mob.position = mob.home;
+                        mob.velocity = Vec3::ZERO;
+                    }
+                }
+                MobAiState::Flee => {
+                    // Flee ignores the home leash: the whole point is to put
+                    // distance between the mob and its attacker.
+                    let speed = mob.kind.walk_speed() * MOB_FLEE_SPEED_FACTOR;
+                    mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
+                    mob.position += mob.velocity * MOB_TICK_SECS;
+                    mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+
+                    if !mob.position.is_finite() {
+                        mob.position = mob.home;
+                        mob.velocity = Vec3::ZERO;
+                    }
                 }
             }
         }
@@ -923,5 +1050,258 @@ mod tests {
 
         runtime.tick(0.05, &mut mobs, |_| false);
         assert_eq!(mobs[0], snapshot, "a non-resident mob must freeze entirely");
+    }
+
+    // ---- S04: passive flee, death collapse, and the reap contract --------
+
+    #[test]
+    fn kinds_partition_exactly_into_passive_and_hostile() {
+        let passive: Vec<MobKind> = MobKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| kind.is_passive())
+            .collect();
+        let hostile: Vec<MobKind> = MobKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| kind.is_hostile())
+            .collect();
+        assert_eq!(passive, vec![MobKind::Pig, MobKind::Cow]);
+        assert_eq!(hostile, vec![MobKind::Zombie, MobKind::Skeleton]);
+        for kind in MobKind::ALL {
+            assert_ne!(kind.is_passive(), kind.is_hostile());
+            assert!(kind.is_passive() || kind.is_hostile());
+        }
+    }
+
+    #[test]
+    fn new_and_restored_mobs_start_with_neutral_flee_and_death() {
+        let fresh = Mob::new(MobKind::Pig, Vec3::ZERO, 0.0);
+        assert_eq!(fresh.flee, 0.0);
+        assert_eq!(fresh.death, 0.0);
+        let restored = Mob::restored(MobKind::Pig, Vec3::ZERO, 0.0, 4);
+        assert_eq!(restored.flee, 0.0);
+        assert_eq!(restored.death, 0.0);
+    }
+
+    #[test]
+    fn non_lethal_hit_makes_only_passive_kinds_flee() {
+        for kind in MobKind::ALL {
+            let mut mob = Mob::new(kind, Vec3::new(0.0, 5.0, 0.0), 2.0);
+            let yaw_before = mob.yaw;
+            let state_before = mob.state;
+            let hit = mob.take_hit(4, attacker_behind()).expect("hit lands");
+            assert!(!hit.killed, "{kind:?} survives 4 damage");
+            if kind.is_passive() {
+                assert_eq!(mob.state, MobAiState::Flee, "{kind:?} must flee");
+                assert_eq!(mob.flee, MOB_FLEE_SECS);
+                assert_eq!(mob.death, 0.0);
+                assert!(mob.yaw.abs() < 1e-6, "{kind:?} must face +Z away");
+            } else {
+                assert_eq!(mob.state, state_before, "{kind:?} state is untouched");
+                assert_eq!(mob.yaw, yaw_before, "{kind:?} yaw is untouched");
+                assert_eq!(mob.flee, 0.0);
+                assert_eq!(mob.death, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn flee_yaw_points_away_from_the_attacker() {
+        let mut mob = Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 2.0);
+        mob.take_hit(1, Vec3::new(2.0, 5.0, 0.0))
+            .expect("hit lands");
+        // Away is -X, so the yaw faces -X: sin = -1, cos = 0.
+        assert!(
+            (mob.yaw.sin() + 1.0).abs() < 1e-5,
+            "yaw sin {}",
+            mob.yaw.sin()
+        );
+        assert!(mob.yaw.cos().abs() < 1e-5, "yaw cos {}", mob.yaw.cos());
+        assert_eq!(mob.state, MobAiState::Flee);
+    }
+
+    #[test]
+    fn flee_survives_the_sixteen_step_yaw_reroll() {
+        let mut runtime = MobRuntime::new(21);
+        let mut mobs = vec![Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 2.0)];
+        mobs[0].take_hit(4, attacker_behind()).expect("hit lands");
+        let flee_yaw = mobs[0].yaw;
+
+        // Exactly sixteen fixed steps: the reroll boundary that would erase a
+        // naive flee.
+        for _ in 0..16 {
+            runtime.tick(0.05, &mut mobs, resident);
+        }
+        assert_eq!(runtime.tick_index(), 16);
+        assert_eq!(mobs[0].state, MobAiState::Flee);
+        assert_eq!(mobs[0].yaw, flee_yaw, "the reroll must not touch a flee");
+        assert!(mobs[0].flee > 0.0);
+    }
+
+    #[test]
+    fn flee_expires_back_to_wander_and_never_goes_negative() {
+        let mut runtime = MobRuntime::new(22);
+        let mut mobs = vec![Mob::new(MobKind::Cow, Vec3::new(0.0, 5.0, 0.0), 0.0)];
+        mobs[0].take_hit(4, attacker_behind()).expect("hit lands");
+
+        let mut previous = mobs[0].flee;
+        for _ in 0..52 {
+            runtime.tick(0.05, &mut mobs, resident);
+            let flee = mobs[0].flee;
+            assert!(flee >= 0.0, "the flee timer went negative: {flee}");
+            assert!(flee <= previous, "the flee timer must not grow");
+            previous = flee;
+        }
+        assert_eq!(mobs[0].flee, 0.0);
+        assert_eq!(mobs[0].state, MobAiState::Wander);
+        assert_eq!(mobs[0].death, 0.0, "a fleeing mob is not dying");
+    }
+
+    #[test]
+    fn flee_ignores_the_home_leash() {
+        let mut runtime = MobRuntime::new(23);
+        let mut mob = Mob::new(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 0.0);
+        // Start five blocks (past the four-block leash) from home, with the
+        // attacker behind so "away" pushes even farther out.
+        mob.home = Vec3::new(0.0, 5.0, 0.0);
+        mob.position = Vec3::new(0.0, 5.0, 5.0);
+        mob.take_hit(1, Vec3::new(0.0, 5.0, 4.0))
+            .expect("hit lands");
+        assert_eq!(mob.state, MobAiState::Flee);
+        let mut mobs = vec![mob];
+
+        for _ in 0..10 {
+            runtime.tick(0.05, &mut mobs, resident);
+        }
+        let distance = (mobs[0].position - mobs[0].home).length();
+        assert!(
+            mobs[0].position.z > 5.0 && distance > 5.0,
+            "flee must keep running away, position {:?} distance {distance}",
+            mobs[0].position
+        );
+    }
+
+    #[test]
+    fn lethal_hit_arms_the_collapse_and_zeroes_velocity() {
+        let mut mob = pig_at_origin();
+        mob.velocity = Vec3::new(1.0, 0.0, 1.0);
+        let hit = mob
+            .take_hit(200, attacker_behind())
+            .expect("lethal hit lands");
+        assert!(hit.killed);
+        assert_eq!(mob.health, 0);
+        assert!(mob.is_dead());
+        assert_eq!(mob.death, MOB_DEATH_SECS);
+        assert_eq!(mob.flee, 0.0);
+        assert_eq!(mob.velocity, Vec3::ZERO);
+        assert!(
+            mob.knockback.length_squared() > 0.0,
+            "the away knockback still applies"
+        );
+        assert!(!mob.death_finished());
+        assert_eq!(mob.death_progress(), 0.0);
+    }
+
+    #[test]
+    fn death_progress_is_zero_monotonic_clamped_and_finished() {
+        let mut runtime = MobRuntime::new(24);
+        let mut mobs = vec![pig_at_origin()];
+        assert_eq!(mobs[0].death_progress(), 0.0, "alive progress is zero");
+        let hit = mobs[0]
+            .take_hit(200, attacker_behind())
+            .expect("lethal hit lands");
+        assert!(hit.killed);
+
+        let mut previous = mobs[0].death_progress();
+        let mut saw_mid_collapse = false;
+        for _ in 0..18 {
+            runtime.tick(0.05, &mut mobs, resident);
+            let progress = mobs[0].death_progress();
+            assert!((0.0..=1.0).contains(&progress), "progress {progress}");
+            assert!(progress >= previous, "progress must be monotonic");
+            if progress > 0.0 && progress < 1.0 {
+                saw_mid_collapse = true;
+            }
+            previous = progress;
+        }
+        assert!(saw_mid_collapse, "the collapse must have a visible middle");
+        assert_eq!(mobs[0].death, 0.0);
+        assert!(mobs[0].death_finished());
+        assert_eq!(mobs[0].death_progress(), 1.0);
+
+        // Clamping: a corrupted timer cannot escape the render range.
+        let mut restored = Mob::restored(MobKind::Pig, Vec3::ZERO, 0.0, 0);
+        assert!(restored.death_finished());
+        assert_eq!(restored.death_progress(), 1.0);
+        restored.death = -1.0;
+        assert_eq!(restored.death_progress(), 1.0);
+        restored.death = MOB_DEATH_SECS * 2.0;
+        assert_eq!(restored.death_progress(), 0.0);
+        restored.death = MOB_DEATH_SECS * 0.5;
+        assert!((restored.death_progress() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn take_hit_and_kill_on_a_corpse_mutate_nothing() {
+        // Already-finished corpse.
+        let mut finished = Mob::restored(MobKind::Pig, Vec3::new(0.0, 5.0, 0.0), 0.0, 0);
+        let snapshot = finished.clone();
+        assert_eq!(finished.take_hit(4, attacker_behind()), None);
+        assert_eq!(finished, snapshot);
+        assert!(!finished.kill());
+        assert_eq!(finished, snapshot);
+
+        // Mid-collapse corpse: still dead, still refuses both entry points.
+        let mut fading = pig_at_origin();
+        fading
+            .take_hit(200, attacker_behind())
+            .expect("lethal hit lands");
+        fading.hurt_iframe = 0.0;
+        let snapshot = fading.clone();
+        assert_eq!(fading.take_hit(4, attacker_behind()), None);
+        assert_eq!(fading, snapshot);
+        assert!(!fading.kill());
+        assert_eq!(fading, snapshot);
+    }
+
+    #[test]
+    fn dying_mob_moves_only_by_knockback_and_still_decays_timers() {
+        let mut runtime = MobRuntime::new(25);
+        let mut mobs = vec![pig_at_origin()];
+        mobs[0]
+            .take_hit(200, attacker_behind())
+            .expect("lethal hit lands");
+        let start = mobs[0].position;
+        let start_walk_phase = mobs[0].walk_phase;
+
+        for _ in 0..4 {
+            runtime.tick(0.05, &mut mobs, resident);
+        }
+
+        assert_eq!(mobs[0].velocity, Vec3::ZERO, "a dying mob never walks");
+        assert_eq!(mobs[0].walk_phase, start_walk_phase);
+        assert_eq!(mobs[0].position.x, start.x);
+        assert_eq!(mobs[0].position.y, start.y);
+        assert!(
+            mobs[0].position.z > start.z,
+            "only the away knockback moved the body"
+        );
+        assert!(mobs[0].hurt < MOB_HURT_FLASH_SECS);
+        assert!(mobs[0].hurt_iframe < MOB_IFRAME_SECS);
+        assert!(mobs[0].death < MOB_DEATH_SECS);
+    }
+
+    #[test]
+    fn non_resident_corpse_freezes_its_collapse() {
+        let mut runtime = MobRuntime::new(26);
+        let mut mob = Mob::new(MobKind::Pig, Vec3::new(100.0, 5.0, 0.5), 0.0);
+        assert!(mob.kill());
+        mob.death = MOB_DEATH_SECS * 0.5;
+        let snapshot = mob.clone();
+        let mut mobs = vec![mob];
+
+        runtime.tick(0.05, &mut mobs, |_| false);
+        assert_eq!(mobs[0], snapshot, "an unloaded corpse freezes entirely");
     }
 }
