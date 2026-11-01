@@ -17,12 +17,20 @@
 //! data so the model contract remains headlessly testable; the wgpu-facing
 //! [`create_mob_pipeline`] factory below only translates that contract into a
 //! pipeline descriptor (one camera bind group, no per-mob state).
+//!
+//! Arrows share that one batch: [`build_arrow_vertices`] is the pure
+//! model-space arrow box (36 vertices, long axis `+Z`, already-authored layer
+//! [`crate::render::texture::MOB_ARROW_TEX_LAYER`]) and [`build_mob_batch`]
+//! appends one oriented copy per visible projectile. The shader, vertex
+//! layout, stride and texture layers 0..=43 are untouched, so a projectile
+//! costs vertices in the existing draw call, never a second pipeline or
+//! `rpass.draw`.
 
 use glam::{Quat, Vec3};
 
 use crate::player::camera::{Camera, Frustum};
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
-use crate::render::texture::MOB_LAYER_BASE;
+use crate::render::texture::{MOB_ARROW_TEX_LAYER, MOB_LAYER_BASE};
 use crate::world::mob::MobKind;
 use crate::world::session::WorldSession;
 
@@ -565,15 +573,123 @@ pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -
     out
 }
 
-/// Build the world-space vertex batch for every visible mob in `session`.
+/// Vertices in one arrow box: 6 faces x 2 triangles x 3 vertices.
+///
+/// The arrow reuses the mob vertex format and pipeline; it is a single thin
+/// cuboid, not a six-part model, so it costs exactly this many vertices on top
+/// of the mob batch.
+pub const ARROW_VERTS: usize = 36;
+
+/// Half length of the arrow's long axis, in blocks (0.6 blocks tip to tail).
+const ARROW_HALF_LEN: f32 = 0.3;
+/// Half extent of the arrow's square cross-section, in blocks (0.06 wide).
+const ARROW_HALF_THICK: f32 = 0.03;
+
+/// Build the model-space vertices of one arrow.
+///
+/// Model space: a single axis-aligned cuboid **centred on the origin** whose
+/// long axis is `+Z` and whose cross-section is `x`/`y`. Centring matters:
+/// [`build_mob_batch`] rotates about the midpoint, so offsetting the box would
+/// swing it in an arc instead of aiming it along the velocity.
+///
+/// Every vertex uses [`MOB_ARROW_TEX_LAYER`] (already authored on the block
+/// texture array) and `flash = 0.0`. `light` is baked into `shade` with the
+/// exact same face-shading constants as [`build_mob_vertices`], so arrows and
+/// mobs respond identically to world light. Non-finite light is sanitised to
+/// `0.0` and clamped to `0..=1`.
+pub fn build_arrow_vertices(light: f32) -> Vec<MobVertex> {
+    let light = finite_or(light, 0.0).clamp(0.0, 1.0);
+    let shade_mul = 0.35 + 0.65 * light;
+    let min = Vec3::new(-ARROW_HALF_THICK, -ARROW_HALF_THICK, -ARROW_HALF_LEN);
+    let max = Vec3::new(ARROW_HALF_THICK, ARROW_HALF_THICK, ARROW_HALF_LEN);
+    let mut out = Vec::with_capacity(ARROW_VERTS);
+
+    for face in &FACES {
+        let shade = face.shade * shade_mul;
+        let corners = [
+            corner(face.corners[0], min, max),
+            corner(face.corners[1], min, max),
+            corner(face.corners[2], min, max),
+            corner(face.corners[3], min, max),
+        ];
+        for &index in &[0usize, 1, 2, 0, 2, 3] {
+            out.push(MobVertex {
+                position: corners[index].to_array(),
+                uv: FACE_UVS[index],
+                tex_layer: MOB_ARROW_TEX_LAYER,
+                shade,
+                flash: 0.0,
+            });
+        }
+    }
+
+    debug_assert_eq!(out.len(), ARROW_VERTS);
+    out
+}
+
+/// Orientation for a projectile moving along `velocity`.
+///
+/// The model long axis is `+Z`, so the quaternion first yaws about `Y`
+/// (`yaw = atan2(v.x, v.z)`) to face the horizontal direction and then pitches
+/// about `X` (`pitch = -asin(v.y / |v|)`) to follow the climb or dive. The
+/// inverse sign on the pitch is required because a positive rotation about
+/// `X` maps `+Z` toward `-Y`; the test suite pins that a downward velocity
+/// ends up pointing down.
+///
+/// A zero-length or non-finite velocity cannot define a direction, so it falls
+/// back to [`Quat::IDENTITY`] (the flat `+Z` pose). Embedded arrows keep their
+/// impact velocity by design, so they render angled into the block they hit.
+fn arrow_orientation(velocity: Vec3) -> Quat {
+    let length_sq = velocity.length_squared();
+    if !velocity.is_finite() || length_sq <= 1e-12 {
+        return Quat::IDENTITY;
+    }
+    let length = length_sq.sqrt();
+    let yaw = velocity.x.atan2(velocity.z);
+    let pitch = -(velocity.y / length).clamp(-1.0, 1.0).asin();
+    Quat::from_rotation_y(yaw) * Quat::from_rotation_x(pitch)
+}
+
+/// Places `model` arrow vertices into world space and appends them to `out`.
+///
+/// Shared by [`build_mob_batch`] and the geometry tests so both exercise the
+/// same rotate-then-translate order.
+fn place_arrow_vertices(
+    out: &mut Vec<MobVertex>,
+    model: &[MobVertex],
+    rotation: Quat,
+    position: Vec3,
+) {
+    for vertex in model {
+        let mut world = *vertex;
+        world.position = (rotation * Vec3::from(vertex.position) + position).to_array();
+        out.push(world);
+    }
+}
+
+/// Build the world-space vertex batch for every visible mob **and arrow** in
+/// `session`.
 ///
 /// A mob is included only when its feet chunk is resident and its AABB
 /// intersects the camera frustum. A dying mob is still included (it remains a
 /// record until the session reaper removes it) and is rendered collapsed by
 /// its own [`crate::world::mob::Mob::death_progress`]. Light is read once from
 /// the feet block, folded into `shade`, and the model vertices are rotated by
-/// the mob yaw and translated to the world position. This is intentionally
-/// pure: no wgpu calls and no allocations beyond the returned output vector.
+/// the mob yaw and translated to the world position.
+///
+/// Arrows are appended after the mob loop with exactly the same gates: a
+/// non-finite position is skipped, a non-resident arrow is skipped (the chunk
+/// has not streamed in yet), and an arrow whose
+/// [`crate::world::arrow::Arrow::aabb`] misses the camera frustum is skipped.
+/// Each survivor contributes [`ARROW_VERTS`] vertices oriented from its
+/// velocity via [`arrow_orientation`] and translated to its centre (embedded
+/// arrows keep their impact velocity and rest position).
+///
+/// Everything lands in one output vector, so the renderer still uploads one
+/// buffer and issues the existing single `rpass.draw(0..mob_vertices.len())`:
+/// no pipeline, uniform, stride or texture-layer change is involved. This is
+/// intentionally pure: no wgpu calls and no allocations beyond the returned
+/// output vector.
 pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> Vec<MobVertex> {
     let frustum = Frustum::from_view_proj(&camera.view_proj(aspect));
     let mut out = Vec::new();
@@ -612,6 +728,35 @@ pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> 
         }
     }
 
+    // Arrows: same gates as mobs, one 36-vertex box each. A zero or non-finite
+    // velocity cannot orient the box, so `arrow_orientation` falls back to the
+    // flat +Z pose rather than dropping a projectile that is still alive.
+    for arrow in session.arrows() {
+        if !arrow.position.is_finite() {
+            continue;
+        }
+        if !session.arrow_is_resident(arrow) {
+            continue;
+        }
+        let (min, max) = arrow.aabb();
+        if !frustum.intersects_aabb(min, max) {
+            continue;
+        }
+
+        let light = session.world.light_at_world(
+            arrow.position.x.floor() as i32,
+            arrow.position.y.floor() as i32,
+            arrow.position.z.floor() as i32,
+        );
+        let rotation = arrow_orientation(arrow.velocity);
+        place_arrow_vertices(
+            &mut out,
+            &build_arrow_vertices(light as f32 / 15.0),
+            rotation,
+            arrow.position,
+        );
+    }
+
     out
 }
 
@@ -621,6 +766,7 @@ mod tests {
 
     use super::*;
     use crate::player::survival::GameMode;
+    use crate::world::arrow::Arrow;
     use crate::world::block::BlockId;
     use crate::world::chunk::{Chunk, ChunkPos};
     use crate::world::mob::{Mob, MOB_DEATH_SECS};
@@ -1095,5 +1241,260 @@ mod tests {
             .push(Mob::new(MobKind::Pig, Vec3::new(f32::NAN, 0.0, 0.5), 0.0));
         let camera = camera_looking_at_plus_z(Vec3::new(0.5, 1.6, -3.0));
         assert!(build_mob_batch(&session, &camera, 16.0 / 9.0).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Arrow geometry (S07-T04)
+    // -----------------------------------------------------------------------
+
+    /// Builds an oriented copy of the model arrow, exactly as
+    /// [`build_mob_batch`] places it (rotate about the centre, then translate).
+    fn placed_arrow(velocity: Vec3, position: Vec3) -> Vec<MobVertex> {
+        let mut placed = Vec::new();
+        place_arrow_vertices(
+            &mut placed,
+            &build_arrow_vertices(1.0),
+            arrow_orientation(velocity),
+            position,
+        );
+        placed
+    }
+
+    /// Spawns a player arrow through the real session seam, panicking if the
+    /// session refuses it (which would make the render assertion meaningless).
+    fn spawn_arrow(session: &mut WorldSession, position: Vec3, dir: Vec3, charge: f32) -> Arrow {
+        let arrow = Arrow::player(position, dir, charge).expect("valid test arrow");
+        session.spawn_arrow(arrow).expect("session accepts arrow");
+        arrow
+    }
+
+    #[test]
+    fn arrow_geometry_is_36_vertices_on_layer_44() {
+        let vertices = build_arrow_vertices(1.0);
+        assert_eq!(vertices.len(), ARROW_VERTS);
+        assert_eq!(ARROW_VERTS, 36);
+        assert_eq!(MOB_ARROW_TEX_LAYER, 44);
+        for vertex in &vertices {
+            assert_eq!(vertex.tex_layer, MOB_ARROW_TEX_LAYER);
+            assert_eq!(vertex.flash, 0.0);
+            assert!(vertex.position.iter().all(|value| value.is_finite()));
+            assert!(vertex.shade.is_finite());
+            assert!((0.0..=1.0).contains(&vertex.uv[0]));
+            assert!((0.0..=1.0).contains(&vertex.uv[1]));
+        }
+        // The same six face-shading constants as a mob: top is the brightest
+        // and bottom the darkest at full light.
+        let darkest = vertices
+            .iter()
+            .map(|vertex| vertex.shade)
+            .fold(f32::INFINITY, f32::min);
+        let brightest = vertices
+            .iter()
+            .map(|vertex| vertex.shade)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!((darkest - SHADE_BOTTOM).abs() < 1e-6);
+        assert!((brightest - SHADE_TOP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arrow_geometry_is_light_sensitive_and_sanitises_non_finite_light() {
+        let bright = build_arrow_vertices(1.0);
+        let dark = build_arrow_vertices(0.0);
+        let nan = build_arrow_vertices(f32::NAN);
+        assert!(dark.iter().all(|vertex| vertex.shade.is_finite()));
+        assert!(nan.iter().all(|vertex| vertex.shade.is_finite()));
+        assert_eq!(dark, nan);
+        assert!(bright
+            .iter()
+            .zip(dark.iter())
+            .all(|(lit, unlit)| lit.shade > unlit.shade));
+    }
+
+    #[test]
+    fn arrow_long_axis_is_positive_z() {
+        let (min, max) = aabb(&build_arrow_vertices(1.0));
+        let extent = max - min;
+        assert!(
+            extent.z > extent.x * 5.0 && extent.z > extent.y * 5.0,
+            "the long axis must be Z: {extent:?}"
+        );
+        assert!((extent.z - 0.6).abs() < 1e-5);
+        assert!((extent.x - 0.06).abs() < 1e-5);
+        assert!((extent.y - 0.06).abs() < 1e-5);
+        // Centred on the origin so rotation about the mid-point is correct,
+        // and the tip points at +Z.
+        assert!(min.z < 0.0 && max.z > 0.0);
+        assert!((min.z + 0.3).abs() < 1e-5);
+        assert!((max.z - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn horizontal_arrow_lies_flat() {
+        let placed = placed_arrow(Vec3::new(0.0, 0.0, 18.0), Vec3::ZERO);
+        let (min, max) = aabb(&placed);
+        let extent = max - min;
+        assert!((extent.z - 0.6).abs() < 1e-4, "forward span {extent:?}");
+        assert!(extent.y < 0.1, "a flat arrow is thin in Y: {extent:?}");
+        assert!(extent.x < 0.1, "a flat arrow is thin in X: {extent:?}");
+    }
+
+    #[test]
+    fn downward_arrow_points_down() {
+        let rotation = arrow_orientation(Vec3::new(0.0, -28.0, 0.0));
+        let mut placed = Vec::new();
+        place_arrow_vertices(
+            &mut placed,
+            &build_arrow_vertices(1.0),
+            rotation,
+            Vec3::ZERO,
+        );
+        let (min, max) = aabb(&placed);
+        let extent = max - min;
+        // The long axis is now vertical within 1e-4.
+        assert!((extent.y - 0.6).abs() < 1e-4, "vertical span {extent:?}");
+        assert!(extent.x < 0.1 && extent.z < 0.1);
+        // The tip (model +Z) maps to the lowest point, so the highest vertex
+        // must be the tail: un-rotating it lands at model z = -0.3.
+        assert!((max.y - 0.3).abs() < 1e-4);
+        let tail = placed
+            .iter()
+            .max_by(|a, b| a.position[1].total_cmp(&b.position[1]))
+            .expect("arrow has vertices");
+        let model = rotation.inverse() * Vec3::from(tail.position);
+        assert!(
+            (-0.31..-0.29).contains(&model.z),
+            "the highest vertex must be the tail, model z {}",
+            model.z
+        );
+    }
+
+    #[test]
+    fn nan_or_zero_velocity_falls_back_to_a_positive_z_box() {
+        for velocity in [
+            Vec3::ZERO,
+            Vec3::new(f32::NAN, 1.0, 0.0),
+            Vec3::new(f32::INFINITY, 0.0, 0.0),
+        ] {
+            let rotation = arrow_orientation(velocity);
+            assert_eq!(rotation, Quat::IDENTITY, "velocity {velocity:?}");
+            let placed = placed_arrow(velocity, Vec3::new(0.5, 1.0, 0.5));
+            assert!(placed
+                .iter()
+                .all(|vertex| vertex.position.iter().all(|value| value.is_finite())));
+            let (min, max) = aabb(&placed);
+            assert!((min.z - 0.2).abs() < 1e-4 && (max.z - 0.8).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn batch_drops_a_non_resident_arrow() {
+        let mut session = session();
+        // Chunk (0, 0, 0) is deliberately absent, so the arrow is non-resident.
+        spawn_arrow(
+            &mut session,
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+        );
+        let camera = camera_looking_at_plus_z(Vec3::new(0.5, 1.6, -3.0));
+        assert!(build_mob_batch(&session, &camera, 16.0 / 9.0).is_empty());
+    }
+
+    #[test]
+    fn batch_drops_a_resident_arrow_behind_the_camera() {
+        let mut session = session();
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, -1), Chunk::new_uniform(BlockId::Air));
+        spawn_arrow(
+            &mut session,
+            Vec3::new(0.5, 1.0, -6.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+        );
+        let camera = camera_looking_at_plus_z(Vec3::new(0.5, 1.6, -3.0));
+        assert!(build_mob_batch(&session, &camera, 16.0 / 9.0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_arrow_list_leaves_the_mob_batch_unchanged() {
+        let mob = Mob::new(MobKind::Pig, Vec3::new(0.5, 0.0, 0.5), 0.0);
+        let (session, batch) =
+            scene_and_batch(std::slice::from_ref(&mob), Vec3::new(0.5, 1.6, -3.0));
+        assert!(session.arrows().is_empty());
+        assert_eq!(batch.len(), MOB_VERTS_PER_MOB);
+
+        let camera = camera_looking_at_plus_z(Vec3::new(0.5, 1.6, -3.0));
+        let rebuilt = build_mob_batch(&session, &camera, 16.0 / 9.0);
+        assert_eq!(batch, rebuilt, "no arrows means no extra vertices");
+    }
+
+    #[test]
+    fn one_visible_arrow_appends_exactly_36_vertices() {
+        let eye = Vec3::new(0.5, 1.6, -3.0);
+        let mob = Mob::new(MobKind::Pig, Vec3::new(0.5, 0.0, 0.5), 0.0);
+        let (mut session, mob_batch) = scene_and_batch(std::slice::from_ref(&mob), eye);
+        assert_eq!(mob_batch.len(), MOB_VERTS_PER_MOB);
+
+        let arrow = spawn_arrow(
+            &mut session,
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+        );
+        let camera = camera_looking_at_plus_z(eye);
+        let batch = build_mob_batch(&session, &camera, 16.0 / 9.0);
+        assert_eq!(batch.len(), MOB_VERTS_PER_MOB + ARROW_VERTS);
+        // Mobs come first and are byte-identical to the arrow-free batch.
+        assert_eq!(&batch[..MOB_VERTS_PER_MOB], mob_batch.as_slice());
+
+        let appended = &batch[MOB_VERTS_PER_MOB..];
+        assert_eq!(appended.len(), ARROW_VERTS);
+        assert!(appended
+            .iter()
+            .all(|vertex| vertex.tex_layer == MOB_ARROW_TEX_LAYER));
+
+        let light = session.world.light_at_world(
+            arrow.position.x.floor() as i32,
+            arrow.position.y.floor() as i32,
+            arrow.position.z.floor() as i32,
+        );
+        let mut expected = Vec::new();
+        place_arrow_vertices(
+            &mut expected,
+            &build_arrow_vertices(light as f32 / 15.0),
+            Quat::IDENTITY,
+            arrow.position,
+        );
+        assert_eq!(appended, expected.as_slice());
+
+        let (min, max) = aabb(appended);
+        assert!((min.x - 0.47).abs() < 1e-4 && (max.x - 0.53).abs() < 1e-4);
+        assert!((min.z - 0.2).abs() < 1e-4 && (max.z - 0.8).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_embedded_arrow_renders_at_its_rest_position_with_impact_heading() {
+        let eye = Vec3::new(0.5, 1.6, -3.0);
+        let mut session = session();
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        let mut arrow = Arrow::player(Vec3::new(0.5, 1.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 0.5)
+            .expect("valid test arrow");
+        let velocity = arrow.velocity;
+        arrow.embed();
+        session.spawn_arrow(arrow).expect("embedded arrow accepted");
+
+        let camera = camera_looking_at_plus_z(eye);
+        let batch = build_mob_batch(&session, &camera, 16.0 / 9.0);
+        assert_eq!(batch.len(), ARROW_VERTS);
+        let (min, max) = aabb(&batch);
+        // Still centred on the impact point, but oriented along the downward
+        // impact velocity, so its long axis is vertical.
+        assert!((min.x - 0.47).abs() < 1e-4 && (max.x - 0.53).abs() < 1e-4);
+        assert!((min.y - 0.7).abs() < 1e-3 && (max.y - 1.3).abs() < 1e-3);
+        assert!(max.z - min.z < 0.1, "downward heading is thin in Z");
+        assert!(velocity.y < 0.0);
     }
 }
