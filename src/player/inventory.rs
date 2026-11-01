@@ -1176,6 +1176,9 @@ pub enum RecipeId {
     WoodHoe,
     StoneHoe,
     IronHoe,
+    WoodSword,
+    StoneSword,
+    IronSword,
 }
 
 /// Read-only recipe evaluation result.
@@ -1367,6 +1370,36 @@ const RECIPES: &[Recipe] = &[
         pattern: &["II", " S", " S"],
         output: ItemId::Tool {
             kind: ToolKind::Hoe,
+            tier: ToolTier::Iron,
+        },
+        output_count: 1,
+    },
+    // Swords follow the vanilla 1-wide, 3-tall head-over-handle column. Like
+    // the hoes they structurally cannot fit the 2x2 player grid, so they are
+    // table-only by construction rather than by an explicit grid check.
+    Recipe {
+        id: RecipeId::WoodSword,
+        pattern: &["P", "P", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::StoneSword,
+        pattern: &["C", "C", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Stone,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::IronSword,
+        pattern: &["I", "I", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
             tier: ToolTier::Iron,
         },
         output_count: 1,
@@ -1661,6 +1694,36 @@ mod tests {
         for slot in inventory.slots.iter_mut() {
             *slot = Some(full);
         }
+    }
+
+    /// Removes `amount` of `id` from the inventory, failing the test if the
+    /// inventory cannot supply it. Keeps craft-chain accounting honest: every
+    /// unit placed in a grid is withdrawn from somewhere.
+    fn withdraw(inventory: &mut Inventory, id: ItemId, amount: u16) -> Item {
+        let mut remaining = amount;
+        for slot in inventory.slots.iter_mut() {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(existing) = *slot {
+                if existing.id() != id {
+                    continue;
+                }
+                let moved = existing.count.min(remaining);
+                remaining -= moved;
+                *slot = if existing.count == moved {
+                    None
+                } else {
+                    Some(
+                        existing
+                            .with_count(existing.count - moved)
+                            .expect("partial stack is valid"),
+                    )
+                };
+            }
+        }
+        assert_eq!(remaining, 0, "inventory holds the requested ingredient");
+        item(id, amount)
     }
 
     /// Builds a grid of `kind` from an ASCII pattern using the same character
@@ -3058,7 +3121,7 @@ mod tests {
 
     #[test]
     fn every_tool_recipe_is_shaped_and_produces_a_full_durability_instance() {
-        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 12] = [
+        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 15] = [
             (
                 RecipeId::WoodPickaxe,
                 ToolKind::Pickaxe,
@@ -3130,6 +3193,24 @@ mod tests {
                 ToolKind::Hoe,
                 ToolTier::Iron,
                 &["II", " S", " S"],
+            ),
+            (
+                RecipeId::WoodSword,
+                ToolKind::Sword,
+                ToolTier::Wood,
+                &["P", "P", "S"],
+            ),
+            (
+                RecipeId::StoneSword,
+                ToolKind::Sword,
+                ToolTier::Stone,
+                &["C", "C", "S"],
+            ),
+            (
+                RecipeId::IronSword,
+                ToolKind::Sword,
+                ToolTier::Iron,
+                &["I", "I", "S"],
             ),
         ];
 
@@ -3261,6 +3342,221 @@ mod tests {
     }
 
     #[test]
+    fn sword_recipes_are_table_only() {
+        let cases: [(RecipeId, &[&str]); 3] = [
+            (RecipeId::WoodSword, &["P", "P", "S"]),
+            (RecipeId::StoneSword, &["C", "C", "S"]),
+            (RecipeId::IronSword, &["I", "I", "S"]),
+        ];
+        for (recipe_id, pattern) in cases {
+            // Swords are a 1-wide, 3-tall column while the player grid is two
+            // rows tall, so the full shape can never be placed there.
+            assert_eq!(pattern.len(), 3);
+            assert!(GridKind::Player.dim() < pattern.len());
+
+            let ids = [
+                pattern_item(pattern[0].as_bytes()[0]).expect("head"),
+                pattern_item(pattern[1].as_bytes()[0]).expect("head"),
+                pattern_item(pattern[2].as_bytes()[0]).expect("handle"),
+            ];
+
+            // Placing the only rows a 2x2 grid can hold (both heads) must
+            // never produce the sword. The wood sword's two planks are
+            // legitimately the sticks recipe, so this asserts "not this
+            // sword" rather than "no recipe".
+            let mut partial = CraftingGrid::new(GridKind::Player);
+            partial.set(0, Some(item(ids[0], 1))).expect("cell 0");
+            partial
+                .set(GridKind::Player.dim(), Some(item(ids[1], 1)))
+                .expect("cell 2");
+            assert_ne!(
+                partial.preview().map(|preview| preview.recipe),
+                Some(recipe_id),
+                "{recipe_id:?} cannot be completed in the 2x2 player grid"
+            );
+
+            // Even squeezing all three ingredients into the 2x2 L leaves no
+            // sword recipe.
+            let mut packed = CraftingGrid::new(GridKind::Player);
+            for (index, id) in ids.into_iter().enumerate() {
+                packed
+                    .set(index, Some(item(id, 1)))
+                    .expect("player cell");
+            }
+            assert_eq!(
+                packed.preview(),
+                None,
+                "{recipe_id:?} cannot fit the 2x2 player grid"
+            );
+
+            let table = grid_from_pattern(GridKind::Table, pattern);
+            assert_eq!(
+                table.preview().map(|preview| preview.recipe),
+                Some(recipe_id),
+                "{recipe_id:?} matches on the table"
+            );
+        }
+    }
+
+    #[test]
+    fn sword_recipe_matches_at_an_offset_on_the_table() {
+        let mut grid = CraftingGrid::new(GridKind::Table);
+        let dim = GridKind::Table.dim();
+        // Wood sword shifted one row down and one column right.
+        grid.set(dim + 1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("first head cell");
+        grid.set(2 * dim + 1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("second head cell");
+        grid.set(3 * dim + 1, Some(stick(1)))
+            .expect("handle cell");
+        assert_eq!(
+            grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::WoodSword)
+        );
+
+        let mut inventory = Inventory::empty();
+        let crafted = grid.take_result(&mut inventory).expect("offset craft");
+        assert_eq!(
+            crafted.id(),
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn sword_recipe_rejects_a_wrong_head_material() {
+        // Both heads must be the sword tier's material; mixing tiers in the
+        // head column matches nothing.
+        let mixed_heads = grid_from_pattern(GridKind::Table, &["P", "C", "S"]);
+        assert_eq!(mixed_heads.preview(), None);
+
+        // A plank in the handle cell is not a wood sword either.
+        let wrong_handle = grid_from_pattern(GridKind::Table, &["P", "P", "P"]);
+        assert_eq!(wrong_handle.preview(), None);
+
+        // And an iron-column handle with stone heads is still not a sword.
+        let iron_handle = grid_from_pattern(GridKind::Table, &["C", "C", "I"]);
+        assert_eq!(iron_handle.preview(), None);
+    }
+
+    #[test]
+    fn wood_sword_craft_chain_starts_from_one_oak_log() {
+        // The slice demo opens with "craft a wood sword from planks and
+        // sticks". Every step moves items between the inventory and a grid,
+        // so the totals account for every unit: nothing is spawned.
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(block(BlockId::OakLog, 1))
+            .expect("inventory holds the starting log");
+
+        // Step 1: the single oak log becomes four planks in the 2x2 grid.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        let log = withdraw(&mut inventory, ItemId::Block(BlockId::OakLog), 1);
+        player.set(0, Some(log)).expect("player cell");
+        let planks = player.take_result(&mut inventory).expect("planks craft");
+        assert_eq!(planks.id(), ItemId::Block(BlockId::OakPlanks));
+        assert_eq!(planks.count(), 4);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            4
+        );
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 0);
+        assert!(player.is_empty());
+
+        // Step 2: two of those four planks become four sticks.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(
+                0,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Block(BlockId::OakPlanks),
+                    1,
+                )),
+            )
+            .expect("player cell");
+        player
+            .set(
+                GridKind::Player.dim(),
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Block(BlockId::OakPlanks),
+                    1,
+                )),
+            )
+            .expect("player cell");
+        let sticks = player.take_result(&mut inventory).expect("sticks craft");
+        assert_eq!(sticks.id(), ItemId::Material(Material::Stick));
+        assert_eq!(sticks.count(), 4);
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            2,
+            "two planks remain"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 4);
+        assert!(player.is_empty());
+
+        // Step 3: the two remaining planks plus one stick become the sword.
+        let mut table = CraftingGrid::new(GridKind::Table);
+        let dim = table.dim();
+        for index in [0, dim] {
+            table
+                .set(
+                    index,
+                    Some(withdraw(
+                        &mut inventory,
+                        ItemId::Block(BlockId::OakPlanks),
+                        1,
+                    )),
+                )
+                .expect("head cell");
+        }
+        table
+            .set(
+                2 * dim,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Material(Material::Stick),
+                    1,
+                )),
+            )
+            .expect("handle cell");
+
+        let preview = table.preview().expect("wood sword pattern matches");
+        assert_eq!(preview.recipe, RecipeId::WoodSword);
+
+        let sword = table.take_result(&mut inventory).expect("sword craft");
+        assert_eq!(
+            sword.id(),
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(sword.count(), 1);
+        assert_eq!(sword.durability(), Some(59));
+        assert!(table.is_empty());
+
+        // Conservation: the log and both head planks are gone, the handle
+        // consumed exactly one stick, and the sword is the only new stack.
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            0
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            3,
+            "only the handle stick is consumed"
+        );
+        assert_eq!(total_of(&inventory, sword.id()), 1);
+    }
+
+    #[test]
     fn take_result_revalidates_a_stale_preview() {
         let mut grid = grid_from_pattern(GridKind::Player, &["P", "P"]);
         let stale = grid.preview().expect("initial preview");
@@ -3333,7 +3629,11 @@ mod tests {
 
     #[test]
     fn recipe_table_patterns_are_unambiguous() {
-        assert_eq!(RECIPES.len(), 17, "13 pre-farming recipes plus 4 new ones");
+        assert_eq!(
+            RECIPES.len(),
+            20,
+            "13 pre-farming recipes plus 4 farming recipes plus 3 swords"
+        );
         for recipe in RECIPES {
             let mut grid = CraftingGrid::new(GridKind::Table);
             for (row, line) in recipe.pattern.iter().enumerate() {
