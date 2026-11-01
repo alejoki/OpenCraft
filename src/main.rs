@@ -1390,6 +1390,11 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
         WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
     if cli.demo_combat {
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
+        // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
+        // digest and the v7 save tail must describe the scripted quartet only,
+        // so ambient spawning and daylight burning stay off for the whole
+        // scripted run. Production sessions never touch this switch.
+        session.set_ambient_spawning(false);
     }
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
@@ -10571,6 +10576,10 @@ mod tests {
         assert_eq!(session.player.mode(), GameMode::Survival);
         assert!(!session.player.can_fly());
         assert!(
+            !session.ambient_spawning(),
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v7 save tail"
+        );
+        assert!(
             session.spawn_settle_pending(),
             "a fresh Survival spawn still settles before physics"
         );
@@ -10610,6 +10619,10 @@ mod tests {
         assert!(
             !loaded.spawn_settle_pending(),
             "a loaded session is never fresh"
+        );
+        assert!(
+            loaded.ambient_spawning(),
+            "only the fresh scripted branch closes the population gate"
         );
     }
 

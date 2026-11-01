@@ -33,6 +33,7 @@ use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobTick};
 use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
+use crate::world::spawning::{SpawnContext, SpawnReport, SpawnRuntime};
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
@@ -91,6 +92,19 @@ pub struct WorldSession {
     /// Fixed-rate 20 Hz mob driver, seeded from the session's world seed.
     /// Ephemeral like `survival_runtime`.
     mob_runtime: MobRuntime,
+    /// Deterministic mob population layer (M009/S05): spawn attempts, the
+    /// global and per-region caps, the distance cull, and daylight burning.
+    /// Ephemeral like `mob_runtime` — a reload restarts the attempt sequence,
+    /// so a save can never carry a spawn cursor.
+    spawn_runtime: SpawnRuntime,
+    /// Cached deterministic world-spawn feet position ([`Self::spawn_position`]),
+    /// computed once per construction by the same pure land search a fresh
+    /// spawn already pays for.
+    ///
+    /// The spawner protects this anchor with its own safe radius, so it must
+    /// stay the *world* spawn: it deliberately does not follow the player, the
+    /// Edit Background anchor, or a saved player position.
+    world_spawn: Vec3,
 }
 
 impl WorldSession {
@@ -117,6 +131,9 @@ impl WorldSession {
         mode: GameMode,
     ) -> WorldSession {
         let mut player = Player::new_with_mode(Self::spawn_position(seed), mode);
+        // The player starts on the deterministic world spawn, so the cached
+        // anchor is that same position: no second land search.
+        let world_spawn = player.position;
         if mode == GameMode::Survival {
             // The deterministic spawn is four blocks above the surface, so the
             // first dry landing is discarded instead of costing health while
@@ -139,6 +156,8 @@ impl WorldSession {
             spawn_settle: mode == GameMode::Survival,
             mobs: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
+            spawn_runtime: SpawnRuntime::new(),
+            world_spawn,
         };
         session.sync_camera();
         session
@@ -186,6 +205,11 @@ impl WorldSession {
             spawn_settle: false,
             mobs: Vec::new(),
             mob_runtime: MobRuntime::new(seed),
+            spawn_runtime: SpawnRuntime::new(),
+            // The editor anchor is not the world spawn: the safe radius must
+            // protect the seed's deterministic spawn pad, so a load pays the
+            // same single pure land search a fresh session already pays.
+            world_spawn: Self::spawn_position(seed),
         };
         session.sync_camera();
         session
@@ -280,6 +304,14 @@ impl WorldSession {
             // is a deterministic restart of the AI clock, not a continuation
             // of the pre-save tick index.
             mob_runtime: MobRuntime::new(seed),
+            // The population layer restarts too (ephemeral gate, accumulators,
+            // attempt cursor, report), so a reload never resumes a spawn
+            // sequence or inherits a closed demo gate.
+            spawn_runtime: SpawnRuntime::new(),
+            // A saved player position is not the world spawn: the safe radius
+            // must protect the seed's deterministic spawn pad, exactly like
+            // `new_at`. One pure land search at construction is the cost.
+            world_spawn: Self::spawn_position(seed),
         };
         session.sync_camera();
         session
@@ -362,19 +394,28 @@ impl WorldSession {
         &mut self.mobs
     }
 
-    /// Removes every mob whose death collapse has finished, returning how
-    /// many records were dropped.
+    /// Removes every mob record that is finished, returning how many records
+    /// were dropped.
     ///
-    /// This is the one removal site for mob records. A record is reaped only
-    /// when it is dead (`health == 0`) and its collapse timer has fully
-    /// drained ([`Mob::death_finished`]). Because [`Mob::death`] decays only
-    /// while the mob's feet chunk is resident, a mid-fade corpse in an
-    /// unloaded chunk freezes and can legally be saved as a health-0 record;
-    /// it vanishes on the first tick after its chunk reloads. Drops are
-    /// granted by the killer, never by the reaper.
+    /// This is still THE one removal site for mob records. Two kinds of record
+    /// leave here:
+    ///
+    /// * a finished corpse — dead (`health == 0`) with the collapse timer
+    ///   fully drained ([`Mob::death_finished`]); and
+    /// * a record the spawner marked with [`Mob::despawn_pending`] because it
+    ///   drifted past [`crate::world::spawning::DESPAWN_RADIUS`]. The spawner
+    ///   only ever *marks*; no other code removes a record, so a mob can never
+    ///   vanish without passing through this function.
+    ///
+    /// Because [`Mob::death`] decays only while the mob's feet chunk is
+    /// resident, a mid-fade corpse in an unloaded chunk freezes and can
+    /// legally be saved as a health-0 record; it vanishes on the first tick
+    /// after its chunk reloads. Drops are granted by the killer, never by the
+    /// reaper.
     pub fn retain_live_mobs(&mut self) -> usize {
         let before = self.mobs.len();
-        self.mobs.retain(|mob| !mob.death_finished());
+        self.mobs
+            .retain(|mob| !mob.death_finished() && !mob.despawn_pending);
         before - self.mobs.len()
     }
 
@@ -481,14 +522,67 @@ impl WorldSession {
         self.spawn_settle
     }
 
-    /// Advances the fixed-rate 20 Hz mob runtime by one frame of game time.
+    /// The cached deterministic world-spawn feet position (D071), the anchor
+    /// the population layer protects with its safe radius.
+    #[inline]
+    pub fn world_spawn(&self) -> Vec3 {
+        self.world_spawn
+    }
+
+    /// Whether the population layer may create mobs and burn them in daylight.
+    ///
+    /// The distance cull is **not** covered by this gate: a record that drifts
+    /// out of range is still culled, so the gate can never move a deterministic
+    /// demo's mob list. This is an ephemeral demo switch (the scripted
+    /// `--demo-combat` seam flips it off around its pinned stages), **not** a
+    /// game-mode rule: ambient spawning behaves identically in Creative and
+    /// Survival, and making Creative inert is S09's rule, not this gate's.
+    #[inline]
+    pub fn ambient_spawning(&self) -> bool {
+        self.spawn_runtime.enabled()
+    }
+
+    /// Enables or disables mob creation and daylight burning.
+    ///
+    /// Mirrors how `--demo-combat` pins the clock and the world mode: the demo
+    /// seam owns this switch for the life of its scripted run, while production
+    /// sessions leave it enabled for their whole life. Disabling clears the
+    /// partial attempt/burn intervals, so re-enabling starts a fresh window
+    /// instead of firing on the next frame.
+    pub fn set_ambient_spawning(&mut self, enabled: bool) {
+        self.spawn_runtime.set_enabled(enabled);
+    }
+
+    /// Cumulative population counters since construction or
+    /// [`WorldSession::reset_spawn_report`]: spawned, despawn-marked, burned, and
+    /// cap-blocked records.
+    #[inline]
+    pub fn spawn_report(&self) -> SpawnReport {
+        self.spawn_runtime.report()
+    }
+
+    /// Zeroes the cumulative spawn report without touching the gate or the
+    /// deterministic attempt sequence, so a demo stage can re-measure a window.
+    pub fn reset_spawn_report(&mut self) {
+        self.spawn_runtime.reset_report();
+    }
+
+    /// Advances the fixed-rate 20 Hz mob runtime AND the deterministic
+    /// population layer by one frame of game time.
     ///
     /// Exactly the [`WorldSession::tick_survival`] clamp contract: `dt` is
     /// clamped to `0..=0.1`, then scaled by `time_scale` (negative becomes
-    /// zero), and non-finite/non-positive game time is a no-op. Residency is
-    /// resolved per mob from the live world manager, so a mob in an unloaded
-    /// chunk neither moves nor decays. Finished corpses are reaped at the end
-    /// through [`WorldSession::retain_live_mobs`].
+    /// zero), and non-finite/non-positive game time is a no-op — a paused or
+    /// zero-scale frame therefore runs neither the AI nor a spawn attempt.
+    /// Residency is resolved per mob from the live world manager, so a mob in
+    /// an unloaded chunk neither moves nor decays.
+    ///
+    /// This is the **single** spawn site: [`SpawnRuntime::tick`] receives the
+    /// already-clamped, already-scaled `game_dt` plus the session's clock, seed,
+    /// player and cached world-spawn anchor, and is the only code that creates
+    /// mob records or marks one for culling. Finished corpses and
+    /// spawner-marked records are both dropped at the end through
+    /// [`WorldSession::retain_live_mobs`], the one removal site.
     pub fn tick_mobs(&mut self, dt: f32, time_scale: f32) -> MobTick {
         let dt = dt.clamp(0.0, 0.1);
         let game_dt = dt * time_scale.max(0.0);
@@ -509,6 +603,21 @@ impl WorldSession {
                 world.is_resident(chunk)
             })
         };
+        {
+            // Same split-borrow shape as the AI driver above: `world` is
+            // immutable while the runtime and the mob list are mutable.
+            let ctx = SpawnContext {
+                seed: self.world.seed(),
+                day_index: self.clock.day_index,
+                time_of_day: self.clock.time_of_day,
+                player: self.player.position,
+                world_spawn: self.world_spawn,
+            };
+            let world = &self.world;
+            let runtime = &mut self.spawn_runtime;
+            let mobs = &mut self.mobs;
+            runtime.tick(game_dt, &ctx, world, mobs);
+        }
         self.retain_live_mobs();
         report
     }
@@ -1129,6 +1238,7 @@ mod tests {
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
+    use crate::world::spawning::{DESPAWN_RADIUS, SAFE_RADIUS};
 
     fn make_save(seed: u32) -> WorldSaveData {
         WorldSaveData {
@@ -3963,6 +4073,323 @@ mod tests {
         assert_eq!(session.mobs().len(), 2);
         assert_eq!(session.retain_live_mobs(), 0, "a second pass is a no-op");
         assert_eq!(session.mobs().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Population layer wiring: cached world spawn, single tick/reap sites, gate
+    // -----------------------------------------------------------------------
+
+    /// A clock tick inside the inclusive sun-zero night window.
+    const NIGHT_TICK: u32 = 18_000;
+    /// The default morning tick: daylight.
+    const DAY_TICK: u32 = crate::world::daycycle::DEFAULT_TIME_OF_DAY;
+
+    fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+        Vec3::new(a.x - b.x, 0.0, a.z - b.z).length()
+    }
+
+    /// Builds a resident, fully lit flat grass plain and puts the player at the
+    /// centre of one of its chunks.
+    ///
+    /// Columns are built through the production `WorldManager` seam and lit
+    /// through the real CPU light pass (`recompute_light_for_test`), because
+    /// `SpawnWorld::column_ready` demands every Y layer *and* a light grid — a
+    /// missing grid would fall back to full sky light and spawn passives out of
+    /// thin air. `chunk_radius` 3 fully covers the ±48 block ring plus the
+    /// 4-block wander leash; 2 is enough when the test only asserts spawn
+    /// positions.
+    fn lit_grass_plain(session: &mut WorldSession, chunk_radius: i32) {
+        use crate::world::chunk::{Chunk, CHUNK_SIZE};
+        use crate::world::manager::{MAX_CHUNK_Y, MIN_CHUNK_Y};
+
+        const SURFACE_Y: i32 = 64;
+        const SURFACE_CHUNK_Y: i32 = SURFACE_Y / CHUNK_SIZE as i32;
+
+        let world_spawn = session.world_spawn();
+        let centre_x = (world_spawn.x.floor() as i32).div_euclid(CHUNK_SIZE as i32);
+        let centre_z = (world_spawn.z.floor() as i32).div_euclid(CHUNK_SIZE as i32);
+        session.player.position = Vec3::new(
+            centre_x as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+            (SURFACE_Y + 1) as f32,
+            centre_z as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+        );
+        session.sync_camera();
+
+        for cx in centre_x - chunk_radius..=centre_x + chunk_radius {
+            for cz in centre_z - chunk_radius..=centre_z + chunk_radius {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let chunk = if cy < SURFACE_CHUNK_Y {
+                        Chunk::new_uniform(BlockId::Stone)
+                    } else if cy == SURFACE_CHUNK_Y {
+                        // A grass floor at world y = 64 with open sky above, so
+                        // the y scan resolves feet at 65 and sky light is 15.
+                        let mut chunk = Chunk::new_uniform(BlockId::Air);
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                chunk.set(lx, 0, lz, BlockId::Grass);
+                            }
+                        }
+                        chunk
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    session
+                        .world
+                        .insert_chunk_for_test(ChunkPos::new(cx, cy, cz), chunk);
+                }
+            }
+        }
+        session.world.recompute_light_for_test();
+    }
+
+    fn lit_grass_plain_session(seed: u32, chunk_radius: i32) -> WorldSession {
+        let mut session = make_mob_session(seed);
+        lit_grass_plain(&mut session, chunk_radius);
+        session
+    }
+
+    #[test]
+    fn a_fresh_session_starts_with_the_ambient_gate_open_and_a_zero_report() {
+        let session = make_mob_session(51);
+
+        assert!(session.ambient_spawning());
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+        assert_eq!(
+            session.world_spawn(),
+            WorldSession::spawn_position(session.world.seed())
+        );
+        assert!(session.world_spawn().is_finite());
+    }
+
+    #[test]
+    fn the_ambient_gate_stops_spawning_and_reopens_on_a_fresh_window() {
+        let mut session = lit_grass_plain_session(52, 2);
+        session.clock = GameClock::from_time(NIGHT_TICK);
+        session.set_ambient_spawning(false);
+        assert!(!session.ambient_spawning());
+
+        // 30 s of night over a ready, lit plain: the closed gate must create
+        // nothing and must leave the report at its zero baseline.
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+        assert!(session.mobs().is_empty(), "the closed gate created mobs");
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+
+        session.set_ambient_spawning(true);
+        assert!(session.ambient_spawning());
+        // Re-enabling cleared the partial interval, so the first attempt still
+        // waits a full `SPAWN_ATTEMPT_SECS`: 0.2 s of game time fires nothing.
+        session.tick_mobs(0.1, 1.0);
+        session.tick_mobs(0.1, 1.0);
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+
+        // And the gate really reopens: the same plain now populates.
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+        assert!(
+            session.spawn_report().spawned > 0,
+            "a re-enabled gate spawned nothing: {:?}",
+            session.spawn_report()
+        );
+    }
+
+    #[test]
+    fn tick_mobs_spawns_night_hostiles_outside_both_safe_radii() {
+        let mut session = lit_grass_plain_session(53, 2);
+        session.clock = GameClock::from_time(NIGHT_TICK);
+        let player = session.player.position;
+        let world_spawn = session.world_spawn();
+
+        // A paused or zero-scaled frame runs on `game_dt == 0` and must run
+        // neither the AI nor a spawn attempt.
+        for _ in 0..10 {
+            session.tick_mobs(0.1, 0.0);
+            session.tick_mobs(-1.0, 1.0);
+            session.tick_mobs(f32::NAN, 1.0);
+        }
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+        assert!(session.mobs().is_empty());
+
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+
+        let report = session.spawn_report();
+        assert!(
+            report.spawned > 0,
+            "the lit night plain produced no hostile: {report:?}"
+        );
+        assert!(!session.mobs().is_empty());
+        for mob in session.mobs() {
+            assert!(
+                mob.kind.is_hostile(),
+                "{:?} spawned at night on the surface",
+                mob.kind
+            );
+            // `home` is the exact spawn feet position. Wander can pull the
+            // body up to the 4-block leash *inside* the ring later, so the
+            // spawn rule is asserted against the anchor, not the pose.
+            let from_player = horizontal_distance(mob.home, player);
+            assert!(
+                from_player >= SAFE_RADIUS,
+                "{:?} home {from_player} inside the player safe radius",
+                mob.kind
+            );
+            let from_world_spawn = horizontal_distance(mob.home, world_spawn);
+            assert!(
+                from_world_spawn >= SAFE_RADIUS,
+                "{:?} home {from_world_spawn} inside the world-spawn safe radius",
+                mob.kind
+            );
+        }
+    }
+
+    #[test]
+    fn tick_mobs_burns_surface_hostiles_to_death_at_day() {
+        let mut session = lit_grass_plain_session(54, 3);
+        session.clock = GameClock::from_time(NIGHT_TICK);
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+        assert!(
+            session.spawn_report().spawned > 0,
+            "the burn proof needs a night population first"
+        );
+
+        session.clock = GameClock::from_time(DAY_TICK);
+        session.reset_spawn_report();
+        // 20 hp at 1 hp per 0.5 s burn cadence is 10 s; 12 s absorbs the
+        // cadence phase and proves every hostile finished.
+        for _ in 0..120 {
+            session.tick_mobs(0.1, 1.0);
+        }
+
+        let report = session.spawn_report();
+        assert!(
+            report.burned > 0,
+            "no hostile burned in daylight: {report:?}"
+        );
+        for mob in session.mobs() {
+            if mob.kind.is_hostile() {
+                assert_eq!(
+                    mob.health, 0,
+                    "a live surface hostile survived 12 s of daylight"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_past_the_despawn_radius_is_removed_by_the_single_reap_site() {
+        let mut session = make_mob_session(55);
+        add_resident_air(&mut session);
+        let far = session.player.position + Vec3::new(DESPAWN_RADIUS + 1.0, 0.0, 0.0);
+        session.mobs_mut().push(Mob::new(MobKind::Pig, far, 0.0));
+
+        // Under one scan interval the record is untouched.
+        session.tick_mobs(0.1, 1.0);
+        assert_eq!(session.mobs().len(), 1);
+        assert_eq!(session.spawn_report().despawned, 0);
+
+        // Crossing `DESPAWN_SCAN_SECS` of game time lets the spawner mark the
+        // record and the one reap site drop it on the same tick.
+        for _ in 0..10 {
+            session.tick_mobs(0.1, 1.0);
+        }
+        assert!(
+            session.mobs().is_empty(),
+            "a despawned record must be gone, not merely marked"
+        );
+        assert_eq!(session.spawn_report().despawned, 1);
+    }
+
+    #[test]
+    fn ambient_spawning_is_frame_rate_independent_through_the_session() {
+        let mut a = lit_grass_plain_session(56, 2);
+        let mut b = lit_grass_plain_session(56, 2);
+        a.clock = GameClock::from_time(NIGHT_TICK);
+        b.clock = GameClock::from_time(NIGHT_TICK);
+
+        for _ in 0..100 {
+            a.tick_mobs(0.05, 1.0);
+        }
+        for _ in 0..500 {
+            b.tick_mobs(0.01, 1.0);
+        }
+
+        assert_eq!(
+            a.spawn_report(),
+            b.spawn_report(),
+            "5 s of game time must produce one population result"
+        );
+        assert!(
+            a.spawn_report().spawned > 0,
+            "the fixture must actually spawn: {:?}",
+            a.spawn_report()
+        );
+        assert_eq!(a.mobs().len(), b.mobs().len());
+        for (left, right) in a.mobs().iter().zip(b.mobs()) {
+            assert_eq!(left.kind, right.kind);
+            assert_eq!(left.home, right.home, "spawn places must match");
+            assert!(
+                (left.position - right.position).length() < 1e-3,
+                "{:?} drifted: {:?} vs {:?}",
+                left.kind,
+                left.position,
+                right.position
+            );
+        }
+    }
+
+    #[test]
+    fn a_restored_session_reopens_ambient_spawning_with_the_world_spawn_anchor() {
+        let mut data = make_save(57);
+        data.mobs = pinned_saved_mobs();
+        let seed = data.seed;
+        let session =
+            WorldSession::session_from_save(data, PathBuf::from("/tmp/spawn-restore.mcvx"));
+
+        assert!(session.ambient_spawning());
+        assert_eq!(session.spawn_report(), SpawnReport::default());
+        assert_eq!(session.world_spawn(), WorldSession::spawn_position(seed));
+        assert!(session.world_spawn().is_finite());
+    }
+
+    #[test]
+    fn ambient_spawning_is_not_gated_on_game_mode() {
+        // S09 owns Creative inertness. This gate is only the scripted demo
+        // seam, so a Creative session must populate exactly like a Survival
+        // one or a later slice could mistake the gate for the mode rule.
+        let mut creative = lit_grass_plain_session(58, 2);
+        let mut survival = WorldSession::new_session_with_mode(
+            58,
+            PathBuf::from("/tmp/session-spawn-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        lit_grass_plain(&mut survival, 2);
+        creative.clock = GameClock::from_time(NIGHT_TICK);
+        survival.clock = GameClock::from_time(NIGHT_TICK);
+
+        for _ in 0..50 {
+            creative.tick_mobs(0.1, 1.0);
+            survival.tick_mobs(0.1, 1.0);
+        }
+
+        assert!(creative.ambient_spawning() && survival.ambient_spawning());
+        assert!(
+            creative.spawn_report().spawned > 0,
+            "a Creative session must populate like Survival: {:?}",
+            creative.spawn_report()
+        );
+        assert_eq!(creative.spawn_report(), survival.spawn_report());
+        assert_eq!(creative.mobs().len(), survival.mobs().len());
+        for (left, right) in creative.mobs().iter().zip(survival.mobs()) {
+            assert_eq!(left.kind, right.kind);
+            assert_eq!(left.home, right.home);
+        }
     }
 
     fn pinned_saved_mobs() -> Vec<SavedMob> {
