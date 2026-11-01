@@ -27,6 +27,45 @@ pub enum MobDropItem {
     Leather,
 }
 
+/// What caused a mob's death, as far as drop attribution is concerned.
+///
+/// Only a player kill grants drops; an environmental death (fall, drowning,
+/// fire in a later slice) resolves to the default zero report and mutates
+/// nothing. This is deliberately a cause tag rather than a damage source: the
+/// drop path only needs to know whether a player earned the table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MobKillCause {
+    /// The killing blow was a player's melee hit.
+    Player,
+    /// Anything else killed the mob; no drops are granted.
+    Environment,
+}
+
+/// What one [`MobDropReport`] delivery actually did.
+///
+/// Mirrors the player layer's best-effort batch accounting without importing
+/// it: `accepted + lost` is always the total unit count of the resolved table,
+/// so a full inventory can only lose the overflow and never duplicate units.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MobDropReport {
+    /// Units that landed in the inventory.
+    pub accepted: u32,
+    /// Units that did not fit and were dropped on the floor.
+    pub lost: u32,
+}
+
+impl MobDropReport {
+    /// Builds a report with explicit accepted/lost totals.
+    pub const fn new(accepted: u32, lost: u32) -> Self {
+        Self { accepted, lost }
+    }
+
+    /// Whether any unit failed to fit.
+    pub fn lost_any(&self) -> bool {
+        self.lost > 0
+    }
+}
+
 /// One pinned entry in a mob drop table.
 ///
 /// The count is an exact fixed amount rather than a range: every kill of a
@@ -147,6 +186,23 @@ mod tests {
     fn hostile_tables_are_empty_until_their_slices() {
         assert!(mob_drops(MobKind::Zombie).is_empty());
         assert!(mob_drops(MobKind::Skeleton).is_empty());
+    }
+
+    #[test]
+    fn drop_report_accounts_for_losses_and_is_default_zero() {
+        assert_eq!(MobDropReport::default(), MobDropReport::new(0, 0));
+        assert!(!MobDropReport::default().lost_any());
+        assert_eq!(MobDropReport::new(3, 0), MobDropReport::new(3, 0));
+        assert!(!MobDropReport::new(3, 0).lost_any());
+        assert_eq!(MobDropReport::new(1, 2), MobDropReport::new(1, 2));
+        assert!(MobDropReport::new(1, 2).lost_any());
+    }
+
+    #[test]
+    fn kill_cause_distinguishes_player_from_environment() {
+        assert_ne!(MobKillCause::Player, MobKillCause::Environment);
+        assert_eq!(MobKillCause::Player, MobKillCause::Player);
+        assert_eq!(MobKillCause::Environment, MobKillCause::Environment);
     }
 
     #[test]

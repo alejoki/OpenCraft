@@ -29,7 +29,8 @@ use crate::world::daycycle::GameClock;
 use crate::world::farming::CropRuntime;
 use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
-use crate::world::mob::{Mob, MobHit, MobRuntime, MobTick};
+use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobTick};
+use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
@@ -432,6 +433,44 @@ impl WorldSession {
         // The immutable borrow ends here; the index is re-checked against the
         // same list, which neither hit test nor this call can change shape.
         self.mobs.get_mut(index)?.take_hit(damage, from)
+    }
+
+    /// The single player-attributed grant seam for a proven mob kill.
+    ///
+    /// Attribution is explicit: [`MobKillCause::Environment`] and any hit that
+    /// did not kill resolve the default zero report and mutate nothing. On a
+    /// player kill the mob's pinned table is resolved through
+    /// [`mob_drop_items`] and delivered best-effort with
+    /// [`Player::collect_items`], so a full inventory loses only the overflow
+    /// and the report says exactly how many units landed.
+    ///
+    /// The mob record is never removed, reordered, or mutated here: the lethal
+    /// hit already armed the collapse, and [`WorldSession::retain_live_mobs`]
+    /// owns removal after the fade. Calling this twice for the same corpse is
+    /// therefore not idempotent by index; callers grant exactly once per hit
+    /// (the melee tick reports a single `Swing` per cooldown).
+    pub fn resolve_mob_kill(
+        &mut self,
+        index: usize,
+        hit: MobHit,
+        cause: MobKillCause,
+    ) -> MobDropReport {
+        if cause != MobKillCause::Player || !hit.killed {
+            return MobDropReport::default();
+        }
+        // The index may be stale (the record streamed out or was reaped since
+        // the swing was armed): a missing or still-live record grants nothing.
+        let Some(kind) = self.mobs.get(index).map(|mob| mob.kind) else {
+            return MobDropReport::default();
+        };
+        if self.mobs.get(index).map(|mob| mob.health) != Some(0) {
+            return MobDropReport::default();
+        }
+        let Some(items) = mob_drop_items(kind) else {
+            return MobDropReport::default();
+        };
+        let outcome = self.player.collect_items(&items);
+        MobDropReport::new(outcome.accepted, outcome.lost)
     }
 
     /// Whether the fresh Survival spawn gate is still waiting for chunks.
@@ -1019,6 +1058,28 @@ fn loot_items(entries: &[LootEntry]) -> Option<Vec<Item>> {
                 return None;
             }
             Item::new(ItemId::from(entry.item), entry.min_count).ok()
+        })
+        .collect()
+}
+
+/// Maps one mob kind's pinned drop table onto validated inventory items.
+///
+/// Unlike [`loot_items`], an empty table is valid and yields `Some(vec![])`:
+/// hostile kinds legitimately drop nothing until their slices fill the table.
+/// A zero count, a count above the identity's stack limit, or an `Item::new`
+/// failure rejects the whole batch instead of delivering a partial one, so a
+/// drifted table can never invent or silently truncate a drop. Entries pass
+/// through the T01 `From<MobDropItem> for ItemId` bridge, which is the only
+/// world -> player identity mapping.
+fn mob_drop_items(kind: MobKind) -> Option<Vec<Item>> {
+    mob_drops(kind)
+        .iter()
+        .map(|drop| {
+            let id = ItemId::from(drop.item);
+            if drop.count == 0 || drop.count > id.stack_limit() {
+                return None;
+            }
+            Item::new(id, drop.count).ok()
         })
         .collect()
 }
@@ -4028,5 +4089,192 @@ mod tests {
             PathBuf::from("/tmp/session-mobs-restored.mcvx"),
         );
         assert!(!restored.spawn_settle_pending());
+    }
+
+    fn mob_session_with(kind: MobKind, seed: u32) -> (WorldSession, usize) {
+        let mut session = make_mob_session(seed);
+        add_resident_air(&mut session);
+        let index = session.mobs().len();
+        session
+            .mobs_mut()
+            .push(Mob::new(kind, Vec3::new(8.5, 5.0, 8.5), 0.0));
+        (session, index)
+    }
+
+    fn lethal_hit(session: &mut WorldSession, index: usize) -> MobHit {
+        let kind = session.mobs()[index].kind;
+        session
+            .attack_mob(index, kind.max_health(), Vec3::new(8.5, 5.0, 6.5))
+            .expect("a full-health hit is lethal")
+    }
+
+    fn assert_inventory_empty(session: &WorldSession) {
+        for slot in 0..crate::player::inventory::INVENTORY_SLOTS {
+            assert_eq!(
+                session.player.inventory().slot(slot),
+                None,
+                "slot {slot} must stay empty"
+            );
+        }
+        assert!(session.player.inventory().cursor().is_none());
+    }
+
+    #[test]
+    fn player_pig_kill_accepts_exactly_meat_and_leather() {
+        let (mut session, index) = mob_session_with(MobKind::Pig, 61);
+        let hit = lethal_hit(&mut session, index);
+
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(2, 0));
+        assert!(!report.lost_any());
+        assert_eq!(
+            session.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::RawPorkchop), 1).ok()
+        );
+        assert_eq!(
+            session.player.inventory().slot(1),
+            Item::new(ItemId::Material(Material::Leather), 1).ok()
+        );
+        assert_eq!(session.mobs().len(), 1, "the record stays for the collapse");
+    }
+
+    #[test]
+    fn player_cow_kill_merges_the_two_leather_grants_into_one_stack() {
+        let (mut session, pig_index) = mob_session_with(MobKind::Pig, 62);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Cow, Vec3::new(10.5, 5.0, 8.5), 0.0));
+        let pig_hit = lethal_hit(&mut session, pig_index);
+        assert_eq!(
+            session.resolve_mob_kill(pig_index, pig_hit, MobKillCause::Player),
+            MobDropReport::new(2, 0)
+        );
+
+        let cow_index = 1;
+        let cow_hit = lethal_hit(&mut session, cow_index);
+        let report = session.resolve_mob_kill(cow_index, cow_hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(3, 0));
+        assert_eq!(
+            session.player.inventory().slot(1),
+            Item::new(ItemId::Material(Material::Leather), 3).ok(),
+            "pig leather and cow leather must merge into one stack of three"
+        );
+        assert_eq!(
+            session.player.inventory().slot(2),
+            Item::new(ItemId::Material(Material::RawBeef), 1).ok()
+        );
+    }
+
+    #[test]
+    fn environment_cause_grants_nothing_even_when_the_inventory_is_empty() {
+        let (mut session, index) = mob_session_with(MobKind::Pig, 63);
+        let hit = lethal_hit(&mut session, index);
+
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Environment);
+
+        assert_eq!(report, MobDropReport::default());
+        assert_inventory_empty(&session);
+        assert_eq!(
+            session.mobs()[index].health,
+            0,
+            "the kill itself still landed"
+        );
+    }
+
+    #[test]
+    fn non_lethal_hit_and_stale_index_grant_nothing() {
+        let (mut session, index) = mob_session_with(MobKind::Pig, 64);
+        let hit = session
+            .attack_mob(index, 1, Vec3::new(8.5, 5.0, 6.5))
+            .expect("a non-lethal hit still lands");
+        assert!(!hit.killed);
+
+        assert_eq!(
+            session.resolve_mob_kill(index, hit, MobKillCause::Player),
+            MobDropReport::default()
+        );
+        assert_inventory_empty(&session);
+
+        let stale = MobHit {
+            damage: 10,
+            health_after: 0,
+            killed: true,
+        };
+        assert_eq!(
+            session.resolve_mob_kill(99, stale, MobKillCause::Player),
+            MobDropReport::default(),
+            "a stale index must not grant drops"
+        );
+        assert_inventory_empty(&session);
+    }
+
+    #[test]
+    fn a_full_inventory_loses_only_the_overflow() {
+        let (mut session, index) = mob_session_with(MobKind::Pig, 65);
+        // 35 stone slots leave no room for the porkchop; the last slot holds
+        // 63 leather so exactly one leather unit can still merge in.
+        let mut slots = [None; crate::player::inventory::INVENTORY_SLOTS];
+        for slot in &mut slots[..crate::player::inventory::INVENTORY_SLOTS - 1] {
+            *slot = Item::new(ItemId::Block(BlockId::Stone), 64).ok();
+        }
+        let last = crate::player::inventory::INVENTORY_SLOTS - 1;
+        slots[last] = Item::new(ItemId::Material(Material::Leather), 63).ok();
+        session.player = Player::with_inventory(
+            session.player.position,
+            crate::player::inventory::Inventory::from_parts(slots, None),
+            crate::player::inventory::CraftingGrid::new(crate::player::inventory::GridKind::Player),
+            crate::player::inventory::CraftingGrid::new(crate::player::inventory::GridKind::Table),
+        );
+
+        let hit = lethal_hit(&mut session, index);
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(1, 1));
+        assert!(report.lost_any());
+        assert_eq!(
+            report.accepted + report.lost,
+            2,
+            "units are conserved: one porkchop lost, one leather accepted"
+        );
+        assert_eq!(
+            session.player.inventory().slot(last),
+            Item::new(ItemId::Material(Material::Leather), 64).ok(),
+            "only the accepted unit landed"
+        );
+    }
+
+    #[test]
+    fn hostile_kind_with_an_empty_table_grants_nothing() {
+        let (mut session, index) = mob_session_with(MobKind::Zombie, 66);
+        let hit = lethal_hit(&mut session, index);
+
+        assert_eq!(
+            session.resolve_mob_kill(index, hit, MobKillCause::Player),
+            MobDropReport::default(),
+            "an empty table is valid and drops nothing"
+        );
+        assert_inventory_empty(&session);
+    }
+
+    #[test]
+    fn mob_drop_items_resolves_the_t01_bridge_for_every_passive_kind() {
+        assert_eq!(
+            mob_drop_items(MobKind::Pig),
+            Some(vec![
+                Item::new(ItemId::Material(Material::RawPorkchop), 1).expect("porkchop"),
+                Item::new(ItemId::Material(Material::Leather), 1).expect("leather"),
+            ])
+        );
+        assert_eq!(
+            mob_drop_items(MobKind::Cow),
+            Some(vec![
+                Item::new(ItemId::Material(Material::RawBeef), 1).expect("beef"),
+                Item::new(ItemId::Material(Material::Leather), 2).expect("leather"),
+            ])
+        );
+        assert_eq!(mob_drop_items(MobKind::Zombie), Some(Vec::new()));
+        assert_eq!(mob_drop_items(MobKind::Skeleton), Some(Vec::new()));
     }
 }

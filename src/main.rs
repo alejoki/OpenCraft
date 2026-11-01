@@ -76,7 +76,8 @@ use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, 
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
-use opencraft::world::mob::{Mob, MobKind};
+use opencraft::world::mob::{Mob, MobHit, MobKind};
+use opencraft::world::mob_loot::{MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
     SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
@@ -281,6 +282,40 @@ fn break_rejection_notice(rejection: BreakRejection) -> Option<&'static str> {
         | BreakRejection::StaleTarget
         | BreakRejection::EditRejected => None,
     }
+}
+
+/// The transient gameplay notice a player-attributed mob kill shows when the
+/// best-effort delivery had to discard part of the table, or `None` when every
+/// unit fit.
+///
+/// A clean delivery stays silent: the items appearing in the hotbar is the
+/// feedback. Only a loss needs words, because those items are gone for good.
+fn mob_drop_notice(report: MobDropReport) -> Option<&'static str> {
+    if report.lost_any() {
+        Some("Inventory full: some mob drops were lost")
+    } else {
+        None
+    }
+}
+
+/// Grants a proven player kill's drops after the hit already landed and the
+/// selected tool was already worn.
+///
+/// The caller owns the ordering (attack -> wear -> drops -> notice): a sword
+/// that breaks on the killing blow must free its hotbar slot before the drop
+/// is delivered, otherwise a full inventory would lose an item the break just
+/// made room for (MEM214/MEM392). This helper performs only the grant and the
+/// message projection; the mob record stays for the collapse and the reaper.
+fn after_lethal_player_hit(
+    session: &mut WorldSession,
+    index: usize,
+    hit: MobHit,
+) -> Option<MenuMessage> {
+    let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+    mob_drop_notice(report).map(|text| MenuMessage {
+        text: text.to_string(),
+        ticks_left: menu::MESSAGE_TICKS,
+    })
 }
 
 /// What an applied break did to the selected hotbar slot.
@@ -7298,12 +7333,24 @@ impl ApplicationHandler for GameApp {
                             self.session.player.mode(),
                             target_health,
                         );
-                        if self
-                            .session
-                            .attack_mob(index, damage, self.session.camera.position)
-                            .is_some()
+                        if let Some(hit) =
+                            self.session
+                                .attack_mob(index, damage, self.session.camera.position)
                         {
+                            // MEM214/MEM392 ordering: attack -> wear -> drops
+                            // -> notice. Wearing first means a sword that
+                            // breaks on the killing blow frees the slot the
+                            // drop then fills. The notice is only replaced on
+                            // an actual loss, so a clean kill never clears an
+                            // unrelated transient message.
                             let _wear = wear_after_proven_action(&mut self.session);
+                            if hit.killed {
+                                if let Some(message) =
+                                    after_lethal_player_hit(&mut self.session, index, hit)
+                                {
+                                    self.game_message = Some(message);
+                                }
+                            }
                         }
                     }
                 }
@@ -18574,6 +18621,108 @@ mod tests {
         assert_eq!(break_rejection_notice(BreakRejection::Unbreakable), None);
         assert_eq!(break_rejection_notice(BreakRejection::StaleTarget), None);
         assert_eq!(break_rejection_notice(BreakRejection::EditRejected), None);
+    }
+
+    #[test]
+    fn mob_drop_notice_names_only_a_loss() {
+        assert_eq!(mob_drop_notice(MobDropReport::default()), None);
+        assert_eq!(mob_drop_notice(MobDropReport::new(2, 0)), None);
+        assert_eq!(
+            mob_drop_notice(MobDropReport::new(1, 1)),
+            Some("Inventory full: some mob drops were lost")
+        );
+    }
+
+    fn full_inventory_with_breaking_sword() -> Inventory {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 1)
+                .expect("a one-durability sword"),
+        );
+        for slot in &mut slots[1..] {
+            *slot = Some(Item::new(ItemId::Block(BlockId::Stone), 64).expect("stone"));
+        }
+        Inventory::from_parts(slots, None)
+    }
+
+    fn pig_kill_session(dir: &std::path::Path, seed: u32, name: &str) -> WorldSession {
+        let mut session = melee_test_session(dir, seed, name);
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0));
+        session
+    }
+
+    fn give_inventory(session: &mut WorldSession, inventory: Inventory) {
+        session.player = Player::with_inventory(
+            session.player.position,
+            inventory,
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+    }
+
+    fn lethal_pig_hit(session: &mut WorldSession) -> MobHit {
+        session
+            .attack_mob(0, 10, session.camera.position)
+            .expect("a full-health pig dies to 10 damage")
+    }
+
+    #[test]
+    fn after_lethal_player_hit_maps_overflow_to_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = pig_kill_session(dir.path(), 4201, "drops-notice.mcvx");
+        give_inventory(&mut session, Inventory::empty());
+        let hit = lethal_pig_hit(&mut session);
+
+        assert!(
+            after_lethal_player_hit(&mut session, 0, hit).is_none(),
+            "a clean delivery stays silent"
+        );
+
+        let mut full = pig_kill_session(dir.path(), 4202, "drops-full.mcvx");
+        give_inventory(&mut full, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut full);
+        let message = after_lethal_player_hit(&mut full, 0, hit)
+            .expect("an overflow delivery shows a notice");
+        assert_eq!(message.text, "Inventory full: some mob drops were lost");
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+    }
+
+    #[test]
+    fn mem214_wear_before_drops_frees_the_only_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Production order: attack -> wear -> drops -> notice. The sword
+        // breaks and frees slot 0 before the grant, so the porkchop lands.
+        let mut ordered = pig_kill_session(dir.path(), 4203, "drops-ordered.mcvx");
+        give_inventory(&mut ordered, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut ordered);
+        assert_eq!(
+            wear_after_proven_action(&mut ordered),
+            ToolWearOutcome::Broke
+        );
+        let report = ordered.resolve_mob_kill(0, hit, MobKillCause::Player);
+        assert_eq!(report, MobDropReport::new(1, 1));
+        assert_eq!(
+            ordered.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::RawPorkchop), 1).ok(),
+            "the freed slot accepts the first drop unit"
+        );
+
+        // Swapped order: drops before wear loses the whole table even though
+        // the wear frees the slot a moment later.
+        let mut swapped = pig_kill_session(dir.path(), 4204, "drops-swapped.mcvx");
+        give_inventory(&mut swapped, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut swapped);
+        let report = swapped.resolve_mob_kill(0, hit, MobKillCause::Player);
+        assert_eq!(report, MobDropReport::new(0, 2));
+        assert_eq!(
+            wear_after_proven_action(&mut swapped),
+            ToolWearOutcome::Broke
+        );
+        assert_eq!(swapped.player.inventory().slot(0), None);
     }
 
     #[test]

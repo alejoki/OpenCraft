@@ -30,11 +30,27 @@ pub const APPLE_HUNGER: u16 = 4;
 /// Bread is the stronger food: it must always restore more than an apple.
 pub const BREAD_HUNGER: u16 = 6;
 
+/// Hunger restored by one raw meat item (raw porkchop or raw beef).
+///
+/// Raw meat sits between an apple and bread: it is a real emergency meal the
+/// mob drop path can deliver, but weaker than a crafted staple. The value is
+/// pinned by tests so a balance change is a deliberate edit.
+pub const RAW_MEAT_HUNGER: u16 = 3;
+
+/// Hunger restored by rotten flesh.
+///
+/// The floor of the food table: filler that still counts as food so a hostile
+/// drop can feed a desperate player without competing with cooked meat. Pinned
+/// by tests.
+pub const ROTTEN_FLESH_HUNGER: u16 = 1;
+
 /// Hunger restored by eating one `id`, or `None` when `id` is not food.
 pub fn food_value(id: ItemId) -> Option<u16> {
     match id {
         ItemId::Material(Material::Apple) => Some(APPLE_HUNGER),
         ItemId::Material(Material::Bread) => Some(BREAD_HUNGER),
+        ItemId::Material(Material::RawPorkchop | Material::RawBeef) => Some(RAW_MEAT_HUNGER),
+        ItemId::Material(Material::RottenFlesh) => Some(ROTTEN_FLESH_HUNGER),
         _ => None,
     }
 }
@@ -279,6 +295,7 @@ mod tests {
             ItemId::Material(Material::Stick),
             ItemId::Material(Material::Wheat),
             ItemId::Material(Material::WheatSeeds),
+            ItemId::Material(Material::Leather),
             ItemId::Block(BlockId::Stone),
             ItemId::Tool {
                 kind: ToolKind::Pickaxe,
@@ -288,6 +305,43 @@ mod tests {
         for id in non_food {
             assert_eq!(food_value(id), None, "{id:?} must not be food");
         }
+    }
+
+    #[test]
+    fn raw_meat_and_rotten_flesh_values_are_pinned() {
+        assert_eq!(RAW_MEAT_HUNGER, 3);
+        assert_eq!(ROTTEN_FLESH_HUNGER, 1);
+        assert_eq!(APPLE_HUNGER, 4, "apple must stay unchanged");
+        assert_eq!(BREAD_HUNGER, 6, "bread must stay unchanged");
+        const {
+            assert!(
+                RAW_MEAT_HUNGER > ROTTEN_FLESH_HUNGER,
+                "raw meat must beat rotten flesh"
+            )
+        };
+        for (material, value) in [
+            (Material::RawPorkchop, RAW_MEAT_HUNGER),
+            (Material::RawBeef, RAW_MEAT_HUNGER),
+            (Material::RottenFlesh, ROTTEN_FLESH_HUNGER),
+        ] {
+            assert_eq!(food_value(ItemId::Material(material)), Some(value));
+        }
+    }
+
+    #[test]
+    fn raw_porkchop_becomes_a_target_below_full_hunger_and_not_at_full() {
+        let porkchop =
+            Item::new(ItemId::Material(Material::RawPorkchop), 1).expect("valid porkchop");
+        let target = EatingTarget::new(4, porkchop, MAX_HUNGER - 1)
+            .expect("raw meat is edible below full hunger");
+        assert_eq!(target.slot(), 4);
+        assert_eq!(target.item(), ItemId::Material(Material::RawPorkchop));
+        assert_eq!(target.restore(), RAW_MEAT_HUNGER);
+
+        assert!(
+            EatingTarget::new(4, porkchop, MAX_HUNGER).is_none(),
+            "full hunger must still refuse raw meat"
+        );
     }
 
     #[test]
