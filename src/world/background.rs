@@ -130,10 +130,11 @@ impl BackgroundScene {
 mod tests {
     use super::*;
     use crate::player::inventory::{CraftingGrid, GridKind, Inventory};
+    use crate::player::survival::{GameMode, SurvivalState};
     use crate::world::chunk::{linear_index, ChunkPos};
     use crate::world::persistence::{
         load_world_from_bytes, load_world_from_path, save_world_to_bytes, save_world_to_path,
-        SavedPlayerState,
+        ChestMap, SavedPlayerState,
     };
     use crate::world::vista::VISTA_SEASON;
     use rustc_hash::FxHashMap;
@@ -153,6 +154,7 @@ mod tests {
             time_of_day: 4_321,
             day_index: 3,
             season_length_days: 2,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [-12.5, 64.25, 108.0],
                 yaw: 1.25,
@@ -163,7 +165,9 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: ChestMap::default(),
             chunk_edits: edits,
         }
     }

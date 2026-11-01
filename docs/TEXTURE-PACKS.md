@@ -65,6 +65,17 @@ Save each block texture directly inside the pack folder, using these exact file 
 14. `snow_side.png`
 15. `coal_ore.png`
 16. `iron_ore.png`
+17. `farmland.png`
+18. `wheat_stage0.png`
+19. `wheat_stage1.png`
+20. `wheat_stage2.png`
+21. `wheat_stage3.png`
+22. `chest.png`
+23. `loot_chest.png`
+
+The block texture array has 32 layers. Layers 0 to 22 are the twenty-three authorable names above, in the order listed. Layers 23 to 31 are reserved built-in layers that cannot be overridden; a file named `reserved_23.png` or any other name that is not in the list above is ignored.
+
+A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. Partial packs may add one texture or all twenty-three.
 
 Image rules:
 
@@ -72,7 +83,7 @@ Image rules:
 - Any size in that range is resampled to the game's 16-by-16 texture grid, so you can author at 16, 32, 64, 128, or 256 pixels and still get a crisp result.
 - A missing file is fine and silently keeps the built-in texture for that block.
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
-- Partial packs always work — add one texture or all sixteen.
+- Partial packs always work — add one texture or all twenty-three.
 
 ## Title logo and menu tint
 

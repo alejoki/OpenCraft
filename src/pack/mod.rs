@@ -4,9 +4,11 @@
 //! imports may appear here so the whole surface is testable headlessly.
 //!
 //! The [`LoadedPack`] contract is the boundary later slices consume: it always
-//! contains exactly [`LAYER_FILES`] resampled 16x16 RGBA layers plus optional
-//! presentation data. Loading never fails and never panics on bad input; every
-//! fallback is reported as a structured [`SettingsWarning`].
+//! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
+//! RGBA layers plus optional presentation data. The first
+//! [`AUTHORABLE_TEX_LAYERS`] of those can be overridden by pack files; the
+//! rest stay reserved built-in layers. Loading never fails and never panics on
+//! bad input; every fallback is reported as a structured [`SettingsWarning`].
 
 use std::path::Path;
 
@@ -18,26 +20,41 @@ pub mod manifest;
 pub mod resample;
 pub mod sound;
 
-/// File names for the 16 block texture layers, index-aligned with
-/// `BlockId::face_tex_layer` (layers 0..16). These names are the authoring
+/// Number of block texture layers a pack may author.
+///
+/// Index-aligned with the first [`AUTHORABLE_TEX_LAYERS`] entries of
+/// `BlockId::face_tex_layer`/the procedural layer set. Layers
+/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::NUM_TEX_LAYERS`] are
+/// reserved built-ins that cannot be overridden.
+pub const AUTHORABLE_TEX_LAYERS: usize = 23;
+
+/// File names for the 23 authorable block texture layers, index-aligned with
+/// `BlockId::face_tex_layer` (layers 0..23). These names are the authoring
 /// contract for packs; do not reorder.
-pub const LAYER_FILES: [&str; 16] = [
-    "grass_top.png",   // 0
-    "grass_side.png",  // 1
-    "dirt.png",        // 2
-    "stone.png",       // 3
-    "cobblestone.png", // 4
-    "sand.png",        // 5
-    "log_top.png",     // 6
-    "log_side.png",    // 7
-    "leaves.png",      // 8
-    "planks.png",      // 9
-    "brick.png",       // 10
-    "snow_top.png",    // 11
-    "bedrock.png",     // 12
-    "snow_side.png",   // 13
-    "coal_ore.png",    // 14
-    "iron_ore.png",    // 15
+pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
+    "grass_top.png",    // 0
+    "grass_side.png",   // 1
+    "dirt.png",         // 2
+    "stone.png",        // 3
+    "cobblestone.png",  // 4
+    "sand.png",         // 5
+    "log_top.png",      // 6
+    "log_side.png",     // 7
+    "leaves.png",       // 8
+    "planks.png",       // 9
+    "brick.png",        // 10
+    "snow_top.png",     // 11
+    "bedrock.png",      // 12
+    "snow_side.png",    // 13
+    "coal_ore.png",     // 14
+    "iron_ore.png",     // 15
+    "farmland.png",     // 16
+    "wheat_stage0.png", // 17
+    "wheat_stage1.png", // 18
+    "wheat_stage2.png", // 19
+    "wheat_stage3.png", // 20
+    "chest.png",        // 21
+    "loot_chest.png",   // 22
 ];
 
 /// Directory-name convention for packs, resolved relative to the process
@@ -59,10 +76,13 @@ pub struct PackLogo {
 
 /// Everything a loaded pack provides, always in a usable state.
 ///
-/// `layers` is always exactly 16 entries of 16x16 RGBA bytes (1024 bytes each),
-/// the same format [`crate::render::texture::create_block_texture_array`]
-/// consumes. Missing, invalid, and out-of-range files fall back per layer to
-/// the procedural texture and appear in `warnings`.
+/// `layers` is always exactly [`crate::render::texture::NUM_TEX_LAYERS`]
+/// entries of 16x16 RGBA bytes (1024 bytes each), the same format
+/// [`crate::render::texture::create_block_texture_array`] consumes. The first
+/// [`AUTHORABLE_TEX_LAYERS`] entries come from [`LAYER_FILES`]; the remaining
+/// reserved layers are always the built-in placeholders. Missing, invalid, and
+/// out-of-range files fall back per layer to the procedural texture and appear
+/// in `warnings`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedPack {
     pub layers: Vec<Vec<u8>>,
@@ -79,9 +99,13 @@ pub struct LoadedPack {
 /// warning), then resolves each of [`LAYER_FILES`]. A layer file that does not
 /// exist is silently replaced by its procedural layer; a file that exists but
 /// fails to decode, is non-square, or is outside 16..=256 pixels falls back the
-/// same way and emits one warning naming the bare file. The optional logo is
-/// decoded at native size (failure -> `None` plus a warning). Unknown files and
-/// unknown manifest keys are ignored. Never panics, never returns `Err`.
+/// same way and emits one warning naming the bare file. Reserved layers
+/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::NUM_TEX_LAYERS`] have
+/// no file name and are never overridable, so a legacy pack that ships only
+/// the original 16 files simply keeps the built-in art for layers 16..22. The
+/// optional logo is decoded at native size (failure -> `None` plus a warning).
+/// Unknown files and unknown manifest keys are ignored. Never panics, never
+/// returns `Err`.
 pub fn load_pack_from_dir(dir: &Path) -> LoadedPack {
     let mut warnings = Vec::new();
 
@@ -148,8 +172,9 @@ pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
 /// Load `packs_root/name`, treating a missing pack folder as an empty pack.
 ///
 /// A missing (or non-directory) pack folder is the settings-deletion scenario:
-/// it yields 16 procedural layers, no presentation data, and exactly one
-/// warning naming the pack. Never crashes.
+/// it yields all [`crate::render::texture::NUM_TEX_LAYERS`] procedural layers,
+/// no presentation data, and exactly one warning naming the pack. Never
+/// crashes.
 pub fn load_pack_by_name(packs_root: &Path, name: &str) -> LoadedPack {
     let dir = packs_root.join(name);
     if !dir.is_dir() {
@@ -355,8 +380,8 @@ whatever = true
         let pack = load_pack_from_dir(&dir);
         let procedural = procedural_layers();
 
-        // Contract: always 16 complete 16x16 RGBA layers.
-        assert_eq!(pack.layers.len(), 16);
+        // Contract: always 32 complete 16x16 RGBA layers.
+        assert_eq!(pack.layers.len(), 32);
         for (index, layer) in pack.layers.iter().enumerate() {
             assert_eq!(layer.len(), LAYER_BYTES, "layer {index} size");
         }
@@ -423,7 +448,7 @@ whatever = true
         assert_eq!(pack.warnings.len(), 1);
         assert_eq!(pack.warnings[0].field, "pack.toml");
         assert_eq!(pack.layers, procedural);
-        assert_eq!(pack.layers.len(), 16);
+        assert_eq!(pack.layers.len(), 32);
         assert!(pack.layers.iter().all(|layer| layer.len() == LAYER_BYTES));
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -454,7 +479,7 @@ whatever = true
         let pack = load_pack_by_name(root.path(), "ghost");
 
         assert_eq!(pack.layers, procedural_layers());
-        assert_eq!(pack.layers.len(), 16);
+        assert_eq!(pack.layers.len(), 32);
         assert!(pack.layers.iter().all(|layer| layer.len() == LAYER_BYTES));
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -555,6 +580,145 @@ whatever = true
             Vec::<String>::new()
         );
         assert!(available_pack_names(root.path()).is_empty());
+    }
+
+    #[test]
+    fn layer_file_names_cover_the_new_block_layers() {
+        assert_eq!(LAYER_FILES.len(), AUTHORABLE_TEX_LAYERS);
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 23);
+        assert_eq!(
+            &LAYER_FILES[16..],
+            &[
+                "farmland.png",
+                "wheat_stage0.png",
+                "wheat_stage1.png",
+                "wheat_stage2.png",
+                "wheat_stage3.png",
+                "chest.png",
+                "loot_chest.png",
+            ]
+        );
+        // The original 16 names keep their indices.
+        assert_eq!(LAYER_FILES[0], "grass_top.png");
+        assert_eq!(LAYER_FILES[15], "iron_ore.png");
+    }
+
+    #[test]
+    fn legacy_sixteen_file_pack_keeps_new_and_reserved_layers_built_in() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "legacy16");
+        read_pack_toml(&dir, "name = \"Legacy 16\"\n");
+        for file in LAYER_FILES.iter().take(16) {
+            write_png(&dir.join(file), 16);
+        }
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+        let expected = resample::resample_to_16(&gradient(16, 16), 16);
+
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
+
+        // The 16 legacy names still override exactly layers 0..=15.
+        for (index, layer) in pack.layers.iter().enumerate().take(16) {
+            assert_eq!(*layer, expected, "layer {index} override");
+            assert_ne!(*layer, procedural[index]);
+        }
+
+        // Layers 16..23 (new authored names) and 23..32 (reserved) keep the
+        // built-in art: a legacy pack needs no changes.
+        for index in 16..AUTHORABLE_TEX_LAYERS {
+            assert_procedural_layer(&pack, &procedural, index);
+        }
+        for index in AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize {
+            assert_procedural_layer(&pack, &procedural, index);
+        }
+
+        assert!(
+            pack.warnings.is_empty(),
+            "legacy pack must load warning-free: {:?}",
+            pack.warnings
+        );
+    }
+
+    #[test]
+    fn authoring_all_twenty_three_names_overrides_every_authorable_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "full23");
+        read_pack_toml(&dir, "name = \"Full 23\"\n");
+        for file in LAYER_FILES.iter() {
+            write_png(&dir.join(file), 32);
+        }
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+        let expected = resample::resample_to_16(&gradient(32, 32), 32);
+
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
+        for (index, _) in LAYER_FILES.iter().enumerate() {
+            assert_eq!(pack.layers[index], expected, "layer {index} resample");
+            assert_ne!(
+                pack.layers[index], procedural[index],
+                "layer {index} must override the procedural texture"
+            );
+        }
+        // Reserved layers are never authorable, even in a full pack.
+        for index in AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize {
+            assert_procedural_layer(&pack, &procedural, index);
+        }
+        assert!(
+            pack.warnings.is_empty(),
+            "a fully authored pack has no warnings: {:?}",
+            pack.warnings
+        );
+    }
+
+    #[test]
+    fn reserved_layer_file_names_are_ignored_silently() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "reserved-names");
+        read_pack_toml(&dir, "name = \"Reserved\"\n");
+        // Neither the first nor the last reserved layer can be overridden, and
+        // the former authored index 16 is no longer a reserved name.
+        for file in ["reserved_23.png", "reserved_31.png", "reserved_16.png"] {
+            write_png(&dir.join(file), 16);
+        }
+
+        let pack = load_pack_from_dir(&dir);
+
+        assert_eq!(pack.layers, procedural_layers());
+        assert!(
+            pack.warnings.is_empty(),
+            "unknown/reserved file names never warn: {:?}",
+            pack.warnings
+        );
+    }
+
+    #[test]
+    fn invalid_new_layer_warns_with_bare_file_name_and_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "bad-new-layer");
+        read_pack_toml(&dir, "name = \"Bad New Layer\"\n");
+        fs::write(dir.join(LAYER_FILES[16]), b"not a png").unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
+        assert_procedural_layer(&pack, &procedural, 16);
+        assert_eq!(warning_fields(&pack), vec![LAYER_FILES[16]]);
+        // Only the failing new layer warns; every other new name is absent and
+        // falls back silently.
+        assert_eq!(pack.layers[17], procedural[17]);
+        assert_eq!(pack.layers[22], procedural[22]);
     }
 
     #[test]

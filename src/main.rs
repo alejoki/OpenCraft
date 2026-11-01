@@ -15,11 +15,16 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
-use opencraft::player::inventory::{GridKind, Item, ToolWear, HOTBAR_SLOTS};
+use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
+use opencraft::player::inventory::{
+    CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
+    ToolWear, HOTBAR_SLOTS,
+};
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError, Player, PLAYER_HALF_WIDTH};
 use opencraft::player::raycast::raycast_voxels;
+use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
@@ -29,9 +34,14 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
+use opencraft::ui::chest::{
+    hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
+    screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
+};
 use opencraft::ui::hud::{
-    hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads,
-    selected_item_label, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects,
+    mining_progress_quads, selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE,
+    HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -40,25 +50,27 @@ use opencraft::ui::inventory::{
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
-    delete_prompt_line, format_row_line, hovered_load_target, hovered_main_menu_row,
-    hovered_new_game_target, hovered_pause_row, load_back_rect, load_cancel_rect,
-    load_confirm_rect, load_delete_rect, load_panel_rect, load_play_rect, load_row_rect,
-    main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect, new_game_row_lines,
-    new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action, validate_create,
-    FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen, NewGameTarget, PauseRow,
-    ScreenKeyAction, MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
+    death_panel_rect, death_row_rect, delete_prompt_line, format_row_line, hovered_death_row,
+    hovered_load_target, hovered_main_menu_row, hovered_new_game_target, hovered_pause_row,
+    load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect,
+    load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
+    new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
+    validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen,
+    NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE, MAIN_MENU_ROWS,
+    NEW_GAME_ROWS, PAUSE_ROWS,
 };
 use opencraft::ui::{
-    LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState, LoadGameIntent,
-    MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
+    DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
+    LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
-use opencraft::world::chunk::{world_to_chunk_and_local, ChunkPos};
-use opencraft::world::daycycle;
+use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, CHUNK_SIZE};
+use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
+use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
@@ -66,9 +78,11 @@ use opencraft::world::persistence::{
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-use opencraft::world::season::{season_of, weather_of, Weather};
+use opencraft::world::season::{season_of, weather_of, Season, Weather};
+use opencraft::world::session::ChestCommandError;
 use opencraft::world::terrain::{
-    biome_at_seeded, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
+    biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
+    DEFAULT_WORLD_SEED, SEA_LEVEL,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -198,6 +212,9 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         time_of_day: session.clock.time_of_day,
         day_index: session.clock.day_index,
         season_length_days: session.season_length_days,
+        // The stored mode, not the effective one: Edit Background may be
+        // running Creative rules over a Survival world without rewriting it.
+        mode: session.save_mode,
         player: SavedPlayerState {
             position: session.player.position.to_array(),
             yaw: session.player.yaw,
@@ -208,7 +225,9 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             inventory: session.player.inventory().clone(),
             player_grid: session.player.player_grid().clone(),
             table_grid: session.player.table_grid().clone(),
+            survival: session.player.survival,
         },
+        chests: session.chests.clone(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -231,6 +250,27 @@ enum BreakRejection {
     /// The world edit returned no remesh work, so it did not apply (unloaded
     /// chunk or outside the vertical world range).
     EditRejected,
+    /// A chest break's contents plus its own drop do not all fit in the 36
+    /// inventory slots, so the all-or-nothing preflight refused before any
+    /// edit, wear, or record change.
+    ChestNoRoom,
+    /// A wheat harvest's deterministic drops do not fit in the 36 inventory
+    /// slots, so the all-or-nothing preflight refused before any edit, wear,
+    /// or inventory change. The crop stays intact and the break is retryable.
+    HarvestNoRoom,
+}
+
+/// The transient gameplay notice a rejected break shows, or `None` for
+/// rejections that are already visible in the world (a stale target or an
+/// unbreakable block needs no message).
+fn break_rejection_notice(rejection: BreakRejection) -> Option<&'static str> {
+    match rejection {
+        BreakRejection::ChestNoRoom => Some("Not enough inventory space to break the chest"),
+        BreakRejection::HarvestNoRoom => Some("Not enough inventory space to harvest the wheat"),
+        BreakRejection::Unbreakable
+        | BreakRejection::StaleTarget
+        | BreakRejection::EditRejected => None,
+    }
 }
 
 /// What an applied break did to the selected hotbar slot.
@@ -248,8 +288,10 @@ enum ToolWearOutcome {
 ///
 /// `Applied` is the only arm that carries remesh work, and it is produced
 /// only after the world edit proved it happened. Every other path — a stale
-/// target, an unbreakable block, or an edit that returned nothing — is a
-/// rejection that left the world, the inventory, and durability untouched.
+/// target, an unbreakable block, a malformed harvest table, an edit that
+/// returned nothing, or a full-inventory preflight refusal (chest or wheat) —
+/// is a rejection that left the world, the inventory, and durability
+/// untouched.
 ///
 /// Production only needs the remesh work, but the wear transition and the
 /// rejection reason are the outcome contract the executable harness asserts
@@ -268,11 +310,19 @@ enum BreakOutcome {
 /// Applies one mining break with a fixed, testable ordering:
 ///
 /// 1. re-read the world and refuse unbreakable/stale targets,
-/// 2. apply the world edit (the only authority that a break happened),
-/// 3. wear the selected tool exactly once, but only after non-empty remesh
+/// 2. for wheat, derive the deterministic harvest and preflight the whole
+///    batch; for a container, preflight its contents plus its own drop, so a
+///    full inventory refuses before any edit, wear, or record change,
+/// 3. apply the world edit (the only authority that a break happened),
+/// 4. wear the selected tool exactly once, but only after non-empty remesh
 ///    work proved the edit applied,
-/// 4. collect the pre-break block last, so a tool that broke has already
+/// 5. collect the pre-break block last, so a tool that broke has already
 ///    freed its hotbar slot and the drop can land there.
+///
+/// Wheat is not a carryable block, so its drops come from
+/// [`WorldSession::wheat_harvest_items`] rather than `collect_block`, and the
+/// crop candidate is removed only after the proven edit. Breaking Farmland
+/// forgets a floating crop candidate above it without editing that crop block.
 ///
 /// An empty remesh result means the edit did not apply (unloaded chunk or
 /// outside the vertical world range), so nothing is worn or collected —
@@ -287,6 +337,38 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
     if session.world.get_block(pos.x, pos.y, pos.z) != block {
         return BreakOutcome::Rejected(BreakRejection::StaleTarget);
     }
+    // Wheat's deterministic drops are the only source of truth for a harvest,
+    // and the all-or-nothing preflight runs before the edit and the wear so a
+    // refusal leaves the block, inventory, and durability byte-identical and
+    // the break retryable. A malformed table fails closed with no loss.
+    let wheat_items = if block.is_wheat_stage() {
+        let Some(items) = session.wheat_harvest_items(block) else {
+            return BreakOutcome::Rejected(BreakRejection::EditRejected);
+        };
+        if !session.player.can_insert_items(&items) {
+            return BreakOutcome::Rejected(BreakRejection::HarvestNoRoom);
+        }
+        Some(items)
+    } else {
+        None
+    };
+    // A chest or loot-chest break drops its whole contents plus the container
+    // item itself. The batch preflight is the only correct capacity test
+    // (heterogeneous stacks compete for the same mergeable room), and it runs
+    // before the edit, the wear, and the record change so a refusal leaves
+    // every byte untouched. An unopened generated LootChest derives the same
+    // contents first open would materialize, so its loot is never lost.
+    // Wheat and containers are mutually exclusive classifications.
+    let chest_items = if block.is_container_interactable() {
+        let items = session.chest_break_items(pos);
+        if !session.player.can_insert_items(&items) {
+            return BreakOutcome::Rejected(BreakRejection::ChestNoRoom);
+        }
+        Some(items)
+    } else {
+        None
+    };
+
     let remeshed = session
         .world
         .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Air);
@@ -304,10 +386,51 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         // Empty slot / non-tool / out-of-range selection: no mutation.
         Err(_) => ToolWearOutcome::Nothing,
     };
-    // Drop mapping is block metadata (Stone -> Cobblestone); the item identity
-    // is the only thing that differs, and the drop is still collected last so
-    // MEM195 ordering is preserved.
-    session.player.collect_block(block.mined_drop());
+    if let Some(items) = chest_items {
+        // The preflight proved capacity, and wearing only ever frees room, so
+        // this batch cannot fail. The record is removed with the block, and an
+        // open station on this exact chest closes; the world edit already set
+        // the unsaved flag.
+        session
+            .player
+            .insert_items(&items)
+            .expect("preflight proved capacity");
+        session.chests.remove(&pos);
+        session.close_chest_at(pos);
+    } else if let Some(items) = wheat_items {
+        // Wheat has no `collect_block` path (the stage blocks are not
+        // carryable); the preflighted batch is inserted after the proven edit
+        // and the crop candidate is forgotten at the same time it leaves the
+        // world, so a stale candidate can never keep ticking.
+        session
+            .player
+            .insert_items(&items)
+            .expect("preflight proved capacity");
+        session.remove_crop(pos);
+    } else {
+        // Drop mapping is block metadata (Stone -> Cobblestone); the item
+        // identity is the only thing that differs, and the drop is still
+        // collected last so MEM195 ordering is preserved.
+        session.player.collect_block(block.mined_drop());
+
+        // Breaking the support ends the crop's eligibility even though the
+        // floating wheat block itself is not edited: the candidate is
+        // forgotten so it can never advance without Farmland below.
+        if block == BlockId::Farmland {
+            session.remove_crop(pos + IVec3::Y);
+        }
+
+        // Oak leaves carry a deterministic secondary apple drop, resolved
+        // here because `BlockId::mined_drop` returns a single identity. The
+        // leaf drop was collected first, so the bonus can never displace it.
+        // The bonus is best-effort: M008 has no item entities or ground spill,
+        // so a full inventory simply loses the apple.
+        if block == BlockId::OakLeaves && loot::oak_leaves_apple(session.world.seed(), pos) {
+            let apple = Item::new(ItemId::Material(Material::Apple), 1)
+                .expect("an apple is a valid carryable item");
+            session.player.collect_item(apple);
+        }
+    }
 
     BreakOutcome::Applied { remeshed, wear }
 }
@@ -336,24 +459,67 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
     if remeshed.is_empty() {
         return None;
     }
+    // A fresh chest must never inherit contents a removed chest left behind at
+    // this position. Only after the edit actually applied, so a rejected
+    // placement cannot erase a live record.
+    if block == BlockId::Chest {
+        session.chests.remove(&ap);
+    }
     session.player.consume_selected();
     Some(remeshed)
 }
 
 /// Outcome of one production right-click world interaction.
 ///
-/// Table targeting runs first and is a pure session decision: a successfully
-/// targeted crafting table neither edits the world nor consumes the selected
-/// stack. Anything else falls through to the pre-existing placement path, so
-/// non-table clicks stay byte-compatible with the placement-only behavior.
+/// The full precedence is chest/table -> Survival food -> hoe/seed farming ->
+/// block placement. Stations and Survival food run before everything else and
+/// are pure session decisions: a successfully targeted storage block or
+/// crafting table neither edits the world nor consumes the selected stack, and
+/// a food item never places a block. Farming follows because the top-face rule
+/// needs the raycast normal, which only this layer sees; a refused farm action
+/// falls through to placement, which is a no-op for tools and materials, so one
+/// click can never edit twice. Farming is mode-independent (Creative farms
+/// too). Anything else falls through to the pre-existing placement path, so
+/// non-station clicks stay byte-compatible with the placement-only behavior.
 ///
-/// `sync_open_table` runs at the interaction boundary so a stale open station
-/// (the table was removed/replaced or the player walked away) is closed before
-/// the click is interpreted — replaced tables fall through to placement.
+/// Both station syncs run at the interaction boundary so a stale open station
+/// (removed/replaced or out of reach) is closed before the click is
+/// interpreted — replaced stations fall through to placement. Chest targeting
+/// runs before table targeting so one shared ray can only ever open the block
+/// the player is actually looking at.
+///
+/// Survival food comes after both station checks and before farming/placement:
+/// holding a food item never places a block, a full-hunger click is refused
+/// through the transient notice channel instead of silently doing nothing, and
+/// Creative keeps its byte-identical placement fallback because food rules are
+/// Survival-only.
 fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
+    session.sync_open_chest();
     session.sync_open_table();
+    if let Some(pos) = session.try_open_targeted_chest() {
+        return RightClickOutcome::ChestOpened(pos);
+    }
     if session.try_open_targeted_table().is_some() {
         return RightClickOutcome::TableOpened;
+    }
+    if session.player.mode() == GameMode::Survival {
+        if let Some(item) = session.player.selected_item() {
+            if food_value(item.id()).is_some() {
+                return match EatingTarget::new(
+                    session.player.selected_slot(),
+                    item,
+                    session.player.survival.hunger(),
+                ) {
+                    Some(_) => RightClickOutcome::EatingStarted,
+                    // Full hunger is the only way a food item refuses here;
+                    // the target constructor already validated slot and food.
+                    None => RightClickOutcome::EatingRefused,
+                };
+            }
+        }
+    }
+    if let Some(outcome) = try_farm_interaction(session) {
+        return outcome;
     }
     match try_place_selected_block(session) {
         Some(remeshed) => RightClickOutcome::Placed(remeshed),
@@ -361,12 +527,124 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
 }
 
+/// Tries the hoe and wheat-seed branches of a right click.
+///
+/// Only the two farming selections raycast here: any other held item or empty
+/// slot returns `None` without work and falls through to placement. The
+/// top-face rule lives at this layer because it is raycast metadata the session
+/// seams never see — tilling a side face and planting into a side face are both
+/// refusals, not mutations. Hoe tills the hit block; seeds plant into its
+/// adjacent cell, with the session re-checking Air/Farmland/reach/overlap.
+/// Returns `None` for every refusal so the click falls through exactly once.
+fn try_farm_interaction(session: &mut WorldSession) -> Option<RightClickOutcome> {
+    let selected = session.player.selected_item()?;
+    let is_hoe = matches!(
+        selected.id(),
+        ItemId::Tool {
+            kind: ToolKind::Hoe,
+            ..
+        }
+    );
+    let is_seeds = selected.id() == ItemId::Material(Material::WheatSeeds);
+    if !is_hoe && !is_seeds {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    if hit.normal != IVec3::Y {
+        return None;
+    }
+    if is_hoe {
+        session
+            .till_at(hit.block_pos)
+            .map(RightClickOutcome::Tilled)
+    } else {
+        session
+            .plant_wheat_at(hit.adjacent_pos)
+            .map(RightClickOutcome::Planted)
+    }
+}
+
 enum RightClickOutcome {
+    /// A chest was opened; the authoritative position is exposed by
+    /// [`WorldSession::open_chest_position`], not duplicated in this outcome.
+    ChestOpened(IVec3),
     /// A table was opened; the authoritative position is exposed by
     /// [`WorldSession::open_table_position`], not duplicated in this outcome.
     TableOpened,
+    /// A Survival food click started the hold-to-eat gesture. No item is
+    /// consumed here: the redraw loop owns completion through `eat_selected`.
+    EatingStarted,
+    /// A Survival food click was refused because hunger is already full. The
+    /// press arm reports [`right_click_notice`] through the transient message
+    /// channel.
+    EatingRefused,
+    /// A hoe tilled soil into Farmland; carries the remesh work to upload.
+    Tilled(Vec<(ChunkPos, ChunkMesh)>),
+    /// Wheat seeds were planted; carries the remesh work to upload.
+    Planted(Vec<(ChunkPos, ChunkMesh)>),
     Placed(Vec<(ChunkPos, ChunkMesh)>),
     Nothing,
+}
+
+/// Transient notice text for a right-click outcome, if any.
+///
+/// Only the full-hunger refusal needs an explanation: every other outcome is
+/// already visible in the world (a station opened, a block appeared) or is an
+/// ordinary non-event.
+fn right_click_notice(outcome: &RightClickOutcome) -> Option<&'static str> {
+    match outcome {
+        RightClickOutcome::EatingRefused => Some("Cannot eat while full"),
+        _ => None,
+    }
+}
+
+/// The hold-to-eat candidate for this frame, or `None` when eating must not
+/// progress.
+///
+/// Cancellation is structural: a released right button, a panel/menu frame
+/// (non-gameplay), an ungrabbed cursor, a non-Survival mode, a dead player, any
+/// movement key, or a selected item that is not food all produce `None`, which
+/// makes [`EatingState::tick`] reset accumulated progress. There is no
+/// separate cancellation switch that a reset site could forget.
+fn eating_candidate(
+    session: &WorldSession,
+    input: &InputState,
+    right_mouse_held: bool,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> Option<EatingTarget> {
+    if !(gameplay && cursor_grabbed && right_mouse_held) {
+        return None;
+    }
+    let player = &session.player;
+    if player.mode() != GameMode::Survival || session.is_dead() || input.is_moving() {
+        return None;
+    }
+    let item = player.selected_item()?;
+    EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
+}
+
+/// Crosshair progress bar for this frame.
+///
+/// Eating owns the single sanctioned bar slot while a meal is in progress; a
+/// completed meal resets the eating state, so mining's amber bar comes back on
+/// the very next frame. `None` means neither action is progressing and no bar
+/// is drawn.
+fn frame_progress_bar(
+    eating: Option<f32>,
+    mining: Option<f32>,
+    surface_w: u32,
+    surface_h: u32,
+) -> Option<[Quad; 2]> {
+    if let Some(progress) = eating {
+        return Some(eating_progress_quads(progress, surface_w, surface_h));
+    }
+    mining.map(|progress| mining_progress_quads(progress, surface_w, surface_h))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +681,10 @@ fn open_inventory(
     via_table: bool,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -415,7 +695,9 @@ fn open_inventory(
     }
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *drag = None;
     *cursor_grabbed = false;
     set_cursor_grab(window, false);
@@ -430,8 +712,10 @@ fn close_inventory(
     session: &mut WorldSession,
     input: &mut InputState,
     left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
+    eating: &mut EatingState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -439,7 +723,9 @@ fn close_inventory(
     session.close_table();
     input.reset();
     mining.reset();
+    eating.reset();
     *left_mouse_held = false;
+    *right_mouse_held = false;
     *drag = None;
     *cursor_grabbed = true;
     set_cursor_grab(window, true);
@@ -599,6 +885,145 @@ fn revalidate_inventory_station(screen: &mut InventoryScreen, session: &mut Worl
     screen.close();
     session.close_table();
     true
+}
+
+// ---------------------------------------------------------------------------
+// Chest-screen adapter (S03-T05)
+//
+// The pure geometry lives in `ui::chest` (T04) and every mutation lives in
+// `WorldSession`'s narrow chest command (T03). This layer only translates
+// winit input into one of those commands and back into a status line; the
+// screen never performs stack arithmetic and gameplay input never leaks
+// through an open chest.
+// ---------------------------------------------------------------------------
+
+/// Opens the chest screen attached to the live chest station opened by
+/// [`right_click_interaction`], releasing the cursor and dropping every
+/// gameplay hold so the screen owns the pointer.
+///
+/// Defensive: the inventory panel and its crafting station are closed first,
+/// so two gameplay panels can never share the pointer. A free function
+/// because `window_event` already holds disjoint `gpu`/`window` borrows,
+/// making a `&mut self` method unusable there (P005).
+#[allow(clippy::too_many_arguments)]
+fn open_chest_screen(
+    screen: &mut ChestScreen,
+    session: &mut WorldSession,
+    inventory: &mut InventoryScreen,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    drag: &mut Option<InventoryTarget>,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    cursor_grabbed: &mut bool,
+    status: &mut Option<String>,
+    window: &Window,
+) {
+    inventory.close();
+    session.close_table();
+    screen.open();
+    input.reset();
+    mining.reset();
+    eating.reset();
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *drag = None;
+    *cursor_grabbed = false;
+    *status = None;
+    set_cursor_grab(window, false);
+}
+
+/// Closes the chest screen from the E/Escape paths and restores gameplay
+/// input ownership: the cursor is re-grabbed, holds are cleared, and the
+/// session station is closed so the 27-slot view cannot outlive the screen.
+#[allow(clippy::too_many_arguments)]
+fn close_chest_screen(
+    screen: &mut ChestScreen,
+    session: &mut WorldSession,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.close();
+    session.close_chest();
+    input.reset();
+    mining.reset();
+    eating.reset();
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *cursor_grabbed = true;
+    set_cursor_grab(window, true);
+}
+
+/// Translates one clicked chest-screen target into exactly one domain command:
+/// a chest slot goes through the station-aware session command (which
+/// revalidates the chest and owns record lifecycle), while a player slot goes
+/// through the shared inventory façade. Neither branch reads or computes stack
+/// counts, and neither can touch the other aggregate.
+pub fn apply_chest_click(
+    session: &mut WorldSession,
+    target: ChestTarget,
+) -> Result<(), ChestCommandError> {
+    match target {
+        ChestTarget::ChestSlot(index) => session.click_open_chest_slot(index),
+        ChestTarget::InventorySlot(index) => session
+            .player
+            .click_inventory_slot(index)
+            .map_err(ChestCommandError::Slot),
+    }
+}
+
+/// One-line status for the chest footer: what moved, or the typed rejection
+/// (warnings-as-data, never a log — D006/MEM009).
+fn chest_status_text(result: Result<(), ChestCommandError>) -> String {
+    match result {
+        Ok(()) => "Moved".to_string(),
+        Err(ChestCommandError::NotOpen) => "Chest closed".to_string(),
+        Err(ChestCommandError::Slot(error)) => format!("Inventory: {error:?}"),
+    }
+}
+
+/// True only when the chest screen is open but its live station has vanished
+/// (broken, replaced, or out of reach). Delegates to the pure T04 state.
+fn chest_should_close(screen: &ChestScreen, open_chest: Option<IVec3>) -> bool {
+    screen.station_lost(open_chest)
+}
+
+/// True only on the surface that accepts gameplay input: Playing with neither
+/// gameplay panel open. One helper keeps the redraw `gameplay` gate and every
+/// input guard in agreement, so a panel can never leak a key, wheel, or click
+/// into the world while still freezing movement.
+fn gameplay_surface(playing: bool, inventory_open: bool, chest_open: bool) -> bool {
+    playing && !inventory_open && !chest_open
+}
+
+/// Backing-panel rect for the transient gameplay notice, in physical pixels.
+///
+/// Centered horizontally and placed just above the hotbar, then clamped so a
+/// long message or a tiny surface always stays on screen. Pure so the layout
+/// is provable without GPU/window state.
+fn gameplay_notice_rect(surface_w: u32, surface_h: u32, text_width: f32) -> (f32, f32, f32, f32) {
+    let w_px = surface_w.max(1) as f32;
+    let h_px = surface_h.max(1) as f32;
+    let text_width = if text_width.is_finite() {
+        text_width.max(0.0)
+    } else {
+        0.0
+    };
+    let width = (text_width + 16.0).min(w_px);
+    let height = (LINE_HEIGHT + 8.0).min(h_px);
+    let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
+        .iter()
+        .map(|rect| rect.1)
+        .fold(h_px, f32::min);
+    let x = ((w_px - width) * 0.5).clamp(0.0, (w_px - width).max(0.0));
+    let y = (hotbar_top - height - 6.0).clamp(0.0, (h_px - height).max(0.0));
+    (x, y, width, height)
 }
 
 /// Where a press-drag-release ends: only a different cell than the press origin
@@ -810,6 +1235,24 @@ fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
         .is_liquid()
 }
 
+/// Vitals HUD quads for the current Playing frame.
+///
+/// One helper shared by the frame loop and the headless tests, so what the
+/// window draws and what the tests prove cannot drift: it reads the session's
+/// live eye submersion and hands the player's vitals and effective mode to the
+/// pure [`vitals_quads`]. Only the Playing block calls it — menu, pause, and
+/// death screens never draw the Survival HUD.
+fn playing_hud_quads(session: &WorldSession, surface_w: u32, surface_h: u32) -> Vec<Quad> {
+    let head_submerged = eye_is_submerged(&session.world, session.camera.position);
+    vitals_quads(
+        &session.player.survival,
+        session.player.mode(),
+        head_submerged,
+        surface_w,
+        surface_h,
+    )
+}
+
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
 /// of `--new`/`--new-world`, `--seed`, or a non-default `--save` means the
 /// launch carries an explicit world choice and enters gameplay directly,
@@ -819,6 +1262,18 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
     cli.force_new_world
         || cli.seed_override.is_some()
         || cli.save_path != Path::new(DEFAULT_SAVE_PATH)
+}
+
+/// Accelerated-watch suppression predicate: true when the launch requested a
+/// scripted demo seam (`--demo-swim`, `--demo-survival`, or `--demo-content`).
+/// A scripted demo owns its own completion and digest contract at its own
+/// pace, so the accelerated `--time-scale` watch and its wall-clock deadline
+/// must stay disarmed even when `--time-scale` is also on the command line —
+/// otherwise a `--demo-content --time-scale 60` launch could shut down before
+/// the scripted run prints its own digest. The flags themselves are still
+/// launch switches, never world intents (see [`cli_has_world_intent`]).
+fn scripted_demo_requested(cli: &CliConfig) -> bool {
+    cli.demo_swim || cli.demo_survival || cli.demo_content
 }
 
 /// The startup world session, mirroring main()'s pre-S03 load-or-fresh
@@ -841,8 +1296,15 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // Fresh worlds start at the default season length; the New Game row and
     // the `--season-length` CLI seam override it on this branch only. A load
     // branch above never reaches here, so a persisted calendar always wins
-    // over a launch flag.
-    let mut session = WorldSession::new_session(seed, cli.save_path.clone(), cli.season_length);
+    // over a launch flag. The mode follows the same rule: `--creative` /
+    // `--survival` pick the fresh world's persisted mode, while a loaded save
+    // restores its own stored mode and ignores the flag.
+    let mut session = WorldSession::new_session_with_mode(
+        seed,
+        cli.save_path.clone(),
+        cli.season_length,
+        cli.mode,
+    );
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
     // resumed save is never moved — its own position is the contract there.
@@ -997,6 +1459,11 @@ fn compose_screen_text(
             }
             lines
         }
+        LifecycleScreen::Death => {
+            let mut lines = vec![DEATH_TITLE.to_string()];
+            lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
+            lines
+        }
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => return String::new(),
     };
     lines.join("\n")
@@ -1036,6 +1503,7 @@ fn screen_panel_rect(
         LifecycleScreen::Pause => pause_panel_rect(surface_w, surface_h),
         LifecycleScreen::NewGame => new_game_panel_rect(surface_w, surface_h),
         LifecycleScreen::LoadGame => load_panel_rect(surface_w, load.row_count()),
+        LifecycleScreen::Death => death_panel_rect(surface_w, surface_h),
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
             menu::panel_rect(surface_w, surface_h)
         }
@@ -1088,6 +1556,11 @@ fn hovered_target_rect(
                     .then(|| load_cancel_rect(surface_w, row_count)),
             }
         }
+        LifecycleScreen::Death => {
+            let row = hovered_death_row(cursor, surface_w, surface_h)?;
+            let index = DEATH_ROWS.iter().position(|&r| r == row)?;
+            death_row_rect(surface_w, surface_h, index)
+        }
         LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
     }
 }
@@ -1101,6 +1574,7 @@ fn screen_title_tag(screen: LifecycleScreen) -> &'static str {
         LifecycleScreen::NewGame => " | New Game",
         LifecycleScreen::LoadGame => " | Load Game",
         LifecycleScreen::Pause => " | Paused",
+        LifecycleScreen::Death => " | Dead",
         LifecycleScreen::Settings(_) => " | Settings",
         LifecycleScreen::Playing => "",
     }
@@ -1204,6 +1678,9 @@ struct Ready {
     /// first `n` buffers are drawn for an `n`-label frame; a closed screen
     /// draws none and never re-shapes anything.
     inventory_labels: Vec<StatsOverlay>,
+    /// Chest panel labels (S03-T05): same change-gated pattern, sized once to
+    /// the pure `MAX_CHEST_LABELS` bound so no frame allocates a text buffer.
+    chest_labels: Vec<StatsOverlay>,
 }
 
 /// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
@@ -1860,6 +2337,1363 @@ fn swim_frame(demo: &mut SwimDemo, session: &mut WorldSession, dt: f32) -> bool 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted survival demo (`--demo-survival`, S08-T02)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock safety net for the scripted survival loop. Every stage is also
+/// bounded by its own 200-update loop, so this only catches a run whose chunks
+/// never stream in (the settle/drown waits).
+const SURVIVAL_DEMO_DEADLINE_SECS: u64 = 120;
+
+/// The scripted survival loop's fixed stage order. Each stage is fed once per
+/// `about_to_wait` call; the wait stages (settle/drown) return `false` until
+/// their world gate is satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurvivalStage {
+    Settle,
+    Fall,
+    Eat,
+    Drown,
+    Starve,
+    Save,
+    Done,
+}
+
+/// The `--demo-survival` seam's whole state: the pinned seed, the resolved
+/// ocean route, the stage cursor, the one latched digest, and the observed
+/// numbers the success digest reports.
+#[derive(Debug)]
+struct SurvivalDemo {
+    seed: u32,
+    route: Option<SwimRoute>,
+    stage: SurvivalStage,
+    /// The digest latched when the run ends (success or abort). Printed by the
+    /// demo-shutdown block with the other bounded-demo diagnostics.
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status.
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+    /// The applied fall damage the demo proved (4 for the pinned 7-block
+    /// drop).
+    fall_damage: u16,
+    /// The hunger the apple restored (4).
+    eat_restored: u16,
+}
+
+impl SurvivalDemo {
+    fn new(seed: u32, route: Option<SwimRoute>, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            route,
+            stage: SurvivalStage::Settle,
+            digest: None,
+            failed: false,
+            deadline,
+            fall_damage: 0,
+            eat_restored: 0,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(format!(
+            "survival_demo: seed={} stage={} observed={} ok=false",
+            self.seed, stage, observed
+        ));
+        self.failed = true;
+    }
+
+    /// The exact success digest printed once on the demo-shutdown path.
+    fn success_digest(&self) -> String {
+        let full = SurvivalState::full();
+        format!(
+            "survival_demo: seed={} fall=true fall_damage={} eat=true eat_restored={} drown=true air_empty=true starve=true death=true respawn=true inventory_kept=true mode=survival saved=true health={} hunger={} air={} ok=true",
+            self.seed,
+            self.fall_damage,
+            self.eat_restored,
+            full.health(),
+            full.hunger(),
+            full.air(),
+        )
+    }
+}
+
+/// Total carried count of one identity across the 36 durable inventory slots.
+fn inventory_item_count(inventory: &Inventory, id: ItemId) -> u16 {
+    inventory
+        .slots()
+        .iter()
+        .flatten()
+        .filter(|item| item.id() == id)
+        .map(|item| item.count())
+        .fold(0u16, u16::saturating_add)
+}
+
+/// The first solid block below the deterministic spawn column, scanning the
+/// same bounded band the fall stage uses. `None` when the spawn ground is not
+/// resident or not solid, so the caller aborts with a self-describing digest.
+fn spawn_ground_y(session: &WorldSession) -> Option<i32> {
+    let spawn = WorldSession::spawn_position(session.world.seed());
+    let spawn_x = spawn.x.floor() as i32;
+    let spawn_z = spawn.z.floor() as i32;
+    let spawn_y = spawn.y.floor() as i32;
+    let top = spawn_y + 2;
+    let bottom = spawn_y - 8;
+    (bottom..=top)
+        .rev()
+        .find(|&y| session.world.get_block(spawn_x, y, spawn_z).is_solid())
+}
+
+/// Drive one Playing frame of the scripted survival loop. Returns true when
+/// this call ended the run (success or abort).
+///
+/// Every stage is bounded: the fall and starvation/drowning simulations are
+/// capped at 200 updates, the wait stages are bounded by the wall-clock
+/// deadline, and every failure latches an abort digest instead of panicking on
+/// live-world variance.
+fn survival_demo_step(demo: &mut SurvivalDemo, session: &mut WorldSession) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    if let Some(deadline) = demo.deadline {
+        if Instant::now() >= deadline {
+            demo.abort(
+                "deadline",
+                &format!("bounded survival run exceeded {SURVIVAL_DEMO_DEADLINE_SECS}s"),
+            );
+            return true;
+        }
+    }
+    let input = InputState::default();
+    match demo.stage {
+        SurvivalStage::Settle => {
+            if !session.settle_spawn() {
+                return false;
+            }
+            demo.stage = SurvivalStage::Fall;
+            false
+        }
+        SurvivalStage::Fall => {
+            let spawn = WorldSession::spawn_position(session.world.seed());
+            if !session.player.on_ground {
+                let mut landed = false;
+                for _ in 0..200 {
+                    session.player.update(1.0 / 60.0, &input, |x, y, z| {
+                        session.world.get_block(x, y, z)
+                    });
+                    if session.player.on_ground {
+                        landed = true;
+                        break;
+                    }
+                }
+                if !landed {
+                    demo.abort(
+                        "fall",
+                        &format!(
+                            "never landed on the spawn column; y={:.3}",
+                            session.player.position.y
+                        ),
+                    );
+                    return true;
+                }
+            }
+            let Some(ground_y) = spawn_ground_y(session) else {
+                demo.abort("fall", "no_ground");
+                return true;
+            };
+            // The spawn landing above consumed the fresh-spawn immunity, so
+            // this pinned 7-block drop is the first landing that can hurt.
+            session.player.survival = SurvivalState::full();
+            session.player.position = Vec3::new(spawn.x, ground_y as f32 + 1.0 + 7.0, spawn.z);
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = false;
+            let mut landed = false;
+            for _ in 0..200 {
+                session.player.update(1.0 / 60.0, &input, |x, y, z| {
+                    session.world.get_block(x, y, z)
+                });
+                if session.player.on_ground {
+                    landed = true;
+                    break;
+                }
+            }
+            if !landed {
+                demo.abort(
+                    "fall",
+                    &format!(
+                        "did not land after the pinned 7-block drop; y={:.3} ground_y={ground_y}",
+                        session.player.position.y
+                    ),
+                );
+                return true;
+            }
+            session.tick_survival(0.1, 1.0, false);
+            let health = session.player.survival.health();
+            if health != 16 {
+                demo.abort(
+                    "fall",
+                    &format!("health={health} after a 7-block drop (expected 16)"),
+                );
+                return true;
+            }
+            demo.fall_damage = 4;
+            demo.stage = SurvivalStage::Eat;
+            false
+        }
+        SurvivalStage::Eat => {
+            let health = session.player.survival.health();
+            let Some(mut vitals) = SurvivalState::new(health, MAX_HUNGER, FULL_AIR) else {
+                demo.abort("eat", "could_not_construct_checked_vitals");
+                return true;
+            };
+            let spent = vitals.spend_hunger(6);
+            if spent != 6 {
+                demo.abort("eat", &format!("spent_hunger={spent} (expected 6)"));
+                return true;
+            }
+            session.player.survival = vitals;
+            let Ok(apple) = Item::new(ItemId::Material(Material::Apple), 2) else {
+                demo.abort("eat", "could_not_build_apple_stack");
+                return true;
+            };
+            let Ok(stick) = Item::new(ItemId::Material(Material::Stick), 1) else {
+                demo.abort("eat", "could_not_build_stick_stack");
+                return true;
+            };
+            if session.player.insert_items(&[apple, stick]).is_err() {
+                demo.abort("eat", "inventory_refused_the_food_and_marker");
+                return true;
+            }
+            let apple_id = ItemId::Material(Material::Apple);
+            let Some(slot) = (0..HOTBAR_SLOTS).find(|&slot| {
+                session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(apple_id)
+            }) else {
+                demo.abort("eat", "apple_slot_missing_after_insert");
+                return true;
+            };
+            if !session.player.select_slot(slot) {
+                demo.abort("eat", "apple_slot_out_of_hotbar_range");
+                return true;
+            }
+            let Some(restored) = session.player.eat_selected(slot, apple_id) else {
+                demo.abort("eat", "eat_selected_refused_the_apple");
+                return true;
+            };
+            if restored != 4 {
+                demo.abort("eat", &format!("eat_restored={restored} (expected 4)"));
+                return true;
+            }
+            let hunger = session.player.survival.hunger();
+            if hunger != 18 {
+                demo.abort("eat", &format!("hunger={hunger} (expected 18)"));
+                return true;
+            }
+            let apples = inventory_item_count(session.player.inventory(), apple_id);
+            if apples != 1 {
+                demo.abort("eat", &format!("apples={apples} (expected 1)"));
+                return true;
+            }
+            demo.eat_restored = restored;
+            demo.stage = SurvivalStage::Drown;
+            false
+        }
+        SurvivalStage::Drown => {
+            let Some(route) = demo.route else {
+                demo.abort("drown", "no_ocean_route");
+                return true;
+            };
+            let spawn = WorldSession::spawn_position(session.world.seed());
+            session.player.position = Vec3::new(
+                0.5,
+                SEA_LEVEL as f32 - 2.0,
+                route.ocean_start_z as f32 + 0.5,
+            );
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = false;
+            session.sync_camera();
+            let (ocean_chunk, _) = world_to_chunk_and_local(0, SEA_LEVEL, route.ocean_start_z);
+            if !session.world.is_resident(ocean_chunk)
+                || session.world.get_block(0, SEA_LEVEL, route.ocean_start_z) != BlockId::Water
+            {
+                return false;
+            }
+            session.player.survival.refill_air();
+            let health_before = session.player.survival.health();
+            let mut drowned = false;
+            for _ in 0..200 {
+                session.tick_survival(0.1, 10.0, true);
+                if session.player.survival.air() == 0
+                    && session.player.survival.health() < health_before
+                {
+                    drowned = true;
+                    break;
+                }
+            }
+            if !drowned {
+                demo.abort(
+                    "drown",
+                    &format!(
+                        "air={} health={} (expected empty air and damage from {health_before})",
+                        session.player.survival.air(),
+                        session.player.survival.health()
+                    ),
+                );
+                return true;
+            }
+            let Some(ground_y) = spawn_ground_y(session) else {
+                demo.abort("drown", "no_ground");
+                return true;
+            };
+            session.player.position = Vec3::new(spawn.x, ground_y as f32 + 1.0, spawn.z);
+            session.player.velocity = Vec3::ZERO;
+            session.player.on_ground = true;
+            session.player.survival.refill_air();
+            session.sync_camera();
+            demo.stage = SurvivalStage::Starve;
+            false
+        }
+        SurvivalStage::Starve => {
+            // The eaten apple leaves hunger below MAX_HUNGER; spending the
+            // maximum simply empties it (the mutator reports the clamped
+            // amount). The observable contract is hunger == 0.
+            session.player.survival.spend_hunger(MAX_HUNGER);
+            let hunger = session.player.survival.hunger();
+            if hunger != 0 {
+                demo.abort(
+                    "starve",
+                    &format!("hunger={hunger} after spending {MAX_HUNGER}"),
+                );
+                return true;
+            }
+            let mut died = false;
+            for _ in 0..200 {
+                session.tick_survival(0.1, 100.0, false);
+                if session.is_dead() {
+                    died = true;
+                    break;
+                }
+            }
+            if !died {
+                demo.abort(
+                    "starve",
+                    &format!(
+                        "health={} hunger={} (expected death within the starvation window)",
+                        session.player.survival.health(),
+                        session.player.survival.hunger()
+                    ),
+                );
+                return true;
+            }
+            session.respawn();
+            if session.player.survival != SurvivalState::full() {
+                demo.abort(
+                    "starve",
+                    &format!(
+                        "respawn left health={} hunger={} air={} (expected full vitals)",
+                        session.player.survival.health(),
+                        session.player.survival.hunger(),
+                        session.player.survival.air()
+                    ),
+                );
+                return true;
+            }
+            let stick_id = ItemId::Material(Material::Stick);
+            if inventory_item_count(session.player.inventory(), stick_id) == 0 {
+                demo.abort("starve", "stick_marker_missing_after_respawn");
+                return true;
+            }
+            demo.stage = SurvivalStage::Save;
+            false
+        }
+        SurvivalStage::Save => {
+            if let Err(err) = save_current_world(session) {
+                demo.abort("save", &format!("save_failed={err}"));
+                return true;
+            }
+            let loaded = match load_world_from_path(&session.save_path) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    demo.abort("save", &format!("load_failed={err}"));
+                    return true;
+                }
+            };
+            if loaded.mode != GameMode::Survival {
+                demo.abort(
+                    "save",
+                    &format!("mode={:?} (expected Survival)", loaded.mode),
+                );
+                return true;
+            }
+            if loaded.player.survival != SurvivalState::full() {
+                demo.abort(
+                    "save",
+                    &format!(
+                        "loaded health={} hunger={} air={} (expected full vitals)",
+                        loaded.player.survival.health(),
+                        loaded.player.survival.hunger(),
+                        loaded.player.survival.air()
+                    ),
+                );
+                return true;
+            }
+            if !loaded.chests.is_empty() {
+                demo.abort(
+                    "save",
+                    &format!("chests={} (expected empty)", loaded.chests.len()),
+                );
+                return true;
+            }
+            if !loaded.chunk_edits.is_empty() {
+                demo.abort(
+                    "save",
+                    &format!("chunk_edits={} (expected empty)", loaded.chunk_edits.len()),
+                );
+                return true;
+            }
+            let stick_id = ItemId::Material(Material::Stick);
+            if inventory_item_count(&loaded.player.inventory, stick_id) == 0 {
+                demo.abort("save", "stick_marker_missing_in_the_loaded_save");
+                return true;
+            }
+            demo.digest = Some(demo.success_digest());
+            demo.stage = SurvivalStage::Done;
+            true
+        }
+        SurvivalStage::Done => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scripted content demo (`--demo-content`, S08-T03)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock safety net for the scripted ruin/farm/chest chain. Every stage
+/// also has its own deterministic gate, so this only catches a run whose
+/// chunks never stream in.
+const CONTENT_DEMO_DEADLINE_SECS: u64 = 240;
+
+/// The scripted content loop's fixed stage order. Scan resolves the legal
+/// ruin-chest candidates, ChestWait walks them until a live `LootChest` is
+/// resident, and the remaining stages perform one production action per
+/// `about_to_wait` turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentStage {
+    Scan,
+    ChestWait,
+    Take,
+    Craft,
+    FarmSearch,
+    TillPlant,
+    Grow,
+    Harvest,
+    Bread,
+    Place,
+    Replant,
+    Save,
+    Done,
+}
+
+/// The `--demo-content` seam's whole state: the pinned seed, the candidate
+/// chest positions, the stage cursor, the one latched digest, and the facts
+/// the success digest reports.
+#[derive(Debug)]
+struct ContentDemo {
+    seed: u32,
+    stage: ContentStage,
+    candidates: Vec<IVec3>,
+    candidate_index: usize,
+    chest_pos: Option<IVec3>,
+    farm_targets: Vec<IVec3>,
+    farm_index: usize,
+    chest_dest: Option<IVec3>,
+    loot_stacks: usize,
+    bread_crafted: u16,
+    digest: Option<String>,
+    failed: bool,
+    deadline: Option<Instant>,
+}
+
+impl ContentDemo {
+    fn new(seed: u32, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            stage: ContentStage::Scan,
+            candidates: Vec::new(),
+            candidate_index: 0,
+            chest_pos: None,
+            farm_targets: Vec::new(),
+            farm_index: 0,
+            chest_dest: None,
+            loot_stacks: 0,
+            bread_crafted: 0,
+            digest: None,
+            failed: false,
+            deadline,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(format!(
+            "content_demo: seed={} stage={} observed={} ok=false",
+            self.seed, stage, observed
+        ));
+        self.failed = true;
+    }
+
+    /// The exact success digest printed once on the demo-shutdown path.
+    fn success_digest(&self) -> String {
+        let chest = self.chest_pos.unwrap_or(IVec3::ZERO);
+        let farm = self.farm_targets.first().copied().unwrap_or(IVec3::ZERO);
+        format!(
+            "content_demo: seed={} chest={},{},{} loot_stacks={} loot_taken=true chest_broken=true chest_item=1 farm={},{},{} tilled=true planted=true winter_paused=true stage3=true harvest_wheat=2 harvest_seeds=4 bread={} chest_placed=true stored_bread=true saved=true reload_chests=1 reload_stage=1 ok=true",
+            self.seed,
+            chest.x,
+            chest.y,
+            chest.z,
+            self.loot_stacks,
+            farm.x,
+            farm.y,
+            farm.z,
+            self.bread_crafted,
+        )
+    }
+}
+
+/// Every legal ruin-chest cell in the bounded `±3`-chunk region around the
+/// origin, sorted by `(x, y, z)` so two runs visit the same candidates.
+///
+/// The candidate rule is the production terrain seam, never a reimplementation
+/// of ruin placement: `ruin_at_seeded` proves an anchor exists and
+/// `ruin_loot_chest_at` proves the exact centre cell is its loot chest. A legal
+/// candidate can still be suppressed in the live chunk (tree overlap, winter
+/// surface, an already occupied cell), so ChestWait verifies the live block.
+fn content_demo_chest_candidates(seed: u32) -> Vec<IVec3> {
+    let span = 3 * CHUNK_SIZE as i32;
+    let mut candidates = Vec::new();
+    for ax in -span..=span {
+        for az in -span..=span {
+            let Some(spec) = ruin_at_seeded(ax, az, seed) else {
+                continue;
+            };
+            let candidate = IVec3::new(ax, spec.surface + 1, az);
+            if ruin_loot_chest_at(candidate, seed).is_some() {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort_unstable_by_key(|pos| (pos.x, pos.y, pos.z));
+    candidates.dedup();
+    candidates
+}
+
+/// Whether a block edit at `pos` can produce remesh work right now.
+///
+/// Mirrors [`WorldSession`]'s edit-first guard (the chunk plus its six face
+/// neighbours must be resident) without making the private session helper
+/// public. The demo uses this before every till/plant/place so a refusal is a
+/// wait, never a silent world mutation.
+fn content_demo_edit_ready(session: &WorldSession, pos: IVec3) -> bool {
+    use opencraft::world::manager::{MAX_CHUNK_Y, MIN_CHUNK_Y};
+
+    let (chunk, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+    if !session.world.is_resident(chunk) {
+        return false;
+    }
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        let ny = chunk.y + dy;
+        if !(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny) {
+            continue;
+        }
+        if !session
+            .world
+            .is_resident(ChunkPos::new(chunk.x + dx, ny, chunk.z + dz))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Deterministic ring search for farmable soil around the ruin chest.
+///
+/// For each column on rings 4..=24, sample the production terrain height and
+/// scan `h-1..=h+3` for a live `Grass` block with live `Air` directly above.
+/// Residency is deliberately not required here: TillPlant waits for the edit
+/// guard, so a search result that is not resident yet is a wait, not a loss.
+fn content_demo_find_farm_targets(session: &WorldSession, chest: IVec3, need: usize) -> Vec<IVec3> {
+    let seed = session.world.seed();
+    let mut targets = Vec::with_capacity(need);
+    'rings: for radius in 4i32..=24 {
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs() != radius && dz.abs() != radius {
+                    continue;
+                }
+                let x = chest.x + dx;
+                let z = chest.z + dz;
+                let h = terrain_height_at_seeded(x, z, seed);
+                for y in (h - 1)..=(h + 3) {
+                    let pos = IVec3::new(x, y, z);
+                    if pos == chest {
+                        continue;
+                    }
+                    if session.world.get_block(x, y, z) == BlockId::Grass
+                        && session.world.get_block(x, y + 1, z) == BlockId::Air
+                    {
+                        targets.push(pos);
+                        if targets.len() >= need {
+                            break 'rings;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Moves every non-empty slot of the open chest into the inventory through the
+/// production click seams, returning the number of loot stacks moved.
+fn content_demo_take_all(session: &mut WorldSession) -> Option<usize> {
+    let pos = session.open_chest_position()?;
+    let occupied: Vec<usize> = {
+        let record = session.chests.get(&pos)?;
+        (0..record.slots().len())
+            .filter(|&index| record.slot(index).is_some())
+            .collect()
+    };
+    let count = occupied.len();
+    for index in occupied {
+        session.click_open_chest_slot(index).ok()?;
+        let empty = (0..session.player.inventory().slots().len())
+            .find(|&slot| session.player.inventory().slot(slot).is_none())?;
+        session.player.click_inventory_slot(empty).ok()?;
+    }
+    if session.player.inventory().cursor().is_some() {
+        return None;
+    }
+    if !session
+        .chests
+        .get(&pos)
+        .map(|record| record.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(count)
+}
+
+/// Makes `id` the selected hotbar item, moving it out of main storage when
+/// needed.
+///
+/// A main-storage stack needs a free hotbar slot. When the hotbar is full, the
+/// first hotbar stack is moved into the first empty main slot to free one; a
+/// full inventory (no empty main slot) refuses with the cursor untouched.
+fn content_demo_ensure_selected(player: &mut Player, id: ItemId) -> bool {
+    let Some(slot) = (0..player.inventory().slots().len())
+        .find(|&slot| player.inventory().slot(slot).map(|item| item.id()) == Some(id))
+    else {
+        return false;
+    };
+    if slot < HOTBAR_SLOTS {
+        return player.select_slot(slot);
+    }
+
+    let hotbar = match (0..HOTBAR_SLOTS).find(|&h| player.inventory().hotbar(h).is_none()) {
+        Some(empty) => empty,
+        None => {
+            let Some(empty_main) = (HOTBAR_SLOTS..player.inventory().slots().len())
+                .find(|&main| player.inventory().slot(main).is_none())
+            else {
+                return false;
+            };
+            let Some(victim) =
+                (0..HOTBAR_SLOTS).find(|&hotbar| player.inventory().hotbar(hotbar).is_some())
+            else {
+                return false;
+            };
+            if player.click_inventory_slot(victim).is_err() {
+                return false;
+            }
+            if player.click_inventory_slot(empty_main).is_err() {
+                // Put the stack back so a refused move never strands the
+                // cursor; the caller only cares that nothing was selected.
+                let _ = player.click_inventory_slot(victim);
+                return false;
+            }
+            victim
+        }
+    };
+
+    if player.click_inventory_slot(slot).is_err() {
+        return false;
+    }
+    if player.click_inventory_slot(hotbar).is_err() {
+        // Return the item to its original main slot rather than leaving it on
+        // the cursor for later gameplay.
+        let _ = player.click_inventory_slot(slot);
+        return false;
+    }
+    player.inventory().cursor().is_none() && player.select_slot(hotbar)
+}
+
+/// Crafts one item through the real 4x4 table grid, preserving player state
+/// around the [`Player::with_inventory`] replacement.
+///
+/// Every ingredient is consumed from a clone first, the recipe preview must
+/// match `expected`, and the output is inserted by the production
+/// `take_craft_result` seam. A refusal before the install leaves the live
+/// session untouched; the install and camera sync happen only after the craft
+/// succeeded.
+fn content_demo_craft(
+    session: &mut WorldSession,
+    cells: &[(usize, ItemId)],
+    expected: RecipeId,
+) -> Option<Item> {
+    let mut inventory = session.player.inventory().clone();
+    let mut grid = CraftingGrid::new(GridKind::Table);
+    for &(cell, id) in cells {
+        let slot = (0..inventory.slots().len())
+            .find(|&slot| inventory.slot(slot).map(|item| item.id()) == Some(id))?;
+        let item = inventory.consume_one(slot)?;
+        grid.set(cell, Some(item)).ok()?;
+    }
+    if grid.preview()?.recipe != expected {
+        return None;
+    }
+
+    let position = session.player.position;
+    let yaw = session.player.yaw;
+    let pitch = session.player.pitch;
+    let mode = session.player.mode();
+    let survival = session.player.survival;
+    let fly_mode = session.player.fly_mode;
+    let selected = session.player.selected_slot();
+    let player_grid = session.player.player_grid().clone();
+
+    let mut player = Player::with_inventory(position, inventory, player_grid, grid);
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.fly_mode = fly_mode;
+    player.survival = survival;
+    player.set_mode(mode);
+    player.restore_selected_slot(selected);
+    let item = player.take_craft_result(GridKind::Table).ok()?;
+
+    session.player = player;
+    session.sync_camera();
+    Some(item)
+}
+
+/// Total carried count of one identity across the 36 durable slots.
+fn content_demo_count(player: &Player, id: ItemId) -> u16 {
+    inventory_item_count(player.inventory(), id)
+}
+
+/// Put the player's feet at `feet`, look straight down, and sync the camera.
+fn content_demo_aim(session: &mut WorldSession, feet: Vec3, pitch: f32) {
+    session.player.position = feet;
+    session.player.velocity = Vec3::ZERO;
+    session.player.on_ground = false;
+    session.player.yaw = 0.0;
+    session.player.pitch = pitch;
+    session.sync_camera();
+}
+
+/// The saved block at `pos`, decoded from a v6 chunk-edit map.
+fn content_demo_saved_block(data: &WorldSaveData, pos: IVec3) -> Option<BlockId> {
+    let (chunk, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+    data.chunk_edits
+        .get(&chunk)
+        .and_then(|edits| edits.get(&(linear_index(lx, ly, lz) as u16)))
+        .copied()
+}
+
+/// Drive one Playing frame of the scripted ruin/farm/chest chain. Returns true
+/// when this call ended the run (success or abort).
+///
+/// Every wait stage checks the production edit/station gates and returns
+/// `false` until the world is ready; every refusal latches a self-describing
+/// abort digest instead of panicking on live-world variance.
+fn content_demo_step(demo: &mut ContentDemo, session: &mut WorldSession) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    if let Some(deadline) = demo.deadline {
+        if Instant::now() >= deadline {
+            demo.abort(
+                "deadline",
+                &format!("bounded content run exceeded {CONTENT_DEMO_DEADLINE_SECS}s"),
+            );
+            return true;
+        }
+    }
+
+    let plank_id = ItemId::Block(BlockId::OakPlanks);
+    let stick_id = ItemId::Material(Material::Stick);
+    let wheat_id = ItemId::Material(Material::Wheat);
+    let seeds_id = ItemId::Material(Material::WheatSeeds);
+    let bread_id = ItemId::Material(Material::Bread);
+    let chest_id = ItemId::Block(BlockId::Chest);
+    let hoe_id = ItemId::Tool {
+        kind: ToolKind::Hoe,
+        tier: ToolTier::Wood,
+    };
+
+    match demo.stage {
+        ContentStage::Scan => {
+            if demo.candidates.is_empty() {
+                demo.candidates = content_demo_chest_candidates(demo.seed);
+            }
+            if demo.candidates.is_empty() {
+                demo.abort("scan", "no_ruin_chest");
+                return true;
+            }
+            demo.candidate_index = 0;
+            demo.stage = ContentStage::ChestWait;
+            false
+        }
+        ContentStage::ChestWait => {
+            let Some(&candidate) = demo.candidates.get(demo.candidate_index) else {
+                demo.abort("chest", "no_live_loot_chest");
+                return true;
+            };
+            let (chunk, _) = world_to_chunk_and_local(candidate.x, candidate.y, candidate.z);
+            if !session.world.is_resident(chunk) {
+                return false;
+            }
+            content_demo_aim(
+                session,
+                Vec3::new(
+                    candidate.x as f32 + 0.5,
+                    candidate.y as f32 + 3.0,
+                    candidate.z as f32 + 0.5,
+                ),
+                -std::f32::consts::FRAC_PI_2,
+            );
+            if session
+                .world
+                .get_block(candidate.x, candidate.y, candidate.z)
+                == BlockId::LootChest
+            {
+                demo.chest_pos = Some(candidate);
+                demo.stage = ContentStage::Take;
+            } else {
+                demo.candidate_index += 1;
+                if demo.candidate_index >= demo.candidates.len() {
+                    demo.abort("chest", "no_live_loot_chest");
+                    return true;
+                }
+            }
+            false
+        }
+        ContentStage::Take => {
+            let Some(chest) = demo.chest_pos else {
+                demo.abort("take", "no_chest_position");
+                return true;
+            };
+            content_demo_aim(
+                session,
+                Vec3::new(
+                    chest.x as f32 + 0.5,
+                    chest.y as f32 + 3.0,
+                    chest.z as f32 + 0.5,
+                ),
+                -std::f32::consts::FRAC_PI_2,
+            );
+            if !content_demo_edit_ready(session, chest) {
+                return false;
+            }
+            if session.world.get_block(chest.x, chest.y, chest.z) != BlockId::LootChest
+                || !session.open_chest_at(chest)
+            {
+                demo.abort("take", "chest_open_refused");
+                return true;
+            }
+            let Some(loot_stacks) = content_demo_take_all(session) else {
+                demo.abort("take", "take_all_failed");
+                return true;
+            };
+            // A retry after an EditRejected break sees the already-empty
+            // record; keep the stack count the first take actually moved.
+            if loot_stacks > 0 {
+                demo.loot_stacks = loot_stacks;
+            }
+            match break_mined_block(session, chest, BlockId::LootChest) {
+                BreakOutcome::Applied { .. } => {}
+                BreakOutcome::Rejected(BreakRejection::EditRejected) => return false,
+                BreakOutcome::Rejected(reason) => {
+                    demo.abort("take", &format!("break_rejected={reason:?}"));
+                    return true;
+                }
+            }
+            if session.world.get_block(chest.x, chest.y, chest.z) != BlockId::Air {
+                demo.abort("take", "chest_still_present");
+                return true;
+            }
+            if content_demo_count(&session.player, chest_id) != 1 {
+                demo.abort(
+                    "take",
+                    &format!(
+                        "chest_item={} (expected 1)",
+                        content_demo_count(&session.player, chest_id)
+                    ),
+                );
+                return true;
+            }
+            demo.stage = ContentStage::Craft;
+            false
+        }
+        ContentStage::Craft => {
+            let Ok(planks) = Item::new(plank_id, 2) else {
+                demo.abort("craft", "could_not_build_planks");
+                return true;
+            };
+            let Ok(sticks) = Item::new(stick_id, 2) else {
+                demo.abort("craft", "could_not_build_sticks");
+                return true;
+            };
+            if session.player.insert_items(&[planks, sticks]).is_err() {
+                demo.abort("craft", "no_room_for_hoe_ingredients");
+                return true;
+            }
+            let Some(hoe) = content_demo_craft(
+                session,
+                &[(0, plank_id), (1, plank_id), (5, stick_id), (9, stick_id)],
+                RecipeId::WoodHoe,
+            ) else {
+                demo.abort("craft", "wood_hoe_craft_failed");
+                return true;
+            };
+            if hoe.id() != hoe_id || hoe.count() != 1 {
+                demo.abort(
+                    "craft",
+                    &format!("crafted={:?} (expected one wood hoe)", hoe.id()),
+                );
+                return true;
+            }
+            if !content_demo_ensure_selected(&mut session.player, hoe_id) {
+                demo.abort("craft", "could_not_select_hoe");
+                return true;
+            }
+            demo.stage = ContentStage::FarmSearch;
+            false
+        }
+        ContentStage::FarmSearch => {
+            let Some(chest) = demo.chest_pos else {
+                demo.abort("farm", "no_chest_position");
+                return true;
+            };
+            demo.farm_targets = content_demo_find_farm_targets(session, chest, 2);
+            if demo.farm_targets.len() < 2 {
+                demo.abort(
+                    "farm",
+                    &format!("no_grass targets={}", demo.farm_targets.len()),
+                );
+                return true;
+            }
+            demo.farm_index = 0;
+            demo.stage = ContentStage::TillPlant;
+            false
+        }
+        ContentStage::TillPlant => {
+            let Some(&target) = demo.farm_targets.get(demo.farm_index) else {
+                demo.abort("tillplant", "missing_target");
+                return true;
+            };
+            let crop = target + IVec3::Y;
+            if !content_demo_edit_ready(session, target) || !content_demo_edit_ready(session, crop)
+            {
+                return false;
+            }
+            content_demo_aim(
+                session,
+                Vec3::new(
+                    target.x as f32 + 0.5,
+                    target.y as f32 - 1.5,
+                    target.z as f32 + 0.5,
+                ),
+                -std::f32::consts::FRAC_PI_2,
+            );
+            if !content_demo_ensure_selected(&mut session.player, hoe_id) {
+                demo.abort("tillplant", "could_not_select_hoe");
+                return true;
+            }
+            let durability_before = session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability());
+            if session.till_at(target).is_none() {
+                demo.abort("tillplant", "till_refused");
+                return true;
+            }
+            if session.world.get_block(target.x, target.y, target.z) != BlockId::Farmland {
+                demo.abort("tillplant", "till_did_not_produce_farmland");
+                return true;
+            }
+            let durability_after = session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability());
+            let expected_durability = durability_before.and_then(|value| value.checked_sub(1));
+            if durability_before.is_none() || durability_after != expected_durability {
+                demo.abort(
+                    "tillplant",
+                    &format!(
+                        "hoe_durability before={durability_before:?} after={durability_after:?}"
+                    ),
+                );
+                return true;
+            }
+            if !content_demo_ensure_selected(&mut session.player, seeds_id) {
+                demo.abort("tillplant", "could_not_select_seeds");
+                return true;
+            }
+            let seeds_before = content_demo_count(&session.player, seeds_id);
+            if session.plant_wheat_at(crop).is_none() {
+                demo.abort("tillplant", "plant_refused");
+                return true;
+            }
+            if session.world.get_block(crop.x, crop.y, crop.z) != BlockId::WheatStage0 {
+                demo.abort("tillplant", "plant_did_not_produce_stage0");
+                return true;
+            }
+            let seeds_after = content_demo_count(&session.player, seeds_id);
+            if seeds_after.checked_add(1) != Some(seeds_before) {
+                demo.abort(
+                    "tillplant",
+                    &format!("seeds before={seeds_before} after={seeds_after} (expected one seed)"),
+                );
+                return true;
+            }
+            demo.farm_index += 1;
+            if demo.farm_index >= demo.farm_targets.len() {
+                demo.stage = ContentStage::Grow;
+            }
+            false
+        }
+        ContentStage::Grow => {
+            let targets = demo.farm_targets.clone();
+            session.clock = GameClock::from_day_and_time(3, DEFAULT_TIME_OF_DAY);
+            if session.season() != Season::Winter {
+                demo.abort(
+                    "grow",
+                    &format!("season={:?} (expected Winter)", session.season()),
+                );
+                return true;
+            }
+            if !session.tick_crops(0.1, 600.0).is_empty() {
+                demo.abort("grow", "crops_advanced_in_winter");
+                return true;
+            }
+            for target in &targets {
+                let crop = *target + IVec3::Y;
+                if session.world.get_block(crop.x, crop.y, crop.z) != BlockId::WheatStage0 {
+                    demo.abort("grow", "winter_changed_a_stage0_crop");
+                    return true;
+                }
+            }
+            session.clock = GameClock::from_day_and_time(0, DEFAULT_TIME_OF_DAY);
+            if session.season() != Season::Spring {
+                demo.abort(
+                    "grow",
+                    &format!("season={:?} (expected Spring)", session.season()),
+                );
+                return true;
+            }
+            for (expected, name) in [
+                (BlockId::WheatStage1, "stage1"),
+                (BlockId::WheatStage2, "stage2"),
+                (BlockId::WheatStage3, "stage3"),
+            ] {
+                if session.tick_crops(0.1, 600.0).is_empty() {
+                    demo.abort("grow", &format!("no_remesh_at_{name}"));
+                    return true;
+                }
+                for target in &targets {
+                    let crop = *target + IVec3::Y;
+                    let live = session.world.get_block(crop.x, crop.y, crop.z);
+                    if live != expected {
+                        demo.abort(
+                            "grow",
+                            &format!("{name}_block={live:?} (expected {expected:?})"),
+                        );
+                        return true;
+                    }
+                }
+            }
+            demo.stage = ContentStage::Harvest;
+            false
+        }
+        ContentStage::Harvest => {
+            let targets = demo.farm_targets.clone();
+            let wheat_before = content_demo_count(&session.player, wheat_id);
+            let seeds_before = content_demo_count(&session.player, seeds_id);
+            for target in &targets {
+                let crop = *target + IVec3::Y;
+                match break_mined_block(session, crop, BlockId::WheatStage3) {
+                    BreakOutcome::Applied { wear, .. } => {
+                        if wear != ToolWearOutcome::Nothing {
+                            demo.abort("harvest", &format!("wear={wear:?} (expected none)"));
+                            return true;
+                        }
+                    }
+                    BreakOutcome::Rejected(reason) => {
+                        demo.abort("harvest", &format!("break_rejected={reason:?}"));
+                        return true;
+                    }
+                }
+                if session.world.get_block(crop.x, crop.y, crop.z) != BlockId::Air {
+                    demo.abort("harvest", "crop_still_present");
+                    return true;
+                }
+            }
+            let wheat_after = content_demo_count(&session.player, wheat_id);
+            let seeds_after = content_demo_count(&session.player, seeds_id);
+            let wheat_delta = i32::from(wheat_after) - i32::from(wheat_before);
+            let seeds_delta = i32::from(seeds_after) - i32::from(seeds_before);
+            if wheat_delta != 2 || seeds_delta != 4 {
+                demo.abort(
+                    "harvest",
+                    &format!(
+                        "wheat_delta={wheat_delta} seeds_delta={seeds_delta} (expected 2 and 4)"
+                    ),
+                );
+                return true;
+            }
+            demo.stage = ContentStage::Bread;
+            false
+        }
+        ContentStage::Bread => {
+            let Some(bread) = content_demo_craft(
+                session,
+                &[(0, wheat_id), (1, wheat_id), (2, wheat_id)],
+                RecipeId::Bread,
+            ) else {
+                demo.abort("bread", "bread_craft_failed");
+                return true;
+            };
+            if bread.id() != bread_id || bread.count() != 1 {
+                demo.abort(
+                    "bread",
+                    &format!("crafted={:?} (expected one bread)", bread.id()),
+                );
+                return true;
+            }
+            demo.bread_crafted = 1;
+            demo.stage = ContentStage::Place;
+            false
+        }
+        ContentStage::Place => {
+            let Some(&target) = demo.farm_targets.first() else {
+                demo.abort("place", "missing_farm_target");
+                return true;
+            };
+            let dest = target + IVec3::Y;
+            content_demo_aim(
+                session,
+                Vec3::new(
+                    target.x as f32 + 0.5,
+                    target.y as f32 + 3.0,
+                    target.z as f32 + 0.5,
+                ),
+                -std::f32::consts::FRAC_PI_2,
+            );
+            if !content_demo_edit_ready(session, dest) {
+                return false;
+            }
+            if !content_demo_ensure_selected(&mut session.player, chest_id) {
+                demo.abort("place", "could_not_select_chest");
+                return true;
+            }
+            match try_place_selected_block(session) {
+                Some(remeshed) if !remeshed.is_empty() => {}
+                _ => {
+                    demo.abort("place", "place_refused");
+                    return true;
+                }
+            }
+            if session.world.get_block(dest.x, dest.y, dest.z) != BlockId::Chest {
+                demo.abort("place", "chest_not_placed_at_destination");
+                return true;
+            }
+            if !session.open_chest_at(dest) {
+                demo.abort("place", "placed_chest_open_refused");
+                return true;
+            }
+            let Some(bread_slot) = (0..session.player.inventory().slots().len()).find(|&slot| {
+                session.player.inventory().slot(slot).map(|item| item.id()) == Some(bread_id)
+            }) else {
+                demo.abort("place", "bread_slot_missing");
+                return true;
+            };
+            if session.player.click_inventory_slot(bread_slot).is_err()
+                || session.click_open_chest_slot(0).is_err()
+            {
+                demo.abort("place", "bread_transfer_refused");
+                return true;
+            }
+            let stored = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(0))
+                .map(|item| item.id())
+                == Some(bread_id);
+            if !stored || session.player.inventory().cursor().is_some() {
+                demo.abort("place", "bread_not_stored");
+                return true;
+            }
+            demo.chest_dest = Some(dest);
+            demo.stage = ContentStage::Replant;
+            false
+        }
+        ContentStage::Replant => {
+            let Some(&target) = demo.farm_targets.get(1) else {
+                demo.abort("replant", "missing_farm_target");
+                return true;
+            };
+            let crop = target + IVec3::Y;
+            content_demo_aim(
+                session,
+                Vec3::new(
+                    target.x as f32 + 0.5,
+                    target.y as f32 - 1.5,
+                    target.z as f32 + 0.5,
+                ),
+                -std::f32::consts::FRAC_PI_2,
+            );
+            if !content_demo_edit_ready(session, crop) {
+                return false;
+            }
+            if !content_demo_ensure_selected(&mut session.player, seeds_id) {
+                demo.abort("replant", "could_not_select_seeds");
+                return true;
+            }
+            if session.plant_wheat_at(crop).is_none() {
+                demo.abort("replant", "plant_refused");
+                return true;
+            }
+            if session.tick_crops(0.1, 600.0).is_empty() {
+                demo.abort("replant", "no_remesh_after_replant");
+                return true;
+            }
+            let live = session.world.get_block(crop.x, crop.y, crop.z);
+            if live != BlockId::WheatStage1 {
+                demo.abort(
+                    "replant",
+                    &format!("replant_stage={live:?} (expected WheatStage1)"),
+                );
+                return true;
+            }
+            demo.stage = ContentStage::Save;
+            false
+        }
+        ContentStage::Save => {
+            if let Err(err) = save_current_world(session) {
+                demo.abort("save", &format!("save_failed={err}"));
+                return true;
+            }
+            let loaded = match load_world_from_path(&session.save_path) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    demo.abort("save", &format!("load_failed={err}"));
+                    return true;
+                }
+            };
+            if loaded.mode != GameMode::Creative {
+                demo.abort(
+                    "save",
+                    &format!("mode={:?} (expected Creative)", loaded.mode),
+                );
+                return true;
+            }
+            if loaded.player.survival != SurvivalState::full() {
+                demo.abort("save", "loaded vitals are not full");
+                return true;
+            }
+            if loaded.chests.len() != 1 {
+                demo.abort(
+                    "save",
+                    &format!("reload_chests={} (expected 1)", loaded.chests.len()),
+                );
+                return true;
+            }
+            let Some(chest_dest) = demo.chest_dest else {
+                demo.abort("save", "no_chest_destination");
+                return true;
+            };
+            let stored_bread = loaded
+                .chests
+                .get(&chest_dest)
+                .and_then(|chest| chest.slot(0))
+                .map(|item| item.id())
+                == Some(bread_id);
+            if !stored_bread {
+                demo.abort("save", "reloaded chest slot 0 is not bread");
+                return true;
+            }
+            let Some(&replant_target) = demo.farm_targets.get(1) else {
+                demo.abort("save", "missing_replant_target");
+                return true;
+            };
+            let replant_crop = replant_target + IVec3::Y;
+            match content_demo_saved_block(&loaded, replant_crop) {
+                Some(BlockId::WheatStage1) => {}
+                other => {
+                    demo.abort(
+                        "save",
+                        &format!("reload_stage={other:?} (expected WheatStage1)"),
+                    );
+                    return true;
+                }
+            }
+            match content_demo_saved_block(&loaded, chest_dest) {
+                Some(BlockId::Chest) => {}
+                other => {
+                    demo.abort(
+                        "save",
+                        &format!("reload_chest_edit={other:?} (expected Chest)"),
+                    );
+                    return true;
+                }
+            }
+            demo.digest = Some(demo.success_digest());
+            demo.stage = ContentStage::Done;
+            true
+        }
+        ContentStage::Done => true,
+    }
+}
+
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
 /// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
 /// under this; the cap only guarantees bounded memory if a run is left going.
@@ -2030,6 +3864,10 @@ struct GameApp {
     /// frame from the RedrawRequested pass. Any reset boundary below clears it
     /// so a menu/focus/session change never inherits partial progress.
     mining: MiningState,
+    /// Hold-to-eat accumulator (S05): driven once per frame with raw frame
+    /// dt and reset by every left-hold/mining reset boundary so a menu, panel,
+    /// focus loss, or session swap can never resume an invisible meal.
+    eating: EatingState,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -2040,6 +3878,11 @@ struct GameApp {
     /// press. Set only after the screen routing and click-to-grab early
     /// returns, cleared on release, focus loss, and screen/session changes.
     left_mouse_held: bool,
+    /// Whether the right mouse button is physically held after a Survival
+    /// food press. Only eating reads it; it is cleared by the dedicated
+    /// Released Right arm and by every reset boundary that clears the left
+    /// hold.
+    right_mouse_held: bool,
     /// Inventory/crafting screen state (S03-T03): mode + table attachment from
     /// the pure T01 model. Open only while the lifecycle screen is Playing —
     /// the panel is a gameplay surface, not a lifecycle screen.
@@ -2051,6 +3894,18 @@ struct GameApp {
     /// stack from. Cleared by any non-pick press, release, close, and screen
     /// change so a stale origin can never move a later stack.
     inventory_drag: Option<InventoryTarget>,
+    /// Chest screen state (S03-T05): open only while the lifecycle screen is
+    /// Playing. The live station lives in `WorldSession`, so this screen never
+    /// duplicates a chest position.
+    chest: ChestScreen,
+    /// Last chest-click status line, read by the T04 renderer as the footer
+    /// message; `None` until the first click of a session.
+    chest_status: Option<String>,
+    /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
+    /// under the player is reported here while still Playing. Same tick-counter
+    /// pattern as the screen messages, but it renders above the hotbar instead
+    /// of on a menu panel.
+    game_message: Option<MenuMessage>,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -2172,10 +4027,24 @@ struct GameApp {
     /// normal run; a launch flag arms it and the fresh-world branch has already
     /// teleported the player onto the route.
     swim: Option<SwimDemo>,
+    /// Scripted survival-loop seam (`--demo-survival`, S08-T02). `None` for
+    /// every normal run; the launch flag arms it and `step_scripted_demos`
+    /// drives the fall/eat/drown/starve/respawn/save stages on Playing frames.
+    survival_demo: Option<SurvivalDemo>,
+    /// Scripted ruin/farm/chest seam (`--demo-content`, S08-T03). `None` for
+    /// every normal run; the launch flag arms it and `step_scripted_demos`
+    /// drives the content stages on Playing frames.
+    content_demo: Option<ContentDemo>,
     /// Whether a failed demo seam requests a non-zero process status. Set by a
-    /// self-describing swim abort; `main` reads it after the event loop exits
-    /// (the shutdown path itself cannot set a process status).
+    /// self-describing swim or survival abort; `main` reads it after the event
+    /// loop exits (the shutdown path itself cannot set a process status).
     exit_failure: bool,
+    /// True when the launch requested a scripted demo seam (`--demo-swim`,
+    /// `--demo-survival`, or `--demo-content`) — see
+    /// [`scripted_demo_requested`]. The accelerated-demo watch and its
+    /// wall-clock deadline stay disarmed for these runs, so a scripted demo
+    /// owns its own bounded completion even when `--time-scale` is present.
+    scripted_demo: bool,
 }
 
 impl GameApp {
@@ -2239,18 +4108,30 @@ impl GameApp {
         // gameplay directly, bypassing every menu screen (preserving every
         // flagged launch, including both smoke scripts' --new/--seed/--save
         // runs); a bare launch opens the main menu over the loaded world.
-        // Cursor state follows the screen: menu screens start with the
-        // cursor released so they are clickable immediately.
+        // A dead session from such a launch enters the Death screen instead
+        // of a frozen Playing frame (S04-T05); a bare launch still starts on
+        // the main menu, which renders over the dead world until the player
+        // loads it. Cursor state follows the screen: menu screens start with
+        // the cursor released so they are clickable immediately.
         let startup_screen = if cli_has_world_intent(&cli) {
-            LifecycleScreen::Playing
+            if session.is_dead() {
+                LifecycleScreen::Death
+            } else {
+                LifecycleScreen::Playing
+            }
         } else {
             LifecycleScreen::MainMenu
         };
         // Bounded accelerated demo (S02-T04): a direct-launch gameplay run
         // with `--time-scale > 1` carries a wall-clock deadline as a safety
         // net. Menu-first launches stay unbounded until gameplay begins (the
-        // frame-driven cycle watch still completes them).
-        let demo_shutdown_deadline = if startup_screen == LifecycleScreen::Playing {
+        // frame-driven cycle watch still completes them). Scripted demos
+        // (`--demo-swim`/`--demo-survival`/`--demo-content`) keep the whole
+        // accelerated watch disarmed: they own their own bounded completion
+        // and digest, so a combined `--time-scale` must not pre-empt them.
+        let scripted_demo = scripted_demo_requested(&cli);
+        let demo_shutdown_deadline = if !scripted_demo && startup_screen == LifecycleScreen::Playing
+        {
             demo_shutdown_deadline(cli.time_scale, cli.demo_days)
         } else {
             None
@@ -2268,6 +4149,36 @@ impl GameApp {
                 None
             };
             Some(SwimDemo::new(seed, swim_route(seed), deadline))
+        } else {
+            None
+        };
+        // Scripted survival seam (S08-T02): the route is resolved from the
+        // same session seed as the swim, and the wall-clock deadline only
+        // arms for a direct-to-gameplay launch. The stage cursor starts at
+        // Settle; `step_scripted_demos` owns every later transition.
+        let survival_demo = if cli.demo_survival {
+            let seed = session.world.seed();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(SURVIVAL_DEMO_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(SurvivalDemo::new(seed, swim_route(seed), deadline))
+        } else {
+            None
+        };
+        // Scripted content seam (S08-T03): the ruin chain is a property of
+        // the session seed, and the wall-clock deadline only arms for a
+        // direct-to-gameplay launch. The stage cursor starts at Scan;
+        // `step_scripted_demos` owns every later transition.
+        let content_demo = if cli.demo_content {
+            let seed = session.world.seed();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(CONTENT_DEMO_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(ContentDemo::new(seed, deadline))
         } else {
             None
         };
@@ -2312,11 +4223,16 @@ impl GameApp {
             input: InputState::default(),
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
+            eating: EatingState::new(),
             audio,
             left_mouse_held: false,
+            right_mouse_held: false,
             inventory: InventoryScreen::new(),
             inventory_status: None,
             inventory_drag: None,
+            chest: ChestScreen::new(),
+            chest_status: None,
+            game_message: None,
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -2348,7 +4264,10 @@ impl GameApp {
             frame_budget: FrameBudgetSampler::new(),
             demo_seam_ran: false,
             swim,
+            survival_demo,
+            content_demo,
             exit_failure: false,
+            scripted_demo,
         }
     }
 
@@ -2557,13 +4476,20 @@ impl GameApp {
         }
         self.input.reset();
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
-        // The inventory panel is a Playing-only surface. Any lifecycle screen
-        // entry drops it (with its transient drag/status) so a stale panel can
-        // never keep absorbing clicks meant for a menu.
+        self.eating.reset();
+        // The inventory and chest screens are Playing-only surfaces. Any
+        // lifecycle screen entry drops them (with their transient drag/status)
+        // and closes the ephemeral chest station so no stale panel can keep
+        // absorbing clicks meant for a menu.
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        self.chest.close();
+        self.chest_status = None;
+        self.game_message = None;
+        self.session.close_chest();
         self.cursor_grabbed = false;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, false);
@@ -2597,7 +4523,9 @@ impl GameApp {
         // Defensive: a hold or partial progress must never survive a trip
         // through a menu and back into gameplay.
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
+        self.eating.reset();
         self.pause_message = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
@@ -2607,6 +4535,84 @@ impl GameApp {
             self.menu.close();
         }
         self.lifecycle = LifecycleState::from_screen(LifecycleScreen::Playing);
+    }
+
+    /// Enter gameplay when the session is alive, or the Death screen when its
+    /// health is already zero. Every menu gameplay entry path (Play on a
+    /// load row, Create on the new-game screen) funnels through here so a
+    /// health-0 save can never resume a frozen dead player.
+    fn enter_gameplay_or_death(&mut self) {
+        if self.session.is_dead() {
+            self.enter_screen(LifecycleScreen::Death);
+        } else {
+            self.enter_playing();
+        }
+    }
+
+    /// Drive every armed scripted demo through one `about_to_wait` turn.
+    ///
+    /// Called before the death transition: the starvation stage respawns in
+    /// the same step, so `enter_death_if_dead` sees full health rather than a
+    /// stale zero-health frame and never flashes the Death screen. An armed
+    /// demo on a non-Playing screen aborts with a self-describing digest
+    /// instead of waiting forever on frames that will never arrive (a
+    /// menu-first `--demo-survival` launch, or a demo that lost the screen to
+    /// death).
+    fn step_scripted_demos(&mut self) {
+        if self.demo_finished {
+            return;
+        }
+        let screen = self.lifecycle.screen();
+        let playing = screen == LifecycleScreen::Playing;
+        let mut finished = false;
+
+        if let Some(demo) = self.survival_demo.as_mut() {
+            let ended = if playing {
+                survival_demo_step(demo, &mut self.session)
+            } else {
+                demo.abort("screen", &format!("screen={screen:?}"));
+                true
+            };
+            finished |= ended;
+        }
+        if let Some(demo) = self.content_demo.as_mut() {
+            let ended = if playing {
+                content_demo_step(demo, &mut self.session)
+            } else {
+                demo.abort("screen", &format!("screen={screen:?}"));
+                true
+            };
+            finished |= ended;
+        }
+
+        if finished {
+            self.demo_seam_ran = true;
+            self.demo_finished = true;
+            let survival_failed = self
+                .survival_demo
+                .as_ref()
+                .map(|demo| demo.failed)
+                .unwrap_or(false);
+            let content_failed = self
+                .content_demo
+                .as_ref()
+                .map(|demo| demo.failed)
+                .unwrap_or(false);
+            self.exit_failure |= survival_failed || content_failed;
+        }
+    }
+
+    /// Transition a live Playing session into Death once its health reaches
+    /// zero. Returns true only on the transition and is idempotent once the
+    /// screen is Death. Called from `about_to_wait`, outside the
+    /// RedrawRequested region that holds disjoint `gpu`/`window` borrows, so
+    /// the whole-`self` `enter_screen` call is legal (P005).
+    fn enter_death_if_dead(&mut self) -> bool {
+        if self.lifecycle.screen() != LifecycleScreen::Playing || !self.session.is_dead() {
+            return false;
+        }
+        self.enter_screen(LifecycleScreen::Death);
+        true
     }
 
     /// Swap in a new world session atomically — the ONE boundary a world
@@ -2653,18 +4659,27 @@ impl GameApp {
         }
         self.input.reset();
         self.left_mouse_held = false;
+        self.right_mouse_held = false;
         self.mining.reset();
+        self.eating.reset();
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
+        self.chest.close();
+        self.chest_status = None;
+        self.game_message = None;
+        self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
         self.demo_seam_ran = false;
-        // The scripted swim belongs to the LAUNCH (the fresh-world startup
-        // branch that teleported the player), never to a session created from
-        // the menu: swapping worlds retires the seam with the old world.
+        // The scripted swim and survival seams belong to the LAUNCH (the
+        // fresh-world startup branch that teleported the player), never to a
+        // session created from the menu: swapping worlds retires them with
+        // the old world.
         self.swim = None;
+        self.survival_demo = None;
+        self.content_demo = None;
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -2721,6 +4736,12 @@ impl GameApp {
                 self.background.clock,
             )
         };
+        // Edit Background always runs Creative movement rules over the live
+        // player, while `save_mode` keeps the world's stored mode intact. The
+        // call must happen after either branch (a loaded Survival world starts
+        // with Survival rules) and before settings application, so the editor
+        // is uniformly Creative without rewriting the file on save.
+        session.use_creative_rules();
         // Settings win over any stored render distance/FOV, exactly like every
         // other session installation (GameApp::new / start_world_session).
         session.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
@@ -2774,6 +4795,14 @@ impl GameApp {
         match decision {
             LifecycleDecision::Navigate(screen) => self.enter_screen(screen),
             LifecycleDecision::ResumeGame => self.enter_playing(),
+            LifecycleDecision::Respawn => {
+                // The death screen's only resumable action: restore the
+                // deterministic spawn and full vitals, then return to
+                // gameplay. The inventory and selected slot are preserved by
+                // `WorldSession::respawn` by design.
+                self.session.respawn();
+                self.enter_playing();
+            }
             LifecycleDecision::StartNewGame
             | LifecycleDecision::LoadWorld
             | LifecycleDecision::EditBackground => {}
@@ -3005,10 +5034,15 @@ impl GameApp {
                 return;
             }
         };
-        // The New Game row owns the season length (S02-T04): the screen's
-        // cycler value, defaulting to one game day per season.
-        let session =
-            WorldSession::new_session(seed, save_path, self.new_game.season_length_days());
+        // The New Game row owns the season length (S02-T04) and the game mode
+        // (S08-T01 T05): the screen's cycler values, defaulting to one game
+        // day per season and Survival.
+        let session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            self.new_game.season_length_days(),
+            self.new_game.mode(),
+        );
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
         if let Ok(LifecycleDecision::StartNewGame) = self
@@ -3016,7 +5050,7 @@ impl GameApp {
             .dispatch(LifecycleIntent::NewGame(NewGameIntent::Create))
         {
             self.start_world_session(session);
-            self.enter_playing();
+            self.enter_gameplay_or_death();
         }
     }
 
@@ -3078,7 +5112,7 @@ impl GameApp {
             .dispatch(LifecycleIntent::LoadGame(LoadGameIntent::Load))
         {
             self.start_world_session(session);
-            self.enter_playing();
+            self.enter_gameplay_or_death();
         }
     }
 
@@ -3138,6 +5172,19 @@ impl GameApp {
                 self.dispatch_screen_intent(event_loop, intent);
                 self.audio.play(SoundSlot::UiClick, self.settings.volume);
             }
+            LifecycleScreen::Death => {
+                // Click-only screen: the player must choose a row. A miss
+                // (including the title line) is a silent no-op.
+                let Some(row) = hovered_death_row(cursor, surface_w, surface_h) else {
+                    return;
+                };
+                let intent = match row {
+                    DeathRow::Respawn => LifecycleIntent::Death(DeathIntent::Respawn),
+                    DeathRow::Quit => LifecycleIntent::Death(DeathIntent::Quit),
+                };
+                self.dispatch_screen_intent(event_loop, intent);
+                self.audio.play(SoundSlot::UiClick, self.settings.volume);
+            }
             LifecycleScreen::NewGame => {
                 let Some(target) = hovered_new_game_target(cursor, surface_w, surface_h) else {
                     return;
@@ -3154,6 +5201,12 @@ impl GameApp {
                     // event), so the click sound below still plays.
                     NewGameTarget::SeasonLength => {
                         self.new_game.cycle_season_length();
+                    }
+                    // Game-mode cycler row: Survival ↔ Creative. Click-only
+                    // like the field rows (one writer per event), so the click
+                    // sound below still plays.
+                    NewGameTarget::GameMode => {
+                        self.new_game.cycle_mode();
                     }
                     NewGameTarget::Create => self.attempt_create(),
                     NewGameTarget::Back => {
@@ -3287,6 +5340,17 @@ impl ApplicationHandler for GameApp {
                 )
             })
             .collect();
+        // Chest panel labels (S03-T05): same overlay type and metrics, sized
+        // once to the pure chest label bound.
+        let chest_labels = (0..MAX_CHEST_LABELS)
+            .map(|_| {
+                StatsOverlay::with_metrics(
+                    &mut ui.font_system,
+                    HOTBAR_COUNT_FONT_SIZE,
+                    HOTBAR_COUNT_LINE_HEIGHT,
+                )
+            })
+            .collect();
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -3321,6 +5385,7 @@ impl ApplicationHandler for GameApp {
             load_delete_text,
             hotbar_counts,
             inventory_labels,
+            chest_labels,
         });
     }
 
@@ -3349,7 +5414,9 @@ impl ApplicationHandler for GameApp {
             WindowEvent::Focused(false) => {
                 self.input.reset();
                 self.left_mouse_held = false;
+                self.right_mouse_held = false;
                 self.mining.reset();
+                self.eating.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -3474,8 +5541,35 @@ impl ApplicationHandler for GameApp {
                                 &mut self.session,
                                 &mut self.input,
                                 &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
                                 &mut self.inventory_drag,
                                 &mut self.mining,
+                                &mut self.eating,
+                                &mut self.cursor_grabbed,
+                                window,
+                            );
+                        }
+                        return;
+                    }
+
+                    // Chest panel owns the keyboard while open (S03-T05):
+                    // every key and release is consumed, so E can never open
+                    // the inventory, a digit cannot select a hotbar slot, and
+                    // Escape cannot pause through the chest. E and Escape close
+                    // it.
+                    if self.chest.is_open() {
+                        if pressed
+                            && !event.repeat
+                            && matches!(code, KeyCode::KeyE | KeyCode::Escape)
+                        {
+                            close_chest_screen(
+                                &mut self.chest,
+                                &mut self.session,
+                                &mut self.input,
+                                &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
+                                &mut self.mining,
+                                &mut self.eating,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -3495,15 +5589,20 @@ impl ApplicationHandler for GameApp {
                                 false,
                                 &mut self.input,
                                 &mut self.left_mouse_held,
+                                &mut self.right_mouse_held,
                                 &mut self.inventory_drag,
                                 &mut self.mining,
+                                &mut self.eating,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
                         }
                         KeyCode::KeyF if pressed && !event.repeat => {
-                            self.session.player.fly_mode = !self.session.player.fly_mode;
-                            self.session.player.velocity = Vec3::ZERO;
+                            // Flight is a Creative capability: `toggle_fly` is a
+                            // no-op in Survival (and zeroes velocity when it
+                            // flips), so this one call keeps the F key honest
+                            // for both modes instead of flipping the raw flag.
+                            self.session.player.toggle_fly();
                         }
                         KeyCode::F5 if pressed && !event.repeat => {
                             if save_current_world(&mut self.session).is_ok() {
@@ -3571,10 +5670,13 @@ impl ApplicationHandler for GameApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Route-before-gameplay: while a screen is open the wheel is
                 // consumed — the hotbar is gameplay state and no screen has
-                // a scroll action in this slice. The inventory panel consumes
-                // it for the same reason (S03-T03): no hotbar selection may
-                // change from inside the panel.
-                if self.lifecycle.screen() != LifecycleScreen::Playing || self.inventory.is_open() {
+                // a scroll action in this slice. Both gameplay panels consume
+                // it for the same reason (S03-T03/T05): no hotbar selection may
+                // change from inside a panel.
+                if self.lifecycle.screen() != LifecycleScreen::Playing
+                    || self.inventory.is_open()
+                    || self.chest.is_open()
+                {
                     return;
                 }
                 let step: isize = match delta {
@@ -3621,7 +5723,9 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some("Crafting Table closed".to_string());
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -3644,14 +5748,57 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some(inventory_status_text(result));
                     }
                     self.left_mouse_held = false;
+                    self.right_mouse_held = false;
                     self.mining.reset();
+                    self.eating.reset();
+                    return;
+                }
+                // Chest panel (S03-T05): a release never transfers a stack
+                // (chest clicks are whole-stack on press), but it must still
+                // be revalidated, clear the hold/partial mining progress, and
+                // be consumed instead of reaching gameplay.
+                if self.chest.is_open() {
+                    let open_chest = self.session.sync_open_chest();
+                    if chest_should_close(&self.chest, open_chest) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.right_mouse_held = false;
+                        self.eating.reset();
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                    }
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
                     return;
                 }
                 // A release can arrive while a menu owns the input, so this
                 // arm deliberately bypasses the screen routing: clearing the
                 // hold and any partial progress is always safe.
                 self.left_mouse_held = false;
+                self.right_mouse_held = false;
                 self.mining.reset();
+                self.eating.reset();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Right,
+                ..
+            } => {
+                // A release can arrive while a menu owns the input, so this
+                // arm deliberately bypasses the screen routing (exactly like
+                // the Left release arm): clearing the right hold and any
+                // partial meal progress is always safe. It is a dedicated arm
+                // so no generic Released branch can swallow the button.
+                self.right_mouse_held = false;
+                self.eating.reset();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -3738,7 +5885,9 @@ impl ApplicationHandler for GameApp {
                         self.inventory_status = Some("Crafting Table closed".to_string());
                         self.inventory_drag = None;
                         self.left_mouse_held = false;
+                        self.right_mouse_held = false;
                         self.mining.reset();
+                        self.eating.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -3801,6 +5950,51 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
 
+                // Chest panel (S03-T05): while open it owns every press.
+                // Left routes exactly one whole-stack command through the
+                // station-aware session (chest slots) or the shared inventory
+                // façade (player slots); right is inert. Returning here keeps
+                // the click away from the re-grab branch, station targeting,
+                // placement, and hold-to-mine arming. The station is synced
+                // first so a between-redraw invalidation closes the screen
+                // before a command can hit a stale 27-slot view.
+                if self.chest.is_open() {
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    let open_chest = self.session.sync_open_chest();
+                    if chest_should_close(&self.chest, open_chest) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.right_mouse_held = false;
+                        self.mining.reset();
+                        self.eating.reset();
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                        return;
+                    }
+                    if button == MouseButton::Left {
+                        let layout = chest_layout(surface_w, surface_h);
+                        let target = self
+                            .cursor_pos
+                            .and_then(|cursor| chest_hit_test(&self.chest, &layout, cursor));
+                        if let Some(target) = target {
+                            let result = apply_chest_click(&mut self.session, target);
+                            self.chest_status = Some(chest_status_text(result));
+                        }
+                    }
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    return;
+                }
+
                 if !self.cursor_grabbed {
                     self.cursor_grabbed = true;
                     set_cursor_grab(window, true);
@@ -3824,11 +6018,13 @@ impl ApplicationHandler for GameApp {
                         // and missing targets fall through to the existing
                         // instant placement path.
                         match right_click_interaction(&mut self.session) {
-                            RightClickOutcome::Placed(remeshed) => {
-                                // Placement applied: one thump at the current
-                                // volume. A rejected placement stays silent.
-                                // Field-disjoint from the live `gpu` borrow
-                                // (P005).
+                            RightClickOutcome::Tilled(remeshed)
+                            | RightClickOutcome::Planted(remeshed)
+                            | RightClickOutcome::Placed(remeshed) => {
+                                // A world edit applied (placement, tilling, or
+                                // planting): one thump at the current volume.
+                                // A refusal stays silent. Field-disjoint from
+                                // the live `gpu` borrow (P005).
                                 self.audio.play(SoundSlot::Place, self.settings.volume);
                                 for (cpos, mesh) in remeshed {
                                     gpu.render_store.upload_mesh(
@@ -3838,6 +6034,26 @@ impl ApplicationHandler for GameApp {
                                         &mesh,
                                     );
                                 }
+                            }
+                            RightClickOutcome::ChestOpened(_pos) => {
+                                // A successful chest interaction opens the pure
+                                // chest screen attached to the live station
+                                // (S03-T05). The helper defensively closes the
+                                // inventory panel and crafting station first.
+                                open_chest_screen(
+                                    &mut self.chest,
+                                    &mut self.session,
+                                    &mut self.inventory,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
+                                    &mut self.inventory_drag,
+                                    &mut self.mining,
+                                    &mut self.eating,
+                                    &mut self.cursor_grabbed,
+                                    &mut self.chest_status,
+                                    window,
+                                );
                             }
                             RightClickOutcome::TableOpened => {
                                 // A successful table interaction opens the
@@ -3850,11 +6066,32 @@ impl ApplicationHandler for GameApp {
                                     true,
                                     &mut self.input,
                                     &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
                                     &mut self.inventory_drag,
                                     &mut self.mining,
+                                    &mut self.eating,
                                     &mut self.cursor_grabbed,
                                     window,
                                 );
+                            }
+                            RightClickOutcome::EatingStarted => {
+                                // The press only arms the hold. Progress and
+                                // the exactly-once consumption happen on the
+                                // redraw ticks, so a press can never eat a
+                                // whole stack and an immediate release
+                                // consumes nothing. No audio (D006).
+                                self.right_mouse_held = true;
+                            }
+                            refusal @ RightClickOutcome::EatingRefused => {
+                                // Full hunger is the only refusal a player
+                                // cannot infer from the world, so it owns the
+                                // transient notice above the hotbar.
+                                if let Some(text) = right_click_notice(&refusal) {
+                                    self.game_message = Some(MenuMessage {
+                                        text: text.to_string(),
+                                        ticks_left: menu::MESSAGE_TICKS,
+                                    });
+                                }
                             }
                             RightClickOutcome::Nothing => {}
                         }
@@ -3881,12 +6118,14 @@ impl ApplicationHandler for GameApp {
                         || self.load_message.is_some()
                         || self.main_menu_message.is_some()
                         || self.pause_message.is_some()
+                        || self.game_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
                         tick_transient_message(&mut self.load_message);
                         tick_transient_message(&mut self.main_menu_message);
                         tick_transient_message(&mut self.pause_message);
+                        tick_transient_message(&mut self.game_message);
                     }
                 }
 
@@ -3900,12 +6139,13 @@ impl ApplicationHandler for GameApp {
                 // real gameplay work; the digest is printed once on demo
                 // shutdown (see `about_to_wait`).
                 sample_frame_budget(&mut self.frame_budget, playing, frame_dt);
-                // Gameplay vs. world-liveness (S03-T03): the inventory panel
-                // freezes player movement, camera aim, the target raycast, and
-                // hold-to-mine, but NOT the world: time, table revalidation,
-                // streaming, and saves keep running so a panel opened next to a
-                // table cannot freeze the chunk pipeline.
-                let gameplay = playing && !self.inventory.is_open();
+                // Gameplay vs. world-liveness (S03-T03/T05): either gameplay
+                // panel freezes player movement, camera aim, the target
+                // raycast, and hold-to-mine, but NOT the world: time, station
+                // revalidation, streaming, and saves keep running so a panel
+                // opened next to a station cannot freeze the chunk pipeline.
+                let gameplay =
+                    gameplay_surface(playing, self.inventory.is_open(), self.chest.is_open());
                 // Game time (S02-T04): advance only on Playing frames, before
                 // the player update, with the app-owned acceleration scale.
                 // The same two lines as `GameApp::tick_clock` (which the
@@ -3921,8 +6161,9 @@ impl ApplicationHandler for GameApp {
                 // inferring it from an external timeout kill. The exit itself
                 // is deferred to `about_to_wait` because `gpu`/`window`
                 // borrows span this region; only plain fields are touched
-                // here.
-                if !self.demo_finished {
+                // here. A scripted demo run skips the watch entirely: its own
+                // bounded state machine owns completion and digest output.
+                if !self.demo_finished && !self.scripted_demo {
                     let finished = observe_demo_cycle(
                         &mut self.demo_cycle,
                         self.time_scale,
@@ -3944,7 +6185,13 @@ impl ApplicationHandler for GameApp {
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
                 if playing {
-                    if gameplay {
+                    // Spawn gate (S04-T07): a fresh Survival session holds the
+                    // whole gameplay movement block until the feet and support
+                    // chunks are resident, so the body cannot fall through
+                    // unloaded Air. Creative and restored sessions are never
+                    // gated (`settle_spawn` answers true immediately).
+                    let spawn_ready = self.session.settle_spawn();
+                    if gameplay && spawn_ready {
                         // Scripted swim seam (S08-T02): while armed it feeds a
                         // constructed `InputState` copy through the SAME
                         // `Player::update` call the real input path uses.
@@ -3970,11 +6217,58 @@ impl ApplicationHandler for GameApp {
                         self.session.camera.yaw = self.session.player.yaw;
                         self.session.camera.pitch = self.session.player.pitch;
                     }
-                    // Open-table state is a world fact (S02-T02): close the
-                    // station as soon as its block is removed/replaced or
-                    // the player steps out of reach. One bounded lookup per
-                    // playing frame, never a scan.
+                    // Survival tick (S04-T07): runs on every Playing frame,
+                    // including frames where gameplay is frozen by an open
+                    // inventory/chest panel — hunger, air, and regeneration
+                    // are game-time rules, not input. The one-shot fall
+                    // distance latched by `Player::update` above is consumed
+                    // exactly once inside the session.
+                    let head_submerged =
+                        eye_is_submerged(&self.session.world, self.session.camera.position);
+                    self.session
+                        .tick_survival(dt, self.time_scale, head_submerged);
+                    // Crop growth (S07-T04): wheat advances on every Playing
+                    // frame, including panel frames where gameplay is false,
+                    // because growth is a game-time rule like hunger. The
+                    // session clamps/scales dt, pauses in Winter, skips
+                    // non-resident crops, and re-checks each live stage before
+                    // applying it; only proven advances return mesh work to
+                    // upload.
+                    for (cpos, mesh) in self.session.tick_crops(dt, self.time_scale) {
+                        gpu.render_store.upload_mesh(
+                            &gpu.ctx.device,
+                            &gpu.renderer.chunk_bind_group_layout,
+                            cpos,
+                            &mesh,
+                        );
+                    }
+                    // Open-station state is a world fact (S02-T02/S03-T03):
+                    // close a station as soon as its block is removed/replaced
+                    // or the player steps out of reach. One bounded lookup per
+                    // station per playing frame, never a scan.
                     self.session.sync_open_table();
+                    self.session.sync_open_chest();
+                    // Hold-to-eat (S05-T03): raw frame dt, never
+                    // `dt * time_scale` — eating is real time exactly like
+                    // mining (D013). The candidate is structurally `None` on
+                    // panel frames (gameplay false), a released hold, a dead
+                    // player, movement, a non-Survival mode, or a non-food
+                    // selection, so progress can never survive its cancel
+                    // condition. `EatingTick::Ate` is the only consumption
+                    // site: the pure state resets before returning, and
+                    // `eat_selected` consumes exactly one item after its own
+                    // fail-closed guards.
+                    let eating_target = eating_candidate(
+                        &self.session,
+                        &self.input,
+                        self.right_mouse_held,
+                        gameplay,
+                        self.cursor_grabbed,
+                    );
+                    if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
+                    {
+                        self.session.player.eat_selected(slot, item);
+                    }
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -3984,6 +6278,25 @@ impl ApplicationHandler for GameApp {
                         self.session.close_table();
                         self.inventory_drag = None;
                         self.inventory_status = Some("Crafting Table closed".to_string());
+                        self.cursor_grabbed = true;
+                        set_cursor_grab(window, true);
+                    }
+                    // Chest-loss close (S03-T05): same rule for the 27-slot
+                    // station, with a transient notice so the player sees why
+                    // the screen vanished instead of a silent close.
+                    if chest_should_close(&self.chest, self.session.open_chest_position()) {
+                        self.chest.close();
+                        self.session.close_chest();
+                        self.chest_status = None;
+                        self.inventory_drag = None;
+                        self.left_mouse_held = false;
+                        self.right_mouse_held = false;
+                        self.mining.reset();
+                        self.eating.reset();
+                        self.game_message = Some(MenuMessage {
+                            text: "Chest closed".to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                     }
@@ -4116,8 +6429,18 @@ impl ApplicationHandler for GameApp {
                             target_block = None;
                         }
                         // A rejected break edited nothing, so the block is
-                        // still there and the wireframe stays truthful.
-                        BreakOutcome::Rejected(_) => {}
+                        // still there and the wireframe stays truthful. The
+                        // one rejection the player cannot infer visually (a
+                        // full inventory refusing a chest break) posts a
+                        // readable transient notice above the hotbar.
+                        BreakOutcome::Rejected(rejection) => {
+                            if let Some(text) = break_rejection_notice(rejection) {
+                                self.game_message = Some(MenuMessage {
+                                    text: text.to_string(),
+                                    ticks_left: menu::MESSAGE_TICKS,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -4303,13 +6626,49 @@ impl ApplicationHandler for GameApp {
                             Some(gpu.load_delete_text.text_area(delete_x, play_y));
                     }
                 }
+                // Gameplay transient notice (S03-T05): a station that vanished
+                // under the player while Playing is reported above the hotbar
+                // through the existing menu text buffer and the same UI pass —
+                // no new pipeline and no logging (D006/MEM009).
+                if active_screen == LifecycleScreen::Playing {
+                    if let Some(message) = self.game_message.as_ref() {
+                        let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        gpu.menu_text.update(
+                            &mut gpu.ui.font_system,
+                            surface_w as f32,
+                            surface_h as f32,
+                            &message.text,
+                        );
+                        let measured = gpu.menu_text.measured_width();
+                        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, measured);
+                        quads.push(Quad {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color: [0.0, 0.0, 0.0, 0.7],
+                        });
+                        menu_text_area = Some(gpu.menu_text.text_area(x + 8.0, y + 4.0));
+                    }
+                }
                 if playing {
-                    if let Some(progress) = self.mining.progress() {
-                        quads.extend(mining_progress_quads(
-                            progress,
-                            gpu.ctx.config.width,
-                            gpu.ctx.config.height,
-                        ));
+                    // Vitals HUD (S04-T06): pure hearts/hunger/air quads drawn
+                    // above the hotbar only on Playing frames — including while
+                    // the inventory or chest panel is open, since both panels
+                    // are appended later and therefore draw above them. Creative
+                    // returns an empty Vec, so the HUD is structurally absent.
+                    quads.extend(playing_hud_quads(
+                        &self.session,
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ));
+                    if let Some(bar) = frame_progress_bar(
+                        self.eating.progress(),
+                        self.mining.progress(),
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ) {
+                        quads.extend(bar);
                     }
                 }
                 // Inventory/crafting panel (S03-T04): extend the same CPU quad
@@ -4328,6 +6687,26 @@ impl ApplicationHandler for GameApp {
                         self.session.player.inventory(),
                         self.session.player.player_grid(),
                         self.session.player.table_grid(),
+                        self.session.player.inventory().cursor(),
+                        self.cursor_pos,
+                    ));
+                    Some(layout)
+                } else {
+                    None
+                };
+                // Chest panel (S03-T05): extend the same CPU quad list, after
+                // the inventory panel and before the single `set_quads`
+                // upload, so the 27+36 grid draws above the world and HUD with
+                // no new pipeline. Geometry comes only from the pure T04
+                // module; a closed screen extends nothing and a missing record
+                // renders as empty slots.
+                let chest_layout_value = if self.chest.is_open() {
+                    let layout = chest_layout(gpu.ctx.config.width, gpu.ctx.config.height);
+                    quads.extend(chest_screen_quads(
+                        &self.chest,
+                        &layout,
+                        self.session.open_chest_contents(),
+                        self.session.player.inventory(),
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                     ));
@@ -4388,6 +6767,27 @@ impl ApplicationHandler for GameApp {
                     );
                 }
 
+                // Chest panel labels (S03-T05): same two-pass borrow pattern,
+                // bounded by the pure `MAX_CHEST_LABELS` and the pool length.
+                let chest_panel_labels = match chest_layout_value {
+                    Some(layout) => chest_screen_labels(
+                        &self.chest,
+                        &layout,
+                        self.session.open_chest_contents(),
+                        self.session.player.inventory(),
+                        self.chest_status.as_deref(),
+                    ),
+                    None => Vec::new(),
+                };
+                for (buffer, label) in gpu.chest_labels.iter_mut().zip(chest_panel_labels.iter()) {
+                    buffer.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &label.text,
+                    );
+                }
+
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
                 // (the crate is log-free by convention). The menu's text
@@ -4431,6 +6831,11 @@ impl ApplicationHandler for GameApp {
                     .iter()
                     .zip(inventory_panel_labels.iter())
                 {
+                    areas.push(buffer.text_area(label.left, label.top));
+                }
+                // Chest panel labels ride the same UI pass above the HUD.
+                debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
+                for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
                     areas.push(buffer.text_area(label.left, label.top));
                 }
                 let prepare_ok = gpu
@@ -4640,6 +7045,20 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Scripted demo seams (S08-T02): drive the survival state machine
+        // before the death transition so its starvation stage can respawn in
+        // the same step and never flashes a stale Death screen. The wrapper
+        // also latches `demo_finished` for the bounded shutdown below.
+        self.step_scripted_demos();
+
+        // Mid-game death transition (S04-T05): the Playing frame loop keeps
+        // rendering the frozen session after a lethal tick, and this is the
+        // non-render region that can call the whole-`self` screen transition
+        // (P005). `enter_screen` already drops input/mining, closes the
+        // inventory/chest panels, and releases the cursor; the call is
+        // idempotent once the screen is Death.
+        self.enter_death_if_dead();
+
         // Scripted swim wall-clock safety net (S08-T02): armed only for a
         // direct-to-gameplay `--demo-swim` launch and deliberately independent
         // of `time_scale` (the swim runs at the default scale so no seasonal
@@ -4686,6 +7105,20 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             if let Some(line) = self.swim.as_ref().and_then(|demo| demo.digest.as_deref()) {
+                let _ = writeln!(stdout, "{line}");
+            }
+            if let Some(line) = self
+                .survival_demo
+                .as_ref()
+                .and_then(|demo| demo.digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            if let Some(line) = self
+                .content_demo
+                .as_ref()
+                .and_then(|demo| demo.digest.as_deref())
+            {
                 let _ = writeln!(stdout, "{line}");
             }
             drop(stdout);
@@ -4761,18 +7194,19 @@ fn main() {
 mod tests {
     use super::*;
     use opencraft::player::inventory::{
-        CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack,
-        HOTBAR_SLOTS,
+        CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
+        RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
-    use opencraft::world::chunk::{Chunk, ChunkPos};
+    use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
     use opencraft::world::season::Season;
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
     use opencraft::player::camera::Camera;
+    use opencraft::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
     use opencraft::world::persistence::ChunkEditMap;
     use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -5090,6 +7524,14 @@ mod tests {
             "--time-scale",
             "60"
         ])));
+        // Mode flags are fresh-world parameters too, NOT a world intent: a
+        // bare `--creative` or `--survival` still opens the main menu.
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--creative"
+        ])));
+        assert!(!cli_has_world_intent(&CliConfig::parse_args([
+            "--survival"
+        ])));
         let scaled = GameApp::new(
             CliConfig::parse_args(["--time-scale", "60"]),
             WorldSession::new_session(9, PathBuf::from("unused.mcvx"), DEFAULT_SEASON_LENGTH_DAYS),
@@ -5114,6 +7556,133 @@ mod tests {
             "--save",
             "custom.mcvx"
         ])));
+    }
+
+    #[test]
+    fn scripted_demo_flags_are_launch_switches_and_never_world_intents() {
+        // Each new scripted-demo flag alone is NOT a world intent: a bare
+        // launch plus the flag still opens the main menu, exactly like a bare
+        // launch. (The effect belongs to the fresh startup branch only.)
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            let cli = CliConfig::parse_args([flag]);
+            assert!(
+                !cli_has_world_intent(&cli),
+                "{flag} alone must not bypass the menus"
+            );
+            assert_eq!(cli_has_world_intent(&cli), cli_has_world_intent(&bare));
+        }
+
+        // Combined with a real world flag the intent is unchanged (the world
+        // flag is still what grants direct gameplay entry).
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            let with_new = CliConfig::parse_args(["--new", flag]);
+            assert!(
+                cli_has_world_intent(&with_new),
+                "{flag} + --new keeps intent"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_demo_requested_suppresses_the_accelerated_watch() {
+        // Neither a bare launch nor a pure `--time-scale` run is scripted: the
+        // accelerated watch stays armed for those (the long-standing demo).
+        assert!(!scripted_demo_requested(&CliConfig::parse_args(Vec::<
+            String,
+        >::new(
+        ))));
+        assert!(!scripted_demo_requested(&CliConfig::parse_args([
+            "--time-scale",
+            "60"
+        ])));
+        assert!(!scripted_demo_requested(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--time-scale",
+            "60"
+        ])));
+
+        // Each scripted flag requests the suppression, with or without an
+        // accelerated scale on the same command line.
+        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+            assert!(
+                scripted_demo_requested(&CliConfig::parse_args([flag])),
+                "{flag} must suppress the accelerated watch"
+            );
+            assert!(
+                scripted_demo_requested(&CliConfig::parse_args([flag, "--time-scale", "60"])),
+                "{flag} must stay scripted even with an accelerated scale"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_demo_arming_disarms_the_accelerated_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("scripted.mcvx");
+        let settings_path = dir.path().join("settings.toml");
+        let background_path = dir.path().join("background/background.mcvx");
+        let save = save_path.to_str().expect("utf8 path");
+
+        // Scripted launch carrying an accelerated scale: the scripted flag
+        // wins and no accelerated wall-clock deadline arms.
+        let scripted_cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-content",
+            "--time-scale",
+            "60",
+            "--save",
+            save,
+        ]);
+        let scripted = GameApp::new_with_paths(
+            scripted_cli,
+            WorldSession::new_session(1, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+            settings_path.clone(),
+            background_path.clone(),
+        );
+        assert!(scripted.scripted_demo);
+        assert!(
+            scripted.demo_shutdown_deadline.is_none(),
+            "a scripted demo must own its own bounded completion"
+        );
+        assert_eq!(scripted.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // The same launch without the scripted flag keeps the accelerated
+        // deadline: the suppression is scoped to the scripted seams.
+        let accelerated_cli =
+            CliConfig::parse_args(["--new", "--seed", "1", "--time-scale", "60", "--save", save]);
+        let accelerated = GameApp::new_with_paths(
+            accelerated_cli,
+            WorldSession::new_session(1, save_path, DEFAULT_SEASON_LENGTH_DAYS),
+            settings_path.clone(),
+            background_path.clone(),
+        );
+        assert!(!accelerated.scripted_demo);
+        assert!(
+            accelerated.demo_shutdown_deadline.is_some(),
+            "accelerated runs without a scripted flag stay bounded"
+        );
+        assert_eq!(accelerated.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // Menu-first scripted launch: the flag never bypasses the menu, so
+        // startup is MainMenu and no accelerated deadline arms.
+        let menu = GameApp::new_with_paths(
+            CliConfig::parse_args(["--demo-content"]),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/menu.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            settings_path,
+            background_path,
+        );
+        assert!(menu.scripted_demo);
+        assert!(menu.demo_shutdown_deadline.is_none());
+        assert_eq!(menu.lifecycle.screen(), LifecycleScreen::MainMenu);
     }
 
     /// One frame of clock progression exactly as the RedrawRequested pass
@@ -6010,6 +8579,463 @@ mod tests {
             .is_none());
     }
 
+    // ---- Scripted survival seam (S08-T02) ----
+
+    /// Insert the generated chunk owning `pos` plus its six face neighbours,
+    /// each generated from the session seed. Unlike the edit-remesh helper the
+    /// neighbours are real terrain, so a fixture that keeps two nearby columns
+    /// resident cannot blank one insertion with the other's Air halo.
+    fn insert_generated_chunk_with_generated_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let seed = session.world.seed();
+        for (dx, dy, dz) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let neighbour = ChunkPos::new(chunk_pos.x + dx, chunk_pos.y + dy, chunk_pos.z + dz);
+            let chunk = generate_chunk_seeded(neighbour, seed, Season::Summer);
+            session.world.insert_chunk_for_test(neighbour, chunk);
+        }
+        chunk_pos
+    }
+
+    /// The success digest is pinned, and the save the loop leaves behind is
+    /// edit-free and chest-free (the fixed-offset script never mutates the
+    /// world).
+    #[test]
+    fn survival_demo_success_digest_is_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival-demo.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(12345);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(0, SEA_LEVEL, 0),
+        );
+
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), None);
+        let mut steps = 0;
+        while steps < 64 && !demo.finished() {
+            steps += 1;
+            survival_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the scripted loop must finish within 64 steps"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, SurvivalStage::Done);
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(
+                "survival_demo: seed=12345 fall=true fall_damage=4 eat=true eat_restored=4 \
+                 drown=true air_empty=true starve=true death=true respawn=true \
+                 inventory_kept=true mode=survival saved=true health=20 hunger=20 air=300 \
+                 ok=true"
+            )
+        );
+
+        // The Save stage leaves the v6 file edit-free: the fixed-offset script
+        // never mutates the world, so the save is reproducible.
+        let saved = load_world_from_path(&save_path).expect("the demo's save loads");
+        assert_eq!(saved.mode, GameMode::Survival);
+        assert!(saved.chests.is_empty(), "the demo opens no chests");
+        assert!(
+            saved.chunk_edits.is_empty(),
+            "the fixed-offset script must leave chunk_edits empty"
+        );
+    }
+
+    /// A stalled run aborts with a self-describing digest, and the first
+    /// outcome wins so a later abort cannot rewrite it.
+    #[test]
+    fn survival_demo_deadline_aborts_with_a_self_describing_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("deadline.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), Some(past));
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.finished());
+        assert!(demo.failed, "a deadline is a failed run");
+        let digest = demo.digest.clone().expect("abort digest latched");
+        assert!(
+            digest.starts_with("survival_demo: seed=12345 stage=deadline "),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+
+        demo.abort("starve", "synthetic_second_abort");
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(digest.as_str()),
+            "the first outcome wins"
+        );
+    }
+
+    /// A seed without a resolved ocean route aborts at the drown stage with a
+    /// self-describing digest instead of teleporting at nothing.
+    #[test]
+    fn survival_demo_without_an_ocean_route_aborts_at_drown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("no-route.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let mut demo = SurvivalDemo::new(12345, None, None);
+        demo.stage = SurvivalStage::Drown;
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.failed);
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(digest.contains("stage=drown"), "{digest}");
+        assert!(digest.contains("observed=no_ocean_route"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+    }
+
+    /// A fall stage over an unresident world is bounded: after its 200-update
+    /// window it aborts instead of looping forever.
+    #[test]
+    fn survival_demo_fall_without_ground_aborts_inside_the_update_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("no-ground.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let mut demo = SurvivalDemo::new(12345, swim_route(12345), None);
+        demo.stage = SurvivalStage::Fall;
+
+        assert!(survival_demo_step(&mut demo, &mut session));
+        assert!(demo.failed);
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(digest.contains("stage=fall"), "{digest}");
+        assert!(digest.contains("observed=no_ground"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+    }
+
+    /// The seam is launch state, not session state; a menu-first launch arms
+    /// without a deadline and the wrapper aborts on its non-Playing screen.
+    #[test]
+    fn survival_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "12345",
+            "--survival",
+            "--demo-survival",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        let demo = app.survival_demo.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 12345);
+        assert!(demo.route.is_some());
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay survival run carries its 120s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.survival_demo.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // Menu-first launch (`--demo-survival` alone): armed without a
+        // deadline. The wrapper aborts it with the screen it actually saw
+        // instead of waiting forever for gameplay frames.
+        let menu_cli = CliConfig::parse_args(["--demo-survival"]);
+        let mut menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                12345,
+                PathBuf::from("/nonexistent/menu-survival.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let menu_demo = menu_app.survival_demo.as_ref().expect("seam armed");
+        assert_eq!(menu_demo.seed, 12345);
+        assert!(menu_demo.deadline.is_none());
+
+        menu_app.step_scripted_demos();
+        let digest = menu_app
+            .survival_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("screen abort digest");
+        assert!(digest.contains("stage=screen"), "{digest}");
+        assert!(digest.contains("observed=screen=MainMenu"), "{digest}");
+        assert!(menu_app.demo_finished, "the abort ends the bounded run");
+        assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
+    }
+
+    // ---- Scripted content seam (S08-T03) ----
+
+    /// The candidate scan is the production ruin seam twice over: deterministic
+    /// for the same seed, non-empty for the pinned seed, and every candidate
+    /// resolves the exact loot-chest cell.
+    #[test]
+    fn content_demo_chest_candidates_are_deterministic_and_non_empty_for_seed_one() {
+        let first = content_demo_chest_candidates(1);
+        let second = content_demo_chest_candidates(1);
+        assert_eq!(first, second, "the bounded scan must be deterministic");
+        assert!(
+            !first.is_empty(),
+            "seed 1 must expose at least one legal ruin chest in the ±3-chunk region"
+        );
+        for pos in first {
+            assert!(
+                ruin_loot_chest_at(pos, 1).is_some(),
+                "candidate {pos:?} must be that ruin's exact loot-chest cell"
+            );
+        }
+    }
+
+    /// Inserts uniform-Air chunks covering a square around `center` (plus the
+    /// vertical face layers), so the test can build a deterministic fixture
+    /// without terrain generation and still satisfy every edit-remesh guard.
+    fn insert_uniform_air_region(session: &mut WorldSession, center: IVec3, radius: i32) {
+        let (center_chunk, _) = world_to_chunk_and_local(center.x, center.y, center.z);
+        let chunk_radius = radius / CHUNK_SIZE as i32 + 1;
+        for dx in -chunk_radius..=chunk_radius {
+            for dz in -chunk_radius..=chunk_radius {
+                for dy in -1..=1 {
+                    let pos = ChunkPos::new(
+                        center_chunk.x + dx,
+                        center_chunk.y + dy,
+                        center_chunk.z + dz,
+                    );
+                    if !session.world.is_resident(pos) {
+                        session
+                            .world
+                            .insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole production chain runs headlessly on seed 1: loot the ruin
+    /// chest, craft the hoe, till/plant/grow/harvest two crops, bake bread,
+    /// place and stock a chest, replant, then save/reload the v6 evidence.
+    #[test]
+    fn content_demo_headless_chain_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("content-demo.mcvx");
+        let candidates = content_demo_chest_candidates(1);
+        let chest = *candidates.first().expect("seed 1 has a legal ruin chest");
+
+        let mut session = WorldSession::new_session(1, save_path.clone(), 1);
+        insert_uniform_air_region(&mut session, chest, 32);
+        session
+            .world
+            .set_block_immediate(chest.x, chest.y, chest.z, BlockId::LootChest);
+
+        // Two deterministic grass columns inside the 4..=24 farm-search ring.
+        for (x, z) in [(chest.x + 4, chest.z), (chest.x + 5, chest.z)] {
+            let h = terrain_height_at_seeded(x, z, 1);
+            session.world.set_block_immediate(x, h, z, BlockId::Grass);
+        }
+
+        let mut demo = ContentDemo::new(1, None);
+        let mut steps = 0;
+        while steps < 64 && !demo.finished() {
+            steps += 1;
+            content_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the scripted chain must finish within 64 steps"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, ContentStage::Done);
+
+        let digest = demo.digest.as_deref().expect("success digest");
+        for needle in [
+            "ok=true",
+            "loot_taken=true",
+            "chest_broken=true",
+            "chest_item=1",
+            "tilled=true",
+            "planted=true",
+            "winter_paused=true",
+            "stage3=true",
+            "harvest_wheat=2",
+            "harvest_seeds=4",
+            "bread=1",
+            "chest_placed=true",
+            "stored_bread=true",
+            "saved=true",
+            "reload_chests=1",
+            "reload_stage=1",
+        ] {
+            assert!(digest.contains(needle), "missing {needle}: {digest}");
+        }
+
+        let saved = load_world_from_path(&save_path).expect("the demo's v6 save loads");
+        assert_eq!(saved.mode, GameMode::Creative);
+        assert_eq!(saved.chests.len(), 1, "only the placed chest survives");
+    }
+
+    #[test]
+    fn content_demo_deadline_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            1,
+            dir.path().join("content-deadline.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut demo = ContentDemo::new(1, Some(past));
+
+        assert!(content_demo_step(&mut demo, &mut session));
+        assert!(demo.failed);
+        let digest = demo.digest.as_deref().expect("abort digest latched");
+        assert!(digest.contains("stage=deadline"), "{digest}");
+        assert!(
+            digest.contains("bounded content run exceeded 240s"),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+    }
+
+    /// The seam is launch state, not session state; a menu-first launch arms
+    /// without a deadline and the wrapper aborts on its non-Playing screen.
+    #[test]
+    fn content_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("content-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--creative",
+            "--demo-content",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        let demo = app.content_demo.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 1);
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay content run carries its 240s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.content_demo.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        let menu_cli = CliConfig::parse_args(["--demo-content"]);
+        let mut menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/menu-content.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let menu_demo = menu_app.content_demo.as_ref().expect("seam armed");
+        assert_eq!(menu_demo.seed, 1);
+        assert!(menu_demo.deadline.is_none());
+
+        menu_app.step_scripted_demos();
+        let digest = menu_app
+            .content_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("screen abort digest");
+        assert!(digest.contains("stage=screen"), "{digest}");
+        assert!(digest.contains("observed=screen=MainMenu"), "{digest}");
+        assert!(menu_app.demo_finished, "the abort ends the bounded run");
+        assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
+    }
+
+    /// A main-storage item moves into a full hotbar by freeing one slot into an
+    /// empty main slot, and the cursor must end empty.
+    #[test]
+    fn content_demo_ensure_selected_moves_a_main_item_into_a_full_hotbar() {
+        let mut slots: [Option<Item>; INVENTORY_SLOTS] = [None; INVENTORY_SLOTS];
+        let dirt = Item::new(ItemId::Block(BlockId::Dirt), 1).expect("valid dirt stack");
+        for slot in slots.iter_mut().take(HOTBAR_SLOTS) {
+            *slot = Some(dirt);
+        }
+        let hoe_id = ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        };
+        slots[HOTBAR_SLOTS + 2] = Some(Item::new(hoe_id, 1).expect("valid hoe"));
+        let inventory = Inventory::from_parts(slots, None);
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            inventory,
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+
+        assert!(content_demo_ensure_selected(&mut player, hoe_id));
+        assert_eq!(player.selected_slot(), 0);
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.id()),
+            Some(hoe_id)
+        );
+        assert_eq!(
+            player.inventory().slot(HOTBAR_SLOTS).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Dirt)),
+            "the displaced hotbar stack lands in the first empty main slot"
+        );
+        assert!(
+            player.inventory().cursor().is_none(),
+            "the cursor ends empty"
+        );
+    }
+
     #[test]
     fn saved_time_of_day_resumes_exactly_across_a_save_and_relaunch() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6261,6 +9287,60 @@ mod tests {
             loaded.season_length_days, 8,
             "a load ignores --season-length"
         );
+    }
+
+    #[test]
+    fn startup_session_applies_cli_mode_to_fresh_worlds_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh_path = dir.path().join("fresh-mode.mcvx");
+        let path_str = fresh_path.to_str().expect("utf8 path");
+
+        // Fresh + --survival: Survival rules, full vitals, walking.
+        let cli = CliConfig::parse_args(["--new", "--save", path_str, "--survival"]);
+        let session = startup_session(&cli);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert!(!session.player.can_fly());
+        assert_eq!(session.player.survival, SurvivalState::full());
+
+        // Fresh default and explicit --creative both keep the Creative /
+        // flying default every pre-M008 launch had.
+        for args in [
+            vec!["--new", "--save", path_str],
+            vec!["--new", "--save", path_str, "--creative"],
+        ] {
+            let session = startup_session(&CliConfig::parse_args(args.iter().copied()));
+            assert_eq!(session.save_mode, GameMode::Creative, "args: {args:?}");
+            assert_eq!(session.player.mode(), GameMode::Creative);
+            assert!(session.player.can_fly(), "args: {args:?}");
+        }
+
+        // Loaded saves ignore the flag: the persisted mode is authoritative,
+        // in both directions.
+        let mut survival = sample_save(11);
+        survival.mode = GameMode::Survival;
+        survival.player.fly_mode = false;
+        let survival_path = dir.path().join("persisted-survival.mcvx");
+        save_world_to_path(&survival_path, &survival).expect("write survival save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            survival_path.to_str().unwrap(),
+            "--creative",
+        ]));
+        assert_eq!(loaded.save_mode, GameMode::Survival);
+        assert_eq!(loaded.player.mode(), GameMode::Survival);
+        assert!(!loaded.player.can_fly());
+
+        let creative_path = dir.path().join("persisted-creative.mcvx");
+        save_world_to_path(&creative_path, &sample_save(12)).expect("write creative save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            creative_path.to_str().unwrap(),
+            "--survival",
+        ]));
+        assert_eq!(loaded.save_mode, GameMode::Creative);
+        assert_eq!(loaded.player.mode(), GameMode::Creative);
+        assert!(loaded.player.can_fly());
     }
 
     /// A headless GameApp for seam tests: no window/GPU, a tempdir catalog,
@@ -6547,6 +9627,68 @@ mod tests {
         );
         assert_eq!(relaunched.background.clock.time_of_day, 9_000);
         assert_eq!(relaunched.background.clock.day_index, 2);
+    }
+
+    #[test]
+    fn edit_background_applies_creative_rules_without_rewriting_a_survival_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        // A Survival background whose raw fly byte is true: the codec must
+        // canonicalise it to false on write, so this fixture also proves the
+        // stored mode survives the edit round trip.
+        let mut data = sample_save(777);
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = true;
+        data.player.position = [10.0, 65.0, -4.0];
+        save_world_to_path(&background_path, &data).expect("write survival background");
+
+        let mut app = app_with_background(dir.path());
+        let playable_path = dir.path().join("playable.mcvx");
+        app.session.save_path = playable_path.clone();
+        assert!(app.background.persisted);
+
+        assert!(app.begin_background_edit());
+        assert_eq!(
+            app.session.player.mode(),
+            GameMode::Creative,
+            "the editor always runs Creative rules"
+        );
+        assert_eq!(
+            app.session.save_mode,
+            GameMode::Survival,
+            "the stored mode is not rewritten by the editor"
+        );
+        assert!(
+            !app.session.player.can_fly(),
+            "mode switch alone does not enable flight"
+        );
+
+        // Move and save through the real Save-and-Quit path.
+        app.session.player.position = Vec3::new(20.5, 66.0, -8.5);
+        app.session.sync_camera();
+        app.lifecycle = LifecycleState::from_screen(LifecycleScreen::Pause);
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+
+        let persisted = load_world_from_path(&background_path).expect("background decodes");
+        assert_eq!(
+            persisted.mode,
+            GameMode::Survival,
+            "editing the background must not rewrite its stored mode"
+        );
+        assert!(
+            !persisted.player.fly_mode,
+            "the writer canonicalises Survival fly=false"
+        );
+        assert_eq!(persisted.player.position, [20.5, 66.0, -8.5]);
+        assert!(
+            !playable_path.exists(),
+            "editing the background must not write a playable save"
+        );
+        assert_eq!(
+            mcvx_files_under(dir.path()),
+            vec![background_path],
+            "the edit round-trip writes only the background save"
+        );
     }
 
     #[test]
@@ -6886,7 +10028,7 @@ mod tests {
         assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
         let loaded = app.current_pack.as_ref().expect("pack loaded");
         assert_eq!(loaded.display_name, "Alpha Pack");
-        assert_eq!(loaded.layers.len(), 16);
+        assert_eq!(loaded.layers.len(), 32);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
@@ -6950,7 +10092,7 @@ mod tests {
 
         assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
         let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(loaded.layers.len(), 16, "fallback still fully usable");
+        assert_eq!(loaded.layers.len(), 32, "fallback still fully usable");
         let message = app.menu.message.as_ref().expect("warning in the menu");
         assert!(
             message.text.contains("grass_top.png"),
@@ -7114,7 +10256,7 @@ mod tests {
             pack.logo.is_none(),
             "corrupt logo falls back to the text title"
         );
-        assert_eq!(pack.layers.len(), 16, "layers stay fully usable");
+        assert_eq!(pack.layers.len(), 32, "layers stay fully usable");
         assert!(
             warnings.iter().any(|w| w.field == "title.png"),
             "warning names the bare logo file: {warnings:?}"
@@ -7176,6 +10318,100 @@ mod tests {
             session
                 .world
                 .insert_chunk_for_test(pos, Chunk::new_uniform(BlockId::Air));
+        }
+    }
+
+    /// The first generated LootChest in a bounded chunk region (radius, cy
+    /// 0..=2, Summer), scanned through worldgen exactly as the session derives
+    /// its table. Panics with the region/seed when the fixture is empty.
+    fn find_generated_loot_chest(seed: u32, radius: i32) -> IVec3 {
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                for cy in 0..=2 {
+                    let chunk =
+                        generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
+                    for lz in 0..CHUNK_SIZE {
+                        for ly in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                if chunk.get(lx, ly, lz) == BlockId::LootChest {
+                                    return IVec3::new(
+                                        cx * CHUNK_SIZE as i32 + lx as i32,
+                                        cy * CHUNK_SIZE as i32 + ly as i32,
+                                        cz * CHUNK_SIZE as i32 + lz as i32,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no generated LootChest for seed {seed} in the {radius}-chunk region");
+    }
+
+    /// Inserts the generated chunk that owns `pos` plus uniform-Air face
+    /// neighbours, so `set_block_immediate` can remesh a break at `pos`.
+    fn insert_generated_chunk_with_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let chunk = generate_chunk_seeded(chunk_pos, session.world.seed(), Season::Summer);
+        session.world.insert_chunk_for_test(chunk_pos, chunk);
+        for neighbour in [
+            ChunkPos::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1),
+        ] {
+            if neighbour != chunk_pos {
+                session
+                    .world
+                    .insert_chunk_for_test(neighbour, Chunk::new_uniform(BlockId::Air));
+            }
+        }
+        chunk_pos
+    }
+
+    /// The validated inventory items a generated ruin chest's table yields, in
+    /// slot order.
+    fn generated_loot_stacks(pos: IVec3, seed: u32) -> Vec<Item> {
+        use opencraft::world::terrain::ruin_loot_chest_at;
+
+        ruin_loot_chest_at(pos, seed)
+            .expect("a generated LootChest must resolve its own table")
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count).expect("valid loot stack")
+            })
+            .collect()
+    }
+
+    /// Takes every non-empty slot of the open chest into the inventory through
+    /// the production click seam, leaving the chest present-empty.
+    fn take_all_open_chest_items(session: &mut WorldSession) {
+        use opencraft::player::inventory::CHEST_SLOTS;
+
+        for index in 0..CHEST_SLOTS {
+            let occupied = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(index))
+                .is_some();
+            if !occupied {
+                continue;
+            }
+            session
+                .click_open_chest_slot(index)
+                .expect("chest slot into the cursor");
+            let empty = (0..INVENTORY_SLOTS)
+                .find(|&slot| session.player.inventory().slot(slot).is_none())
+                .expect("an empty inventory slot accepts the stack");
+            session
+                .player
+                .click_inventory_slot(empty)
+                .expect("cursor into the inventory");
         }
     }
 
@@ -7596,6 +10832,63 @@ mod tests {
                 session.player.hotbar_stack(slot)
             );
         }
+    }
+
+    #[test]
+    fn survival_mode_vitals_and_chests_survive_save_and_restart() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{ChestSlots, Item, ItemId, Material, CHEST_SLOTS};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("survival.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            5150,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let vitals = SurvivalState::new(4, 11, 120).expect("in-range vitals");
+        session.player.survival = vitals;
+        let mut chest: ChestSlots = [None; CHEST_SLOTS];
+        chest[0] = Some(Item::new(ItemId::Material(Material::Apple), 3).expect("apple"));
+        chest[26] = Some(Item::new(ItemId::Material(Material::Bread), 1).expect("bread"));
+        let chest = Container::from_slots(chest);
+        session.chests.insert(IVec3::new(2, 30, -5), chest.clone());
+
+        // A stale fly byte must not leak through the save writer: the persisted
+        // mode canonicalises it to false even though the field itself is true.
+        session.player.fly_mode = true;
+        assert!(
+            !session.player.can_fly(),
+            "Survival cannot fly even with a hand-set fly flag"
+        );
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        assert_eq!(loaded.mode, GameMode::Survival);
+        assert_eq!(loaded.player.survival, vitals);
+        assert!(
+            !loaded.player.fly_mode,
+            "the writer canonicalises Survival fly=false"
+        );
+        assert_eq!(loaded.chests.len(), 1);
+        assert_eq!(loaded.chests[&IVec3::new(2, 30, -5)], chest);
+        assert_eq!(
+            loaded.chests[&IVec3::new(2, 30, -5)].slot(0),
+            Some(Item::new(ItemId::Material(Material::Apple), 3).expect("apple"))
+        );
+        assert_eq!(
+            loaded.chests[&IVec3::new(2, 30, -5)].slot(26),
+            Some(Item::new(ItemId::Material(Material::Bread), 1).expect("bread"))
+        );
+
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(restored.save_mode, GameMode::Survival);
+        assert_eq!(restored.player.mode(), GameMode::Survival);
+        assert_eq!(restored.player.survival, vitals);
+        assert_eq!(restored.chests[&IVec3::new(2, 30, -5)], chest);
+        assert!(!restored.player.fly_mode);
+        assert!(!restored.player.can_fly());
     }
 
     #[test]
@@ -9159,6 +12452,47 @@ mod tests {
     }
 
     #[test]
+    fn new_game_create_defaults_to_survival_and_cycling_selects_creative() {
+        // Default form: Survival wins, with full vitals and no flight. This
+        // is the user-visible New Game default (the CLI default stays
+        // Creative, asserted separately).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Survival World".into()));
+        assert_eq!(app.new_game.mode(), GameMode::Survival);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_mode, GameMode::Survival);
+        assert_eq!(app.session.player.mode(), GameMode::Survival);
+        assert!(!app.session.player.can_fly(), "Survival cannot fly");
+        assert!(
+            !app.session.player.toggle_fly(),
+            "the F toggle is a no-op in Survival"
+        );
+        assert!(!app.session.player.can_fly());
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+        assert_eq!(
+            app.session.save_path,
+            dir.path().join("Survival World.mcvx")
+        );
+
+        // Cycling the mode row once before Create selects Creative, and the
+        // resulting session is the pre-M008 flying default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Creative World".into()));
+        assert_eq!(app.new_game.cycle_mode(), GameMode::Creative);
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_mode, GameMode::Creative);
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
+        assert!(app.session.player.can_fly(), "Creative starts flying");
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+    }
+
+    #[test]
     fn new_game_season_length_row_feeds_the_session_it_creates() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
@@ -9770,17 +13104,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
 
-        // The create flow: name "alpha", seed text "42".
+        // The create flow: name "alpha", seed text "42". The integrated
+        // loop asserts flight persistence below, so select Creative on the
+        // mode row before Create — the default is Survival, whose save
+        // writer canonicalises fly=false.
         app.new_game
             .apply(TextInputAction::InsertText("alpha".into()));
         app.new_game.cycle_focus();
         app.new_game.apply(TextInputAction::InsertText("42".into()));
+        assert_eq!(app.new_game.cycle_mode(), GameMode::Creative);
         app.attempt_create();
 
         let expected_seed = resolve_seed_or("42", 0);
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.world.seed(), expected_seed);
         assert_eq!(app.session.save_path, dir.path().join("alpha.mcvx"));
+        assert_eq!(app.session.save_mode, GameMode::Creative);
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
 
         // Edit the world: load the spawn chunk and place a block (marking
         // unsaved changes), and move the player / pick a hotbar slot so
@@ -9819,6 +13159,11 @@ mod tests {
         let save_path = dir.path().join("alpha.mcvx");
         let data = load_world_from_path(&save_path).expect("alpha.mcvx written and loadable");
         assert_eq!(data.seed, expected_seed);
+        assert_eq!(
+            data.mode,
+            GameMode::Creative,
+            "the selected mode is what the save carries"
+        );
         assert_eq!(data.player.position, [12.5, 70.0, -3.5]);
         assert_eq!(data.player.yaw, 1.25);
         assert_eq!(data.player.pitch, -0.5);
@@ -9839,6 +13184,12 @@ mod tests {
 
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         assert_eq!(app.session.world.seed(), expected_seed, "seed round-trips");
+        assert_eq!(
+            app.session.save_mode,
+            GameMode::Creative,
+            "mode round-trips"
+        );
+        assert_eq!(app.session.player.mode(), GameMode::Creative);
         assert_eq!(
             app.session.save_path, save_path,
             "session owns the row's own file path"
@@ -10793,14 +14144,14 @@ mod tests {
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
-            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
+            "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
             compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
-            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nCreate World\nBack"
+            "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
@@ -11019,6 +14370,7 @@ mod tests {
             time_of_day: opencraft::world::daycycle::DEFAULT_TIME_OF_DAY,
             day_index: 0,
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
+            mode: GameMode::Creative,
             player: SavedPlayerState {
                 position: [1.0, 64.0, -2.0],
                 yaw: 0.5,
@@ -11029,9 +14381,240 @@ mod tests {
                 inventory: Inventory::empty(),
                 player_grid: CraftingGrid::new(GridKind::Player),
                 table_grid: CraftingGrid::new(GridKind::Table),
+                survival: SurvivalState::full(),
             },
+            chests: rustc_hash::FxHashMap::default(),
             chunk_edits: ChunkEditMap::default(),
         }
+    }
+
+    /// A dead Survival save carrying a hotbar stack and a non-default
+    /// selection, so the death-entry and respawn tests prove inventory and
+    /// selected-slot preservation alongside the zero-health routing.
+    fn dead_survival_save(seed: u32) -> WorldSaveData {
+        let mut save = sample_save(seed);
+        save.mode = GameMode::Survival;
+        save.player.fly_mode = false;
+        save.player.selected_slot = 4;
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone stack"))
+            .expect("the empty inventory accepts the stack");
+        save.player.inventory = inventory;
+        save.player.survival = SurvivalState::new(0, 6, 40).expect("dead but in-range vitals");
+        save
+    }
+
+    #[test]
+    fn dead_save_load_enters_death_and_respawn_preserves_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        WorldCatalogFs::new(dir.path())
+            .save_world("doomed", &dead_survival_save(21))
+            .expect("write dead save");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+        assert_eq!(app.load.row_count(), 1);
+        app.play_row(0);
+
+        // Play routes a health-0 save to Death instead of a frozen Playing
+        // frame, and the save's own selection/inventory survive the load.
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Death);
+        assert!(app.session.is_dead());
+        assert_eq!(app.session.world.seed(), 21);
+        assert_eq!(app.session.player.selected_slot(), 4);
+        let inventory = app.session.player.inventory().clone();
+        let selected = app.session.player.selected_slot();
+        assert!(
+            inventory.hotbar(0).is_some(),
+            "the loaded hotbar item survives the load"
+        );
+
+        // Respawn returns to Playing at the deterministic spawn with full
+        // vitals, while the exact pre-respawn inventory and selection stay.
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::Respawn));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            app.session.player.position,
+            WorldSession::spawn_position(21)
+        );
+        assert_eq!(app.session.player.survival, SurvivalState::full());
+        assert_eq!(app.session.player.inventory(), &inventory);
+        assert_eq!(app.session.player.selected_slot(), selected);
+    }
+
+    #[test]
+    fn healthy_save_load_enters_playing_not_death() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut save = sample_save(22);
+        save.mode = GameMode::Survival;
+        save.player.fly_mode = false;
+        WorldCatalogFs::new(dir.path())
+            .save_world("alive", &save)
+            .expect("write healthy save");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+        app.play_row(0);
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(!app.session.is_dead());
+        assert!(app.cursor_grabbed, "Playing semantics grab the cursor");
+    }
+
+    #[test]
+    fn dead_cli_save_starts_on_death_while_bare_launch_starts_on_main_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("dead-cli.mcvx");
+        save_world_to_path(&save_path, &dead_survival_save(23)).expect("write dead save");
+        let save_arg = save_path.to_str().expect("utf-8 tempdir path");
+
+        // A flagged CLI launch that restores zero health starts on Death.
+        let flagged = CliConfig::parse_args(["--save", save_arg]);
+        let session = startup_session(&flagged);
+        assert!(session.is_dead(), "the CLI load restores zero health");
+        let app = GameApp::new_with_paths(
+            flagged,
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Death);
+
+        // The same dead session through a bare launch starts on the main
+        // menu (which renders over the dead world until it is loaded).
+        let session = startup_session(&CliConfig::parse_args(["--save", save_arg]));
+        assert!(session.is_dead());
+        let app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+    }
+
+    #[test]
+    fn death_quit_writes_zero_health_and_returns_to_the_main_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("death-quit.mcvx");
+        let session = WorldSession::session_from_save(dead_survival_save(24), save_path.clone());
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        app.enter_screen(LifecycleScreen::Death);
+
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.main_menu_message.is_none(), "the save succeeded");
+
+        // Death Quit reuses the one save site: the file keeps health 0 and
+        // the rest of the loaded state, including the selection.
+        let data = load_world_from_path(&save_path).expect("the death save decodes");
+        assert_eq!(data.mode, GameMode::Survival);
+        assert_eq!(data.player.survival.health(), 0);
+        assert_eq!(data.player.selected_slot, 4);
+    }
+
+    #[test]
+    fn death_quit_save_failure_lands_on_the_main_menu_never_pause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Force a save failure exactly like the existing blocker pattern: the
+        // save path's parent is a regular file, so create_dir_all fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let save_path = blocker.join("dead.mcvx");
+        let session = WorldSession::session_from_save(dead_survival_save(25), save_path.clone());
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+        app.enter_screen(LifecycleScreen::Death);
+
+        assert!(!app.apply_lifecycle_decision(LifecycleDecision::SaveAndQuit));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let message = app
+            .main_menu_message
+            .as_ref()
+            .expect("save failure surfaces on the main menu");
+        assert!(
+            message.text.contains("could not save world"),
+            "unexpected failure text: {}",
+            message.text
+        );
+        assert_ne!(
+            app.lifecycle.screen(),
+            LifecycleScreen::Pause,
+            "a failed death quit never falls back to Pause"
+        );
+        assert!(!save_path.exists());
+    }
+
+    #[test]
+    fn enter_death_if_dead_is_idempotent_and_only_transitions_from_dead_playing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A dead session on the main menu is left alone: the menu owns it.
+        let mut menu = app_at_screen(dir.path(), LifecycleScreen::MainMenu);
+        menu.session.player.survival = SurvivalState::new(0, 3, 10).expect("dead vitals");
+        assert!(!menu.enter_death_if_dead());
+        assert_eq!(menu.lifecycle.screen(), LifecycleScreen::MainMenu);
+
+        // A healthy Playing session is left alone.
+        let mut alive = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        assert!(!alive.enter_death_if_dead());
+        assert_eq!(alive.lifecycle.screen(), LifecycleScreen::Playing);
+
+        // A dead Playing session transitions once and closes the panel.
+        let mut dead = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        dead.session.player.survival = SurvivalState::new(0, 3, 10).expect("dead vitals");
+        dead.inventory.open_player();
+        assert!(dead.inventory.is_open());
+        assert!(dead.enter_death_if_dead());
+        assert_eq!(dead.lifecycle.screen(), LifecycleScreen::Death);
+        assert!(
+            !dead.inventory.is_open(),
+            "Death closes the inventory panel"
+        );
+        assert!(!dead.enter_death_if_dead(), "already on Death: idempotent");
+        assert_eq!(dead.lifecycle.screen(), LifecycleScreen::Death);
+    }
+
+    #[test]
+    fn death_screen_text_title_tag_and_geometry_match_the_death_rows() {
+        let (sw, sh) = (1280u32, 720u32);
+        let app = app_at_screen(Path::new("/nonexistent/saves"), LifecycleScreen::MainMenu);
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::Death,
+                &app.new_game,
+                &app.load,
+                None,
+                None,
+                None
+            ),
+            "You Died\nRespawn\nQuit"
+        );
+        assert_eq!(screen_title_tag(LifecycleScreen::Death), " | Dead");
+        assert_eq!(
+            screen_panel_rect(LifecycleScreen::Death, &app.load, sw, sh),
+            death_panel_rect(sw, sh)
+        );
+        for (index, row) in DEATH_ROWS.iter().enumerate() {
+            let rect = death_row_rect(sw, sh, index).expect("row geometry exists");
+            let center = (rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0);
+            assert_eq!(
+                hovered_target_rect(LifecycleScreen::Death, &app.load, Some(center), sw, sh),
+                Some(rect),
+                "hover follows the {row:?} row geometry"
+            );
+        }
+        assert_eq!(
+            hovered_target_rect(LifecycleScreen::Death, &app.load, Some((0.0, 0.0)), sw, sh),
+            None,
+            "the title line is not clickable"
+        );
     }
 
     #[test]
@@ -11467,6 +15050,152 @@ mod tests {
         );
     }
 
+    /// S04-T06: the Playing-frame HUD seam draws exactly ten heart fills and
+    /// ten hunger fills for a full-vitals Survival session, and Creative is
+    /// structurally empty even though it shares the same seam.
+    #[test]
+    fn playing_hud_quads_shows_survival_vitals_and_hides_creative() {
+        use opencraft::ui::hud::{AIR_FILL_COLOR, HEART_FILL_COLOR, HUNGER_FILL_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        assert_eq!(session.player.survival, SurvivalState::full());
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert!(!quads.is_empty(), "Survival draws the vitals HUD");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .count(),
+            10,
+            "ten full hearts at full health"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .count(),
+            10,
+            "ten full hunger pips at full hunger"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .count(),
+            0,
+            "full lungs on dry land draw no air row"
+        );
+
+        let creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        assert!(
+            playing_hud_quads(&creative, 1280, 720).is_empty(),
+            "Creative is structurally exempt from the vitals HUD"
+        );
+    }
+
+    /// S04-T06: low vitals change the fills (one half heart, no hunger fill)
+    /// and a non-full lung adds the air row even while the eye is dry.
+    #[test]
+    fn playing_hud_quads_tracks_low_vitals_and_the_air_row() {
+        use opencraft::ui::hud::{
+            HEART_FILL_COLOR, HUNGER_FILL_COLOR, VITALS_BACKGROUND_COLOR, VITALS_ICON_SIZE,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-low.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        session.player.survival = SurvivalState::new(1, 0, 0).expect("valid vitals");
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        let hearts: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.color == HEART_FILL_COLOR)
+            .collect();
+        assert_eq!(hearts.len(), 1, "one health point is one half heart");
+        assert_eq!(hearts[0].w, VITALS_ICON_SIZE * 0.5, "half-heart width");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .count(),
+            0,
+            "zero hunger emits no amber fill"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == VITALS_BACKGROUND_COLOR)
+                .count(),
+            30,
+            "the air row adds ten dark icons above hunger even at zero breath"
+        );
+    }
+
+    /// S04-T06: a submerged eye (a live water chunk around the camera) shows
+    /// the ten-bubble air row even at full breath.
+    #[test]
+    fn playing_hud_quads_submerged_vitals_show_the_air_row() {
+        use opencraft::ui::hud::{AIR_FILL_COLOR, VITALS_BACKGROUND_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("vitals-submerged.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        // Feet at y=32 place the eye at y≈33.6, inside the water chunk below.
+        session.player.position = Vec3::new(16.5, 32.0, 16.5);
+        session.sync_camera();
+        assert!(
+            !eye_is_submerged(&session.world, session.camera.position),
+            "the fixture must start dry (the chunk is unloaded)"
+        );
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Water));
+        assert!(
+            eye_is_submerged(&session.world, session.camera.position),
+            "the inserted water chunk must submerge the eye"
+        );
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .count(),
+            10,
+            "a submerged head with full lungs still draws ten bubbles"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == VITALS_BACKGROUND_COLOR)
+                .count(),
+            30,
+            "hearts + hunger + air backgrounds"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // S05-T02: stone-tier reachability acceptance
     // -----------------------------------------------------------------------
@@ -11873,9 +15602,7 @@ mod tests {
     // S05-T03: all-nine-tool matrix and the break-at-zero generalization
     // -----------------------------------------------------------------------
 
-    use opencraft::player::inventory::{
-        Material, ToolKind, ToolTier, INVENTORY_SLOTS, MAX_STACK_COUNT,
-    };
+    use opencraft::player::inventory::{ToolKind, ToolTier, MAX_STACK_COUNT};
 
     /// Table-grid cells the head row of `kind` occupies.
     fn tool_head_cells(kind: ToolKind) -> &'static [usize] {
@@ -11883,6 +15610,10 @@ mod tests {
             ToolKind::Pickaxe => &[0, 1, 2],
             ToolKind::Axe => &[0, 1, 4],
             ToolKind::Shovel => &[0],
+            // Hoe recipes now exist (S07), but this S05 matrix intentionally
+            // covers only the nine Pickaxe/Axe/Shovel break-centric
+            // combinations.
+            ToolKind::Hoe => &[],
         }
     }
 
@@ -11891,6 +15622,10 @@ mod tests {
         match kind {
             ToolKind::Pickaxe | ToolKind::Axe => &[5, 9],
             ToolKind::Shovel => &[4, 8],
+            // Hoe recipes now exist (S07), but this S05 matrix intentionally
+            // covers only the nine Pickaxe/Axe/Shovel break-centric
+            // combinations.
+            ToolKind::Hoe => &[],
         }
     }
 
@@ -12429,6 +16164,7 @@ mod tests {
                 ToolKind::Pickaxe => BlockId::Dirt,
                 ToolKind::Axe => BlockId::Stone,
                 ToolKind::Shovel => BlockId::OakLog,
+                ToolKind::Hoe => unreachable!("hoe recipes are S07"),
             };
             let wrong = MiningTarget::from_block(IVec3::new(7, 8, 0), wrong_block, Some(tool))
                 .expect("a mismatched block is still breakable");
@@ -12477,6 +16213,7 @@ mod tests {
                         ToolTier::Iron => 0.075,
                     },
                 ),
+                ToolKind::Hoe => unreachable!("hoe recipes are S07"),
             };
             assert_eq!(target_block.break_duration_secs(), Some(base_duration));
             let drop_id = ItemId::Block(target_block.mined_drop());
@@ -12745,5 +16482,2533 @@ mod tests {
             jump_or_up: KeyCode::ArrowUp,
             ..opencraft::settings::Keybinds::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T05: chest screen adapter, station priority, and gameplay notice
+    // -----------------------------------------------------------------------
+
+    /// A session with an empty air chunk (and face neighbours) ready for a
+    /// chest fixture at `(0, 5, 0)`.
+    fn chest_test_session(dir: &Path, seed: u32, name: &str) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+    }
+
+    /// Places a chest at `(0, 5, 0)`, aims the player at it, and opens the
+    /// live station through the same raycast path the frame loop uses.
+    fn open_chest_fixture(session: &mut WorldSession) -> IVec3 {
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(session, pos);
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        pos
+    }
+
+    #[test]
+    fn chest_screen_state_and_station_loss_helpers() {
+        let mut screen = ChestScreen::new();
+        let pos = IVec3::new(1, 5, -2);
+        assert!(!screen.is_open());
+        assert!(!screen.station_lost(None));
+        assert!(!chest_should_close(&screen, None));
+
+        screen.open();
+        assert!(screen.is_open());
+        assert!(
+            chest_should_close(&screen, None),
+            "an open screen with no live station must close"
+        );
+        assert!(!chest_should_close(&screen, Some(pos)));
+
+        screen.close();
+        assert!(!screen.is_open());
+        assert!(!chest_should_close(&screen, None));
+    }
+
+    #[test]
+    fn enter_screen_retires_the_chest_screen_station_status_and_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+        let pos = open_chest_fixture(&mut app.session);
+        app.chest.open();
+        app.chest_status = Some("Moved".to_string());
+        app.game_message = Some(MenuMessage {
+            text: "Chest closed".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        });
+
+        app.enter_screen(LifecycleScreen::Pause);
+
+        assert!(!app.chest.is_open(), "a menu retires the chest screen");
+        assert!(app.chest_status.is_none());
+        assert!(app.game_message.is_none());
+        assert_eq!(
+            app.session.open_chest_position(),
+            None,
+            "the ephemeral station cannot outlive the screen"
+        );
+        assert_eq!(
+            app.session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Chest
+        );
+    }
+
+    #[test]
+    fn apply_chest_click_routes_chest_and_player_slots_without_cross_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 51, "chest-route.mcvx");
+        let pos = open_chest_fixture(&mut session);
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 1).expect("valid stone stack");
+
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+        assert_eq!(session.player.inventory().hotbar(0), Some(stone));
+        assert!(session.chests.is_empty(), "opening alone creates no record");
+
+        // Player-slot routing goes through the shared inventory façade.
+        apply_chest_click(&mut session, ChestTarget::InventorySlot(0))
+            .expect("the player slot click is accepted");
+        assert_eq!(session.player.inventory().cursor(), Some(stone));
+        assert!(session.player.inventory().hotbar(0).is_none());
+        assert!(
+            session.chests.is_empty(),
+            "a player-slot click can never touch the chest aggregate"
+        );
+
+        // Chest-slot routing goes through the station-aware session command.
+        apply_chest_click(&mut session, ChestTarget::ChestSlot(0))
+            .expect("the chest slot click is accepted");
+        assert_eq!(session.player.inventory().cursor(), None);
+        assert_eq!(
+            session.chest_at(pos).and_then(|chest| chest.slot(0)),
+            Some(stone)
+        );
+        assert!(
+            session.player.inventory().hotbar(0).is_none(),
+            "a chest-slot click can never touch the player slots"
+        );
+
+        // Out-of-range chest slots are rejected before any mutation.
+        let record_before = session.chest_at(pos).cloned();
+        assert_eq!(
+            apply_chest_click(&mut session, ChestTarget::ChestSlot(27)),
+            Err(ChestCommandError::Slot(InventoryError::OutOfBounds))
+        );
+        assert_eq!(session.chest_at(pos), record_before.as_ref());
+
+        // Losing the station is reported, never silently routed elsewhere.
+        session.close_chest();
+        assert_eq!(
+            apply_chest_click(&mut session, ChestTarget::ChestSlot(0)),
+            Err(ChestCommandError::NotOpen)
+        );
+    }
+
+    #[test]
+    fn chest_status_text_covers_success_and_every_error_shape() {
+        assert_eq!(chest_status_text(Ok(())), "Moved");
+        assert_eq!(
+            chest_status_text(Err(ChestCommandError::NotOpen)),
+            "Chest closed"
+        );
+        assert_eq!(
+            chest_status_text(Err(ChestCommandError::Slot(InventoryError::OutOfBounds))),
+            format!("Inventory: {:?}", InventoryError::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn gameplay_surface_excludes_inventory_and_chest_panels() {
+        assert!(gameplay_surface(true, false, false));
+        assert!(!gameplay_surface(true, true, false));
+        assert!(!gameplay_surface(true, false, true));
+        assert!(!gameplay_surface(true, true, true));
+        assert!(!gameplay_surface(false, false, false));
+        assert!(!gameplay_surface(false, true, true));
+    }
+
+    #[test]
+    fn gameplay_notice_rect_stays_centered_and_on_screen_above_the_hotbar() {
+        let (surface_w, surface_h) = (1280, 720);
+        let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
+            .iter()
+            .map(|rect| rect.1)
+            .fold(f32::INFINITY, f32::min);
+
+        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, 200.0);
+        assert!((x + w * 0.5 - surface_w as f32 * 0.5).abs() < 0.001);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(x + w <= surface_w as f32);
+        assert!(
+            y + h <= hotbar_top,
+            "notice bottom {} must stay above hotbar top {hotbar_top}",
+            y + h
+        );
+
+        // Huge text clamps to the surface instead of leaving the screen.
+        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, 5_000.0);
+        assert_eq!(w, surface_w as f32);
+        assert_eq!(x, 0.0);
+        assert!(y >= 0.0 && y + h <= surface_h as f32);
+
+        // Tiny surfaces keep every coordinate finite and on screen.
+        let (x, y, w, h) = gameplay_notice_rect(1, 1, 50.0);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(x + w <= 1.0 && y + h <= 1.0);
+    }
+
+    #[test]
+    fn gameplay_notice_message_ticks_and_expires_through_tick_transient_message() {
+        let mut message = Some(MenuMessage {
+            text: "Chest closed".to_string(),
+            ticks_left: 2,
+        });
+        assert!(tick_transient_message(&mut message));
+        assert_eq!(message.as_ref().map(|msg| msg.ticks_left), Some(1));
+        assert!(!tick_transient_message(&mut message));
+        assert!(message.is_none(), "the notice expires exactly at zero");
+    }
+
+    #[test]
+    fn right_click_on_a_live_chest_opens_chest_opened_without_placing_or_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 52, "chest-open.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut session, pos);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::ChestOpened(opened) if opened == pos),
+            "a targeted chest must open through the chest clause first"
+        );
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert_eq!(session.open_table_position(), None);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "opening a chest must not place the selected block"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "opening a chest must not consume the selected stack"
+        );
+        assert!(session.chests.is_empty(), "opening alone creates no record");
+    }
+
+    #[test]
+    fn right_click_on_a_non_chest_target_still_falls_through_to_placement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 53, "chest-fallback.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut session, pos);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "a non-chest, non-table target must use the placement path"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 1,
+            }),
+            "placement consumes exactly one selected item"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S03-T06: chest break preflight and end-to-end persistence proof
+    // -----------------------------------------------------------------------
+
+    /// A preflight-refused break has no visual cue in the world (the block is
+    /// still there), so each full-inventory refusal owns a readable notice.
+    /// Every other rejection is already visible and must not post a message.
+    #[test]
+    fn break_rejection_notice_names_the_full_inventory_refusals() {
+        assert_eq!(
+            break_rejection_notice(BreakRejection::ChestNoRoom),
+            Some("Not enough inventory space to break the chest")
+        );
+        assert_eq!(
+            break_rejection_notice(BreakRejection::HarvestNoRoom),
+            Some("Not enough inventory space to harvest the wheat")
+        );
+        assert_eq!(break_rejection_notice(BreakRejection::Unbreakable), None);
+        assert_eq!(break_rejection_notice(BreakRejection::StaleTarget), None);
+        assert_eq!(break_rejection_notice(BreakRejection::EditRejected), None);
+    }
+
+    #[test]
+    fn breaking_a_chest_drops_every_content_plus_one_chest_item() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Item, ItemId, ToolKind, ToolTier, CHEST_SLOTS,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 60, "chest-break.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 5).expect("stone"));
+        contents[25] = Some(Item::new(ItemId::Block(BlockId::OakPlanks), 3).expect("planks"));
+        session.chests.insert(pos, Container::from_slots(contents));
+
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        session.player.insert_items(&[axe]).expect("axe fits");
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(&mut session, pos, BlockId::Chest));
+
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 9 },
+            "exactly one durability point is spent"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert!(
+            session.chest_at(pos).is_none(),
+            "the persisted record is removed with the block"
+        );
+        // Slot 0 held the axe; the batch lands in insertion (slot) order.
+        assert_eq!(
+            session.player.hotbar_stack(1),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 5,
+            })
+        );
+        assert_eq!(
+            session.player.hotbar_stack(2),
+            Some(ItemStack {
+                block: BlockId::OakPlanks,
+                count: 3,
+            })
+        );
+        assert_eq!(
+            session.player.hotbar_stack(3),
+            Some(ItemStack {
+                block: BlockId::Chest,
+                count: 1,
+            }),
+            "exactly one chest item drops"
+        );
+    }
+
+    #[test]
+    fn breaking_a_non_empty_chest_with_a_full_inventory_is_refused_untouched() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Inventory, Item, ItemId, ToolKind, ToolTier, CHEST_SLOTS, INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 61, "chest-full.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone"));
+        let record = Container::from_slots(contents);
+        session.chests.insert(pos, record.clone());
+
+        // 36 non-stackable tools: the contents plus the chest item cannot fit.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the break"
+        );
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::Chest,
+            "the refused break edits nothing"
+        );
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&record),
+            "the record survives a refused break"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "a refused break spends no durability"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "a refused break does not partially insert the contents"
+        );
+    }
+
+    #[test]
+    fn cursor_and_crafting_grids_do_not_create_chest_break_capacity() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            ChestSlots, Inventory, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
+            INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 62, "chest-spill.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone"));
+        let record = Container::from_slots(contents);
+        session.chests.insert(pos, record.clone());
+
+        // 35 tools leave exactly one empty slot: the contents can land there,
+        // but the chest item cannot. A matching cursor stack and items in both
+        // crafting grids must not be counted as spill capacity.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let stick = Item::new(ItemId::Material(Material::Stick), 4).expect("stick");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(axe);
+        }
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid.set(0, Some(stick)).expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid.set(0, Some(stick)).expect("table grid cell");
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, Some(stick)),
+            player_grid.clone(),
+            table_grid.clone(),
+        );
+        assert!(session.player.select_slot(0));
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "the cursor and grids are not 36-slot capacity"
+        );
+        assert_eq!(session.chest_at(pos), Some(&record));
+        assert_eq!(session.player.inventory().cursor(), Some(stick));
+        assert_eq!(session.player.player_grid(), &player_grid);
+        assert_eq!(session.player.table_grid(), &table_grid);
+    }
+
+    #[test]
+    fn an_empty_chest_needs_room_only_for_the_chest_item() {
+        use opencraft::player::inventory::{
+            Inventory, Item, ItemId, ToolKind, ToolTier, INVENTORY_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 63, "chest-empty.mcvx");
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+
+        // No record means an untouched, empty chest: only the chest item is
+        // dropped, but a completely full inventory still refuses.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut full = [None; INVENTORY_SLOTS];
+        for slot in full.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(full, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::Chest);
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "the chest item itself has nowhere to go"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Chest);
+        assert_eq!(session.player.inventory(), &inventory_before);
+
+        // One free slot is exactly enough for the chest item.
+        let mut one_free = [None; INVENTORY_SLOTS];
+        for slot in one_free.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(one_free, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::Chest));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert!(session.chest_at(pos).is_none());
+        let chest_items: u16 = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Block(BlockId::Chest))
+            .map(Item::count)
+            .sum();
+        assert_eq!(chest_items, 1, "an empty chest drops exactly one chest");
+    }
+
+    #[test]
+    fn breaking_an_unopened_loot_chest_spills_derived_loot_and_one_chest_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 73u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest
+        );
+
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::LootChest));
+
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Air);
+        assert!(
+            session.chest_at(pos).is_none(),
+            "no record exists for a never-opened chest"
+        );
+
+        let mut expected = generated_loot_stacks(pos, seed);
+        expected
+            .push(Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item is valid"));
+        let stored: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            stored, expected,
+            "the unopened chest spills the same table first open would materialize, plus one chest"
+        );
+    }
+
+    #[test]
+    fn breaking_an_unopened_loot_chest_with_a_full_inventory_is_refused_untouched() {
+        use opencraft::player::inventory::{Inventory, Item, ToolKind, ToolTier, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 74u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+
+        // 36 non-stackable tools: the derived stacks plus the chest item
+        // cannot fit, so the all-or-nothing preflight must refuse.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::LootChest);
+
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the unopened-chest break"
+        );
+        assert_eq!(
+            session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest,
+            "the refused break edits nothing"
+        );
+        assert!(
+            session.chest_at(pos).is_none(),
+            "a refused break creates no record"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "a refused break does not partially insert the derived loot"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "a refused break spends no durability"
+        );
+    }
+
+    #[test]
+    fn breaking_a_looted_loot_chest_drops_only_the_chest_item() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{Inventory, Item, ItemId, CHEST_SLOTS, INVENTORY_SLOTS};
+        use opencraft::player::physics::Player;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 75u32;
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.path().join("loot-looted.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = find_generated_loot_chest(seed, 3);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        aim_table_interaction_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+
+        // Take every stack through the real chest click seam.
+        for index in 0..CHEST_SLOTS {
+            let occupied = session
+                .open_chest_contents()
+                .and_then(|chest| chest.slot(index))
+                .is_some();
+            if !occupied {
+                continue;
+            }
+            session
+                .click_open_chest_slot(index)
+                .expect("chest slot into the cursor");
+            let empty = (0..INVENTORY_SLOTS)
+                .find(|&slot| session.player.inventory().slot(slot).is_none())
+                .expect("an empty inventory slot accepts the stack");
+            session
+                .player
+                .click_inventory_slot(empty)
+                .expect("cursor into the inventory");
+        }
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "the looted chest keeps a present-empty record"
+        );
+        let looted: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(looted, generated_loot_stacks(pos, seed));
+
+        // Pocket the loot away: the break must not re-derive a table the
+        // present-empty record already spent.
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::LootChest));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(pos.x, pos.y, pos.z), BlockId::Air);
+        assert!(session.chest_at(pos).is_none());
+        let stored: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            stored,
+            vec![Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item is valid")],
+            "a looted chest drops only the chest item"
+        );
+    }
+
+    #[test]
+    fn generated_ruin_loot_chest_chain_survives_save_reload_and_break() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{ToolKind, ToolTier};
+        use opencraft::player::physics::Player;
+        use opencraft::world::chunk::linear_index;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = DEFAULT_WORLD_SEED;
+        let pos = find_generated_loot_chest(seed, 3);
+        let expected_loot = generated_loot_stacks(pos, seed);
+        assert!(!expected_loot.is_empty(), "the ruin table is non-empty");
+
+        // Session A: open/take/save/reload/reopen. The first open materializes
+        // the deterministic table; taking everything must persist a
+        // present-empty record so a reloaded reopen never re-rolls loot.
+        let path_a = dir.path().join("ruin-loot-chain-a.mcvx");
+        let mut session =
+            WorldSession::new_session(seed, path_a.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut session, pos);
+        aim_table_interaction_at(&mut session, pos);
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        let opened = session
+            .open_chest_contents()
+            .expect("a generated LootChest materializes on first open");
+        assert_eq!(
+            opened.contents(),
+            expected_loot,
+            "first open yields exactly the deterministic ruin table"
+        );
+
+        take_all_open_chest_items(&mut session);
+        assert_eq!(
+            session.chest_at(pos),
+            Some(&Container::empty()),
+            "taking everything leaves a present-empty record"
+        );
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the transfer is a player content change"
+        );
+        let looted: Vec<Item> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(looted, expected_loot, "every stack landed in the inventory");
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&path_a).expect("load succeeds");
+        assert_eq!(loaded.chests.len(), 1, "only the touched chest is stored");
+        assert_eq!(
+            loaded.chests.get(&pos),
+            Some(&Container::empty()),
+            "the present-empty record round-trips through the save writer"
+        );
+
+        let mut restored = WorldSession::session_from_save(loaded, path_a.clone());
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        restored.world.insert_chunk_for_test(
+            chunk_pos,
+            generate_chunk_seeded(chunk_pos, seed, Season::Summer),
+        );
+        aim_table_interaction_at(&mut restored, pos);
+        assert!(restored.open_chest_at(pos), "the live chest reopens");
+        assert_eq!(
+            restored.open_chest_contents(),
+            Some(&Container::empty()),
+            "a reloaded emptied chest never re-rolls its loot"
+        );
+
+        // Session B: a never-opened chest spills its derived table plus one
+        // chest item, and both the absent record and the Air block edit
+        // survive the save writer.
+        let path_b = dir.path().join("ruin-loot-chain-b.mcvx");
+        let mut spill_session =
+            WorldSession::new_session(seed, path_b.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut spill_session, pos);
+        assert!(
+            spill_session.chest_at(pos).is_none(),
+            "an unopened generated chest has no record"
+        );
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut spill_session,
+            pos,
+            BlockId::LootChest,
+        ));
+        assert!(!remeshed.is_empty(), "the applied break remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(
+            spill_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Air
+        );
+        assert!(
+            spill_session.chest_at(pos).is_none(),
+            "breaking an unopened chest creates no record"
+        );
+
+        let mut expected_spill = expected_loot.clone();
+        expected_spill.push(Item::new(ItemId::Block(BlockId::Chest), 1).expect("one chest item"));
+        let spilled: Vec<Item> = spill_session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            spilled, expected_spill,
+            "the unopened break spills the derived table plus exactly one chest"
+        );
+
+        save_current_world(&mut spill_session).expect("save succeeds");
+        let loaded = load_world_from_path(&path_b).expect("load succeeds");
+        assert!(
+            !loaded.chests.contains_key(&pos),
+            "the unopened break persisted no chest record"
+        );
+        let (edit_chunk, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        assert_eq!(
+            loaded.chunk_edits[&edit_chunk][&(linear_index(lx, ly, lz) as u16)],
+            BlockId::Air,
+            "the persisted break edit wins over regenerated LootChest terrain"
+        );
+
+        // Session C: a full inventory refuses the break untouched, and the
+        // same chest can still be broken once room exists.
+        let path_c = dir.path().join("ruin-loot-chain-c.mcvx");
+        let mut full_session =
+            WorldSession::new_session(seed, path_c.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_generated_chunk_with_face_neighbors(&mut full_session, pos);
+
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        full_session.player = Player::with_inventory(
+            full_session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(full_session.player.select_slot(0));
+        let inventory_before = full_session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut full_session, pos, BlockId::LootChest);
+        assert!(
+            matches!(outcome, BreakOutcome::Rejected(BreakRejection::ChestNoRoom)),
+            "a full inventory must refuse the derived batch"
+        );
+        assert_eq!(
+            full_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::LootChest,
+            "the refused break edits nothing"
+        );
+        assert!(
+            full_session.chest_at(pos).is_none(),
+            "the refused break creates no record"
+        );
+        assert_eq!(
+            full_session.player.inventory(),
+            &inventory_before,
+            "the refused break leaves the inventory byte-identical"
+        );
+
+        full_session.player = Player::with_inventory(
+            full_session.player.position,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut full_session,
+            pos,
+            BlockId::LootChest,
+        ));
+        assert!(!remeshed.is_empty(), "the retried break applies");
+        assert_eq!(
+            full_session.world.get_block(pos.x, pos.y, pos.z),
+            BlockId::Air
+        );
+        let retried: Vec<Item> = full_session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            retried, expected_spill,
+            "the retried break derives the same deterministic batch"
+        );
+    }
+
+    #[test]
+    fn placing_a_chest_clears_a_stale_record_only_after_the_edit_applies() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{ChestSlots, Item, ItemId, CHEST_SLOTS};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = chest_test_session(dir.path(), 64, "chest-place-clean.mcvx");
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        let destination = IVec3::new(0, 6, 0);
+        let mut contents: ChestSlots = [None; CHEST_SLOTS];
+        contents[0] = Some(Item::new(ItemId::Block(BlockId::Stone), 4).expect("stone"));
+        session
+            .chests
+            .insert(destination, Container::from_slots(contents));
+
+        // Nothing selected: the placement never reaches the world, so the
+        // stale record must survive a rejected attempt.
+        assert!(session.player.select_slot(5));
+        assert!(try_place_selected_block(&mut session).is_none());
+        assert!(
+            session.chest_at(destination).is_some(),
+            "a placement that did not apply must not clear the record"
+        );
+
+        // A real chest placement replaces the stale record's position.
+        assert!(session.player.collect_block(BlockId::Chest).is_some());
+        assert!(session.player.select_slot(0));
+        let remeshed = try_place_selected_block(&mut session).expect("chest places");
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Chest);
+        assert!(
+            session.chest_at(destination).is_none(),
+            "a fresh chest must not inherit stale contents"
+        );
+        assert_eq!(session.player.hotbar_stack(0), None);
+    }
+
+    #[test]
+    fn crafted_chest_places_stores_saves_and_reloads_contents() {
+        use opencraft::player::container::Container;
+        use opencraft::player::inventory::{
+            CraftingGrid, GridKind, Inventory, Item, ItemId, CHEST_SLOTS,
+        };
+        use opencraft::player::physics::Player;
+        use opencraft::world::chunk::linear_index;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("chest-roundtrip.mcvx");
+        let mut session =
+            WorldSession::new_session(5151, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        // Real crafting step: eight planks in the table grid's 3x3 ring.
+        let ring = [0usize, 1, 2, 4, 6, 8, 9, 10];
+        let mut inventory = Inventory::empty();
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        let planks = Item::new(ItemId::Block(BlockId::OakPlanks), 1).expect("planks");
+        for cell in ring {
+            table_grid.set(cell, Some(planks)).expect("ring cell");
+        }
+        let chest = table_grid
+            .take_result(&mut inventory)
+            .expect("eight planks craft one chest");
+        assert_eq!(chest.id(), ItemId::Block(BlockId::Chest));
+        assert!(table_grid.is_empty(), "the craft consumes all eight planks");
+
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 12).expect("stone");
+        inventory.insert(stone).expect("stone fits");
+        session.player = Player::with_inventory(
+            session.player.position,
+            inventory,
+            CraftingGrid::new(GridKind::Player),
+            table_grid,
+        );
+        assert!(session.player.select_slot(0), "the chest is selected");
+
+        let placed = try_place_selected_block(&mut session).expect("crafted chest places");
+        assert!(!placed.is_empty());
+        let pos = IVec3::new(0, 6, 0);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Chest);
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            None,
+            "placement consumed exactly the crafted chest"
+        );
+
+        // Store the stone stack through the real station command pair.
+        aim_table_interaction_at(&mut session, pos);
+        assert!(session.open_chest_at(pos));
+        assert!(session.player.click_inventory_slot(1).is_ok());
+        assert!(session.click_open_chest_slot(0).is_ok());
+        assert_eq!(session.player.inventory().cursor(), None);
+        let stored = Item::new(ItemId::Block(BlockId::Stone), 12).expect("stone");
+        assert_eq!(
+            session
+                .chest_at(pos)
+                .and_then(|container| container.slot(0)),
+            Some(stored),
+            "the chest record holds the moved stack"
+        );
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let (chunk, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        assert_eq!(
+            loaded
+                .chunk_edits
+                .get(&chunk)
+                .and_then(|edits| edits.get(&(linear_index(lx, ly, lz) as u16))),
+            Some(&BlockId::Chest),
+            "the placed chest survives in the saved chunk edits"
+        );
+        assert_eq!(
+            loaded
+                .chests
+                .get(&pos)
+                .and_then(|container| container.slot(0)),
+            Some(stored),
+            "the saved chest record holds the stack"
+        );
+
+        // A restored WorldManager starts with no loaded chunks, so the test
+        // re-creates the all-air neighbourhood and the chest block itself as
+        // scaffolding before reopening the persisted record.
+        let mut restored = WorldSession::session_from_save(loaded, save_path.clone());
+        insert_test_chunk_with_face_neighbors(&mut restored, BlockId::Air);
+        assert!(restored.chests.contains_key(&pos));
+        assert!(!restored
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest)
+            .is_empty());
+        assert!(restored.open_chest_at(pos));
+
+        // Take the stack back into the inventory: this leaves a touched-empty
+        // record rather than deleting it.
+        assert!(restored.click_open_chest_slot(0).is_ok());
+        assert_eq!(restored.player.inventory().cursor(), Some(stored));
+        assert!(restored.player.click_inventory_slot(1).is_ok());
+        assert_eq!(restored.player.inventory().cursor(), None);
+        save_current_world(&mut restored).expect("second save succeeds");
+
+        let reloaded = load_world_from_path(&save_path).expect("second load succeeds");
+        assert_eq!(
+            reloaded.chests.get(&pos),
+            Some(&Container::empty()),
+            "a touched-empty chest keeps its record"
+        );
+        assert_eq!(
+            reloaded
+                .player
+                .inventory
+                .slots()
+                .iter()
+                .flatten()
+                .find(|item| item.id() == ItemId::Block(BlockId::Stone))
+                .map(Item::count),
+            Some(12),
+            "the taken stack is in the saved inventory"
+        );
+        assert_eq!(CHEST_SLOTS, 27, "the record has the full chest width");
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T03: Survival right-click eating priority, hold completion, and
+    // lifecycle resets
+    // -----------------------------------------------------------------------
+
+    fn apple_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Apple), count).expect("valid apple stack")
+    }
+
+    fn bread_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
+    }
+
+    /// A Survival session holding `item` in slot 0 at `hunger`.
+    fn survival_food_session(
+        dir: &Path,
+        seed: u32,
+        name: &str,
+        item: Item,
+        hunger: u16,
+    ) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item);
+        let mut player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        let deficit = MAX_HUNGER - hunger;
+        assert_eq!(
+            player.survival.spend_hunger(deficit),
+            deficit,
+            "hunger fixture"
+        );
+        assert!(player.select_slot(0));
+        session.player = player;
+        session
+    }
+
+    fn selected_food_count(session: &WorldSession) -> Option<u16> {
+        session.player.selected_item().map(|item| item.count())
+    }
+
+    fn tick_until_ate(state: &mut EatingState, target: EatingTarget) -> Option<(usize, ItemId)> {
+        for _ in 0..64 {
+            if let EatingTick::Ate { slot, item, .. } = state.tick(0.1, Some(target)) {
+                return Some((slot, item));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn eating_right_click_prefers_a_targeted_chest_over_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 70, "eat-chest.mcvx", apple_item(3), 10);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::ChestOpened(opened) if opened == pos),
+            "a targeted chest wins over a held apple"
+        );
+        assert_eq!(session.open_chest_position(), Some(pos));
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10, "nothing eaten");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_prefers_a_targeted_table_over_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 71, "eat-table.mcvx", apple_item(3), 10);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::TableOpened));
+        assert_eq!(session.open_table_position(), Some(pos));
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10, "nothing eaten");
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_starts_a_meal_without_consuming_or_placing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 72, "eat-start.mcvx", apple_item(3), 10);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::EatingStarted));
+        assert_eq!(right_click_notice(&outcome), None);
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "starting a meal never edits the world"
+        );
+        assert_eq!(session.open_chest_position(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn eating_right_click_refuses_full_hunger_with_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 73, "eat-full.mcvx", apple_item(3), MAX_HUNGER);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::EatingRefused));
+        assert_eq!(right_click_notice(&outcome), Some("Cannot eat while full"));
+        assert_eq!(selected_food_count(&session), Some(3), "nothing consumed");
+        assert_eq!(session.player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+    }
+
+    #[test]
+    fn eating_right_click_never_starts_in_creative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 74, "eat-creative.mcvx", apple_item(3), 10);
+        session.player.set_mode(GameMode::Creative);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(matches!(outcome, RightClickOutcome::Nothing));
+        assert_eq!(right_click_notice(&outcome), None);
+        assert_eq!(selected_food_count(&session), Some(3));
+        assert_eq!(session.player.survival.hunger(), 10);
+    }
+
+    #[test]
+    fn eating_right_click_falls_through_to_placement_for_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = survival_food_session(
+            dir.path(),
+            75,
+            "eat-place.mcvx",
+            Item::new(ItemId::Block(BlockId::Stone), 2).expect("stone stack"),
+            MAX_HUNGER,
+        );
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut session, pos);
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()),
+            "a non-food block still uses the placement path"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(selected_food_count(&session), Some(1));
+        assert_eq!(session.player.survival.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn eating_candidate_gates_every_cancel_condition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 76, "eat-candidate.mcvx", apple_item(3), 10);
+        let idle = InputState::default();
+
+        let candidate = eating_candidate(&session, &idle, true, true, true)
+            .expect("an idle Survival player holding right click can eat");
+        assert_eq!(candidate.slot(), 0);
+        assert_eq!(candidate.item(), ItemId::Material(Material::Apple));
+        assert_eq!(candidate.restore(), 4);
+
+        assert!(eating_candidate(&session, &idle, false, true, true).is_none());
+        assert!(eating_candidate(&session, &idle, true, false, true).is_none());
+        assert!(eating_candidate(&session, &idle, true, true, false).is_none());
+
+        let moving = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        assert!(eating_candidate(&session, &moving, true, true, true).is_none());
+
+        session.player.set_mode(GameMode::Creative);
+        assert!(eating_candidate(&session, &idle, true, true, true).is_none());
+        session.player.set_mode(GameMode::Survival);
+
+        session.player.survival.damage(MAX_HUNGER);
+        assert!(session.is_dead(), "fixture kills the player");
+        assert!(eating_candidate(&session, &idle, true, true, true).is_none());
+
+        let full = survival_food_session(
+            dir.path(),
+            77,
+            "eat-candidate-full.mcvx",
+            apple_item(3),
+            MAX_HUNGER,
+        );
+        assert!(eating_candidate(&full, &idle, true, true, true).is_none());
+
+        let non_food = survival_food_session(
+            dir.path(),
+            78,
+            "eat-candidate-stick.mcvx",
+            Item::new(ItemId::Material(Material::Stick), 1).expect("stick"),
+            10,
+        );
+        assert!(eating_candidate(&non_food, &idle, true, true, true).is_none());
+    }
+
+    #[test]
+    fn eating_hold_completes_one_apple_then_starts_a_fresh_meal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 79, "eat-apple.mcvx", apple_item(3), 10);
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("meal target");
+        let mut state = EatingState::new();
+
+        let (slot, item) = tick_until_ate(&mut state, target).expect("first meal completes");
+        assert_eq!((slot, item), (0, ItemId::Material(Material::Apple)));
+        assert!(state.progress().is_none(), "Ate resets before returning");
+        assert_eq!(session.player.eat_selected(slot, item), Some(4));
+        assert_eq!(session.player.survival.hunger(), 14);
+        assert_eq!(selected_food_count(&session), Some(2));
+
+        // The hold is still active: the same target starts a fresh cycle.
+        let (slot, item) =
+            tick_until_ate(&mut state, target).expect("a sustained hold starts a second meal");
+        assert_eq!(session.player.eat_selected(slot, item), Some(4));
+        assert_eq!(session.player.survival.hunger(), 18);
+        assert_eq!(selected_food_count(&session), Some(1));
+    }
+
+    #[test]
+    fn eating_hold_bread_restores_more_hunger_than_an_apple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            survival_food_session(dir.path(), 80, "eat-bread.mcvx", bread_item(2), 10);
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("meal target");
+        let mut state = EatingState::new();
+
+        let (slot, item) = tick_until_ate(&mut state, target).expect("bread meal completes");
+        assert_eq!((slot, item), (0, ItemId::Material(Material::Bread)));
+        assert_eq!(session.player.eat_selected(slot, item), Some(6));
+        assert_eq!(session.player.survival.hunger(), 16);
+        assert_eq!(selected_food_count(&session), Some(1));
+    }
+
+    #[test]
+    fn eating_progress_cancels_on_release_panel_slot_change_and_movement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (index, case) in ["release", "panel", "slot", "movement"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut session = survival_food_session(
+                dir.path(),
+                90 + index as u32,
+                &format!("eat-cancel-{case}.mcvx"),
+                apple_item(3),
+                10,
+            );
+            let idle = InputState::default();
+            let target = eating_candidate(&session, &idle, true, true, true).expect("start");
+            let mut state = EatingState::new();
+            for _ in 0..5 {
+                assert!(matches!(
+                    state.tick(0.1, Some(target)),
+                    EatingTick::Eating { .. }
+                ));
+            }
+            assert!(state.progress().is_some(), "{case}: progress accumulated");
+
+            let interrupted = match index {
+                0 => eating_candidate(&session, &idle, false, true, true),
+                1 => eating_candidate(&session, &idle, true, false, true),
+                2 => {
+                    assert!(session.player.select_slot(1));
+                    eating_candidate(&session, &idle, true, true, true)
+                }
+                3 => {
+                    let moving = InputState {
+                        forward: true,
+                        ..Default::default()
+                    };
+                    eating_candidate(&session, &moving, true, true, true)
+                }
+                _ => unreachable!(),
+            };
+            assert!(interrupted.is_none(), "{case}: candidate must cancel");
+            assert!(matches!(state.tick(0.1, interrupted), EatingTick::Idle));
+            assert!(
+                state.progress().is_none(),
+                "{case}: partial progress cleared"
+            );
+            assert_eq!(session.player.survival.hunger(), 10, "{case}: no restore");
+            assert_eq!(
+                session
+                    .player
+                    .inventory()
+                    .hotbar(0)
+                    .map(|item| item.count()),
+                Some(3),
+                "{case}: no consumption"
+            );
+        }
+    }
+
+    #[test]
+    fn eating_right_click_notice_only_explains_full_hunger() {
+        assert_eq!(
+            right_click_notice(&RightClickOutcome::EatingRefused),
+            Some("Cannot eat while full")
+        );
+        for quiet in [
+            RightClickOutcome::EatingStarted,
+            RightClickOutcome::Nothing,
+            RightClickOutcome::TableOpened,
+            RightClickOutcome::ChestOpened(IVec3::ZERO),
+            RightClickOutcome::Placed(Vec::new()),
+        ] {
+            assert_eq!(right_click_notice(&quiet), None);
+        }
+    }
+
+    #[test]
+    fn eating_frame_progress_bar_prefers_eating_then_mining_then_none() {
+        use opencraft::ui::hud::EATING_FILL_COLOR;
+
+        let eating = frame_progress_bar(Some(0.5), Some(0.5), 1280, 720)
+            .expect("eating wins when both bars exist");
+        assert_eq!(eating[1].color, EATING_FILL_COLOR);
+
+        let mining =
+            frame_progress_bar(None, Some(0.5), 1280, 720).expect("mining is the fallback bar");
+        assert_eq!(
+            mining[1].color,
+            mining_progress_quads(0.5, 1280, 720)[1].color
+        );
+        assert_ne!(eating[1].color, mining[1].color);
+
+        assert!(frame_progress_bar(None, None, 1280, 720).is_none());
+    }
+
+    /// S05-T03: a lifecycle screen entry drops the right hold and any partial
+    /// meal, mirroring the S02 left-hold test.
+    #[test]
+    fn eating_state_cleared_by_enter_screen() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.right_mouse_held = true;
+        let target = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        app.eating.tick(0.5, Some(target));
+        assert!(app.eating.progress().is_some());
+
+        app.enter_screen(LifecycleScreen::MainMenu);
+
+        assert!(!app.right_mouse_held, "right hold cleared on screen entry");
+        assert!(
+            app.eating.progress().is_none(),
+            "partial meal cleared on screen entry"
+        );
+    }
+
+    /// S05-T03: a world swap clears the right hold and any partial meal.
+    #[test]
+    fn eating_state_cleared_by_start_world_session() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        app.right_mouse_held = true;
+        let target = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        app.eating.tick(0.5, Some(target));
+        assert!(app.eating.progress().is_some());
+
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+
+        assert!(!app.right_mouse_held, "right hold cleared on session swap");
+        assert!(
+            app.eating.progress().is_none(),
+            "partial meal cleared on session swap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T04: deterministic oak-leaf apple bonus drop
+    // -----------------------------------------------------------------------
+
+    /// Finds one position inside the loaded test chunk whose oak-leaf apple
+    /// roll matches `wanted`. Chunk (0,0,0) spans world 0..32 on every axis and
+    /// its face halo is loaded by [`insert_test_chunk_with_face_neighbors`].
+    fn leaf_position_with_roll(seed: u32, wanted: bool) -> IVec3 {
+        for x in 0..CHUNK_SIZE as i32 {
+            for y in 0..CHUNK_SIZE as i32 {
+                for z in 0..CHUNK_SIZE as i32 {
+                    let pos = IVec3::new(x, y, z);
+                    if opencraft::world::loot::oak_leaves_apple(seed, pos) == wanted {
+                        return pos;
+                    }
+                }
+            }
+        }
+        panic!("no oak-leaf position with roll {wanted} for seed {seed}");
+    }
+
+    /// Total units of one identity across the 36 inventory slots.
+    fn player_item_count(player: &Player, id: ItemId) -> u32 {
+        player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == id)
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn oak_leaves_apple_drop_is_deterministic_and_only_on_a_true_roll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            1,
+            dir.path().join("leaf-apple.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let seed = session.world.seed();
+        let true_pos = leaf_position_with_roll(seed, true);
+        let false_pos = leaf_position_with_roll(seed, false);
+        assert_ne!(true_pos, false_pos, "both rolls must be observable");
+
+        let leaf_id = ItemId::Block(BlockId::OakLeaves);
+        let apple_id = ItemId::Material(Material::Apple);
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            true_pos,
+            BlockId::OakLeaves,
+        ));
+        assert!(!remeshed.is_empty(), "the true-roll leaf break applies");
+        assert_eq!(player_item_count(&session.player, leaf_id), 1);
+        assert_eq!(
+            player_item_count(&session.player, apple_id),
+            1,
+            "a true roll yields exactly one apple"
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            false_pos,
+            BlockId::OakLeaves,
+        ));
+        assert!(!remeshed.is_empty(), "the false-roll leaf break applies");
+        assert_eq!(player_item_count(&session.player, leaf_id), 2);
+        assert_eq!(
+            player_item_count(&session.player, apple_id),
+            1,
+            "a false roll yields no bonus apple"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_replay_on_the_now_air_cell_adds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            2,
+            dir.path().join("leaf-replay.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let pos = leaf_position_with_roll(session.world.seed(), true);
+        applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+        let leaf_id = ItemId::Block(BlockId::OakLeaves);
+        let apple_id = ItemId::Material(Material::Apple);
+        let leaves_before = player_item_count(&session.player, leaf_id);
+        let apples_before = player_item_count(&session.player, apple_id);
+
+        let replay = break_mined_block(&mut session, pos, BlockId::OakLeaves);
+
+        assert!(
+            matches!(replay, BreakOutcome::Rejected(BreakRejection::StaleTarget)),
+            "the now-Air cell is a stale target"
+        );
+        assert_eq!(player_item_count(&session.player, leaf_id), leaves_before);
+        assert_eq!(player_item_count(&session.player, apple_id), apples_before);
+    }
+
+    #[test]
+    fn oak_leaves_apple_is_lost_when_the_inventory_is_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            3,
+            dir.path().join("leaf-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+        let pos = leaf_position_with_roll(session.world.seed(), true);
+
+        // 35 stone stacks plus one free slot: the leaf drop fills the free
+        // slot, so the bonus apple has nowhere to go and is silently lost.
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 64).expect("stone stack");
+        let mut slots = [Some(stone); INVENTORY_SLOTS];
+        slots[INVENTORY_SLOTS - 1] = None;
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+
+        let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+
+        assert!(!remeshed.is_empty(), "the leaf break applies");
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::Stone)),
+            35 * 64,
+            "the stone stacks are untouched"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::OakLeaves)),
+            1,
+            "the leaf drop lands in the last free slot"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Apple)),
+            0,
+            "a full inventory loses only the bonus apple"
+        );
+    }
+
+    #[test]
+    fn oak_leaves_apple_roll_repeats_with_the_same_seed_and_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut drops = Vec::new();
+        for attempt in 0..2 {
+            let mut session = WorldSession::new_session(
+                21,
+                dir.path().join(format!("leaf-repeat-{attempt}.mcvx")),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            );
+            insert_test_chunk_with_face_neighbors(&mut session, BlockId::OakLeaves);
+            let pos = leaf_position_with_roll(session.world.seed(), true);
+            applied_break(break_mined_block(&mut session, pos, BlockId::OakLeaves));
+            drops.push(player_item_count(
+                &session.player,
+                ItemId::Material(Material::Apple),
+            ));
+        }
+
+        assert_eq!(drops, vec![1, 1], "the same seed and position agree");
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T04: production farming wiring (till, plant, tick, harvest)
+    // -----------------------------------------------------------------------
+
+    /// Stands east of `pos` and looks horizontally west, so the ray enters the
+    /// block's +X side face rather than its top. Keeps player and camera in
+    /// sync because the farm seams reach-check against the eye.
+    fn aim_side_face_at(session: &mut WorldSession, pos: IVec3) {
+        session.player.position = Vec3::new(
+            pos.x as f32 + 3.5,
+            pos.y as f32 + 0.5 - PLAYER_EYE_HEIGHT,
+            pos.z as f32 + 0.5,
+        );
+        session.player.yaw = std::f32::consts::PI;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+    }
+
+    fn wood_hoe() -> Item {
+        use opencraft::player::inventory::ToolTier;
+
+        Item::tool_with_durability(ToolKind::Hoe, ToolTier::Wood, 59).expect("wood hoe")
+    }
+
+    #[test]
+    fn hoe_tills_top_face_grass_to_farmland_and_wears_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            30,
+            dir.path().join("hoe-till.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Tilled(ref remeshed) if !remeshed.is_empty()),
+            "a top-face hoe click must report the proven till edit"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "tilling never places the held tool as a block"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "the proven edit wears exactly one point"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(1),
+            "the hoe is never consumed"
+        );
+    }
+
+    #[test]
+    fn hoe_tilling_refuses_side_face_and_non_soil_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            31,
+            dir.path().join("hoe-refuse.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        // A side face is refused before the session seam: the top-face rule
+        // lives in the interaction layer.
+        aim_side_face_at(&mut session, IVec3::new(0, 5, 0));
+        let side = right_click_interaction(&mut session);
+        assert!(matches!(side, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Grass);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "a side-face refusal spends no durability"
+        );
+
+        // A top-face non-soil block passes the face rule but is refused by the
+        // session's live soil re-check, also without mutation.
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        let stone = right_click_interaction(&mut session);
+        assert!(matches!(stone, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Stone);
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "a non-soil refusal spends no durability"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "refusals leave the inventory byte-identical"
+        );
+    }
+
+    #[test]
+    fn planting_wheat_seeds_on_farmland_consumes_exactly_one_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("wheat-plant.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 5).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        let outcome = right_click_interaction(&mut session);
+
+        assert!(
+            matches!(outcome, RightClickOutcome::Planted(ref remeshed) if !remeshed.is_empty()),
+            "a top-face seed click on farmland must plant"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::Farmland,
+            "planting never edits the support block"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(4),
+            "exactly one seed is consumed"
+        );
+    }
+
+    #[test]
+    fn wheat_planting_refuses_occupied_and_non_farmland_targets_without_consuming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("wheat-plant-refuse.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        session.world.set_block_immediate(0, 6, 0, BlockId::Stone);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 3).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+
+        // The ray hits Stone's top face; the adjacent cell has Air but its
+        // support is Stone, never Farmland.
+        let occupied = right_click_interaction(&mut session);
+        assert!(matches!(occupied, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Stone);
+        assert_eq!(session.world.get_block(0, 7, 0), BlockId::Air);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+
+        // A grass top face is not a planting surface either.
+        session.world.set_block_immediate(0, 6, 0, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        let grass = right_click_interaction(&mut session);
+        assert!(matches!(grass, RightClickOutcome::Nothing));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Grass);
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(3),
+            "no refusal consumes a seed"
+        );
+    }
+
+    #[test]
+    fn farming_priority_prefers_stations_and_food_and_works_in_creative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Chest targeting wins over a held hoe and neither edits nor wears.
+        let mut chest_session = WorldSession::new_session(
+            34,
+            dir.path().join("farm-priority-chest.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut chest_session, BlockId::Air);
+        chest_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Chest);
+        chest_session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(chest_session.player.select_slot(0));
+        aim_table_interaction_at(&mut chest_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut chest_session),
+            RightClickOutcome::ChestOpened(pos) if pos == IVec3::new(0, 5, 0)
+        ));
+        assert_eq!(chest_session.world.get_block(0, 5, 0), BlockId::Chest);
+        assert_eq!(
+            chest_session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(59),
+            "opening a station never wears the held tool"
+        );
+
+        // Table targeting wins over a held hoe.
+        let mut table_session = WorldSession::new_session(
+            35,
+            dir.path().join("farm-priority-table.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut table_session, BlockId::Air);
+        table_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::CraftingTable);
+        table_session
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(table_session.player.select_slot(0));
+        aim_table_interaction_at(&mut table_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut table_session),
+            RightClickOutcome::TableOpened
+        ));
+        assert_eq!(
+            table_session.world.get_block(0, 5, 0),
+            BlockId::CraftingTable
+        );
+
+        // Survival food wins over a farmable target: the click starts the meal
+        // instead of tilling the grass below it.
+        let mut food_session =
+            survival_food_session(dir.path(), 36, "farm-priority-food.mcvx", apple_item(2), 10);
+        food_session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Grass);
+        aim_table_interaction_at(&mut food_session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut food_session),
+            RightClickOutcome::EatingStarted
+        ));
+        assert_eq!(
+            food_session.world.get_block(0, 5, 0),
+            BlockId::Grass,
+            "food is interpreted before farming"
+        );
+
+        // Creative still farms: only Survival food is mode-gated.
+        let mut creative = WorldSession::new_session(
+            37,
+            dir.path().join("farm-priority-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(creative.player.mode(), GameMode::Creative);
+        insert_test_chunk_with_face_neighbors(&mut creative, BlockId::Air);
+        creative.world.set_block_immediate(0, 5, 0, BlockId::Grass);
+        creative
+            .player
+            .insert_items(&[wood_hoe()])
+            .expect("hoe fits");
+        assert!(creative.player.select_slot(0));
+        aim_table_interaction_at(&mut creative, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut creative),
+            RightClickOutcome::Tilled(_)
+        ));
+        assert_eq!(creative.world.get_block(0, 5, 0), BlockId::Farmland);
+    }
+
+    #[test]
+    fn breaking_mature_wheat_yields_one_wheat_and_two_seeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            40,
+            dir.path().join("wheat-harvest-mature.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::WheatStage3);
+
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::WheatStage3));
+
+        assert!(!remeshed.is_empty(), "the harvest edit remeshes its chunk");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            1,
+            "mature wheat yields exactly one wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+            2,
+            "mature wheat yields exactly two seeds"
+        );
+    }
+
+    #[test]
+    fn breaking_immature_wheat_yields_one_seed() {
+        for (index, block) in [
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut session = WorldSession::new_session(
+                41 + index as u32,
+                dir.path()
+                    .join(format!("wheat-harvest-immature-{index}.mcvx")),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            );
+            insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+            let pos = IVec3::new(0, 5, 0);
+            session
+                .world
+                .set_block_immediate(pos.x, pos.y, pos.z, block);
+
+            let (remeshed, _) = applied_break(break_mined_block(&mut session, pos, block));
+
+            assert!(!remeshed.is_empty(), "{block:?} harvest applies");
+            assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+            assert_eq!(
+                player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+                0,
+                "{block:?} must not yield wheat"
+            );
+            assert_eq!(
+                player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+                1,
+                "{block:?} yields exactly one seed"
+            );
+        }
+    }
+
+    #[test]
+    fn wheat_harvest_refusal_leaves_block_inventory_and_durability_untouched_and_retries() {
+        use opencraft::player::inventory::ToolTier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            45,
+            dir.path().join("wheat-harvest-full.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let pos = IVec3::new(0, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::WheatStage3);
+
+        // 36 non-stackable tools leave no room for 1 wheat plus 2 seeds.
+        let axe = Item::tool_with_durability(ToolKind::Axe, ToolTier::Wood, 10).expect("axe");
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(axe);
+        }
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+        let inventory_before = session.player.inventory().clone();
+
+        let outcome = break_mined_block(&mut session, pos, BlockId::WheatStage3);
+
+        assert!(
+            matches!(
+                outcome,
+                BreakOutcome::Rejected(BreakRejection::HarvestNoRoom)
+            ),
+            "a full inventory must refuse the harvest"
+        );
+        assert_eq!(
+            session.world.get_block(0, 5, 0),
+            BlockId::WheatStage3,
+            "the refused harvest edits nothing"
+        );
+        assert_eq!(
+            session.player.inventory(),
+            &inventory_before,
+            "the refused harvest inserts nothing"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(10),
+            "the refused harvest spends no durability"
+        );
+
+        // Retrying from an empty inventory succeeds without duplicating loot.
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts([None; INVENTORY_SLOTS], None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, pos, BlockId::WheatStage3));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Nothing);
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            1
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::WheatSeeds)),
+            2
+        );
+    }
+
+    #[test]
+    fn breaking_farmland_removes_the_crop_candidate_above() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            46,
+            dir.path().join("farmland-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland);
+        let seeds = Item::new(ItemId::Material(Material::WheatSeeds), 2).expect("valid seed stack");
+        session.player.insert_items(&[seeds]).expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(_)
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+
+        let (remeshed, _) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 5, 0),
+            BlockId::Farmland,
+        ));
+
+        assert!(!remeshed.is_empty());
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Block(BlockId::Dirt)),
+            1,
+            "farmland still drops dirt"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "the floating crop block itself is not edited"
+        );
+        assert!(
+            session.tick_crops(0.1, 600.0).is_empty(),
+            "the removed candidate produces no advance"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "a floating crop never advances past stage 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T05: end-to-end farm chain through the real interactions
+    // -----------------------------------------------------------------------
+
+    /// Seeds a 4x4 table grid with one unit per cell taken from the live
+    /// inventory, proves the expected recipe preview, installs that grid on the
+    /// player, and crafts exactly once through the production result-slot
+    /// adapter the S05 tool lab uses.
+    ///
+    /// One unit per ingredient is consumed from the inventory before the craft,
+    /// so the conservation asserted by the caller is a real aggregate change:
+    /// the result replaces exactly the units the recipe consumed. The player is
+    /// rebuilt only because `Player::with_inventory` is the one seam that
+    /// accepts a pre-filled grid; position, mode, vitals, and the 2x2 grid are
+    /// preserved.
+    fn craft_once_at_table(
+        session: &mut WorldSession,
+        cells: &[(usize, ItemId)],
+        expected: RecipeId,
+    ) -> Item {
+        let mut inventory = session.player.inventory().clone();
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for &(index, id) in cells {
+            let slot = inventory
+                .slots()
+                .iter()
+                .position(|slot| slot.map(|item| item.id()) == Some(id))
+                .unwrap_or_else(|| panic!("no {id:?} in the inventory for {expected:?}"));
+            let ingredient = inventory
+                .consume_one(slot)
+                .expect("the located slot holds the requested ingredient");
+            table_grid
+                .set(index, Some(ingredient))
+                .expect("the cell index is inside the 4x4 grid");
+        }
+        assert_eq!(
+            table_grid.preview().map(|preview| preview.recipe),
+            Some(expected),
+            "the seeded table cells must match the expected recipe"
+        );
+
+        let position = session.player.position;
+        let player_grid = session.player.player_grid().clone();
+        let mode = session.player.mode();
+        let survival = session.player.survival;
+        session.player = Player::with_inventory(position, inventory, player_grid, table_grid);
+        session.player.set_mode(mode);
+        session.player.survival = survival;
+
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        match apply_inventory_click(
+            &mut session.player,
+            &screen,
+            Some(IVec3::new(0, 5, 0)),
+            InventoryTarget::ResultSlot(GridKind::Table),
+        ) {
+            Ok(InventoryClickOutcome::Crafted(item)) => item,
+            other => panic!("expected the {expected:?} result slot to craft, got {other:?}"),
+        }
+    }
+
+    /// The first inventory slot holding `id`, so crafted tools and looted
+    /// stacks are selected through the real hotbar selection seam.
+    fn player_slot_of(player: &Player, id: ItemId) -> usize {
+        player
+            .inventory()
+            .slots()
+            .iter()
+            .position(|slot| slot.map(|item| item.id()) == Some(id))
+            .unwrap_or_else(|| panic!("no {id:?} in the inventory"))
+    }
+
+    #[test]
+    fn farm_chain_from_seed_to_bread_through_real_interactions() {
+        use opencraft::player::inventory::ToolTier;
+        use opencraft::world::chunk::linear_index;
+        use opencraft::world::daycycle::{GameClock, DEFAULT_TIME_OF_DAY};
+        use opencraft::world::loot::LootItem;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 1u32;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("farm-chain.mcvx"),
+            1,
+            GameMode::Survival,
+        );
+        assert_eq!(session.season(), Season::Spring);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+
+        // The first seeds come from an S06 generated ruin chest, never a
+        // test-only constructor. One-day seasons make seed 1 Spring today and
+        // Winter on day 3.
+        let chest = find_generated_loot_chest(seed, 3);
+        let entries = opencraft::world::terrain::ruin_loot_chest_at(chest, seed)
+            .expect("a generated LootChest resolves its table");
+        assert!(
+            entries.iter().any(|entry| entry.item == LootItem::Wheat),
+            "every ruin guarantees wheat"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.item == LootItem::WheatSeeds),
+            "every ruin guarantees wheat seeds"
+        );
+        let mut loot: Vec<Item> = entries
+            .iter()
+            .map(|entry| {
+                Item::new(ItemId::from(entry.item), entry.min_count)
+                    .expect("a generated loot count is a valid stack")
+            })
+            .collect();
+        // The table guarantees 1..=2 wheat and the mature harvest adds one, so
+        // top up to the three the bread recipe consumes. The shaped hoe also
+        // consumes two planks and two sticks, which the ruin table need not
+        // supply.
+        loot.push(Item::new(ItemId::Material(Material::Wheat), 2).expect("wheat stock"));
+        loot.push(Item::new(ItemId::Block(BlockId::OakPlanks), 2).expect("plank stock"));
+        loot.push(Item::new(ItemId::Material(Material::Stick), 2).expect("stick stock"));
+        session
+            .player
+            .insert_items(&loot)
+            .expect("the ruin loot fits the empty inventory");
+
+        // Flat test world: no generated terrain at the farm coordinates.
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        assert!(
+            !session
+                .world
+                .set_block_immediate(0, 5, 0, BlockId::Grass)
+                .is_empty(),
+            "seeding the farm ground remeshes"
+        );
+
+        // Craft the wood hoe through the shaped recipe and the real
+        // result-slot adapter, then select it.
+        let hoe_id = ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        };
+        let hoe = craft_once_at_table(
+            &mut session,
+            &[
+                (0, ItemId::Block(BlockId::OakPlanks)),
+                (1, ItemId::Block(BlockId::OakPlanks)),
+                (5, ItemId::Material(Material::Stick)),
+                (9, ItemId::Material(Material::Stick)),
+            ],
+            RecipeId::WoodHoe,
+        );
+        assert_eq!(hoe.id(), hoe_id);
+        assert_eq!(hoe.durability(), Some(59), "a fresh wood hoe is full");
+        let hoe_slot = player_slot_of(&session.player, hoe_id);
+        assert!(
+            session.player.select_slot(hoe_slot),
+            "the crafted hoe must be selectable from the hotbar"
+        );
+
+        // Till the top face: exactly one durability is spent only after the
+        // edit is proven.
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Tilled(ref remeshed) if !remeshed.is_empty()
+        ));
+        assert_eq!(session.world.get_block(0, 5, 0), BlockId::Farmland);
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(58),
+            "tilling spends exactly one durability"
+        );
+
+        // Plant the looted seeds: exactly one seed leaves the selected stack.
+        let seeds_id = ItemId::Material(Material::WheatSeeds);
+        let seeds_slot = player_slot_of(&session.player, seeds_id);
+        assert!(session.player.select_slot(seeds_slot));
+        let seeds_before_plant = player_item_count(&session.player, seeds_id);
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(ref remeshed) if !remeshed.is_empty()
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert_eq!(
+            player_item_count(&session.player, seeds_id),
+            seeds_before_plant - 1,
+            "planting consumes exactly one seed"
+        );
+
+        // Winter freezes growth; Spring resumes from the same stage zero.
+        session.clock = GameClock::from_day_and_time(3, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Winter);
+        assert!(
+            session.tick_crops(0.1, 600.0).is_empty(),
+            "winter pauses crop growth"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+
+        session.clock = GameClock::from_day_and_time(0, DEFAULT_TIME_OF_DAY);
+        assert_eq!(session.season(), Season::Spring);
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::WheatStage0,
+            "winter left the crop untouched"
+        );
+        for stage in [
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+        ] {
+            let remeshed = session.tick_crops(0.1, 600.0);
+            assert!(!remeshed.is_empty(), "{stage:?} must remesh the crop");
+            assert_eq!(session.world.get_block(0, 6, 0), stage);
+        }
+
+        // Harvest the mature crop through the production break path.
+        let wheat_before = player_item_count(&session.player, ItemId::Material(Material::Wheat));
+        let seeds_before_harvest = player_item_count(&session.player, seeds_id);
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 6, 0),
+            BlockId::WheatStage3,
+        ));
+        assert!(!remeshed.is_empty(), "the harvest remeshes");
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Nothing,
+            "an empty hand wears nothing"
+        );
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::Air);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            wheat_before + 1,
+            "mature wheat yields exactly one wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, seeds_id),
+            seeds_before_harvest + 2,
+            "mature wheat returns exactly two seeds"
+        );
+
+        // Craft bread from three wheat through the same real recipe path.
+        let wheat_before_bread =
+            player_item_count(&session.player, ItemId::Material(Material::Wheat));
+        let bread_before = player_item_count(&session.player, ItemId::Material(Material::Bread));
+        let bread = craft_once_at_table(
+            &mut session,
+            &[
+                (0, ItemId::Material(Material::Wheat)),
+                (1, ItemId::Material(Material::Wheat)),
+                (2, ItemId::Material(Material::Wheat)),
+            ],
+            RecipeId::Bread,
+        );
+        assert_eq!(bread.id(), ItemId::Material(Material::Bread));
+        assert_eq!(bread.count(), 1);
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Wheat)),
+            wheat_before_bread - 3,
+            "bread consumes exactly three wheat"
+        );
+        assert_eq!(
+            player_item_count(&session.player, ItemId::Material(Material::Bread)),
+            bread_before + 1
+        );
+
+        // Plant again, grow one stage, save, and reload. The stage is an
+        // ordinary v6 chunk edit; the candidate is rebuilt from it at zero.
+        let seeds_slot = player_slot_of(&session.player, seeds_id);
+        assert!(session.player.select_slot(seeds_slot));
+        aim_table_interaction_at(&mut session, IVec3::new(0, 5, 0));
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::Planted(_)
+        ));
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage0);
+        assert!(!session.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(session.world.get_block(0, 6, 0), BlockId::WheatStage1);
+
+        let (crop_chunk, (lx, ly, lz)) = world_to_chunk_and_local(0, 6, 0);
+        let crop_index = linear_index(lx, ly, lz) as u16;
+        assert_eq!(
+            session
+                .world
+                .chunk_edits()
+                .get(&crop_chunk)
+                .and_then(|edits| edits.get(&crop_index)),
+            Some(&BlockId::WheatStage1),
+            "the live stage is recorded as a chunk edit"
+        );
+
+        save_current_world(&mut session).expect("the farm save writes");
+        let loaded = load_world_from_path(&session.save_path).expect("the farm save decodes");
+        let persisted_stage = loaded
+            .chunk_edits
+            .get(&crop_chunk)
+            .and_then(|edits| edits.get(&crop_index))
+            .copied();
+        assert_eq!(
+            persisted_stage,
+            Some(BlockId::WheatStage1),
+            "the visible stage survives the save"
+        );
+        assert_eq!(loaded.seed, seed);
+        assert_eq!(loaded.season_length_days, 1);
+
+        let mut restored = WorldSession::session_from_save(loaded, session.save_path.clone());
+        assert_eq!(restored.season(), Season::Spring);
+        assert_eq!(restored.player.mode(), GameMode::Survival);
+
+        insert_test_chunk_with_face_neighbors(&mut restored, BlockId::Air);
+        assert!(!restored
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Farmland)
+            .is_empty());
+        assert!(!restored
+            .world
+            .set_block_immediate(0, 6, 0, persisted_stage.expect("the saved stage edit"))
+            .is_empty());
+        assert!(!restored.tick_crops(0.1, 600.0).is_empty());
+        assert_eq!(
+            restored.world.get_block(0, 6, 0),
+            BlockId::WheatStage2,
+            "the rebuilt crop resumes growing from the persisted stage"
+        );
     }
 }

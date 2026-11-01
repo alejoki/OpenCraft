@@ -15,7 +15,8 @@
 #         a `timeout` kill surfaces as 124 and is an explicit failure here).
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 5 — the SAVE_VERSION that carries the calendar tail.
+#         is 6 — the SAVE_VERSION that appends the survival header after the
+#         calendar tail.
 #     (d) day_index (u32 LE at byte offset 130) is exactly 4 — four dawn
 #         crossings, one per demo day.
 #     (e) season_length_days (u32 LE at byte offset 134) is the default 1.
@@ -24,10 +25,14 @@
 # (no mining, no placement), so the variable-length chunk section writes a
 # zero edit count and the layout is the header (36 + 27) + time_of_day (4) +
 # chunk count (4) + v4 inventory extension (59) = 130 bytes before the v5
-# tail. Those offsets are pinned by `V5_SEASON_OFFSET`/`V5_SEASON_LEN` in
-# src/world/persistence.rs, so this script and the unit tests cannot drift
-# apart silently. Any header change before the chunk section invalidates those
-# offsets: update the persistence test consts first, then copy them here.
+# calendar tail. The v6 survival header (mode u8, health/hunger/air u16 each,
+# chest count u32 = 11 bytes) is appended after that tail, so the calendar
+# offsets 130/134 stay pinned. Those offsets are pinned by
+# `V5_SEASON_OFFSET`/`V5_SEASON_LEN` in src/world/persistence.rs, so this
+# script and the unit tests cannot drift apart silently; the size check also
+# requires the v6 survival header to be present. Any header change before the
+# chunk section invalidates those offsets: update the persistence test consts
+# first, then copy them here.
 #
 # Why day 4 after one run: the default clock starts at noon (tick 6000) and
 # the T5 multi-cycle watch completes only after four summed 24,000-tick
@@ -76,6 +81,9 @@ V5_SEASON_OFFSET=130
 V5_SEASON_LEN=8
 V5_DAY_INDEX_OFFSET=$V5_SEASON_OFFSET
 V5_SEASON_LENGTH_OFFSET=$((V5_SEASON_OFFSET + 4))
+# v6 survival tail appended after the calendar: mode u8 + health u16 +
+# hunger u16 + air u16 + chest count u32.
+V6_HEADER_LEN=11
 
 SEED=1
 DEMO_DAYS=4
@@ -122,8 +130,8 @@ if [[ ! -f "$SAVE" ]]; then
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN)) ]]; then
-    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v5 calendar tail"
+if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN)) ]]; then
+    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header after the v5 calendar tail"
     exit 1
 fi
 
@@ -134,8 +142,8 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 5 ]]; then
-    echo "WEATHER SMOKE FAIL: save version is $VERSION (expected 5)"
+if [[ "$VERSION" -ne 6 ]]; then
+    echo "WEATHER SMOKE FAIL: save version is $VERSION (expected 6)"
     exit 1
 fi
 

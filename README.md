@@ -8,6 +8,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Efficient Chunk Rendering**: Implements Greedy Meshing to optimize the rendering of voxel chunks, significantly reducing the number of vertices sent to the GPU.
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
+*   **Survival and Creative Modes**: New worlds default to Survival. Survival has 20 health, 20 hunger, and 300 air, shown as a hearts/hunger/air HUD; fall, drowning, and starvation damage; a Death screen with Respawn and Quit (respawn at the deterministic spawn with your inventory kept); hold-to-eat apples and bread; hoe-based wheat farming that pauses in Winter; 27-slot chests; and deterministic ruin loot. Creative keeps flying and building, is invulnerable, never hungry, and never loses air. The mode is chosen at creation and locked.
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
     *   Fly mode for free movement and exploration.
@@ -16,11 +17,12 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Rebindable key controls for movement and actions.
     *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
-*   **Texture Packs**: Swap block textures and menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
+*   **Texture Packs**: Swap block textures and menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. The block array has 32 layers: 23 authorable block textures (the original 16 plus Farmland, four Wheat stages, Chest, and LootChest) with optional per-layer overrides; a pack that supplies only the original 16 layers falls back per layer to the built-in procedural art. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
 *   **Customizable Menu Background**: The panorama behind the main menu is its own saved world at `saves/background/background.mcvx`. Choose **Edit Background** on the main menu to build it with the normal controls; the menu resumes your saved vantage point, time of day, and season. A missing or unreadable file falls back to the built-in scenery and never blocks launch.
-*   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. See the [save and release notes](docs/SAVE-NOTES.md).
+*   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. Version 6 saves round-trip the game mode, health/hunger/air, and every chest's contents; version 1-5 saves load as Creative with full vitals. See the [save and release notes](docs/SAVE-NOTES.md).
 *   **Comprehensive UI System**:
     *   Main Menu (including Edit Background), New Game, Load Game, and Pause screens.
+    *   Chest screen (27 chest slots plus the 36-slot player inventory) and Death screen (Respawn and Quit).
     *   In-game settings menu for live adjustments.
     *   UI logic is decoupled from rendering, built with `glyphon` for text rendering.
 
@@ -62,6 +64,7 @@ You can also launch directly into a world using command-line flags, bypassing th
 *   `--new`: Force the creation of a new world, even if a save file exists at the specified path.
 *   `--seed <NUMBER>`: Specify a seed for world generation.
 *   `--save <PATH>`: Set the path for the save file (e.g., `my_world.mcvx`).
+*   `--creative` / `--survival`: Select the game mode for a fresh world only. The last flag wins; a loaded world keeps its stored mode.
 
 For example, to start a new world with seed 4242:
 
@@ -75,7 +78,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | Key | Action |
 | --- | --- |
 | **Escape** | Open/Close Pause Menu (in-game) or back out of other menus. |
-| **F** | Toggle Fly/Walk mode. |
+| **F** | Toggle Fly/Walk (Creative only). |
 | **F5** | Quick save the current world. |
 
 ### Movement
@@ -90,11 +93,23 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 ### Gameplay
 | Key | Action |
 | --- | --- |
-| **Left Click** | Break block. |
-| **Right Click** | Place block. |
+| **Left Click** | Break block; harvest mature wheat. |
+| **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
 | **Escape** | Open the pause menu (settings are available from there). |
+
+### Survival
+| Key | Action |
+| --- | --- |
+| **Hold Right Click (food)** | Eat an apple or bread from the selected hotbar slot. The progress bar fills over 1.6 s; release or move to cancel. |
+| **Right Click (hoe)** | Till the top face of grass or dirt into Farmland. |
+| **Right Click (Wheat Seeds)** | Plant seeds on Farmland. |
+| **Left Click (wheat)** | Harvest mature wheat for 1 Wheat and 2 Wheat Seeds; immature wheat returns 1 Wheat Seed. |
+| **Right Click (chest)** | Open the chest screen. |
+| **Left Click (chest screen)** | Move a whole stack between the chest and your inventory. Right click is inert in the chest screen. |
+| **E or Escape (chest screen)** | Close the chest screen. |
+| **Respawn / Quit (Death screen)** | Respawn at the deterministic spawn with full vitals and your inventory kept, or Quit to save and return to the menu. |
 
 ## 📂 Project Structure
 

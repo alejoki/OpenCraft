@@ -15,6 +15,7 @@ pub enum LifecycleScreen {
     Playing,
     Pause,
     Settings(SettingsCaller),
+    Death,
 }
 
 /// Compatibility alias for callers that prefer the shorter screen name.
@@ -68,6 +69,14 @@ pub enum SettingsIntent {
     Back,
 }
 
+/// Intents accepted by the death screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathIntent {
+    Respawn,
+    /// Leave the world through the existing save-on-quit path.
+    Quit,
+}
+
 /// A screen-specific intent submitted to [`LifecycleState::dispatch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleIntent {
@@ -76,6 +85,7 @@ pub enum LifecycleIntent {
     LoadGame(LoadGameIntent),
     Pause(PauseIntent),
     Settings(SettingsIntent),
+    Death(DeathIntent),
 }
 
 /// The application-level action resulting from a valid lifecycle intent.
@@ -93,6 +103,8 @@ pub enum LifecycleDecision {
     EditBackground,
     /// The caller should return control to the active session.
     ResumeGame,
+    /// The caller should respawn the active session, then enter Playing.
+    Respawn,
     /// The caller should save the active session, then show the main menu.
     SaveAndQuit,
     /// The caller should terminate the application.
@@ -151,7 +163,9 @@ impl LifecycleState {
                 // The caller switches to Playing only after the edit session
                 // is installed, so a failed load leaves the menu untouched.
             }
-            LifecycleDecision::ResumeGame => self.screen = LifecycleScreen::Playing,
+            LifecycleDecision::ResumeGame | LifecycleDecision::Respawn => {
+                self.screen = LifecycleScreen::Playing
+            }
             LifecycleDecision::SaveAndQuit => self.screen = LifecycleScreen::MainMenu,
             LifecycleDecision::ExitGame => {}
         }
@@ -192,6 +206,10 @@ pub fn decide(screen: LifecycleScreen, intent: LifecycleIntent) -> LifecycleResu
                 SettingsCaller::Pause => LifecycleScreen::Pause,
             })
         }
+        (LifecycleScreen::Death, LifecycleIntent::Death(intent)) => match intent {
+            DeathIntent::Respawn => LifecycleDecision::Respawn,
+            DeathIntent::Quit => LifecycleDecision::SaveAndQuit,
+        },
         _ => {
             return Err(LifecycleError::IntentNotAllowed { screen, intent });
         }
@@ -298,6 +316,77 @@ mod tests {
     }
 
     #[test]
+    fn death_exposes_respawn_and_quit_to_save_and_quit() {
+        assert_eq!(
+            decide(Screen::Death, LifecycleIntent::Death(DeathIntent::Respawn)),
+            Ok(LifecycleDecision::Respawn)
+        );
+        assert_eq!(
+            decide(Screen::Death, LifecycleIntent::Death(DeathIntent::Quit)),
+            Ok(LifecycleDecision::SaveAndQuit)
+        );
+    }
+
+    #[test]
+    fn death_rejects_non_death_intents_on_every_screen_and_death_intents_elsewhere() {
+        let non_death_intents = [
+            LifecycleIntent::MainMenu(MainMenuIntent::NewGame),
+            LifecycleIntent::NewGame(NewGameIntent::Back),
+            LifecycleIntent::LoadGame(LoadGameIntent::Back),
+            LifecycleIntent::Pause(PauseIntent::Resume),
+            LifecycleIntent::Settings(SettingsIntent::Back),
+        ];
+        for intent in non_death_intents {
+            assert_eq!(
+                decide(Screen::Death, intent),
+                Err(LifecycleError::IntentNotAllowed {
+                    screen: Screen::Death,
+                    intent,
+                }),
+                "Death must reject {intent:?}"
+            );
+        }
+        let death_intents = [
+            LifecycleIntent::Death(DeathIntent::Respawn),
+            LifecycleIntent::Death(DeathIntent::Quit),
+        ];
+        for screen in [
+            Screen::MainMenu,
+            Screen::NewGame,
+            Screen::LoadGame,
+            Screen::Playing,
+            Screen::Pause,
+            Screen::Settings(SettingsCaller::MainMenu),
+            Screen::Settings(SettingsCaller::Pause),
+        ] {
+            for intent in death_intents {
+                assert_eq!(
+                    decide(screen, intent),
+                    Err(LifecycleError::IntentNotAllowed { screen, intent }),
+                    "{screen:?} must reject {intent:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn death_dispatch_moves_respawn_to_playing_and_quit_to_main_menu() {
+        let mut state = LifecycleState::from_screen(Screen::Death);
+        assert_eq!(
+            state.dispatch(LifecycleIntent::Death(DeathIntent::Respawn)),
+            Ok(LifecycleDecision::Respawn)
+        );
+        assert_eq!(state.screen(), Screen::Playing);
+
+        let mut state = LifecycleState::from_screen(Screen::Death);
+        assert_eq!(
+            state.dispatch(LifecycleIntent::Death(DeathIntent::Quit)),
+            Ok(LifecycleDecision::SaveAndQuit)
+        );
+        assert_eq!(state.screen(), Screen::MainMenu);
+    }
+
+    #[test]
     fn settings_back_returns_to_the_caller_without_changing_settings_semantics() {
         assert_eq!(
             decide(
@@ -361,6 +450,7 @@ mod tests {
             Screen::Pause,
             Screen::Settings(SettingsCaller::MainMenu),
             Screen::Settings(SettingsCaller::Pause),
+            Screen::Death,
         ] {
             let intent = LifecycleIntent::MainMenu(MainMenuIntent::EditBackground);
             assert_eq!(

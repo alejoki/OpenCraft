@@ -24,6 +24,7 @@ use super::lifecycle::LifecycleScreen;
 use super::menu::{hit_test, MenuMessage, Rect, MENU_PAD, MENU_TOP, MESSAGE_TICKS};
 use super::text_input::{TextInput, TextInputAction, TextInputOutcome};
 use super::LINE_HEIGHT;
+use crate::player::survival::GameMode;
 use crate::world::catalog::{
     is_duplicate_name, validate_world_name, CatalogRow, ConfirmOutcome, DeleteConfirmation,
     PendingDelete, RowStatus, WorldNameError, MAX_WORLD_NAME_LEN,
@@ -104,6 +105,33 @@ impl PauseRow {
             PauseRow::Resume => "Resume",
             PauseRow::Settings => "Settings",
             PauseRow::SaveAndQuit => "Save and Quit",
+        }
+    }
+}
+
+/// One death-screen row, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathRow {
+    Respawn,
+    Quit,
+}
+
+/// All death rows, top-to-bottom in display order.
+pub const DEATH_ROWS: [DeathRow; 2] = [DeathRow::Respawn, DeathRow::Quit];
+
+/// Total number of death rows.
+pub const DEATH_ROW_COUNT: usize = DEATH_ROWS.len();
+
+/// Title line shown above the death rows. It occupies text line 0, so the
+/// clickable rows start at line 1.
+pub const DEATH_TITLE: &str = "You Died";
+
+impl DeathRow {
+    /// Human-facing row label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            DeathRow::Respawn => "Respawn",
+            DeathRow::Quit => "Quit",
         }
     }
 }
@@ -193,6 +221,28 @@ pub fn hovered_pause_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> 
         .map(|index| PAUSE_ROWS[index])
 }
 
+/// Geometry of death row `index`, or `None` out of range. The title
+/// occupies text line 0, so row 0 sits on text line 1 and row 1 on line 2.
+pub fn death_row_rect(surface_w: u32, surface_h: u32, index: usize) -> Option<Rect> {
+    let _ = surface_h;
+    (index < DEATH_ROW_COUNT).then(|| fixed_row_rect(surface_w, index + 1, SCREEN_WIDTH))
+}
+
+/// The dark panel rect behind the death title and all death rows.
+pub fn death_panel_rect(surface_w: u32, surface_h: u32) -> Rect {
+    let _ = surface_h;
+    fixed_panel_rect(surface_w, SCREEN_WIDTH, DEATH_ROW_COUNT + 1)
+}
+
+/// Which death row the cursor is over, if any.
+pub fn hovered_death_row(cursor: (f32, f32), surface_w: u32, surface_h: u32) -> Option<DeathRow> {
+    (0..DEATH_ROW_COUNT)
+        .find(|&index| {
+            death_row_rect(surface_w, surface_h, index).is_some_and(|r| hit_test(cursor, r))
+        })
+        .map(|index| DEATH_ROWS[index])
+}
+
 // ---------------------------------------------------------------------------
 // New-game screen: targets and geometry
 // ---------------------------------------------------------------------------
@@ -208,24 +258,26 @@ pub const NEW_GAME_SEASON_LENGTHS: [u32; 4] =
     [crate::world::season::DEFAULT_SEASON_LENGTH_DAYS, 2, 4, 8];
 
 /// One clickable/hoverable target on the new-game screen, in display
-/// order: two text fields, then four action rows (the season-length row
-/// is a cycler, like the settings-screen choice rows).
+/// order: two text fields, then five action rows (the season-length and
+/// game-mode rows are cyclers, like the settings-screen choice rows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewGameTarget {
     NameField,
     SeedField,
     Randomize,
     SeasonLength,
+    GameMode,
     Create,
     Back,
 }
 
 /// All new-game rows, top-to-bottom in display order.
-pub const NEW_GAME_ROWS: [NewGameTarget; 6] = [
+pub const NEW_GAME_ROWS: [NewGameTarget; 7] = [
     NewGameTarget::NameField,
     NewGameTarget::SeedField,
     NewGameTarget::Randomize,
     NewGameTarget::SeasonLength,
+    NewGameTarget::GameMode,
     NewGameTarget::Create,
     NewGameTarget::Back,
 ];
@@ -242,6 +294,7 @@ impl NewGameTarget {
             NewGameTarget::SeedField => "Seed (blank = random)",
             NewGameTarget::Randomize => "Randomize Seed",
             NewGameTarget::SeasonLength => "Season Length",
+            NewGameTarget::GameMode => "Game Mode",
             NewGameTarget::Create => "Create World",
             NewGameTarget::Back => "Back",
         }
@@ -471,6 +524,10 @@ pub struct NewGameScreen {
     /// cycler state. Always in range: only [`Self::cycle_season_length`]
     /// writes it, and it wraps modulo the list length.
     season_length_index: usize,
+    /// The game-mode row's cycler state. Defaults to [`GameMode::Survival`]:
+    /// the New Game screen is a survival-first selection, unlike the pre-M008
+    /// CLI default which stays Creative. Only [`Self::cycle_mode`] writes it.
+    mode: GameMode,
     message: Option<MenuMessage>,
 }
 
@@ -488,6 +545,7 @@ impl NewGameScreen {
             seed: TextInput::new(SEED_MAX_CHARS),
             focus: FocusField::Name,
             season_length_index: 0,
+            mode: GameMode::Survival,
             message: None,
         }
     }
@@ -544,6 +602,21 @@ impl NewGameScreen {
     pub fn cycle_season_length(&mut self) -> u32 {
         self.season_length_index = (self.season_length_index + 1) % NEW_GAME_SEASON_LENGTHS.len();
         self.season_length_days()
+    }
+
+    /// The selected game mode for the world Create will build. Default is
+    /// [`GameMode::Survival`]; the value feeds
+    /// `session::new_session_with_mode` at Create time.
+    pub fn mode(&self) -> GameMode {
+        self.mode
+    }
+
+    /// Advance the game-mode row to the other mode (Survival → Creative →
+    /// Survival). Like the season-length cycler this is click-only, so the
+    /// text-focus cycle and `screen_key_action` are untouched.
+    pub fn cycle_mode(&mut self) -> GameMode {
+        self.mode = self.mode.next();
+        self.mode
     }
 
     /// The currently focused field, by reference.
@@ -637,6 +710,8 @@ fn insert_caret(value: &str, cursor: usize) -> String {
 /// The season-length row never takes text focus (Tab only toggles
 /// [`FocusField`]), so it renders as a plain `Season Length: N day(s)`
 /// value line and the pluralization is honest: "1 day" but "4 days".
+/// The game-mode row follows it as `Game Mode: Survival|Creative`; it is
+/// likewise click-only.
 pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
     let name = screen.name().value();
     let seed = screen.seed().value();
@@ -660,6 +735,7 @@ pub fn new_game_row_lines(screen: &NewGameScreen) -> Vec<String> {
         seed_line,
         NewGameTarget::Randomize.label().to_string(),
         season_length_line(screen.season_length_days()),
+        game_mode_line(screen.mode()),
         NewGameTarget::Create.label().to_string(),
         NewGameTarget::Back.label().to_string(),
     ]
@@ -672,6 +748,11 @@ fn season_length_line(days: u32) -> String {
     } else {
         format!("Season Length: {days} days")
     }
+}
+
+/// The game-mode row's display text, e.g. "Game Mode: Survival".
+fn game_mode_line(mode: GameMode) -> String {
+    format!("{}: {}", NewGameTarget::GameMode.label(), mode.label())
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +975,9 @@ pub fn screen_key_action(
             KeyCode::Escape => ScreenKeyAction::Back,
             _ => ScreenKeyAction::None,
         },
+        // The death screen is click-only: the player must choose Respawn or
+        // Quit explicitly, so no key (Escape and Enter included) may act.
+        LifecycleScreen::Death => ScreenKeyAction::None,
         LifecycleScreen::MainMenu | LifecycleScreen::Playing | LifecycleScreen::Settings(_) => {
             ScreenKeyAction::None
         }
@@ -943,6 +1027,92 @@ mod tests {
     }
 
     #[test]
+    fn death_rows_are_in_display_order_with_labels_and_title() {
+        assert_eq!(DEATH_ROW_COUNT, 2);
+        assert_eq!(DEATH_ROWS, [DeathRow::Respawn, DeathRow::Quit]);
+        assert_eq!(DEATH_TITLE, "You Died");
+        assert_eq!(DeathRow::Respawn.label(), "Respawn");
+        assert_eq!(DeathRow::Quit.label(), "Quit");
+    }
+
+    #[test]
+    fn death_geometry_is_contiguous_with_the_title_line() {
+        // The title is text line 0; row 0 starts on line 1 and row 1 on line 2.
+        let (title_x, title_y, title_w, title_h) = fixed_row_rect(SW, 0, SCREEN_WIDTH);
+        let (x0, y0, w0, h0) = death_row_rect(SW, SH, 0).unwrap();
+        assert_eq!(x0, title_x);
+        assert_eq!(w0, title_w);
+        assert_eq!(h0, LINE_HEIGHT);
+        assert_eq!(y0, title_y + title_h, "row 0 sits directly under the title");
+
+        let (x1, y1, w1, h1) = death_row_rect(SW, SH, 1).unwrap();
+        assert_eq!((x1, w1, h1), (x0, w0, h0));
+        assert_eq!(y1, y0 + h0, "row 1 sits directly under row 0");
+        assert_eq!(death_row_rect(SW, SH, DEATH_ROW_COUNT), None);
+        assert_eq!(death_row_rect(SW, SH, 99), None);
+
+        // The panel covers the title plus both rows with symmetric padding.
+        let (px, py, pw, ph) = death_panel_rect(SW, SH);
+        assert_eq!(px, title_x - MENU_PAD);
+        assert_eq!(py, MENU_TOP);
+        assert_eq!(pw, SCREEN_WIDTH + 2.0 * MENU_PAD);
+        assert_eq!(
+            ph,
+            2.0 * MENU_PAD + (DEATH_ROW_COUNT + 1) as f32 * LINE_HEIGHT
+        );
+        assert_eq!(title_y - py, MENU_PAD);
+        assert_eq!(py + ph - (y1 + h1), MENU_PAD);
+
+        // Narrow/zero surfaces clamp exactly like the other fixed screens.
+        assert_eq!(death_row_rect(200, SH, 0).unwrap().0, 0.0);
+        assert_eq!(death_panel_rect(200, SH).0, 0.0 - MENU_PAD);
+    }
+
+    #[test]
+    fn death_hover_hit_tests_the_rows_half_open_and_misses_the_title() {
+        let (x, y, w, h) = death_row_rect(SW, SH, 0).unwrap();
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, y + h / 2.0), SW, SH),
+            Some(DeathRow::Respawn)
+        );
+        assert_eq!(
+            hovered_death_row((x, y), SW, SH),
+            Some(DeathRow::Respawn),
+            "top-left corner is inside"
+        );
+        assert_eq!(
+            hovered_death_row((x + w, y + h / 2.0), SW, SH),
+            None,
+            "right edge is outside"
+        );
+        let (x1, y1, w1, _) = death_row_rect(SW, SH, 1).unwrap();
+        assert_eq!(
+            hovered_death_row((x1 + w1 / 2.0, y1 + h / 2.0), SW, SH),
+            Some(DeathRow::Quit)
+        );
+        assert_eq!(
+            hovered_death_row((x1, y1), SW, SH),
+            Some(DeathRow::Quit),
+            "the Respawn/Quit boundary belongs to the lower row"
+        );
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, y - 1.0), SW, SH),
+            None,
+            "the title line is not clickable"
+        );
+        assert_eq!(
+            hovered_death_row((0.0, 0.0), SW, SH),
+            None,
+            "above the panel"
+        );
+        assert_eq!(
+            hovered_death_row((x + w / 2.0, SW as f32 + 500.0), SW, SH),
+            None,
+            "below the last row"
+        );
+    }
+
+    #[test]
     fn every_row_and_target_label_is_non_empty() {
         for row in MAIN_MENU_ROWS {
             assert!(!row.label().is_empty());
@@ -950,6 +1120,10 @@ mod tests {
         for row in PAUSE_ROWS {
             assert!(!row.label().is_empty());
         }
+        for row in DEATH_ROWS {
+            assert!(!row.label().is_empty());
+        }
+        assert!(!DEATH_TITLE.is_empty());
         for target in NEW_GAME_ROWS {
             assert!(!target.label().is_empty());
         }
@@ -1193,8 +1367,9 @@ mod tests {
         );
         assert_eq!(hovered_pause_row((x, 0.0), SW, SH), None, "above the panel");
 
-        // new-game targets: name field (0) and create (4; SeasonLength
-        // was inserted at 3, shifting the action rows down)
+        // new-game targets: name field (0), the game-mode cycler (4), and
+        // create (5; SeasonLength sits at 3 and GameMode was inserted at 4,
+        // shifting Create/Back down one more)
         let (x, y0, w, h) = new_game_row_rect(SW, SH, 0).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w / 2.0, y0 + h / 2.0), SW, SH),
@@ -1208,6 +1383,11 @@ mod tests {
         let (_, y4, w4, h4) = new_game_row_rect(SW, SH, 4).unwrap();
         assert_eq!(
             hovered_new_game_target((x + w4 / 2.0, y4 + h4 / 2.0), SW, SH),
+            Some(NewGameTarget::GameMode)
+        );
+        let (_, y5, w5, h5) = new_game_row_rect(SW, SH, 5).unwrap();
+        assert_eq!(
+            hovered_new_game_target((x + w5 / 2.0, y5 + h5 / 2.0), SW, SH),
             Some(NewGameTarget::Create)
         );
         assert_eq!(hovered_new_game_target((0.0, 0.0), SW, SH), None);
@@ -1624,6 +1804,7 @@ mod tests {
                 "  Seed: (random)".to_string(),
                 "Randomize Seed".to_string(),
                 "Season Length: 1 day".to_string(),
+                "Game Mode: Survival".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1641,6 +1822,7 @@ mod tests {
                 "> Seed:   |".to_string(),
                 "Randomize Seed".to_string(),
                 "Season Length: 1 day".to_string(),
+                "Game Mode: Survival".to_string(),
                 "Create World".to_string(),
                 "Back".to_string(),
             ]
@@ -1651,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn new_game_rows_include_the_season_length_cycler_between_randomize_and_create() {
+    fn new_game_rows_include_the_season_length_and_game_mode_cyclers_before_create() {
         assert_eq!(
             NEW_GAME_ROWS,
             [
@@ -1659,15 +1841,47 @@ mod tests {
                 NewGameTarget::SeedField,
                 NewGameTarget::Randomize,
                 NewGameTarget::SeasonLength,
+                NewGameTarget::GameMode,
                 NewGameTarget::Create,
                 NewGameTarget::Back,
             ]
         );
-        assert_eq!(NEW_GAME_ROW_COUNT, 6);
+        assert_eq!(NEW_GAME_ROW_COUNT, 7);
         assert_eq!(NewGameTarget::SeasonLength.label(), "Season Length");
-        // Create/Back shifted down by one: the enum order is the click map.
-        assert_eq!(NEW_GAME_ROWS[4], NewGameTarget::Create);
-        assert_eq!(NEW_GAME_ROWS[5], NewGameTarget::Back);
+        assert_eq!(NewGameTarget::GameMode.label(), "Game Mode");
+        // SeasonLength stays pinned at 3; GameMode is inserted at 4 and
+        // Create/Back shift down by one: enum order is the click map.
+        assert_eq!(NEW_GAME_ROWS[3], NewGameTarget::SeasonLength);
+        assert_eq!(NEW_GAME_ROWS[4], NewGameTarget::GameMode);
+        assert_eq!(NEW_GAME_ROWS[5], NewGameTarget::Create);
+        assert_eq!(NEW_GAME_ROWS[6], NewGameTarget::Back);
+    }
+
+    #[test]
+    fn game_mode_defaults_to_survival_and_cycles_to_creative_and_back() {
+        let mut screen = NewGameScreen::new();
+        assert_eq!(screen.mode(), GameMode::Survival, "survival-first default");
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Survival");
+
+        assert_eq!(screen.cycle_mode(), GameMode::Creative);
+        assert_eq!(screen.mode(), GameMode::Creative);
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Creative");
+
+        assert_eq!(screen.cycle_mode(), GameMode::Survival);
+        assert_eq!(new_game_row_lines(&screen)[4], "Game Mode: Survival");
+
+        // The mode row is click-only: Tab keeps toggling exactly the two
+        // text fields, and cycling the mode leaves both values and the
+        // focused field untouched (one writer per event).
+        screen.apply(TextInputAction::InsertText("Deep Dark".into()));
+        screen.cycle_mode();
+        assert_eq!(screen.focus(), FocusField::Name);
+        assert_eq!(screen.name().value(), "Deep Dark");
+        assert_eq!(screen.season_length_days(), 1);
+        assert_eq!(
+            screen_key_action(LifecycleScreen::NewGame, KeyCode::Tab, false),
+            ScreenKeyAction::CycleField
+        );
     }
 
     #[test]
@@ -1824,6 +2038,22 @@ mod tests {
             screen_key_action(LifecycleScreen::Pause, KeyCode::Enter, false),
             ScreenKeyAction::None
         );
+
+        // death: click-only, so no key acts — Escape and Enter included
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Tab,
+            KeyCode::Space,
+            KeyCode::ArrowDown,
+        ] {
+            assert_eq!(
+                screen_key_action(LifecycleScreen::Death, key, false),
+                ScreenKeyAction::None,
+                "{key:?} must not act on the death screen"
+            );
+        }
 
         // main menu: nothing to back out to — a documented no-op
         assert_eq!(

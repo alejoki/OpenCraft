@@ -12,7 +12,7 @@
 #     must not block launch and must not be repaired, rewritten, or deleted.
 #     The process survives 10 s and the bytes are identical afterwards.
 #
-#   Variant C (valid file): create a real v5 save at the background path with
+#   Variant C (valid file): create a real v6 save at the background path with
 #     the bounded accelerated demo (--new/--save), then bare-launch the menu
 #     for 10 s and assert the file is byte-identical. The menu is a reader:
 #     idling on it never writes the background.

@@ -15,6 +15,7 @@
 //! consumers can migrate without regaining mutable slot arrays.
 
 use crate::world::block::BlockId;
+use crate::world::loot::LootItem;
 
 /// Number of hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
@@ -37,6 +38,12 @@ pub const MATERIAL_STACK_LIMIT: u16 = 64;
 
 /// Largest storage bound for any crafting grid (4x4 inclusive).
 pub const MAX_GRID_SLOTS: usize = 16;
+
+/// Number of durable chest slots in a world chest.
+pub const CHEST_SLOTS: usize = 27;
+
+/// Fixed-size chest storage: 27 optional validated items.
+pub type ChestSlots = [Option<Item>; CHEST_SLOTS];
 
 /// Side length of the player (inventory) crafting grid.
 pub const PLAYER_GRID_DIM: usize = 2;
@@ -62,10 +69,7 @@ impl ItemStack {
     /// Builds a stack, rejecting blocks that cannot be carried and counts
     /// outside `1..=MAX_STACK_COUNT`.
     pub fn new(block: BlockId, count: u16) -> Option<Self> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water)
-            || count == 0
-            || count > MAX_STACK_COUNT
-        {
+        if !block.is_carryable() || count == 0 || count > MAX_STACK_COUNT {
             return None;
         }
         Some(Self { block, count })
@@ -103,7 +107,7 @@ impl Hotbar {
     /// slot is capped at `MAX_STACK_COUNT`. Returns the first slot written, or
     /// `None` when the block/amount is invalid or nothing can be accepted.
     pub fn collect(&mut self, block: BlockId, amount: u16) -> Option<usize> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
+        if !block.is_carryable() || amount == 0 {
             return None;
         }
 
@@ -177,16 +181,24 @@ impl Default for Hotbar {
 // Item identity and validated instances
 // ---------------------------------------------------------------------------
 
-/// Non-block materials produced by crafting.
+/// Non-block materials produced by crafting or harvested from the world.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Material {
     Stick,
+    Apple,
+    Wheat,
+    WheatSeeds,
+    Bread,
 }
 
 impl Material {
     pub const fn name(self) -> &'static str {
         match self {
             Material::Stick => "Stick",
+            Material::Apple => "Apple",
+            Material::Wheat => "Wheat",
+            Material::WheatSeeds => "Wheat Seeds",
+            Material::Bread => "Bread",
         }
     }
 }
@@ -197,6 +209,7 @@ pub enum ToolKind {
     Pickaxe,
     Axe,
     Shovel,
+    Hoe,
 }
 
 impl ToolKind {
@@ -205,6 +218,7 @@ impl ToolKind {
             ToolKind::Pickaxe => "Pickaxe",
             ToolKind::Axe => "Axe",
             ToolKind::Shovel => "Shovel",
+            ToolKind::Hoe => "Hoe",
         }
     }
 }
@@ -277,13 +291,35 @@ impl ItemId {
                 (ToolTier::Wood, ToolKind::Pickaxe) => "Wood Pickaxe",
                 (ToolTier::Wood, ToolKind::Axe) => "Wood Axe",
                 (ToolTier::Wood, ToolKind::Shovel) => "Wood Shovel",
+                (ToolTier::Wood, ToolKind::Hoe) => "Wood Hoe",
                 (ToolTier::Stone, ToolKind::Pickaxe) => "Stone Pickaxe",
                 (ToolTier::Stone, ToolKind::Axe) => "Stone Axe",
                 (ToolTier::Stone, ToolKind::Shovel) => "Stone Shovel",
+                (ToolTier::Stone, ToolKind::Hoe) => "Stone Hoe",
                 (ToolTier::Iron, ToolKind::Pickaxe) => "Iron Pickaxe",
                 (ToolTier::Iron, ToolKind::Axe) => "Iron Axe",
                 (ToolTier::Iron, ToolKind::Shovel) => "Iron Shovel",
+                (ToolTier::Iron, ToolKind::Hoe) => "Iron Hoe",
             },
+        }
+    }
+}
+
+/// Maps a worldgen loot identity onto the player item identity it yields.
+///
+/// Ores resolve to their block item; harvested plants resolve to the matching
+/// material. This is the only bridge from [`LootItem`] into this module —
+/// worldgen itself never imports the player layer.
+impl From<LootItem> for ItemId {
+    fn from(item: LootItem) -> Self {
+        match item {
+            LootItem::Apple => ItemId::Material(Material::Apple),
+            LootItem::Bread => ItemId::Material(Material::Bread),
+            LootItem::Wheat => ItemId::Material(Material::Wheat),
+            LootItem::WheatSeeds => ItemId::Material(Material::WheatSeeds),
+            LootItem::Stick => ItemId::Material(Material::Stick),
+            LootItem::CoalOre => ItemId::Block(BlockId::CoalOre),
+            LootItem::IronOre => ItemId::Block(BlockId::IronOre),
         }
     }
 }
@@ -327,9 +363,7 @@ impl Item {
     /// must be count one (they start at full durability).
     pub fn new(id: ItemId, count: u16) -> Result<Self, ItemError> {
         match id {
-            ItemId::Block(BlockId::Air | BlockId::Bedrock | BlockId::Water) => {
-                Err(ItemError::UncarryableBlock)
-            }
+            ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
             ItemId::Tool { tier, .. } => {
@@ -716,6 +750,35 @@ impl Inventory {
         Ok(())
     }
 
+    /// Whether every item in `items` fits, in order, without touching the
+    /// cursor or either crafting grid.
+    ///
+    /// This is a trial run of [`Inventory::insert_all`]: the items compete for
+    /// the same mergeable stacks and empty slots, so per-item `can_insert`
+    /// checks are not equivalent when the list contains several stacks of the
+    /// same identity.
+    pub fn can_insert_all(&self, items: &[Item]) -> bool {
+        let mut trial = self.clone();
+        items.iter().all(|item| trial.insert(*item).is_ok())
+    }
+
+    /// Inserts every item completely or none at all.
+    ///
+    /// Works on a clone and commits the whole slot array only after the last
+    /// item inserts, which is what makes the chest-break preflight atomic for
+    /// heterogeneous contents plus the chest's own drop item. The cursor and
+    /// both crafting grids are never part of the trial or the commit.
+    pub fn insert_all(&mut self, items: &[Item]) -> Result<(), InventoryError> {
+        let mut trial = self.clone();
+        for item in items {
+            trial.insert(*item)?;
+        }
+        // A full inventory clone is cheap (36 copyable slots) and committing
+        // the slots keeps the cursor exactly as the caller left it.
+        self.slots = trial.slots;
+        Ok(())
+    }
+
     /// Best-effort block collection in hotbar-then-main order.
     ///
     /// Unlike [`Inventory::insert`], this matches world pickup semantics: it
@@ -723,7 +786,7 @@ impl Inventory {
     /// the remainder. Returns `None` (no mutation) when nothing was accepted
     /// or the block cannot be carried.
     pub fn collect_block(&mut self, block: BlockId, amount: u16) -> Option<CollectOutcome> {
-        if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) || amount == 0 {
+        if !block.is_carryable() || amount == 0 {
             return None;
         }
 
@@ -1031,6 +1094,7 @@ pub enum RecipeId {
     Planks,
     Sticks,
     CraftingTable,
+    Chest,
     WoodPickaxe,
     WoodAxe,
     WoodShovel,
@@ -1040,6 +1104,10 @@ pub enum RecipeId {
     IronPickaxe,
     IronAxe,
     IronShovel,
+    Bread,
+    WoodHoe,
+    StoneHoe,
+    IronHoe,
 }
 
 /// Read-only recipe evaluation result.
@@ -1110,6 +1178,12 @@ const RECIPES: &[Recipe] = &[
         id: RecipeId::CraftingTable,
         pattern: &["PP", "PP"],
         output: ItemId::Block(BlockId::CraftingTable),
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::Chest,
+        pattern: &["PPP", "P P", "PPP"],
+        output: ItemId::Block(BlockId::Chest),
         output_count: 1,
     },
     Recipe {
@@ -1193,9 +1267,48 @@ const RECIPES: &[Recipe] = &[
         },
         output_count: 1,
     },
+    Recipe {
+        id: RecipeId::Bread,
+        pattern: &["WWW"],
+        output: ItemId::Material(Material::Bread),
+        output_count: 1,
+    },
+    // Hoes are 2 wide and 3 tall, so they only fit the 4x4 table and stay
+    // visually distinct from the 3-wide pickaxe/axe heads and the 1-wide
+    // shovel column.
+    Recipe {
+        id: RecipeId::WoodHoe,
+        pattern: &["PP", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::StoneHoe,
+        pattern: &["CC", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Stone,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::IronHoe,
+        pattern: &["II", " S", " S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Iron,
+        },
+        output_count: 1,
+    },
 ];
 
 /// Pattern character to item identity. Unknown characters never match.
+///
+/// Known characters: `L` oak log, `P` oak planks, `C` cobblestone,
+/// `I` iron ore, `S` stick, `W` wheat.
 fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
@@ -1203,6 +1316,7 @@ fn pattern_item(byte: u8) -> Option<ItemId> {
         b'C' => Some(ItemId::Block(BlockId::Cobblestone)),
         b'I' => Some(ItemId::Block(BlockId::IronOre)),
         b'S' => Some(ItemId::Material(Material::Stick)),
+        b'W' => Some(ItemId::Material(Material::Wheat)),
         _ => None,
     }
 }
@@ -1453,6 +1567,10 @@ mod tests {
 
     fn stick(count: u16) -> Item {
         item(ItemId::Material(Material::Stick), count)
+    }
+
+    fn wheat(count: u16) -> Item {
+        item(ItemId::Material(Material::Wheat), count)
     }
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {
@@ -1731,6 +1849,157 @@ mod tests {
     }
 
     #[test]
+    fn central_carryability_predicate_drives_all_item_constructors() {
+        let uncarryable = [
+            BlockId::Farmland,
+            BlockId::WheatStage0,
+            BlockId::WheatStage1,
+            BlockId::WheatStage2,
+            BlockId::WheatStage3,
+            BlockId::LootChest,
+        ];
+        for block in uncarryable {
+            assert!(
+                ItemStack::new(block, 1).is_none(),
+                "{block:?} must be rejected by the legacy stack constructor"
+            );
+            assert_eq!(
+                Item::new(ItemId::Block(block), 1),
+                Err(ItemError::UncarryableBlock),
+                "{block:?} must be rejected by Item::new"
+            );
+            assert_eq!(
+                Hotbar::empty().collect(block, 1),
+                None,
+                "{block:?} must be rejected by the legacy hotbar"
+            );
+            assert_eq!(
+                Inventory::empty().collect_block(block, 1),
+                None,
+                "{block:?} must be rejected by Inventory::collect_block"
+            );
+        }
+
+        // Chest is the one carryable block appended in S02 and must still flow
+        // through every constructor.
+        let stack = ItemStack::new(BlockId::Chest, 1).expect("chest stack");
+        assert_eq!(stack.block, BlockId::Chest);
+        let item = Item::new(ItemId::Block(BlockId::Chest), 1).expect("chest item");
+        assert_eq!(item.id(), ItemId::Block(BlockId::Chest));
+
+        let mut hotbar = Hotbar::empty();
+        assert_eq!(hotbar.collect(BlockId::Chest, 1), Some(0));
+        assert_eq!(
+            hotbar.stack(0),
+            Some(ItemStack {
+                block: BlockId::Chest,
+                count: 1
+            })
+        );
+
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            inventory.collect_block(BlockId::Chest, 2),
+            Some(CollectOutcome {
+                first_slot: 0,
+                accepted: 2
+            })
+        );
+    }
+
+    #[test]
+    fn loot_vocabulary_maps_to_valid_item_identities() {
+        use crate::world::loot::LootItem;
+
+        let cases = [
+            (LootItem::Apple, ItemId::Material(Material::Apple)),
+            (LootItem::Bread, ItemId::Material(Material::Bread)),
+            (LootItem::Wheat, ItemId::Material(Material::Wheat)),
+            (LootItem::WheatSeeds, ItemId::Material(Material::WheatSeeds)),
+            (LootItem::Stick, ItemId::Material(Material::Stick)),
+            (LootItem::CoalOre, ItemId::Block(BlockId::CoalOre)),
+            (LootItem::IronOre, ItemId::Block(BlockId::IronOre)),
+        ];
+
+        for (loot, expected) in cases {
+            let id: ItemId = loot.into();
+            assert_eq!(id, expected, "{loot:?} maps to the wrong identity");
+            let item = Item::new(id, 1)
+                .unwrap_or_else(|error| panic!("{loot:?} must build an item, got {error:?}"));
+            assert_eq!(item.id(), expected);
+            assert_eq!(item.count(), 1);
+        }
+    }
+
+    #[test]
+    fn food_and_hoe_identities_have_stable_names_and_limits() {
+        assert_eq!(Material::Stick.name(), "Stick");
+        assert_eq!(Material::Apple.name(), "Apple");
+        assert_eq!(Material::Wheat.name(), "Wheat");
+        assert_eq!(Material::WheatSeeds.name(), "Wheat Seeds");
+        assert_eq!(Material::Bread.name(), "Bread");
+        assert_eq!(ToolKind::Hoe.name(), "Hoe");
+
+        for material in [
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+        ] {
+            let id = ItemId::Material(material);
+            assert_eq!(id.name(), material.name());
+            assert_eq!(id.stack_limit(), MATERIAL_STACK_LIMIT);
+            assert_eq!(Item::new(id, 0), Err(ItemError::EmptyStack));
+            assert_eq!(
+                Item::new(id, MATERIAL_STACK_LIMIT + 1),
+                Err(ItemError::StackOverflow)
+            );
+            assert!(Item::new(id, MATERIAL_STACK_LIMIT).is_ok());
+            assert!(item(id, MATERIAL_STACK_LIMIT).is_stackable());
+        }
+
+        let names = [
+            (ToolTier::Wood, "Wood Hoe"),
+            (ToolTier::Stone, "Stone Hoe"),
+            (ToolTier::Iron, "Iron Hoe"),
+        ];
+        for (tier, name) in names {
+            let id = ItemId::Tool {
+                kind: ToolKind::Hoe,
+                tier,
+            };
+            assert_eq!(id.name(), name);
+            assert_eq!(id.stack_limit(), 1);
+            let fresh = item(id, 1);
+            assert!(fresh.is_tool());
+            assert!(!fresh.is_stackable());
+            assert_eq!(fresh.durability(), Some(tier.max_durability()));
+            assert_eq!(fresh.max_durability(), Some(tier.max_durability()));
+
+            // Hoes reuse the checked durability constructor, so they inherit
+            // the same zero/over-maximum rejection as every other tool.
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, 0),
+                Err(ItemError::InvalidDurability)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, tier.max_durability() + 1),
+                Err(ItemError::InvalidDurability)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Hoe, tier, tier.max_durability())
+                    .expect("full durability is valid")
+                    .durability(),
+                Some(tier.max_durability())
+            );
+        }
+
+        assert_eq!(CHEST_SLOTS, 27);
+        let chest: ChestSlots = [None; CHEST_SLOTS];
+        assert_eq!(chest.len(), 27, "a chest carries exactly 27 slots");
+    }
+
+    #[test]
     fn tools_are_non_stackable_and_start_at_full_durability() {
         assert_eq!(
             Item::new(
@@ -1887,6 +2156,79 @@ mod tests {
         assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(1));
         assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(1));
         assert!(inventory.hotbar(0).unwrap().is_tool());
+    }
+
+    #[test]
+    fn insert_all_inserts_every_item_and_leaves_the_cursor_alone() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, 900));
+        inventory.cursor = Some(stick(7));
+
+        let items = [block(BlockId::Stone, 50), stick(3)];
+        let before = inventory.clone();
+        assert!(inventory.can_insert_all(&items));
+        assert_eq!(inventory, before, "a trial capacity check never mutates");
+
+        inventory.insert_all(&items).expect("both items fit");
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(950));
+        assert_eq!(inventory.hotbar(1), Some(stick(3)));
+        assert_eq!(
+            inventory.cursor(),
+            Some(stick(7)),
+            "the cursor is not a batch destination"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::Stone)), 950);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 10);
+    }
+
+    #[test]
+    fn insert_all_failure_preserves_every_slot_and_the_cursor() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        let pickaxe = tool(ToolKind::Pickaxe, ToolTier::Iron);
+        for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(pickaxe);
+        }
+        let mut inventory = Inventory::from_parts(slots, Some(stick(9)));
+        let before = inventory.clone();
+
+        // The stone would fill the single empty slot, then the axe has nowhere
+        // to go; the batch must not commit the stone partially.
+        let items = [
+            block(BlockId::Stone, 1),
+            tool(ToolKind::Axe, ToolTier::Iron),
+        ];
+        assert!(!inventory.can_insert_all(&items));
+        assert_eq!(inventory.insert_all(&items), Err(InventoryError::NoRoom));
+        assert_eq!(inventory, before, "a failed batch must not commit");
+        assert_eq!(inventory.slot(INVENTORY_SLOTS - 1), None);
+        assert_eq!(inventory.cursor(), Some(stick(9)));
+    }
+
+    #[test]
+    fn cursor_contents_do_not_create_spill_capacity() {
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        inventory.cursor = Some(block(BlockId::Stone, 1));
+        let before = inventory.clone();
+
+        let stone = [block(BlockId::Stone, 1)];
+        assert!(
+            !inventory.can_insert_all(&stone),
+            "a matching cursor stack is not 36-slot capacity"
+        );
+        assert_eq!(inventory.insert_all(&stone), Err(InventoryError::NoRoom));
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn insert_all_accepts_an_empty_batch_without_mutation() {
+        let mut inventory = Inventory::empty();
+        inventory.cursor = Some(stick(2));
+        let before = inventory.clone();
+
+        assert!(inventory.can_insert_all(&[]));
+        assert_eq!(inventory.insert_all(&[]), Ok(()));
+        assert_eq!(inventory, before);
     }
 
     #[test]
@@ -2493,8 +2835,110 @@ mod tests {
     }
 
     #[test]
+    fn chest_recipe_is_a_ring_of_eight_planks_in_the_table_grid() {
+        let cells = [0, 1, 2, 4, 6, 8, 9, 10];
+        let mut grid = CraftingGrid::new(GridKind::Table);
+        for cell in cells {
+            grid.set(cell, Some(block(BlockId::OakPlanks, 2)))
+                .expect("ring cell in the 4x4 grid");
+        }
+
+        let preview = grid.preview().expect("eight planks in a ring make a chest");
+        assert_eq!(preview.recipe, RecipeId::Chest);
+        assert_eq!(preview.output, ItemId::Block(BlockId::Chest));
+        assert_eq!(preview.output_count, 1);
+
+        let mut inventory = Inventory::empty();
+        let first = grid.take_result(&mut inventory).expect("first chest");
+        assert_eq!(first.id(), ItemId::Block(BlockId::Chest));
+        assert_eq!(first.count(), 1);
+        for cell in cells {
+            assert_eq!(
+                grid.slot(cell).map(|item| item.count()),
+                Some(1),
+                "exactly one plank is consumed from cell {cell}"
+            );
+        }
+
+        let second = grid.take_result(&mut inventory).expect("second chest");
+        assert_eq!(second.id(), ItemId::Block(BlockId::Chest));
+        assert!(grid.is_empty(), "eight planks per chest empties the ring");
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Chest)),
+            2,
+            "two crafts yield two chests"
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            0,
+            "no planks leak into the inventory"
+        );
+        assert_eq!(grid.take_result(&mut inventory), Err(CraftError::NoRecipe));
+    }
+
+    #[test]
+    fn chest_recipe_projections_match_anywhere_in_the_table_grid() {
+        // The ring shifted one cell down and right still matches: the matcher
+        // compares trimmed bounding boxes, not absolute cells.
+        let mut offset = CraftingGrid::new(GridKind::Table);
+        for (row, col) in [
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 1),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (3, 3),
+        ] {
+            offset
+                .set(
+                    row * TABLE_GRID_DIM + col,
+                    Some(block(BlockId::OakPlanks, 1)),
+                )
+                .expect("cell in range");
+        }
+        assert_eq!(
+            offset.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Chest)
+        );
+    }
+
+    #[test]
+    fn chest_recipe_cannot_be_crafted_in_the_2x2_player_grid() {
+        // Four planks in the player grid are the crafting-table recipe; the
+        // chest's 3x3 bounding box can never fit there.
+        let mut player_grid = grid_from_pattern(GridKind::Player, &["PP", "PP"]);
+        assert_eq!(
+            player_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::CraftingTable)
+        );
+
+        let mut inventory = Inventory::empty();
+        let crafted = player_grid
+            .take_result(&mut inventory)
+            .expect("the 2x2 grid still crafts a table");
+        assert_eq!(crafted.id(), ItemId::Block(BlockId::CraftingTable));
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Chest)),
+            0,
+            "a chest can never come out of a 2x2 craft"
+        );
+
+        // Even a 2x2 arrangement of planks with a hole is not the chest: the
+        // only four-plank player recipe is the table.
+        let mut holed = CraftingGrid::new(GridKind::Player);
+        for index in [0, 1, 2] {
+            holed
+                .set(index, Some(block(BlockId::OakPlanks, 1)))
+                .expect("cell in range");
+        }
+        assert_eq!(holed.preview(), None);
+    }
+
+    #[test]
     fn every_tool_recipe_is_shaped_and_produces_a_full_durability_instance() {
-        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 9] = [
+        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 12] = [
             (
                 RecipeId::WoodPickaxe,
                 ToolKind::Pickaxe,
@@ -2548,6 +2992,24 @@ mod tests {
                 ToolKind::Shovel,
                 ToolTier::Iron,
                 &["I", "S", "S"],
+            ),
+            (
+                RecipeId::WoodHoe,
+                ToolKind::Hoe,
+                ToolTier::Wood,
+                &["PP", " S", " S"],
+            ),
+            (
+                RecipeId::StoneHoe,
+                ToolKind::Hoe,
+                ToolTier::Stone,
+                &["CC", " S", " S"],
+            ),
+            (
+                RecipeId::IronHoe,
+                ToolKind::Hoe,
+                ToolTier::Iron,
+                &["II", " S", " S"],
             ),
         ];
 
@@ -2624,6 +3086,61 @@ mod tests {
     }
 
     #[test]
+    fn bread_recipe_requires_one_three_wheat_row_in_the_table() {
+        let mut grid = grid_from_pattern(GridKind::Table, &["WWW"]);
+        let preview = grid.preview().expect("three wheat in a row match bread");
+        assert_eq!(preview.recipe, RecipeId::Bread);
+        assert_eq!(preview.output, ItemId::Material(Material::Bread));
+        assert_eq!(preview.output_count, 1);
+
+        let mut inventory = Inventory::empty();
+        let crafted = grid.take_result(&mut inventory).expect("bread craft");
+        assert_eq!(crafted.id(), ItemId::Material(Material::Bread));
+        assert_eq!(crafted.count(), 1);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Wheat)), 0);
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn bread_recipe_rejects_short_gapped_and_cramped_grids() {
+        // Two wheat is not a loaf.
+        let two = grid_from_pattern(GridKind::Table, &["WW"]);
+        assert_eq!(two.preview(), None);
+
+        // Three wheat with a hole keeps a three-wide bounding box but fails
+        // the inner-space check.
+        let mut gapped = CraftingGrid::new(GridKind::Table);
+        for index in [0, 2] {
+            gapped.set(index, Some(wheat(1))).expect("cell in range");
+        }
+        assert_eq!(gapped.preview(), None);
+
+        // The 2x2 player grid cannot hold a three-wide row: packing three
+        // wheat into an L leaves no recipe match.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        for index in [0, 1, 2] {
+            player.set(index, Some(wheat(1))).expect("cell in range");
+        }
+        assert_eq!(player.preview(), None);
+    }
+
+    #[test]
+    fn player_grid_cannot_fit_the_two_by_three_hoe_pattern() {
+        // The hoe bounding box is 2 wide and 3 tall, so the 2x2 player grid
+        // can at most hold its top row plus one stick below. That prefix must
+        // stay recipe-less; the full pattern is table-only.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(0, Some(block(BlockId::OakPlanks, 1)))
+            .expect("cell 0");
+        player
+            .set(1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("cell 1");
+        player.set(3, Some(stick(1))).expect("cell 3");
+        assert_eq!(player.preview(), None);
+    }
+
+    #[test]
     fn take_result_revalidates_a_stale_preview() {
         let mut grid = grid_from_pattern(GridKind::Player, &["P", "P"]);
         let stale = grid.preview().expect("initial preview");
@@ -2696,6 +3213,7 @@ mod tests {
 
     #[test]
     fn recipe_table_patterns_are_unambiguous() {
+        assert_eq!(RECIPES.len(), 17, "13 pre-farming recipes plus 4 new ones");
         for recipe in RECIPES {
             let mut grid = CraftingGrid::new(GridKind::Table);
             for (row, line) in recipe.pattern.iter().enumerate() {

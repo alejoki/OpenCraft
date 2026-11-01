@@ -1,9 +1,12 @@
 use glam::Vec3;
 
+use crate::player::container::Container;
+use crate::player::eating::food_value;
 use crate::player::inventory::{
-    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemStack,
-    RecipePreview, ToolWear, HOTBAR_SLOTS,
+    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemId,
+    ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
+use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
 
 /// Errors from the narrow inventory-screen command façade.
@@ -106,6 +109,52 @@ impl InputState {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Whether any movement key is held this frame.
+    ///
+    /// Hold-to-eat cancels on movement (see [`crate::player::eating`]), so the
+    /// check lives next to the flags themselves rather than being re-derived
+    /// from them at the call site.
+    pub fn is_moving(&self) -> bool {
+        self.forward
+            || self.backward
+            || self.left
+            || self.right
+            || self.jump_or_up
+            || self.crouch_or_down
+            || self.sprint
+    }
+}
+
+/// Dry-land fall measurement carried by the player's physics step.
+///
+/// Physics measures distance only; damage, hunger, and air rules live in
+/// [`crate::player::survival`] and are applied by `WorldSession::tick_survival`
+/// (S04). Water contact always cancels a pending fall and consumes the armed
+/// spawn immunity, because touching water counts as the first contact.
+#[derive(Clone, Debug, Default)]
+struct FallState {
+    /// Highest feet height seen since the body last left the ground.
+    peak_y: Option<f32>,
+    /// One-shot dry-land distance latched on landing, consumed by the session.
+    landing_distance: f32,
+    /// Discards the first ground (or water) contact after a fresh spawn or
+    /// respawn.
+    spawn_immune: bool,
+}
+
+impl FallState {
+    /// Drops all fall bookkeeping, including spawn immunity.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Drops the in-flight fall and any latched landing but keeps spawn
+    /// immunity.
+    fn clear_pending(&mut self) {
+        self.peak_y = None;
+        self.landing_distance = 0.0;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +165,12 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub fly_mode: bool,
+    /// Persisted vitals. Constructed only through checked `SurvivalState`
+    /// constructors, so an out-of-range save record never reaches this field.
+    pub survival: SurvivalState,
+    /// Effective mode. Private with a mode checked by `GameMode::allows_fly`;
+    /// `fly_mode` alone can never grant Survival flight.
+    mode: GameMode,
     /// Selected hotbar slot, always in `0..HOTBAR_SLOTS`. Private so the only
     /// ways to change it are the bounds-checked methods below; session restore
     /// cannot publish an out-of-range selection.
@@ -126,6 +181,8 @@ pub struct Player {
     player_grid: CraftingGrid,
     /// Unfinished 4x4 crafting-table grid carried with the player.
     table_grid: CraftingGrid,
+    /// Dry-land fall measurement and one-shot spawn immunity (S04).
+    fall: FallState,
 }
 
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
@@ -158,11 +215,91 @@ impl Player {
             pitch: -0.25,
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
+            // Fresh players stay Creative so every pre-M008 CLI demo, smoke, and
+            // physics test keeps its flying default. `new_with_mode` (and later
+            // session restore) overwrites both fields explicitly.
+            survival: SurvivalState::full(),
+            mode: GameMode::Creative,
             selected_slot: 0,
             inventory: Inventory::empty(),
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
+            fall: FallState::default(),
         }
+    }
+
+    /// Builds a fresh player in `mode`.
+    ///
+    /// Starts from [`Player::new`] so the position/velocity/inventory/grid
+    /// defaults are identical to the Creative constructor, then applies the
+    /// mode rule. A Survival player walks (fly toggle off); a Creative player
+    /// keeps the inherited flying default.
+    pub fn new_with_mode(position: Vec3, mode: GameMode) -> Self {
+        let mut player = Self::new(position);
+        player.set_mode(mode);
+        player
+    }
+
+    /// The effective game mode.
+    pub const fn mode(&self) -> GameMode {
+        self.mode
+    }
+
+    /// Sets the effective mode.
+    ///
+    /// Survival structurally forces the fly toggle off; Creative does not
+    /// re-enable it, so switching Creative -> Survival -> Creative leaves the
+    /// player walking until it explicitly turns flight back on.
+    pub fn set_mode(&mut self, mode: GameMode) {
+        self.mode = mode;
+        if !mode.allows_fly() {
+            self.fly_mode = false;
+        }
+        // A mode change never carries an in-flight fall or spawn immunity.
+        self.fall.clear();
+    }
+
+    /// Whether the player can actually fly right now.
+    ///
+    /// Only a Creative mode with the toggle on passes. Survival is rejected by
+    /// `GameMode::allows_fly`, so assigning `fly_mode = true` by hand (or a
+    /// future decode bug) still cannot make a Survival player fly.
+    pub const fn can_fly(&self) -> bool {
+        self.fly_mode && self.mode.allows_fly()
+    }
+
+    /// Toggles flight for a mode that allows it.
+    ///
+    /// Returns `false` and mutates nothing in Survival. In Creative it flips the
+    /// toggle, zeroes the velocity so the mode switch cannot carry momentum
+    /// into (or out of) a different movement rule, and returns `true`.
+    pub fn toggle_fly(&mut self) -> bool {
+        if !self.mode.allows_fly() {
+            return false;
+        }
+        self.fly_mode = !self.fly_mode;
+        self.velocity = Vec3::ZERO;
+        // Entering or leaving flight drops any in-flight fall measurement, but
+        // a fresh-spawn immunity survives an honest mode toggle.
+        self.fall.clear_pending();
+        true
+    }
+
+    /// Returns the one-shot dry-land fall distance latched by the last landing.
+    ///
+    /// The value is cleared on read so a single fall can never be damaged
+    /// twice. Water contact and flight leave no latch behind.
+    pub fn take_landing_fall(&mut self) -> f32 {
+        let distance = self.fall.landing_distance;
+        self.fall.landing_distance = 0.0;
+        distance
+    }
+
+    /// Arms the first-contact spawn immunity used by fresh Survival sessions
+    /// and respawn (S04). Any in-flight fall is discarded.
+    pub fn arm_spawn_immunity(&mut self) {
+        self.fall.clear_pending();
+        self.fall.spawn_immune = true;
     }
 
     /// Rebuilds a player from a persisted aggregate (session restore).
@@ -252,9 +389,54 @@ impl Player {
         self.inventory.collect_block(block, 1)
     }
 
+    /// Inserts one whole item stack, all-or-nothing.
+    ///
+    /// Thin forwarder over [`Inventory::insert`]: `true` only when every unit
+    /// fit, `false` with no slot mutated otherwise. World pickup uses this for
+    /// the oak-leaf apple bonus; M008 has no item entities or spill, so a full
+    /// inventory simply loses the bonus instead of duplicating or dropping it
+    /// on the ground.
+    pub fn collect_item(&mut self, item: Item) -> bool {
+        self.inventory.insert(item).is_ok()
+    }
+
     /// Consumes exactly one item from the selected hotbar slot.
     pub fn consume_selected(&mut self) -> Option<Item> {
         self.inventory.consume_one(self.selected_slot)
+    }
+
+    /// Completes one hold-to-eat meal: consumes exactly one `expected` item
+    /// from `slot` and restores its food value, returning the hunger actually
+    /// applied.
+    ///
+    /// This is the caller-owned completion half of
+    /// [`crate::player::eating::EatingState`]. Every guard runs before any
+    /// mutation, so a stale completion (slot switched, item picked up, hunger
+    /// already full) is a fail-closed `None` with the inventory and vitals
+    /// untouched:
+    ///
+    /// - `slot` must still be the selected hotbar slot;
+    /// - the selected item identity must equal `expected`;
+    /// - hunger must be below [`MAX_HUNGER`];
+    /// - `expected` must be a food identity.
+    ///
+    /// One successful call consumes exactly one unit, never a whole stack,
+    /// and `SurvivalState::restore_hunger` reports the applied amount after
+    /// the cap.
+    pub fn eat_selected(&mut self, slot: usize, expected: ItemId) -> Option<u16> {
+        if slot != self.selected_slot || self.survival.hunger() >= MAX_HUNGER {
+            return None;
+        }
+        let restore = food_value(expected)?;
+        if self.selected_item()?.id() != expected {
+            return None;
+        }
+        // The slot is the selected slot and holds `expected`, so this cannot
+        // fail; the `?` keeps a hypothetical decode bug fail-closed before the
+        // hunger restore runs.
+        let consumed = self.inventory.consume_one(slot)?;
+        debug_assert_eq!(consumed.id(), expected);
+        Some(self.survival.restore_hunger(restore))
     }
 
     /// Spends exactly one durability point on the selected hotbar tool.
@@ -265,6 +447,22 @@ impl Player {
     /// a bare-hand break can never fabricate or consume a tool.
     pub fn wear_selected_tool(&mut self) -> Result<ToolWear, InventoryError> {
         self.inventory.use_tool(self.selected_slot)
+    }
+
+    /// Whether every item in `items` fits into the 36 inventory slots.
+    ///
+    /// Thin forwarder over [`Inventory::can_insert_all`]: the cursor and both
+    /// crafting grids are never counted as spill capacity.
+    pub fn can_insert_items(&self, items: &[Item]) -> bool {
+        self.inventory.can_insert_all(items)
+    }
+
+    /// Inserts every item completely or none at all.
+    ///
+    /// Thin forwarder over [`Inventory::insert_all`]. The cursor and both
+    /// crafting grids are untouched on success and on failure.
+    pub fn insert_items(&mut self, items: &[Item]) -> Result<(), InventoryError> {
+        self.inventory.insert_all(items)
     }
 
     // -----------------------------------------------------------------------
@@ -303,6 +501,20 @@ impl Player {
         } else {
             self.inventory.pick_up_half(index)
         }
+    }
+
+    /// Whole-stack left-click between one chest slot and the shared cursor.
+    ///
+    /// Thin forwarder over [`Container::click_slot`]. The player aggregate owns
+    /// the only cursor, so this is the single UI entry point for moving items
+    /// in or out of a chest; both grids and the 36 inventory slots are
+    /// untouched.
+    pub fn click_container_slot(
+        &mut self,
+        container: &mut Container,
+        index: usize,
+    ) -> Result<(), InventoryError> {
+        container.click_slot(&mut self.inventory, index)
     }
 
     /// Moves a whole stack between one crafting-grid cell and the cursor.
@@ -511,7 +723,7 @@ impl Player {
             move_dir = move_dir.normalize();
         }
 
-        if self.fly_mode {
+        if self.can_fly() {
             let speed = if input.sprint { 48.0 } else { 18.0 };
             let mut vel = move_dir * speed;
             if input.jump_or_up {
@@ -523,8 +735,12 @@ impl Player {
             self.velocity = vel;
             self.position += self.velocity * dt;
             self.on_ground = false;
+            // Flight is never a fall: drop any in-flight measurement.
+            self.fall.clear_pending();
             return;
         }
+
+        let start_y = self.position.y;
 
         // Submersion is derived from the already-in-scope `get_block` closure —
         // no signature change and no new call-site parameter. Sampling the feet
@@ -551,10 +767,10 @@ impl Player {
         self.velocity.z = move_dir.z * walk_speed;
 
         // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
-        // only (positions, sink/rise, on_ground). No fall-damage, health, or
-        // drowning claim is made anywhere in this slice — no health/fall/damage
-        // system exists in `src/`; fall damage and drowning are deferred to M008
-        // (MEM227).
+        // only (positions, sink/rise, on_ground). Fall distance is measured by
+        // the dry-land bookkeeping after the sub-step loop below; the damage,
+        // hunger, and air rules live in `player::survival` and are applied by
+        // `WorldSession::tick_survival` (S04). Water contact cancels a fall.
         if submerged {
             // D087: no buoyant surface lock. A submerged walk-mode body is
             // dragged vertically and then pulled down by gravity while
@@ -624,6 +840,41 @@ impl Player {
                     self.velocity.z = 0.0;
                 }
             }
+        }
+
+        // Fall measurement (dry land only). Physics owns the distance; the
+        // survival runtime owns the damage. Re-sample submersion at the new
+        // position because the body may have entered water during this step.
+        let body_x_after = self.position.x.floor() as i32;
+        let body_z_after = self.position.z.floor() as i32;
+        let feet_block_y_after = (self.position.y + 1e-4).floor() as i32;
+        let mid_block_y_after = (self.position.y + PLAYER_HEIGHT * 0.5).floor() as i32;
+        let submerged_after = get_block(body_x_after, feet_block_y_after, body_z_after).is_liquid()
+            || get_block(body_x_after, mid_block_y_after, body_z_after).is_liquid();
+
+        if submerged || submerged_after {
+            // Water contact counts as the first contact: cancel the fall and
+            // spend the fresh-spawn immunity.
+            self.fall.clear_pending();
+            self.fall.spawn_immune = false;
+        } else if self.on_ground {
+            let peak = self.fall.peak_y.take();
+            if self.fall.spawn_immune {
+                // Fresh spawn/respawn: discard the first dry landing whole.
+                self.fall.spawn_immune = false;
+            } else if let Some(peak) = peak {
+                self.fall.landing_distance = (peak - self.position.y).max(0.0);
+            }
+        } else {
+            // A ledge walk-off keeps its takeoff height, and a jump still
+            // peaks at the apex instead of only recording the final height.
+            self.fall.peak_y = Some(
+                self.fall
+                    .peak_y
+                    .unwrap_or(start_y)
+                    .max(start_y)
+                    .max(self.position.y),
+            );
         }
     }
 }
@@ -786,6 +1037,37 @@ mod tests {
         assert!(
             player.collect_block(BlockId::Bedrock).is_none(),
             "uncarryable blocks are rejected without mutation"
+        );
+    }
+
+    #[test]
+    fn collect_item_is_all_or_nothing() {
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("valid apple");
+        let mut player = Player::new(Vec3::ZERO);
+        assert!(
+            player.collect_item(apple),
+            "an empty inventory fits an apple"
+        );
+        assert_eq!(player.inventory().slot(0), Some(apple));
+
+        let stone = block_item(BlockId::Stone, 64);
+        let slots = [Some(stone); INVENTORY_SLOTS];
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        let before = player.inventory().clone();
+
+        assert!(
+            !player.collect_item(apple),
+            "one free slot filled by 64 stone cannot take an apple"
+        );
+        assert_eq!(
+            player.inventory(),
+            &before,
+            "a rejected item leaves every slot untouched"
         );
     }
 
@@ -987,7 +1269,10 @@ mod tests {
 
     // -- Inventory-screen command façade -------------------------------------
 
-    use crate::player::inventory::{ItemId, Material, RecipeId, INVENTORY_SLOTS, MAX_STACK_COUNT};
+    use crate::player::inventory::{
+        ItemId, Material, RecipeId, ToolKind, ToolTier, CHEST_SLOTS, INVENTORY_SLOTS,
+        MAX_STACK_COUNT,
+    };
 
     fn block_item(block: BlockId, count: u16) -> Item {
         Item::new(ItemId::Block(block), count).expect("valid test block stack")
@@ -1118,6 +1403,217 @@ mod tests {
             &after_pick_up,
             "an out-of-range put-down keeps the cursor stack"
         );
+    }
+
+    // -- Chest container / batch insert forwarders ---------------------------
+
+    fn tool_item(kind: ToolKind, tier: ToolTier) -> Item {
+        Item::new(ItemId::Tool { kind, tier }, 1).expect("valid test tool")
+    }
+
+    /// 36 non-stackable tool slots plus a tool on the cursor. Every inventory
+    /// slot is occupied, so no item can be inserted without merging.
+    fn full_tool_inventory_with_cursor() -> Inventory {
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let kind = match index % 3 {
+                0 => ToolKind::Pickaxe,
+                1 => ToolKind::Axe,
+                _ => ToolKind::Shovel,
+            };
+            let tier = match index % 2 {
+                0 => ToolTier::Wood,
+                _ => ToolTier::Iron,
+            };
+            *slot = Some(tool_item(kind, tier));
+        }
+        Inventory::from_parts(slots, Some(tool_item(ToolKind::Hoe, ToolTier::Stone)))
+    }
+
+    fn container_units(container: &Container) -> u32 {
+        container
+            .slots()
+            .iter()
+            .flatten()
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn insert_items_moves_a_batch_without_touching_cursor_or_grids() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(block_item(BlockId::Stone, 900));
+        let inventory = Inventory::from_parts(slots, Some(stick_item(7)));
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(3, Some(stick_item(2)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::OakPlanks, 2)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(Vec3::ZERO, inventory, player_grid, table_grid);
+
+        let cursor_before = player.inventory().cursor();
+        let player_grid_before = player.player_grid().clone();
+        let table_grid_before = player.table_grid().clone();
+
+        let items = [block_item(BlockId::Stone, 50), stick_item(3)];
+        assert!(player.can_insert_items(&items));
+        player.insert_items(&items).expect("both items fit");
+
+        assert_eq!(
+            player.inventory().slot(0).map(|item| item.count()),
+            Some(950)
+        );
+        assert_eq!(player.inventory().slot(1), Some(stick_item(3)));
+        assert_eq!(
+            player.inventory().cursor(),
+            cursor_before,
+            "the cursor is not a batch destination"
+        );
+        assert_eq!(player.player_grid(), &player_grid_before);
+        assert_eq!(player.table_grid(), &table_grid_before);
+    }
+
+    #[test]
+    fn insert_items_failure_leaves_slots_cursor_and_both_grids_unchanged() {
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::OakPlanks, 4)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(5, Some(stick_item(3)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            full_tool_inventory_with_cursor(),
+            player_grid,
+            table_grid,
+        );
+
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        let items = [block_item(BlockId::Chest, 1), stick_item(1)];
+        assert!(!player.can_insert_items(&items));
+        assert_eq!(player.insert_items(&items), Err(InventoryError::NoRoom));
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(
+            player.table_grid(),
+            &before_table_grid,
+            "a rejected batch never spills into the crafting grids"
+        );
+    }
+
+    #[test]
+    fn cursor_and_grid_contents_do_not_create_spill_capacity() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = Some(block_item(BlockId::Brick, MAX_STACK_COUNT));
+        }
+        // Cursor and both grids hold the identity being inserted; none of
+        // them is part of the 36-slot capacity calculation.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(0, Some(block_item(BlockId::Stone, MAX_STACK_COUNT)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::Stone, MAX_STACK_COUNT)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, Some(block_item(BlockId::Stone, 5))),
+            player_grid,
+            table_grid,
+        );
+
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        let stone = [block_item(BlockId::Stone, 1)];
+        assert!(
+            !player.can_insert_items(&stone),
+            "a matching cursor stack and grid cells are not inventory capacity"
+        );
+        assert_eq!(player.insert_items(&stone), Err(InventoryError::NoRoom));
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(player.table_grid(), &before_table_grid);
+    }
+
+    #[test]
+    fn container_slot_click_moves_items_through_the_shared_cursor() {
+        let mut player = player_with_slots([(0, block_item(BlockId::Stone, 4))]);
+        let mut container = Container::from_slots([None; CHEST_SLOTS]);
+        let units_before = player_units(&player) + container_units(&container);
+
+        player
+            .click_inventory_slot(0)
+            .expect("pick the stone into the cursor");
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 4))
+        );
+
+        player
+            .click_container_slot(&mut container, 5)
+            .expect("cursor into the chest");
+        assert_eq!(container.slot(5), Some(block_item(BlockId::Stone, 4)));
+        assert_eq!(player.inventory().cursor(), None);
+        assert_eq!(
+            player_units(&player) + container_units(&container),
+            units_before,
+            "player -> chest conserves items"
+        );
+
+        player
+            .click_container_slot(&mut container, 5)
+            .expect("chest back onto the cursor");
+        assert_eq!(container.slot(5), None);
+        assert_eq!(
+            player.inventory().cursor(),
+            Some(block_item(BlockId::Stone, 4))
+        );
+        assert_eq!(
+            player_units(&player) + container_units(&container),
+            units_before,
+            "chest -> player conserves items"
+        );
+    }
+
+    #[test]
+    fn container_slot_click_out_of_bounds_preserves_chest_and_player() {
+        let mut player = player_with_slots([(0, block_item(BlockId::Stone, 2))]);
+        player
+            .click_inventory_slot(0)
+            .expect("pick the stone into the cursor");
+        let mut slots = [None; CHEST_SLOTS];
+        slots[0] = Some(stick_item(3));
+        let mut container = Container::from_slots(slots);
+
+        let before_container = container.clone();
+        let before_inventory = player.inventory().clone();
+        let before_player_grid = player.player_grid().clone();
+        let before_table_grid = player.table_grid().clone();
+
+        assert_eq!(
+            player.click_container_slot(&mut container, CHEST_SLOTS),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(
+            player.click_container_slot(&mut container, usize::MAX),
+            Err(InventoryError::OutOfBounds)
+        );
+        assert_eq!(container, before_container);
+        assert_eq!(player.inventory(), &before_inventory);
+        assert_eq!(player.player_grid(), &before_player_grid);
+        assert_eq!(player.table_grid(), &before_table_grid);
     }
 
     #[test]
@@ -1586,6 +2082,191 @@ mod tests {
         }
     }
 
+    /// Solid floor at `floor_y` with open air above. Used by the fall tests.
+    fn dry_land_at(floor_y: i32) -> impl Fn(i32, i32, i32) -> BlockId {
+        move |_x, y, _z| {
+            if y < floor_y {
+                BlockId::Stone
+            } else {
+                BlockId::Air
+            }
+        }
+    }
+
+    /// Runs gravity-only frames until the body lands, bounded to 10 game
+    /// seconds at 60 Hz.
+    fn fall_to_ground(player: &mut Player, floor_y: i32) {
+        let idle = InputState::default();
+        for frame in 0..600 {
+            player.update(1.0 / 60.0, &idle, dry_land_at(floor_y));
+            if player.on_ground {
+                return;
+            }
+            assert!(
+                player.position.y > floor_y as f32 - 1.0,
+                "fall fell through the floor at frame {frame}: y={}",
+                player.position.y
+            );
+        }
+        panic!("body never landed on floor y={floor_y}");
+    }
+
+    #[test]
+    fn dry_land_falls_latch_distance_and_map_to_survival_damage() {
+        for (drop, expected_damage) in [(3.0_f32, 0_u16), (4.0, 1), (5.0, 2)] {
+            let mut player =
+                Player::new_with_mode(Vec3::new(0.5, 5.0 + drop, 0.5), GameMode::Survival);
+            fall_to_ground(&mut player, 5);
+            let distance = player.take_landing_fall();
+            assert!(
+                (distance - drop).abs() < 1e-3,
+                "a {drop}-block drop must latch {drop}, got {distance}"
+            );
+            assert_eq!(
+                crate::player::survival::fall_damage(distance),
+                expected_damage,
+                "a {drop}-block drop must map to {expected_damage} damage"
+            );
+            assert_eq!(
+                player.take_landing_fall(),
+                0.0,
+                "the landing latch must be consumed exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_land_jump_latches_less_than_the_safe_drop() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 5.0, 0.5), GameMode::Survival);
+        player.on_ground = true;
+        let jump = InputState {
+            jump_or_up: true,
+            ..Default::default()
+        };
+        player.update(1.0 / 60.0, &jump, dry_land_at(5));
+        let idle = InputState::default();
+        for _ in 0..600 {
+            player.update(1.0 / 60.0, &idle, dry_land_at(5));
+            if player.on_ground {
+                break;
+            }
+        }
+        assert!(player.on_ground, "the jump must come back down");
+        let distance = player.take_landing_fall();
+        assert!(
+            distance > 0.0 && distance < 3.0,
+            "a 9.0 m/s jump must stay under the 3-block safe drop, got {distance}"
+        );
+    }
+
+    #[test]
+    fn water_entry_cancels_the_fall_and_spends_spawn_immunity() {
+        let mut player = Player::new_with_mode(
+            Vec3::new(0.5, TEST_SEA_LEVEL as f32 + 10.0, 0.5),
+            GameMode::Survival,
+        );
+        player.arm_spawn_immunity();
+        let idle = InputState::default();
+        let mut entered = false;
+        for _ in 0..600 {
+            player.update(1.0 / 60.0, &idle, water_column);
+            if player.position.y < TEST_SEA_LEVEL as f32 {
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered, "the body must enter the water column");
+        assert_eq!(
+            player.take_landing_fall(),
+            0.0,
+            "water contact must cancel the fall"
+        );
+        assert!(
+            !player.fall.spawn_immune,
+            "water contact counts as the first contact and spends immunity"
+        );
+        assert!(player.fall.peak_y.is_none());
+    }
+
+    #[test]
+    fn spawn_immunity_discards_only_the_first_dry_landing() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 9.0, 0.5), GameMode::Survival);
+        player.arm_spawn_immunity();
+        fall_to_ground(&mut player, 5);
+        assert_eq!(
+            player.take_landing_fall(),
+            0.0,
+            "the armed first landing must be discarded"
+        );
+        assert!(!player.fall.spawn_immune, "immunity is a one-shot");
+
+        player.position.y = 9.0;
+        player.velocity = Vec3::ZERO;
+        player.on_ground = false;
+        fall_to_ground(&mut player, 5);
+        let distance = player.take_landing_fall();
+        assert!(
+            (distance - 4.0).abs() < 1e-3,
+            "the second 4-block fall must be measured, got {distance}"
+        );
+    }
+
+    #[test]
+    fn restored_player_without_armed_immunity_takes_the_first_fall() {
+        // Session restore never arms immunity: a saved mid-air fall must hurt.
+        let mut player = Player::with_inventory(
+            Vec3::new(0.5, 9.0, 0.5),
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        assert!(!player.fall.spawn_immune);
+        fall_to_ground(&mut player, 5);
+        let distance = player.take_landing_fall();
+        assert!(
+            (distance - 4.0).abs() < 1e-3,
+            "an unarmed restored player must take the first 4-block fall, got {distance}"
+        );
+    }
+
+    #[test]
+    fn toggle_fly_and_set_mode_drop_a_pending_fall() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 40.0, 0.5), GameMode::Survival);
+        let idle = InputState::default();
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(player.fall.peak_y.is_some(), "a dry fall must build a peak");
+
+        player.set_mode(GameMode::Creative);
+        assert!(
+            player.fall.peak_y.is_none(),
+            "set_mode must clear the pending peak"
+        );
+        assert_eq!(
+            player.fall.landing_distance, 0.0,
+            "set_mode must clear a latched landing"
+        );
+
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(player.fall.peak_y.is_some());
+        assert!(player.toggle_fly(), "Creative must allow the fly toggle");
+        assert!(
+            player.fall.peak_y.is_none(),
+            "toggling flight must clear the pending peak"
+        );
+
+        player.fall.landing_distance = 7.0;
+        assert!(player.toggle_fly());
+        assert_eq!(
+            player.fall.landing_distance, 0.0,
+            "toggling flight must clear a latched landing"
+        );
+    }
+
     #[test]
     fn swim_idle_submerged_player_sinks_away_from_the_surface() {
         // D087: no automatic surface lock. Released just under the surface with
@@ -1840,11 +2521,12 @@ mod tests {
     /// The `BlockId` solid/liquid matrix itself is pinned by
     /// `test_solid_and_liquid_matrix_over_every_block_id` in `src/world/block.rs`.
     ///
-    /// Honesty note: no fall-damage, health, or drowning claim is made anywhere
-    /// in S03 (or in the D087 rework). No health/fall/damage system exists in
-    /// `src/` (grep-verified during research); fall damage and drowning are
-    /// deferred to M008 (MEM227). Swim assertions cover mechanics only
-    /// (positions, sink/rise, `on_ground`).
+    /// Honesty note: this S03/D087 acceptance test makes no fall-damage,
+    /// health, or drowning claim. Fall distance is measured in `Player::update`
+    /// (S04), while the damage/hunger/air rules live in `player::survival` and
+    /// are applied by `WorldSession::tick_survival`; water contact cancels a
+    /// fall. The swim assertions here cover mechanics only (positions,
+    /// sink/rise, `on_ground`).
     #[test]
     fn water_is_passable_but_never_walkable_at_the_physics_consumer() {
         assert!(!BlockId::Water.is_solid(), "water must stay passable");
@@ -1904,5 +2586,314 @@ mod tests {
             lowest < start_y - 2.0,
             "an idle body must sink away from the water surface (start {start_y}, lowest {lowest})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M008: game modes and the structurally gated flight rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_player_is_creative_full_and_flying() {
+        let player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert_eq!(player.survival, SurvivalState::full());
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn new_with_mode_survival_walks_with_full_vitals() {
+        let player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        assert_eq!(player.mode(), GameMode::Survival);
+        assert_eq!(player.survival, SurvivalState::full());
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+    }
+
+    #[test]
+    fn new_with_mode_creative_flies() {
+        let player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Creative);
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn set_mode_survival_disables_fly() {
+        let mut player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        assert!(player.can_fly());
+        player.set_mode(GameMode::Survival);
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+    }
+
+    #[test]
+    fn set_mode_creative_does_not_re_enable_fly() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        player.set_mode(GameMode::Creative);
+        assert_eq!(player.mode(), GameMode::Creative);
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+        // An explicit toggle is still available once the mode allows it.
+        assert!(player.toggle_fly());
+        assert!(player.can_fly());
+    }
+
+    #[test]
+    fn toggle_fly_creative_toggles_and_zeroes_velocity() {
+        let mut player = Player::new(Vec3::new(0.5, 10.0, 0.5));
+        player.velocity = Vec3::new(1.0, -2.0, 3.0);
+        assert!(player.toggle_fly());
+        assert!(!player.fly_mode);
+        assert!(!player.can_fly());
+        assert_eq!(player.velocity, Vec3::ZERO);
+
+        player.velocity = Vec3::new(-4.0, 5.0, -6.0);
+        assert!(player.toggle_fly());
+        assert!(player.fly_mode);
+        assert!(player.can_fly());
+        assert_eq!(player.velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn toggle_fly_survival_is_a_no_op() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Survival);
+        player.fly_mode = true; // stale hand-set flag: still structurally gated
+        player.velocity = Vec3::new(1.0, 2.0, 3.0);
+        assert!(!player.toggle_fly());
+        assert!(player.fly_mode, "Survival toggle must mutate nothing");
+        assert!(!player.can_fly());
+        assert_eq!(player.velocity, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn survival_update_falls_under_gravity_even_with_fly_flag_true() {
+        let mut player = Player::new_with_mode(Vec3::new(0.5, 60.0, 0.5), GameMode::Survival);
+        player.fly_mode = true;
+        let start_y = player.position.y;
+        let idle = InputState::default();
+        for _ in 0..30 {
+            player.update(1.0 / 60.0, &idle, |_, _, _| BlockId::Air);
+        }
+        assert!(
+            player.position.y < start_y - 1.0,
+            "Survival must fall, not hover: {start_y} -> {}",
+            player.position.y
+        );
+        assert!(!player.on_ground);
+    }
+
+    #[test]
+    fn creative_update_still_uses_the_fly_branch() {
+        let mut player = Player::new(Vec3::new(0.5, 60.0, 0.5));
+        let start_y = player.position.y;
+        let up = InputState {
+            jump_or_up: true,
+            ..Default::default()
+        };
+        player.update(1.0 / 60.0, &up, |_, _, _| BlockId::Air);
+        assert!(
+            player.position.y > start_y,
+            "Creative flying must rise: {start_y} -> {}",
+            player.position.y
+        );
+        assert!(!player.on_ground);
+        // No gravity while flying: idle input leaves the position unchanged.
+        let hover_y = player.position.y;
+        player.update(1.0 / 60.0, &InputState::default(), |_, _, _| BlockId::Air);
+        assert!((player.position.y - hover_y).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T03: caller-owned hold-to-eat completion
+    // -----------------------------------------------------------------------
+
+    fn apple_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Apple), count).expect("valid apple stack")
+    }
+
+    fn bread_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
+    }
+
+    /// A Survival player holding `item` in slot 0 at `hunger`.
+    ///
+    /// `Player::with_inventory` is always Creative, so the mode is set
+    /// explicitly before any eating command runs.
+    fn food_player(item: Item, hunger: u16) -> Player {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item);
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(MAX_HUNGER - hunger);
+        assert!(player.select_slot(0));
+        player
+    }
+
+    fn selected_count(player: &Player) -> Option<u16> {
+        player.selected_item().map(|item| item.count())
+    }
+
+    #[test]
+    fn eat_selected_consumes_one_apple_and_restores_four_hunger() {
+        let mut player = food_player(apple_item(2), 10);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Apple));
+
+        assert_eq!(applied, Some(4), "one apple restores exactly 4 hunger");
+        assert_eq!(player.survival.hunger(), 14);
+        assert_eq!(
+            selected_count(&player),
+            Some(1),
+            "exactly one item consumed"
+        );
+    }
+
+    #[test]
+    fn eat_selected_consumes_one_bread_and_restores_six_hunger() {
+        let mut player = food_player(bread_item(2), 10);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Bread));
+
+        assert_eq!(applied, Some(6), "one bread restores exactly 6 hunger");
+        assert_eq!(player.survival.hunger(), 16);
+        assert_eq!(
+            selected_count(&player),
+            Some(1),
+            "exactly one item consumed"
+        );
+    }
+
+    #[test]
+    fn eat_selected_reports_the_capped_restore_at_hunger_nineteen() {
+        // 19 is the last hunger value a meal can start from; the restore is
+        // reported after the MAX_HUNGER cap rather than as the food's nominal
+        // value.
+        let mut player = food_player(bread_item(2), MAX_HUNGER - 1);
+
+        let applied = player.eat_selected(0, ItemId::Material(Material::Bread));
+
+        assert_eq!(applied, Some(1));
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(1));
+    }
+
+    #[test]
+    fn eat_selected_rejects_a_slot_mismatch_without_mutation() {
+        let mut player = food_player(apple_item(2), 10);
+        // A second apple elsewhere proves the guard is about the selected
+        // slot, not merely about the item existing somewhere.
+        let mut slots = *player.inventory().slots();
+        slots[1] = Some(apple_item(1));
+        player = Player::with_inventory(
+            player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(10);
+        assert!(player.select_slot(1));
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.count()),
+            Some(2)
+        );
+        assert_eq!(
+            player.inventory().hotbar(1).map(|item| item.count()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn eat_selected_rejects_an_item_mismatch_without_mutation() {
+        let mut player = food_player(apple_item(2), 10);
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Bread)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+    }
+
+    #[test]
+    fn eat_selected_rejects_an_empty_slot_without_mutation() {
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(GameMode::Survival);
+        player.survival.spend_hunger(10);
+        assert!(player.select_slot(0));
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), None);
+    }
+
+    #[test]
+    fn eat_selected_refuses_full_hunger_without_consuming() {
+        let mut player = food_player(apple_item(2), MAX_HUNGER);
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Apple)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(2), "nothing was consumed");
+    }
+
+    #[test]
+    fn eat_selected_rejects_non_food_even_when_selected() {
+        let mut player = food_player(
+            Item::new(ItemId::Material(Material::Stick), 2).expect("stick stack"),
+            10,
+        );
+
+        assert_eq!(
+            player.eat_selected(0, ItemId::Material(Material::Stick)),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+    }
+
+    #[test]
+    fn is_moving_tracks_every_movement_key() {
+        let input = InputState::default();
+        assert!(!input.is_moving(), "an idle input is not moving");
+
+        for index in 0..7 {
+            let mut input = InputState::default();
+            match index {
+                0 => input.forward = true,
+                1 => input.backward = true,
+                2 => input.left = true,
+                3 => input.right = true,
+                4 => input.jump_or_up = true,
+                5 => input.crouch_or_down = true,
+                6 => input.sprint = true,
+                _ => unreachable!(),
+            }
+            assert!(input.is_moving(), "key index {index} must count as moving");
+            input.reset();
+            assert!(!input.is_moving(), "reset clears every movement key");
+        }
     }
 }
