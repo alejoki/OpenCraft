@@ -12,7 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
+use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot, SOUND_SLOT_COUNT};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
@@ -138,7 +138,7 @@ fn load_startup_pack(
 fn load_startup_sounds(
     packs_root: &Path,
     selected: Option<&str>,
-) -> ([SoundBuffer; 4], Vec<SettingsWarning>) {
+) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
     let Some(name) = selected else {
         return (default_buffers(), Vec::new());
     };

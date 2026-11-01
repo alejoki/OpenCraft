@@ -121,12 +121,21 @@ The same image rules as block textures apply to every mob file: square PNG, 16 t
 
 ## Sounds
 
-A pack can replace the game's four built-in sounds. Save audio files flat in the pack folder, next to the textures, using these exact base names:
+A pack can replace the game's nine built-in sounds. Save audio files flat in the pack folder, next to the textures, using these exact base names:
 
-1. `break` — breaking a block
-2. `place` — placing a block
-3. `mine_complete` — finishing a block's mining time
-4. `ui_click` — clicking a menu row or button
+| Base name | When it plays |
+| --- | --- |
+| `break` | breaking a block |
+| `place` | placing a block |
+| `mine_complete` | finishing a block's mining time |
+| `ui_click` | clicking a menu row or button |
+| `mob_idle` | a mob's idle grunt |
+| `mob_hurt` | a mob taking damage |
+| `mob_death` | a mob dying |
+| `bow_release` | releasing a drawn bow |
+| `arrow_impact` | an arrow hitting a block or mob |
+
+The first four are the original block and menu sounds; a pack written before mobs existed keeps overriding exactly the same slots, because new sounds are only ever appended to the end of the table.
 
 Each sound may use any of these formats. If several files share a base name, only the highest-priority one is read:
 
@@ -142,13 +151,13 @@ Sound rules:
 
 - A missing sound file is fine and silently keeps the built-in synthesized sound for that slot.
 - A corrupt, oversized, or empty (zero-sample) file also keeps the built-in sound, but the menu shows a warning that names the file.
-- Partial packs always work — add one sound or all four, with or without textures.
+- Partial packs always work — add one sound or all nine, with or without textures.
 - Sounds apply live when you cycle the **Texture Pack** row; no restart is needed.
-- Cycling back to **Default** restores all four built-in sounds.
+- Cycling back to **Default** restores all nine built-in sounds.
 
 ## A complete sound pack
 
-A sound pack is a `pack.toml` manifest plus up to four optional sound files. Copy
+A sound pack is a `pack.toml` manifest plus up to nine optional sound files. Copy
 this manifest and save it as `packs/my-sounds/pack.toml`:
 
 ```toml
@@ -165,6 +174,11 @@ packs/my-sounds/
   place.wav         # optional - block placed
   mine_complete.wav # optional - mining sequence finished
   ui_click.wav      # optional - menu interaction
+  mob_idle.wav      # optional - mob idle grunt
+  mob_hurt.wav      # optional - mob damaged
+  mob_death.wav     # optional - mob died
+  bow_release.wav   # optional - bow released
+  arrow_impact.wav  # optional - arrow landed
 ```
 
 Every sound file is optional. A missing slot silently keeps the built-in sound for
