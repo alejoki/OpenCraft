@@ -107,6 +107,8 @@ Mob part art shares the same texture array as block art, starting at layer 32. T
 
 The same image rules as block textures apply to every mob file: square PNG, 16 to 256 pixels per side, resampled to 16x16.
 
+The committed `packs/uat-sound/` folder is the per-file layout example: it shows the flat "one file per override, named exactly" layout a pack uses (its files happen to be sounds, so a mob texture pack keeps the same layout with the `pig_body.png`-style names from the table above).
+
 - Each file is optional and overrides only its own layer.
 - A missing file silently keeps the built-in procedural art for that part.
 - A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
@@ -188,18 +190,26 @@ for the accepted formats and the 1 MiB per-file cap.
 
 ### Runnable example: `packs/uat-sound/`
 
-The project repository ships a ready-made example pack at `packs/uat-sound/`:
+The project repository ships a ready-made example pack at `packs/uat-sound/`. It
+holds seven files: the manifest plus six sounds, five valid and one deliberately
+corrupt.
 
-- `break.wav`, `place.wav`, and `mine_complete.wav` are valid 16-bit stereo PCM WAVs.
-- `ui_click.wav` is deliberately corrupt ASCII so you can see the in-menu fallback
-  warning: the menu reports that the file could not be decoded and keeps playing the
-  built-in tick instead of crashing.
+| File | State | What it proves |
+| --- | --- | --- |
+| `pack.toml` | valid | the manifest and the menu tint |
+| `break.wav` | valid | a replaced block-break sound |
+| `place.wav` | valid | a replaced block-place sound |
+| `mine_complete.wav` | valid | a replaced mining-complete sound |
+| `mob_hurt.wav` | valid | a replaced mob-damage sound (a byte copy of `break.wav`) |
+| `arrow_impact.wav` | valid | a replaced arrow-landing sound (a byte copy of `place.wav`) |
+| `ui_click.wav` | deliberately corrupt ASCII | per-file fallback: the menu reports the decode failure and keeps the built-in tick |
 
 It is a test fixture, not part of a normal game install. To try it, copy the
 `uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
 creating the `packs/` folder yourself first if it does not exist — then cycle the
 **Texture Pack** row to `uat-sound`. Break and place a block and finish a mining
-sequence to hear the custom sounds; open the settings menu to see the corrupt-file
+sequence to hear the custom sounds; hit a mob and land an arrow to hear the pack's
+`mob_hurt` and `arrow_impact` files; open the settings menu to see the corrupt-file
 warning while the built-in click keeps playing. Cycling back to **Default** restores
 the built-in sounds.
 

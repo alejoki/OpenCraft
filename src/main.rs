@@ -70,7 +70,7 @@ use opencraft::ui::{
     LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
-use opencraft::world::arrow::{ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
+use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
@@ -79,7 +79,8 @@ use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, 
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
-use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind};
+use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind, MobShot};
+use opencraft::world::mob_ai::MobAttack;
 use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
@@ -4048,6 +4049,24 @@ pub const COMBAT_HOSTILE_ABORT_TICKS: u32 = 400;
 /// instead of hanging the demo's 120 s deadline.
 pub const COMBAT_SKELETON_ABORT_TICKS: u32 = 400;
 
+/// Fixed-step observations the Creative stage's inertness window runs.
+///
+/// 40 x 0.1 s = 4 s of game time with the hostile gate OPEN and the player's
+/// effective mode Creative. The stage requires zero decided attacks, zero
+/// decided shots, zero applied player damage, and no mob ever in `Chase` for
+/// the whole window, so a leak in either Creative authority site fails instead
+/// of passing on one quiet frame.
+pub const COMBAT_CREATIVE_INERT_TICKS: u32 = 40;
+
+/// Hard cap on each Creative stage fixed-step observation loop (the inertness
+/// window and the arrow's flight).
+///
+/// 40 x 0.1 s = 4 s of game time. The charge-0 arrow crosses the two blocks to
+/// a pinned Zombie inside the first 0.1 s tick, so this is only the bound that
+/// turns a projectile-sweep regression into a self-describing abort instead of
+/// a hung 120 s demo deadline.
+pub const COMBAT_CREATIVE_ABORT_TICKS: u32 = 40;
+
 /// Minimum Ambient spawn-phase observations before the stage may advance.
 ///
 /// 60 observations x 0.1 s of game time = 6 s, i.e. 24 fixed spawn attempts at
@@ -4134,14 +4153,22 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
 /// embedding then expiring. It earns the real wood bow and arrows the save
 /// witness now carries.
 ///
-/// The Skeleton stage (M009/S08-T04) sits between Shot and Save: it proves the
-/// stand-off ranged brain on one synthetic skeleton pinned at a spot whose
+/// The Skeleton stage (M009/S08-T04) sits between Shot and Creative: it proves
+/// the stand-off ranged brain on one synthetic skeleton pinned at a spot whose
 /// [`drop_roll`] lands the rare bow, the skeleton arrow's 2-damage player hit
 /// and `SkeletonArrow` death cause, the respawn, and the player-attributed
-/// bone/arrow/bow drops. It removes its synthetic victim before Save, so the
-/// two-record witness and every earlier digest stay byte-identical. Full
-/// order: `Settle -> Ambient -> Spawn -> Walk -> Fight -> Drops -> Hostile ->
-/// Shot -> Skeleton -> Save -> Restore -> Done`.
+/// bone/arrow/bow drops. It removes its synthetic victim before Creative, so
+/// the two-record witness and every earlier digest stay byte-identical.
+///
+/// The Creative stage (M009/S09-T05) sits between Skeleton and Save: it proves
+/// the effective-mode mob rule from a Survival save whose live player switches
+/// to Creative rules — no target selection, no melee, no arrows, no damage —
+/// and then that one melee swing and one charge-0 arrow each one-shot a
+/// full-health Zombie with the pinned drop table intact. It consumes exactly
+/// the two rotten-flesh units its kills earned, so the 218-byte v7 witness and
+/// every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
+/// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
+/// Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
@@ -4153,6 +4180,7 @@ enum CombatStage {
     Hostile,
     Shot,
     Skeleton,
+    Creative,
     Save,
     Restore,
     Done,
@@ -4318,6 +4346,31 @@ struct CombatDemo {
     /// The latched `combat_skeleton:` line, printed immediately after the
     /// `combat_shot:` line on the demo-shutdown path.
     skeleton_digest: Option<String>,
+    /// Whether the Creative inertness window observed no hostile decision at all
+    /// (`true` on success: zero attacks, zero shots, zero damage, no chase).
+    creative_inert: bool,
+    /// Melee attacks the Creative inertness window observed (`0` on success).
+    creative_attacks: u32,
+    /// Skeleton shots the Creative inertness window observed (`0` on success).
+    creative_shots: u32,
+    /// Player damage applied by arrows during the Creative window (`0`).
+    creative_damage: u16,
+    /// Damage the Creative melee swing applied (`20`: exactly one shot).
+    creative_melee_damage: u16,
+    /// Damage the Creative charge-0 arrow applied (`20`: exactly one shot).
+    creative_arrow_damage: u16,
+    /// Mob kills the Creative stage proved (`2`: one melee, one arrow).
+    creative_kills: u32,
+    /// Drop units those two kills delivered (`2` rotten flesh).
+    creative_drops: u32,
+    /// Drop units a full inventory refused (`0`).
+    creative_drops_lost: u32,
+    /// Whether the inventory total was conserved after both earned drops were
+    /// consumed again (`true` on success).
+    creative_inventory_kept: bool,
+    /// The latched `combat_creative:` line, printed immediately after the
+    /// `combat_skeleton:` line on the demo-shutdown path.
+    creative_digest: Option<String>,
 }
 
 impl CombatDemo {
@@ -4383,6 +4436,17 @@ impl CombatDemo {
             skeleton_bow: false,
             skeleton_respawn: false,
             skeleton_digest: None,
+            creative_inert: false,
+            creative_attacks: 0,
+            creative_shots: 0,
+            creative_damage: 0,
+            creative_melee_damage: 0,
+            creative_arrow_damage: 0,
+            creative_kills: 0,
+            creative_drops: 0,
+            creative_drops_lost: 0,
+            creative_inventory_kept: false,
+            creative_digest: None,
         }
     }
 
@@ -4483,6 +4547,32 @@ impl CombatDemo {
             self.skeleton_arrows,
             self.skeleton_bow,
             if self.skeleton_respawn { "spawn" } else { "none" }
+        )
+    }
+
+    /// The exact `combat_creative:` digest printed once on the demo-shutdown
+    /// path (immediately after the `combat_skeleton:` line).
+    ///
+    /// Only latched after the Creative stage proved the inert authority window,
+    /// both direct authority seams, the 20-damage melee and arrow one-shots
+    /// with their drops, and the conserved inventory, so the trailing
+    /// `inventory=kept ok=true` literals are the latching contract.
+    /// `attacks`/`shots`/`damage` are the measured zeroes; both damages and the
+    /// kill/drop counts are the measured values the stage asserts before it
+    /// prints them.
+    fn creative_digest(&self) -> String {
+        format!(
+            "combat_creative: seed={} inert={} attacks={} shots={} damage={} melee_damage={} arrow_damage={} kills={} drops={} drops_lost={} inventory=kept ok=true",
+            self.seed,
+            self.creative_inert,
+            self.creative_attacks,
+            self.creative_shots,
+            self.creative_damage,
+            self.creative_melee_damage,
+            self.creative_arrow_damage,
+            self.creative_kills,
+            self.creative_drops,
+            self.creative_drops_lost
         )
     }
 
@@ -4670,6 +4760,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
         CombatStage::Hostile => combat_hostile_stage(demo, session),
         CombatStage::Shot => combat_shot_stage(demo, session),
         CombatStage::Skeleton => combat_skeleton_stage(demo, session),
+        CombatStage::Creative => combat_creative_stage(demo, session),
         CombatStage::Save => combat_save_stage(demo, session),
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
@@ -6805,6 +6896,430 @@ fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
     demo.skeleton_bow = bows_sorted.len() == 2;
     demo.skeleton_respawn = true;
     demo.skeleton_digest = Some(demo.skeleton_digest());
+    demo.stage = CombatStage::Creative;
+    false
+}
+
+/// The Creative stage: the slice's real-binary proof that the effective player
+/// mode, not the stored save mode, decides every mob interaction.
+///
+/// Runs entirely in ONE call, like Fight/Drops/Hostile/Shot/Skeleton: every
+/// number here is observable, and a redraw between two partial phases would let
+/// the mob runtime move a record the next check describes. Every mutation goes
+/// through a production seam: [`WorldSession::use_creative_rules`],
+/// [`WorldSession::set_hostile_ai_enabled`], [`WorldSession::tick_mobs`],
+/// [`WorldSession::tick_arrows`], [`WorldSession::apply_mob_attacks`],
+/// [`WorldSession::apply_mob_shots`], [`attack_damage`],
+/// [`WorldSession::attack_mob`], [`WorldSession::resolve_mob_kill`],
+/// [`WorldSession::spawn_arrow`], [`opencraft::player::physics::Player::consume_item`]
+/// and [`WorldSession::sync_camera`].
+///
+/// The proof has four measured parts:
+///
+/// 1. **Inertness.** With the hostile gate OPEN and a Zombie pinned two blocks
+///    away plus a full-health synthetic Zombie at the spot,
+///    [`COMBAT_CREATIVE_INERT_TICKS`] fixed steps must decide zero attacks,
+///    zero shots, apply zero player damage, leave the player at 20 health with
+///    no cause and no hurt flash, spawn no arrows, and never put a mob in
+///    `Chase`. The direct authority seams are then probed with hand-built
+///    [`MobAttack`]/[`MobShot`] slices and must also refuse.
+/// 2. **One-shot melee.** A no-weapon swing resolves through [`attack_damage`]
+///    to exactly 20 and kills a full-health Zombie in one [`WorldSession::attack_mob`],
+///    whose player-attributed [`WorldSession::resolve_mob_kill`] grants exactly
+///    one rotten flesh.
+/// 3. **One-shot arrow.** A charge-0 player arrow (base damage 1, so the kill
+///    cannot be explained by charge) kills a second full-health Zombie through
+///    the real projectile sweep, granting exactly one more rotten flesh.
+/// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
+///    again and the inventory total must return to its pre-stage value, which
+///    is what keeps the 218-byte v7 save byte-identical.
+///
+/// Documented demo pins, not gameplay rules: the two survivors are parked 20
+/// blocks behind the camera (position *and* leash anchor, so the synthetic
+/// victim's `home` is a unique key) and the whole mob vector is restored
+/// byte-for-byte from a snapshot before the next stage; the player pose is
+/// restored afterwards, so the Save witness starts from the same pinned pose.
+fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive, in a
+    // Survival world whose LIVE player is about to take Creative rules.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "creative",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    let mode = session.player.mode();
+    if mode != GameMode::Survival || session.save_mode != GameMode::Survival {
+        demo.abort(
+            "creative",
+            &format!("mode={mode:?} save_mode={:?}", session.save_mode),
+        );
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "creative",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+    if !session.arrows().is_empty() {
+        demo.abort("creative", &format!("arrows={}", session.arrows().len()));
+        return true;
+    }
+    session.set_ambient_spawning(false);
+
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+    let flesh_id = ItemId::Material(Material::RottenFlesh);
+    let flesh_before = combat_inventory_units(session, flesh_id);
+    let player_feet = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+
+    // Demo pin 1: snapshot both survivors, then park them 20 blocks behind the
+    // camera. The leash anchor moves with the body so the parked pair stays put
+    // (MEM449: a 4-block home leash would otherwise walk them back toward the
+    // player) and the synthetic victim's `home` stays a unique key. The whole
+    // vector is restored from this snapshot at the end, so the mutation never
+    // reaches the save or the next stage.
+    let survivors: Vec<Mob> = session.mobs().to_vec();
+    let parked = player_feet - forward * 20.0;
+    for mob in session.mobs_mut() {
+        mob.position = parked;
+        mob.home = parked;
+    }
+
+    // The effective-versus-stored distinction this whole slice is built on.
+    session.use_creative_rules();
+    if session.player.mode() != GameMode::Creative || session.save_mode != GameMode::Survival {
+        demo.abort(
+            "creative",
+            &format!(
+                "effective={:?} stored={:?}",
+                session.player.mode(),
+                session.save_mode
+            ),
+        );
+        return true;
+    }
+
+    // Spot selection: the exact bounded 8-angle, 2.0-block loop the Hostile
+    // stage uses, so the two stages cannot disagree about a legal spot. The
+    // loop order is fixed and no RNG or clock enters it.
+    let feet_y = player_feet.y;
+    let eye = session.player.eye_position();
+    let mut spot = None;
+    for step in 0..8u32 {
+        let angle = session.player.yaw + step as f32 * std::f32::consts::FRAC_PI_4;
+        let candidate = Vec3::new(
+            player_feet.x + angle.cos() * 2.0,
+            feet_y,
+            player_feet.z + angle.sin() * 2.0,
+        );
+        if combat_hostile_spot_ok(session, candidate, eye) {
+            spot = Some(candidate);
+            break;
+        }
+    }
+    let Some(spot) = spot else {
+        demo.abort("creative", "observed=spot");
+        return true;
+    };
+    let victim_yaw = (player_feet.x - spot.x).atan2(player_feet.z - spot.z);
+
+    // 1. Inertness window. One synthetic full-health Zombie at the verified
+    //    spot; 40 open-gate fixed steps must decide nothing at all.
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Zombie, spot, victim_yaw));
+    session.set_hostile_ai_enabled(true);
+    let mut attacks = 0u32;
+    let mut shots = 0u32;
+    let mut damage = 0u16;
+    let mut chased = false;
+    for _ in 0..COMBAT_CREATIVE_INERT_TICKS {
+        // Re-pin every body before observing, keyed on its `home` (the
+        // survivors share the parked anchor, the victim owns the spot).
+        for mob in session.mobs_mut() {
+            mob.position = if mob.home.distance_squared(spot) <= 1e-6 {
+                spot
+            } else {
+                parked
+            };
+        }
+        let tick = session.tick_mobs(0.1, 1.0);
+        attacks = attacks.saturating_add(tick.attacks.len() as u32);
+        shots = shots.saturating_add(tick.shots.len() as u32);
+        chased |= session
+            .mobs()
+            .iter()
+            .any(|mob| mob.state == MobAiState::Chase);
+        let arrow_tick = session.tick_arrows(0.1, 1.0);
+        damage = damage.saturating_add(arrow_tick.player_damage);
+        chased |= session
+            .mobs()
+            .iter()
+            .any(|mob| mob.state == MobAiState::Chase);
+        if session.player.survival.health() != 20 || !session.arrows().is_empty() {
+            break;
+        }
+    }
+    let health = session.player.survival.health();
+    let cause = session.last_damage_cause();
+    let flash = session.player_hurt_intensity();
+    let arrows_empty = session.arrows().is_empty();
+    if attacks != 0
+        || shots != 0
+        || damage != 0
+        || chased
+        || health != 20
+        || cause.is_some()
+        || flash != 0.0
+        || !arrows_empty
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "inert attacks={attacks} shots={shots} damage={damage} chase={chased} health={health} cause={cause:?} flash={flash} arrows={}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 1b. Direct authority proof: even a hand-built decision list must be
+    //     refused by the two single-authority seams. Defense in depth, exactly
+    //     the contract `tick_mobs`'s closed target build relies on.
+    let melee_authority = session.apply_mob_attacks(&[MobAttack {
+        kind: MobKind::Zombie,
+        from: spot,
+    }]);
+    let shot_authority = session.apply_mob_shots(&[MobShot {
+        kind: MobKind::Skeleton,
+        origin: session.player.eye_position(),
+        dir: forward,
+    }]);
+    let health = session.player.survival.health();
+    if melee_authority != 0 || shot_authority != 0 || !session.arrows().is_empty() || health != 20 {
+        demo.abort(
+            "creative",
+            &format!(
+                "authority attack={melee_authority} shots={shot_authority} arrows={} health={health}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 2. Melee one-shot: a fist (no selected item) resolves to the target's own
+    //    health in Creative, so one swing kills the full-health victim.
+    let melee_damage = attack_damage(None, session.player.mode(), 20);
+    if melee_damage != 20 {
+        demo.abort("creative", &format!("melee_damage={melee_damage}"));
+        return true;
+    }
+    let Some(victim_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.home.distance_squared(spot) <= 1e-6)
+    else {
+        demo.abort("creative", "observed=victim_missing");
+        return true;
+    };
+    let Some(hit) = session.attack_mob(victim_index, melee_damage, session.camera.position) else {
+        demo.abort("creative", "observed=melee_refused");
+        return true;
+    };
+    if !hit.killed || hit.health_after != 0 || hit.damage != melee_damage {
+        demo.abort(
+            "creative",
+            &format!(
+                "melee killed={} health={} damage={}",
+                hit.killed, hit.health_after, hit.damage
+            ),
+        );
+        return true;
+    }
+    let melee_drops = session.resolve_mob_kill(victim_index, hit, MobKillCause::Player);
+    if melee_drops.accepted != 1 || melee_drops.lost != 0 {
+        demo.abort(
+            "creative",
+            &format!(
+                "melee_drops accepted={} lost={}",
+                melee_drops.accepted, melee_drops.lost
+            ),
+        );
+        return true;
+    }
+    let flesh_after_melee = combat_inventory_units(session, flesh_id);
+    if flesh_after_melee != flesh_before + 1 {
+        demo.abort(
+            "creative",
+            &format!("melee_flesh={flesh_after_melee}/{flesh_before}"),
+        );
+        return true;
+    }
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
+
+    // 3. Arrow one-shot: a charge-0 arrow (base damage 1) still kills a
+    //    full-health Zombie through the Creative hit rule, and the real
+    //    projectile sweep delivers the player-attributed drop table.
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Zombie, spot, victim_yaw));
+    let arrow_victim_health = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.home.distance_squared(spot) <= 1e-6)
+        .map(|mob| mob.health)
+        .unwrap_or(0);
+    if arrow_victim_health != MobKind::Zombie.max_health() {
+        demo.abort("creative", &format!("victim_health={arrow_victim_health}"));
+        return true;
+    }
+    let eye = session.player.eye_position();
+    let chest = spot + Vec3::Y * (MobKind::Zombie.height() * 0.5);
+    let Some(arrow) = Arrow::player(eye, (chest - eye).normalize_or_zero(), 0.0) else {
+        demo.abort("creative", "observed=arrow");
+        return true;
+    };
+    if arrow.damage != 1 {
+        demo.abort("creative", &format!("arrow_base={}", arrow.damage));
+        return true;
+    }
+    if session.spawn_arrow(arrow).is_none() {
+        demo.abort("creative", "observed=arrow_spawn");
+        return true;
+    }
+    let mut mob_hits = 0u32;
+    let mut arrow_kills = 0u32;
+    let mut arrow_drops = MobDropReport::default();
+    for _ in 0..COMBAT_CREATIVE_ABORT_TICKS {
+        let tick = session.tick_arrows(0.1, 1.0);
+        mob_hits = mob_hits.saturating_add(tick.mob_hits);
+        arrow_kills = arrow_kills.saturating_add(tick.kills);
+        arrow_drops.accepted = arrow_drops.accepted.saturating_add(tick.drops.accepted);
+        arrow_drops.lost = arrow_drops.lost.saturating_add(tick.drops.lost);
+        if mob_hits >= 1 {
+            break;
+        }
+    }
+    let arrow_victim_after = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.home.distance_squared(spot) <= 1e-6)
+        .map(|mob| mob.health);
+    let arrow_damage = arrow_victim_health.saturating_sub(arrow_victim_after.unwrap_or(0));
+    let flesh_after_arrow = combat_inventory_units(session, flesh_id);
+    if mob_hits != 1
+        || arrow_kills != 1
+        || arrow_drops.accepted != 1
+        || arrow_drops.lost != 0
+        || arrow_victim_after != Some(0)
+        || arrow_damage != MobKind::Zombie.max_health()
+        || !session.arrows().is_empty()
+        || flesh_after_arrow != flesh_before + 2
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "arrow hits={mob_hits} kills={arrow_kills} drops={} lost={} health={arrow_victim_after:?} damage={arrow_damage} arrows={} flesh={flesh_after_arrow}/{flesh_before}",
+                arrow_drops.accepted,
+                arrow_drops.lost,
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
+
+    // 4. Conserve the save witness: both earned units are consumed again, so
+    //    the inventory section (and therefore the 218-byte v7 layout) is
+    //    byte-identical.
+    if session.player.consume_item(flesh_id).is_none()
+        || session.player.consume_item(flesh_id).is_none()
+    {
+        demo.abort("creative", &format!("consume flesh={flesh_after_arrow}"));
+        return true;
+    }
+    let items_after = combat_inventory_units_total(session);
+    let flesh_left = combat_inventory_units(session, flesh_id);
+    if items_after != items_before || flesh_left != flesh_before {
+        demo.abort(
+            "creative",
+            &format!(
+                "inventory items={items_after}/{items_before} flesh={flesh_left}/{flesh_before}"
+            ),
+        );
+        return true;
+    }
+
+    // Restore before the next stage: close the gate, put the stored mode back,
+    // restore the survivors byte-for-byte, and re-pin the player pose the Save
+    // witness expects.
+    session.set_hostile_ai_enabled(false);
+    session.player.set_mode(session.save_mode);
+    *session.mobs_mut() = survivors;
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.player.combat.reset();
+    session.sync_camera();
+    let mobs = session.mobs().len();
+    let health = session.player.survival.health();
+    let cause = session.last_damage_cause();
+    let items_restored = combat_inventory_units_total(session);
+    if mobs != 2
+        || session.player.mode() != session.save_mode
+        || session.is_dead()
+        || health != 20
+        || cause.is_some()
+        || items_restored != items_before
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "restore mobs={mobs} mode={:?}/{:?} dead={} health={health} cause={cause:?} items={items_restored}/{items_before}",
+                session.player.mode(),
+                session.save_mode,
+                session.is_dead()
+            ),
+        );
+        return true;
+    }
+
+    demo.creative_inert = true;
+    demo.creative_attacks = attacks;
+    demo.creative_shots = shots;
+    demo.creative_damage = damage;
+    demo.creative_melee_damage = melee_damage;
+    demo.creative_arrow_damage = arrow_damage;
+    demo.creative_kills = 2;
+    demo.creative_drops = melee_drops.accepted.saturating_add(arrow_drops.accepted);
+    demo.creative_drops_lost = melee_drops.lost.saturating_add(arrow_drops.lost);
+    demo.creative_inventory_kept = true;
+    demo.creative_digest = Some(demo.creative_digest());
     demo.stage = CombatStage::Save;
     false
 }
@@ -10807,6 +11322,16 @@ impl ApplicationHandler for GameApp {
             {
                 let _ = writeln!(stdout, "{line}");
             }
+            // The Creative stage's digest follows the Skeleton line for the
+            // same reason: every earlier line and the 218-byte v7 witness keep
+            // their exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.creative_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
             drop(stdout);
             self.shutdown(event_loop);
             return;
@@ -13548,9 +14073,9 @@ mod tests {
 
         assert!(
             !combat_skeleton_stage(&mut demo, &mut session),
-            "the skeleton proof hands over to Save"
+            "the skeleton proof hands over to the creative proof"
         );
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.stage, CombatStage::Creative);
         assert!(!demo.failed, "unexpected skeleton abort: {:?}", demo.digest);
         assert_eq!(demo.skeleton_fired, 1, "one decided shot, one hit");
         assert_eq!(demo.skeleton_player_hits, 1);
@@ -13726,10 +14251,204 @@ mod tests {
         assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
     }
 
+    /// The Creative stage proved against a lit synthetic plain: with the
+    /// hostile gate OPEN and the live player switched to Creative rules, a
+    /// Zombie pinned two blocks away and a full-health synthetic Zombie produce
+    /// zero attacks, zero shots, zero damage, and no chase over 40 fixed steps;
+    /// both direct authority seams refuse a hand-built decision slice; one
+    /// no-weapon swing (20 damage) and one charge-0 arrow (base damage 1) each
+    /// one-shot a full-health Zombie and earn exactly one rotten flesh; and the
+    /// two earned units are consumed again so the inventory total is unchanged.
+    #[test]
+    fn combat_demo_creative_stage_proves_inertness_and_one_shot_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-creative.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        // Only the two records this test places may exist: an ambient spawn
+        // during the inertness window would change the stage's shape check.
+        session.set_ambient_spawning(false);
+
+        // A non-empty inventory makes the "conserved" assertion mean something
+        // instead of comparing 0 to 0.
+        let item = Item::new(ItemId::Material(Material::Stick), 5).expect("stick stack");
+        assert!(
+            session.player.collect_item(item),
+            "the witness inventory must be non-empty"
+        );
+
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, player + forward * 7.0, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, player + forward * 12.0, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        let before: Vec<Mob> = session.mobs().to_vec();
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+        let flesh_id = ItemId::Material(Material::RottenFlesh);
+        assert_eq!(combat_inventory_units(&session, flesh_id), 0);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(
+            !combat_creative_stage(&mut demo, &mut session),
+            "the creative proof hands over to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(
+            !demo.finished(),
+            "a successful stage never latches an abort"
+        );
+        assert!(!demo.failed, "unexpected creative abort: {:?}", demo.digest);
+
+        // The inertness verdict is measured, not inferred from the pass.
+        assert!(demo.creative_inert);
+        assert_eq!(demo.creative_attacks, 0, "no melee may be decided");
+        assert_eq!(demo.creative_shots, 0, "no arrow may be decided");
+        assert_eq!(demo.creative_damage, 0, "Creative must take no damage");
+        assert_eq!(demo.creative_melee_damage, 20, "one fist swing one-shots");
+        assert_eq!(demo.creative_arrow_damage, 20, "a charge-0 arrow one-shots");
+        assert_eq!(demo.creative_kills, 2);
+        assert_eq!(demo.creative_drops, 2, "one rotten flesh per kill");
+        assert_eq!(demo.creative_drops_lost, 0);
+        assert!(demo.creative_inventory_kept);
+        assert_eq!(
+            demo.creative_digest.as_deref(),
+            Some(
+                "combat_creative: seed=12345 inert=true attacks=0 shots=0 damage=0 melee_damage=20 arrow_damage=20 kills=2 drops=2 drops_lost=0 inventory=kept ok=true"
+            )
+        );
+
+        // The stage restored the world it borrowed: the survivors are
+        // byte-identical, both synthetic victims are gone by their home, the
+        // player is back in Survival at full health with no cause or flash, and
+        // the inventory total (and the rotten-flesh count) is unchanged.
+        assert_eq!(session.mobs(), before.as_slice());
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.survival.health(), 20);
+        assert!(!session.is_dead());
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert!(session.arrows().is_empty());
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+        assert_eq!(combat_inventory_units_total(&session), items_before);
+        assert_eq!(combat_inventory_units(&session, flesh_id), 0);
+    }
+
+    /// The `combat_creative:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the seed may vary. The inert flag, the three
+    /// zeroes, both 20-damage one-shots, and the two-earned/two-consumed drop
+    /// counts are latching literals the stage asserts before it prints them.
+    #[test]
+    fn combat_creative_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.creative_inert = true;
+        demo.creative_melee_damage = 20;
+        demo.creative_arrow_damage = 20;
+        demo.creative_kills = 2;
+        demo.creative_drops = 2;
+        demo.creative_inventory_kept = true;
+        assert_eq!(
+            demo.creative_digest(),
+            "combat_creative: seed=1 inert=true attacks=0 shots=0 damage=0 melee_damage=20 arrow_damage=20 kills=2 drops=2 drops_lost=0 inventory=kept ok=true"
+        );
+    }
+
+    /// The Creative stage refuses a world it does not own before any tick, any
+    /// one-shot, any push, or any drop: a record shape other than exactly one
+    /// Zombie plus one Skeleton and an already-Creative session (no stored
+    /// Survival mode to prove the effective-versus-stored distinction against)
+    /// both latch a self-describing abort.
+    #[test]
+    fn combat_creative_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-creative-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let feet = session.player.position;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=creative"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(combat_inventory_units_total(&session), 0);
+        assert_eq!(session.mobs().len(), 1, "the abort mutates nothing");
+        assert_eq!(session.player.mode(), GameMode::Survival);
+
+        // A session already in Creative has no stored Survival mode, so it is
+        // not a valid subject for the effective-versus-stored proof.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-creative-mode.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let feet = creative.player.position;
+        let forward = Vec3::new(creative.player.yaw.cos(), 0.0, creative.player.yaw.sin());
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + forward * 2.0, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, feet - forward * 20.0, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
+    }
+
     /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot ->
-    /// Skeleton -> Save) to completion and return the session plus its finished
-    /// demo. Both save-leg tests use this so the fresh save is always produced by
-    /// the production Save stage rather than hand-built wire data.
+    /// Skeleton -> Creative -> Save) to completion and return the session plus
+    /// its finished demo. Both save-leg tests use this so the fresh save is
+    /// always produced by the production Save stage rather than hand-built wire
+    /// data.
     fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
         let mut session = WorldSession::new_session_with_mode(
             seed,

@@ -8,7 +8,8 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Efficient Chunk Rendering**: Implements Greedy Meshing to optimize the rendering of voxel chunks, significantly reducing the number of vertices sent to the GPU.
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
-*   **Survival and Creative Modes**: New worlds default to Survival. Survival has 20 health, 20 hunger, and 300 air, shown as a hearts/hunger/air HUD; fall, drowning, and starvation damage; a Death screen with Respawn and Quit (respawn at the deterministic spawn with your inventory kept); hold-to-eat apples and bread; hoe-based wheat farming that pauses in Winter; 27-slot chests; and deterministic ruin loot. Creative keeps flying and building, is invulnerable, never hungry, and never loses air. The mode is chosen at creation and locked.
+*   **Survival and Creative Modes**: New worlds default to Survival. Survival has 20 health, 20 hunger, and 300 air, shown as a hearts/hunger/air HUD; fall, drowning, and starvation damage; a Death screen with Respawn and Quit (respawn at the deterministic spawn with your inventory kept); hold-to-eat apples and bread; hoe-based wheat farming that pauses in Winter; 27-slot chests; and deterministic ruin loot. Creative keeps flying and building, is invulnerable, never hungry, never loses air, is never targeted or damaged by mobs, and one-shots any mob with its drops intact. The mode is chosen at creation and locked; the mob rule follows the *effective* mode, so Edit Background inherits Creative's immunity and one-shot swings while the background world keeps its stored mode.
+*   **Mob and Combat Audio**: Nine built-in generated sounds — block break, block place, mine-complete, UI click, mob idle, mob hurt, mob death, bow release, and arrow impact. A texture pack can override any of them per file; a missing file silently keeps the built-in sound and a corrupt one falls back with a menu warning. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md#sounds).
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
     *   Fly mode for free movement and exploration.
@@ -127,6 +128,8 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | **Left Click (chest screen)** | Move a whole stack between the chest and your inventory. Right click is inert in the chest screen. |
 | **E or Escape (chest screen)** | Close the chest screen. |
 | **Respawn / Quit (Death screen)** | Respawn at the deterministic spawn with full vitals and your inventory kept, or Quit to save and return to the menu. |
+| **Mob sounds** | An idle call from a nearby mob every few seconds; a hurt sound when a mob takes non-lethal damage; and a death sound when a mob dies. A bow release is heard on a real shot (a tap-cancel is silent) and an arrow impact when an arrow hits a body or a block. |
+| **Creative mobs** | Mobs never target or damage a Creative player. Any melee swing (even with no weapon) and any player arrow kills a mob in one hit, and the mob's normal drops still land in your inventory. The rule follows the effective mode, so Edit Background is safe from attacks too. |
 
 ## 📂 Project Structure
 
