@@ -1071,7 +1071,15 @@ fn loot_items(entries: &[LootEntry]) -> Option<Vec<Item>> {
 /// drifted table can never invent or silently truncate a drop. Entries pass
 /// through the T01 `From<MobDropItem> for ItemId` bridge, which is the only
 /// world -> player identity mapping.
-fn mob_drop_items(kind: MobKind) -> Option<Vec<Item>> {
+///
+/// `#[doc(hidden)] pub` is a narrowly scoped allowance, not supported API: the
+/// bin crate's bounded `--demo-combat` Drops self-check builds the same batch a
+/// kill delivers so it can prove the overflow accounting one level below the
+/// [`crate::player::physics::Player::collect_items`] forwarder. No gameplay
+/// caller reads this; production delivery always goes through
+/// [`WorldSession::resolve_mob_kill`].
+#[doc(hidden)]
+pub fn mob_drop_items(kind: MobKind) -> Option<Vec<Item>> {
     mob_drops(kind)
         .iter()
         .map(|drop| {

@@ -18,7 +18,7 @@ use opencraft::pack::{self, LoadedPack};
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
-    ToolWear, HOTBAR_SLOTS,
+    ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
 };
 use opencraft::player::melee::{
     attack_damage, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH, SWORD_DAMAGE_WOOD,
@@ -76,7 +76,7 @@ use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, 
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
-use opencraft::world::mob::{Mob, MobHit, MobKind};
+use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind};
 use opencraft::world::mob_loot::{MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
@@ -86,7 +86,7 @@ use opencraft::world::persistence::{
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Season, Weather};
-use opencraft::world::session::ChestCommandError;
+use opencraft::world::session::{mob_drop_items, ChestCommandError};
 use opencraft::world::terrain::{
     biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
     DEFAULT_WORLD_SEED, SEA_LEVEL,
@@ -3814,14 +3814,32 @@ const COMBAT_PINNED_HEALTH: [u16; 4] = [4, 7, 11, 14];
 /// behind a default facing.
 const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 
+/// Measured byte length of the fresh `--demo-combat` save (seed 12345), after
+/// the Drops stage earns the wood sword plus the pig/cow drops and the Save
+/// stage writes the two surviving hostile records.
+///
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v7_save`)
+/// and reading the file back, never computed by hand: every earned stack changes
+/// the serialized inventory size. The same run measures the mob-count offset.
+/// Test-only pins: nothing in production reads the file length.
+#[cfg(test)]
+const COMBAT_SAVE_BYTES: usize = 204;
+/// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
+/// record starts at 166 and the Skeleton record at 185, so the tail ends at
+/// [`COMBAT_SAVE_BYTES`].
+#[cfg(test)]
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 162;
+
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
 /// spawn chunks are resident.
 ///
-/// Fight runs in the SAME step that Walk reports success, and it latches its
-/// numbers before advancing to Save. Save then re-pins the quartet's pose and
-/// health, so a redraw between the two stages (which may tick the mobs) cannot
-/// change a single saved value; the fight provably never leaks into the save.
+/// Fight runs in the SAME step that Walk reports success so no redraw can
+/// slip between the walk verdict and the scripted hit sequence. Drops runs in
+/// its own one-call step: it re-pins the mob it is about to kill, so a redraw
+/// between Fight and Drops cannot perturb a single observed number. It then
+/// latches its verdict and advances to Save, which re-pins the two surviving
+/// hostile records, so neither the fight nor the kills can leak into the save.
 /// The Restore stage is the loaded-save leg's first and only stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
@@ -3829,6 +3847,7 @@ enum CombatStage {
     Spawn,
     Walk,
     Fight,
+    Drops,
     Save,
     Restore,
     Done,
@@ -3874,6 +3893,21 @@ struct CombatDemo {
     melee_damage: u16,
     /// Swings the i-frame window refused (`1` on a successful fresh leg).
     melee_blocked: u32,
+    /// Mob records the Drops stage killed (`2` on a successful fresh leg).
+    killed: u32,
+    /// Drop units the Drops stage delivered into the real 36-slot inventory.
+    drops: u32,
+    /// Drop units a full inventory refused (zero on the pinned demo path).
+    drops_lost: u32,
+    /// Mob records the Walk verdict observed, frozen at the moment the walk
+    /// succeeded: Drops removes two records and Save re-pins the rest, so a
+    /// live count read at digest time would no longer describe the walk.
+    walk_mobs: u32,
+    /// Resident mobs at the walk verdict, frozen with [`CombatDemo::walk_mobs`].
+    walk_resident: u32,
+    /// Rendered vertices at the walk verdict, frozen with
+    /// [`CombatDemo::walk_mobs`].
+    walk_verts: usize,
 }
 
 impl CombatDemo {
@@ -3897,6 +3931,12 @@ impl CombatDemo {
             melee_hits: 0,
             melee_damage: 0,
             melee_blocked: 0,
+            killed: 0,
+            drops: 0,
+            drops_lost: 0,
+            walk_mobs: 0,
+            walk_resident: 0,
+            walk_verts: 0,
         }
     }
 
@@ -3916,39 +3956,26 @@ impl CombatDemo {
         self.failed = true;
     }
 
-    /// The exact success digest printed once on the demo-shutdown path. The
-    /// vertex count is the sum over resident mobs of the real
-    /// [`build_mob_vertices`] output, so it pins the render path's batch size
-    /// (4 mobs x 6 cuboids x 6 faces x 6 vertices = 864).
-    fn success_digest(&self, session: &WorldSession) -> String {
-        let mobs = session.mobs().len();
-        let resident = session.resident_mobs().count();
-        let verts: usize = session
-            .resident_mobs()
-            .map(|mob| {
-                build_mob_vertices(
-                    mob.kind,
-                    MobAnim {
-                        walk_phase: mob.walk_phase,
-                        walk_amount: 1.0,
-                        light: 1.0,
-                    },
-                    0.0,
-                    0.0,
-                )
-                .len()
-            })
-            .sum();
+    /// The exact success digest printed once on the demo-shutdown path.
+    ///
+    /// Every walk number is the frozen value latched when the Walk verdict
+    /// passed: the Drops stage removes two records and the Save stage re-pins
+    /// the survivors, so reading the live session here would report counts
+    /// that describe the end of the run instead of the walk that was proven.
+    fn success_digest(&self) -> String {
         format!(
-            "combat_demo: seed={} mobs={} resident={} walked={} verts={} melee_hits={} melee_damage={} melee_blocked={} saved={} records={} ok=true",
+            "combat_demo: seed={} mobs={} resident={} walked={} verts={} melee_hits={} melee_damage={} melee_blocked={} killed={} drops={} drops_lost={} saved={} records={} ok=true",
             self.seed,
-            mobs,
-            resident,
+            self.walk_mobs,
+            self.walk_resident,
             self.walked,
-            verts,
+            self.walk_verts,
             self.melee_hits,
             self.melee_damage,
             self.melee_blocked,
+            self.killed,
+            self.drops,
+            self.drops_lost,
             self.saved,
             self.records
         )
@@ -4059,6 +4086,30 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
                 && walked == 4
                 && demo.walk_updates >= COMBAT_WALK_OBSERVATIONS
             {
+                // Freeze the walk verdict before any later stage rewrites the
+                // mob list: the digest must describe the walk that was proven,
+                // not the two-record world the Drops stage leaves behind. The
+                // vertex count is the sum over resident mobs of the real
+                // [`build_mob_vertices`] output (4 mobs x 6 cuboids x 6 faces x
+                // 6 vertices = 864), so it pins the render path's batch size.
+                demo.walk_mobs = total as u32;
+                demo.walk_resident = resident as u32;
+                demo.walk_verts = session
+                    .resident_mobs()
+                    .map(|mob| {
+                        build_mob_vertices(
+                            mob.kind,
+                            MobAnim {
+                                walk_phase: mob.walk_phase,
+                                walk_amount: 1.0,
+                                light: 1.0,
+                            },
+                            0.0,
+                            0.0,
+                        )
+                        .len()
+                    })
+                    .sum();
                 // Fight runs in THIS step, not a later one, for the same
                 // reason the old direct Save call did: no redraw may slip
                 // between the walk verdict and the scripted hit sequence.
@@ -4078,6 +4129,7 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
             false
         }
         CombatStage::Fight => combat_fight_stage(demo, session),
+        CombatStage::Drops => combat_drops_stage(demo, session),
         CombatStage::Save => combat_save_stage(demo, session),
         CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
@@ -4096,9 +4148,12 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
 /// of a parallel copy of it.
 ///
 /// On success the stage latches `melee_hits`/`melee_damage`/`melee_blocked`
-/// and advances to `Save`, which re-pins the quartet's real pose and health in
-/// the following step. Every mismatch latches `stage=fight` naming the
-/// observed value, so a partial proof can never be mistaken for a pass.
+/// and advances to `Drops`, which kills the two passive records and delivers
+/// their drops. The crafted wood sword stays in the inventory: it is the
+/// player's earned item and the milestone requires the inventory to persist, so
+/// it is part of the saved witness rather than a throwaway fixture. Every
+/// mismatch latches `stage=fight` naming the observed value, so a partial proof
+/// can never be mistaken for a pass.
 fn combat_fight_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
     let pig_kind = MobKind::ALL[0];
     debug_assert_eq!(pig_kind, MobKind::Pig, "index 0 is the demo's Pig pin");
@@ -4351,54 +4406,495 @@ fn combat_fight_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool
         return true;
     }
 
-    // The demo sword is a fixture, not part of the pinned save witness: consume
-    // it through the same production consume seam eating uses, so the saved
-    // payload keeps the pre-S03 byte layout for a fresh world (an empty
-    // inventory) and the offset-149 mob-count guard in the bin test stays a
-    // meaningful "no save offset moved" check rather than a shifted one.
-    if session.player.consume_selected().is_none() {
-        demo.abort("fight", "sword_not_consumed");
-        return true;
-    }
-    if session.player.selected_item().is_some() {
-        demo.abort("fight", "inventory_not_empty_after_fixture");
-        return true;
-    }
+    // The demo sword is a real earned item, not a fixture: it stays in the
+    // hotbar so the saved witness carries the player's inventory into the
+    // Drops stage and through the reload.
 
     // Latch the observed numbers the success digest reports, then hand over to
-    // the Save stage, which re-pins the real quartet (positions, yaw, and the
-    // 4/7/11/14 damaged-health witness) in the next step.
+    // the Drops stage, which kills the two passive records (fleeing, collapsing
+    // and being reaped) and delivers their drops into this same inventory.
     demo.melee_hits = 2;
     demo.melee_damage = SWORD_DAMAGE_WOOD;
     demo.melee_blocked = blocked;
+    demo.stage = CombatStage::Drops;
+    false
+}
+
+/// Re-pins one demo mob at `feet` with every ephemeral combat timer cleared, so
+/// each scripted hit starts from the same known state.
+///
+/// Demo pose pin, NOT a gameplay rule: the Drops stage owns the pose of the
+/// record it is about to hit, exactly like the Fight stage owns the Pig's pin.
+fn combat_pin_mob_for_hit(session: &mut WorldSession, index: usize, feet: Vec3) {
+    if let Some(mob) = session.mobs_mut().get_mut(index) {
+        mob.position = feet;
+        mob.home = feet;
+        mob.velocity = Vec3::ZERO;
+        mob.knockback = Vec3::ZERO;
+        mob.hurt = 0.0;
+        mob.hurt_iframe = 0.0;
+        mob.flee = 0.0;
+        mob.death = 0.0;
+        mob.state = MobAiState::Wander;
+    }
+}
+
+/// Total `id` units across all 36 inventory slots (order-independent).
+fn combat_inventory_units(session: &WorldSession, id: ItemId) -> u32 {
+    session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .filter(|item| item.id() == id)
+        .map(|item| u32::from(item.count()))
+        .sum()
+}
+
+/// Aims the crosshair ray at `index`'s AABB centre and applies one real wood
+/// sword hit through [`WorldSession::melee_candidate`] +
+/// [`WorldSession::attack_mob`].
+///
+/// Returns the observed failure as a string instead of aborting directly, so
+/// the caller latches one self-describing `stage=drops` digest.
+fn combat_sword_hit(
+    session: &mut WorldSession,
+    index: usize,
+    origin: Vec3,
+) -> Result<MobHit, String> {
+    let Some(mob) = session.mobs().get(index) else {
+        return Err(format!("index={index}"));
+    };
+    let (min, max) = mob.aabb();
+    let centre = (min + max) * 0.5;
+    let dir = (centre - origin).normalize_or_zero();
+    let Some(candidate) = session.melee_candidate(origin, dir, MELEE_REACH) else {
+        return Err(format!("crosshair=miss index={index}"));
+    };
+    if candidate.index != index {
+        return Err(format!(
+            "crosshair_index={} expected={index}",
+            candidate.index
+        ));
+    }
+    session
+        .attack_mob(index, SWORD_DAMAGE_WOOD, origin)
+        .ok_or_else(|| format!("hit_refused index={index}"))
+}
+
+/// The Drops stage: the slice's real-binary proof that a hit makes a passive mob
+/// flee away, that a lethal hit collapses the box model and then removes the
+/// record, and that a player-attributed kill lands its raw meat and leather in
+/// the real 36-slot inventory.
+///
+/// Runs entirely in ONE call, like the Fight stage: every number here is
+/// observable, and a redraw between two partial phases would let the mob runtime
+/// move a record the next check describes. Every mutation goes through a
+/// production seam — [`WorldSession::melee_candidate`],
+/// [`WorldSession::attack_mob`], [`WorldSession::tick_mobs`] (which reaps
+/// internally), [`WorldSession::resolve_mob_kill`] and [`mob_drop_items`] — so
+/// the demo proves the shipped path instead of a parallel copy of it.
+///
+/// On success it latches `killed`/`drops`/`drops_lost` and advances to `Save`,
+/// which pins the two surviving hostile records and writes the witness.
+fn combat_drops_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let sword_id = ItemId::Tool {
+        kind: ToolKind::Sword,
+        tier: ToolTier::Wood,
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(sword_id) {
+        demo.abort("drops", "sword_not_held");
+        return true;
+    }
+    let origin = session.camera.position;
+    let player_position = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+    // The pin point: two blocks along the yaw forward axis at the player's own
+    // feet height, always inside the resident spawn chunks the Walk stage
+    // proved. Both passive phases reuse it.
+    let pin_feet = Vec3::new(
+        player_position.x + forward.x * 2.0,
+        player_position.y,
+        player_position.z + forward.z * 2.0,
+    );
+    let horizontal_from_player = |feet: Vec3| {
+        Vec3::new(feet.x - player_position.x, 0.0, feet.z - player_position.z).length()
+    };
+    let mut accepted = 0u32;
+    let mut lost = 0u32;
+
+    // ---- Pig: 10 -> 6 (flee) -> 2 -> 0 (collapse) -> reap ----------------
+    if session.mobs().first().map(|mob| mob.kind) != Some(MobKind::Pig) {
+        demo.abort("drops", "pig_index0_missing");
+        return true;
+    }
+    session.mobs_mut()[0].health = MobKind::Pig.max_health();
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 6 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_first health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let pig = &session.mobs()[0];
+        if pig.state != MobAiState::Flee || pig.flee <= 0.0 || pig.death != 0.0 {
+            demo.abort(
+                "drops",
+                &format!(
+                    "pig_flee state={:?} flee={} death={}",
+                    pig.state, pig.flee, pig.death
+                ),
+            );
+            return true;
+        }
+    }
+
+    // Flee is a runtime behaviour, not a field flip: age the fixed-rate runtime
+    // (six 0.1 s frames = twelve fixed steps) and require the Pig to be farther
+    // from the player, with the 0.5 s i-frame window expired (ten steps).
+    let before_flee = horizontal_from_player(session.mobs()[0].position);
+    for _ in 0..6 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    let after_flee = horizontal_from_player(session.mobs()[0].position);
+    if after_flee <= before_flee {
+        demo.abort(
+            "drops",
+            &format!("pig_flee before={before_flee:.3} after={after_flee:.3}"),
+        );
+        return true;
+    }
+    let iframe = session.mobs()[0].hurt_iframe;
+    if iframe != 0.0 {
+        demo.abort("drops", &format!("pig_iframe={iframe}"));
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 2 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_second health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 0 || !hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_lethal health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let pig = &session.mobs()[0];
+        if pig.death <= 0.0 || pig.death_progress() >= 1.0 || pig.velocity != Vec3::ZERO {
+            demo.abort(
+                "drops",
+                &format!(
+                    "pig_collapse death={} progress={:.3} velocity=({:.3},{:.3},{:.3})",
+                    pig.death,
+                    pig.death_progress(),
+                    pig.velocity.x,
+                    pig.velocity.y,
+                    pig.velocity.z
+                ),
+            );
+            return true;
+        }
+    }
+    let before_reap = session.mobs().len();
+    let report = session.resolve_mob_kill(0, hit, MobKillCause::Player);
+    if report != MobDropReport::new(2, 0) {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_drops accepted={} lost={}",
+                report.accepted, report.lost
+            ),
+        );
+        return true;
+    }
+    accepted += report.accepted;
+    lost += report.lost;
+
+    // The collapse must finish before the reaper may remove the record: age
+    // more than the pinned 0.8 s collapse in fixed steps.
+    for _ in 0..10 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    if session.mobs().len() + 1 != before_reap {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_reap before={before_reap} after={}",
+                session.mobs().len()
+            ),
+        );
+        return true;
+    }
+    if session.mobs().iter().any(|mob| mob.kind == MobKind::Pig) {
+        demo.abort("drops", "pig_record_survived_reap");
+        return true;
+    }
+    let porkchop = combat_inventory_units(session, ItemId::Material(Material::RawPorkchop));
+    let leather = combat_inventory_units(session, ItemId::Material(Material::Leather));
+    if porkchop != 1 || leather != 1 {
+        demo.abort(
+            "drops",
+            &format!("pig_inventory porkchop={porkchop} leather={leather}"),
+        );
+        return true;
+    }
+
+    // ---- Cow: 10 -> 6 (flee) -> 2 -> 0 (collapse) -> reap ----------------
+    // The index is looked up by kind: the Pig's record was reaped above, so
+    // every later slot shifted down by one.
+    let Some(cow_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.kind == MobKind::Cow)
+    else {
+        demo.abort("drops", "cow_missing");
+        return true;
+    };
+    session.mobs_mut()[cow_index].health = MobKind::Cow.max_health();
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 6 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_first health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let cow = &session.mobs()[cow_index];
+        if cow.state != MobAiState::Flee || cow.flee <= 0.0 || cow.death != 0.0 {
+            demo.abort(
+                "drops",
+                &format!(
+                    "cow_flee state={:?} flee={} death={}",
+                    cow.state, cow.flee, cow.death
+                ),
+            );
+            return true;
+        }
+    }
+
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 2 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_second health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 0 || !hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_lethal health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let cow = &session.mobs()[cow_index];
+        if cow.death <= 0.0 || cow.death_progress() >= 1.0 || cow.velocity != Vec3::ZERO {
+            demo.abort(
+                "drops",
+                &format!(
+                    "cow_collapse death={} progress={:.3} velocity=({:.3},{:.3},{:.3})",
+                    cow.death,
+                    cow.death_progress(),
+                    cow.velocity.x,
+                    cow.velocity.y,
+                    cow.velocity.z
+                ),
+            );
+            return true;
+        }
+    }
+    let before_reap = session.mobs().len();
+    let report = session.resolve_mob_kill(cow_index, hit, MobKillCause::Player);
+    if report != MobDropReport::new(3, 0) {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_drops accepted={} lost={}",
+                report.accepted, report.lost
+            ),
+        );
+        return true;
+    }
+    accepted += report.accepted;
+    lost += report.lost;
+    for _ in 0..10 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    if session.mobs().len() + 1 != before_reap {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_reap before={before_reap} after={}",
+                session.mobs().len()
+            ),
+        );
+        return true;
+    }
+    if session.mobs().iter().any(|mob| mob.kind == MobKind::Cow) {
+        demo.abort("drops", "cow_record_survived_reap");
+        return true;
+    }
+    let beef = combat_inventory_units(session, ItemId::Material(Material::RawBeef));
+    let leather = combat_inventory_units(session, ItemId::Material(Material::Leather));
+    if beef != 1 || leather != 3 {
+        demo.abort(
+            "drops",
+            &format!("cow_inventory beef={beef} leather={leather}"),
+        );
+        return true;
+    }
+
+    // Overflow self-check one level below the Player forwarder: a 35-full
+    // inventory with one empty slot must accept exactly one unit, report the
+    // other, and produce the exact overflow notice. The solved batch comes from
+    // the same `mob_drop_items` bridge the kill seam uses.
+    let Some(stick) = Item::new(ItemId::Material(Material::Stick), 64).ok() else {
+        demo.abort("drops", "stick_stack_build_failed");
+        return true;
+    };
+    let mut slots = [None; INVENTORY_SLOTS];
+    for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+        *slot = Some(stick);
+    }
+    let mut inventory = Inventory::from_parts(slots, None);
+    let Some(pig_items) = mob_drop_items(MobKind::Pig) else {
+        demo.abort("drops", "pig_table_unresolved");
+        return true;
+    };
+    let outcome = inventory.collect_items(&pig_items);
+    if outcome.accepted != 1 || outcome.lost != 1 {
+        demo.abort(
+            "drops",
+            &format!(
+                "overflow accepted={} lost={}",
+                outcome.accepted, outcome.lost
+            ),
+        );
+        return true;
+    }
+    let notice = mob_drop_notice(MobDropReport::new(outcome.accepted, outcome.lost));
+    if notice != Some("Inventory full: some mob drops were lost") {
+        demo.abort("drops", &format!("overflow_notice={notice:?}"));
+        return true;
+    }
+
+    demo.killed = 2;
+    demo.drops = accepted;
+    demo.drops_lost = lost;
     demo.stage = CombatStage::Save;
     false
 }
 
-/// Pin the quartet's pose and damaged health, write the world through the one
-/// production save site, then read the file back and require the exact four
+/// Pin the two surviving hostile records and write the world through the one
+/// production save site, then read the file back and require exactly those two
 /// records.
 ///
-/// Everything happens in one call so no Playing tick can run between the pose
-/// assignment and the write. Any failure latches `stage=save` with the named
-/// observed value instead of leaving a half-written world.
+/// The Drops stage removes the Pig and the Cow, so the witness is the two
+/// hostile kinds alone: Zombie at 11 health and Skeleton at 14, each at its own
+/// kind-indexed quartet pose and pinned yaw. Everything happens in one call so
+/// no Playing tick can run between the pose assignment and the write. Any
+/// failure latches `stage=save` with the named observed value instead of leaving
+/// a half-written world.
 fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
     let (positions, _) = combat_quartet(session.player.position, session.player.yaw, demo.seed);
-    {
-        let mobs = session.mobs_mut();
-        if mobs.len() != 4 {
-            demo.abort("save", &format!("mobs={}", mobs.len()));
+    if session.mobs().len() != 2 {
+        demo.abort("save", &format!("mobs={}", session.mobs().len()));
+        return true;
+    }
+    let mut survivors = 0u32;
+    for mob in session.mobs_mut() {
+        if !matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("save", &format!("kind={:?}", mob.kind));
             return true;
         }
-        for mob in mobs.iter_mut() {
-            let Some(index) = MobKind::ALL.iter().position(|kind| *kind == mob.kind) else {
-                demo.abort("save", &format!("kind={:?}", mob.kind));
-                return true;
-            };
-            mob.position = positions[index];
-            mob.yaw = COMBAT_PINNED_YAW[index];
-            mob.health = COMBAT_PINNED_HEALTH[index];
-        }
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == mob.kind) else {
+            demo.abort("save", &format!("kind={:?}", mob.kind));
+            return true;
+        };
+        mob.position = positions[index];
+        mob.yaw = COMBAT_PINNED_YAW[index];
+        mob.health = COMBAT_PINNED_HEALTH[index];
+        survivors += 1;
+    }
+    if survivors != 2 {
+        demo.abort("save", &format!("survivors={survivors}"));
+        return true;
     }
     if let Err(error) = save_current_world(session) {
         demo.abort("save", &format!("error={error}"));
@@ -4411,11 +4907,15 @@ fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool 
             return true;
         }
     };
-    if loaded.mobs.len() != 4 {
+    if loaded.mobs.len() != 2 {
         demo.abort("save", &format!("records={}", loaded.mobs.len()));
         return true;
     }
     for record in &loaded.mobs {
+        if !matches!(record.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("save", &format!("records=kind={:?}", record.kind));
+            return true;
+        }
         let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
             demo.abort("save", &format!("records=kind={:?}", record.kind));
             return true;
@@ -4428,17 +4928,17 @@ fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool 
             return true;
         }
     }
-    demo.saved = 4;
+    demo.saved = 2;
     demo.records = loaded.mobs.len() as u32;
-    demo.digest = Some(demo.success_digest(session));
+    demo.digest = Some(demo.success_digest());
     demo.stage = CombatStage::Done;
     true
 }
 
 /// Loaded-save leg: read the save, recompute the quartet from the RESTORED
-/// player pose and seed, and require the exact pinned kind/position/yaw/health
-/// per record. The live session is only checked for kinds and health, because
-/// a Playing tick may already have run `tick_mobs` and moved the mobs.
+/// player pose and seed, and require the two pinned hostile records plus the
+/// earned inventory. The live session is only checked for kinds and health,
+/// because a Playing tick may already have run `tick_mobs` and moved the mobs.
 fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
     debug_assert!(!demo.fresh, "the Restore stage is only for a loaded save");
     let loaded = match load_world_from_path(&session.save_path) {
@@ -4448,7 +4948,7 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
             return true;
         }
     };
-    if loaded.mobs.len() != 4 {
+    if loaded.mobs.len() != 2 {
         // A v6 save (or any save with an empty mob tail) lands here.
         demo.abort("restore", &format!("mobs={}", loaded.mobs.len()));
         return true;
@@ -4458,24 +4958,32 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
         loaded.player.yaw,
         loaded.seed,
     );
-    let mut kinds_seen = [false; 4];
+    let mut kinds_seen = 0u32;
     let mut positions_ok = true;
     let mut yaw_ok = true;
     let mut health_ok = true;
+    let mut health: Vec<String> = Vec::with_capacity(2);
     for record in &loaded.mobs {
+        // The Drops stage kills the two passive kinds, so the witness must be
+        // exactly the two hostile ones — never "two records of any kind".
+        if !matches!(record.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("restore", &format!("kind={:?}", record.kind));
+            return true;
+        }
         let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
             demo.abort("restore", &format!("kind={:?}", record.kind));
             return true;
         };
-        kinds_seen[index] = true;
+        kinds_seen += 1;
+        health.push(COMBAT_PINNED_HEALTH[index].to_string());
         positions_ok &= record.position == positions[index].to_array();
         // The Save stage pins the facing to COMBAT_PINNED_YAW, not to the
         // pose-derived turn, so the restore comparison uses the same pin.
         yaw_ok &= record.yaw == COMBAT_PINNED_YAW[index];
         health_ok &= record.health == COMBAT_PINNED_HEALTH[index];
     }
-    if !kinds_seen.iter().all(|seen| *seen) {
-        demo.abort("restore", "kinds=duplicate");
+    if kinds_seen != 2 {
+        demo.abort("restore", &format!("kinds={kinds_seen}"));
         return true;
     }
     if !positions_ok {
@@ -4491,11 +4999,15 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
         return true;
     }
     let live = session.mobs();
-    if live.len() != 4 {
+    if live.len() != 2 {
         demo.abort("restore", &format!("mobs={}", live.len()));
         return true;
     }
-    for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+    for kind in [MobKind::Zombie, MobKind::Skeleton] {
+        let Some(index) = MobKind::ALL.iter().position(|candidate| *candidate == kind) else {
+            demo.abort("restore", &format!("live_kind={kind:?}"));
+            return true;
+        };
         let Some(mob) = live.iter().find(|mob| mob.kind == kind) else {
             demo.abort("restore", &format!("live_kind={kind:?}"));
             return true;
@@ -4505,18 +5017,68 @@ fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
             return true;
         }
     }
-    let health = COMBAT_PINNED_HEALTH
+
+    // The earned inventory is part of the witness: the wood sword the player
+    // crafted (a full 59 durability), one raw porkchop, one raw beef, and the
+    // pair's three leather units — exactly four non-empty stacks, scanned
+    // order-independently across all 36 slots.
+    let mut stacks = 0u32;
+    let mut sword_durability: Option<Option<u16>> = None;
+    let mut porkchop = 0u32;
+    let mut beef = 0u32;
+    let mut leather = 0u32;
+    for item in loaded
+        .player
+        .inventory
+        .slots()
         .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join("/");
+        .filter_map(|slot| slot.as_ref())
+    {
+        stacks += 1;
+        match item.id() {
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            } => {
+                if sword_durability.is_some() {
+                    demo.abort("restore", "items=duplicate_sword");
+                    return true;
+                }
+                sword_durability = Some(item.durability());
+            }
+            ItemId::Material(Material::RawPorkchop) => porkchop += u32::from(item.count()),
+            ItemId::Material(Material::RawBeef) => beef += u32::from(item.count()),
+            ItemId::Material(Material::Leather) => leather += u32::from(item.count()),
+            other => {
+                demo.abort("restore", &format!("items=unexpected={other:?}"));
+                return true;
+            }
+        }
+    }
+    if stacks != 4 {
+        demo.abort("restore", &format!("items={stacks}"));
+        return true;
+    }
+    if sword_durability != Some(Some(ToolTier::Wood.max_durability())) {
+        demo.abort("restore", &format!("items=sword={sword_durability:?}"));
+        return true;
+    }
+    if porkchop != 1 || beef != 1 || leather != 3 {
+        demo.abort(
+            "restore",
+            &format!("items=porkchop={porkchop} beef={beef} leather={leather}"),
+        );
+        return true;
+    }
+
     demo.digest = Some(format!(
-        "combat_demo: seed={} stage=restored mobs={} health={} yaw={} positions={} ok=true",
+        "combat_demo: seed={} stage=restored mobs={} health={} yaw={} positions={} items={} ok=true",
         demo.seed,
         live.len(),
-        health,
+        health.join("/"),
         yaw_ok,
-        positions_ok
+        positions_ok,
+        stacks
     ));
     demo.stage = CombatStage::Done;
     true
@@ -10233,7 +10795,7 @@ mod tests {
         assert_eq!(
             demo.digest.as_deref(),
             Some(
-                "combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 melee_hits=2 melee_damage=4 melee_blocked=1 saved=4 records=4 ok=true"
+                "combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 melee_hits=2 melee_damage=4 melee_blocked=1 killed=2 drops=5 drops_lost=0 saved=2 records=2 ok=true"
             )
         );
     }
@@ -10296,9 +10858,11 @@ mod tests {
         (session, demo)
     }
 
-    /// The fresh leg writes a v7 save through the production save site, and the
-    /// file itself carries the pinned damaged-health quartet (version word at
-    /// offset 4, count at offset 149, exact records).
+    /// The fresh leg writes the v7 save through the production save site, and
+    /// the file itself carries the two surviving hostile records plus the earned
+    /// inventory. The file length and the mob-count offset are MEASURED by
+    /// running the fresh leg, never computed by hand: they depend on the exact
+    /// serialized size of the inventory stacks the demo earns.
     #[test]
     fn combat_demo_fresh_leg_writes_and_verifies_a_v7_save() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10307,24 +10871,64 @@ mod tests {
         let (session, demo) = run_fresh_combat_leg(seed, save_path.clone());
 
         assert_eq!(demo.stage, CombatStage::Done);
-        assert_eq!(demo.saved, 4);
-        assert_eq!(demo.records, 4);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
         let digest = demo.digest.as_deref().expect("success digest");
-        assert!(digest.contains("saved=4 records=4"), "{digest}");
+        assert!(digest.contains("saved=2 records=2"), "{digest}");
         assert!(digest.contains("ok=true"), "{digest}");
 
         let bytes = std::fs::read(&save_path).expect("read save");
+        assert_eq!(
+            bytes.len(),
+            COMBAT_SAVE_BYTES,
+            "measured fresh-leg save length"
+        );
+        // Locate the mob count by scanning for the exact two-record tail: the
+        // Zombie record starts immediately after the u32 count. This cross-check
+        // keeps the pinned offset honest if a future stage changes the layout
+        // without re-measuring.
+        let (positions, _) = combat_quartet(session.player.position, session.player.yaw, seed);
+        let mut tail: Vec<u8> = Vec::new();
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
+            tail.push(kind.tag());
+            for c in positions[index].to_array() {
+                tail.extend_from_slice(&c.to_le_bytes());
+            }
+            tail.extend_from_slice(&COMBAT_PINNED_YAW[index].to_le_bytes());
+            tail.extend_from_slice(&COMBAT_PINNED_HEALTH[index].to_le_bytes());
+        }
+        let tail_start = bytes
+            .windows(tail.len())
+            .position(|window| window == tail.as_slice())
+            .expect("two-record mob tail in the save");
+        assert_eq!(
+            tail_start - 4,
+            COMBAT_SAVE_MOB_COUNT_OFFSET,
+            "pinned mob-count offset"
+        );
         assert_eq!(&bytes[4..8], &7u32.to_le_bytes(), "v7 version word");
         assert_eq!(
-            &bytes[149..153],
-            &4u32.to_le_bytes(),
-            "mob count at offset 149"
+            &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
+            &2u32.to_le_bytes(),
+            "mob count at the measured offset"
+        );
+        assert_eq!(
+            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len(),
+            bytes.len(),
+            "the mob tail is the last section"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
-        assert_eq!(loaded.mobs.len(), 4);
-        let (positions, _) = combat_quartet(session.player.position, session.player.yaw, seed);
-        for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+        assert_eq!(loaded.mobs.len(), 2);
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
             let record = loaded
                 .mobs
                 .iter()
@@ -10343,9 +10947,10 @@ mod tests {
         }
     }
 
-    /// The Fight stage proves the hit sequence on the real records, and the
-    /// Save stage that follows immediately still writes the pinned 4/7/11/14
-    /// quartet: the fight must never leak into the save.
+    /// The Fight stage proves the hit sequence on the real records, the Drops
+    /// stage then kills the two passive records, and the Save stage that follows
+    /// writes only the two surviving hostile records at their pinned damaged
+    /// health: neither the fight nor the kills may leak into the save.
     #[test]
     fn combat_demo_fight_stage_hits_the_pig_then_the_save_stays_pinned() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10386,27 +10991,28 @@ mod tests {
 
         // Drive the Fight stage directly (in production it runs in the same
         // step as the Walk verdict) so the pig's post-fight state is
-        // observable before the Save stage re-pins the quartet.
+        // observable before the Drops stage kills it.
         demo.stage = CombatStage::Fight;
         assert!(
             !combat_fight_stage(&mut demo, &mut session),
-            "the fight advances to Save instead of ending the run"
+            "the fight advances to Drops instead of ending the run"
         );
-        assert_eq!(demo.stage, CombatStage::Save);
+        assert_eq!(demo.stage, CombatStage::Drops);
         assert!(!demo.failed, "unexpected fight abort: {:?}", demo.digest);
         assert_eq!(demo.melee_hits, 2);
         assert_eq!(demo.melee_damage, SWORD_DAMAGE_WOOD);
         assert_eq!(demo.melee_blocked, 1);
 
         // Two 4-damage hits from 10 health: the i-frame window refused the
-        // re-hit, so exactly one hit landed per window, and the demo never
-        // kills a mob (S04 owns death).
+        // re-hit, so exactly one hit landed per window and the fight never kills
+        // anything — the Drops stage owns death.
         let camera = session.camera.position;
         let pig = &session.mobs()[0];
         assert_eq!(pig.kind, MobKind::Pig);
         assert_eq!(pig.health, 2, "10 -> 6 -> 2, two hits of 4 damage");
         assert!(pig.hurt > 0.0, "the last hit armed the hurt flash");
         assert!(pig.hurt_iframe > 0.0, "the last hit re-armed i-frames");
+        assert_eq!(pig.death, 0.0, "the fight must not start a collapse");
         let knockback = Vec3::new(pig.knockback.x, 0.0, pig.knockback.z);
         let away = Vec3::new(pig.position.x - camera.x, 0.0, pig.position.z - camera.z);
         assert!(
@@ -10418,24 +11024,48 @@ mod tests {
             "knockback must point away from the attacker"
         );
 
-        // The immediately following Save stage re-pins the real quartet and
+        // The Drops stage kills the Pig and the Cow and delivers their drops.
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "the drops stage advances to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
+        assert_eq!(demo.killed, 2);
+        assert_eq!(demo.drops, 5, "pig 2 units + cow 3 units");
+        assert_eq!(demo.drops_lost, 0);
+        assert_eq!(session.mobs().len(), 2, "both passive records were reaped");
+
+        // The immediately following Save stage pins the two survivors and
         // writes the damaged-health witness the reload leg asserts.
         assert!(
             combat_demo_step(&mut demo, &mut session),
             "the save stage ends the fresh leg"
         );
         assert_eq!(demo.stage, CombatStage::Done);
-        assert_eq!(demo.saved, 4);
-        assert_eq!(demo.records, 4);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
         let digest = demo.digest.as_deref().expect("success digest");
         assert!(
-            digest.contains("melee_hits=2 melee_damage=4 melee_blocked=1"),
+            digest.contains("melee_hits=2 melee_damage=4 melee_blocked=1 killed=2 drops=5"),
             "{digest}"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
-        assert_eq!(loaded.mobs.len(), 4);
-        for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+        assert_eq!(loaded.mobs.len(), 2);
+        assert!(
+            loaded
+                .mobs
+                .iter()
+                .all(|record| matches!(record.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "only the two hostile records may survive: {:?}",
+            loaded.mobs.iter().map(|r| r.kind).collect::<Vec<_>>()
+        );
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
             let record = loaded
                 .mobs
                 .iter()
@@ -10443,10 +11073,133 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {kind:?} record"));
             assert_eq!(
                 record.health, COMBAT_PINNED_HEALTH[index],
-                "the fight must not leak into the save ({kind:?})"
+                "the fight and drops must not leak into the save ({kind:?})"
             );
             assert_eq!(record.yaw, COMBAT_PINNED_YAW[index], "yaw {kind:?}");
         }
+    }
+
+    /// The Drops stage alone: a hit makes the Pig flee away, a lethal hit
+    /// collapses it and the reaper removes the record, and both kills deliver
+    /// raw meat and leather into the real inventory. Removing flee, the collapse
+    /// timer, the reaper, or the drop grant aborts the stage or leaves the
+    /// inventory short, so this test fails for any of them.
+    #[test]
+    fn combat_demo_drops_stage_proves_flee_collapse_reap_and_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-drops.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        for y in [spawn.y, spawn.y - 4.0] {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    spawn.x.floor() as i32,
+                    y.floor() as i32,
+                    spawn.z.floor() as i32,
+                ),
+            );
+        }
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert_eq!(demo.stage, CombatStage::Walk);
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+
+        // The Walk verdict runs Fight in the same step, which hands over to
+        // Drops. Stopping there proves the Drops stage against the real quartet.
+        let mut updates = 0u32;
+        while demo.stage == CombatStage::Walk && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            combat_demo_step(&mut demo, &mut session);
+        }
+        assert_eq!(
+            demo.stage,
+            CombatStage::Drops,
+            "the walk verdict handed over to drops: {:?}",
+            demo.digest
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(
+            session.mobs().len(),
+            4,
+            "the quartet starts the drops stage"
+        );
+
+        assert!(
+            !combat_drops_stage(&mut demo, &mut session),
+            "the drops stage advances to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
+        assert_eq!(demo.killed, 2);
+        assert_eq!(demo.drops, 5);
+        assert_eq!(demo.drops_lost, 0);
+
+        // Both passive records were reaped; only the hostiles remain.
+        assert_eq!(session.mobs().len(), 2);
+        assert!(
+            session
+                .mobs()
+                .iter()
+                .all(|mob| matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "dead passive records must be reaped: {:?}",
+            session
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>()
+        );
+
+        // The drops landed in the real 36-slot inventory next to the earned
+        // sword.
+        let sword_id = ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Wood,
+        };
+        assert_eq!(combat_inventory_units(&session, sword_id), 1);
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::RawPorkchop)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::RawBeef)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Leather)),
+            3,
+            "pig 1 + cow 2 leather units"
+        );
+
+        // The success digest reports the latched drop verdict.
+        assert!(
+            combat_demo_step(&mut demo, &mut session),
+            "the save stage ends the fresh leg"
+        );
+        assert_eq!(demo.stage, CombatStage::Done);
+        let digest = demo.digest.as_deref().expect("success digest");
+        assert!(
+            digest.contains("killed=2 drops=5 drops_lost=0 saved=2 records=2 ok=true"),
+            "{digest}"
+        );
     }
 
     /// The reload leg is a second invocation against the same save path: a
@@ -10481,7 +11234,7 @@ mod tests {
             .expect("restore digest");
         assert_eq!(
             digest,
-            "combat_demo: seed=12345 stage=restored mobs=4 health=4/7/11/14 yaw=true positions=true ok=true"
+            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=4 ok=true"
         );
         assert!(!app.exit_failure);
     }

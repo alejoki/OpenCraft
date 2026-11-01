@@ -13,5 +13,6 @@ pub mod mob_loot;
 pub mod persistence;
 pub mod season;
 pub mod session;
+pub mod spawning;
 pub mod terrain;
 pub mod vista;

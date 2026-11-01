@@ -107,6 +107,10 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 | **Craft (wood sword)** | At a crafting table, stack 2 Oak Planks over 1 Stick in a single vertical column. Each swing deals 4 damage. |
 | **Craft (stone / iron sword)** | Swap the two planks for 2 Cobblestone (5 damage) or 2 Iron Ore (6 damage), keeping the Stick at the bottom. Swords do not shorten block-breaking time. |
 | **Left Click (mob)** | Attack the mob under the crosshair within reach. The hit shows a hurt flash and knocks the mob away; one swing per ~0.6 s, and the same mob ignores further hits for ~0.5 s. A mob in reach takes priority over the block behind it. |
+| **Hit a pig or cow** | The mob turns and runs away from you for a couple of seconds; a wounded animal keeps its distance instead of standing still. |
+| **Kill a pig or cow** | A lethal hit collapses the animal where it stands, then a moment later its body is gone. A pig drops raw porkchop and leather; a cow drops raw beef and leather. |
+| **Mob drops** | Drops go straight into your 36 inventory slots, never onto the ground. If the inventory is full, only the part that does not fit is lost and a short message says so. |
+| **Eat raw meat** | Raw porkchop and raw beef restore 3 hunger; rotten flesh restores 1. Hold Right Click with the food selected, as with apples and bread. |
 | **Right Click (Wheat Seeds)** | Plant seeds on Farmland. |
 | **Left Click (wheat)** | Harvest mature wheat for 1 Wheat and 2 Wheat Seeds; immature wheat returns 1 Wheat Seed. |
 | **Right Click (chest)** | Open the chest screen. |
