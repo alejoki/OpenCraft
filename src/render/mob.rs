@@ -13,12 +13,15 @@
 //! emitted as `6 parts x 6 faces x 2 triangles x 3 vertices = 216` vertices.
 //! The sub-block part sizes are the reason [`crate::mesh::quad::PackedQuad`]
 //! cannot represent a mob: that format only stores integer chunk-local block
-//! coordinates. T04 adds the wgpu pipeline and draw; this module is pure CPU
-//! data so the model contract stays headlessly testable.
+//! coordinates. [`build_mob_vertices`] and [`build_mob_batch`] stay pure CPU
+//! data so the model contract remains headlessly testable; the wgpu-facing
+//! [`create_mob_pipeline`] factory below only translates that contract into a
+//! pipeline descriptor (one camera bind group, no per-mob state).
 
 use glam::{Quat, Vec3};
 
 use crate::player::camera::{Camera, Frustum};
+use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::texture::MOB_LAYER_BASE;
 use crate::world::mob::MobKind;
 use crate::world::session::WorldSession;
@@ -60,6 +63,138 @@ pub fn mob_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &MOB_VERTEX_ATTRIBUTES,
     }
+}
+
+/// Mob shader (WGSL): one batched, textured box-model pass.
+///
+/// The vertex stage consumes the pinned [`MobVertex`] attributes, applies the
+/// shared camera view-projection, and derives the distance fog factor from the
+/// existing [`crate::render::pipeline::CameraUniform`] (`camera_pos` plus
+/// `fog_start_end.xy`) so the 112-byte uniform layout is untouched. The
+/// fragment stage samples the same 48-layer block texture array from the
+/// camera bind group (`uv`, flat `tex_layer`), multiplies by the CPU-baked
+/// face shade, applies the hurt flash tint, and fades into `fog_color`.
+///
+/// Group 0 is the existing camera bind group: binding 0 uniform, binding 1
+/// `texture_2d_array<f32>`, binding 2 sampler. There is deliberately no group
+/// 1: the whole scene draws with a single bind group and a single draw call.
+pub const MOB_SHADER_WGSL: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_start_end: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(0) @binding(1) var block_texture: texture_2d_array<f32>;
+@group(0) @binding(2) var block_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) tex_layer: u32,
+    @location(2) shade: f32,
+    @location(3) flash: f32,
+    @location(4) fog: f32,
+};
+
+@vertex
+fn vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tex_layer: u32,
+    @location(3) shade: f32,
+    @location(4) flash: f32,
+) -> VertexOutput {
+    let cam_dist = distance(position, camera.camera_pos.xyz);
+    let fog_start = camera.fog_start_end.x;
+    let fog_end = camera.fog_start_end.y;
+    let fog_t = clamp((cam_dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
+
+    var out: VertexOutput;
+    out.clip_pos = camera.view_proj * vec4<f32>(position, 1.0);
+    out.uv = uv;
+    out.tex_layer = tex_layer;
+    out.shade = shade;
+    out.flash = flash;
+    out.fog = fog_t * fog_t;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(block_texture, block_sampler, in.uv, i32(in.tex_layer));
+    var rgb = texel.rgb * in.shade;
+    rgb = mix(rgb, vec3<f32>(1.0, 0.15, 0.1), in.flash);
+    let final_rgb = mix(rgb, camera.fog_color.rgb, in.fog);
+    return vec4<f32>(final_rgb, 1.0);
+}
+"#;
+
+/// Create the single batched mob pipeline.
+///
+/// The pipeline layout is `&[camera_bgl]` ONLY: mobs reuse the existing camera
+/// uniform + block texture array + sampler bind group, so there is no per-mob
+/// bind group, no chunk uniform, and no second draw call per mob. The pipeline
+/// is opaque (REPLACE blending) and writes depth with `LessEqual`, so opaque
+/// terrain occludes mobs and mobs occlude the translucent water drawn after
+/// them (D136).
+pub fn create_mob_pipeline(
+    ctx: &RenderContext,
+    camera_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mob_shader"),
+            source: wgpu::ShaderSource::Wgsl(MOB_SHADER_WGSL.into()),
+        });
+
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mob_pipeline_layout"),
+            bind_group_layouts: &[camera_bgl],
+            push_constant_ranges: &[],
+        });
+
+    ctx.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mob_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[mob_vertex_layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: ctx.config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // Mob cuboids are emitted with outward CCW winding, but the
+                // model is open (no back faces needed) and death squashes can
+                // flip thin parts; hardware culling only costs visibility.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        })
 }
 
 /// Animation inputs for one model-space build.

@@ -7,6 +7,7 @@ use crate::player::camera::{visible_face_mask, Camera, Frustum};
 use crate::player::inventory::HOTBAR_SLOTS;
 use crate::render::buffer::{ChunkRenderStore, QUAD_VERTICES};
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
+use crate::render::mob::{create_mob_pipeline, MobVertex};
 use crate::render::sky;
 use crate::render::texture::{
     block_layers_match_shape, create_block_texture_array, upload_block_layers,
@@ -690,11 +691,15 @@ pub trait UiPass {
 }
 
 pub struct VoxelRenderer {
-    /// The 32-layer block texture array retained so live pack changes can
+    /// The 48-layer block texture array retained so live pack changes can
     /// re-upload layer data into the existing texture (MEM111). The view and
     /// bind group above stay valid because only the contents change.
     pub block_texture: wgpu::Texture,
     pub voxel_pipeline: wgpu::RenderPipeline,
+    /// Opaque, depth-writing pipeline for the batched box-model mob batch.
+    /// Drawn inside the main pass strictly between the opaque chunk loop and
+    /// the translucent water draw, reusing the camera bind group only (D136).
+    pub mob_pipeline: wgpu::RenderPipeline,
     /// Alpha-blended, depth-write-disabled pipeline for `ChunkMesh::water_quads`.
     /// Drawn inside the main pass strictly after the opaque chunk loop.
     pub water_pipeline: wgpu::RenderPipeline,
@@ -789,6 +794,13 @@ impl VoxelRenderer {
                 },
             ],
         });
+
+        // Mob pipeline (M009/S01-T04, D136): one batched draw for every visible
+        // mob, built on the camera bind group alone. Constructed here because
+        // this is the only place the camera bind group layout is in hand; the
+        // pipeline layout borrows it, so nothing else can be reordered above
+        // it without re-creating the layout.
+        let mob_pipeline = create_mob_pipeline(ctx, &camera_bgl);
 
         let chunk_bind_group_layout =
             ctx.device
@@ -1003,6 +1015,7 @@ impl VoxelRenderer {
         Self {
             block_texture,
             voxel_pipeline,
+            mob_pipeline,
             water_pipeline,
             overlay_pipeline,
             sky_pipeline,
@@ -1028,20 +1041,22 @@ impl VoxelRenderer {
         upload_block_layers(&self.block_texture, queue, layers);
     }
 
-    // 10 args: the existing world-pass parameters plus the T01 `ui_pass`
-    // hook, the T02 `show_overlays` gate, and the S02-T03 grouped `sky`
-    // inputs (which since S03 also carry `time_of_day` for the sky pass, so
-    // the signature did not grow). Kept flat rather than grouped further to
-    // avoid churn at the single call site in src/main.rs; this is the
-    // frame-draw entry point, not a general-purpose API.
+    // 11 args: the existing world-pass parameters, the T04 batched mob vertex
+    // slice (immediately after `store`), plus the T01 `ui_pass` hook, the T02
+    // `show_overlays` gate, and the S02-T03 grouped `sky` inputs (which since
+    // S03 also carry `time_of_day` for the sky pass). Kept flat rather than
+    // grouped further to avoid churn at the single call site in src/main.rs;
+    // this is the frame-draw entry point, not a general-purpose API.
     //
     // Pass order on the encoder: sky (clears color) -> world (loads color,
-    // clears depth) -> overlay -> optional UI (loads color).
+    // clears depth: opaque -> mobs -> water -> weather) -> overlay -> optional
+    // UI (loads color).
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
         ctx: &RenderContext,
         store: &ChunkRenderStore,
+        mob_vertices: &[MobVertex],
         camera: &Camera,
         render_distance: i32,
         target_block: Option<IVec3>,
@@ -1099,6 +1114,22 @@ impl VoxelRenderer {
                 contents: bytemuck::cast_slice(&overlay_verts),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+
+        // Mob batch upload (D136): one buffer for the whole visible scene, or
+        // no buffer at all when nothing is visible. The overlay precedent: an
+        // empty scene allocates nothing and the draw below is skipped.
+        let mob_vertex_buffer = if mob_vertices.is_empty() {
+            None
+        } else {
+            Some(
+                ctx.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("mob_vbuf"),
+                        contents: bytemuck::cast_slice(mob_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
+        };
 
         let mut encoder = ctx
             .device
@@ -1217,6 +1248,19 @@ impl VoxelRenderer {
                         }
                     }
                 }
+            }
+
+            // Mob stage: strictly AFTER the opaque chunk loop (so terrain
+            // wrote depth and occludes mobs) and BEFORE the water draw (so the
+            // opaque mob depth write occludes water behind a mob, while water
+            // still draws over mobs in front of it). One pipeline, one bind
+            // group and ONE draw call for the whole batch; no per-mob state.
+            // The buffer is `None` for an empty scene, so nothing is recorded.
+            if let Some(mob_vertex_buffer) = mob_vertex_buffer.as_ref() {
+                rpass.set_pipeline(&self.mob_pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                rpass.set_vertex_buffer(0, mob_vertex_buffer.slice(..));
+                rpass.draw(0..mob_vertices.len() as u32, 0..1);
             }
 
             // Translucent water stage: strictly AFTER the opaque chunk loop
@@ -1783,6 +1827,104 @@ mod tests {
             !main_block.contains("LoadOp::Clear(sky.clear_color)"),
             "the world pass must not clear the color the sky pass wrote"
         );
+    }
+
+    #[test]
+    fn mob_draw_sits_between_the_opaque_loop_and_the_water_draw() {
+        // Source pin on main_pass stage order: opaque chunks -> mobs -> water.
+        // Terrain depth must occlude mobs, and the opaque mob depth write must
+        // occlude the translucent water drawn after it (D136). Slice off the
+        // test module so the literals below cannot satisfy their own pin.
+        let src = include_str!("pipeline.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let opaque_loop_at = code
+            .find("for gpu_chunk in store.chunks.values()")
+            .expect("opaque chunk loop exists");
+        let mob_draw_at = code
+            .find("set_pipeline(&self.mob_pipeline)")
+            .expect("mob draw exists");
+        let water_draw_at = code
+            .find("set_pipeline(&self.water_pipeline)")
+            .expect("water draw exists");
+        assert!(
+            opaque_loop_at < mob_draw_at && mob_draw_at < water_draw_at,
+            "stage order must be opaque loop -> mob draw -> water draw"
+        );
+
+        let mob_block = &code[mob_draw_at..water_draw_at];
+        assert!(mob_block.contains("mob_vertex_buffer"));
+        assert!(mob_block.contains("camera_bind_group"));
+        assert!(
+            mob_block.contains("rpass.draw(0..mob_vertices.len()"),
+            "one draw call must cover the whole mob batch"
+        );
+        assert!(
+            !mob_block.contains("for ") && !mob_block.contains(".iter()"),
+            "the mob stage must not loop per mob"
+        );
+    }
+
+    #[test]
+    fn mob_draw_skips_an_empty_batch() {
+        // The overlay precedent: no mob buffer is created for an empty scene,
+        // and the draw is guarded on `Some(buffer)`, so an empty batch records
+        // nothing at all (no pipeline/bind-group churn, no zero-vertex draw).
+        let src = include_str!("pipeline.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        assert!(
+            code.contains("if mob_vertices.is_empty()"),
+            "an empty batch must skip buffer creation"
+        );
+        let guard_at = code
+            .find("if let Some(mob_vertex_buffer) = mob_vertex_buffer.as_ref()")
+            .expect("the mob draw is guarded on the optional buffer");
+        let draw_at = code
+            .find("rpass.draw(0..mob_vertices.len()")
+            .expect("mob draw exists");
+        assert!(guard_at < draw_at, "the draw must sit inside the guard");
+        let guard_block = &code[guard_at..draw_at];
+        assert!(guard_block.contains("set_pipeline(&self.mob_pipeline)"));
+        assert!(guard_block.contains("mob_vertex_buffer.slice(..)"));
+    }
+
+    #[test]
+    fn mob_pipeline_is_opaque_and_camera_only() {
+        // Source pin on the mob pipeline factory in mob.rs: opaque REPLACE
+        // blending, depth writes with LessEqual, and a layout that carries the
+        // camera bind group ONLY (no chunk uniform, no per-mob bind group).
+        let src = include_str!("mob.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("mob test module marker")];
+        assert!(
+            code.contains("depth_write_enabled: true"),
+            "mobs must write depth so water behind them is occluded"
+        );
+        assert!(code.contains("CompareFunction::LessEqual"));
+        assert!(
+            code.contains("BlendState::REPLACE"),
+            "mobs are opaque; no alpha blending"
+        );
+        assert!(
+            code.contains("bind_group_layouts: &[camera_bgl]"),
+            "the mob pipeline layout must be the camera bind group alone"
+        );
+        assert!(
+            code.contains("buffers: &[mob_vertex_layout()]"),
+            "the mob pipeline must consume the pinned 32-byte vertex layout"
+        );
+        assert!(
+            !code.contains("chunk_bind_group") && !code.contains("@group(1)"),
+            "mobs must not bind a chunk uniform or a second group"
+        );
+        // Shader contract: shared camera view-projection, array sample by flat
+        // layer, shade multiply, hurt flash tint, distance fog.
+        assert!(code.contains("camera.view_proj * vec4<f32>(position, 1.0)"));
+        assert!(code.contains("camera.fog_start_end.x") && code.contains("camera.fog_start_end.y"));
+        assert!(
+            code.contains("textureSample(block_texture, block_sampler, in.uv, i32(in.tex_layer))")
+        );
+        assert!(code.contains("texel.rgb * in.shade"));
+        assert!(code.contains("vec3<f32>(1.0, 0.15, 0.1), in.flash"));
+        assert!(code.contains("mix(rgb, camera.fog_color.rgb, in.fog)"));
     }
 
     fn assert_close(actual: f32, expected: f32, what: &str) {

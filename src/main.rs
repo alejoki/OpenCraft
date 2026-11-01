@@ -27,6 +27,7 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
+use opencraft::render::mob::build_mob_batch;
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
@@ -6881,6 +6882,10 @@ impl ApplicationHandler for GameApp {
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.vista_store,
+                        // Mobs are session-scoped: the menu panorama never
+                        // draws them, so the vista path passes an empty slice
+                        // and allocates no mob vertex buffer.
+                        &[],
                         vista_camera,
                         self.background.world.render_distance(),
                         None,
@@ -6914,9 +6919,17 @@ impl ApplicationHandler for GameApp {
                     // fog compression inside `effective_fog`.
                     let underwater =
                         eye_is_submerged(&self.session.world, self.session.camera.position);
+                    // Batched mob geometry for this frame (D136): one
+                    // world-space vertex slice for every resident, in-frustum
+                    // mob. Built once per frame from the live session; an
+                    // empty mob list produces an empty slice and therefore no
+                    // GPU buffer allocation inside render_frame.
+                    let aspect = gpu.ctx.config.width as f32 / gpu.ctx.config.height.max(1) as f32;
+                    let mob_vertices = build_mob_batch(&self.session, &self.session.camera, aspect);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
+                        &mob_vertices,
                         &self.session.camera,
                         self.session.world.render_distance(),
                         target_block,
