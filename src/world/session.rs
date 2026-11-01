@@ -33,7 +33,7 @@ use crate::world::loot::{wheat_harvest, LootEntry};
 use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
-use crate::world::mob_loot::{mob_drops, MobDropReport, MobKillCause};
+use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{SpawnContext, SpawnReport, SpawnRuntime};
@@ -852,9 +852,10 @@ impl WorldSession {
     /// Attribution is explicit: [`MobKillCause::Environment`] and any hit that
     /// did not kill resolve the default zero report and mutate nothing. On a
     /// player kill the mob's pinned table is resolved through
-    /// [`mob_drop_items`] and delivered best-effort with
-    /// [`Player::collect_items`], so a full inventory loses only the overflow
-    /// and the report says exactly how many units landed.
+    /// [`mob_drop_items`] — including the rare-entry gate keyed on the world
+    /// seed, the kind and the mob's quantised home cell — and delivered
+    /// best-effort with [`Player::collect_items`], so a full inventory loses
+    /// only the overflow and the report says exactly how many units landed.
     ///
     /// The mob record is never removed, reordered, or mutated here: the lethal
     /// hit already armed the collapse, and [`WorldSession::retain_live_mobs`]
@@ -872,13 +873,21 @@ impl WorldSession {
         }
         // The index may be stale (the record streamed out or was reaped since
         // the swing was armed): a missing or still-live record grants nothing.
-        let Some(kind) = self.mobs.get(index).map(|mob| mob.kind) else {
+        let Some(mob) = self.mobs.get(index) else {
             return MobDropReport::default();
         };
-        if self.mobs.get(index).map(|mob| mob.health) != Some(0) {
+        if mob.health != 0 {
             return MobDropReport::default();
         }
-        let Some(items) = mob_drop_items(kind) else {
+        let kind = mob.kind;
+        // The rare gate is keyed on the persisted home, so a reloaded mob
+        // rolls the same drops; no tick or kill order enters the draw.
+        let home_cell = IVec3::new(
+            mob.home.x.floor() as i32,
+            mob.home.y.floor() as i32,
+            mob.home.z.floor() as i32,
+        );
+        let Some(items) = mob_drop_items(kind, self.world.seed(), home_cell) else {
             return MobDropReport::default();
         };
         let outcome = self.player.collect_items(&items);
@@ -1770,13 +1779,17 @@ fn loot_items(entries: &[LootEntry]) -> Option<Vec<Item>> {
 
 /// Maps one mob kind's pinned drop table onto validated inventory items.
 ///
-/// Unlike [`loot_items`], an empty table is valid and yields `Some(vec![])`:
-/// hostile kinds legitimately drop nothing until their slices fill the table.
-/// A zero count, a count above the identity's stack limit, or an `Item::new`
-/// failure rejects the whole batch instead of delivering a partial one, so a
-/// drifted table can never invent or silently truncate a drop. Entries pass
-/// through the T01 `From<MobDropItem> for ItemId` bridge, which is the only
-/// world -> player identity mapping.
+/// An empty table is valid and yields `Some(vec![])`: a hostile kind whose
+/// slice has not landed yet legitimately drops nothing. Each entry is filtered
+/// through [`crate::world::mob_loot::MobDrop::rolls`] against one
+/// [`crate::world::mob_loot::drop_roll`] value drawn from
+/// `(seed, kind, home_cell)`, so the result is deterministic and the same
+/// corpse always resolves the same batch. A zero count, a count above the
+/// identity's stack limit, or an `Item::new` failure rejects the whole batch
+/// instead of delivering a partial one, so a drifted table can never invent or
+/// silently truncate a drop. Entries pass through the T01
+/// `From<MobDropItem> for ItemId` bridge, which is the only world -> player
+/// identity mapping.
 ///
 /// `#[doc(hidden)] pub` is a narrowly scoped allowance, not supported API: the
 /// bin crate's bounded `--demo-combat` Drops self-check builds the same batch a
@@ -1785,9 +1798,11 @@ fn loot_items(entries: &[LootEntry]) -> Option<Vec<Item>> {
 /// caller reads this; production delivery always goes through
 /// [`WorldSession::resolve_mob_kill`].
 #[doc(hidden)]
-pub fn mob_drop_items(kind: MobKind) -> Option<Vec<Item>> {
+pub fn mob_drop_items(kind: MobKind, seed: u32, home_cell: IVec3) -> Option<Vec<Item>> {
+    let roll = drop_roll(seed, kind, home_cell);
     mob_drops(kind)
         .iter()
+        .filter(|drop| drop.rolls(roll))
         .map(|drop| {
             let id = ItemId::from(drop.item);
             if drop.count == 0 || drop.count > id.stack_limit() {
@@ -5730,41 +5745,175 @@ mod tests {
     }
 
     #[test]
-    fn hostile_kind_with_an_empty_table_grants_nothing() {
-        let (mut session, index) = mob_session_with(MobKind::Skeleton, 66);
+    fn environmental_skeleton_death_grants_nothing() {
+        let (mut session, index) = mob_session_with(MobKind::Skeleton, 73);
         let hit = lethal_hit(&mut session, index);
 
-        assert_eq!(
-            session.resolve_mob_kill(index, hit, MobKillCause::Player),
-            MobDropReport::default(),
-            "an empty table is valid and drops nothing"
-        );
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Environment);
+
+        assert_eq!(report, MobDropReport::default());
         assert_inventory_empty(&session);
+        assert_eq!(
+            session.mobs()[index].health,
+            0,
+            "the kill itself still landed"
+        );
     }
 
     #[test]
     fn mob_drop_items_resolves_the_t01_bridge_for_every_kind() {
+        // The fixture home cell and two seed picks: 73 lands the skeleton's
+        // one-in-sixteen bow, 71 does not (see mob_loot::drop_roll).
+        let home = IVec3::new(8, 5, 8);
         assert_eq!(
-            mob_drop_items(MobKind::Pig),
+            mob_drop_items(MobKind::Pig, 61, home),
             Some(vec![
                 Item::new(ItemId::Material(Material::RawPorkchop), 1).expect("porkchop"),
                 Item::new(ItemId::Material(Material::Leather), 1).expect("leather"),
             ])
         );
         assert_eq!(
-            mob_drop_items(MobKind::Cow),
+            mob_drop_items(MobKind::Cow, 61, home),
             Some(vec![
                 Item::new(ItemId::Material(Material::RawBeef), 1).expect("beef"),
                 Item::new(ItemId::Material(Material::Leather), 2).expect("leather"),
             ])
         );
         assert_eq!(
-            mob_drop_items(MobKind::Zombie),
+            mob_drop_items(MobKind::Zombie, 61, home),
             Some(vec![
                 Item::new(ItemId::Material(Material::RottenFlesh), 1).expect("rotten flesh"),
             ])
         );
-        assert_eq!(mob_drop_items(MobKind::Skeleton), Some(Vec::new()));
+        assert_eq!(
+            mob_drop_items(MobKind::Skeleton, 71, home),
+            Some(vec![
+                Item::new(ItemId::Material(Material::Bone), 1).expect("bone"),
+                Item::new(ItemId::Material(Material::Arrow), 2).expect("arrows"),
+            ]),
+            "a rare-bow miss still drops the unconditional entries"
+        );
+        assert_eq!(
+            mob_drop_items(MobKind::Skeleton, 73, home),
+            Some(vec![
+                Item::new(ItemId::Material(Material::Bone), 1).expect("bone"),
+                Item::new(ItemId::Material(Material::Arrow), 2).expect("arrows"),
+                Item::new(
+                    ItemId::Tool {
+                        kind: ToolKind::Bow,
+                        tier: ToolTier::Wood,
+                    },
+                    1,
+                )
+                .expect("wood bow"),
+            ]),
+            "the same inputs must resolve the same rare batch"
+        );
+        // Deterministic and home-keyed: a different home is a different draw.
+        assert_eq!(
+            mob_drop_items(MobKind::Skeleton, 73, home),
+            mob_drop_items(MobKind::Skeleton, 73, home)
+        );
+        assert_ne!(
+            mob_drop_items(MobKind::Skeleton, 73, IVec3::new(100, 5, 8)),
+            mob_drop_items(MobKind::Skeleton, 73, home),
+            "a different home cell must not share the fixture's roll"
+        );
+    }
+
+    #[test]
+    fn player_skeleton_kill_grants_bone_arrows_and_a_durable_bow_on_a_hit() {
+        let (mut session, index) = mob_session_with(MobKind::Skeleton, 73);
+        let hit = lethal_hit(&mut session, index);
+
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(4, 0));
+        assert!(!report.lost_any());
+        assert_eq!(
+            session.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::Bone), 1).ok()
+        );
+        assert_eq!(
+            session.player.inventory().slot(1),
+            Item::new(ItemId::Material(Material::Arrow), 2).ok()
+        );
+        let bow = session
+            .player
+            .inventory()
+            .slot(2)
+            .expect("the rare bow must land");
+        assert_eq!(
+            bow.id(),
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(bow.count(), 1, "tools are non-stackable");
+        assert_eq!(
+            bow.durability(),
+            Some(ToolTier::Wood.max_durability()),
+            "a dropped bow enters at full wood-bow durability"
+        );
+    }
+
+    #[test]
+    fn player_skeleton_kill_without_the_rare_roll_grants_bone_and_arrows_only() {
+        let (mut session, index) = mob_session_with(MobKind::Skeleton, 71);
+        let hit = lethal_hit(&mut session, index);
+
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(3, 0));
+        assert_eq!(
+            session.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::Bone), 1).ok()
+        );
+        assert_eq!(
+            session.player.inventory().slot(1),
+            Item::new(ItemId::Material(Material::Arrow), 2).ok()
+        );
+        assert_eq!(
+            session.player.inventory().slot(2),
+            None,
+            "a miss must not invent a bow"
+        );
+    }
+
+    #[test]
+    fn skeleton_full_inventory_loses_only_the_overflow_across_all_three_entries() {
+        let (mut session, index) = mob_session_with(MobKind::Skeleton, 73);
+        // 34 stone slots leave no room for the bone or the bow; the last slot
+        // holds 62 arrows, so exactly the two rolled arrows merge in.
+        let mut slots = [None; crate::player::inventory::INVENTORY_SLOTS];
+        for slot in &mut slots[..crate::player::inventory::INVENTORY_SLOTS - 1] {
+            *slot = Item::new(ItemId::Block(BlockId::Stone), 64).ok();
+        }
+        let last = crate::player::inventory::INVENTORY_SLOTS - 1;
+        slots[last] = Item::new(ItemId::Material(Material::Arrow), 62).ok();
+        session.player = Player::with_inventory(
+            session.player.position,
+            crate::player::inventory::Inventory::from_parts(slots, None),
+            crate::player::inventory::CraftingGrid::new(crate::player::inventory::GridKind::Player),
+            crate::player::inventory::CraftingGrid::new(crate::player::inventory::GridKind::Table),
+        );
+
+        let hit = lethal_hit(&mut session, index);
+        let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+
+        assert_eq!(report, MobDropReport::new(2, 2));
+        assert!(report.lost_any());
+        assert_eq!(
+            report.accepted + report.lost,
+            4,
+            "units are conserved: bone and bow lost, two arrows accepted"
+        );
+        assert_eq!(
+            session.player.inventory().slot(last),
+            Item::new(ItemId::Material(Material::Arrow), 64).ok(),
+            "only the overflow of the arrow entry was lost"
+        );
     }
 
     #[test]

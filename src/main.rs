@@ -5510,7 +5510,8 @@ fn combat_drops_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool
         *slot = Some(stick);
     }
     let mut inventory = Inventory::from_parts(slots, None);
-    let Some(pig_items) = mob_drop_items(MobKind::Pig) else {
+    let Some(pig_items) = mob_drop_items(MobKind::Pig, session.world.seed(), IVec3::new(0, 0, 0))
+    else {
         demo.abort("drops", "pig_table_unresolved");
         return true;
     };

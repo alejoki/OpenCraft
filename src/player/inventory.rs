@@ -380,8 +380,10 @@ impl From<LootItem> for ItemId {
 /// Maps a mob drop identity onto the player item identity it yields.
 ///
 /// This is the only bridge from [`MobDropItem`] into this module — the world
-/// layer's drop tables never import the player layer (D094). Every mob drop is
-/// a material, so each identity resolves to an [`ItemId::Material`].
+/// layer's drop tables never import the player layer (D094). Bones and arrows
+/// are materials; the rare bow resolves to the wood-tier tool identity, so
+/// `Item::new` grants it full wood-bow durability (the bow is wood-only,
+/// D133/MEM396).
 ///
 /// The match is exhaustive by construction: a new [`MobDropItem`] variant is a
 /// compile error here until it is given a real item identity.
@@ -392,6 +394,12 @@ impl From<MobDropItem> for ItemId {
             MobDropItem::RawBeef => ItemId::Material(Material::RawBeef),
             MobDropItem::Leather => ItemId::Material(Material::Leather),
             MobDropItem::RottenFlesh => ItemId::Material(Material::RottenFlesh),
+            MobDropItem::Bone => ItemId::Material(Material::Bone),
+            MobDropItem::Arrow => ItemId::Material(Material::Arrow),
+            MobDropItem::Bow => ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
         }
     }
 }
@@ -2234,15 +2242,20 @@ mod tests {
             (MobDropItem::RawBeef, Material::RawBeef),
             (MobDropItem::Leather, Material::Leather),
             (MobDropItem::RottenFlesh, Material::RottenFlesh),
+            (MobDropItem::Bone, Material::Bone),
+            (MobDropItem::Arrow, Material::Arrow),
         ];
         let every_variant = [
             MobDropItem::RawPorkchop,
             MobDropItem::RawBeef,
             MobDropItem::Leather,
             MobDropItem::RottenFlesh,
+            MobDropItem::Bone,
+            MobDropItem::Arrow,
+            MobDropItem::Bow,
         ];
         assert_eq!(
-            cases.len(),
+            cases.len() + 1,
             every_variant.len(),
             "every MobDropItem variant must appear in the mapping table"
         );
@@ -2262,6 +2275,26 @@ mod tests {
             assert_eq!(item.id(), expected);
             assert_eq!(item.count(), 1);
         }
+
+        // The bow is the one non-material drop: a wood-only tool, so the
+        // identity is non-stackable and `Item::new` grants full durability.
+        let bow: ItemId = MobDropItem::Bow.into();
+        assert_eq!(
+            bow,
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(bow.stack_limit(), 1);
+        let bow_item = Item::new(bow, 1).expect("a wood bow must be constructible");
+        assert_eq!(bow_item.id(), bow);
+        assert_eq!(bow_item.count(), 1);
+        assert_eq!(
+            bow_item.durability(),
+            Some(ToolTier::Wood.max_durability()),
+            "a dropped bow must enter at full wood-bow durability"
+        );
     }
 
     #[test]
