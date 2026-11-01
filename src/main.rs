@@ -3734,14 +3734,32 @@ const COMBAT_WALK_ABORT_UPDATES: u32 = 600;
 /// deterministic, mob-visible time of day. Never derived from the wall clock.
 pub const COMBAT_DUSK_TICK: u32 = 12_000;
 
+/// Pinned damaged health for the demo quartet, in [`MobKind::ALL`] order.
+/// Every value is strictly below its kind's [`MobKind::max_health`] (Pig/Cow
+/// 10, Zombie/Skeleton 20), so the saved tail proves damaged health survives a
+/// relaunch instead of silently restoring a full-health default.
+const COMBAT_PINNED_HEALTH: [u16; 4] = [4, 7, 11, 14];
+
+/// Pinned non-round facing for the demo quartet, in [`MobKind::ALL`] order.
+/// Non-round values make a yaw round-trip failure visible instead of hiding
+/// behind a default facing.
+const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
+
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
 /// spawn chunks are resident.
+///
+/// The Save stage runs in the SAME step that Walk reports success, so the
+/// pose pin and the write cannot be separated by a redraw that would tick the
+/// mobs and make the reload leg non-deterministic. The Restore stage is the
+/// loaded-save leg's first and only stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatStage {
     Settle,
     Spawn,
     Walk,
+    Save,
+    Restore,
     Done,
 }
 
@@ -3752,8 +3770,9 @@ enum CombatStage {
 #[derive(Debug)]
 struct CombatDemo {
     seed: u32,
-    /// True only for the fresh Survival startup branch. A loaded save must
-    /// never be re-seeded, so it aborts `stage=loaded` instead.
+    /// True only for the fresh Survival startup branch. A loaded save is
+    /// never re-seeded: it starts at the Restore stage and proves the saved
+    /// quartet instead.
     fresh: bool,
     stage: CombatStage,
     /// The digest latched when the run ends (success or abort). Printed by the
@@ -3772,6 +3791,11 @@ struct CombatDemo {
     walked: u32,
     /// Walk observations so far; the stage aborts after 600.
     walk_updates: u32,
+    /// Mob records the fresh Save stage wrote (reported in the success
+    /// digest; `4` on a successful save leg).
+    saved: u32,
+    /// Mob records the fresh Save stage read back and verified.
+    records: u32,
 }
 
 impl CombatDemo {
@@ -3779,13 +3803,19 @@ impl CombatDemo {
         Self {
             seed,
             fresh,
-            stage: CombatStage::Settle,
+            stage: if fresh {
+                CombatStage::Settle
+            } else {
+                CombatStage::Restore
+            },
             digest: None,
             failed: false,
             deadline,
             spawn_positions: [Vec3::ZERO; 4],
             walked: 0,
             walk_updates: 0,
+            saved: 0,
+            records: 0,
         }
     }
 
@@ -3829,10 +3859,39 @@ impl CombatDemo {
             })
             .sum();
         format!(
-            "combat_demo: seed={} mobs={} resident={} walked={} verts={} ok=true",
-            self.seed, mobs, resident, self.walked, verts
+            "combat_demo: seed={} mobs={} resident={} walked={} verts={} saved={} records={} ok=true",
+            self.seed, mobs, resident, self.walked, verts, self.saved, self.records
         )
     }
+}
+
+/// The demo quartet's pinned feet positions and facings, derived from one
+/// player pose and the world seed.
+///
+/// Spawn, Save, and Restore all call this single helper, so the three stages
+/// cannot drift apart: a save leg that recomputed the pose differently from
+/// the spawn leg (or a restore leg that recomputed it differently again) would
+/// fail its own exact comparison. The constants are the pre-S02 spawn math
+/// unchanged: three and a half blocks ahead along the yaw forward axis, the
+/// quartet fanned across the right axis, feet on the seeded terrain surface,
+/// each mob turned toward the player (`atan2(dx, dz)` because mob yaw 0 faces
+/// +Z).
+fn combat_quartet(player_position: Vec3, yaw: f32, seed: u32) -> ([Vec3; 4], [f32; 4]) {
+    let forward = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+    let right = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
+    let offsets = [-1.8_f32, -0.6, 0.6, 1.8];
+    let mut positions = [Vec3::ZERO; 4];
+    let mut yaws = [0.0_f32; 4];
+    for (index, offset) in offsets.iter().enumerate() {
+        let x = player_position.x + forward.x * 3.5 + right.x * offset;
+        let z = player_position.z + forward.z * 3.5 + right.z * offset;
+        let y = terrain_height_at_seeded(x.floor() as i32, z.floor() as i32, seed) as f32 + 1.0;
+        positions[index] = Vec3::new(x, y, z);
+        // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns the quartet toward the
+        // player (the render path proves the facing).
+        yaws[index] = (player_position.x - x).atan2(player_position.z - z);
+    }
+    (positions, yaws)
 }
 
 /// Drive one Playing frame of the scripted combat loop. Returns true when this
@@ -3854,10 +3913,6 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
             return true;
         }
     }
-    if !demo.fresh {
-        demo.abort("loaded", "fresh=false");
-        return true;
-    }
     match demo.stage {
         CombatStage::Settle => {
             if !session.settle_spawn() {
@@ -3870,25 +3925,8 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
             // A demo run owns its mob list: clearing first makes a re-armed
             // seam deterministic instead of stacking two quartets.
             session.mobs_mut().clear();
-            let player = &session.player;
-            let forward = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
-            let right = Vec3::new(-player.yaw.sin(), 0.0, player.yaw.cos());
-            let offsets = [-1.8_f32, -0.6, 0.6, 1.8];
-            let seed = demo.seed;
-            let player_x = player.position.x;
-            let player_z = player.position.z;
-            let mut positions = [Vec3::ZERO; 4];
-            let mut yaws = [0.0_f32; 4];
-            for (index, offset) in offsets.iter().enumerate() {
-                let x = player.position.x + forward.x * 3.5 + right.x * offset;
-                let z = player.position.z + forward.z * 3.5 + right.z * offset;
-                let y =
-                    terrain_height_at_seeded(x.floor() as i32, z.floor() as i32, seed) as f32 + 1.0;
-                positions[index] = Vec3::new(x, y, z);
-                // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns the quartet
-                // toward the player (the render path proves the facing).
-                yaws[index] = (player_x - x).atan2(player_z - z);
-            }
+            let (positions, yaws) =
+                combat_quartet(session.player.position, session.player.yaw, demo.seed);
             {
                 let mobs = session.mobs_mut();
                 for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
@@ -3931,10 +3969,11 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
                 && walked == 4
                 && demo.walk_updates >= COMBAT_WALK_OBSERVATIONS
             {
-                let digest = demo.success_digest(session);
-                demo.digest = Some(digest);
-                demo.stage = CombatStage::Done;
-                return true;
+                // Save runs in THIS step, not a later one: a redraw between
+                // the pose pin and the write would tick the mobs and make the
+                // reload leg non-deterministic.
+                demo.stage = CombatStage::Save;
+                return combat_save_stage(demo, session);
             }
             if demo.walk_updates >= COMBAT_WALK_ABORT_UPDATES {
                 demo.abort(
@@ -3948,8 +3987,158 @@ fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
             }
             false
         }
+        CombatStage::Save => combat_save_stage(demo, session),
+        CombatStage::Restore => combat_restore_stage(demo, session),
         CombatStage::Done => true,
     }
+}
+
+/// Pin the quartet's pose and damaged health, write the world through the one
+/// production save site, then read the file back and require the exact four
+/// records.
+///
+/// Everything happens in one call so no Playing tick can run between the pose
+/// assignment and the write. Any failure latches `stage=save` with the named
+/// observed value instead of leaving a half-written world.
+fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let (positions, _) =
+        combat_quartet(session.player.position, session.player.yaw, demo.seed);
+    {
+        let mobs = session.mobs_mut();
+        if mobs.len() != 4 {
+            demo.abort("save", &format!("mobs={}", mobs.len()));
+            return true;
+        }
+        for mob in mobs.iter_mut() {
+            let Some(index) = MobKind::ALL.iter().position(|kind| *kind == mob.kind) else {
+                demo.abort("save", &format!("kind={:?}", mob.kind));
+                return true;
+            };
+            mob.position = positions[index];
+            mob.yaw = COMBAT_PINNED_YAW[index];
+            mob.health = COMBAT_PINNED_HEALTH[index];
+        }
+    }
+    if let Err(error) = save_current_world(session) {
+        demo.abort("save", &format!("error={error}"));
+        return true;
+    }
+    let loaded = match load_world_from_path(&session.save_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            demo.abort("save", &format!("error={error}"));
+            return true;
+        }
+    };
+    if loaded.mobs.len() != 4 {
+        demo.abort("save", &format!("records={}", loaded.mobs.len()));
+        return true;
+    }
+    for record in &loaded.mobs {
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
+            demo.abort("save", &format!("records=kind={:?}", record.kind));
+            return true;
+        };
+        if record.position != positions[index].to_array()
+            || record.yaw != COMBAT_PINNED_YAW[index]
+            || record.health != COMBAT_PINNED_HEALTH[index]
+        {
+            demo.abort("save", &format!("records=mismatch={index}"));
+            return true;
+        }
+    }
+    demo.saved = 4;
+    demo.records = loaded.mobs.len() as u32;
+    demo.digest = Some(demo.success_digest(session));
+    demo.stage = CombatStage::Done;
+    true
+}
+
+/// Loaded-save leg: read the save, recompute the quartet from the RESTORED
+/// player pose and seed, and require the exact pinned kind/position/yaw/health
+/// per record. The live session is only checked for kinds and health, because
+/// a Playing tick may already have run `tick_mobs` and moved the mobs.
+fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    debug_assert!(!demo.fresh, "the Restore stage is only for a loaded save");
+    let loaded = match load_world_from_path(&session.save_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            demo.abort("restore", &format!("error={error}"));
+            return true;
+        }
+    };
+    if loaded.mobs.len() != 4 {
+        // A v6 save (or any save with an empty mob tail) lands here.
+        demo.abort("restore", &format!("mobs={}", loaded.mobs.len()));
+        return true;
+    }
+    let (positions, _) = combat_quartet(
+        Vec3::from_array(loaded.player.position),
+        loaded.player.yaw,
+        loaded.seed,
+    );
+    let mut kinds_seen = [false; 4];
+    let mut positions_ok = true;
+    let mut yaw_ok = true;
+    let mut health_ok = true;
+    for record in &loaded.mobs {
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
+            demo.abort("restore", &format!("kind={:?}", record.kind));
+            return true;
+        };
+        kinds_seen[index] = true;
+        positions_ok &= record.position == positions[index].to_array();
+        // The Save stage pins the facing to COMBAT_PINNED_YAW, not to the
+        // pose-derived turn, so the restore comparison uses the same pin.
+        yaw_ok &= record.yaw == COMBAT_PINNED_YAW[index];
+        health_ok &= record.health == COMBAT_PINNED_HEALTH[index];
+    }
+    if !kinds_seen.iter().all(|seen| *seen) {
+        demo.abort("restore", "kinds=duplicate");
+        return true;
+    }
+    if !positions_ok {
+        demo.abort("restore", "positions=false");
+        return true;
+    }
+    if !yaw_ok {
+        demo.abort("restore", "yaw=false");
+        return true;
+    }
+    if !health_ok {
+        demo.abort("restore", "health=false");
+        return true;
+    }
+    let live = session.mobs();
+    if live.len() != 4 {
+        demo.abort("restore", &format!("mobs={}", live.len()));
+        return true;
+    }
+    for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+        let Some(mob) = live.iter().find(|mob| mob.kind == kind) else {
+            demo.abort("restore", &format!("live_kind={kind:?}"));
+            return true;
+        };
+        if mob.health != COMBAT_PINNED_HEALTH[index] {
+            demo.abort("restore", &format!("live_health={}", mob.health));
+            return true;
+        }
+    }
+    let health = COMBAT_PINNED_HEALTH
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join("/");
+    demo.digest = Some(format!(
+        "combat_demo: seed={} stage=restored mobs={} health={} yaw={} positions={} ok=true",
+        demo.seed,
+        live.len(),
+        health,
+        yaw_ok,
+        positions_ok
+    ));
+    demo.stage = CombatStage::Done;
+    true
 }
 
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
@@ -4295,8 +4484,9 @@ struct GameApp {
     content_demo: Option<ContentDemo>,
     /// Scripted combat seam (`--demo-combat`, M009/S01-T05). `None` for every
     /// normal run; the launch flag arms it and `step_scripted_demos` drives the
-    /// settle/spawn/walk stages on Playing frames. Only a fresh launch may be
-    /// seeded with the demo quartet; a loaded save aborts with a digest.
+    /// settle/spawn/walk/save stages on Playing frames. Only a fresh launch may
+    /// be seeded with the demo quartet; a loaded save runs the Restore stage and
+    /// proves the persisted records instead.
     combat_demo: Option<CombatDemo>,
     /// Whether a failed demo seam requests a non-zero process status. Set by a
     /// self-describing swim or survival abort; `main` reads it after the event
@@ -4445,10 +4635,11 @@ impl GameApp {
         } else {
             None
         };
-        // Scripted combat seam (M009/S01-T05): the fresh flag comes from the
-        // session's spawn-settle gate (only a fresh Survival spawn arms it),
-        // so a loaded save can never be seeded with the demo quartet. The
-        // wall-clock deadline only arms for a direct-to-gameplay launch.
+        // Scripted combat seam (M009/S01-T05, S02-T03): the fresh flag comes
+        // from the session's spawn-settle gate (only a fresh Survival spawn
+        // arms it), so a loaded save starts at the Restore stage instead of
+        // being seeded. The wall-clock deadline only arms for a
+        // direct-to-gameplay launch.
         let combat_demo = if cli.demo_combat {
             let seed = session.world.seed();
             let fresh = session.spawn_settle_pending();
@@ -9463,10 +9654,11 @@ mod tests {
         assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
     }
 
-    /// A loaded Playing save aborts at `stage=loaded`: the demo may never seed
-    /// mobs into a persisted world.
+    /// A loaded save with no mob tail (a v6 save, or a v7 save that persisted
+    /// zero mobs) aborts at `stage=restore` with the observed count: the demo
+    /// may never seed mobs into a persisted world.
     #[test]
-    fn combat_demo_loaded_playing_save_aborts_at_the_loaded_stage() {
+    fn combat_demo_loaded_save_without_mobs_aborts_at_the_restore_stage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let save_path = dir.path().join("combat-loaded.mcvx");
         let mut data = sample_save(1);
@@ -9482,6 +9674,7 @@ mod tests {
         assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
         let demo = app.combat_demo.as_ref().expect("seam armed");
         assert!(!demo.fresh, "a loaded session is never a fresh spawn");
+        assert_eq!(demo.stage, CombatStage::Restore);
         assert!(demo.deadline.is_some());
 
         app.step_scripted_demos();
@@ -9491,9 +9684,10 @@ mod tests {
             .and_then(|demo| demo.digest.clone())
             .expect("loaded abort digest");
         assert!(
-            digest.starts_with("combat_demo: seed=1 stage=loaded "),
+            digest.starts_with("combat_demo: seed=1 stage=restore "),
             "{digest}"
         );
+        assert!(digest.contains("observed=mobs=0"), "{digest}");
         assert!(digest.contains("ok=false"), "{digest}");
         assert!(app.demo_finished);
         assert!(app.exit_failure);
@@ -9573,8 +9767,149 @@ mod tests {
         assert_eq!(demo.walked, 4);
         assert_eq!(
             demo.digest.as_deref(),
-            Some("combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 ok=true")
+            Some(
+                "combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 saved=4 records=4 ok=true"
+            )
         );
+    }
+
+    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Save) to
+    /// completion and return the session plus its finished demo. Both save-leg
+    /// tests use this so the fresh save is always produced by the production
+    /// Save stage rather than hand-built wire data.
+    fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert_eq!(demo.stage, CombatStage::Walk);
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+        let mut updates = 0;
+        let mut ended = false;
+        while !ended && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            ended = combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the fresh leg must finish within 600 updates"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        (session, demo)
+    }
+
+    /// The fresh leg writes a v7 save through the production save site, and the
+    /// file itself carries the pinned damaged-health quartet (version word at
+    /// offset 4, count at offset 149, exact records).
+    #[test]
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v7_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-fresh-leg.mcvx");
+        let (session, demo) = run_fresh_combat_leg(seed, save_path.clone());
+
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert_eq!(demo.saved, 4);
+        assert_eq!(demo.records, 4);
+        let digest = demo.digest.as_deref().expect("success digest");
+        assert!(digest.contains("saved=4 records=4"), "{digest}");
+        assert!(digest.contains("ok=true"), "{digest}");
+
+        let bytes = std::fs::read(&save_path).expect("read save");
+        assert_eq!(&bytes[4..8], &7u32.to_le_bytes(), "v7 version word");
+        assert_eq!(
+            &bytes[149..153],
+            &4u32.to_le_bytes(),
+            "mob count at offset 149"
+        );
+
+        let loaded = load_world_from_path(&save_path).expect("load save");
+        assert_eq!(loaded.mobs.len(), 4);
+        let (positions, _) =
+            combat_quartet(session.player.position, session.player.yaw, seed);
+        for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+            let record = loaded
+                .mobs
+                .iter()
+                .find(|record| record.kind == kind)
+                .unwrap_or_else(|| panic!("missing {kind:?} record"));
+            assert_eq!(record.position, positions[index].to_array(), "feet {kind:?}");
+            assert_eq!(record.yaw, COMBAT_PINNED_YAW[index], "yaw {kind:?}");
+            assert_eq!(
+                record.health, COMBAT_PINNED_HEALTH[index],
+                "health {kind:?}"
+            );
+        }
+    }
+
+    /// The reload leg is a second invocation against the same save path: a
+    /// loaded session starts at Restore, and one step proves the pinned kinds,
+    /// positions, yaw, and damaged health through the real startup path.
+    #[test]
+    fn combat_demo_reload_leg_restores_the_pinned_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-reload.mcvx");
+        let _ = run_fresh_combat_leg(seed, save_path.clone());
+
+        // Relaunch exactly as the binary does: `--save P --demo-combat`, no
+        // `--new`, so the startup path loads the fresh leg's save.
+        let cli = CliConfig::parse_args([
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-combat",
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("seam armed");
+        assert!(!demo.fresh, "a loaded session is never a fresh spawn");
+        assert_eq!(demo.stage, CombatStage::Restore);
+
+        app.step_scripted_demos();
+        let digest = app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("restore digest");
+        assert_eq!(
+            digest,
+            "combat_demo: seed=12345 stage=restored mobs=4 health=4/7/11/14 yaw=true positions=true ok=true"
+        );
+        assert!(!app.exit_failure);
     }
 
     /// Deadline and walk-timeout runs latch self-describing aborts (and the
