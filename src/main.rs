@@ -80,6 +80,7 @@ use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
 use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind};
+use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
@@ -743,29 +744,67 @@ fn bow_charge_candidate(
     BowTarget::new(player.selected_slot(), player.selected_item()?)
 }
 
+/// Outcome of one bow release: whether an arrow actually left the bow, and
+/// the refusal reason when it did not.
+///
+/// Deliberately richer than `Option<BowFireError>`: `None` there conflated a
+/// real shot with a sub-threshold tap-cancel, so a bow-release sound would
+/// have played on every cancel. `fired` is true only for an accepted shot.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct BowRelease {
+    /// A real arrow was spawned by this release.
+    fired: bool,
+    /// The refusal reason, if the release attempted a shot and was refused.
+    error: Option<BowFireError>,
+}
+
 /// Releases the held bow: resets the charge unconditionally, then fires one
 /// arrow when this is a gameplay frame with a grabbed cursor.
 ///
 /// A free function because `window_event` already holds disjoint
 /// `gpu`/`window` borrows, making a `&mut self` method unusable there (P005).
 /// The reset happens **before** the gameplay gate, so a release on a menu or
-/// panel frame can never leave a live charge behind. Only the returned error
-/// is significant to the caller: a sub-threshold tap is a silent cancel.
+/// panel frame can never leave a live charge behind. Only `fired` is
+/// significant to the audio arm: a sub-threshold tap or a non-gameplay release
+/// is a silent cancel, while a refused shot reports its error for the notice.
 fn release_bow(
     bow: &mut BowState,
     session: &mut WorldSession,
     gameplay: bool,
     cursor_grabbed: bool,
-) -> Option<BowFireError> {
-    let charge = bow.release()?;
+) -> BowRelease {
+    let Some(charge) = bow.release() else {
+        return BowRelease::default();
+    };
     if !(gameplay && cursor_grabbed) {
-        return None;
+        return BowRelease::default();
     }
     // Copy the camera inputs before the mutable session borrow: argument
     // evaluation would otherwise overlap with `fire_bow`'s receiver borrow.
     let origin = session.camera.position;
     let dir = session.camera.forward();
-    session.fire_bow(origin, dir, charge).err()
+    match session.fire_bow(origin, dir, charge) {
+        Ok(_) => BowRelease {
+            fired: true,
+            error: None,
+        },
+        Err(error) => BowRelease {
+            fired: false,
+            error: Some(error),
+        },
+    }
+}
+
+/// Map one classified audio frame to the fixed slot order the frame loop plays:
+/// idle, hurt, death, bow release, arrow impact.
+fn mob_audio_slots(frame: MobAudioFrame) -> [Option<SoundSlot>; 5] {
+    [
+        frame.idle.then_some(SoundSlot::MobIdle),
+        frame.hurt.then_some(SoundSlot::MobHurt),
+        frame.death.then_some(SoundSlot::MobDeath),
+        frame.bow_release.then_some(SoundSlot::BowRelease),
+        frame.arrow_impact.then_some(SoundSlot::ArrowImpact),
+    ]
 }
 
 /// Attack-before-mining priority for one Playing frame.
@@ -7212,6 +7251,10 @@ struct GameApp {
     /// a partial or full draw can never survive a session swap, panel, focus
     /// loss, death, or release.
     bow: BowState,
+    /// World-swappable idle-call cadence (M009/S09-T04). Reset by
+    /// `on_session_installed` so a new world never inherits a half-drained
+    /// timer from the old one; only the real Playing frame ticks it.
+    mob_idle: MobIdleGate,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -7593,6 +7636,7 @@ impl GameApp {
             eating: EatingState::new(),
             melee: MeleeState::new(),
             bow: BowState::new(),
+            mob_idle: MobIdleGate::default(),
             audio,
             left_mouse_held: false,
             right_mouse_held: false,
@@ -8051,6 +8095,7 @@ impl GameApp {
         self.mining.reset();
         self.eating.reset();
         self.bow.reset();
+        self.mob_idle = MobIdleGate::default();
         self.melee.reset();
         self.inventory.close();
         self.inventory_status = None;
@@ -9212,13 +9257,18 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.eating.reset();
                 self.melee.reset();
-                let bow_error = release_bow(
+                let release = release_bow(
                     &mut self.bow,
                     &mut self.session,
                     self.lifecycle.screen() == LifecycleScreen::Playing,
                     self.cursor_grabbed,
                 );
-                if let Some(text) = bow_release_notice(bow_error) {
+                if release.fired {
+                    // Only a real shot is audible: a tap-cancel or a refused
+                    // shot is silent (the notice below covers `NoAmmo`).
+                    self.audio.play(SoundSlot::BowRelease, self.settings.volume);
+                }
+                if let Some(text) = bow_release_notice(release.error) {
                     self.game_message = Some(MenuMessage {
                         text: text.to_string(),
                         ticks_left: menu::MESSAGE_TICKS,
@@ -9625,6 +9675,12 @@ impl ApplicationHandler for GameApp {
                 // Settings-from-pause, and Playing keep rendering the session
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
+                // Audible mob/combat events this frame (M009/S09-T04). Declared
+                // outside the `playing` branch so the play site after the
+                // melee/mining block can read it, but only the Playing arm
+                // below ever fills it: a menu/pause frame leaves every flag
+                // false and therefore plays nothing.
+                let mut mob_audio = MobAudioFrame::default();
                 if playing {
                     // Spawn gate (S04-T07): a fresh Survival session holds the
                     // whole gameplay movement block until the feet and support
@@ -9689,6 +9745,9 @@ impl ApplicationHandler for GameApp {
                     // in unloaded chunks. The batched mob draw reads the
                     // resulting records; this call is the only tick site, so
                     // the scripted `--demo-combat` seam never double-steps.
+                    // Audible events this frame (M009/S09-T04): pure data from
+                    // the melee arm, the arrow sweep, and the idle gate below,
+                    // played once at the end of the Playing frame.
                     self.session.tick_mobs(dt, self.time_scale);
                     // Projectile runtime (M009/S07-T05): the same game-time
                     // rule as mobs. The session clamps/scales `dt`, freezes
@@ -9697,6 +9756,21 @@ impl ApplicationHandler for GameApp {
                     // arrow kill reuses the mob-drop overflow notice, so a
                     // full inventory can never silently lose those drops.
                     let arrow_tick = self.session.tick_arrows(dt, self.time_scale);
+                    mob_audio = mob_audio.merge(MobAudioFrame::from_arrow_counts(
+                        arrow_tick.mob_hits,
+                        arrow_tick.block_hits,
+                        arrow_tick.player_hits,
+                        arrow_tick.kills,
+                    ));
+                    // Idle calls are a cadence, not a per-frame check: the gate
+                    // only answers once per interval (and retries cheaply while
+                    // nothing is audible). Raw frame dt like the other input-
+                    // driven accumulators (D013).
+                    mob_audio.idle = self.mob_idle.tick(
+                        dt,
+                        self.session.player.position,
+                        self.session.resident_mobs(),
+                    );
                     if arrow_tick.drops.lost_any() {
                         self.game_message = Some(MenuMessage {
                             text: mob_drop_notice(arrow_tick.drops)
@@ -9921,6 +9995,7 @@ impl ApplicationHandler for GameApp {
                             self.session
                                 .attack_mob(index, damage, self.session.camera.position)
                         {
+                            mob_audio = mob_audio.merge(MobAudioFrame::from_melee_hit(Some(hit)));
                             // MEM214/MEM392 ordering: attack -> wear -> drops
                             // -> notice. Wearing first means a sword that
                             // breaks on the killing blow frees the slot the
@@ -9984,6 +10059,15 @@ impl ApplicationHandler for GameApp {
                             }
                         }
                     }
+                }
+
+                // Mob/combat audio (M009/S09-T04): the single play site for the
+                // five new slots, on the Playing frame only (the flags above
+                // are never set elsewhere). Same field-disjoint borrows as the
+                // break calls inside the mining block (P005), and the frame's
+                // pure classification never allocates.
+                for slot in mob_audio_slots(mob_audio).into_iter().flatten() {
+                    self.audio.play(slot, self.settings.volume);
                 }
 
                 // Translucent dark panel behind the stats text: the visible
@@ -25026,7 +25110,9 @@ mod tests {
         let durability_before = selected_bow_durability(&session);
         let arrows_before = arrow_count(&session);
 
-        assert_eq!(release_bow(&mut bow, &mut session, true, true), None);
+        let release = release_bow(&mut bow, &mut session, true, true);
+        assert!(!release.fired, "a tap never fires");
+        assert_eq!(release.error, None, "a tap is a silent cancel");
         assert_eq!(bow.progress(), None, "release always resets the draw");
         assert!(session.arrows().is_empty(), "a tap never fires");
         assert_eq!(arrow_count(&session), arrows_before, "a tap spends no ammo");
@@ -25047,9 +25133,10 @@ mod tests {
         let arrows_before = arrow_count(&session);
         let durability_before = selected_bow_durability(&session).expect("tool durability");
 
-        let error = release_bow(&mut bow, &mut session, true, true);
+        let release = release_bow(&mut bow, &mut session, true, true);
 
-        assert_eq!(error, None, "a full draw fires");
+        assert!(release.fired, "a full draw fires");
+        assert_eq!(release.error, None);
         assert_eq!(session.arrows().len(), 1, "exactly one arrow");
         assert_eq!(
             session.arrows()[0].owner,
@@ -25074,12 +25161,16 @@ mod tests {
         let durability_before = selected_bow_durability(&session);
 
         bow_draw_to_full(&mut bow, &session);
-        assert_eq!(release_bow(&mut bow, &mut session, false, true), None);
+        let release = release_bow(&mut bow, &mut session, false, true);
+        assert!(!release.fired, "a panel frame never fires");
+        assert_eq!(release.error, None);
         assert_eq!(bow.progress(), None, "panel frame still resets the draw");
         assert!(session.arrows().is_empty(), "a panel frame never fires");
 
         bow_draw_to_full(&mut bow, &session);
-        assert_eq!(release_bow(&mut bow, &mut session, true, false), None);
+        let release = release_bow(&mut bow, &mut session, true, false);
+        assert!(!release.fired, "an ungrabbed cursor never fires");
+        assert_eq!(release.error, None);
         assert_eq!(bow.progress(), None, "ungrabbed cursor still resets");
         assert!(
             session.arrows().is_empty(),
@@ -25107,6 +25198,89 @@ mod tests {
     }
 
     #[test]
+    fn mob_audio_slots_maps_every_event_to_its_slot() {
+        let cases = [
+            (
+                MobAudioFrame {
+                    idle: true,
+                    ..MobAudioFrame::default()
+                },
+                [Some(SoundSlot::MobIdle), None, None, None, None],
+            ),
+            (
+                MobAudioFrame {
+                    hurt: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, Some(SoundSlot::MobHurt), None, None, None],
+            ),
+            (
+                MobAudioFrame {
+                    death: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, Some(SoundSlot::MobDeath), None, None],
+            ),
+            (
+                MobAudioFrame {
+                    bow_release: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, None, Some(SoundSlot::BowRelease), None],
+            ),
+            (
+                MobAudioFrame {
+                    arrow_impact: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, None, None, Some(SoundSlot::ArrowImpact)],
+            ),
+        ];
+        for (frame, expected) in cases {
+            assert_eq!(mob_audio_slots(frame), expected);
+        }
+        assert_eq!(
+            mob_audio_slots(MobAudioFrame {
+                idle: true,
+                hurt: true,
+                death: true,
+                bow_release: true,
+                arrow_impact: true,
+            }),
+            [
+                Some(SoundSlot::MobIdle),
+                Some(SoundSlot::MobHurt),
+                Some(SoundSlot::MobDeath),
+                Some(SoundSlot::BowRelease),
+                Some(SoundSlot::ArrowImpact),
+            ]
+        );
+        assert_eq!(mob_audio_slots(MobAudioFrame::default()), [None; 5]);
+    }
+
+    #[test]
+    fn bow_release_reports_fired_only_on_an_accepted_shot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 103, "bow-fired-flag.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+
+        // A sub-threshold tap is a cancel: the draw resets, nothing fires.
+        let target = bow_charge_candidate(&session, true, true, true).expect("bow target");
+        bow.tick(0.1, Some(target));
+        let tap = release_bow(&mut bow, &mut session, true, true);
+        assert!(!tap.fired, "a tap is not a fired shot");
+        assert_eq!(tap.error, None, "a tap is a silent cancel");
+        assert!(session.arrows().is_empty());
+
+        // An accepted full draw fires with no refusal attached.
+        bow_draw_to_full(&mut bow, &session);
+        let accepted = release_bow(&mut bow, &mut session, true, true);
+        assert!(accepted.fired, "a full draw fires");
+        assert_eq!(accepted.error, None);
+        assert_eq!(session.arrows().len(), 1);
+    }
+
+    #[test]
     fn bow_without_ammo_refuses_without_wear_and_reports_the_exact_notice() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = bow_session(dir.path(), 102, "bow-no-ammo.mcvx", GameMode::Survival);
@@ -25121,10 +25295,11 @@ mod tests {
 
         let mut bow = BowState::new();
         bow_draw_to_full(&mut bow, &session);
-        let error = release_bow(&mut bow, &mut session, true, true);
+        let release = release_bow(&mut bow, &mut session, true, true);
 
-        assert_eq!(error, Some(BowFireError::NoAmmo));
-        assert_eq!(bow_release_notice(error), Some("No arrows"));
+        assert!(!release.fired, "a refused shot never fires");
+        assert_eq!(release.error, Some(BowFireError::NoAmmo));
+        assert_eq!(bow_release_notice(release.error), Some("No arrows"));
         assert!(session.arrows().is_empty(), "a refused shot spawns nothing");
         assert_eq!(
             selected_bow_durability(&session),

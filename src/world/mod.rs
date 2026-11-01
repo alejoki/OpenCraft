@@ -12,6 +12,7 @@ pub mod loot;
 pub mod manager;
 pub mod mob;
 pub mod mob_ai;
+pub mod mob_audio;
 pub mod mob_loot;
 pub mod persistence;
 pub mod season;
