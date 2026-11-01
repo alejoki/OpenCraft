@@ -153,6 +153,11 @@ pub struct CliConfig {
     /// persisted, fresh startup only, and exempt from the accelerated-demo
     /// watch.
     pub demo_content: bool,
+    /// Whether the bounded scripted combat demo (`--demo-combat`, M009/S01-T05)
+    /// is requested. Same bare-switch contract as `demo_swim`/`demo_survival`:
+    /// no value, never a world intent, never persisted, fresh startup only,
+    /// and exempt from the accelerated-demo watch.
+    pub demo_combat: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -177,6 +182,7 @@ impl CliConfig {
         let mut demo_swim = false;
         let mut demo_survival = false;
         let mut demo_content = false;
+        let mut demo_combat = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -245,6 +251,10 @@ impl CliConfig {
                     // Same bare-switch rule as `--demo-swim`.
                     demo_content = true;
                 }
+                "--demo-combat" => {
+                    // Same bare-switch rule as `--demo-swim`.
+                    demo_combat = true;
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -267,6 +277,7 @@ impl CliConfig {
             demo_swim,
             demo_survival,
             demo_content,
+            demo_combat,
             mode,
         }
     }
@@ -3021,6 +3032,38 @@ mod tests {
         let both = CliConfig::parse_args(["--demo-survival", "--demo-content"]);
         assert!(both.demo_survival);
         assert!(both.demo_content);
+    }
+
+    #[test]
+    fn test_demo_combat_parses_as_a_bare_switch() {
+        // Absent keeps the seam off: a normal launch is byte-identical.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_combat);
+        assert!(!bare.demo_swim);
+        assert!(!bare.demo_survival);
+        assert!(!bare.demo_content);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let combat = CliConfig::parse_args(["--demo-combat"]);
+        assert!(combat.demo_combat);
+        assert!(!combat.force_new_world);
+        assert_eq!(combat.seed_override, None);
+        assert_eq!(
+            combat.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--seed 5` is parsed as the seed, proving the bare
+        // switch never swallowed the next token as its value.
+        let with_seed = CliConfig::parse_args(["--demo-combat", "--seed", "5"]);
+        assert!(with_seed.demo_combat);
+        assert_eq!(with_seed.seed_override, Some(5));
+
+        // A stray non-flag token after the switch is ignored like any other
+        // unknown argument and never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-combat", "5"]);
+        assert!(stray.demo_combat);
+        assert_eq!(stray.seed_override, None);
     }
 
     #[test]

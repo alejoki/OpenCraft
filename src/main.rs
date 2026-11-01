@@ -27,7 +27,7 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
-use opencraft::render::mob::build_mob_batch;
+use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
@@ -73,6 +73,7 @@ use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, 
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
+use opencraft::world::mob::{Mob, MobKind};
 use opencraft::world::persistence::{
     load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
     WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
@@ -1266,7 +1267,8 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
 }
 
 /// Accelerated-watch suppression predicate: true when the launch requested a
-/// scripted demo seam (`--demo-swim`, `--demo-survival`, or `--demo-content`).
+/// scripted demo seam (`--demo-swim`, `--demo-survival`, `--demo-content`, or
+/// `--demo-combat`).
 /// A scripted demo owns its own completion and digest contract at its own
 /// pace, so the accelerated `--time-scale` watch and its wall-clock deadline
 /// must stay disarmed even when `--time-scale` is also on the command line —
@@ -1274,7 +1276,7 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
 /// the scripted run prints its own digest. The flags themselves are still
 /// launch switches, never world intents (see [`cli_has_world_intent`]).
 fn scripted_demo_requested(cli: &CliConfig) -> bool {
-    cli.demo_swim || cli.demo_survival || cli.demo_content
+    cli.demo_swim || cli.demo_survival || cli.demo_content || cli.demo_combat
 }
 
 /// The startup world session, mirroring main()'s pre-S03 load-or-fresh
@@ -1294,18 +1296,27 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
         }
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+    // The scripted combat seam (`--demo-combat`, M009/S01-T05) pins a fresh
+    // world to Survival at dusk so the mob path is proven with walking mobs in
+    // front of a non-flying player. It overrides `cli.mode` on the fresh
+    // branch only: the load branch above returns first, so a saved world is
+    // never re-moded, re-clocked, or re-seeded by the flag.
+    let mode = if cli.demo_combat {
+        GameMode::Survival
+    } else {
+        cli.mode
+    };
     // Fresh worlds start at the default season length; the New Game row and
     // the `--season-length` CLI seam override it on this branch only. A load
     // branch above never reaches here, so a persisted calendar always wins
     // over a launch flag. The mode follows the same rule: `--creative` /
     // `--survival` pick the fresh world's persisted mode, while a loaded save
     // restores its own stored mode and ignores the flag.
-    let mut session = WorldSession::new_session_with_mode(
-        seed,
-        cli.save_path.clone(),
-        cli.season_length,
-        cli.mode,
-    );
+    let mut session =
+        WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
+    if cli.demo_combat {
+        session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
+    }
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
     // resumed save is never moved — its own position is the contract there.
@@ -3695,6 +3706,247 @@ fn content_demo_step(demo: &mut ContentDemo, session: &mut WorldSession) -> bool
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted combat demo (`--demo-combat`, M009/S01-T05)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock safety net for the scripted combat loop. The Walk stage is also
+/// bounded by its own 600-update cap, so this only catches a run whose world
+/// never streams in (the Settle wait).
+const COMBAT_DEMO_DEADLINE_SECS: u64 = 120;
+
+/// Minimum Walk observations before success may latch (120 Playing frames =
+/// 2 s at 60 Hz). Besides proving sustained walking rather than a single
+/// lucky step, this gives the shutdown `frame_budget:` digest a meaningful
+/// sample set: with only a handful of samples p95 collapses onto the maximum
+/// sample, so one startup-heavy frame would dominate the printed p95.
+const COMBAT_WALK_OBSERVATIONS: u32 = 120;
+/// Hard cap on Walk observations before the stage aborts with a digest.
+const COMBAT_WALK_ABORT_UPDATES: u32 = 600;
+
+/// The pinned clock for a fresh `--demo-combat` world. 12_000 ticks is late
+/// afternoon (just before dusk), so the demo proves the box-model path at a
+/// deterministic, mob-visible time of day. Never derived from the wall clock.
+pub const COMBAT_DUSK_TICK: u32 = 12_000;
+
+/// The scripted combat loop's fixed stage order. Each stage is fed once per
+/// `about_to_wait` call; Settle returns `false` until the fresh Survival
+/// spawn chunks are resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombatStage {
+    Settle,
+    Spawn,
+    Walk,
+    Done,
+}
+
+/// The `--demo-combat` seam's whole state: the pinned seed, whether the world
+/// is a fresh launch (the only branch allowed to be seeded with demo mobs),
+/// the stage cursor, the one latched digest, and the observed numbers the
+/// success digest reports.
+#[derive(Debug)]
+struct CombatDemo {
+    seed: u32,
+    /// True only for the fresh Survival startup branch. A loaded save must
+    /// never be re-seeded, so it aborts `stage=loaded` instead.
+    fresh: bool,
+    stage: CombatStage,
+    /// The digest latched when the run ends (success or abort). Printed by the
+    /// demo-shutdown block with the other bounded-demo diagnostics.
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status.
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+    /// The feet position recorded at spawn, in mob-list order, for the Walk
+    /// stage's movement check.
+    spawn_positions: [Vec3; 4],
+    /// Mobs that had both a walking phase and a recorded displacement at the
+    /// last Walk observation (reported in the success digest).
+    walked: u32,
+    /// Walk observations so far; the stage aborts after 600.
+    walk_updates: u32,
+}
+
+impl CombatDemo {
+    fn new(seed: u32, fresh: bool, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            fresh,
+            stage: CombatStage::Settle,
+            digest: None,
+            failed: false,
+            deadline,
+            spawn_positions: [Vec3::ZERO; 4],
+            walked: 0,
+            walk_updates: 0,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(format!(
+            "combat_demo: seed={} stage={} observed={} ok=false",
+            self.seed, stage, observed
+        ));
+        self.failed = true;
+    }
+
+    /// The exact success digest printed once on the demo-shutdown path. The
+    /// vertex count is the sum over resident mobs of the real
+    /// [`build_mob_vertices`] output, so it pins the render path's batch size
+    /// (4 mobs x 6 cuboids x 6 faces x 6 vertices = 864).
+    fn success_digest(&self, session: &WorldSession) -> String {
+        let mobs = session.mobs().len();
+        let resident = session.resident_mobs().count();
+        let verts: usize = session
+            .resident_mobs()
+            .map(|mob| {
+                build_mob_vertices(
+                    mob.kind,
+                    MobAnim {
+                        walk_phase: mob.walk_phase,
+                        walk_amount: 1.0,
+                        light: 1.0,
+                    },
+                    0.0,
+                    0.0,
+                )
+                .len()
+            })
+            .sum();
+        format!(
+            "combat_demo: seed={} mobs={} resident={} walked={} verts={} ok=true",
+            self.seed, mobs, resident, self.walked, verts
+        )
+    }
+}
+
+/// Drive one Playing frame of the scripted combat loop. Returns true when this
+/// call ended the run (success or abort).
+///
+/// The demo never ticks the mob runtime itself: the real Playing tick owns
+/// `session.tick_mobs`, exactly as it owns `tick_survival`/`tick_crops`. This
+/// seam only spawns the pinned quartet, observes them, and latches one digest.
+fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    if let Some(deadline) = demo.deadline {
+        if Instant::now() >= deadline {
+            demo.abort(
+                "deadline",
+                &format!("bounded combat run exceeded {COMBAT_DEMO_DEADLINE_SECS}s"),
+            );
+            return true;
+        }
+    }
+    if !demo.fresh {
+        demo.abort("loaded", "fresh=false");
+        return true;
+    }
+    match demo.stage {
+        CombatStage::Settle => {
+            if !session.settle_spawn() {
+                return false;
+            }
+            demo.stage = CombatStage::Spawn;
+            false
+        }
+        CombatStage::Spawn => {
+            // A demo run owns its mob list: clearing first makes a re-armed
+            // seam deterministic instead of stacking two quartets.
+            session.mobs_mut().clear();
+            let player = &session.player;
+            let forward = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+            let right = Vec3::new(-player.yaw.sin(), 0.0, player.yaw.cos());
+            let offsets = [-1.8_f32, -0.6, 0.6, 1.8];
+            let seed = demo.seed;
+            let player_x = player.position.x;
+            let player_z = player.position.z;
+            let mut positions = [Vec3::ZERO; 4];
+            let mut yaws = [0.0_f32; 4];
+            for (index, offset) in offsets.iter().enumerate() {
+                let x = player.position.x + forward.x * 3.5 + right.x * offset;
+                let z = player.position.z + forward.z * 3.5 + right.z * offset;
+                let y =
+                    terrain_height_at_seeded(x.floor() as i32, z.floor() as i32, seed) as f32 + 1.0;
+                positions[index] = Vec3::new(x, y, z);
+                // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns the quartet
+                // toward the player (the render path proves the facing).
+                yaws[index] = (player_x - x).atan2(player_z - z);
+            }
+            {
+                let mobs = session.mobs_mut();
+                for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+                    mobs.push(Mob::new(kind, positions[index], yaws[index]));
+                }
+            }
+            let count = session.mobs().len();
+            if count != 4 {
+                demo.abort("spawn", &format!("mobs={count}"));
+                return true;
+            }
+            demo.spawn_positions = positions;
+            demo.stage = CombatStage::Walk;
+            false
+        }
+        CombatStage::Walk => {
+            // The observation count is bumped BEFORE the success check so the
+            // demo can require a minimum walking window (see
+            // [`COMBAT_WALK_OBSERVATIONS`]).
+            demo.walk_updates += 1;
+            let mut resident = 0usize;
+            let mut walked = 0u32;
+            for (index, mob) in session.mobs().iter().enumerate() {
+                if !session.mob_is_resident(mob) {
+                    continue;
+                }
+                resident += 1;
+                let spawn = demo.spawn_positions.get(index).copied().unwrap_or(mob.home);
+                let dx = mob.position.x - spawn.x;
+                let dy = mob.position.y - spawn.y;
+                let dz = mob.position.z - spawn.z;
+                if mob.walk_phase > 0.1 && (dx * dx + dy * dy + dz * dz).sqrt() > 1e-3 {
+                    walked += 1;
+                }
+            }
+            demo.walked = walked;
+            let total = session.mobs().len();
+            if total == 4
+                && resident == 4
+                && walked == 4
+                && demo.walk_updates >= COMBAT_WALK_OBSERVATIONS
+            {
+                let digest = demo.success_digest(session);
+                demo.digest = Some(digest);
+                demo.stage = CombatStage::Done;
+                return true;
+            }
+            if demo.walk_updates >= COMBAT_WALK_ABORT_UPDATES {
+                demo.abort(
+                    "walk",
+                    &format!(
+                        "walked={walked} resident={resident} total={total} updates={}",
+                        demo.walk_updates
+                    ),
+                );
+                return true;
+            }
+            false
+        }
+        CombatStage::Done => true,
+    }
+}
+
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
 /// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
 /// under this; the cap only guarantees bounded memory if a run is left going.
@@ -4036,12 +4288,17 @@ struct GameApp {
     /// every normal run; the launch flag arms it and `step_scripted_demos`
     /// drives the content stages on Playing frames.
     content_demo: Option<ContentDemo>,
+    /// Scripted combat seam (`--demo-combat`, M009/S01-T05). `None` for every
+    /// normal run; the launch flag arms it and `step_scripted_demos` drives the
+    /// settle/spawn/walk stages on Playing frames. Only a fresh launch may be
+    /// seeded with the demo quartet; a loaded save aborts with a digest.
+    combat_demo: Option<CombatDemo>,
     /// Whether a failed demo seam requests a non-zero process status. Set by a
     /// self-describing swim or survival abort; `main` reads it after the event
     /// loop exits (the shutdown path itself cannot set a process status).
     exit_failure: bool,
     /// True when the launch requested a scripted demo seam (`--demo-swim`,
-    /// `--demo-survival`, or `--demo-content`) — see
+    /// `--demo-survival`, `--demo-content`, or `--demo-combat`) — see
     /// [`scripted_demo_requested`]. The accelerated-demo watch and its
     /// wall-clock deadline stay disarmed for these runs, so a scripted demo
     /// owns its own bounded completion even when `--time-scale` is present.
@@ -4183,6 +4440,22 @@ impl GameApp {
         } else {
             None
         };
+        // Scripted combat seam (M009/S01-T05): the fresh flag comes from the
+        // session's spawn-settle gate (only a fresh Survival spawn arms it),
+        // so a loaded save can never be seeded with the demo quartet. The
+        // wall-clock deadline only arms for a direct-to-gameplay launch.
+        let combat_demo = if cli.demo_combat {
+            let seed = session.world.seed();
+            let fresh = session.spawn_settle_pending();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(COMBAT_DEMO_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(CombatDemo::new(seed, fresh, deadline))
+        } else {
+            None
+        };
         // The loaded Settings are the single source of truth for video
         // parameters: FOV applies to the session's camera at startup, and
         // render distance to its world (defaults are 75 degrees / 16
@@ -4267,6 +4540,7 @@ impl GameApp {
             swim,
             survival_demo,
             content_demo,
+            combat_demo,
             exit_failure: false,
             scripted_demo,
         }
@@ -4585,6 +4859,15 @@ impl GameApp {
             };
             finished |= ended;
         }
+        if let Some(demo) = self.combat_demo.as_mut() {
+            let ended = if playing {
+                combat_demo_step(demo, &mut self.session)
+            } else {
+                demo.abort("screen", &format!("screen={screen:?}"));
+                true
+            };
+            finished |= ended;
+        }
 
         if finished {
             self.demo_seam_ran = true;
@@ -4599,7 +4882,12 @@ impl GameApp {
                 .as_ref()
                 .map(|demo| demo.failed)
                 .unwrap_or(false);
-            self.exit_failure |= survival_failed || content_failed;
+            let combat_failed = self
+                .combat_demo
+                .as_ref()
+                .map(|demo| demo.failed)
+                .unwrap_or(false);
+            self.exit_failure |= survival_failed || content_failed || combat_failed;
         }
     }
 
@@ -4674,13 +4962,14 @@ impl GameApp {
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
         self.demo_seam_ran = false;
-        // The scripted swim and survival seams belong to the LAUNCH (the
-        // fresh-world startup branch that teleported the player), never to a
-        // session created from the menu: swapping worlds retires them with
-        // the old world.
+        // The scripted swim/survival/content/combat seams belong to the LAUNCH
+        // (the fresh-world startup branch that teleported or seeded the
+        // player), never to a session created from the menu: swapping worlds
+        // retires them with the old world.
         self.swim = None;
         self.survival_demo = None;
         self.content_demo = None;
+        self.combat_demo = None;
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -6243,6 +6532,13 @@ impl ApplicationHandler for GameApp {
                             &mesh,
                         );
                     }
+                    // Mob runtime (M009/S01-T05): the same game-time rule as
+                    // survival/crops. The session clamps/scales `dt`, runs a
+                    // deterministic fixed 20 Hz accumulator, and freezes mobs
+                    // in unloaded chunks. The batched mob draw reads the
+                    // resulting records; this call is the only tick site, so
+                    // the scripted `--demo-combat` seam never double-steps.
+                    self.session.tick_mobs(dt, self.time_scale);
                     // Open-station state is a world fact (S02-T02/S03-T03):
                     // close a station as soon as its block is removed/replaced
                     // or the player steps out of reach. One bounded lookup per
@@ -7134,6 +7430,13 @@ impl ApplicationHandler for GameApp {
             {
                 let _ = writeln!(stdout, "{line}");
             }
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
             drop(stdout);
             self.shutdown(event_loop);
             return;
@@ -7220,6 +7523,7 @@ mod tests {
 
     use opencraft::player::camera::Camera;
     use opencraft::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
+    use opencraft::render::texture::NUM_TEX_LAYERS;
     use opencraft::world::persistence::ChunkEditMap;
     use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -7577,7 +7881,12 @@ mod tests {
         // launch plus the flag still opens the main menu, exactly like a bare
         // launch. (The effect belongs to the fresh startup branch only.)
         let bare = CliConfig::parse_args(Vec::<String>::new());
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             let cli = CliConfig::parse_args([flag]);
             assert!(
                 !cli_has_world_intent(&cli),
@@ -7588,7 +7897,12 @@ mod tests {
 
         // Combined with a real world flag the intent is unchanged (the world
         // flag is still what grants direct gameplay entry).
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             let with_new = CliConfig::parse_args(["--new", flag]);
             assert!(
                 cli_has_world_intent(&with_new),
@@ -7619,7 +7933,12 @@ mod tests {
 
         // Each scripted flag requests the suppression, with or without an
         // accelerated scale on the same command line.
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             assert!(
                 scripted_demo_requested(&CliConfig::parse_args([flag])),
                 "{flag} must suppress the accelerated watch"
@@ -9010,6 +9329,315 @@ mod tests {
         assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
     }
 
+    // ---- Scripted combat seam (M009/S01-T05) ----
+
+    /// Fresh `--demo-combat` pins Survival at the dusk tick; the load branch
+    /// returns before every one of those overrides, so a saved clock, mode,
+    /// and position always win over the flag.
+    #[test]
+    fn combat_demo_fresh_flag_pins_survival_and_dusk_only_for_fresh_worlds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("combat-fresh.mcvx");
+        let path_str = path.to_str().expect("utf8 path");
+
+        let cli =
+            CliConfig::parse_args(["--new", "--seed", "1", "--demo-combat", "--save", path_str]);
+        let session = startup_session(&cli);
+        assert_eq!(session.clock.time_of_day, COMBAT_DUSK_TICK);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert!(!session.player.can_fly());
+        assert!(
+            session.spawn_settle_pending(),
+            "a fresh Survival spawn still settles before physics"
+        );
+        assert!(
+            session.mobs().is_empty(),
+            "startup arms the seam but seeds no mobs"
+        );
+
+        // The flag overrides an explicit `--creative` on the fresh branch.
+        let overridden = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--creative",
+            "--demo-combat",
+            "--save",
+            path_str,
+        ]);
+        let session = startup_session(&overridden);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.clock.time_of_day, COMBAT_DUSK_TICK);
+
+        // Load branch: the persisted clock/mode/position win over the flag.
+        let mut data = sample_save(1);
+        data.time_of_day = 5_000;
+        data.mode = GameMode::Creative;
+        data.player.position = [100.0, 40.0, -7.0];
+        save_world_to_path(&path, &data).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            path_str,
+            "--demo-combat",
+        ]));
+        assert_eq!(loaded.clock.time_of_day, 5_000);
+        assert_eq!(loaded.save_mode, GameMode::Creative);
+        assert_eq!(loaded.player.position, Vec3::new(100.0, 40.0, -7.0));
+        assert!(
+            !loaded.spawn_settle_pending(),
+            "a loaded session is never fresh"
+        );
+    }
+
+    /// The seam is launch state, not session state: a session swap retires it,
+    /// a menu-first launch arms it without a deadline, and the wrapper aborts
+    /// with `stage=screen` on the non-Playing screen.
+    #[test]
+    fn combat_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-combat",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 1);
+        assert!(
+            demo.fresh,
+            "a fresh Survival spawn is the demo's only fresh world"
+        );
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay combat run carries its 120s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.combat_demo.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // Menu-first launch: armed without a deadline, and the wrapper aborts
+        // on its non-Playing screen instead of waiting for frames.
+        let menu_cli = CliConfig::parse_args(["--demo-combat"]);
+        let mut menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/menu-combat.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let menu_demo = menu_app.combat_demo.as_ref().expect("seam armed");
+        assert_eq!(menu_demo.seed, 1);
+        assert!(menu_demo.deadline.is_none());
+
+        menu_app.step_scripted_demos();
+        let digest = menu_app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("screen abort digest");
+        assert!(digest.contains("stage=screen"), "{digest}");
+        assert!(digest.contains("observed=screen=MainMenu"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(menu_app.demo_finished, "the abort ends the bounded run");
+        assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
+    }
+
+    /// A loaded Playing save aborts at `stage=loaded`: the demo may never seed
+    /// mobs into a persisted world.
+    #[test]
+    fn combat_demo_loaded_playing_save_aborts_at_the_loaded_stage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-loaded.mcvx");
+        let mut data = sample_save(1);
+        data.time_of_day = 5_000;
+        save_world_to_path(&save_path, &data).expect("write save");
+        let cli = CliConfig::parse_args([
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-combat",
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("seam armed");
+        assert!(!demo.fresh, "a loaded session is never a fresh spawn");
+        assert!(demo.deadline.is_some());
+
+        app.step_scripted_demos();
+        let digest = app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("loaded abort digest");
+        assert!(
+            digest.starts_with("combat_demo: seed=1 stage=loaded "),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(app.demo_finished);
+        assert!(app.exit_failure);
+    }
+
+    /// Insert the fresh player's feet and support chunks, then run the fixed
+    /// 20 Hz tick + one demo step per update until the quartet is walking.
+    #[test]
+    fn combat_demo_headless_success_digest_is_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-demo.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session));
+        assert_eq!(demo.stage, CombatStage::Spawn, "the spawn gate settles");
+        assert!(!combat_demo_step(&mut demo, &mut session));
+        assert_eq!(demo.stage, CombatStage::Walk);
+        assert_eq!(session.mobs().len(), 4);
+        assert_eq!(
+            session
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>(),
+            MobKind::ALL.to_vec()
+        );
+
+        // The quartet spawns 3.5 blocks ahead of the player, so its feet
+        // chunks stream in on their own here.
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+
+        let mut updates = 0;
+        let mut ended = false;
+        while !ended && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            ended = combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the walk stage must finish within 600 updates"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert_eq!(demo.walked, 4);
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some("combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 ok=true")
+        );
+    }
+
+    /// Deadline and walk-timeout runs latch self-describing aborts (and the
+    /// first outcome wins), so a stalled harness still gets a verdict digest.
+    #[test]
+    fn combat_demo_deadline_and_walk_aborts_are_self_describing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut demo = CombatDemo::new(12345, true, Some(past));
+        assert!(combat_demo_step(&mut demo, &mut session));
+        assert!(demo.failed, "a deadline is a failed run");
+        let digest = demo.digest.clone().expect("deadline digest latched");
+        assert!(
+            digest.starts_with("combat_demo: seed=12345 stage=deadline "),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+        demo.abort("walk", "synthetic_second_abort");
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(digest.as_str()),
+            "the first outcome wins"
+        );
+
+        // Walk timeout: a spawned quartet that is never ticked stays unwalked,
+        // and the 600th observation aborts instead of waiting forever.
+        let spawn = WorldSession::spawn_position(12345);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        let mut demo = CombatDemo::new(12345, true, None);
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "stays in Settle"
+        );
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "spawns into Walk"
+        );
+        assert_eq!(demo.stage, CombatStage::Walk);
+        demo.walk_updates = 599;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.as_deref().expect("walk abort digest");
+        assert!(digest.contains("stage=walk"), "{digest}");
+        assert!(digest.contains("walked=0"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+    }
+
     /// A main-storage item moves into a full hotbar by freeing one slot into an
     /// empty main slot, and the cursor must end empty.
     #[test]
@@ -10041,7 +10669,7 @@ mod tests {
         assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
         let loaded = app.current_pack.as_ref().expect("pack loaded");
         assert_eq!(loaded.display_name, "Alpha Pack");
-        assert_eq!(loaded.layers.len(), 32);
+        assert_eq!(loaded.layers.len(), NUM_TEX_LAYERS as usize);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
@@ -10105,7 +10733,11 @@ mod tests {
 
         assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
         let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(loaded.layers.len(), 32, "fallback still fully usable");
+        assert_eq!(
+            loaded.layers.len(),
+            NUM_TEX_LAYERS as usize,
+            "fallback still fully usable"
+        );
         let message = app.menu.message.as_ref().expect("warning in the menu");
         assert!(
             message.text.contains("grass_top.png"),
@@ -10269,7 +10901,11 @@ mod tests {
             pack.logo.is_none(),
             "corrupt logo falls back to the text title"
         );
-        assert_eq!(pack.layers.len(), 32, "layers stay fully usable");
+        assert_eq!(
+            pack.layers.len(),
+            NUM_TEX_LAYERS as usize,
+            "layers stay fully usable"
+        );
         assert!(
             warnings.iter().any(|w| w.field == "title.png"),
             "warning names the bare logo file: {warnings:?}"
