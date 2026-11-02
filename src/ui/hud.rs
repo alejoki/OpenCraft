@@ -108,6 +108,18 @@ pub fn hotbar_count_text_origin(rect: (f32, f32, f32, f32)) -> (f32, f32) {
     (x + 4.0, y + h - HOTBAR_COUNT_LINE_HEIGHT - 2.0)
 }
 
+/// Icon area for one hotbar slot: the slot minus the count-label strip.
+///
+/// Count labels start at [`hotbar_count_text_origin`] and grow downward, so an
+/// icon that stays above that top edge can never cover a number. Degenerate
+/// slots collapse to a zero-height rect instead of inverting.
+pub fn hotbar_icon_rect(rect: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = rect;
+    let label_top = hotbar_count_text_origin(rect).1;
+    let icon_h = (label_top - y).clamp(0.0, h.max(0.0));
+    (x, y, w, icon_h)
+}
+
 /// Fill color of the eating progress bar, distinct from the mining amber.
 pub const EATING_FILL_COLOR: [f32; 4] = [0.55, 0.85, 0.35, 0.95];
 
@@ -573,6 +585,32 @@ mod tests {
             for quad in bow_progress_quads(0.5, w, h) {
                 for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
                     assert!(value.is_finite(), "{name} finite on {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hotbar_icon_rect_stays_inside_the_slot_and_above_the_count_label() {
+        for (w, h) in [(1280, 720), (0, 0), (80, 60)] {
+            for (slot, rect) in hotbar_slot_rects(w, h).iter().enumerate() {
+                let icon = hotbar_icon_rect(*rect);
+                let label_top = hotbar_count_text_origin(*rect).1;
+                for (name, value) in [("x", icon.0), ("y", icon.1), ("w", icon.2), ("h", icon.3)] {
+                    assert!(value.is_finite(), "slot {slot} icon {name} finite");
+                }
+                assert!(icon.2 >= 0.0 && icon.3 >= 0.0, "never inverted");
+                assert!(icon.0 >= rect.0 && icon.0 + icon.2 <= rect.0 + rect.2 + 1e-3);
+                assert!(icon.1 >= rect.1);
+                // On very small surfaces the label strip is taller than the
+                // slot itself and starts above it; there is no positive icon
+                // area to keep clear, so only assert the real invariant when
+                // the label actually begins inside the slot.
+                if label_top >= rect.1 {
+                    assert!(
+                        icon.1 + icon.3 <= label_top + 1e-3,
+                        "slot {slot} icon bottom clears the count label top"
+                    );
                 }
             }
         }

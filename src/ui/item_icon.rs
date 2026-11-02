@@ -13,8 +13,9 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use super::inventory::Rect;
-use crate::player::inventory::{Item, ItemId};
+use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
+use super::inventory::{InventoryLayout, InventoryMode, Rect};
+use crate::player::inventory::{CraftingGrid, Inventory, Item, ItemId};
 use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
 
@@ -225,6 +226,142 @@ pub fn icon_vertices_for_item(
         ),
         _ => None,
     }
+}
+
+/// Append the cube icon for one optional item into `out`, skipping empty and
+/// non-block identities (S01 only draws block cubes).
+fn push_item_icon(
+    out: &mut Vec<IconVertex>,
+    item: Option<Item>,
+    slot: Rect,
+    surface_w: u32,
+    surface_h: u32,
+) {
+    if let Some(item) = item {
+        if let Some(vertices) = icon_vertices_for_item(item, slot, surface_w, surface_h) {
+            out.extend(vertices);
+        }
+    }
+}
+
+/// Append the cube icon for one recipe preview's output, if it is a carryable
+/// block and the output stack is valid.
+fn push_preview_icon(
+    out: &mut Vec<IconVertex>,
+    preview: Option<crate::player::inventory::RecipePreview>,
+    slot: Rect,
+    surface_w: u32,
+    surface_h: u32,
+) {
+    let Some(preview) = preview else {
+        return;
+    };
+    let item = Item::new(preview.output, preview.output_count).ok();
+    push_item_icon(out, item, slot, surface_w, surface_h);
+}
+
+/// All block cube icons for the open inventory panel.
+///
+/// Covers exactly the same surfaces as [`super::inventory::screen_quads`]:
+/// 36 inventory slots, the 4 player crafting cells, the 16 table cells only
+/// in [`InventoryMode::Table`], both result previews, and the cursor ghost.
+/// Closed screens emit nothing. Non-block identities are skipped by
+/// [`icon_vertices_for_item`] until their own icon path lands.
+#[allow(clippy::too_many_arguments)]
+pub fn inventory_icon_vertices(
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    cursor_item: Option<Item>,
+    cursor_pos: Option<(f32, f32)>,
+    surface_w: u32,
+    surface_h: u32,
+) -> Vec<IconVertex> {
+    if !mode.is_open() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (index, rect) in layout.slots.iter().enumerate() {
+        push_item_icon(&mut out, inventory.slot(index), *rect, surface_w, surface_h);
+    }
+    for (index, rect) in layout.player_grid.iter().enumerate() {
+        push_item_icon(
+            &mut out,
+            player_grid.slot(index),
+            *rect,
+            surface_w,
+            surface_h,
+        );
+    }
+    push_preview_icon(
+        &mut out,
+        player_grid.preview(),
+        layout.player_result,
+        surface_w,
+        surface_h,
+    );
+
+    if mode == InventoryMode::Table {
+        for (index, rect) in layout.table_grid.iter().enumerate() {
+            push_item_icon(
+                &mut out,
+                table_grid.slot(index),
+                *rect,
+                surface_w,
+                surface_h,
+            );
+        }
+        push_preview_icon(
+            &mut out,
+            table_grid.preview(),
+            layout.table_result,
+            surface_w,
+            surface_h,
+        );
+    }
+
+    if let (Some(item), Some((cx, cy))) = (cursor_item, cursor_pos) {
+        if cx.is_finite() && cy.is_finite() {
+            let size = layout.player_result.2 * 0.75;
+            push_item_icon(
+                &mut out,
+                Some(item),
+                (cx - size * 0.5, cy - size * 0.5, size, size),
+                surface_w,
+                surface_h,
+            );
+        }
+    }
+
+    out
+}
+
+/// Block cube icons for the nine gameplay hotbar slots.
+///
+/// Each icon is inset inside its [`hotbar_slot_rects`] slot and clipped to
+/// stay above the count label's top edge ([`hotbar_count_text_origin`]), so a
+/// stack count can never be hidden behind a cube face. Empty slots and
+/// non-block identities produce no vertices.
+pub fn hotbar_icon_vertices(
+    inventory: &Inventory,
+    surface_w: u32,
+    surface_h: u32,
+) -> Vec<IconVertex> {
+    let mut out = Vec::new();
+    for (slot, rect) in hotbar_slot_rects(surface_w, surface_h).iter().enumerate() {
+        let icon_slot = hotbar_icon_rect(*rect);
+        push_item_icon(
+            &mut out,
+            inventory.hotbar(slot),
+            icon_slot,
+            surface_w,
+            surface_h,
+        );
+    }
+    out
 }
 
 /// Filter a CPU icon batch down to the vertices the GPU can safely consume.
@@ -456,7 +593,10 @@ impl IconRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::{Item, ItemId, Material, ToolKind, ToolTier};
+    use crate::player::inventory::{
+        CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
+        HOTBAR_SLOTS, INVENTORY_SLOTS,
+    };
 
     const SLOT: Rect = (10.0, 20.0, 40.0, 40.0);
 
@@ -644,6 +784,317 @@ mod tests {
             tier: ToolTier::Wood,
         });
         assert!(icon_vertices_for_item(pickaxe, SLOT, 800, 600).is_none());
+    }
+
+    fn px_vertex(v: &IconVertex, surface_w: u32, surface_h: u32) -> (f32, f32) {
+        (
+            (v.clip_pos[0] + 1.0) * 0.5 * surface_w.max(1) as f32,
+            (1.0 - v.clip_pos[1]) * 0.5 * surface_h.max(1) as f32,
+        )
+    }
+
+    fn block_inventory(count: usize) -> Inventory {
+        let grass = item(ItemId::Block(BlockId::Grass));
+        let mut slots = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(count) {
+            *slot = Some(grass);
+        }
+        Inventory::from_parts(slots, None)
+    }
+
+    fn open_layout(mode: InventoryMode) -> crate::ui::inventory::InventoryLayout {
+        crate::ui::inventory::layout(1280, 720, mode)
+    }
+
+    #[test]
+    fn inventory_icons_cover_all_36_slots_and_skip_empty_slots() {
+        let full = block_inventory(INVENTORY_SLOTS);
+        let player_grid = CraftingGrid::new(GridKind::Player);
+        let table_grid = CraftingGrid::new(GridKind::Table);
+        let layout = open_layout(InventoryMode::Player);
+        let verts = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &full,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert_eq!(verts.len(), INVENTORY_SLOTS * 18);
+
+        let empty = Inventory::empty();
+        let none = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &empty,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(none.is_empty(), "an empty inventory draws no icons");
+
+        let closed = inventory_icon_vertices(
+            InventoryMode::Closed,
+            &layout,
+            &full,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(closed.is_empty(), "a closed screen draws no icons");
+    }
+
+    #[test]
+    fn table_mode_adds_sixteen_cells_but_player_mode_does_not() {
+        let inventory = Inventory::empty();
+        let player_grid = CraftingGrid::new(GridKind::Player);
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for cell in 0..16 {
+            table_grid
+                .set(cell, Some(item(ItemId::Block(BlockId::Grass))))
+                .expect("active table cell");
+        }
+
+        let player_layout = open_layout(InventoryMode::Player);
+        let player_verts = inventory_icon_vertices(
+            InventoryMode::Player,
+            &player_layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(player_verts.is_empty(), "player mode ignores table cells");
+
+        let table_layout = open_layout(InventoryMode::Table);
+        let table_verts = inventory_icon_vertices(
+            InventoryMode::Table,
+            &table_layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert_eq!(table_verts.len(), 16 * 18);
+    }
+
+    #[test]
+    fn result_previews_and_cursor_ghost_emit_block_cubes() {
+        let inventory = Inventory::empty();
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        // One oak log -> planks preview, whose output is a block.
+        player_grid
+            .set(0, Some(item(ItemId::Block(BlockId::OakLog))))
+            .expect("player cell");
+        let table_grid = CraftingGrid::new(GridKind::Table);
+        let layout = open_layout(InventoryMode::Player);
+
+        let with_preview = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        // One block ingredient cube plus the block result preview cube.
+        assert_eq!(with_preview.len(), 2 * 18, "player result preview cube");
+
+        let mut no_recipe = CraftingGrid::new(GridKind::Player);
+        no_recipe
+            .set(0, Some(item(ItemId::Block(BlockId::Stone))))
+            .expect("player cell");
+        let cell_only = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &no_recipe,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert_eq!(cell_only.len(), 18, "a lone stone cell is not a recipe");
+
+        let cursor_inventory = Inventory::from_parts(
+            [None; INVENTORY_SLOTS],
+            Some(item(ItemId::Block(BlockId::Stone))),
+        );
+        let with_cursor = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &cursor_inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &table_grid,
+            cursor_inventory.cursor(),
+            Some((640.0, 360.0)),
+            1280,
+            720,
+        );
+        assert_eq!(with_cursor.len(), 18, "cursor ghost cube");
+
+        let no_cursor_pos = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &cursor_inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &table_grid,
+            cursor_inventory.cursor(),
+            None,
+            1280,
+            720,
+        );
+        assert!(
+            no_cursor_pos.is_empty(),
+            "a block on the cursor without a finite position draws nothing"
+        );
+
+        let nan_cursor = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &cursor_inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &table_grid,
+            cursor_inventory.cursor(),
+            Some((f32::NAN, 360.0)),
+            1280,
+            720,
+        );
+        assert!(
+            nan_cursor.is_empty(),
+            "non-finite cursor position is skipped"
+        );
+    }
+
+    #[test]
+    fn table_result_preview_emits_a_block_cube() {
+        let inventory = Inventory::empty();
+        let player_grid = CraftingGrid::new(GridKind::Player);
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for cell in [0, 1, 4, 5] {
+            table_grid
+                .set(cell, Some(item(ItemId::Block(BlockId::OakPlanks))))
+                .expect("active table cell");
+        }
+        let layout = open_layout(InventoryMode::Table);
+        let verts = inventory_icon_vertices(
+            InventoryMode::Table,
+            &layout,
+            &inventory,
+            &player_grid,
+            &table_grid,
+            None,
+            None,
+            1280,
+            720,
+        );
+        // Four ingredient cubes plus the crafting-table block preview cube.
+        assert_eq!(verts.len(), 5 * 18);
+    }
+
+    #[test]
+    fn non_block_items_produce_no_s01_icons() {
+        let stick = item(ItemId::Material(Material::Stick));
+        let inventory = Inventory::from_parts([Some(stick); INVENTORY_SLOTS], None);
+        let layout = open_layout(InventoryMode::Player);
+        let verts = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &CraftingGrid::new(GridKind::Table),
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(verts.is_empty(), "materials wait for the S02 icon path");
+
+        let hotbar = hotbar_icon_vertices(&inventory, 1280, 720);
+        assert!(hotbar.is_empty(), "materials draw no hotbar cube");
+    }
+
+    #[test]
+    fn hotbar_icons_fill_the_nine_slots_and_stay_above_count_labels() {
+        let inventory = block_inventory(INVENTORY_SLOTS);
+        let verts = hotbar_icon_vertices(&inventory, 1280, 720);
+        assert_eq!(verts.len(), HOTBAR_SLOTS * 18);
+
+        let rects = hotbar_slot_rects(1280, 720);
+        for (slot, chunk) in verts.chunks(18).enumerate() {
+            let (x, y, w, h) = rects[slot];
+            let label_top = super::super::hud::hotbar_count_text_origin(rects[slot]).1;
+            for v in chunk {
+                let (px, py) = px_vertex(v, 1280, 720);
+                assert!(
+                    px >= x - 1e-3 && px <= x + w + 1e-3,
+                    "slot {slot} x in rect"
+                );
+                assert!(
+                    py >= y - 1e-3 && py <= y + h + 1e-3,
+                    "slot {slot} y in rect"
+                );
+                assert!(
+                    py <= label_top + 1e-3,
+                    "slot {slot} icon must not cover the count label (py {py} > {label_top})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hotbar_icons_respect_degenerate_surfaces() {
+        let inventory = block_inventory(INVENTORY_SLOTS);
+        for (sw, sh) in [(0, 0), (1, 1), (80, 60)] {
+            let verts = hotbar_icon_vertices(&inventory, sw, sh);
+            assert_eq!(verts.len(), HOTBAR_SLOTS * 18);
+            assert!(verts
+                .iter()
+                .all(|v| v.clip_pos.iter().all(|c| c.is_finite())));
+        }
+    }
+
+    #[test]
+    fn main_uploads_icons_before_the_single_render_pass() {
+        // Source pin: icons are built and uploaded after the quad upload but
+        // before the UI pass opens, and the icon pass draws after quads.
+        let src = include_str!("../main.rs");
+        let set_quads_at = src.find("gpu.ui.set_quads(").expect("quad upload exists");
+        let set_icons_at = src.find("gpu.ui.set_icons(").expect("icon upload exists");
+        let render_at = src
+            .find("let ui_pass: Option<&dyn UiPass>")
+            .expect("render pass construction exists");
+        assert!(
+            set_quads_at < set_icons_at && set_icons_at < render_at,
+            "main must upload icons after quads and before the render pass"
+        );
+        assert!(
+            src.contains("hotbar_icon_vertices("),
+            "main must draw the hotbar icons"
+        );
+        assert!(
+            src.contains("inventory_icon_vertices("),
+            "main must draw the inventory panel icons"
+        );
     }
 
     #[test]
