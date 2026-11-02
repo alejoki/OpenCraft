@@ -53,7 +53,7 @@ use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
     MAX_LABELS,
 };
-use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconVertex};
+use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
@@ -10940,19 +10940,20 @@ impl ApplicationHandler for GameApp {
                     gpu.ctx.config.height,
                 );
 
-                // Textured block cube icons (S01-T03): the hotbar is always
-                // live, and the inventory panel adds its own slots/grids/
-                // result previews/cursor ghost. Both builders are pure CPU
-                // geometry from the same pixel-space rects the quads use; the
-                // icon pass draws after every quad and below text, so counts
-                // and labels always win.
-                let mut icons: Vec<IconVertex> = hotbar_icon_vertices(
+                // Textured item icons (S01-T03 block cubes, S02-T02
+                // material/tool sprites): the hotbar is always live, and the
+                // inventory panel adds its own slots/grids/result previews/
+                // cursor ghost. Both builders are pure CPU geometry from the
+                // same pixel-space rects the quads use and classify each item
+                // through `icon_source`; the icon pass draws after every quad
+                // and below text, so counts and labels always win.
+                let mut icons: IconDrawList = hotbar_icon_vertices(
                     self.session.player.inventory(),
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
                 if let Some(layout) = inventory_layout.as_ref() {
-                    icons.extend(inventory_icon_vertices(
+                    icons.append(inventory_icon_vertices(
                         inventory_mode,
                         layout,
                         self.session.player.inventory(),
@@ -10966,7 +10967,8 @@ impl ApplicationHandler for GameApp {
                 }
                 gpu.ui.set_icons(
                     &gpu.ctx.device,
-                    &icons,
+                    &icons.block,
+                    &icons.sprite,
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );

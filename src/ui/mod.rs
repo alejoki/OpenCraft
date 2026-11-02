@@ -116,18 +116,20 @@ impl UiRenderer {
         self.logo_renderer.set_logo(device, queue, logo);
     }
 
-    /// Rebuild the per-frame item-icon vertex buffer (block cube icons).
-    /// Pure CPU work; call once per frame before the render pass opens. An
-    /// empty list clears the buffer so nothing is drawn.
+    /// Rebuild the per-frame item-icon vertex buffers (block cubes and
+    /// procedural material/tool sprites). Pure CPU work; call once per frame
+    /// before the render pass opens. An empty batch clears that buffer so
+    /// nothing is drawn for it.
     pub fn set_icons(
         &mut self,
         device: &wgpu::Device,
-        icons: &[IconVertex],
+        block_icons: &[IconVertex],
+        sprite_icons: &[IconVertex],
         surface_w: u32,
         surface_h: u32,
     ) {
         self.icon_renderer
-            .set_icons(device, icons, surface_w, surface_h);
+            .set_icons(device, block_icons, sprite_icons, surface_w, surface_h);
     }
 
     /// Rebuild the per-frame logo quad. `None` clears it, which also keeps a
@@ -147,7 +149,7 @@ impl UiRenderer {
 impl UiPass for UiRenderer {
     fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         // Quads first (panorama tint/panels), then the pack logo, then item
-        // icons (block cubes), then text on top.
+        // icons (block cubes, then material/tool sprites), then text on top.
         self.quad_renderer.draw(pass);
         self.logo_renderer.draw(pass);
         self.icon_renderer.draw(pass);

@@ -1,10 +1,16 @@
-//! Pure block-item cube icon geometry and texture-array face mapping.
+//! Item icon geometry, source mapping, and the UI icon renderer.
 //!
-//! Everything above the renderer (added in a later task) is GPU-free: given a
-//! pixel-space slot rect it emits textured triangles in clip space, exactly
-//! like `ui::quad` and `ui::logo` do for their own vertices. Keeping this
-//! module's geometry pure means the three-face cube can be proven headless,
-//! before any wgpu device exists.
+//! Two icon sources feed one pipeline: carryable blocks render as three-face
+//! cubes sampled from the world block texture array, while materials and tools
+//! render as flat quads sampled from a UI-only procedural sprite array
+//! ([`generate_item_sprite_layers_rgba`]). Every carryable [`ItemId`] is
+//! classified by [`icon_source`], so a slot can never silently stay empty.
+//!
+//! Everything above the renderer is GPU-free: given a pixel-space slot rect it
+//! emits textured triangles in clip space, exactly like `ui::quad` and
+//! `ui::logo` do for their own vertices. Keeping this module's geometry pure
+//! means cubes and sprite quads can be proven headless, before any wgpu device
+//! exists.
 //!
 //! Coordinates are physical pixels, top-left origin, y down, converted to NDC
 //! with the codebase-wide convention (`x_ndc = 2x/sw - 1`,
@@ -16,7 +22,7 @@ use wgpu::util::DeviceExt;
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
 use super::inventory::{InventoryLayout, InventoryMode, Rect};
 use crate::player::inventory::{
-    CraftingGrid, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
+    CraftingGrid, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
 };
 use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
@@ -781,65 +787,118 @@ pub fn cube_icon_vertices(
     verts
 }
 
-/// Icon vertices for one inventory item, or `None` when the item has no cube
-/// icon in this slice.
+/// Axis-aligned textured quad for one procedural sprite layer inside `slot`.
 ///
-/// Only carryable block identities produce a cube; materials and tools return
-/// `None` until their own icon path lands. Empty or uncarryable items also
-/// return `None`, so a malformed caller can never draw a ghost cube.
-pub fn icon_vertices_for_item(
-    item: Item,
+/// Sprites are flat art, so unlike [`cube_icon_vertices`] they need no face
+/// projection: one inset quad with full `0..=1` UVs and the sprite array layer
+/// carried per vertex. The inset comes from [`icon_rect`], so sprite and cube
+/// icons share one padding rule and both stay inside the slot.
+pub fn sprite_icon_vertices(
     slot: Rect,
+    layer: u32,
     surface_w: u32,
     surface_h: u32,
-) -> Option<Vec<IconVertex>> {
-    match item.id() {
-        ItemId::Block(block) if item.count() > 0 && block.is_carryable() => Some(
-            cube_icon_vertices(slot, block_icon_layers(block), surface_w, surface_h),
-        ),
-        _ => None,
-    }
+) -> Vec<IconVertex> {
+    let (x, y, w, h) = icon_rect(slot);
+    let sw = surface_w.max(1) as f32;
+    let sh = surface_h.max(1) as f32;
+    let mut verts = Vec::with_capacity(6);
+    push_quad(
+        &mut verts,
+        [(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
+        layer,
+        sw,
+        sh,
+    );
+    verts
 }
 
-/// Append the cube icon for one optional item into `out`, skipping empty and
-/// non-block identities (S01 only draws block cubes).
-fn push_item_icon(
-    out: &mut Vec<IconVertex>,
-    item: Option<Item>,
-    slot: Rect,
-    surface_w: u32,
-    surface_h: u32,
-) {
-    if let Some(item) = item {
-        if let Some(vertices) = icon_vertices_for_item(item, slot, surface_w, surface_h) {
-            out.extend(vertices);
+/// One frame's icon geometry, split by texture source.
+///
+/// The renderer owns one pipeline and one shader but two texture arrays (world
+/// blocks and UI-only procedural sprites), so the CPU batch has to be split the
+/// same way. Block cubes land in [`Self::block`] and sample the block array;
+/// material/tool quads land in [`Self::sprite`] and sample the sprite array.
+/// The split also fixes draw order: blocks first, sprites second.
+#[derive(Clone, Debug, Default)]
+pub struct IconDrawList {
+    pub block: Vec<IconVertex>,
+    pub sprite: Vec<IconVertex>,
+}
+
+impl IconDrawList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total vertices across both batches.
+    pub fn len(&self) -> usize {
+        self.block.len() + self.sprite.len()
+    }
+
+    /// True when neither batch would draw anything.
+    pub fn is_empty(&self) -> bool {
+        self.block.is_empty() && self.sprite.is_empty()
+    }
+
+    /// Classify one optional stack and append its icon geometry.
+    ///
+    /// Every carryable identity routes through [`icon_source`]: carryable
+    /// blocks append an 18-vertex cube, materials and constructible tools
+    /// append a 6-vertex sprite quad. Empty stacks, zero counts, and
+    /// uncarryable/unconstructible identities append nothing, so a malformed
+    /// caller can never draw a ghost icon.
+    pub fn push_item(&mut self, item: Option<Item>, slot: Rect, surface_w: u32, surface_h: u32) {
+        let Some(item) = item else {
+            return;
+        };
+        if item.count() == 0 {
+            return;
+        }
+        let Some(source) = icon_source(item.id()) else {
+            return;
+        };
+        match source {
+            IconSource::Block(layers) => self
+                .block
+                .extend(cube_icon_vertices(slot, layers, surface_w, surface_h)),
+            IconSource::Sprite(layer) => self
+                .sprite
+                .extend(sprite_icon_vertices(slot, layer, surface_w, surface_h)),
         }
     }
+
+    /// Append the icon for one recipe preview's output, if the output stack is
+    /// valid and the identity has an icon source.
+    pub fn push_preview(
+        &mut self,
+        preview: Option<RecipePreview>,
+        slot: Rect,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        let Some(preview) = preview else {
+            return;
+        };
+        let item = Item::new(preview.output, preview.output_count).ok();
+        self.push_item(item, slot, surface_w, surface_h);
+    }
+
+    /// Append another frame fragment's batches, preserving block-before-sprite
+    /// ordering inside each batch.
+    pub fn append(&mut self, mut other: IconDrawList) {
+        self.block.append(&mut other.block);
+        self.sprite.append(&mut other.sprite);
+    }
 }
 
-/// Append the cube icon for one recipe preview's output, if it is a carryable
-/// block and the output stack is valid.
-fn push_preview_icon(
-    out: &mut Vec<IconVertex>,
-    preview: Option<crate::player::inventory::RecipePreview>,
-    slot: Rect,
-    surface_w: u32,
-    surface_h: u32,
-) {
-    let Some(preview) = preview else {
-        return;
-    };
-    let item = Item::new(preview.output, preview.output_count).ok();
-    push_item_icon(out, item, slot, surface_w, surface_h);
-}
-
-/// All block cube icons for the open inventory panel.
+/// All item icons for the open inventory panel.
 ///
 /// Covers exactly the same surfaces as [`super::inventory::screen_quads`]:
 /// 36 inventory slots, the 4 player crafting cells, the 16 table cells only
 /// in [`InventoryMode::Table`], both result previews, and the cursor ghost.
-/// Closed screens emit nothing. Non-block identities are skipped by
-/// [`icon_vertices_for_item`] until their own icon path lands.
+/// Closed screens emit nothing. Block identities produce cubes, materials and
+/// tools produce sprite quads.
 #[allow(clippy::too_many_arguments)]
 pub fn inventory_icon_vertices(
     mode: InventoryMode,
@@ -851,26 +910,19 @@ pub fn inventory_icon_vertices(
     cursor_pos: Option<(f32, f32)>,
     surface_w: u32,
     surface_h: u32,
-) -> Vec<IconVertex> {
+) -> IconDrawList {
+    let mut out = IconDrawList::new();
     if !mode.is_open() {
-        return Vec::new();
+        return out;
     }
 
-    let mut out = Vec::new();
     for (index, rect) in layout.slots.iter().enumerate() {
-        push_item_icon(&mut out, inventory.slot(index), *rect, surface_w, surface_h);
+        out.push_item(inventory.slot(index), *rect, surface_w, surface_h);
     }
     for (index, rect) in layout.player_grid.iter().enumerate() {
-        push_item_icon(
-            &mut out,
-            player_grid.slot(index),
-            *rect,
-            surface_w,
-            surface_h,
-        );
+        out.push_item(player_grid.slot(index), *rect, surface_w, surface_h);
     }
-    push_preview_icon(
-        &mut out,
+    out.push_preview(
         player_grid.preview(),
         layout.player_result,
         surface_w,
@@ -879,16 +931,9 @@ pub fn inventory_icon_vertices(
 
     if mode == InventoryMode::Table {
         for (index, rect) in layout.table_grid.iter().enumerate() {
-            push_item_icon(
-                &mut out,
-                table_grid.slot(index),
-                *rect,
-                surface_w,
-                surface_h,
-            );
+            out.push_item(table_grid.slot(index), *rect, surface_w, surface_h);
         }
-        push_preview_icon(
-            &mut out,
+        out.push_preview(
             table_grid.preview(),
             layout.table_result,
             surface_w,
@@ -899,8 +944,7 @@ pub fn inventory_icon_vertices(
     if let (Some(item), Some((cx, cy))) = (cursor_item, cursor_pos) {
         if cx.is_finite() && cy.is_finite() {
             let size = layout.player_result.2 * 0.75;
-            push_item_icon(
-                &mut out,
+            out.push_item(
                 Some(item),
                 (cx - size * 0.5, cy - size * 0.5, size, size),
                 surface_w,
@@ -912,27 +956,17 @@ pub fn inventory_icon_vertices(
     out
 }
 
-/// Block cube icons for the nine gameplay hotbar slots.
+/// Item icons for the nine gameplay hotbar slots.
 ///
 /// Each icon is inset inside its [`hotbar_slot_rects`] slot and clipped to
 /// stay above the count label's top edge ([`hotbar_count_text_origin`]), so a
-/// stack count can never be hidden behind a cube face. Empty slots and
-/// non-block identities produce no vertices.
-pub fn hotbar_icon_vertices(
-    inventory: &Inventory,
-    surface_w: u32,
-    surface_h: u32,
-) -> Vec<IconVertex> {
-    let mut out = Vec::new();
+/// stack count can never be hidden behind a cube face or a sprite. Empty slots
+/// and non-carryable identities produce no vertices.
+pub fn hotbar_icon_vertices(inventory: &Inventory, surface_w: u32, surface_h: u32) -> IconDrawList {
+    let mut out = IconDrawList::new();
     for (slot, rect) in hotbar_slot_rects(surface_w, surface_h).iter().enumerate() {
         let icon_slot = hotbar_icon_rect(*rect);
-        push_item_icon(
-            &mut out,
-            inventory.hotbar(slot),
-            icon_slot,
-            surface_w,
-            surface_h,
-        );
+        out.push_item(inventory.hotbar(slot), icon_slot, surface_w, surface_h);
     }
     out
 }
@@ -987,29 +1021,120 @@ fn fs_main(in: IconOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Draws textured item icons (block cube faces) inside the color-only UI
-/// pass, sampling the world's block texture array.
+/// Texture format of the UI-only procedural sprite array.
 ///
-/// The texture view/sampler are borrowed once at construction (they come from
-/// [`crate::render::pipeline::VoxelRenderer`]) and then owned by the bind
-/// group. Only the per-frame vertex buffer is rebuilt in
-/// [`set_icons`](Self::set_icons), the same pattern as `QuadRenderer` and
-/// `LogoRenderer`.
+/// Matches the block texture array (`Rgba8UnormSrgb`), so both bind groups feed
+/// the same shader and produce identically gamma-correct icons.
+const ITEM_SPRITE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Create the 32-layer procedural sprite texture array and its sampler.
+///
+/// The atlas is generated from [`generate_item_sprite_layers_rgba`] and uploaded
+/// exactly once at renderer construction: unlike the block array it is never
+/// replaced by a pack, so there is no reload churn. `mip_level_count` is 1
+/// because 16x16 pixel art is sampled nearest and mips would only blur it.
+///
+/// Returns only the view and sampler; a wgpu `TextureView` keeps its source
+/// texture alive internally.
+fn create_item_sprite_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::TextureView, wgpu::Sampler) {
+    let size = wgpu::Extent3d {
+        width: ITEM_SPRITE_SIZE,
+        height: ITEM_SPRITE_SIZE,
+        depth_or_array_layers: ITEM_SPRITE_LAYERS,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ui_item_sprite_array"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: ITEM_SPRITE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    for (layer_index, layer) in generate_item_sprite_layers_rgba().iter().enumerate() {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer_index as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            layer,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(ITEM_SPRITE_SIZE * 4),
+                rows_per_image: Some(ITEM_SPRITE_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ITEM_SPRITE_SIZE,
+                height: ITEM_SPRITE_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("ui_item_sprite_array_view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(ITEM_SPRITE_LAYERS),
+        ..Default::default()
+    });
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("ui_item_sprite_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    (view, sampler)
+}
+
+/// Draws textured item icons inside the color-only UI pass.
+///
+/// One pipeline and one shader serve two texture sources, each with its own
+/// bind group and vertex buffer:
+///
+/// * `block` — three-face cubes sampling the world's block texture array (the
+///   view/sampler borrowed at construction from
+///   [`crate::render::pipeline::VoxelRenderer`]).
+/// * `sprite` — flat material/tool quads sampling the UI-only procedural sprite
+///   array, generated and uploaded internally in [`Self::new`].
+///
+/// Only the per-frame vertex buffers are rebuilt in [`set_icons`](Self::set_icons),
+/// the same pattern as `QuadRenderer` and `LogoRenderer`.
 ///
 /// Draw this strictly after the quad and logo renderers and strictly before
-/// glyphon text, so icons sit above panels/tint and below labels/counts.
+/// glyphon text, so icons sit above panels/tint and below labels/counts. Inside
+/// [`Self::draw`], the block batch is issued before the sprite batch.
 pub struct IconRenderer {
     pipeline: wgpu::RenderPipeline,
-    bind_group: Option<wgpu::BindGroup>,
-    vertex_buffer: Option<wgpu::Buffer>,
-    vertex_count: u32,
+    block_bind_group: wgpu::BindGroup,
+    sprite_bind_group: wgpu::BindGroup,
+    block_vertex_buffer: Option<wgpu::Buffer>,
+    block_vertex_count: u32,
+    sprite_vertex_buffer: Option<wgpu::Buffer>,
+    sprite_vertex_count: u32,
 }
 
 impl IconRenderer {
     pub fn new(
         ctx: &RenderContext,
-        texture_view: &wgpu::TextureView,
-        sampler: &wgpu::Sampler,
+        block_texture_view: &wgpu::TextureView,
+        block_texture_sampler: &wgpu::Sampler,
     ) -> Self {
         let shader = ctx
             .device
@@ -1100,67 +1225,119 @@ impl IconRenderer {
                 multiview: None,
             });
 
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ui_item_icon_bind_group"),
+        let block_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui_item_icon_block_bind_group"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(texture_view),
+                    resource: wgpu::BindingResource::TextureView(block_texture_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
+                    resource: wgpu::BindingResource::Sampler(block_texture_sampler),
+                },
+            ],
+        });
+
+        let (sprite_view, sprite_sampler) = create_item_sprite_array(&ctx.device, &ctx.queue);
+        let sprite_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui_item_icon_sprite_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sprite_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sprite_sampler),
                 },
             ],
         });
 
         Self {
             pipeline,
-            bind_group: Some(bind_group),
-            vertex_buffer: None,
-            vertex_count: 0,
+            block_bind_group,
+            sprite_bind_group,
+            block_vertex_buffer: None,
+            block_vertex_count: 0,
+            sprite_vertex_buffer: None,
+            sprite_vertex_count: 0,
         }
     }
 
-    /// Rebuild the per-frame icon vertex buffer. Pure CPU work (no texture
+    /// Rebuild both per-frame icon vertex buffers. Pure CPU work (no texture
     /// upload); call once per frame before the UI pass opens. An empty slice
-    /// clears the buffer so nothing is drawn.
+    /// clears that batch so nothing is drawn for it.
     pub fn set_icons(
         &mut self,
         device: &wgpu::Device,
-        icons: &[IconVertex],
+        block_icons: &[IconVertex],
+        sprite_icons: &[IconVertex],
         surface_w: u32,
         surface_h: u32,
     ) {
-        let verts = sanitize_icon_vertices(icons, surface_w, surface_h);
-        self.vertex_count = verts.len() as u32;
-        self.vertex_buffer = if verts.is_empty() {
-            None
-        } else {
-            Some(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ui_item_icon_vbuf"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-            )
-        };
+        let (block_buffer, block_count) = upload_icon_batch(
+            device,
+            "ui_item_icon_block_vbuf",
+            block_icons,
+            surface_w,
+            surface_h,
+        );
+        self.block_vertex_buffer = block_buffer;
+        self.block_vertex_count = block_count;
+
+        let (sprite_buffer, sprite_count) = upload_icon_batch(
+            device,
+            "ui_item_icon_sprite_vbuf",
+            sprite_icons,
+            surface_w,
+            surface_h,
+        );
+        self.sprite_vertex_buffer = sprite_buffer;
+        self.sprite_vertex_count = sprite_count;
     }
 
-    /// Draw pending icons into the UI pass. No-op when nothing is queued.
+    /// Draw pending icons into the UI pass: block cubes first, then sprites.
+    /// No-op when nothing is queued.
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        if self.vertex_count == 0 {
-            return;
+        if let (Some(buffer), true) = (&self.block_vertex_buffer, self.block_vertex_count > 0) {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.block_bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..self.block_vertex_count, 0..1);
         }
-        let (Some(bind_group), Some(buffer)) = (&self.bind_group, &self.vertex_buffer) else {
-            return;
-        };
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_vertex_buffer(0, buffer.slice(..));
-        pass.draw(0..self.vertex_count, 0..1);
+        if let (Some(buffer), true) = (&self.sprite_vertex_buffer, self.sprite_vertex_count > 0) {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.sprite_bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..self.sprite_vertex_count, 0..1);
+        }
     }
+}
+
+/// Sanitize and upload one icon batch, returning its buffer and vertex count.
+///
+/// An empty (or fully sanitized-away) batch allocates no buffer at all, so
+/// closing every screen never creates GPU resources.
+fn upload_icon_batch(
+    device: &wgpu::Device,
+    label: &str,
+    icons: &[IconVertex],
+    surface_w: u32,
+    surface_h: u32,
+) -> (Option<wgpu::Buffer>, u32) {
+    let verts = sanitize_icon_vertices(icons, surface_w, surface_h);
+    if verts.is_empty() {
+        return (None, 0);
+    }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    (Some(buffer), verts.len() as u32)
 }
 
 #[cfg(test)]
@@ -1344,19 +1521,85 @@ mod tests {
     }
 
     #[test]
-    fn icon_vertices_for_item_accepts_blocks_and_rejects_other_identities() {
-        let grass = item(ItemId::Block(BlockId::Grass));
-        let cube = icon_vertices_for_item(grass, SLOT, 800, 600);
-        assert_eq!(cube.expect("block has a cube icon").len(), 18);
+    fn push_item_classifies_blocks_and_sprites_and_rejects_invalid() {
+        let mut grass = IconDrawList::new();
+        grass.push_item(Some(item(ItemId::Block(BlockId::Grass))), SLOT, 800, 600);
+        assert_eq!(grass.block.len(), 18, "carryable block -> cube");
+        assert!(grass.sprite.is_empty());
 
-        let stick = item(ItemId::Material(Material::Stick));
-        assert!(icon_vertices_for_item(stick, SLOT, 800, 600).is_none());
+        let mut stick = IconDrawList::new();
+        stick.push_item(
+            Some(item(ItemId::Material(Material::Stick))),
+            SLOT,
+            800,
+            600,
+        );
+        assert!(stick.block.is_empty());
+        assert_eq!(stick.sprite.len(), 6, "material -> one sprite quad");
+        assert!(stick.sprite.iter().all(|v| v.layer == 0));
 
-        let pickaxe = item(ItemId::Tool {
-            kind: ToolKind::Pickaxe,
-            tier: ToolTier::Wood,
-        });
-        assert!(icon_vertices_for_item(pickaxe, SLOT, 800, 600).is_none());
+        let mut pickaxe = IconDrawList::new();
+        pickaxe.push_item(
+            Some(item(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            })),
+            SLOT,
+            800,
+            600,
+        );
+        assert!(pickaxe.block.is_empty());
+        assert_eq!(pickaxe.sprite.len(), 6, "tool -> one sprite quad");
+        assert_eq!(pickaxe.sprite[0].layer, 11);
+
+        // Uncarryable blocks and unconstructible tool pairs cannot even be
+        // constructed as items, and they also have no icon source.
+        for id in [
+            ItemId::Block(BlockId::Air),
+            ItemId::Block(BlockId::Water),
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Stone,
+            },
+        ] {
+            assert!(Item::new(id, 1).is_err(), "{id:?} is not constructible");
+            assert!(icon_source(id).is_none(), "{id:?} has no icon source");
+            let mut list = IconDrawList::new();
+            list.push_item(Item::new(id, 1).ok(), SLOT, 800, 600);
+            assert!(list.is_empty(), "{id:?} must not draw an icon");
+        }
+
+        // Empty stacks and zero counts add nothing either.
+        let mut empty = IconDrawList::new();
+        empty.push_item(None, SLOT, 800, 600);
+        assert!(empty.is_empty());
+        let zero = Item::new(ItemId::Material(Material::Apple), 0);
+        assert!(zero.is_err(), "zero-count stacks are unrepresentable");
+    }
+
+    #[test]
+    fn sprite_quads_are_unit_uv_and_inset_inside_the_slot() {
+        let (sx, sy, sw, sh) = SLOT;
+        let verts = sprite_icon_vertices(SLOT, 3, 800, 600);
+        assert_eq!(verts.len(), 6);
+        assert!(verts.iter().all(|v| v.layer == 3));
+        let mut uvs = verts.iter().map(|v| (v.uv[0], v.uv[1])).collect::<Vec<_>>();
+        uvs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        uvs.dedup();
+        assert_eq!(
+            uvs,
+            vec![(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)],
+            "the quad spans the full 0..=1 UV range"
+        );
+
+        let (ix, iy, iw, ih) = icon_rect(SLOT);
+        for v in &verts {
+            let (px, py) = px_vertex(v, 800, 600);
+            assert!(px >= sx && px <= sx + sw, "sprite x inside slot");
+            assert!(py >= sy && py <= sy + sh, "sprite y inside slot");
+            assert!(px >= ix - 1e-3 && px <= ix + iw + 1e-3);
+            assert!(py >= iy - 1e-3 && py <= iy + ih + 1e-3);
+        }
     }
 
     fn px_vertex(v: &IconVertex, surface_w: u32, surface_h: u32) -> (f32, f32) {
@@ -1396,7 +1639,8 @@ mod tests {
             1280,
             720,
         );
-        assert_eq!(verts.len(), INVENTORY_SLOTS * 18);
+        assert_eq!(verts.block.len(), INVENTORY_SLOTS * 18);
+        assert!(verts.sprite.is_empty());
 
         let empty = Inventory::empty();
         let none = inventory_icon_vertices(
@@ -1463,7 +1707,8 @@ mod tests {
             1280,
             720,
         );
-        assert_eq!(table_verts.len(), 16 * 18);
+        assert_eq!(table_verts.block.len(), 16 * 18);
+        assert!(table_verts.sprite.is_empty());
     }
 
     #[test]
@@ -1489,7 +1734,12 @@ mod tests {
             720,
         );
         // One block ingredient cube plus the block result preview cube.
-        assert_eq!(with_preview.len(), 2 * 18, "player result preview cube");
+        assert_eq!(
+            with_preview.block.len(),
+            2 * 18,
+            "player result preview cube"
+        );
+        assert!(with_preview.sprite.is_empty());
 
         let mut no_recipe = CraftingGrid::new(GridKind::Player);
         no_recipe
@@ -1506,7 +1756,11 @@ mod tests {
             1280,
             720,
         );
-        assert_eq!(cell_only.len(), 18, "a lone stone cell is not a recipe");
+        assert_eq!(
+            cell_only.block.len(),
+            18,
+            "a lone stone cell is not a recipe"
+        );
 
         let cursor_inventory = Inventory::from_parts(
             [None; INVENTORY_SLOTS],
@@ -1523,7 +1777,7 @@ mod tests {
             1280,
             720,
         );
-        assert_eq!(with_cursor.len(), 18, "cursor ghost cube");
+        assert_eq!(with_cursor.block.len(), 18, "cursor ghost cube");
 
         let no_cursor_pos = inventory_icon_vertices(
             InventoryMode::Player,
@@ -1581,11 +1835,12 @@ mod tests {
             720,
         );
         // Four ingredient cubes plus the crafting-table block preview cube.
-        assert_eq!(verts.len(), 5 * 18);
+        assert_eq!(verts.block.len(), 5 * 18);
+        assert!(verts.sprite.is_empty());
     }
 
     #[test]
-    fn non_block_items_produce_no_s01_icons() {
+    fn material_and_tool_inventories_render_only_sprite_quads() {
         let stick = item(ItemId::Material(Material::Stick));
         let inventory = Inventory::from_parts([Some(stick); INVENTORY_SLOTS], None);
         let layout = open_layout(InventoryMode::Player);
@@ -1600,20 +1855,27 @@ mod tests {
             1280,
             720,
         );
-        assert!(verts.is_empty(), "materials wait for the S02 icon path");
+        assert!(
+            verts.block.is_empty(),
+            "materials never use the block array"
+        );
+        assert_eq!(verts.sprite.len(), INVENTORY_SLOTS * 6);
+        assert!(verts.sprite.iter().all(|v| v.layer == 0));
 
         let hotbar = hotbar_icon_vertices(&inventory, 1280, 720);
-        assert!(hotbar.is_empty(), "materials draw no hotbar cube");
+        assert!(hotbar.block.is_empty());
+        assert_eq!(hotbar.sprite.len(), HOTBAR_SLOTS * 6);
     }
 
     #[test]
     fn hotbar_icons_fill_the_nine_slots_and_stay_above_count_labels() {
         let inventory = block_inventory(INVENTORY_SLOTS);
         let verts = hotbar_icon_vertices(&inventory, 1280, 720);
-        assert_eq!(verts.len(), HOTBAR_SLOTS * 18);
+        assert_eq!(verts.block.len(), HOTBAR_SLOTS * 18);
+        assert!(verts.sprite.is_empty());
 
         let rects = hotbar_slot_rects(1280, 720);
-        for (slot, chunk) in verts.chunks(18).enumerate() {
+        for (slot, chunk) in verts.block.chunks(18).enumerate() {
             let (x, y, w, h) = rects[slot];
             let label_top = super::super::hud::hotbar_count_text_origin(rects[slot]).1;
             for v in chunk {
@@ -1639,8 +1901,9 @@ mod tests {
         let inventory = block_inventory(INVENTORY_SLOTS);
         for (sw, sh) in [(0, 0), (1, 1), (80, 60)] {
             let verts = hotbar_icon_vertices(&inventory, sw, sh);
-            assert_eq!(verts.len(), HOTBAR_SLOTS * 18);
+            assert_eq!(verts.block.len(), HOTBAR_SLOTS * 18);
             assert!(verts
+                .block
                 .iter()
                 .all(|v| v.clip_pos.iter().all(|c| c.is_finite())));
         }
@@ -1667,6 +1930,14 @@ mod tests {
         assert!(
             src.contains("inventory_icon_vertices("),
             "main must draw the inventory panel icons"
+        );
+        assert!(
+            src.contains("IconDrawList"),
+            "main must build one split icon draw list per frame"
+        );
+        assert!(
+            src.contains("&icons.block") && src.contains("&icons.sprite"),
+            "main must pass both batches to set_icons"
         );
     }
 
@@ -1710,15 +1981,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_icon_batches_clear_the_gpu_buffer() {
-        // Source pin: an empty slice must leave vertex_count 0 and no buffer,
-        // so closing every inventory never uploads or draws anything.
+    fn empty_icon_batches_clear_the_gpu_buffers() {
+        // Source pin: an empty batch must leave its count 0 and allocate no
+        // buffer, so closing every inventory never uploads or draws anything.
         let src = include_str!("item_icon.rs");
         let set_icons_at = src.find("pub fn set_icons").expect("set_icons exists");
         let set_icons_block = &src[set_icons_at..];
-        assert!(set_icons_block.contains("self.vertex_count = verts.len() as u32"));
-        assert!(set_icons_block.contains("if verts.is_empty()"));
-        assert!(set_icons_block.contains("None"));
+        assert!(set_icons_block.contains("self.block_vertex_count = block_count"));
+        assert!(set_icons_block.contains("self.sprite_vertex_count = sprite_count"));
+        assert!(set_icons_block.contains("upload_icon_batch"));
+
+        let helper_at = src
+            .find("fn upload_icon_batch")
+            .expect("upload helper exists");
+        let helper = &src[helper_at..];
+        assert!(helper.contains("if verts.is_empty()"));
+        assert!(helper.contains("return (None, 0)"));
+    }
+
+    #[test]
+    fn draw_issues_block_batch_before_sprite_batch() {
+        // Source pin on IconRenderer::draw: the block batch is set first, then
+        // the sprite batch, using one pipeline with two bind groups.
+        let src = include_str!("item_icon.rs");
+        let draw_at = src
+            .find("pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>)")
+            .expect("draw exists");
+        let draw_block = &src[draw_at..];
+        let end = draw_block
+            .find("fn upload_icon_batch")
+            .expect("helper follows draw");
+        let draw_body = &draw_block[..end];
+        let block_at = draw_body
+            .find("&self.block_bind_group")
+            .expect("block bind group draw");
+        let sprite_at = draw_body
+            .find("&self.sprite_bind_group")
+            .expect("sprite bind group draw");
+        assert!(
+            block_at < sprite_at,
+            "block cubes must draw before material/tool sprites"
+        );
+        assert_eq!(
+            draw_body
+                .matches("pass.set_pipeline(&self.pipeline)")
+                .count(),
+            2,
+            "one pipeline serves both batches"
+        );
     }
 
     #[test]
@@ -1925,7 +2235,9 @@ mod tests {
         let mut hashes = std::collections::HashSet::new();
         for layer in &used {
             let bytes = &first[*layer as usize];
-            let opaque = bytes.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+            let (pixels, remainder) = bytes.as_chunks::<4>();
+            assert!(remainder.is_empty(), "layer {layer} must be whole RGBA");
+            let opaque = pixels.iter().filter(|pixel| pixel[3] > 0).count();
             assert!(
                 opaque >= 24,
                 "layer {layer} must be a real sprite, only {opaque} opaque pixels"
@@ -2011,5 +2323,176 @@ mod tests {
             Some(26),
             "the bow is pinned to the final used layer"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprite batches alongside block cubes (S02-T02)
+    // -----------------------------------------------------------------------
+
+    /// Every material and constructible tool, one per slot, cycling.
+    fn sprite_inventory() -> Inventory {
+        let mut ids: Vec<ItemId> = ALL_MATERIALS
+            .iter()
+            .map(|material| ItemId::Material(*material))
+            .collect();
+        ids.extend(all_tools());
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (slot, id) in slots.iter_mut().zip(ids.iter().cycle()) {
+            *slot = Some(item(*id));
+        }
+        Inventory::from_parts(slots, None)
+    }
+
+    #[test]
+    fn full_material_inventory_yields_36_sprite_quads_and_no_block_vertices() {
+        let inventory = sprite_inventory();
+        let layout = open_layout(InventoryMode::Player);
+        let icons = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &CraftingGrid::new(GridKind::Table),
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(
+            icons.block.is_empty(),
+            "materials/tools never sample the block texture array"
+        );
+        assert_eq!(icons.sprite.len(), INVENTORY_SLOTS * 6);
+        assert_eq!(icons.sprite.len(), 216, "36 sprite quads");
+        assert_eq!(icons.len(), 216);
+    }
+
+    #[test]
+    fn mixed_inventory_splits_block_and_sprite_batches_exactly() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            *slot = Some(if index % 2 == 0 {
+                item(ItemId::Block(BlockId::Stone))
+            } else {
+                item(ItemId::Material(Material::Apple))
+            });
+        }
+        let inventory = Inventory::from_parts(slots, None);
+        let layout = open_layout(InventoryMode::Player);
+        let icons = inventory_icon_vertices(
+            InventoryMode::Player,
+            &layout,
+            &inventory,
+            &CraftingGrid::new(GridKind::Player),
+            &CraftingGrid::new(GridKind::Table),
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert_eq!(icons.block.len(), 18 * 18, "18 block cubes");
+        assert_eq!(icons.sprite.len(), 18 * 6, "18 sprite quads");
+        assert_eq!(icons.len(), 18 * 18 + 18 * 6);
+    }
+
+    #[test]
+    fn hotbar_apple_and_pickaxe_yield_two_sprite_quads() {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(item(ItemId::Material(Material::Apple)));
+        slots[1] = Some(item(ItemId::Tool {
+            kind: ToolKind::Pickaxe,
+            tier: ToolTier::Iron,
+        }));
+        let inventory = Inventory::from_parts(slots, None);
+        let icons = hotbar_icon_vertices(&inventory, 1280, 720);
+        assert!(icons.block.is_empty());
+        assert_eq!(icons.sprite.len(), 2 * 6, "apple + pickaxe quads");
+
+        // The apple uses layer 1 and the iron pickaxe layer 13; the batches
+        // stay in hotbar slot order.
+        assert!(icons.sprite[..6].iter().all(|v| v.layer == 1));
+        assert!(icons.sprite[6..].iter().all(|v| v.layer == 13));
+    }
+
+    #[test]
+    fn every_sprite_quad_stays_inside_its_slot_and_above_the_count_origin() {
+        let inventory = sprite_inventory();
+        let icons = hotbar_icon_vertices(&inventory, 1280, 720);
+        assert_eq!(icons.sprite.len(), HOTBAR_SLOTS * 6);
+        let rects = hotbar_slot_rects(1280, 720);
+        for (slot, chunk) in icons.sprite.chunks(6).enumerate() {
+            let (x, y, w, h) = rects[slot];
+            let (count_x, count_y) = super::super::hud::hotbar_count_text_origin(rects[slot]);
+            for v in chunk {
+                let (px, py) = px_vertex(v, 1280, 720);
+                assert!(
+                    px >= x - 1e-3 && px <= x + w + 1e-3,
+                    "slot {slot} sprite x {px} outside [{x}, {}]",
+                    x + w
+                );
+                assert!(
+                    py >= y - 1e-3 && py <= y + h + 1e-3,
+                    "slot {slot} sprite y {py} outside [{y}, {}]",
+                    y + h
+                );
+                assert!(
+                    py <= count_y + 1e-3,
+                    "slot {slot} sprite must stay above the count origin ({py} > {count_y})"
+                );
+                // The bottom-left count origin itself must never be covered.
+                assert!(
+                    !(px <= count_x && py >= count_y),
+                    "slot {slot} sprite covers the count origin"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn icon_source_covers_every_carryable_item_so_no_slot_stays_empty() {
+        let mut carryable = Vec::new();
+        for block in ALL_BLOCKS {
+            let id = ItemId::Block(block);
+            if block.is_carryable() {
+                carryable.push(id);
+            }
+        }
+        carryable.extend(ALL_MATERIALS.iter().map(|m| ItemId::Material(*m)));
+        carryable.extend(all_tools());
+
+        for id in carryable {
+            let mut icons = IconDrawList::new();
+            icons.push_item(Some(item(id)), SLOT, 800, 600);
+            assert!(
+                icons.len() == 18 || icons.len() == 6,
+                "{id:?} must produce exactly one icon (got {} vertices)",
+                icons.len()
+            );
+            assert_eq!(
+                icons.block.is_empty(),
+                matches!(icon_source(id), Some(IconSource::Sprite(_))),
+                "{id:?} must land in the batch matching its icon source"
+            );
+        }
+    }
+
+    #[test]
+    fn append_preserves_block_before_sprite_ordering() {
+        let mut a = IconDrawList::new();
+        a.push_item(Some(item(ItemId::Block(BlockId::Stone))), SLOT, 800, 600);
+        let mut b = IconDrawList::new();
+        b.push_item(
+            Some(item(ItemId::Material(Material::Stick))),
+            SLOT,
+            800,
+            600,
+        );
+        b.push_item(Some(item(ItemId::Block(BlockId::Dirt))), SLOT, 800, 600);
+        a.append(b);
+        assert_eq!(a.block.len(), 2 * 18);
+        assert_eq!(a.sprite.len(), 6);
+        // Both block cubes precede the sprite quad in their own batches, which
+        // is what the two-draw renderer relies on.
+        assert_eq!(a.len(), 2 * 18 + 6);
     }
 }
