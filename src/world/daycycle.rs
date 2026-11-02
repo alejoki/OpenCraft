@@ -486,6 +486,42 @@ pub const STAR_DUSK_CLEAR_TICK: u32 = 12_306;
 /// palette ramp endpoints (`NIGHTFALL_TICK` / `PRE_DAWN_TICK`).
 pub const STAR_DAWN_CLEAR_TICK: u32 = 23_694;
 
+/// Whether the sun is below the horizon at `time_of_day` — the night window.
+///
+/// This is **the only time source the spawner may use** ([`crate::world::spawning`]).
+/// It is defined as the exact complement of [`sun_brightness`] being non-zero:
+/// `STAR_DUSK_CLEAR_TICK <= t <= STAR_DAWN_CLEAR_TICK` (12,306..=23,694), so
+/// `is_night(t) == (sun_brightness(t) == 0.0)` holds for every tick. The dusk
+/// edge is inclusive because [`STAR_DUSK_CLEAR_TICK`] is *the first tick at
+/// which* [`sun_brightness`] is exactly `0.0` — the sun is already below the
+/// horizon there, even though the last sliver of the ramp-out has just
+/// finished. Dawn and the last tick of the day (0 and 23,695) are day.
+///
+/// **Sky light in this engine is time-invariant**: the light grid is computed
+/// once from block occlusion and is never scaled by the clock. Night darkness
+/// therefore has to come from this predicate, not from a lower `sky_light`
+/// reading; a surface block at night still reports `MAX_SKY_LIGHT` (15).
+///
+/// Note that `COMBAT_DUSK_TICK = 12_000` in `src/main.rs` is still **day**:
+/// [`sun_brightness`] does not reach exactly `0.0` until 12,306. A dusk demo
+/// therefore cannot spawn hostiles on the surface and has to pin a real night
+/// tick (`COMBAT_NIGHT_TICK = 18_000`).
+#[inline]
+pub fn is_night(time_of_day: u32) -> bool {
+    let t = time_of_day % DAY_TICKS;
+    (STAR_DUSK_CLEAR_TICK..=STAR_DAWN_CLEAR_TICK).contains(&t)
+}
+
+/// Whether the sun is at or above the horizon: the exact inverse of
+/// [`is_night`].
+///
+/// Passive spawns, daylight burning, and any other "it is daytime" rule read
+/// this predicate so no caller re-derives the boundary from a clock tick.
+#[inline]
+pub fn is_day(time_of_day: u32) -> bool {
+    !is_night(time_of_day)
+}
+
 /// Star-field visibility in `0..=1`.
 ///
 /// Stars appear only once the sun has exactly zero brightness: visibility is
@@ -1341,6 +1377,55 @@ mod tests {
         assert_eq!(clock.day_index, 1);
         assert_eq!(clock.time_of_day, 90);
         assert_close(previous, DAY_TICKS as f32 + 90.0);
+    }
+
+    #[test]
+    fn is_night_boundaries_match_the_sun_zero_brightness_band() {
+        // Pinned ticks: the window is exactly the set of ticks where
+        // `sun_brightness` is 0.0 (S05's spawn clock).
+        assert!(!is_night(0), "dawn is day");
+        assert!(!is_night(12_000), "12,000 is dusk, still day");
+        assert!(
+            !is_night(STAR_DUSK_CLEAR_TICK - 1),
+            "12,305 still carries light"
+        );
+        assert!(
+            is_night(STAR_DUSK_CLEAR_TICK),
+            "12,306 is the first tick at exactly zero sun brightness"
+        );
+        assert!(is_night(18_000), "midnight is night");
+        assert!(
+            is_night(STAR_DAWN_CLEAR_TICK),
+            "23,694 is the last dark tick"
+        );
+        assert!(!is_night(23_695), "23,695 is the first day tick");
+        // `is_day` is the exact inverse, including outside one full cycle.
+        for t in [
+            0,
+            12_000,
+            STAR_DUSK_CLEAR_TICK - 1,
+            STAR_DUSK_CLEAR_TICK,
+            18_000,
+            STAR_DAWN_CLEAR_TICK,
+            23_695,
+            DAY_TICKS,
+        ] {
+            assert_eq!(is_day(t), !is_night(t), "is_day/is_night disagree at {t}");
+        }
+        assert!(is_night(DAY_TICKS + 18_000), "ticks wrap modulo DAY_TICKS");
+    }
+
+    /// The spawner's only time source must be exactly "the sun is below the
+    /// horizon", so the predicate and the brightness helper can never drift.
+    #[test]
+    fn is_night_is_exactly_the_zero_sun_brightness_window_for_every_tick() {
+        for t in 0..DAY_TICKS {
+            assert_eq!(
+                is_night(t),
+                sun_brightness(t) == 0.0,
+                "is_night disagrees with sun_brightness at tick {t}"
+            );
+        }
     }
 
     #[test]

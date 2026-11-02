@@ -35,6 +35,13 @@ pub const HUNGER_FILL_COLOR: [f32; 4] = [0.95, 0.65, 0.15, 0.95];
 /// Fill color of an air bubble.
 pub const AIR_FILL_COLOR: [f32; 4] = [0.25, 0.6, 0.95, 0.9];
 
+/// Peak alpha of the full-screen red damage flash.
+///
+/// Deliberately translucent: the flash tints the whole frame (HUD included)
+/// without hiding what the player is looking at, and it rides the existing
+/// alpha-blended quad pass, so no new pipeline or texture is needed.
+pub const DAMAGE_FLASH_ALPHA: f32 = 0.35;
+
 /// Icons per vitals row: ten two-point hearts / hunger pips.
 const VITALS_ICON_COUNT: usize = (MAX_HEALTH / 2) as usize;
 /// Full width of one ten-icon vitals row, including its interior gaps.
@@ -104,6 +111,10 @@ pub fn hotbar_count_text_origin(rect: (f32, f32, f32, f32)) -> (f32, f32) {
 /// Fill color of the eating progress bar, distinct from the mining amber.
 pub const EATING_FILL_COLOR: [f32; 4] = [0.55, 0.85, 0.35, 0.95];
 
+/// Fill color of the bow-charge progress bar, distinct from both the eating
+/// green and the mining amber.
+pub const BOW_FILL_COLOR: [f32; 4] = [0.35, 0.85, 1.0, 0.95];
+
 /// Shared crosshair progress-bar geometry: an always-visible dark background
 /// followed by a fill of `fill_color` scaled to `progress`.
 ///
@@ -159,6 +170,17 @@ pub fn mining_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [
 /// release-cancelled meal never leaves a stale bar shape behind.
 pub fn eating_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
     progress_bar_quads(progress, surface_w, surface_h, EATING_FILL_COLOR)
+}
+
+/// Build the two quads that draw the bow-charge progress bar in the same
+/// crosshair-anchored slot as the mining and eating bars, with a cyan fill.
+///
+/// The slot is shared, so only one action bar is ever visible at a time: the
+/// caller's priority (eating, then bow, then mining) picks which action owns
+/// this frame. Sharing the geometry also means a cancelled draw never leaves
+/// a stale bar shape behind.
+pub fn bow_progress_quads(progress: f32, surface_w: u32, surface_h: u32) -> [Quad; 2] {
+    progress_bar_quads(progress, surface_w, surface_h, BOW_FILL_COLOR)
 }
 
 /// Fill fraction of one heart icon: ten hearts of two health points each.
@@ -276,6 +298,35 @@ pub fn vitals_quads(
     }
 
     quads
+}
+
+/// Build the optional full-screen red damage flash quad for `intensity`.
+///
+/// `intensity` is the player combat carrier's `hurt_intensity()` (the
+/// remaining 0.5 s flash scaled to `0.0..=1.0`). A non-finite or non-positive
+/// intensity returns `None`, so a quiescent or corrupted timer draws nothing
+/// rather than a stray black/NaN rectangle; every other value clamps into
+/// `0.0..=1.0` before it scales [`DAMAGE_FLASH_ALPHA`].
+///
+/// The quad covers the whole surface in physical pixels (`x/y = 0`), the same
+/// coordinate space as every other HUD quad. It is appended after the vitals
+/// quads by the caller, so the tint covers the HUD too.
+pub fn damage_flash_quad(intensity: f32, surface_w: u32, surface_h: u32) -> Option<Quad> {
+    if !intensity.is_finite() || intensity <= 0.0 {
+        return None;
+    }
+    Some(Quad {
+        x: 0.0,
+        y: 0.0,
+        w: surface_w.max(1) as f32,
+        h: surface_h.max(1) as f32,
+        color: [
+            0.8,
+            0.05,
+            0.05,
+            DAMAGE_FLASH_ALPHA * intensity.clamp(0.0, 1.0),
+        ],
+    })
 }
 
 /// One vitals icon: an always-present dark background plus an optional colored
@@ -466,6 +517,65 @@ mod tests {
         assert_close(zero.y, 0.5 + CROSSHAIR_BAR_OFFSET_Y, "max(1) y");
         assert_close(zero.w, PROGRESS_BAR_WIDTH, "background width intact");
         assert_close(zero.h, PROGRESS_BAR_HEIGHT, "background height intact");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bow-charge progress bar (S07-T05)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bow_bar_shares_the_geometry_and_scales_with_progress() {
+        for (progress, expected_w) in [(0.0, 0.0), (0.25, 30.0), (0.5, 60.0), (1.0, 120.0)] {
+            let [bow_bg, bow_fill] = bow_progress_quads(progress, 1280, 720);
+            let [mine_bg, mine_fill] = mining_progress_quads(progress, 1280, 720);
+            for (name, bow, mine) in [
+                ("background", bow_bg, mine_bg),
+                ("fill", bow_fill, mine_fill),
+            ] {
+                assert_close(bow.x, mine.x, &format!("{name} x at {progress}"));
+                assert_close(bow.y, mine.y, &format!("{name} y at {progress}"));
+                assert_close(bow.h, mine.h, &format!("{name} h at {progress}"));
+            }
+            assert_close(bow_fill.w, expected_w, &format!("fill w at {progress}"));
+        }
+    }
+
+    #[test]
+    fn bow_fill_color_is_distinct_from_eating_and_mining() {
+        let [bow_bg, bow_fill] = bow_progress_quads(0.5, 1280, 720);
+        let [mine_bg, mine_fill] = mining_progress_quads(0.5, 1280, 720);
+        let [eat_bg, eat_fill] = eating_progress_quads(0.5, 1280, 720);
+
+        assert_eq!(bow_fill.color, BOW_FILL_COLOR, "bow fill color");
+        assert_eq!(bow_bg.color, mine_bg.color, "shared dark background");
+        assert_eq!(bow_bg.color, eat_bg.color, "shared dark background");
+        assert_eq!(bow_bg.color, [0.0, 0.0, 0.0, 0.55], "background stays dark");
+
+        assert_ne!(BOW_FILL_COLOR, EATING_FILL_COLOR, "distinct from eating");
+        assert_ne!(BOW_FILL_COLOR, mine_fill.color, "distinct from mining");
+        assert_ne!(eat_fill.color, mine_fill.color, "eating stays distinct");
+        for channel in BOW_FILL_COLOR {
+            assert!(
+                (0.0..=1.0).contains(&channel),
+                "bow channel {channel} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn bow_bar_clamps_and_stays_finite_on_degenerate_surfaces() {
+        let [_, full] = bow_progress_quads(1.5, 1280, 720);
+        assert_close(full.w, PROGRESS_BAR_WIDTH, "1.5 is full width");
+        let [_, nan] = bow_progress_quads(f32::NAN, 1280, 720);
+        assert_close(nan.w, 0.0, "NaN is zero width");
+
+        for (w, h) in [(0, 0), (1, 1)] {
+            for quad in bow_progress_quads(0.5, w, h) {
+                for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+                    assert!(value.is_finite(), "{name} finite on {w}x{h}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -790,5 +900,60 @@ mod tests {
         for quad in quads {
             assert!(quad.x.is_finite() && quad.y.is_finite());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Damage flash quad (S06-T04)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn damage_flash_is_absent_for_quiescent_and_non_finite_intensities() {
+        for intensity in [0.0, -0.5, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                damage_flash_quad(intensity, 1280, 720).is_none(),
+                "intensity {intensity} must draw nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_flash_covers_the_whole_surface_at_peak_alpha() {
+        let quad = damage_flash_quad(1.0, 1280, 720).expect("a full hit draws the flash");
+        assert_close(quad.x, 0.0, "flash x");
+        assert_close(quad.y, 0.0, "flash y");
+        assert_close(quad.w, 1280.0, "flash w covers the surface");
+        assert_close(quad.h, 720.0, "flash h covers the surface");
+        assert_close(quad.color[3], DAMAGE_FLASH_ALPHA, "peak alpha");
+        assert_close(quad.color[3], 0.35, "pinned peak alpha");
+        for channel in &quad.color[..3] {
+            assert!(
+                (0.0..=1.0).contains(channel),
+                "flash channel {channel} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_flash_intensity_clamps_and_scales_alpha() {
+        let over = damage_flash_quad(5.0, 640, 480).expect("5.0 still draws");
+        assert_close(
+            over.color[3],
+            DAMAGE_FLASH_ALPHA,
+            "above 1.0 clamps to peak alpha",
+        );
+
+        let half = damage_flash_quad(0.5, 640, 480).expect("0.5 draws");
+        assert_close(half.color[3], 0.175, "half intensity is half alpha");
+        assert_close(half.w, 640.0, "half intensity still covers the surface");
+    }
+
+    #[test]
+    fn damage_flash_stays_finite_on_degenerate_surfaces() {
+        let quad = damage_flash_quad(1.0, 0, 0).expect("a zero surface still yields a quad");
+        for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+            assert!(value.is_finite(), "{name} finite on 0x0");
+        }
+        assert_close(quad.w, 1.0, "max(1) keeps the width finite");
+        assert_close(quad.h, 1.0, "max(1) keeps the height finite");
     }
 }

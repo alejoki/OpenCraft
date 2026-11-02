@@ -12,13 +12,18 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot};
+use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot, SOUND_SLOT_COUNT};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::{self, LoadedPack};
+use opencraft::player::bow::{BowState, BowTarget, BowTick};
+use opencraft::player::combat::DamageCause;
 use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
-    ToolWear, HOTBAR_SLOTS,
+    ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
+};
+use opencraft::player::melee::{
+    attack_damage, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH, SWORD_DAMAGE_WOOD,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
@@ -27,6 +32,7 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
+use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::generate_all_texture_layers_rgba;
 use opencraft::settings::keybind::key_to_string;
@@ -39,9 +45,9 @@ use opencraft::ui::chest::{
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
 };
 use opencraft::ui::hud::{
-    eating_progress_quads, hotbar_count_label_for, hotbar_count_text_origin, hotbar_slot_rects,
-    mining_progress_quads, selected_item_label, vitals_quads, HOTBAR_COUNT_FONT_SIZE,
-    HOTBAR_COUNT_LINE_HEIGHT,
+    bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
+    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
+    vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
@@ -50,20 +56,21 @@ use opencraft::ui::inventory::{
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::screens::{
-    death_panel_rect, death_row_rect, delete_prompt_line, format_row_line, hovered_death_row,
-    hovered_load_target, hovered_main_menu_row, hovered_new_game_target, hovered_pause_row,
-    load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect, load_panel_rect,
-    load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect, new_game_panel_rect,
-    new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect, screen_key_action,
-    validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow, NewGameScreen,
-    NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE, MAIN_MENU_ROWS,
-    NEW_GAME_ROWS, PAUSE_ROWS,
+    death_cause_line, death_panel_rect, death_row_rect, delete_prompt_line, format_row_line,
+    hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
+    hovered_pause_row, load_back_rect, load_cancel_rect, load_confirm_rect, load_delete_rect,
+    load_panel_rect, load_play_rect, load_row_rect, main_menu_panel_rect, main_menu_row_rect,
+    new_game_panel_rect, new_game_row_lines, new_game_row_rect, pause_panel_rect, pause_row_rect,
+    screen_key_action, validate_create, DeathRow, FocusField, LoadScreen, LoadTarget, MainMenuRow,
+    NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE,
+    MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
 use opencraft::ui::{
     DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
     LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
     TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
+use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
@@ -72,14 +79,22 @@ use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, 
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
 use opencraft::world::manager::WorldManager;
+use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind, MobShot};
+use opencraft::world::mob_ai::MobAttack;
+use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
+use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedPlayerState,
-    WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
+    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
+    DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of, Season, Weather};
-use opencraft::world::session::ChestCommandError;
+use opencraft::world::session::{mob_drop_items, BowFireError, ChestCommandError};
+use opencraft::world::spawning::{
+    SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
+};
 use opencraft::world::terrain::{
     biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
     DEFAULT_WORLD_SEED, SEA_LEVEL,
@@ -125,7 +140,7 @@ fn load_startup_pack(
 fn load_startup_sounds(
     packs_root: &Path,
     selected: Option<&str>,
-) -> ([SoundBuffer; 4], Vec<SettingsWarning>) {
+) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
     let Some(name) = selected else {
         return (default_buffers(), Vec::new());
     };
@@ -228,6 +243,10 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
             survival: session.player.survival,
         },
         chests: session.chests.clone(),
+        // Persist the live mob records here, at the one production save site.
+        // The codec sorts by (kind, position), so the session's list order
+        // never leaks into the file layout.
+        mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
     let result = save_world_to_path(&session.save_path, &data);
@@ -273,6 +292,40 @@ fn break_rejection_notice(rejection: BreakRejection) -> Option<&'static str> {
     }
 }
 
+/// The transient gameplay notice a player-attributed mob kill shows when the
+/// best-effort delivery had to discard part of the table, or `None` when every
+/// unit fit.
+///
+/// A clean delivery stays silent: the items appearing in the hotbar is the
+/// feedback. Only a loss needs words, because those items are gone for good.
+fn mob_drop_notice(report: MobDropReport) -> Option<&'static str> {
+    if report.lost_any() {
+        Some("Inventory full: some mob drops were lost")
+    } else {
+        None
+    }
+}
+
+/// Grants a proven player kill's drops after the hit already landed and the
+/// selected tool was already worn.
+///
+/// The caller owns the ordering (attack -> wear -> drops -> notice): a sword
+/// that breaks on the killing blow must free its hotbar slot before the drop
+/// is delivered, otherwise a full inventory would lose an item the break just
+/// made room for (MEM214/MEM392). This helper performs only the grant and the
+/// message projection; the mob record stays for the collapse and the reaper.
+fn after_lethal_player_hit(
+    session: &mut WorldSession,
+    index: usize,
+    hit: MobHit,
+) -> Option<MenuMessage> {
+    let report = session.resolve_mob_kill(index, hit, MobKillCause::Player);
+    mob_drop_notice(report).map(|text| MenuMessage {
+        text: text.to_string(),
+        ticks_left: menu::MESSAGE_TICKS,
+    })
+}
+
 /// What an applied break did to the selected hotbar slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ToolWearOutcome {
@@ -282,6 +335,25 @@ enum ToolWearOutcome {
     Broke,
     /// The selected slot was empty or held a non-tool: nothing was worn.
     Nothing,
+}
+
+/// Spends exactly one durability point after an edit or hit actually applied.
+///
+/// One mapping serves both production mutation sites — the mining break and the
+/// melee hit — so the two paths can never diverge on what a wear reports. The
+/// caller owns the ordering (mutate first, wear second); this helper only
+/// classifies the result.
+fn wear_after_proven_action(session: &mut WorldSession) -> ToolWearOutcome {
+    match session.player.wear_selected_tool() {
+        Ok(ToolWear::Worn(item)) => ToolWearOutcome::Worn {
+            remaining: item
+                .durability()
+                .expect("a successfully worn tool still reports durability"),
+        },
+        Ok(ToolWear::Broke) => ToolWearOutcome::Broke,
+        // Empty slot / non-tool / out-of-range selection: no mutation.
+        Err(_) => ToolWearOutcome::Nothing,
+    }
 }
 
 /// Outcome of one production mining break.
@@ -376,16 +448,7 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         return BreakOutcome::Rejected(BreakRejection::EditRejected);
     }
 
-    let wear = match session.player.wear_selected_tool() {
-        Ok(ToolWear::Worn(item)) => ToolWearOutcome::Worn {
-            remaining: item
-                .durability()
-                .expect("a successfully worn tool still reports durability"),
-        },
-        Ok(ToolWear::Broke) => ToolWearOutcome::Broke,
-        // Empty slot / non-tool / out-of-range selection: no mutation.
-        Err(_) => ToolWearOutcome::Nothing,
-    };
+    let wear = wear_after_proven_action(session);
     if let Some(items) = chest_items {
         // The preflight proved capacity, and wearing only ever frees room, so
         // this batch cannot fail. The record is removed with the block, and an
@@ -471,8 +534,8 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 
 /// Outcome of one production right-click world interaction.
 ///
-/// The full precedence is chest/table -> Survival food -> hoe/seed farming ->
-/// block placement. Stations and Survival food run before everything else and
+/// The full precedence is chest/table -> held bow -> Survival food -> hoe/seed
+/// farming -> block placement. Stations and Survival food run before everything else and
 /// are pure session decisions: a successfully targeted storage block or
 /// crafting table neither edits the world nor consumes the selected stack, and
 /// a food item never places a block. Farming follows because the top-face rule
@@ -488,6 +551,12 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
 /// runs before table targeting so one shared ray can only ever open the block
 /// the player is actually looking at.
 ///
+/// A held bow comes after both station checks so a bow aimed at a chest still
+/// opens the chest, and before the Survival food branch so a bow press always
+/// arms a draw. It is mode-independent: a Creative player may draw and fire
+/// (S09 owns Creative damage). The press only arms the hold — charge and the
+/// actual shot happen on the frame tick and the release arm.
+///
 /// Survival food comes after both station checks and before farming/placement:
 /// holding a food item never places a block, a full-hunger click is refused
 /// through the transient notice channel instead of silently doing nothing, and
@@ -501,6 +570,15 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
     if session.try_open_targeted_table().is_some() {
         return RightClickOutcome::TableOpened;
+    }
+    if matches!(
+        session.player.selected_item().map(|item| item.id()),
+        Some(ItemId::Tool {
+            kind: ToolKind::Bow,
+            ..
+        })
+    ) {
+        return RightClickOutcome::BowChargeStarted;
     }
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
@@ -583,6 +661,9 @@ enum RightClickOutcome {
     /// press arm reports [`right_click_notice`] through the transient message
     /// channel.
     EatingRefused,
+    /// A held bow press started a charge. The press only arms the right hold;
+    /// progress and the shot are owned by the frame tick and the release arm.
+    BowChargeStarted,
     /// A hoe tilled soil into Farmland; carries the remesh work to upload.
     Tilled(Vec<(ChunkPos, ChunkMesh)>),
     /// Wheat seeds were planted; carries the remesh work to upload.
@@ -599,6 +680,18 @@ enum RightClickOutcome {
 fn right_click_notice(outcome: &RightClickOutcome) -> Option<&'static str> {
     match outcome {
         RightClickOutcome::EatingRefused => Some("Cannot eat while full"),
+        _ => None,
+    }
+}
+
+/// Transient notice for a bow-release refusal, if any.
+///
+/// Only [`BowFireError::NoAmmo`] needs words: it is the one refusal a player
+/// cannot infer from the world. Every other refusal (dead, not holding a bow,
+/// invalid shot, arrow cap) is already visible or is an ordinary non-event.
+fn bow_release_notice(error: Option<BowFireError>) -> Option<&'static str> {
+    match error {
+        Some(BowFireError::NoAmmo) => Some("No arrows"),
         _ => None,
     }
 }
@@ -629,20 +722,132 @@ fn eating_candidate(
     EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
 }
 
+/// The hold-to-draw candidate for this frame, or `None` when the draw must
+/// not progress.
+///
+/// Cancellation is structural exactly like [`eating_candidate`]: a released
+/// right button, a panel/menu frame, an ungrabbed cursor, a dead player, or a
+/// selection that is not a wood bow all produce `None`, which makes
+/// [`BowState::tick`] reset the accumulated charge. Unlike eating, movement
+/// deliberately does **not** cancel: a draw survives walking (see
+/// [`crate::player::bow`]). There is no separate cancellation switch that a
+/// reset site could forget.
+fn bow_charge_candidate(
+    session: &WorldSession,
+    right_mouse_held: bool,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> Option<BowTarget> {
+    if !(gameplay && cursor_grabbed && right_mouse_held) || session.is_dead() {
+        return None;
+    }
+    let player = &session.player;
+    BowTarget::new(player.selected_slot(), player.selected_item()?)
+}
+
+/// Outcome of one bow release: whether an arrow actually left the bow, and
+/// the refusal reason when it did not.
+///
+/// Deliberately richer than `Option<BowFireError>`: `None` there conflated a
+/// real shot with a sub-threshold tap-cancel, so a bow-release sound would
+/// have played on every cancel. `fired` is true only for an accepted shot.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct BowRelease {
+    /// A real arrow was spawned by this release.
+    fired: bool,
+    /// The refusal reason, if the release attempted a shot and was refused.
+    error: Option<BowFireError>,
+}
+
+/// Releases the held bow: resets the charge unconditionally, then fires one
+/// arrow when this is a gameplay frame with a grabbed cursor.
+///
+/// A free function because `window_event` already holds disjoint
+/// `gpu`/`window` borrows, making a `&mut self` method unusable there (P005).
+/// The reset happens **before** the gameplay gate, so a release on a menu or
+/// panel frame can never leave a live charge behind. Only `fired` is
+/// significant to the audio arm: a sub-threshold tap or a non-gameplay release
+/// is a silent cancel, while a refused shot reports its error for the notice.
+fn release_bow(
+    bow: &mut BowState,
+    session: &mut WorldSession,
+    gameplay: bool,
+    cursor_grabbed: bool,
+) -> BowRelease {
+    let Some(charge) = bow.release() else {
+        return BowRelease::default();
+    };
+    if !(gameplay && cursor_grabbed) {
+        return BowRelease::default();
+    }
+    // Copy the camera inputs before the mutable session borrow: argument
+    // evaluation would otherwise overlap with `fire_bow`'s receiver borrow.
+    let origin = session.camera.position;
+    let dir = session.camera.forward();
+    match session.fire_bow(origin, dir, charge) {
+        Ok(_) => BowRelease {
+            fired: true,
+            error: None,
+        },
+        Err(error) => BowRelease {
+            fired: false,
+            error: Some(error),
+        },
+    }
+}
+
+/// Map one classified audio frame to the fixed slot order the frame loop plays:
+/// idle, hurt, death, bow release, arrow impact.
+fn mob_audio_slots(frame: MobAudioFrame) -> [Option<SoundSlot>; 5] {
+    [
+        frame.idle.then_some(SoundSlot::MobIdle),
+        frame.hurt.then_some(SoundSlot::MobHurt),
+        frame.death.then_some(SoundSlot::MobDeath),
+        frame.bow_release.then_some(SoundSlot::BowRelease),
+        frame.arrow_impact.then_some(SoundSlot::ArrowImpact),
+    ]
+}
+
+/// Attack-before-mining priority for one Playing frame.
+///
+/// A resident mob under the crosshair within melee reach is the frame's
+/// action: it suppresses the mining candidate entirely, so one left press can
+/// never both hit a mob and start breaking the block behind it. With no attack
+/// candidate the mining candidate passes through unchanged — the 8.0-block
+/// raycast reach and every duration rule stay owned by
+/// [`MiningTarget::from_block`]. Suppression is free because
+/// [`MiningState::tick`] resets its own progress on `None`; do not add a second
+/// reset call at the call site.
+fn mining_after_attack(
+    attack: Option<MeleeHit>,
+    mining: Option<MiningTarget>,
+) -> Option<MiningTarget> {
+    if attack.is_some() {
+        None
+    } else {
+        mining
+    }
+}
+
 /// Crosshair progress bar for this frame.
 ///
-/// Eating owns the single sanctioned bar slot while a meal is in progress; a
-/// completed meal resets the eating state, so mining's amber bar comes back on
-/// the very next frame. `None` means neither action is progressing and no bar
-/// is drawn.
+/// One shared bar slot, so priority decides who owns it: eating -> bow ->
+/// mining. Eating consumes a real item, a bow draw is a held input the player
+/// must see, and mining is the fallback. A completed or cancelled action resets
+/// its own state, so the next-priority bar comes back on the very next frame.
+/// `None` means no action is progressing and no bar is drawn.
 fn frame_progress_bar(
     eating: Option<f32>,
+    bow: Option<f32>,
     mining: Option<f32>,
     surface_w: u32,
     surface_h: u32,
 ) -> Option<[Quad; 2]> {
     if let Some(progress) = eating {
         return Some(eating_progress_quads(progress, surface_w, surface_h));
+    }
+    if let Some(progress) = bow {
+        return Some(bow_progress_quads(progress, surface_w, surface_h));
     }
     mining.map(|progress| mining_progress_quads(progress, surface_w, surface_h))
 }
@@ -668,6 +873,18 @@ pub enum InventoryClickOutcome {
     Crafted(Item),
 }
 
+/// Clears the three hold accumulators shared by every panel open/close path.
+///
+/// The four panel helpers all reset the same set, so factoring it here means a
+/// new accumulator (the bow draw) is added once and every panel boundary picks
+/// it up. Melee is deliberately absent: panel opens never reset a swing
+/// cooldown today, and this refactor must not change that behaviour.
+fn reset_panel_holds(mining: &mut MiningState, eating: &mut EatingState, bow: &mut BowState) {
+    mining.reset();
+    eating.reset();
+    bow.reset();
+}
+
 /// Opens the inventory panel from either the E key (`via_table = false`) or a
 /// successful table interaction (`via_table = true`), releasing the cursor and
 /// dropping every gameplay hold so the panel owns the pointer.
@@ -685,6 +902,7 @@ fn open_inventory(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
@@ -694,8 +912,7 @@ fn open_inventory(
         screen.toggle(table_open);
     }
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -716,14 +933,14 @@ fn close_inventory(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
     screen.close();
     session.close_table();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -916,6 +1133,7 @@ fn open_chest_screen(
     drag: &mut Option<InventoryTarget>,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     status: &mut Option<String>,
     window: &Window,
@@ -924,8 +1142,7 @@ fn open_chest_screen(
     session.close_table();
     screen.open();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *drag = None;
@@ -946,14 +1163,14 @@ fn close_chest_screen(
     right_mouse_held: &mut bool,
     mining: &mut MiningState,
     eating: &mut EatingState,
+    bow: &mut BowState,
     cursor_grabbed: &mut bool,
     window: &Window,
 ) {
     screen.close();
     session.close_chest();
     input.reset();
-    mining.reset();
-    eating.reset();
+    reset_panel_holds(mining, eating, bow);
     *left_mouse_held = false;
     *right_mouse_held = false;
     *cursor_grabbed = true;
@@ -1242,15 +1459,25 @@ fn eye_is_submerged(world: &WorldManager, eye: Vec3) -> bool {
 /// live eye submersion and hands the player's vitals and effective mode to the
 /// pure [`vitals_quads`]. Only the Playing block calls it — menu, pause, and
 /// death screens never draw the Survival HUD.
+///
+/// The red damage flash is appended AFTER the vitals quads so it tints the HUD
+/// too, and it is drawn only while the player's hurt timer is live: a
+/// quiescent player yields the vitals quads alone. Creative yields nothing at
+/// all, because `vitals_quads` is structurally empty there and a Creative
+/// player can never arm the hurt timer (mob damage is refused).
 fn playing_hud_quads(session: &WorldSession, surface_w: u32, surface_h: u32) -> Vec<Quad> {
     let head_submerged = eye_is_submerged(&session.world, session.camera.position);
-    vitals_quads(
+    let mut quads = vitals_quads(
         &session.player.survival,
         session.player.mode(),
         head_submerged,
         surface_w,
         surface_h,
-    )
+    );
+    if let Some(flash) = damage_flash_quad(session.player_hurt_intensity(), surface_w, surface_h) {
+        quads.push(flash);
+    }
+    quads
 }
 
 /// CLI world intent: the exact three-flag disjunction from the plan. Any
@@ -1265,7 +1492,8 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
 }
 
 /// Accelerated-watch suppression predicate: true when the launch requested a
-/// scripted demo seam (`--demo-swim`, `--demo-survival`, or `--demo-content`).
+/// scripted demo seam (`--demo-swim`, `--demo-survival`, `--demo-content`, or
+/// `--demo-combat`).
 /// A scripted demo owns its own completion and digest contract at its own
 /// pace, so the accelerated `--time-scale` watch and its wall-clock deadline
 /// must stay disarmed even when `--time-scale` is also on the command line —
@@ -1273,7 +1501,25 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
 /// the scripted run prints its own digest. The flags themselves are still
 /// launch switches, never world intents (see [`cli_has_world_intent`]).
 fn scripted_demo_requested(cli: &CliConfig) -> bool {
-    cli.demo_swim || cli.demo_survival || cli.demo_content
+    cli.demo_swim || cli.demo_survival || cli.demo_content || cli.demo_combat
+}
+
+/// Whether this launch is a bounded demo/watch seam that owns its own world
+/// witness: the four scripted demos plus the accelerated multi-cycle watch.
+///
+/// The watch arms on exactly [`demo_shutdown_deadline`]'s condition
+/// (`time_scale > DEFAULT_TIME_SCALE`), never on `--demo-days` alone — that
+/// flag defaults to 1, so treating it as the arming signal would close the gate
+/// for every production launch.
+///
+/// Those runs pin exact save layouts — several real-binary scripts assert a
+/// zero v7 mob count on an "edit-free fresh world" — so the ambient population
+/// layer stays closed for their whole life. That is the same ephemeral demo
+/// switch `--demo-combat` uses around its own pinned stages (M009/S05-T03):
+/// creation and daylight burning are off, the distance cull still runs.
+/// Production launches never touch it, so the shipped game keeps spawning.
+fn demo_owns_world_witness(cli: &CliConfig) -> bool {
+    scripted_demo_requested(cli) || cli.time_scale > DEFAULT_TIME_SCALE
 }
 
 /// The startup world session, mirroring main()'s pre-S03 load-or-fresh
@@ -1289,22 +1535,63 @@ fn scripted_demo_requested(cli: &CliConfig) -> bool {
 fn startup_session(cli: &CliConfig) -> WorldSession {
     if !cli.force_new_world && cli.save_path.exists() {
         if let Ok(save) = load_world_from_path(&cli.save_path) {
-            return WorldSession::session_from_save(save, cli.save_path.clone());
+            let mut session = WorldSession::session_from_save(save, cli.save_path.clone());
+            // A bounded accelerated watch that reloads a save must keep the
+            // same pinned witness as its fresh leg: no ambient records may
+            // appear in the next saved tail. The scripted demos are
+            // deliberately excluded here: a loaded `--demo-combat` leg is a
+            // one-call Restore that re-saves nothing, and T03 pinned that only
+            // the fresh scripted branch closes the gate.
+            if cli.time_scale > DEFAULT_TIME_SCALE {
+                session.set_ambient_spawning(false);
+            }
+            if cli.demo_combat {
+                // The pinned quartet sits 3.5 blocks from the player, inside
+                // the 16-block aggro, so hostile AI must stay off until the
+                // dedicated `Hostile` stage reopens it. The load branch is a
+                // one-call Restore leg, but the gate is ephemeral state the
+                // session must still start closed for the scripted run.
+                session.set_hostile_ai_enabled(false);
+            }
+            return session;
         }
     }
     let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+    // The scripted combat seam (`--demo-combat`, M009/S01-T05) pins a fresh
+    // world to Survival at dusk so the mob path is proven with walking mobs in
+    // front of a non-flying player. It overrides `cli.mode` on the fresh
+    // branch only: the load branch above returns first, so a saved world is
+    // never re-moded, re-clocked, or re-seeded by the flag.
+    let mode = if cli.demo_combat {
+        GameMode::Survival
+    } else {
+        cli.mode
+    };
     // Fresh worlds start at the default season length; the New Game row and
     // the `--season-length` CLI seam override it on this branch only. A load
     // branch above never reaches here, so a persisted calendar always wins
     // over a launch flag. The mode follows the same rule: `--creative` /
     // `--survival` pick the fresh world's persisted mode, while a loaded save
     // restores its own stored mode and ignores the flag.
-    let mut session = WorldSession::new_session_with_mode(
-        seed,
-        cli.save_path.clone(),
-        cli.season_length,
-        cli.mode,
-    );
+    let mut session =
+        WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
+    if cli.demo_combat {
+        session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
+    }
+    // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
+    // digest and every bounded demo's v7 save tail must describe only what that
+    // demo placed, so ambient spawning and daylight burning stay off for the
+    // whole run. Production sessions never touch this switch.
+    if demo_owns_world_witness(cli) {
+        session.set_ambient_spawning(false);
+    }
+    // The pinned quartet sits 3.5 blocks from the player, inside the
+    // 16-block aggro, so hostile AI must stay off until the dedicated
+    // `Hostile` stage reopens it. Guarded on `demo_combat` alone: the other
+    // scripted demos and the accelerated watch must keep their behaviour.
+    if cli.demo_combat {
+        session.set_hostile_ai_enabled(false);
+    }
     // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
     // onto the pinned route. The load branch above returns before this, so a
     // resumed save is never moved — its own position is the contract there.
@@ -1381,6 +1668,11 @@ fn tick_transient_message(message: &mut Option<MenuMessage>) -> bool {
 /// main menu appends its transient message (the S03-T03 Save-and-Quit
 /// save-failure note) as its last line when present; with no message it
 /// lists exactly its five rows.
+///
+/// The Death screen renders `DEATH_TITLE` on line 0, the cause line (from
+/// the session's ambient, never-persisted [`DamageCause`]) on line 1, then
+/// the [`DEATH_ROWS`] labels — matching `death_row_rect`'s `index + 2`
+/// shift exactly.
 fn compose_screen_text(
     screen: LifecycleScreen,
     new_game: &NewGameScreen,
@@ -1388,6 +1680,7 @@ fn compose_screen_text(
     load_message: Option<&MenuMessage>,
     main_menu_message: Option<&MenuMessage>,
     pause_message: Option<&MenuMessage>,
+    death_cause: Option<DamageCause>,
 ) -> String {
     let lines: Vec<String> = match screen {
         LifecycleScreen::MainMenu => {
@@ -1461,6 +1754,7 @@ fn compose_screen_text(
         }
         LifecycleScreen::Death => {
             let mut lines = vec![DEATH_TITLE.to_string()];
+            lines.push(death_cause_line(death_cause));
             lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
             lines
         }
@@ -3694,6 +3988,3651 @@ fn content_demo_step(demo: &mut ContentDemo, session: &mut WorldSession) -> bool
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted combat demo (`--demo-combat`, M009/S01-T05)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock safety net for the scripted combat loop. The Walk stage is also
+/// bounded by its own 600-update cap, so this only catches a run whose world
+/// never streams in (the Settle wait).
+const COMBAT_DEMO_DEADLINE_SECS: u64 = 120;
+
+/// Minimum Walk observations before success may latch (120 Playing frames =
+/// 2 s at 60 Hz). Besides proving sustained walking rather than a single
+/// lucky step, this gives the shutdown `frame_budget:` digest a meaningful
+/// sample set: with only a handful of samples p95 collapses onto the maximum
+/// sample, so one startup-heavy frame would dominate the printed p95.
+const COMBAT_WALK_OBSERVATIONS: u32 = 120;
+/// Hard cap on Walk observations before the stage aborts with a digest.
+const COMBAT_WALK_ABORT_UPDATES: u32 = 600;
+
+/// The pinned clock for a fresh `--demo-combat` world. 12_000 ticks is late
+/// afternoon (just before dusk), so the demo proves the box-model path at a
+/// deterministic, mob-visible time of day. Never derived from the wall clock.
+///
+/// **12_000 is still DAY.** [`daycycle::is_night`] opens at
+/// [`daycycle::STAR_DUSK_CLEAR_TICK`] (12_306), the first tick whose sun
+/// brightness is exactly zero, so a dusk demo cannot spawn a hostile on the lit
+/// surface. That is exactly why the Ambient stage pins its own real night tick
+/// ([`COMBAT_NIGHT_TICK`]) instead of reusing this one.
+pub const COMBAT_DUSK_TICK: u32 = 12_000;
+
+/// The pinned night clock for the Ambient stage: 18_000 ticks is midnight.
+///
+/// The sun is exactly below the horizon there, so [`daycycle::is_night`] is true
+/// while the surface sky light is still [`PASSIVE_SURFACE_LIGHT`] (sky light is
+/// time-invariant in this engine): the surface-hostile night rule is what the
+/// stage proves, not the cave-light rule.
+pub const COMBAT_NIGHT_TICK: u32 = 18_000;
+
+/// The pinned daytime clock for the Ambient burn phase: 06_000 ticks is
+/// mid-morning, well clear of both night edges (12_306 and 23_694), so
+/// [`daycycle::is_day`] is true and surface hostiles must burn.
+pub const COMBAT_DAY_TICK: u32 = 6_000;
+
+/// Hard cap on the `Hostile` stage's fixed-step observations.
+///
+/// 400 x 0.1 s = 40 s of game time. The stage needs 7 landed zombie hits at a
+/// 1.0 s cadence (six seconds) plus the walk-in and knockback settle, so this
+/// leaves a wide margin while staying inside the demo's own 120 s wall-clock
+/// deadline. It is bounded rather than "until dead" so a steering or cadence
+/// regression latches a self-describing abort instead of hanging the run.
+pub const COMBAT_HOSTILE_ABORT_TICKS: u32 = 400;
+
+/// Hard cap on each Skeleton stage phase's fixed-step observations.
+///
+/// 400 x 0.1 s = 40 s of game time. The fire phase needs one skeleton shot
+/// (the brain fires on its first step) plus ~0.4 s of arrow flight; the
+/// death-cause phase needs the next 2.0 s shot plus flight; the kill proof
+/// needs one arrow flight. Bounded rather than "until dead" so a regression in
+/// the ranged brain or the projectile sweep latches a self-describing abort
+/// instead of hanging the demo's 120 s deadline.
+pub const COMBAT_SKELETON_ABORT_TICKS: u32 = 400;
+
+/// Fixed-step observations the Creative stage's inertness window runs.
+///
+/// 40 x 0.1 s = 4 s of game time with the hostile gate OPEN and the player's
+/// effective mode Creative. The stage requires zero decided attacks, zero
+/// decided shots, zero applied player damage, and no mob ever in `Chase` for
+/// the whole window, so a leak in either Creative authority site fails instead
+/// of passing on one quiet frame.
+pub const COMBAT_CREATIVE_INERT_TICKS: u32 = 40;
+
+/// Hard cap on each Creative stage fixed-step observation loop (the inertness
+/// window and the arrow's flight).
+///
+/// 40 x 0.1 s = 4 s of game time. The charge-0 arrow crosses the two blocks to
+/// a pinned Zombie inside the first 0.1 s tick, so this is only the bound that
+/// turns a projectile-sweep regression into a self-describing abort instead of
+/// a hung 120 s demo deadline.
+pub const COMBAT_CREATIVE_ABORT_TICKS: u32 = 40;
+
+/// Minimum Ambient spawn-phase observations before the stage may advance.
+///
+/// 60 observations x 0.1 s of game time = 6 s, i.e. 24 fixed spawn attempts at
+/// [`opencraft::world::spawning::SPAWN_ATTEMPT_SECS`]; measured night runs place
+/// at least one hostile well before that, so the stage proves sustained
+/// population rather than one lucky attempt.
+const COMBAT_AMBIENT_MIN_UPDATES: u32 = 60;
+/// Hard cap on Ambient spawn-phase observations before the stage aborts with a
+/// self-describing digest.
+///
+/// 3000 x 0.1 s = 300 s of game time (1200 attempts), but the real bound is
+/// wall time: with default settings the present mode is uncapped (~1000 fps
+/// here), so 600 observations elapsed in under a second of wall time before the
+/// streamer had lit the 24..48 block spawn ring — a measured zero-spawn abort.
+/// 3000 observations gives that warm-up room (a few seconds uncapped, ~50 s at
+/// 60 Hz) while staying inside the demo's own 120 s wall-clock deadline.
+const COMBAT_AMBIENT_ABORT_UPDATES: u32 = 3000;
+/// Ticks of `tick_mobs(0.05, 1.0)` the Ambient despawn phase runs after moving
+/// one record past [`DESPAWN_RADIUS`]. 22 x 0.05 s = 1.1 s, just past the 1.0 s
+/// despawn scan cadence, so the mark and the single reap site both run.
+const COMBAT_AMBIENT_DESPAWN_TICKS: u32 = 22;
+/// Hard cap on the Ambient burn phase's ticks. 400 x 0.05 s = 20 s of game
+/// time = 40 burn intervals of 0.5 s, twice the 20 intervals a full-health
+/// hostile needs, so a stuck burn is a real failure rather than a slow clock.
+const COMBAT_AMBIENT_BURN_TICKS: u32 = 400;
+
+/// Pinned damaged health for the demo quartet, in [`MobKind::ALL`] order.
+/// Every value is strictly below its kind's [`MobKind::max_health`] (Pig/Cow
+/// 10, Zombie/Skeleton 20), so the saved tail proves damaged health survives a
+/// relaunch instead of silently restoring a full-health default.
+const COMBAT_PINNED_HEALTH: [u16; 4] = [4, 7, 11, 14];
+
+/// Pinned non-round facing for the demo quartet, in [`MobKind::ALL`] order.
+/// Non-round values make a yaw round-trip failure visible instead of hiding
+/// behind a default facing.
+const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
+
+/// Measured byte length of the fresh `--demo-combat` save (seed 12345), after
+/// the Drops stage earns the wood sword plus the pig/cow drops and the Shot
+/// stage earns the wood bow and its arrows, and the Save stage writes the two
+/// surviving hostile records.
+///
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v7_save`)
+/// and reading the file back, never computed by hand: every earned stack changes
+/// the serialized inventory size. The same run measures the mob-count offset.
+/// Test-only pins: nothing in production reads the file length.
+#[cfg(test)]
+const COMBAT_SAVE_BYTES: usize = 218;
+/// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
+/// record starts 4 bytes later and the Skeleton record follows it, so the tail
+/// ends at [`COMBAT_SAVE_BYTES`].
+#[cfg(test)]
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
+
+/// The scripted combat loop's fixed stage order. Each stage is fed once per
+/// `about_to_wait` call; Settle returns `false` until the fresh Survival
+/// spawn chunks are resident.
+///
+/// Fight runs in the SAME step that Walk reports success so no redraw can
+/// slip between the walk verdict and the scripted hit sequence. Drops runs in
+/// its own one-call step: it re-pins the mob it is about to kill, so a redraw
+/// between Fight and Drops cannot perturb a single observed number. It then
+/// latches its verdict and advances to Save, which re-pins the two surviving
+/// hostile records, so neither the fight nor the kills can leak into the save.
+/// The Restore stage is the loaded-save leg's first and only stage.
+///
+/// The Ambient stage (M009/S05-T05) sits between Settle and Spawn: it proves
+/// the real population layer through the same session seams the shipped game
+/// uses (night surface spawning, the safe radius, the global cap, the despawn
+/// radius, and daylight burning), then restores the pinned dusk clock and
+/// closes the ambient gate so the pinned quartet stages below are never
+/// perturbed.
+///
+/// The Hostile stage (M009/S06-T06) sits between Drops and Shot: it proves the
+/// hostile steering brain and the zombie melee seam on the two surviving
+/// records (line-of-sight aggro, a chase, 3-damage hits with knockback, a
+/// mob-caused death, and a respawn that keeps the inventory), then restores the
+/// pinned player pose and closes the hostile gate so the Shot proof and the
+/// Save witness start from a known state.
+///
+/// The Shot stage (M009/S07-T06) sits between Hostile and Save: it proves the
+/// bow charge/cancel curve through [`BowState`], the `fire_bow` ammo/wear seam,
+/// a full-charge arrow hitting a body with knockback, and a straight-down shot
+/// embedding then expiring. It earns the real wood bow and arrows the save
+/// witness now carries.
+///
+/// The Skeleton stage (M009/S08-T04) sits between Shot and Creative: it proves
+/// the stand-off ranged brain on one synthetic skeleton pinned at a spot whose
+/// [`drop_roll`] lands the rare bow, the skeleton arrow's 2-damage player hit
+/// and `SkeletonArrow` death cause, the respawn, and the player-attributed
+/// bone/arrow/bow drops. It removes its synthetic victim before Creative, so
+/// the two-record witness and every earlier digest stay byte-identical.
+///
+/// The Creative stage (M009/S09-T05) sits between Skeleton and Save: it proves
+/// the effective-mode mob rule from a Survival save whose live player switches
+/// to Creative rules — no target selection, no melee, no arrows, no damage —
+/// and then that one melee swing and one charge-0 arrow each one-shot a
+/// full-health Zombie with the pinned drop table intact. It consumes exactly
+/// the two rotten-flesh units its kills earned, so the 218-byte v7 witness and
+/// every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
+/// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
+/// Save -> Restore -> Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombatStage {
+    Settle,
+    Ambient,
+    Spawn,
+    Walk,
+    Fight,
+    Drops,
+    Hostile,
+    Shot,
+    Skeleton,
+    Creative,
+    Save,
+    Restore,
+    Done,
+}
+
+/// The Ambient stage's three phases, in order.
+///
+/// `Spawn` pins midnight and lets the production population layer fill the
+/// night surface. `Despawn` moves one record past the despawn radius and proves
+/// the single reap site removes it. `Burn` pins morning and proves surface
+/// hostiles burn to death. Each phase latches its own counter so the printed
+/// digest can be re-measured against a fixed seed and clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbientPhase {
+    Spawn,
+    Despawn,
+    Burn,
+}
+
+/// The `--demo-combat` seam's whole state: the pinned seed, whether the world
+/// is a fresh launch (the only branch allowed to be seeded with demo mobs),
+/// the stage cursor, the one latched digest, and the observed numbers the
+/// success digest reports.
+#[derive(Debug)]
+struct CombatDemo {
+    seed: u32,
+    /// True only for the fresh Survival startup branch. A loaded save is
+    /// never re-seeded: it starts at the Restore stage and proves the saved
+    /// quartet instead.
+    fresh: bool,
+    stage: CombatStage,
+    /// The digest latched when the run ends (success or abort). Printed by the
+    /// demo-shutdown block with the other bounded-demo diagnostics.
+    digest: Option<String>,
+    /// Whether the latched outcome was an abort. `main` turns this into a
+    /// non-zero process status.
+    failed: bool,
+    /// Wall-clock safety net, armed only for a direct-to-gameplay launch.
+    deadline: Option<Instant>,
+    /// The feet position recorded at spawn, in mob-list order, for the Walk
+    /// stage's movement check.
+    spawn_positions: [Vec3; 4],
+    /// Mobs that had both a walking phase and a recorded displacement at the
+    /// last Walk observation (reported in the success digest).
+    walked: u32,
+    /// Walk observations so far; the stage aborts after 600.
+    walk_updates: u32,
+    /// Mob records the fresh Save stage wrote (reported in the success
+    /// digest; `4` on a successful save leg).
+    saved: u32,
+    /// Mob records the fresh Save stage read back and verified.
+    records: u32,
+    /// Melee hits the Fight stage landed through `WorldSession::attack_mob`
+    /// (`2` on a successful fresh leg: 10 -> 6 -> 2 on the Pig).
+    melee_hits: u32,
+    /// Damage per landed hit, reported by the Fight stage's sword tier.
+    melee_damage: u16,
+    /// Swings the i-frame window refused (`1` on a successful fresh leg).
+    melee_blocked: u32,
+    /// Mob records the Drops stage killed (`2` on a successful fresh leg).
+    killed: u32,
+    /// Drop units the Drops stage delivered into the real 36-slot inventory.
+    drops: u32,
+    /// Drop units a full inventory refused (zero on the pinned demo path).
+    drops_lost: u32,
+    /// Mob records the Walk verdict observed, frozen at the moment the walk
+    /// succeeded: Drops removes two records and Save re-pins the rest, so a
+    /// live count read at digest time would no longer describe the walk.
+    walk_mobs: u32,
+    /// Resident mobs at the walk verdict, frozen with [`CombatDemo::walk_mobs`].
+    walk_resident: u32,
+    /// Rendered vertices at the walk verdict, frozen with
+    /// [`CombatDemo::walk_mobs`].
+    walk_verts: usize,
+    /// Cursor inside the Ambient stage (only meaningful while
+    /// `stage == CombatStage::Ambient`).
+    ambient_phase: AmbientPhase,
+    /// Ambient spawn-phase observations so far (see
+    /// [`COMBAT_AMBIENT_MIN_UPDATES`] / [`COMBAT_AMBIENT_ABORT_UPDATES`]).
+    ambient_updates: u32,
+    /// Largest live mob-list length seen during the Ambient spawn phase. The
+    /// global cap makes this `<= MAX_MOBS_TOTAL` by construction.
+    ambient_peak: usize,
+    /// Records observed inside the safe radius during the Ambient spawn phase.
+    /// Any value other than zero aborts the stage: the population layer must
+    /// never place a mob near the player or the world spawn.
+    ambient_safe: u32,
+    /// The spawn report snapshot latched when the Ambient spawn phase ended.
+    spawn_phase_report: SpawnReport,
+    /// Records the Ambient despawn phase proved removed (`1` on success).
+    spawn_despawned: u32,
+    /// Hostiles the Ambient burn phase proved killed by daylight.
+    spawn_burned: u32,
+    /// The latched `combat_spawn:` line, printed immediately after the pinned
+    /// `combat_demo:` line on the demo-shutdown path.
+    spawn_digest: Option<String>,
+    /// Zombie melee hits the Hostile stage accepted (`7` on success: 3 damage
+    /// each, the last saturating 2 -> 0).
+    hostile_attacks: u32,
+    /// Applied damage across those hits (`20` = the player's whole health bar).
+    hostile_damage: u16,
+    /// Whether the last damage event before the death was tagged `Zombie`.
+    hostile_cause: bool,
+    /// Whether the stage respawned the player at the deterministic spawn.
+    hostile_respawn: bool,
+    /// Whether the inventory total survived the respawn unchanged.
+    hostile_inventory_kept: bool,
+    /// Whether at least one accepted hit left a live knockback impulse.
+    hostile_knockback: bool,
+    /// The latched `combat_hostile:` line, printed immediately after the
+    /// pinned `combat_spawn:` line on the demo-shutdown path.
+    hostile_digest: Option<String>,
+    /// Whether the Shot stage reached a full draw before releasing (`true` on
+    /// success).
+    shot_charged: bool,
+    /// Whether a sub-threshold release canceled with no ammo or wear (`true`).
+    shot_canceled: bool,
+    /// Fully charged shots the Shot stage fired through
+    /// [`WorldSession::fire_bow`] (`1` on success: the embed probe below is
+    /// proven by `embed`/`expired` instead).
+    shot_fired: u32,
+    /// Mob hits the charged shot's first tick reported (`1`).
+    shot_mob_hits: u32,
+    /// Damage that arrow applied to the Zombie (`4` at full charge).
+    shot_damage: u16,
+    /// Whether the mob hit left a knockback impulse pointing away from the
+    /// shooter.
+    shot_knockback: bool,
+    /// Whether the straight-down shot was observed embedded after a block hit.
+    shot_embed: bool,
+    /// Whether the embedded arrow later expired and left the list.
+    shot_expired: bool,
+    /// Arrow units after both shots (`2`: four granted minus two fired).
+    shot_ammo: u32,
+    /// Bow durability after both shots (`Some(57)`: 59 minus one wear per
+    /// shot).
+    shot_bow: Option<u16>,
+    /// The latched `combat_shot:` line, printed immediately after the
+    /// `combat_hostile:` line on the demo-shutdown path.
+    shot_digest: Option<String>,
+    /// Skeleton shots the Skeleton stage observed the brain decide (the digest's
+    /// `fired`; `1` on the pinned leg because the stage stops at the first hit).
+    skeleton_fired: u32,
+    /// Player hits the skeleton arrows landed (`1`: the stage stops at the
+    /// first accepted hit).
+    skeleton_player_hits: u32,
+    /// Applied skeleton-arrow damage across those hits (`2`).
+    skeleton_damage: u16,
+    /// Whether the first observed shot's direction pointed above the straight
+    /// line to the player eye (the gravity-compensation proof, `true`).
+    skeleton_arc: bool,
+    /// Mob records the Skeleton stage's player-fired arrow killed (`1`).
+    skeleton_killed: u32,
+    /// Bone units the kill delivered (`1`).
+    skeleton_bones: u32,
+    /// Arrow units the kill delivered (`2`).
+    skeleton_arrows: u32,
+    /// Whether the kill delivered the rare full-durability bow (`true` on the
+    /// pinned leg: the spot search only accepts a cell whose roll lands it).
+    skeleton_bow: bool,
+    /// Whether the respawn returned the player to the deterministic spawn.
+    skeleton_respawn: bool,
+    /// The latched `combat_skeleton:` line, printed immediately after the
+    /// `combat_shot:` line on the demo-shutdown path.
+    skeleton_digest: Option<String>,
+    /// Whether the Creative inertness window observed no hostile decision at all
+    /// (`true` on success: zero attacks, zero shots, zero damage, no chase).
+    creative_inert: bool,
+    /// Melee attacks the Creative inertness window observed (`0` on success).
+    creative_attacks: u32,
+    /// Skeleton shots the Creative inertness window observed (`0` on success).
+    creative_shots: u32,
+    /// Player damage applied by arrows during the Creative window (`0`).
+    creative_damage: u16,
+    /// Damage the Creative melee swing applied (`20`: exactly one shot).
+    creative_melee_damage: u16,
+    /// Damage the Creative charge-0 arrow applied (`20`: exactly one shot).
+    creative_arrow_damage: u16,
+    /// Mob kills the Creative stage proved (`2`: one melee, one arrow).
+    creative_kills: u32,
+    /// Drop units those two kills delivered (`2` rotten flesh).
+    creative_drops: u32,
+    /// Drop units a full inventory refused (`0`).
+    creative_drops_lost: u32,
+    /// Whether the inventory total was conserved after both earned drops were
+    /// consumed again (`true` on success).
+    creative_inventory_kept: bool,
+    /// The latched `combat_creative:` line, printed immediately after the
+    /// `combat_skeleton:` line on the demo-shutdown path.
+    creative_digest: Option<String>,
+}
+
+impl CombatDemo {
+    fn new(seed: u32, fresh: bool, deadline: Option<Instant>) -> Self {
+        Self {
+            seed,
+            fresh,
+            stage: if fresh {
+                CombatStage::Settle
+            } else {
+                CombatStage::Restore
+            },
+            digest: None,
+            failed: false,
+            deadline,
+            spawn_positions: [Vec3::ZERO; 4],
+            walked: 0,
+            walk_updates: 0,
+            saved: 0,
+            records: 0,
+            melee_hits: 0,
+            melee_damage: 0,
+            melee_blocked: 0,
+            killed: 0,
+            drops: 0,
+            drops_lost: 0,
+            walk_mobs: 0,
+            walk_resident: 0,
+            walk_verts: 0,
+            ambient_phase: AmbientPhase::Spawn,
+            ambient_updates: 0,
+            ambient_peak: 0,
+            ambient_safe: 0,
+            spawn_phase_report: SpawnReport::default(),
+            spawn_despawned: 0,
+            spawn_burned: 0,
+            spawn_digest: None,
+            hostile_attacks: 0,
+            hostile_damage: 0,
+            hostile_cause: false,
+            hostile_respawn: false,
+            hostile_inventory_kept: false,
+            hostile_knockback: false,
+            hostile_digest: None,
+            shot_charged: false,
+            shot_canceled: false,
+            shot_fired: 0,
+            shot_mob_hits: 0,
+            shot_damage: 0,
+            shot_knockback: false,
+            shot_embed: false,
+            shot_expired: false,
+            shot_ammo: 0,
+            shot_bow: None,
+            shot_digest: None,
+            skeleton_fired: 0,
+            skeleton_player_hits: 0,
+            skeleton_damage: 0,
+            skeleton_arc: false,
+            skeleton_killed: 0,
+            skeleton_bones: 0,
+            skeleton_arrows: 0,
+            skeleton_bow: false,
+            skeleton_respawn: false,
+            skeleton_digest: None,
+            creative_inert: false,
+            creative_attacks: 0,
+            creative_shots: 0,
+            creative_damage: 0,
+            creative_melee_damage: 0,
+            creative_arrow_damage: 0,
+            creative_kills: 0,
+            creative_drops: 0,
+            creative_drops_lost: 0,
+            creative_inventory_kept: false,
+            creative_digest: None,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Whether this demo currently owns mob time.
+    ///
+    /// The Ambient stage drives its own fixed `tick_mobs(0.05)` calls and pins
+    /// exact population counters. The real Playing frame would otherwise add a
+    /// profile-dependent number of extra ticks (and therefore spawn attempts)
+    /// between observations, so the frame loop must stand down for this stage.
+    /// Every other stage keeps the production tick: the Walk stage's proof is
+    /// that the real frame loop moves the quartet.
+    fn owns_mob_ticks(&self) -> bool {
+        !self.finished() && self.stage == CombatStage::Ambient
+    }
+
+    /// Latch a self-describing abort. Idempotent: the first outcome wins.
+    fn abort(&mut self, stage: &'static str, observed: &str) {
+        if self.finished() {
+            return;
+        }
+        self.digest = Some(format!(
+            "combat_demo: seed={} stage={} observed={} ok=false",
+            self.seed, stage, observed
+        ));
+        self.failed = true;
+    }
+
+    /// The exact `combat_spawn:` digest printed once on the demo-shutdown path
+    /// (immediately after the pinned `combat_demo:` line).
+    ///
+    /// Only latched after all three Ambient phases pass, so the literal
+    /// `ok=true` is the latching contract, not a computed value.
+    fn spawn_digest(&self) -> String {
+        format!(
+            "combat_spawn: seed={} spawned={} despawned={} burned={} cap_blocked={} safe={} peak={} ok=true",
+            self.seed,
+            self.spawn_phase_report.spawned,
+            self.spawn_despawned,
+            self.spawn_burned,
+            self.spawn_phase_report.cap_blocked,
+            self.ambient_safe,
+            self.ambient_peak
+        )
+    }
+
+    /// The exact `combat_hostile:` digest printed once on the demo-shutdown
+    /// path (immediately after the pinned `combat_spawn:` line).
+    ///
+    /// Only latched after the Hostile stage proved aggro, the 3-damage
+    /// i-frame-gated hits, knockback, the mob-caused death, the respawn, and the
+    /// kept inventory, so the trailing literals are the latching contract: the
+    /// harness pins the literal shape (`cause=zombie respawn=spawn
+    /// knockback=true inventory=kept ok=true`) rather than four computed
+    /// words. `attacks` and `damage` are the measured values.
+    fn hostile_digest(&self) -> String {
+        format!(
+            "combat_hostile: seed={} attacks={} damage={} cause=zombie respawn=spawn knockback=true inventory=kept ok=true",
+            self.seed, self.hostile_attacks, self.hostile_damage
+        )
+    }
+
+    /// The exact `combat_shot:` digest printed once on the demo-shutdown path
+    /// (immediately after the `combat_hostile:` line).
+    ///
+    /// Only latched after the Shot stage proved the sub-threshold cancel, the
+    /// full draw, the fired arrow, the mob hit with away knockback, and the
+    /// block embed that expired, so the trailing literal `ok=true` is the
+    /// latching contract. `fired` counts the fully charged shot; the
+    /// straight-down embed probe is reported by `embed`/`expired`.
+    fn shot_digest(&self) -> String {
+        format!(
+            "combat_shot: seed={} charged={} canceled={} fired={} mob_hits={} damage={} knockback={} embed={} expired={} ammo={} bow={} ok=true",
+            self.seed,
+            self.shot_charged,
+            self.shot_canceled,
+            self.shot_fired,
+            self.shot_mob_hits,
+            self.shot_damage,
+            self.shot_knockback,
+            self.shot_embed,
+            self.shot_expired,
+            self.shot_ammo,
+            self.shot_bow.unwrap_or(0)
+        )
+    }
+
+    /// The exact `combat_skeleton:` digest printed once on the demo-shutdown
+    /// path (immediately after the `combat_shot:` line).
+    ///
+    /// Only latched after the Skeleton stage proved the gravity-compensated
+    /// shot, the 2-damage player hit with the `SkeletonArrow` cause, the
+    /// `Skeleton arrow` death-screen line, the respawn, and the
+    /// player-attributed bone/arrow/bow drops, so the trailing literals are the
+    /// latching contract. `fired`, `player_hits`, `damage`, and `bow` are the
+    /// measured values the stage asserts before latching.
+    fn skeleton_digest(&self) -> String {
+        format!(
+            "combat_skeleton: seed={} fired={} player_hits={} damage={} cause=skeleton_arrow arc={} killed={} bones={} arrows={} bow={} respawn={} ok=true",
+            self.seed,
+            self.skeleton_fired,
+            self.skeleton_player_hits,
+            self.skeleton_damage,
+            self.skeleton_arc,
+            self.skeleton_killed,
+            self.skeleton_bones,
+            self.skeleton_arrows,
+            self.skeleton_bow,
+            if self.skeleton_respawn { "spawn" } else { "none" }
+        )
+    }
+
+    /// The exact `combat_creative:` digest printed once on the demo-shutdown
+    /// path (immediately after the `combat_skeleton:` line).
+    ///
+    /// Only latched after the Creative stage proved the inert authority window,
+    /// both direct authority seams, the 20-damage melee and arrow one-shots
+    /// with their drops, and the conserved inventory, so the trailing
+    /// `inventory=kept ok=true` literals are the latching contract.
+    /// `attacks`/`shots`/`damage` are the measured zeroes; both damages and the
+    /// kill/drop counts are the measured values the stage asserts before it
+    /// prints them.
+    fn creative_digest(&self) -> String {
+        format!(
+            "combat_creative: seed={} inert={} attacks={} shots={} damage={} melee_damage={} arrow_damage={} kills={} drops={} drops_lost={} inventory=kept ok=true",
+            self.seed,
+            self.creative_inert,
+            self.creative_attacks,
+            self.creative_shots,
+            self.creative_damage,
+            self.creative_melee_damage,
+            self.creative_arrow_damage,
+            self.creative_kills,
+            self.creative_drops,
+            self.creative_drops_lost
+        )
+    }
+
+    /// The exact success digest printed once on the demo-shutdown path.
+    ///
+    /// Every walk number is the frozen value latched when the Walk verdict
+    /// passed: the Drops stage removes two records and the Save stage re-pins
+    /// the survivors, so reading the live session here would report counts
+    /// that describe the end of the run instead of the walk that was proven.
+    fn success_digest(&self) -> String {
+        format!(
+            "combat_demo: seed={} mobs={} resident={} walked={} verts={} melee_hits={} melee_damage={} melee_blocked={} killed={} drops={} drops_lost={} saved={} records={} ok=true",
+            self.seed,
+            self.walk_mobs,
+            self.walk_resident,
+            self.walked,
+            self.walk_verts,
+            self.melee_hits,
+            self.melee_damage,
+            self.melee_blocked,
+            self.killed,
+            self.drops,
+            self.drops_lost,
+            self.saved,
+            self.records
+        )
+    }
+}
+
+/// The demo quartet's pinned feet positions and facings, derived from one
+/// player pose and the world seed.
+///
+/// Spawn, Save, and Restore all call this single helper, so the three stages
+/// cannot drift apart: a save leg that recomputed the pose differently from
+/// the spawn leg (or a restore leg that recomputed it differently again) would
+/// fail its own exact comparison. The constants are the pre-S02 spawn math
+/// unchanged: three and a half blocks ahead along the yaw forward axis, the
+/// quartet fanned across the right axis, feet on the seeded terrain surface,
+/// each mob turned toward the player (`atan2(dx, dz)` because mob yaw 0 faces
+/// +Z).
+fn combat_quartet(player_position: Vec3, yaw: f32, seed: u32) -> ([Vec3; 4], [f32; 4]) {
+    let forward = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+    let right = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
+    let offsets = [-1.8_f32, -0.6, 0.6, 1.8];
+    let mut positions = [Vec3::ZERO; 4];
+    let mut yaws = [0.0_f32; 4];
+    for (index, offset) in offsets.iter().enumerate() {
+        let x = player_position.x + forward.x * 3.5 + right.x * offset;
+        let z = player_position.z + forward.z * 3.5 + right.z * offset;
+        let y = terrain_height_at_seeded(x.floor() as i32, z.floor() as i32, seed) as f32 + 1.0;
+        positions[index] = Vec3::new(x, y, z);
+        // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns the quartet toward the
+        // player (the render path proves the facing).
+        yaws[index] = (player_position.x - x).atan2(player_position.z - z);
+    }
+    (positions, yaws)
+}
+
+/// Drive one Playing frame of the scripted combat loop. Returns true when this
+/// call ended the run (success or abort).
+///
+/// The demo never ticks the mob runtime itself: the real Playing tick owns
+/// `session.tick_mobs`, exactly as it owns `tick_survival`/`tick_crops`. This
+/// seam only spawns the pinned quartet, observes them, and latches one digest.
+fn combat_demo_step(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    if demo.finished() {
+        return true;
+    }
+    if let Some(deadline) = demo.deadline {
+        if Instant::now() >= deadline {
+            demo.abort(
+                "deadline",
+                &format!("bounded combat run exceeded {COMBAT_DEMO_DEADLINE_SECS}s"),
+            );
+            return true;
+        }
+    }
+    match demo.stage {
+        CombatStage::Settle => {
+            if !session.settle_spawn() {
+                return false;
+            }
+            // The Ambient stage owns the population gate from here: it opens
+            // it for its own night spawn / daylight burn proof and closes it
+            // again before handing over. Closing it now means a Settle frame
+            // that races the gate can never create a record the pinned quartet
+            // stages would have to reason about.
+            session.set_ambient_spawning(false);
+            demo.stage = CombatStage::Ambient;
+            false
+        }
+        CombatStage::Ambient => combat_ambient_stage(demo, session),
+        CombatStage::Spawn => {
+            // A demo run owns its mob list: clearing first makes a re-armed
+            // seam deterministic instead of stacking two quartets.
+            session.mobs_mut().clear();
+            let (positions, yaws) =
+                combat_quartet(session.player.position, session.player.yaw, demo.seed);
+            {
+                let mobs = session.mobs_mut();
+                for (index, kind) in MobKind::ALL.iter().copied().enumerate() {
+                    mobs.push(Mob::new(kind, positions[index], yaws[index]));
+                }
+            }
+            let count = session.mobs().len();
+            if count != 4 {
+                demo.abort("spawn", &format!("mobs={count}"));
+                return true;
+            }
+            demo.spawn_positions = positions;
+            demo.stage = CombatStage::Walk;
+            false
+        }
+        CombatStage::Walk => {
+            // The observation count is bumped BEFORE the success check so the
+            // demo can require a minimum walking window (see
+            // [`COMBAT_WALK_OBSERVATIONS`]).
+            demo.walk_updates += 1;
+            let mut resident = 0usize;
+            let mut walked = 0u32;
+            for (index, mob) in session.mobs().iter().enumerate() {
+                if !session.mob_is_resident(mob) {
+                    continue;
+                }
+                resident += 1;
+                let spawn = demo.spawn_positions.get(index).copied().unwrap_or(mob.home);
+                let dx = mob.position.x - spawn.x;
+                let dy = mob.position.y - spawn.y;
+                let dz = mob.position.z - spawn.z;
+                if mob.walk_phase > 0.1 && (dx * dx + dy * dy + dz * dz).sqrt() > 1e-3 {
+                    walked += 1;
+                }
+            }
+            demo.walked = walked;
+            let total = session.mobs().len();
+            if total == 4
+                && resident == 4
+                && walked == 4
+                && demo.walk_updates >= COMBAT_WALK_OBSERVATIONS
+            {
+                // Freeze the walk verdict before any later stage rewrites the
+                // mob list: the digest must describe the walk that was proven,
+                // not the two-record world the Drops stage leaves behind. The
+                // vertex count is the sum over resident mobs of the real
+                // [`build_mob_vertices`] output (4 mobs x 6 cuboids x 6 faces x
+                // 6 vertices = 864), so it pins the render path's batch size.
+                demo.walk_mobs = total as u32;
+                demo.walk_resident = resident as u32;
+                demo.walk_verts = session
+                    .resident_mobs()
+                    .map(|mob| {
+                        build_mob_vertices(
+                            mob.kind,
+                            MobAnim {
+                                walk_phase: mob.walk_phase,
+                                walk_amount: 1.0,
+                                light: 1.0,
+                            },
+                            0.0,
+                            0.0,
+                        )
+                        .len()
+                    })
+                    .sum();
+                // Fight runs in THIS step, not a later one, for the same
+                // reason the old direct Save call did: no redraw may slip
+                // between the walk verdict and the scripted hit sequence.
+                demo.stage = CombatStage::Fight;
+                return combat_fight_stage(demo, session);
+            }
+            if demo.walk_updates >= COMBAT_WALK_ABORT_UPDATES {
+                demo.abort(
+                    "walk",
+                    &format!(
+                        "walked={walked} resident={resident} total={total} updates={}",
+                        demo.walk_updates
+                    ),
+                );
+                return true;
+            }
+            false
+        }
+        CombatStage::Fight => combat_fight_stage(demo, session),
+        CombatStage::Drops => combat_drops_stage(demo, session),
+        CombatStage::Hostile => combat_hostile_stage(demo, session),
+        CombatStage::Shot => combat_shot_stage(demo, session),
+        CombatStage::Skeleton => combat_skeleton_stage(demo, session),
+        CombatStage::Creative => combat_creative_stage(demo, session),
+        CombatStage::Save => combat_save_stage(demo, session),
+        CombatStage::Restore => combat_restore_stage(demo, session),
+        CombatStage::Done => true,
+    }
+}
+
+/// The Ambient stage: the slice's real-binary proof that the deterministic
+/// population layer works through the shipped `WorldSession::tick_mobs` seam.
+///
+/// Three phases run in order, each re-measured from a fresh report baseline:
+///
+/// * [`AmbientPhase::Spawn`] pins [`COMBAT_NIGHT_TICK`], resets the report,
+///   opens the ambient gate and drives 0.1 s of game time per observation. It
+///   rejects any record inside [`SAFE_RADIUS`] of the player or the cached
+///   world spawn, rejects a peak above [`MAX_MOBS_TOTAL`], and advances once at
+///   least two records spawned AND at least two burn-eligible surface hostiles
+///   exist after [`COMBAT_AMBIENT_MIN_UPDATES`] observations: one record proves
+///   the despawn cull, the other proves daylight burning. Requiring the burn
+///   target up front is what makes the stage's own `burned >= 1` contract
+///   reachable — a run that spawned only one record would otherwise have the
+///   cull consume its only burn witness. [`COMBAT_AMBIENT_ABORT_UPDATES`] bounds
+///   a world that never populates enough.
+/// * [`AmbientPhase::Despawn`] closes the gate (the distance cull still runs),
+///   moves one record past [`DESPAWN_RADIUS`], and ages 1.1 s so the 1.0 s scan
+///   marks it and the single reap site removes it. It prefers a record that the
+///   burner would *not* touch, so the burn witness always survives the cull.
+/// * [`AmbientPhase::Burn`] pins [`COMBAT_DAY_TICK`] and reopens the gate: every
+///   surface hostile burns 1 hp per 0.5 s. It advances once no burnable hostile
+///   remains and at least one burned.
+///
+/// On success it restores the pinned dusk clock, closes the ambient gate, and
+/// latches [`CombatDemo::spawn_digest`], so the pinned quartet stages that
+/// follow are byte-for-byte what they were before this stage existed. Every
+/// mutation goes through a production seam (`session.clock`,
+/// [`WorldSession::set_ambient_spawning`], [`WorldSession::reset_spawn_report`],
+/// [`WorldSession::spawn_report`], [`WorldSession::mobs`],
+/// [`WorldSession::tick_mobs`]). Every abort names the observed value and exits
+/// the run non-zero through [`CombatDemo::abort`].
+fn combat_ambient_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    match demo.ambient_phase {
+        AmbientPhase::Spawn => {
+            if demo.ambient_updates == 0 {
+                // The Ambient stage pins exact population counters, and a spawn
+                // attempt against a not-yet-streamed column is silently
+                // refused. Wait until every candidate column in the 24..48
+                // block ring is resident and lit so debug and release see the
+                // same ready set for the whole attempt sequence. The frame
+                // loop stands down for this stage (see
+                // [`CombatDemo::owns_mob_ticks`]), so nothing ticks while the
+                // ring streams in.
+                if !session.spawn_ring_ready() {
+                    return false;
+                }
+                // First entry: a known night clock, a zero report baseline, an
+                // open gate, and a fresh fixed-step runtime. The attempt
+                // sequence and the wander ticks are then a pure function of
+                // the seed.
+                session.clock = GameClock::from_time(COMBAT_NIGHT_TICK);
+                session.reset_spawn_report();
+                session.reset_mob_runtime();
+                session.set_ambient_spawning(true);
+                demo.ambient_peak = 0;
+                demo.ambient_safe = 0;
+            }
+            // 0.1 s of game time per observation keeps the stage headlessly
+            // driveable; the real frame loop adds its own Playing tick on top.
+            session.tick_mobs(0.05, 1.0);
+            session.tick_mobs(0.05, 1.0);
+            demo.ambient_updates += 1;
+            demo.ambient_peak = demo.ambient_peak.max(session.mobs().len());
+
+            // A record inside either safe radius is a hard contract failure:
+            // the layer must never place a mob on the player or the spawn pad.
+            // The safe radius is a *placement* rule: a record must never be
+            // spawned on the player or the world-spawn pad. Wandering after a
+            // legal placement is ordinary gameplay (the burn phase even pins
+            // records back to `home` for the same reason), so the violation is
+            // measured on the immutable spawn anchor, never the live feet.
+            let safe_violations = session
+                .mobs()
+                .iter()
+                .filter(|mob| {
+                    combat_horizontal_distance(mob.home, session.player.position) < SAFE_RADIUS
+                        || combat_horizontal_distance(mob.home, session.world_spawn()) < SAFE_RADIUS
+                })
+                .count();
+            demo.ambient_safe += safe_violations as u32;
+            if safe_violations > 0 {
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "safe={} peak={} updates={}",
+                        demo.ambient_safe, demo.ambient_peak, demo.ambient_updates
+                    ),
+                );
+                return true;
+            }
+            if demo.ambient_peak > MAX_MOBS_TOTAL {
+                demo.abort(
+                    "ambient",
+                    &format!("peak={} cap={MAX_MOBS_TOTAL}", demo.ambient_peak),
+                );
+                return true;
+            }
+
+            let report = session.spawn_report();
+            // Two independent witnesses are needed downstream: one record for
+            // the despawn cull and one surface hostile for the daylight burn.
+            let burnable = session
+                .mobs()
+                .iter()
+                .filter(|mob| combat_mob_burn_eligible(session, mob))
+                .count();
+            if report.spawned >= 2
+                && demo.ambient_updates >= COMBAT_AMBIENT_MIN_UPDATES
+                && burnable >= 2
+            {
+                demo.spawn_phase_report = report;
+                demo.ambient_phase = AmbientPhase::Despawn;
+                return false;
+            }
+            if demo.ambient_updates >= COMBAT_AMBIENT_ABORT_UPDATES {
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "spawned={} burnable={burnable} updates={}",
+                        report.spawned, demo.ambient_updates
+                    ),
+                );
+                return true;
+            }
+            false
+        }
+        AmbientPhase::Despawn => {
+            // Spawns and burning stay off, but the despawn scan is ungated, so
+            // the radius proof still runs.
+            session.set_ambient_spawning(false);
+            let before = session.mobs().len();
+            let player = session.player.position;
+            // Prefer a record the burner would never touch (e.g. a cave-dark
+            // hostile) so the surface burn witness survives the cull. When every
+            // record is burn-eligible the spawn phase guaranteed at least two, so
+            // removing the first still leaves one.
+            let victim = session
+                .mobs()
+                .iter()
+                .position(|mob| !combat_mob_burn_eligible(session, mob))
+                .unwrap_or(0);
+            let Some(first) = session.mobs_mut().get_mut(victim) else {
+                demo.abort("ambient", "despawn_no_record");
+                return true;
+            };
+            first.position = player + Vec3::new(DESPAWN_RADIUS + 8.0, 0.0, 0.0);
+            first.velocity = Vec3::ZERO;
+            for _ in 0..COMBAT_AMBIENT_DESPAWN_TICKS {
+                session.tick_mobs(0.05, 1.0);
+            }
+            let after = session.mobs().len();
+            let marked = session.spawn_report().despawned;
+            if after + 1 != before || marked != 1 {
+                demo.abort(
+                    "ambient",
+                    &format!("despawn before={before} after={after} marked={marked}"),
+                );
+                return true;
+            }
+            demo.spawn_despawned = 1;
+            demo.ambient_phase = AmbientPhase::Burn;
+            false
+        }
+        AmbientPhase::Burn => {
+            session.clock = GameClock::from_time(COMBAT_DAY_TICK);
+            // Burning must be on. Day passives may also spawn here; every
+            // assertion below ignores them.
+            session.set_ambient_spawning(true);
+            let before = session.spawn_report().burned;
+            let start_burnable = session
+                .mobs()
+                .iter()
+                .filter(|mob| combat_mob_burn_eligible(session, mob))
+                .count();
+            let mut finished = false;
+            for _ in 0..COMBAT_AMBIENT_BURN_TICKS {
+                // Demo pin, not a spawn rule (same shape as the Drops stage's
+                // `combat_pin_mob_for_hit`): hold every record on its immutable
+                // spawn anchor so a wander under a tree canopy cannot pause the
+                // burn cadence mid-kill and leave the run without a witness.
+                // Cave-dark records stay dark at their anchor and the burner
+                // simply ignores them.
+                for mob in session.mobs_mut() {
+                    mob.position = mob.home;
+                    mob.velocity = Vec3::ZERO;
+                }
+                session.tick_mobs(0.05, 1.0);
+                if !session
+                    .mobs()
+                    .iter()
+                    .any(|mob| combat_mob_burn_eligible(session, mob))
+                {
+                    finished = true;
+                    break;
+                }
+            }
+            let burned = session.spawn_report().burned.saturating_sub(before);
+            if !finished || burned < 1 {
+                // Self-describing: name the observed population so a world that
+                // only produced cave-dark hostiles (which never burn) is
+                // distinguishable from a clock or gate failure.
+                let total = session.mobs().len();
+                let hostiles = session
+                    .mobs()
+                    .iter()
+                    .filter(|mob| mob.kind.is_hostile() && mob.health > 0)
+                    .count();
+                let burnable = session
+                    .mobs()
+                    .iter()
+                    .filter(|mob| combat_mob_burn_eligible(session, mob))
+                    .count();
+                demo.abort(
+                    "ambient",
+                    &format!(
+                        "burned={burned} finished={finished} start_burnable={start_burnable} mobs={total} hostiles={hostiles} burnable={burnable}"
+                    ),
+                );
+                return true;
+            }
+            demo.spawn_burned = burned;
+            // Restore the pinned dusk clock and close the gate before the
+            // quartet stages: at dusk (`COMBAT_DUSK_TICK` is still day) the
+            // Zombie/Skeleton quartet would otherwise burn during a slow Walk
+            // and break the pinned `total == 4` verdict.
+            session.clock.time_of_day = COMBAT_DUSK_TICK;
+            session.set_ambient_spawning(false);
+            demo.spawn_digest = Some(demo.spawn_digest());
+            demo.stage = CombatStage::Spawn;
+            false
+        }
+    }
+}
+
+/// Horizontal (XZ) distance between two feet positions. The population layer's
+/// safe and despawn radii are horizontal by design, so the demo's checks are
+/// too: a mob deep in a cave below the player is still nearby.
+fn combat_horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+    let dx = a.x - b.x;
+    let dz = a.z - b.z;
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// Whether the burner's own eligibility rule would burn this record while the
+/// clock is day: a live hostile standing on an evaluated, fully sky-lit,
+/// non-water surface.
+///
+/// Mirrors `spawning::scan_burn` (which is private) through the public
+/// [`SpawnWorld`] capability, including the `column_ready` gate before the light
+/// read; the day/clock half of that rule is checked by the caller. The Ambient
+/// stage uses it both to require a burn witness up front and to decide when the
+/// burn phase is finished.
+fn combat_mob_burn_eligible(session: &WorldSession, mob: &Mob) -> bool {
+    if !mob.kind.is_hostile() || mob.health == 0 {
+        return false;
+    }
+    let feet = IVec3::new(
+        mob.position.x.floor() as i32,
+        mob.position.y.floor() as i32,
+        mob.position.z.floor() as i32,
+    );
+    let (cx, cz) = (
+        feet.x.div_euclid(CHUNK_SIZE as i32),
+        feet.z.div_euclid(CHUNK_SIZE as i32),
+    );
+    if !SpawnWorld::column_ready(&session.world, cx, cz) {
+        return false;
+    }
+    SpawnWorld::sky_light(&session.world, feet) == PASSIVE_SURFACE_LIGHT
+        && SpawnWorld::block(&session.world, feet) != BlockId::Water
+}
+
+/// The Fight stage: the slice's real-binary proof that a crafted wood sword
+/// hits the mob under the crosshair.
+///
+/// The whole hit sequence runs in ONE call, for the same reason
+/// [`combat_save_stage`] does: a redraw between two steps would run the mob
+/// runtime and make the reported numbers non-deterministic. Every value comes
+/// from a production seam — `selected_item`, `melee_candidate`,
+/// [`mining_after_attack`], [`MeleeState`], [`attack_damage`] and
+/// [`WorldSession::attack_mob`] — so the demo proves the shipped path instead
+/// of a parallel copy of it.
+///
+/// On success the stage latches `melee_hits`/`melee_damage`/`melee_blocked`
+/// and advances to `Drops`, which kills the two passive records and delivers
+/// their drops. The crafted wood sword stays in the inventory: it is the
+/// player's earned item and the milestone requires the inventory to persist, so
+/// it is part of the saved witness rather than a throwaway fixture. Every
+/// mismatch latches `stage=fight` naming the observed value, so a partial proof
+/// can never be mistaken for a pass.
+fn combat_fight_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let pig_kind = MobKind::ALL[0];
+    debug_assert_eq!(pig_kind, MobKind::Pig, "index 0 is the demo's Pig pin");
+
+    // Weapon preflight through production seams only. The fresh demo world
+    // starts with an empty inventory, so the stage inserts a real wood sword
+    // and selects it exactly like a player would.
+    let sword_id = ItemId::Tool {
+        kind: ToolKind::Sword,
+        tier: ToolTier::Wood,
+    };
+    let Ok(sword) = Item::new(sword_id, 1) else {
+        demo.abort("fight", "could_not_build_sword");
+        return true;
+    };
+    if !session.player.collect_item(sword) || !session.player.select_slot(0) {
+        demo.abort("fight", "sword_not_held");
+        return true;
+    }
+    let held = session.player.selected_item().map(|item| item.id());
+    if held != Some(sword_id) {
+        demo.abort("fight", &format!("held={held:?}"));
+        return true;
+    }
+    let origin = session.camera.position;
+    let player_position = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+
+    // Demo pose pin, NOT a spawn rule: the pig's feet are placed two blocks
+    // along the yaw forward axis at the player's own feet height, at full
+    // health with every combat timer cleared, so the hit sequence starts from
+    // a known state. `combat_save_stage` re-pins the real quartet witness
+    // afterwards, so nothing here can leak into the save.
+    let pig_feet = Vec3::new(
+        player_position.x + forward.x * 2.0,
+        player_position.y,
+        player_position.z + forward.z * 2.0,
+    );
+    let pig_centre = pig_feet + Vec3::Y * (pig_kind.height() * 0.5);
+    {
+        let mobs = session.mobs_mut();
+        if mobs.len() != 4 {
+            demo.abort("fight", &format!("mobs={}", mobs.len()));
+            return true;
+        }
+        let Some(pig) = mobs.first_mut() else {
+            demo.abort("fight", "mobs=0");
+            return true;
+        };
+        if pig.kind != pig_kind {
+            demo.abort("fight", &format!("kind={:?}", pig.kind));
+            return true;
+        }
+        pig.position = pig_feet;
+        pig.health = pig_kind.max_health();
+        pig.hurt = 0.0;
+        pig.hurt_iframe = 0.0;
+        pig.knockback = Vec3::ZERO;
+        // The other three records are parked far behind the camera (beyond
+        // any melee reach) so the crosshair test below is unambiguous no
+        // matter how far the Walk stage let them wander. `combat_save_stage`
+        // re-pins their real quartet pose in the next step.
+        for mob in mobs.iter_mut().skip(1) {
+            mob.position = player_position - forward * 20.0;
+            mob.health = mob.kind.max_health();
+            mob.hurt = 0.0;
+            mob.hurt_iframe = 0.0;
+            mob.knockback = Vec3::ZERO;
+        }
+    }
+    if session.mobs().is_empty() {
+        demo.abort("fight", "mobs=0");
+        return true;
+    }
+    let pig_health = session.mobs()[0].health;
+
+    // Crosshair ray: camera eye -> the pinned pig's AABB centre, normalized so
+    // `MELEE_REACH` is a block distance.
+    let dir = (pig_centre - origin).normalize_or_zero();
+    let Some(crosshair) = session.melee_candidate(origin, dir, MELEE_REACH) else {
+        demo.abort("fight", &format!("crosshair=miss reach={MELEE_REACH}"));
+        return true;
+    };
+    if crosshair.index != 0 {
+        demo.abort("fight", &format!("crosshair_index={}", crosshair.index));
+        return true;
+    }
+    if crosshair.distance > MELEE_REACH {
+        demo.abort(
+            "fight",
+            &format!("crosshair_distance={}", crosshair.distance),
+        );
+        return true;
+    }
+
+    // Priority proof with a guaranteed block: raycast the ground one block
+    // ahead of the player through the real voxel raycast and require a real
+    // `MiningTarget`, so the suppression rule below is proven against a
+    // genuine mining candidate rather than a fabricated one.
+    let mining_dir = (session.player.position + forward - origin).normalize_or_zero();
+    let mine_hit = raycast_voxels(origin, mining_dir, 8.0, |x, y, z| {
+        session.world.get_block(x, y, z)
+    });
+    let Some(mine_hit) = mine_hit else {
+        demo.abort("fight", "mining=no_block_ahead");
+        return true;
+    };
+    let mine_block = session.world.get_block(
+        mine_hit.block_pos.x,
+        mine_hit.block_pos.y,
+        mine_hit.block_pos.z,
+    );
+    let Some(mining) = MiningTarget::from_block(
+        mine_hit.block_pos,
+        mine_block,
+        session.player.selected_item(),
+    ) else {
+        demo.abort("fight", &format!("mining=unbreakable {mine_block:?}"));
+        return true;
+    };
+    if mining_after_attack(Some(crosshair), Some(mining)).is_some() {
+        demo.abort("fight", "mining=not_suppressed_by_attack");
+        return true;
+    }
+    if mining_after_attack(None, Some(mining)) != Some(mining) {
+        demo.abort("fight", "mining=suppressed_without_attack");
+        return true;
+    }
+
+    // First swing: the initial cooldown is zero, so one tick swings.
+    let mut melee = MeleeState::new();
+    let Some(target) = MeleeTarget::new(0, pig_health) else {
+        demo.abort("fight", &format!("target_health={pig_health}"));
+        return true;
+    };
+    if melee.tick(0.1, Some(target)) != (MeleeTick::Swing { index: 0 }) {
+        demo.abort("fight", "first_swing=blocked");
+        return true;
+    }
+    let damage = attack_damage(
+        session.player.selected_item(),
+        session.player.mode(),
+        target.health(),
+    );
+    if damage != SWORD_DAMAGE_WOOD {
+        demo.abort("fight", &format!("damage={damage}"));
+        return true;
+    }
+    let Some(first) = session.attack_mob(0, damage, origin) else {
+        demo.abort("fight", "first_hit=refused");
+        return true;
+    };
+    if first.damage != SWORD_DAMAGE_WOOD || first.health_after != 6 || first.killed {
+        demo.abort(
+            "fight",
+            &format!(
+                "first_hit damage={} health_after={} killed={}",
+                first.damage, first.health_after, first.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let pig = &session.mobs()[0];
+        if !(pig.hurt.is_finite() && pig.hurt > 0.0) {
+            demo.abort("fight", &format!("hurt={}", pig.hurt));
+            return true;
+        }
+        if !(pig.hurt_iframe.is_finite() && pig.hurt_iframe > 0.0) {
+            demo.abort("fight", &format!("hurt_iframe={}", pig.hurt_iframe));
+            return true;
+        }
+        let knockback = Vec3::new(pig.knockback.x, 0.0, pig.knockback.z);
+        let away = Vec3::new(pig.position.x - origin.x, 0.0, pig.position.z - origin.z);
+        if knockback.length_squared() <= 0.0 || knockback.dot(away) <= 0.0 {
+            demo.abort(
+                "fight",
+                &format!(
+                    "knockback=({:.3},{:.3}) away=({:.3},{:.3})",
+                    knockback.x, knockback.z, away.x, away.z
+                ),
+            );
+            return true;
+        }
+    }
+
+    // Blocked re-hit: the 0.5 s i-frame window refuses a second hit through
+    // the exact production call the frame loop uses.
+    let mut blocked = 0u32;
+    if session.attack_mob(0, SWORD_DAMAGE_WOOD, origin).is_some() {
+        demo.abort("fight", "iframe=not_enforced");
+        return true;
+    }
+    blocked += 1;
+    if matches!(melee.tick(0.0, Some(target)), MeleeTick::Swing { .. }) {
+        demo.abort("fight", "cooldown=not_enforced");
+        return true;
+    }
+
+    // Cooldown re-arm WITHOUT skipping the clamp: `MeleeState::tick` clamps a
+    // frame to `MAX_DT` (0.1 s), so one `tick(SWING_COOLDOWN_SECS, ..)` would
+    // prove nothing. Walk the 0.6 s window in eight 0.1 s frames and require
+    // exactly one swing across it (the cooldown elapses after six or seven
+    // decays, so only the count is asserted).
+    let live_target = MeleeTarget::new(0, session.mobs()[0].health);
+    let mut swings = 0u32;
+    for _ in 0..8 {
+        if let MeleeTick::Swing { index } = melee.tick(0.1, live_target) {
+            if index != 0 {
+                demo.abort("fight", &format!("cooldown_index={index}"));
+                return true;
+            }
+            swings += 1;
+        }
+    }
+    if swings != 1 {
+        demo.abort("fight", &format!("cooldown_swings={swings}"));
+        return true;
+    }
+
+    // The pure swing clock above advanced 0.8 s of input time, while the mob's
+    // timers only decay inside the fixed-rate runtime. Age the runtime by the
+    // same 0.8 s so the second hit lands on an expired 0.5 s i-frame window
+    // rather than being refused by the window the blocked re-hit just proved.
+    for _ in 0..8 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    let iframe = session.mobs()[0].hurt_iframe;
+    if iframe > 0.0 {
+        demo.abort("fight", &format!("iframe_not_expired={iframe}"));
+        return true;
+    }
+    let Some(second) = session.attack_mob(0, SWORD_DAMAGE_WOOD, origin) else {
+        demo.abort("fight", "second_hit=refused");
+        return true;
+    };
+    if second.damage != SWORD_DAMAGE_WOOD || second.health_after != 2 || second.killed {
+        demo.abort(
+            "fight",
+            &format!(
+                "second_hit damage={} health_after={} killed={}",
+                second.damage, second.health_after, second.killed
+            ),
+        );
+        return true;
+    }
+    let final_health = session.mobs()[0].health;
+    if final_health != 2 {
+        demo.abort("fight", &format!("health={final_health}"));
+        return true;
+    }
+
+    // The demo sword is a real earned item, not a fixture: it stays in the
+    // hotbar so the saved witness carries the player's inventory into the
+    // Drops stage and through the reload.
+
+    // Latch the observed numbers the success digest reports, then hand over to
+    // the Drops stage, which kills the two passive records (fleeing, collapsing
+    // and being reaped) and delivers their drops into this same inventory.
+    demo.melee_hits = 2;
+    demo.melee_damage = SWORD_DAMAGE_WOOD;
+    demo.melee_blocked = blocked;
+    demo.stage = CombatStage::Drops;
+    false
+}
+
+/// Re-pins one demo mob at `feet` with every ephemeral combat timer cleared, so
+/// each scripted hit starts from the same known state.
+///
+/// Demo pose pin, NOT a gameplay rule: the Drops stage owns the pose of the
+/// record it is about to hit, exactly like the Fight stage owns the Pig's pin.
+fn combat_pin_mob_for_hit(session: &mut WorldSession, index: usize, feet: Vec3) {
+    if let Some(mob) = session.mobs_mut().get_mut(index) {
+        mob.position = feet;
+        mob.home = feet;
+        mob.velocity = Vec3::ZERO;
+        mob.knockback = Vec3::ZERO;
+        mob.hurt = 0.0;
+        mob.hurt_iframe = 0.0;
+        mob.flee = 0.0;
+        mob.death = 0.0;
+        mob.state = MobAiState::Wander;
+    }
+}
+
+/// Total `id` units across all 36 inventory slots (order-independent).
+fn combat_inventory_units(session: &WorldSession, id: ItemId) -> u32 {
+    session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .filter(|item| item.id() == id)
+        .map(|item| u32::from(item.count()))
+        .sum()
+}
+
+/// Aims the crosshair ray at `index`'s AABB centre and applies one real wood
+/// sword hit through [`WorldSession::melee_candidate`] +
+/// [`WorldSession::attack_mob`].
+///
+/// Returns the observed failure as a string instead of aborting directly, so
+/// the caller latches one self-describing `stage=drops` digest.
+fn combat_sword_hit(
+    session: &mut WorldSession,
+    index: usize,
+    origin: Vec3,
+) -> Result<MobHit, String> {
+    let Some(mob) = session.mobs().get(index) else {
+        return Err(format!("index={index}"));
+    };
+    let (min, max) = mob.aabb();
+    let centre = (min + max) * 0.5;
+    let dir = (centre - origin).normalize_or_zero();
+    let Some(candidate) = session.melee_candidate(origin, dir, MELEE_REACH) else {
+        return Err(format!("crosshair=miss index={index}"));
+    };
+    if candidate.index != index {
+        return Err(format!(
+            "crosshair_index={} expected={index}",
+            candidate.index
+        ));
+    }
+    session
+        .attack_mob(index, SWORD_DAMAGE_WOOD, origin)
+        .ok_or_else(|| format!("hit_refused index={index}"))
+}
+
+/// The Drops stage: the slice's real-binary proof that a hit makes a passive mob
+/// flee away, that a lethal hit collapses the box model and then removes the
+/// record, and that a player-attributed kill lands its raw meat and leather in
+/// the real 36-slot inventory.
+///
+/// Runs entirely in ONE call, like the Fight stage: every number here is
+/// observable, and a redraw between two partial phases would let the mob runtime
+/// move a record the next check describes. Every mutation goes through a
+/// production seam — [`WorldSession::melee_candidate`],
+/// [`WorldSession::attack_mob`], [`WorldSession::tick_mobs`] (which reaps
+/// internally), [`WorldSession::resolve_mob_kill`] and [`mob_drop_items`] — so
+/// the demo proves the shipped path instead of a parallel copy of it.
+///
+/// On success it latches `killed`/`drops`/`drops_lost` and advances to `Save`,
+/// which pins the two surviving hostile records and writes the witness.
+fn combat_drops_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let sword_id = ItemId::Tool {
+        kind: ToolKind::Sword,
+        tier: ToolTier::Wood,
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(sword_id) {
+        demo.abort("drops", "sword_not_held");
+        return true;
+    }
+    let origin = session.camera.position;
+    let player_position = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+    // The pin point: two blocks along the yaw forward axis at the player's own
+    // feet height, always inside the resident spawn chunks the Walk stage
+    // proved. Both passive phases reuse it.
+    let pin_feet = Vec3::new(
+        player_position.x + forward.x * 2.0,
+        player_position.y,
+        player_position.z + forward.z * 2.0,
+    );
+    let horizontal_from_player = |feet: Vec3| {
+        Vec3::new(feet.x - player_position.x, 0.0, feet.z - player_position.z).length()
+    };
+    let mut accepted = 0u32;
+    let mut lost = 0u32;
+
+    // ---- Pig: 10 -> 6 (flee) -> 2 -> 0 (collapse) -> reap ----------------
+    if session.mobs().first().map(|mob| mob.kind) != Some(MobKind::Pig) {
+        demo.abort("drops", "pig_index0_missing");
+        return true;
+    }
+    session.mobs_mut()[0].health = MobKind::Pig.max_health();
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 6 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_first health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let pig = &session.mobs()[0];
+        if pig.state != MobAiState::Flee || pig.flee <= 0.0 || pig.death != 0.0 {
+            demo.abort(
+                "drops",
+                &format!(
+                    "pig_flee state={:?} flee={} death={}",
+                    pig.state, pig.flee, pig.death
+                ),
+            );
+            return true;
+        }
+    }
+
+    // Flee is a runtime behaviour, not a field flip: age the fixed-rate runtime
+    // (six 0.1 s frames = twelve fixed steps) and require the Pig to be farther
+    // from the player, with the 0.5 s i-frame window expired (ten steps).
+    let before_flee = horizontal_from_player(session.mobs()[0].position);
+    for _ in 0..6 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    let after_flee = horizontal_from_player(session.mobs()[0].position);
+    if after_flee <= before_flee {
+        demo.abort(
+            "drops",
+            &format!("pig_flee before={before_flee:.3} after={after_flee:.3}"),
+        );
+        return true;
+    }
+    let iframe = session.mobs()[0].hurt_iframe;
+    if iframe != 0.0 {
+        demo.abort("drops", &format!("pig_iframe={iframe}"));
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 2 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_second health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, 0, pin_feet);
+    let hit = match combat_sword_hit(session, 0, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 0 || !hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_lethal health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let pig = &session.mobs()[0];
+        if pig.death <= 0.0 || pig.death_progress() >= 1.0 || pig.velocity != Vec3::ZERO {
+            demo.abort(
+                "drops",
+                &format!(
+                    "pig_collapse death={} progress={:.3} velocity=({:.3},{:.3},{:.3})",
+                    pig.death,
+                    pig.death_progress(),
+                    pig.velocity.x,
+                    pig.velocity.y,
+                    pig.velocity.z
+                ),
+            );
+            return true;
+        }
+    }
+    let before_reap = session.mobs().len();
+    let report = session.resolve_mob_kill(0, hit, MobKillCause::Player);
+    if report != MobDropReport::new(2, 0) {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_drops accepted={} lost={}",
+                report.accepted, report.lost
+            ),
+        );
+        return true;
+    }
+    accepted += report.accepted;
+    lost += report.lost;
+
+    // The collapse must finish before the reaper may remove the record: age
+    // more than the pinned 0.8 s collapse in fixed steps.
+    for _ in 0..10 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    if session.mobs().len() + 1 != before_reap {
+        demo.abort(
+            "drops",
+            &format!(
+                "pig_reap before={before_reap} after={}",
+                session.mobs().len()
+            ),
+        );
+        return true;
+    }
+    if session.mobs().iter().any(|mob| mob.kind == MobKind::Pig) {
+        demo.abort("drops", "pig_record_survived_reap");
+        return true;
+    }
+    let porkchop = combat_inventory_units(session, ItemId::Material(Material::RawPorkchop));
+    let leather = combat_inventory_units(session, ItemId::Material(Material::Leather));
+    if porkchop != 1 || leather != 1 {
+        demo.abort(
+            "drops",
+            &format!("pig_inventory porkchop={porkchop} leather={leather}"),
+        );
+        return true;
+    }
+
+    // ---- Cow: 10 -> 6 (flee) -> 2 -> 0 (collapse) -> reap ----------------
+    // The index is looked up by kind: the Pig's record was reaped above, so
+    // every later slot shifted down by one.
+    let Some(cow_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.kind == MobKind::Cow)
+    else {
+        demo.abort("drops", "cow_missing");
+        return true;
+    };
+    session.mobs_mut()[cow_index].health = MobKind::Cow.max_health();
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 6 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_first health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let cow = &session.mobs()[cow_index];
+        if cow.state != MobAiState::Flee || cow.flee <= 0.0 || cow.death != 0.0 {
+            demo.abort(
+                "drops",
+                &format!(
+                    "cow_flee state={:?} flee={} death={}",
+                    cow.state, cow.flee, cow.death
+                ),
+            );
+            return true;
+        }
+    }
+
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 2 || hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_second health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+
+    combat_pin_mob_for_hit(session, cow_index, pin_feet);
+    let hit = match combat_sword_hit(session, cow_index, origin) {
+        Ok(hit) => hit,
+        Err(observed) => {
+            demo.abort("drops", &observed);
+            return true;
+        }
+    };
+    if hit.health_after != 0 || !hit.killed {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_lethal health_after={} killed={}",
+                hit.health_after, hit.killed
+            ),
+        );
+        return true;
+    }
+    {
+        let cow = &session.mobs()[cow_index];
+        if cow.death <= 0.0 || cow.death_progress() >= 1.0 || cow.velocity != Vec3::ZERO {
+            demo.abort(
+                "drops",
+                &format!(
+                    "cow_collapse death={} progress={:.3} velocity=({:.3},{:.3},{:.3})",
+                    cow.death,
+                    cow.death_progress(),
+                    cow.velocity.x,
+                    cow.velocity.y,
+                    cow.velocity.z
+                ),
+            );
+            return true;
+        }
+    }
+    let before_reap = session.mobs().len();
+    let report = session.resolve_mob_kill(cow_index, hit, MobKillCause::Player);
+    if report != MobDropReport::new(3, 0) {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_drops accepted={} lost={}",
+                report.accepted, report.lost
+            ),
+        );
+        return true;
+    }
+    accepted += report.accepted;
+    lost += report.lost;
+    for _ in 0..10 {
+        session.tick_mobs(0.1, 1.0);
+    }
+    if session.mobs().len() + 1 != before_reap {
+        demo.abort(
+            "drops",
+            &format!(
+                "cow_reap before={before_reap} after={}",
+                session.mobs().len()
+            ),
+        );
+        return true;
+    }
+    if session.mobs().iter().any(|mob| mob.kind == MobKind::Cow) {
+        demo.abort("drops", "cow_record_survived_reap");
+        return true;
+    }
+    let beef = combat_inventory_units(session, ItemId::Material(Material::RawBeef));
+    let leather = combat_inventory_units(session, ItemId::Material(Material::Leather));
+    if beef != 1 || leather != 3 {
+        demo.abort(
+            "drops",
+            &format!("cow_inventory beef={beef} leather={leather}"),
+        );
+        return true;
+    }
+
+    // Overflow self-check one level below the Player forwarder: a 35-full
+    // inventory with one empty slot must accept exactly one unit, report the
+    // other, and produce the exact overflow notice. The solved batch comes from
+    // the same `mob_drop_items` bridge the kill seam uses.
+    let Some(stick) = Item::new(ItemId::Material(Material::Stick), 64).ok() else {
+        demo.abort("drops", "stick_stack_build_failed");
+        return true;
+    };
+    let mut slots = [None; INVENTORY_SLOTS];
+    for slot in slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+        *slot = Some(stick);
+    }
+    let mut inventory = Inventory::from_parts(slots, None);
+    let Some(pig_items) = mob_drop_items(MobKind::Pig, session.world.seed(), IVec3::new(0, 0, 0))
+    else {
+        demo.abort("drops", "pig_table_unresolved");
+        return true;
+    };
+    let outcome = inventory.collect_items(&pig_items);
+    if outcome.accepted != 1 || outcome.lost != 1 {
+        demo.abort(
+            "drops",
+            &format!(
+                "overflow accepted={} lost={}",
+                outcome.accepted, outcome.lost
+            ),
+        );
+        return true;
+    }
+    let notice = mob_drop_notice(MobDropReport::new(outcome.accepted, outcome.lost));
+    if notice != Some("Inventory full: some mob drops were lost") {
+        demo.abort("drops", &format!("overflow_notice={notice:?}"));
+        return true;
+    }
+
+    demo.killed = 2;
+    demo.drops = accepted;
+    demo.drops_lost = lost;
+    demo.stage = CombatStage::Hostile;
+    false
+}
+
+/// Total item units across all 36 inventory slots plus the cursor stack.
+///
+/// [`combat_inventory_units`] answers "how much of this item id"; this answers
+/// "how much of anything", which is what the Hostile stage needs to prove a
+/// respawn keeps the whole inventory instead of only the sword.
+fn combat_inventory_units_total(session: &WorldSession) -> u32 {
+    let inventory = session.player.inventory();
+    let slots: u32 = inventory
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .map(|item| u32::from(item.count()))
+        .sum();
+    slots + inventory.cursor().map_or(0, |item| u32::from(item.count()))
+}
+
+/// Whether a zombie can be pinned with its feet at `feet` and still see the
+/// player's eyes from `eye`.
+///
+/// The stage's spot rule: the feet and head blocks must be air, the block below
+/// must be solid, and the eye-to-eye ray must be clear. It is a demo placement
+/// guard, not a gameplay rule — the production steering brain re-checks LOS
+/// every step and would refuse the aggro on its own.
+fn combat_hostile_spot_ok(session: &WorldSession, feet: Vec3, eye: Vec3) -> bool {
+    if !feet.is_finite() {
+        return false;
+    }
+    let x = feet.x.floor() as i32;
+    let y = feet.y.floor() as i32;
+    let z = feet.z.floor() as i32;
+    if session.world.get_block(x, y, z) != BlockId::Air
+        || session.world.get_block(x, y + 1, z) != BlockId::Air
+        || !session.world.get_block(x, y - 1, z).is_solid()
+    {
+        return false;
+    }
+    opencraft::world::mob_ai::has_line_of_sight(&session.world, feet + Vec3::Y * 1.5, eye)
+}
+
+/// Snap a player's feet height to the block top it is standing on.
+///
+/// Physics leaves a resting player within a few ULPs of the integer block top.
+/// A spot search that floors the raw float can therefore pick the block *below*
+/// the feet on one run and the feet block on the next, which is exactly the
+/// kind of sub-millimetre drift a pinned real-binary proof must not inherit.
+/// The game has no half blocks, so the epsilon floor is the physical feet cell.
+fn combat_spot_feet_y(y: f32) -> f32 {
+    (y + 1e-3).floor()
+}
+
+/// The Hostile stage: the slice's real-binary proof that a Zombie acquires the
+/// player through line of sight, closes to melee range, and lands repeated
+/// 3-damage hits at a 1.0 s cadence with knockback until the player dies with a
+/// `Zombie` cause; then that `respawn()` returns to the deterministic spawn
+/// with the whole inventory kept.
+///
+/// Runs entirely in ONE call, like Fight and Drops: every number here is
+/// observable, and a redraw between two partial phases would let the mob
+/// runtime move a record the next check describes. Every mutation goes through
+/// a production seam — [`WorldSession::set_hostile_ai_enabled`],
+/// [`WorldSession::tick_mobs`] (the same fixed 20 Hz runtime the frame loop
+/// owns, which builds the `MobTarget`, runs the steering brain, decides the
+/// melee swing and applies it), [`WorldSession::is_dead`],
+/// [`WorldSession::last_damage_cause`], [`WorldSession::respawn`] and
+/// [`WorldSession::spawn_position`] — so the demo proves the shipped path
+/// instead of a parallel copy of it.
+///
+/// Two documented demo pins, not gameplay rules:
+///
+/// * the live Zombie is re-pinned at a chosen spot next to the player (the
+///   Drops stage leaves the quartet pose, and the stage needs a measured
+///   starting distance);
+/// * the player pose is restored afterwards, so the Shot stage and the Save
+///   witness start from the same pinned pose (the v7 layout itself is measured
+///   by the fresh-leg test, never by this stage).
+///
+/// The Skeleton is left where Drops left it: it is hostile and will chase, but
+/// it has no attack profile, so it can never add a damage event.
+fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    if mobs != 2 || zombies != 1 {
+        demo.abort("hostile", &format!("mobs={mobs} zombies={zombies}"));
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("hostile", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+
+    // The respawn assertion compares against the pose the Save witness expects,
+    // and the inventory total is the one number a respawn must not disturb.
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+
+    // Spot selection: two blocks along the player's yaw forward axis first,
+    // then the same radius at 45-degree yaw offsets in a fixed order, so a
+    // terrain edge cannot make the stage flaky while the choice stays
+    // deterministic. The seed-1 demo pose is measured against this list.
+    let feet_y = combat_spot_feet_y(session.player.position.y);
+    let eye = session.player.eye_position();
+    let mut spot = None;
+    for step in 0..8u32 {
+        let angle = session.player.yaw + step as f32 * std::f32::consts::FRAC_PI_4;
+        let candidate = Vec3::new(
+            session.player.position.x + angle.cos() * 2.0,
+            feet_y,
+            session.player.position.z + angle.sin() * 2.0,
+        );
+        if combat_hostile_spot_ok(session, candidate, eye) {
+            spot = Some(candidate);
+            break;
+        }
+    }
+    let Some(spot) = spot else {
+        demo.abort(
+            "hostile",
+            &format!(
+                "observed=spot player=({:.3},{:.3},{:.3}) yaw={:.3} pitch={:.3} eye=({:.3},{:.3},{:.3})",
+                session.player.position.x,
+                session.player.position.y,
+                session.player.position.z,
+                session.player.yaw,
+                session.player.pitch,
+                eye.x,
+                eye.y,
+                eye.z
+            ),
+        );
+        return true;
+    };
+
+    let player = session.player.position;
+    let Some(zombie_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.kind == MobKind::Zombie)
+    else {
+        demo.abort("hostile", "observed=zombie_missing");
+        return true;
+    };
+    {
+        let mob = &mut session.mobs_mut()[zombie_index];
+        mob.position = spot;
+        // Mob yaw 0 faces +Z, so `atan2(dx, dz)` turns it toward the player.
+        mob.yaw = (player.x - spot.x).atan2(player.z - spot.z);
+        mob.health = MobKind::Zombie.max_health();
+        mob.state = MobAiState::Wander;
+        mob.aggro = 0.0;
+        mob.stuck = 0.0;
+        mob.reaggro = 0.0;
+        mob.cooldown = 0.0;
+        mob.velocity = Vec3::ZERO;
+        mob.knockback = Vec3::ZERO;
+    }
+
+    session.set_hostile_ai_enabled(true);
+    let mut attacks = 0u32;
+    let mut damage = 0u16;
+    let mut knockback = false;
+    for _ in 0..COMBAT_HOSTILE_ABORT_TICKS {
+        let before = session.player.survival.health();
+        session.tick_mobs(0.1, 1.0);
+        let lost = before.saturating_sub(session.player.survival.health());
+        if lost > 0 {
+            // One accepted hit per player i-frame window, never more: a single
+            // 20 Hz frame cannot land two 3-damage hits. The only accepted
+            // shortfall is the saturating final hit (2 hp left, 3 requested),
+            // which is also the hit that kills.
+            if lost != 3 && !(session.is_dead() && lost < 3) {
+                demo.abort("hostile", &format!("damage={lost}"));
+                return true;
+            }
+            attacks += 1;
+            damage = damage.saturating_add(lost);
+            if session.player.combat.knockback().length_squared() > 1e-6 {
+                knockback = true;
+            }
+        }
+        if session.is_dead() {
+            break;
+        }
+    }
+
+    // 7 requested hits x 3 damage = 21, but the applied total is 20 because the
+    // last hit saturates the 2 hp left. Report APPLIED damage, not requested.
+    let cause = session.last_damage_cause();
+    if !session.is_dead()
+        || attacks != 7
+        || damage != 20
+        || !knockback
+        || cause != Some(DamageCause::Zombie)
+    {
+        demo.abort(
+            "hostile",
+            &format!(
+                "dead={} attacks={attacks} damage={damage} knockback={knockback} cause={:?}",
+                session.is_dead(),
+                cause
+            ),
+        );
+        return true;
+    }
+
+    // Respawn through the production seam, then prove every post-condition the
+    // Death screen and the HUD depend on.
+    let spawn = WorldSession::spawn_position(demo.seed);
+    session.respawn();
+    let items_after = combat_inventory_units_total(session);
+    let chasing = session
+        .mobs()
+        .iter()
+        .any(|mob| mob.state == MobAiState::Chase);
+    let alive = !session.is_dead();
+    let health = session.player.survival.health();
+    let position = session.player.position;
+    let cause_cleared = session.last_damage_cause().is_none();
+    let flash = session.player_hurt_intensity();
+    if !alive
+        || health != 20
+        || position != spawn
+        || !cause_cleared
+        || flash != 0.0
+        || items_after != items_before
+        || chasing
+    {
+        demo.abort(
+            "hostile",
+            &format!(
+                "respawn alive={alive} health={health} spawn={} cause={cause_cleared} flash={flash} items={items_after}/{items_before} chase={chasing}",
+                position == spawn
+            ),
+        );
+        return true;
+    }
+
+    // Documented demo pin: restore the pose the Save stage's witness and the
+    // reload leg's quartet recomputation depend on. `respawn()` moved the body
+    // to the world spawn; the saved player state must stay byte-identical.
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.sync_camera();
+    session.set_hostile_ai_enabled(false);
+    session.player.combat.reset();
+
+    demo.hostile_attacks = attacks;
+    demo.hostile_damage = damage;
+    demo.hostile_knockback = knockback;
+    demo.hostile_cause = true;
+    demo.hostile_respawn = true;
+    demo.hostile_inventory_kept = true;
+    demo.hostile_digest = Some(demo.hostile_digest());
+    demo.stage = CombatStage::Shot;
+    false
+}
+
+/// The Shot stage: the real-binary proof that a bow charge fires through the
+/// shipped ammo/wear seam and that the projectile resolves against both a body
+/// and a block.
+///
+/// Runs entirely in ONE call, like Fight/Drops/Hostile: every number here is
+/// observable, and a redraw between two partial phases could let the mob
+/// runtime move a record the next check describes. The draw curve is driven by
+/// the same pure [`BowState`] the input path owns, and the only host mutations
+/// go through [`WorldSession::fire_bow`] and [`WorldSession::tick_arrows`] —
+/// the exact seams the Playing frame calls — so the stage proves the shipped
+/// path instead of a parallel copy.
+///
+/// Two documented demo pins, not gameplay rules:
+///
+/// * a real wood bow and four real arrows are granted through
+///   [`opencraft::player::physics::Player::collect_items`] (the demo has no
+///   crafting step of its own, and the save witness must carry the earned
+///   bow);
+/// * the Zombie is re-pinned two blocks along the yaw forward axis at the
+///   player's feet height (the Fight stage's pig pin) with every combat timer
+///   cleared, and the Skeleton is parked 20 blocks behind the camera so the
+///   shot ray is unambiguous. [`combat_save_stage`] re-pins both survivors
+///   afterwards, so nothing here can leak into the witness.
+///
+/// Every mismatch latches `stage=shot` with the named observed fact and ends
+/// the run non-zero, so a partial proof can never be mistaken for a pass.
+fn combat_shot_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "shot",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("shot", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "shot",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+
+    // Grant the real bow and arrows through the production pickup seam.
+    let bow_id = ItemId::Tool {
+        kind: ToolKind::Bow,
+        tier: ToolTier::Wood,
+    };
+    let arrow_id = ItemId::Material(Material::Arrow);
+    let (Ok(bow), Ok(arrows)) = (Item::new(bow_id, 1), Item::new(arrow_id, 4)) else {
+        demo.abort("shot", "observed=item");
+        return true;
+    };
+    let grant = session.player.collect_items(&[bow, arrows]);
+    if grant.lost != 0 {
+        demo.abort("shot", &format!("grant_lost={}", grant.lost));
+        return true;
+    }
+    let ammo_before = combat_inventory_units(session, arrow_id);
+    if ammo_before != 4 {
+        demo.abort("shot", &format!("ammo={ammo_before}"));
+        return true;
+    }
+    let Some(bow_slot) = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .position(|slot| slot.as_ref().map(|item| item.id()) == Some(bow_id))
+    else {
+        demo.abort("shot", "observed=bow_slot");
+        return true;
+    };
+    if !session.player.select_slot(bow_slot)
+        || session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+    {
+        demo.abort("shot", &format!("held=slot{bow_slot}"));
+        return true;
+    }
+    let bow_before = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if bow_before != Some(ToolTier::Wood.max_durability()) {
+        demo.abort("shot", &format!("bow={bow_before:?}"));
+        return true;
+    }
+
+    // Demo pose pin: the Zombie two blocks forward at the player's feet height,
+    // the Skeleton far behind the camera. Both records start at full health with
+    // every combat timer cleared.
+    let player_position = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+    let zombie_feet = Vec3::new(
+        player_position.x + forward.x * 2.0,
+        player_position.y,
+        player_position.z + forward.z * 2.0,
+    );
+    {
+        let mobs = session.mobs_mut();
+        let Some(zombie) = mobs.iter_mut().find(|mob| mob.kind == MobKind::Zombie) else {
+            demo.abort("shot", "observed=zombie_missing");
+            return true;
+        };
+        zombie.position = zombie_feet;
+        zombie.home = zombie_feet;
+        zombie.health = MobKind::Zombie.max_health();
+        zombie.state = MobAiState::Wander;
+        zombie.velocity = Vec3::ZERO;
+        zombie.knockback = Vec3::ZERO;
+        zombie.hurt = 0.0;
+        zombie.hurt_iframe = 0.0;
+        zombie.cooldown = 0.0;
+        zombie.flee = 0.0;
+        zombie.death = 0.0;
+        zombie.aggro = 0.0;
+        zombie.stuck = 0.0;
+        zombie.reaggro = 0.0;
+        let Some(skeleton) = mobs.iter_mut().find(|mob| mob.kind == MobKind::Skeleton) else {
+            demo.abort("shot", "observed=skeleton_missing");
+            return true;
+        };
+        skeleton.position = player_position - forward * 20.0;
+        skeleton.home = skeleton.position;
+        skeleton.health = MobKind::Skeleton.max_health();
+        skeleton.state = MobAiState::Wander;
+        skeleton.velocity = Vec3::ZERO;
+        skeleton.knockback = Vec3::ZERO;
+        skeleton.hurt = 0.0;
+        skeleton.hurt_iframe = 0.0;
+        skeleton.cooldown = 0.0;
+        skeleton.flee = 0.0;
+        skeleton.death = 0.0;
+        skeleton.aggro = 0.0;
+        skeleton.stuck = 0.0;
+        skeleton.reaggro = 0.0;
+    }
+    session.sync_camera();
+
+    let Some(target) = session
+        .player
+        .selected_item()
+        .and_then(|item| BowTarget::new(bow_slot, item))
+    else {
+        demo.abort("shot", "observed=bow_target");
+        return true;
+    };
+
+    // 1. Sub-threshold release: a 0.1 s draw is below the 0.2 s minimum, so the
+    //    release cancels and nothing is spent.
+    let mut bow = BowState::new();
+    let partial = bow.tick(0.1, Some(target));
+    if partial != (BowTick::Charging { progress: 0.1 }) {
+        demo.abort("shot", &format!("partial={partial:?}"));
+        return true;
+    }
+    if bow.release().is_some() {
+        demo.abort("shot", "observed=cancel_fired");
+        return true;
+    }
+    let ammo_after_cancel = combat_inventory_units(session, arrow_id);
+    let bow_after_cancel = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if !session.arrows().is_empty()
+        || ammo_after_cancel != ammo_before
+        || bow_after_cancel != bow_before
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "cancel arrows={} ammo={ammo_after_cancel} bow={bow_after_cancel:?}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 2. Full draw at ten 0.1 s ticks, then one real shot.
+    let mut last = BowTick::Idle;
+    for _ in 0..10 {
+        last = bow.tick(0.1, Some(target));
+    }
+    if last != BowTick::Full {
+        demo.abort("shot", &format!("charge={last:?}"));
+        return true;
+    }
+    let Some(charge) = bow.release() else {
+        demo.abort("shot", "observed=release");
+        return true;
+    };
+    if (charge - 1.0).abs() > 1e-6 {
+        demo.abort("shot", &format!("charge={charge}"));
+        return true;
+    }
+    let origin = session.camera.position;
+    let centre = zombie_feet + Vec3::Y * (MobKind::Zombie.height() * 0.5);
+    let dir = (centre - origin).normalize_or_zero();
+    let fired = match session.fire_bow(origin, dir, charge) {
+        Ok(arrow) => arrow,
+        Err(error) => {
+            demo.abort("shot", &format!("fire={error:?}"));
+            return true;
+        }
+    };
+    let speed = fired.velocity.length();
+    if fired.damage != 4 || (speed - 32.0).abs() > 1e-3 {
+        demo.abort(
+            "shot",
+            &format!("arrow damage={} speed={speed}", fired.damage),
+        );
+        return true;
+    }
+    let ammo_after_first = combat_inventory_units(session, arrow_id);
+    let bow_after_first = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if session.arrows().len() != 1
+        || ammo_after_first != 3
+        || bow_after_first != Some(ToolTier::Wood.max_durability() - 1)
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "first arrows={} ammo={ammo_after_first} bow={bow_after_first:?}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 3. One 0.1 s tick: the arrow reaches the Zombie, damages it, knocks it
+    //    away from the shooter, and is spent.
+    let hit_tick = session.tick_arrows(0.1, 1.0);
+    let Some(zombie) = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.kind == MobKind::Zombie)
+    else {
+        demo.abort("shot", "observed=zombie_missing");
+        return true;
+    };
+    let expected_health = MobKind::Zombie.max_health() - fired.damage;
+    let away = Vec3::new(
+        zombie.position.x - origin.x,
+        0.0,
+        zombie.position.z - origin.z,
+    );
+    if hit_tick.mob_hits != 1
+        || !session.arrows().is_empty()
+        || zombie.health != expected_health
+        || zombie.hurt <= 0.0
+        || zombie.knockback.length_squared() <= 1e-6
+        || zombie.knockback.dot(away) <= 0.0
+    {
+        demo.abort(
+            "shot",
+            &format!(
+                "hit hits={} arrows={} health={} hurt={} knockback={}",
+                hit_tick.mob_hits,
+                session.arrows().len(),
+                zombie.health,
+                zombie.hurt,
+                zombie.knockback.length_squared() > 1e-6
+            ),
+        );
+        return true;
+    }
+    let damage = fired.damage;
+
+    // 4. A straight-down shot embeds in the ground and expires ~2 s later. The
+    //    loop is bounded so a broken block test fails instead of hanging, and
+    //    it requires both halves: an observed Embedded arrow after a block hit,
+    //    and an empty list with a counted expiry.
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+        && (!session.player.select_slot(bow_slot)
+            || session.player.selected_item().map(|item| item.id()) != Some(bow_id))
+    {
+        demo.abort("shot", "observed=bow_reselect");
+        return true;
+    }
+    if let Err(error) = session.fire_bow(session.camera.position, -Vec3::Y, 1.0) {
+        demo.abort("shot", &format!("embed_fire={error:?}"));
+        return true;
+    }
+    let mut embed_seen = false;
+    let mut expired = 0u32;
+    let mut emptied = false;
+    for _ in 0..60 {
+        let tick = session.tick_arrows(0.1, 1.0);
+        if tick.block_hits >= 1
+            && session
+                .arrows()
+                .iter()
+                .any(|arrow| arrow.state == ArrowState::Embedded)
+        {
+            embed_seen = true;
+        }
+        expired = expired.saturating_add(tick.expired);
+        if session.arrows().is_empty() {
+            emptied = true;
+            break;
+        }
+    }
+    if !embed_seen || !emptied || expired == 0 {
+        demo.abort(
+            "shot",
+            &format!(
+                "embed seen={embed_seen} emptied={emptied} expired={expired} arrows={}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    let ammo_after = combat_inventory_units(session, arrow_id);
+    let bow_after = session
+        .player
+        .selected_item()
+        .and_then(|item| item.durability());
+    if ammo_after != 2 || bow_after != Some(ToolTier::Wood.max_durability() - 2) {
+        demo.abort("shot", &format!("ammo={ammo_after} bow={bow_after:?}"));
+        return true;
+    }
+
+    demo.shot_charged = true;
+    demo.shot_canceled = true;
+    demo.shot_fired = 1;
+    demo.shot_mob_hits = hit_tick.mob_hits;
+    demo.shot_damage = damage;
+    demo.shot_knockback = true;
+    demo.shot_embed = true;
+    demo.shot_expired = true;
+    demo.shot_ammo = ammo_after;
+    demo.shot_bow = bow_after;
+    demo.shot_digest = Some(demo.shot_digest());
+    demo.stage = CombatStage::Skeleton;
+    false
+}
+
+/// One pinned survivor snapshot the Skeleton stage parks, re-pins, and restores.
+///
+/// The stage keys every write on `home` (never a list index): the synthetic
+/// victim is removed by its `home`, so a reaped corpse or a record that streams
+/// in can never shift the record the stage is proving.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct CombatSkeletonSurvivor {
+    kind: MobKind,
+    position: Vec3,
+    home: Vec3,
+    yaw: f32,
+    health: u16,
+}
+
+/// Write one survivor snapshot onto the record whose `home` is `key`.
+///
+/// Returns false when no record carries that key, so the caller latches an abort
+/// instead of silently proving a world it does not own.
+fn combat_skeleton_pin(
+    session: &mut WorldSession,
+    key: Vec3,
+    survivor: &CombatSkeletonSurvivor,
+) -> bool {
+    let Some(mob) = session
+        .mobs_mut()
+        .iter_mut()
+        .find(|mob| mob.home.distance_squared(key) <= 1e-6)
+    else {
+        return false;
+    };
+    mob.position = survivor.position;
+    mob.home = survivor.home;
+    mob.yaw = survivor.yaw;
+    mob.health = survivor.health;
+    mob.state = MobAiState::Wander;
+    mob.velocity = Vec3::ZERO;
+    mob.knockback = Vec3::ZERO;
+    mob.hurt = 0.0;
+    mob.hurt_iframe = 0.0;
+    mob.cooldown = 0.0;
+    mob.flee = 0.0;
+    mob.death = 0.0;
+    mob.aggro = 0.0;
+    mob.stuck = 0.0;
+    mob.stuck_anchor = survivor.position;
+    mob.reaggro = 0.0;
+    true
+}
+
+/// The Skeleton stage's deterministic stand-off spot finder.
+///
+/// Scans 16 angles around the player's facing, the five fire-band radii, and a
+/// four-block vertical window for a cell that is a legal skeleton standing
+/// place *and* whose rare-bow [`drop_roll`] lands the one-in-sixteen gate. The
+/// scan order is fixed and no RNG or clock enters it, so the same world always
+/// proves the same spot.
+///
+/// Acceptance is the production placement contract the brain re-checks every
+/// step: feet and head blocks air, a solid block under the feet, an open eye
+/// cell, and a clear ray from the skeleton's eye (feet + 1.5) to the player's
+/// eye. The rare-bow clause is what lets the kill proof below exercise the real
+/// drop table's rare branch instead of asserting a `false` the harness would
+/// never see.
+fn combat_skeleton_spot(session: &WorldSession, seed: u32) -> Option<Vec3> {
+    let player_feet = session.player.position;
+    let player_eye = session.player.eye_position();
+    let bow = mob_drops(MobKind::Skeleton)
+        .iter()
+        .find(|drop| drop.item == MobDropItem::Bow)?;
+    for step in 0..16u32 {
+        let angle = session.player.yaw + step as f32 * (std::f32::consts::TAU / 16.0);
+        for radius in [5.5_f32, 6.5, 7.5, 8.5, 9.5] {
+            for offset in [-1.0_f32, 0.0, 1.0, 2.0] {
+                let feet = Vec3::new(
+                    player_feet.x + angle.cos() * radius,
+                    player_feet.y + offset,
+                    player_feet.z + angle.sin() * radius,
+                );
+                if !feet.is_finite() {
+                    continue;
+                }
+                let cell = IVec3::new(
+                    feet.x.floor() as i32,
+                    feet.y.floor() as i32,
+                    feet.z.floor() as i32,
+                );
+                if session.world.get_block(cell.x, cell.y, cell.z) != BlockId::Air
+                    || session.world.get_block(cell.x, cell.y + 1, cell.z) != BlockId::Air
+                    || !session
+                        .world
+                        .get_block(cell.x, cell.y - 1, cell.z)
+                        .is_solid()
+                {
+                    continue;
+                }
+                let eye = feet + Vec3::Y * 1.5;
+                let eye_cell = IVec3::new(
+                    eye.x.floor() as i32,
+                    eye.y.floor() as i32,
+                    eye.z.floor() as i32,
+                );
+                if session
+                    .world
+                    .get_block(eye_cell.x, eye_cell.y, eye_cell.z)
+                    .is_solid()
+                {
+                    continue;
+                }
+                if !opencraft::world::mob_ai::has_line_of_sight(&session.world, eye, player_eye) {
+                    continue;
+                }
+                if bow.rolls(drop_roll(seed, MobKind::Skeleton, cell)) {
+                    return Some(feet);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The Skeleton stage: the slice's real-binary proof that a stand-off skeleton
+/// fires a gravity-compensated arrow that damages the player and names
+/// `Skeleton arrow` as the death cause, that the respawn keeps the inventory,
+/// and that a player-killed skeleton delivers its bone/arrow/rare-bow table.
+///
+/// Runs entirely in ONE call, like every other stage: every number here is
+/// observable, and a redraw between two partial phases could let the mob
+/// runtime move a record the next check describes. Every mutation goes through
+/// a production seam — [`WorldSession::set_hostile_ai_enabled`],
+/// [`WorldSession::mobs_mut`], [`WorldSession::tick_mobs`] (the same fixed 20 Hz
+/// runtime the frame loop owns), [`WorldSession::tick_arrows`],
+/// [`WorldSession::fire_bow`], [`opencraft::player::survival::SurvivalState::damage`],
+/// [`WorldSession::respawn`], [`WorldSession::spawn_position`],
+/// [`WorldSession::last_damage_cause`], and
+/// [`opencraft::ui::screens::death_cause_line`] — so the demo proves the shipped
+/// path instead of a parallel copy of it.
+///
+/// Three documented demo pins, not gameplay rules:
+///
+/// * the two surviving pinned hostiles are parked 20 blocks behind the camera
+///   and re-pinned at the top of every observation, so a wander can never bring
+///   one inside the 16-block aggro range and steal the damage or death cause
+///   the stage is proving;
+/// * one synthetic victim `Mob::new(Skeleton, ..)` is pushed at a spot whose
+///   [`drop_roll`] lands the rare bow, with `home` fixed at that spot (the drop
+///   roll key) even when the kill proof re-pins its body two blocks forward;
+/// * the player is dropped to 1 hp from 18 through
+///   [`opencraft::player::survival::SurvivalState::damage`] so the *next*
+///   skeleton arrow is the killing blow and the death cause is unambiguous.
+///
+/// Every mismatch latches `stage=skeleton` with the named observed fact and ends
+/// the run non-zero, so a partial proof can never be mistaken for a pass.
+fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive, holding
+    // the bow the Shot stage earned.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "skeleton",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    if session.player.mode() != GameMode::Survival {
+        demo.abort("skeleton", &format!("mode={:?}", session.player.mode()));
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "skeleton",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+    let bow_id = ItemId::Tool {
+        kind: ToolKind::Bow,
+        tier: ToolTier::Wood,
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id) {
+        demo.abort("skeleton", "observed=bow_not_selected");
+        return true;
+    }
+
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+    let player_feet = session.player.position;
+    let player_eye = session.player.eye_position();
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+
+    // Demo pin 1: snapshot both survivors, then park them 20 blocks behind the
+    // camera. The loop below re-pins the parked snapshot before every
+    // observation, so their wander can never walk them into aggro range.
+    let survivors: Vec<CombatSkeletonSurvivor> = session
+        .mobs()
+        .iter()
+        .map(|mob| CombatSkeletonSurvivor {
+            kind: mob.kind,
+            position: mob.position,
+            home: mob.home,
+            yaw: mob.yaw,
+            health: mob.health,
+        })
+        .collect();
+    let parked: Vec<CombatSkeletonSurvivor> = survivors
+        .iter()
+        .map(|survivor| {
+            let behind = player_feet - forward * 20.0;
+            CombatSkeletonSurvivor {
+                position: behind,
+                home: behind,
+                yaw: 0.0,
+                ..*survivor
+            }
+        })
+        .collect();
+    for (survivor, pin) in survivors.iter().zip(parked.iter()) {
+        if !combat_skeleton_pin(session, survivor.home, pin) {
+            demo.abort("skeleton", "observed=survivor");
+            return true;
+        }
+    }
+
+    let Some(spot) = combat_skeleton_spot(session, demo.seed) else {
+        demo.abort("skeleton", "observed=spot");
+        return true;
+    };
+    let victim_home = spot;
+    let victim_yaw = (player_feet.x - spot.x).atan2(player_feet.z - spot.z);
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Skeleton, spot, victim_yaw));
+    {
+        let victim = session
+            .mobs_mut()
+            .last_mut()
+            .expect("the victim was just pushed");
+        victim.home = victim_home;
+        victim.health = MobKind::Skeleton.max_health();
+        victim.state = MobAiState::Wander;
+        victim.cooldown = 0.0;
+        victim.aggro = 0.0;
+        victim.stuck = 0.0;
+        victim.stuck_anchor = spot;
+        victim.reaggro = 0.0;
+        victim.velocity = Vec3::ZERO;
+        victim.knockback = Vec3::ZERO;
+    }
+
+    // 1. Fire proof: open the gate and alternate the production mob and arrow
+    //    ticks until one shot is decided and one accepted player hit lands.
+    session.set_hostile_ai_enabled(true);
+    let mut fired = 0u32;
+    let mut player_hits = 0u32;
+    let mut damage = 0u16;
+    let mut arc = false;
+    let mut arrow_ok = false;
+    let mut pinned_ok = true;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        for pin in &parked {
+            pinned_ok &= combat_skeleton_pin(session, pin.home, pin);
+        }
+        let mob_tick = session.tick_mobs(0.1, 1.0);
+        if !mob_tick.shots.is_empty() {
+            fired = fired.saturating_add(mob_tick.shots.len() as u32);
+            if let Some(shot) = mob_tick.shots.first() {
+                // The aim is gravity-compensated, so the direction points above
+                // the straight line to the player eye.
+                let straight = (player_eye - shot.origin).normalize_or_zero();
+                let aimed = shot.dir.normalize_or_zero();
+                arc |= aimed.y > straight.y + 1e-4;
+            }
+            arrow_ok |= session.arrows().iter().any(|arrow| {
+                arrow.owner == ArrowOwner::Skeleton && arrow.damage == ARROW_DAMAGE_SKELETON
+            });
+        }
+        let arrow_tick = session.tick_arrows(0.1, 1.0);
+        player_hits = player_hits.saturating_add(arrow_tick.player_hits);
+        damage = damage.saturating_add(arrow_tick.player_damage);
+        if fired > 0 && player_hits >= 1 {
+            break;
+        }
+    }
+    let cause = session.last_damage_cause();
+    if !pinned_ok
+        || fired == 0
+        || player_hits != 1
+        || damage != ARROW_DAMAGE_SKELETON
+        || !arc
+        || !arrow_ok
+        || cause != Some(DamageCause::SkeletonArrow)
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "fired={fired} player_hits={player_hits} damage={damage} arc={arc} arrow={arrow_ok} cause={cause:?} pinned={pinned_ok}"
+            ),
+        );
+        return true;
+    }
+
+    // 2. Death-cause pin: drop the player to 1 hp and let the next skeleton
+    //    arrow kill. The applied damage of the killing blow is 1, so the death
+    //    itself is the assertion here, not a second full-size hit.
+    let health = session.player.survival.health();
+    if health != 20 - ARROW_DAMAGE_SKELETON {
+        demo.abort("skeleton", &format!("health={health}"));
+        return true;
+    }
+    let dropped = session.player.survival.damage(health - 1);
+    if dropped != health - 1 || session.player.survival.health() != 1 {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "drop applied={dropped} health={}",
+                session.player.survival.health()
+            ),
+        );
+        return true;
+    }
+    let mut died = false;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        for pin in &parked {
+            pinned_ok &= combat_skeleton_pin(session, pin.home, pin);
+        }
+        session.tick_mobs(0.1, 1.0);
+        session.tick_arrows(0.1, 1.0);
+        if session.is_dead() {
+            died = true;
+            break;
+        }
+    }
+    let cause = session.last_damage_cause();
+    let cause_line = death_cause_line(cause);
+    if !died
+        || !pinned_ok
+        || cause != Some(DamageCause::SkeletonArrow)
+        || cause_line != "Cause: Skeleton arrow"
+    {
+        demo.abort(
+            "skeleton",
+            &format!("death dead={died} cause={cause:?} line={cause_line}"),
+        );
+        return true;
+    }
+
+    // 3. Respawn through the production seam, then prove every post-condition
+    //    the Death screen and the HUD depend on. A respawn clears in-flight
+    //    projectiles, so the empty-list assert is part of the contract.
+    let spawn = WorldSession::spawn_position(demo.seed);
+    session.respawn();
+    let respawned = session.player.position;
+    let items_after = combat_inventory_units_total(session);
+    let alive = !session.is_dead();
+    let respawn_health = session.player.survival.health();
+    let cause_cleared = session.last_damage_cause().is_none();
+    let flash = session.player_hurt_intensity();
+    let arrows_empty = session.arrows().is_empty();
+    if !alive
+        || respawn_health != 20
+        || respawned != spawn
+        || !cause_cleared
+        || flash != 0.0
+        || items_after != items_before
+        || !arrows_empty
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "respawn alive={alive} health={respawn_health} spawn={} cause={cause_cleared} flash={flash} items={items_after}/{items_before} arrows={}",
+                respawned == spawn,
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.sync_camera();
+
+    // 4. Kill proof: re-pin the victim's body two blocks forward (its `home`
+    //    stays at the rare spot, the drop-roll key), give it 4 health so one
+    //    full-charge arrow kills it, and let the real projectile sweep deliver
+    //    the player-attributed drop table.
+    let arrow_id = ItemId::Material(Material::Arrow);
+    let bones_before = combat_inventory_units(session, ItemId::Material(Material::Bone));
+    let arrows_before = combat_inventory_units(session, arrow_id);
+    if bones_before != 0 || arrows_before != 2 {
+        demo.abort(
+            "skeleton",
+            &format!("ammo bones={bones_before} arrows={arrows_before}"),
+        );
+        return true;
+    }
+    let victim_feet = Vec3::new(
+        pose.0.x + forward.x * 2.0,
+        pose.0.y,
+        pose.0.z + forward.z * 2.0,
+    );
+    let Some(victim) = session
+        .mobs_mut()
+        .iter_mut()
+        .find(|mob| mob.home.distance_squared(victim_home) <= 1e-6)
+    else {
+        demo.abort("skeleton", "observed=victim_missing");
+        return true;
+    };
+    victim.position = victim_feet;
+    victim.yaw = (pose.0.x - victim_feet.x).atan2(pose.0.z - victim_feet.z);
+    victim.health = 4;
+    victim.state = MobAiState::Wander;
+    victim.cooldown = 0.0;
+    victim.aggro = 0.0;
+    victim.stuck = 0.0;
+    victim.stuck_anchor = victim_feet;
+    victim.reaggro = 0.0;
+    victim.velocity = Vec3::ZERO;
+    victim.knockback = Vec3::ZERO;
+    victim.hurt = 0.0;
+    victim.hurt_iframe = 0.0;
+    victim.death = 0.0;
+
+    let Some(bow_slot) = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .position(|slot| slot.as_ref().map(|item| item.id()) == Some(bow_id))
+    else {
+        demo.abort("skeleton", "observed=bow_slot");
+        return true;
+    };
+    if session.player.selected_item().map(|item| item.id()) != Some(bow_id)
+        && (!session.player.select_slot(bow_slot)
+            || session.player.selected_item().map(|item| item.id()) != Some(bow_id))
+    {
+        demo.abort("skeleton", &format!("held=slot{bow_slot}"));
+        return true;
+    }
+    let origin = session.camera.position;
+    let centre = victim_feet + Vec3::Y * (MobKind::Skeleton.height() * 0.5);
+    let dir = (centre - origin).normalize_or_zero();
+    match session.fire_bow(origin, dir, 1.0) {
+        Ok(arrow) if arrow.damage == 4 => {}
+        Ok(arrow) => {
+            demo.abort("skeleton", &format!("arrow damage={}", arrow.damage));
+            return true;
+        }
+        Err(error) => {
+            demo.abort("skeleton", &format!("fire={error:?}"));
+            return true;
+        }
+    }
+    let arrows_after_fire = combat_inventory_units(session, arrow_id);
+    if arrows_after_fire != 1 {
+        demo.abort("skeleton", &format!("arrows={arrows_after_fire}"));
+        return true;
+    }
+    let mut kills = 0u32;
+    let mut lost = 0u32;
+    for _ in 0..COMBAT_SKELETON_ABORT_TICKS {
+        let tick = session.tick_arrows(0.1, 1.0);
+        kills = kills.saturating_add(tick.kills);
+        lost = lost.saturating_add(tick.drops.lost);
+        if kills >= 1 {
+            break;
+        }
+    }
+    let bones_after = combat_inventory_units(session, ItemId::Material(Material::Bone));
+    let arrows_after = combat_inventory_units(session, arrow_id);
+    let bows: Vec<Option<u16>> = session
+        .player
+        .inventory()
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .filter(|item| item.id() == bow_id)
+        .map(|item| item.durability())
+        .collect();
+    let mut bows_sorted = bows.clone();
+    bows_sorted.sort();
+    // Three player shots wear the earned bow by one point each: two in the Shot
+    // stage (59 -> 57) and this kill shot (57 -> 56). The dropped bow enters at
+    // full durability, so the pair is exactly `[56, 59]`.
+    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(3);
+    let expected_bows = vec![Some(worn_bow), Some(ToolTier::Wood.max_durability())];
+    if kills != 1
+        || lost != 0
+        || bones_after != 1
+        || arrows_after != 3
+        || bows_sorted != expected_bows
+    {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "kill kills={kills} lost={lost} bones={bones_after} arrows={arrows_after} bows={bows:?}"
+            ),
+        );
+        return true;
+    }
+
+    // Demo pin 3: remove the synthetic victim by its `home` (never an index),
+    // close the gate, and restore the two pinned survivors byte for byte so the
+    // Save stage owns a world it expects.
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(victim_home) > 1e-6);
+    session.set_hostile_ai_enabled(false);
+    for (survivor, pin) in survivors.iter().zip(parked.iter()) {
+        if !combat_skeleton_pin(session, pin.home, survivor) {
+            demo.abort("skeleton", "observed=restore");
+            return true;
+        }
+    }
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.player.combat.reset();
+    session.sync_camera();
+    if session.mobs().len() != 2 {
+        demo.abort("skeleton", &format!("mobs={}", session.mobs().len()));
+        return true;
+    }
+
+    demo.skeleton_fired = fired;
+    demo.skeleton_player_hits = player_hits;
+    demo.skeleton_damage = damage;
+    demo.skeleton_arc = arc;
+    demo.skeleton_killed = kills;
+    demo.skeleton_bones = bones_after.saturating_sub(bones_before);
+    demo.skeleton_arrows = arrows_after.saturating_sub(arrows_after_fire);
+    demo.skeleton_bow = bows_sorted.len() == 2;
+    demo.skeleton_respawn = true;
+    demo.skeleton_digest = Some(demo.skeleton_digest());
+    demo.stage = CombatStage::Creative;
+    false
+}
+
+/// The Creative stage: the slice's real-binary proof that the effective player
+/// mode, not the stored save mode, decides every mob interaction.
+///
+/// Runs entirely in ONE call, like Fight/Drops/Hostile/Shot/Skeleton: every
+/// number here is observable, and a redraw between two partial phases would let
+/// the mob runtime move a record the next check describes. Every mutation goes
+/// through a production seam: [`WorldSession::use_creative_rules`],
+/// [`WorldSession::set_hostile_ai_enabled`], [`WorldSession::tick_mobs`],
+/// [`WorldSession::tick_arrows`], [`WorldSession::apply_mob_attacks`],
+/// [`WorldSession::apply_mob_shots`], [`attack_damage`],
+/// [`WorldSession::attack_mob`], [`WorldSession::resolve_mob_kill`],
+/// [`WorldSession::spawn_arrow`], [`opencraft::player::physics::Player::consume_item`]
+/// and [`WorldSession::sync_camera`].
+///
+/// The proof has four measured parts:
+///
+/// 1. **Inertness.** With the hostile gate OPEN and a Zombie pinned two blocks
+///    away plus a full-health synthetic Zombie at the spot,
+///    [`COMBAT_CREATIVE_INERT_TICKS`] fixed steps must decide zero attacks,
+///    zero shots, apply zero player damage, leave the player at 20 health with
+///    no cause and no hurt flash, spawn no arrows, and never put a mob in
+///    `Chase`. The direct authority seams are then probed with hand-built
+///    [`MobAttack`]/[`MobShot`] slices and must also refuse.
+/// 2. **One-shot melee.** A no-weapon swing resolves through [`attack_damage`]
+///    to exactly 20 and kills a full-health Zombie in one [`WorldSession::attack_mob`],
+///    whose player-attributed [`WorldSession::resolve_mob_kill`] grants exactly
+///    one rotten flesh.
+/// 3. **One-shot arrow.** A charge-0 player arrow (base damage 1, so the kill
+///    cannot be explained by charge) kills a second full-health Zombie through
+///    the real projectile sweep, granting exactly one more rotten flesh.
+/// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
+///    again and the inventory total must return to its pre-stage value, which
+///    is what keeps the 218-byte v7 save byte-identical.
+///
+/// Documented demo pins, not gameplay rules: the two survivors are parked 20
+/// blocks behind the camera (position *and* leash anchor, so the synthetic
+/// victim's `home` is a unique key) and the whole mob vector is restored
+/// byte-for-byte from a snapshot before the next stage; the player pose is
+/// restored afterwards, so the Save witness starts from the same pinned pose.
+fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    // Preflight: the two hostile survivors alone, at full health, alive, in a
+    // Survival world whose LIVE player is about to take Creative rules.
+    let mobs = session.mobs().len();
+    let zombies = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Zombie)
+        .count();
+    let skeletons = session
+        .mobs()
+        .iter()
+        .filter(|mob| mob.kind == MobKind::Skeleton)
+        .count();
+    if mobs != 2 || zombies != 1 || skeletons != 1 {
+        demo.abort(
+            "creative",
+            &format!("mobs={mobs} zombies={zombies} skeletons={skeletons}"),
+        );
+        return true;
+    }
+    let mode = session.player.mode();
+    if mode != GameMode::Survival || session.save_mode != GameMode::Survival {
+        demo.abort(
+            "creative",
+            &format!("mode={mode:?} save_mode={:?}", session.save_mode),
+        );
+        return true;
+    }
+    let health = session.player.survival.health();
+    if session.is_dead() || health != 20 {
+        demo.abort(
+            "creative",
+            &format!("dead={} health={health}", session.is_dead()),
+        );
+        return true;
+    }
+    if !session.arrows().is_empty() {
+        demo.abort("creative", &format!("arrows={}", session.arrows().len()));
+        return true;
+    }
+    session.set_ambient_spawning(false);
+
+    let pose = (
+        session.player.position,
+        session.player.yaw,
+        session.player.pitch,
+    );
+    let items_before = combat_inventory_units_total(session);
+    let flesh_id = ItemId::Material(Material::RottenFlesh);
+    let flesh_before = combat_inventory_units(session, flesh_id);
+    let player_feet = session.player.position;
+    let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+
+    // Demo pin 1: snapshot both survivors, then park them 20 blocks behind the
+    // camera. The leash anchor moves with the body so the parked pair stays put
+    // (MEM449: a 4-block home leash would otherwise walk them back toward the
+    // player) and the synthetic victim's `home` stays a unique key. The whole
+    // vector is restored from this snapshot at the end, so the mutation never
+    // reaches the save or the next stage.
+    let survivors: Vec<Mob> = session.mobs().to_vec();
+    let parked = player_feet - forward * 20.0;
+    for mob in session.mobs_mut() {
+        mob.position = parked;
+        mob.home = parked;
+    }
+
+    // The effective-versus-stored distinction this whole slice is built on.
+    session.use_creative_rules();
+    if session.player.mode() != GameMode::Creative || session.save_mode != GameMode::Survival {
+        demo.abort(
+            "creative",
+            &format!(
+                "effective={:?} stored={:?}",
+                session.player.mode(),
+                session.save_mode
+            ),
+        );
+        return true;
+    }
+
+    // Spot selection: the exact bounded 8-angle, 2.0-block loop the Hostile
+    // stage uses, so the two stages cannot disagree about a legal spot. The
+    // loop order is fixed and no RNG or clock enters it.
+    let feet_y = combat_spot_feet_y(player_feet.y);
+    let eye = session.player.eye_position();
+    let mut spot = None;
+    for step in 0..8u32 {
+        let angle = session.player.yaw + step as f32 * std::f32::consts::FRAC_PI_4;
+        let candidate = Vec3::new(
+            player_feet.x + angle.cos() * 2.0,
+            feet_y,
+            player_feet.z + angle.sin() * 2.0,
+        );
+        if combat_hostile_spot_ok(session, candidate, eye) {
+            spot = Some(candidate);
+            break;
+        }
+    }
+    let Some(spot) = spot else {
+        demo.abort("creative", "observed=spot");
+        return true;
+    };
+    let victim_yaw = (player_feet.x - spot.x).atan2(player_feet.z - spot.z);
+
+    // 1. Inertness window. One synthetic full-health Zombie at the verified
+    //    spot; 40 open-gate fixed steps must decide nothing at all.
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Zombie, spot, victim_yaw));
+    session.set_hostile_ai_enabled(true);
+    let mut attacks = 0u32;
+    let mut shots = 0u32;
+    let mut damage = 0u16;
+    let mut chased = false;
+    for _ in 0..COMBAT_CREATIVE_INERT_TICKS {
+        // Re-pin every body before observing, keyed on its `home` (the
+        // survivors share the parked anchor, the victim owns the spot).
+        for mob in session.mobs_mut() {
+            mob.position = if mob.home.distance_squared(spot) <= 1e-6 {
+                spot
+            } else {
+                parked
+            };
+        }
+        let tick = session.tick_mobs(0.1, 1.0);
+        attacks = attacks.saturating_add(tick.attacks.len() as u32);
+        shots = shots.saturating_add(tick.shots.len() as u32);
+        chased |= session
+            .mobs()
+            .iter()
+            .any(|mob| mob.state == MobAiState::Chase);
+        let arrow_tick = session.tick_arrows(0.1, 1.0);
+        damage = damage.saturating_add(arrow_tick.player_damage);
+        chased |= session
+            .mobs()
+            .iter()
+            .any(|mob| mob.state == MobAiState::Chase);
+        if session.player.survival.health() != 20 || !session.arrows().is_empty() {
+            break;
+        }
+    }
+    let health = session.player.survival.health();
+    let cause = session.last_damage_cause();
+    let flash = session.player_hurt_intensity();
+    let arrows_empty = session.arrows().is_empty();
+    if attacks != 0
+        || shots != 0
+        || damage != 0
+        || chased
+        || health != 20
+        || cause.is_some()
+        || flash != 0.0
+        || !arrows_empty
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "inert attacks={attacks} shots={shots} damage={damage} chase={chased} health={health} cause={cause:?} flash={flash} arrows={}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 1b. Direct authority proof: even a hand-built decision list must be
+    //     refused by the two single-authority seams. Defense in depth, exactly
+    //     the contract `tick_mobs`'s closed target build relies on.
+    let melee_authority = session.apply_mob_attacks(&[MobAttack {
+        kind: MobKind::Zombie,
+        from: spot,
+    }]);
+    let shot_authority = session.apply_mob_shots(&[MobShot {
+        kind: MobKind::Skeleton,
+        origin: session.player.eye_position(),
+        dir: forward,
+    }]);
+    let health = session.player.survival.health();
+    if melee_authority != 0 || shot_authority != 0 || !session.arrows().is_empty() || health != 20 {
+        demo.abort(
+            "creative",
+            &format!(
+                "authority attack={melee_authority} shots={shot_authority} arrows={} health={health}",
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+
+    // 2. Melee one-shot: a fist (no selected item) resolves to the target's own
+    //    health in Creative, so one swing kills the full-health victim.
+    let melee_damage = attack_damage(None, session.player.mode(), 20);
+    if melee_damage != 20 {
+        demo.abort("creative", &format!("melee_damage={melee_damage}"));
+        return true;
+    }
+    let Some(victim_index) = session
+        .mobs()
+        .iter()
+        .position(|mob| mob.home.distance_squared(spot) <= 1e-6)
+    else {
+        demo.abort("creative", "observed=victim_missing");
+        return true;
+    };
+    let Some(hit) = session.attack_mob(victim_index, melee_damage, session.camera.position) else {
+        demo.abort("creative", "observed=melee_refused");
+        return true;
+    };
+    if !hit.killed || hit.health_after != 0 || hit.damage != melee_damage {
+        demo.abort(
+            "creative",
+            &format!(
+                "melee killed={} health={} damage={}",
+                hit.killed, hit.health_after, hit.damage
+            ),
+        );
+        return true;
+    }
+    let melee_drops = session.resolve_mob_kill(victim_index, hit, MobKillCause::Player);
+    if melee_drops.accepted != 1 || melee_drops.lost != 0 {
+        demo.abort(
+            "creative",
+            &format!(
+                "melee_drops accepted={} lost={}",
+                melee_drops.accepted, melee_drops.lost
+            ),
+        );
+        return true;
+    }
+    let flesh_after_melee = combat_inventory_units(session, flesh_id);
+    if flesh_after_melee != flesh_before + 1 {
+        demo.abort(
+            "creative",
+            &format!("melee_flesh={flesh_after_melee}/{flesh_before}"),
+        );
+        return true;
+    }
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
+
+    // 3. Arrow one-shot: a charge-0 arrow (base damage 1) still kills a
+    //    full-health Zombie through the Creative hit rule, and the real
+    //    projectile sweep delivers the player-attributed drop table.
+    session
+        .mobs_mut()
+        .push(Mob::new(MobKind::Zombie, spot, victim_yaw));
+    let arrow_victim_health = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.home.distance_squared(spot) <= 1e-6)
+        .map(|mob| mob.health)
+        .unwrap_or(0);
+    if arrow_victim_health != MobKind::Zombie.max_health() {
+        demo.abort("creative", &format!("victim_health={arrow_victim_health}"));
+        return true;
+    }
+    let eye = session.player.eye_position();
+    let chest = spot + Vec3::Y * (MobKind::Zombie.height() * 0.5);
+    let Some(arrow) = Arrow::player(eye, (chest - eye).normalize_or_zero(), 0.0) else {
+        demo.abort("creative", "observed=arrow");
+        return true;
+    };
+    if arrow.damage != 1 {
+        demo.abort("creative", &format!("arrow_base={}", arrow.damage));
+        return true;
+    }
+    if session.spawn_arrow(arrow).is_none() {
+        demo.abort("creative", "observed=arrow_spawn");
+        return true;
+    }
+    let mut mob_hits = 0u32;
+    let mut arrow_kills = 0u32;
+    let mut arrow_drops = MobDropReport::default();
+    for _ in 0..COMBAT_CREATIVE_ABORT_TICKS {
+        let tick = session.tick_arrows(0.1, 1.0);
+        mob_hits = mob_hits.saturating_add(tick.mob_hits);
+        arrow_kills = arrow_kills.saturating_add(tick.kills);
+        arrow_drops.accepted = arrow_drops.accepted.saturating_add(tick.drops.accepted);
+        arrow_drops.lost = arrow_drops.lost.saturating_add(tick.drops.lost);
+        if mob_hits >= 1 {
+            break;
+        }
+    }
+    let arrow_victim_after = session
+        .mobs()
+        .iter()
+        .find(|mob| mob.home.distance_squared(spot) <= 1e-6)
+        .map(|mob| mob.health);
+    let arrow_damage = arrow_victim_health.saturating_sub(arrow_victim_after.unwrap_or(0));
+    let flesh_after_arrow = combat_inventory_units(session, flesh_id);
+    if mob_hits != 1
+        || arrow_kills != 1
+        || arrow_drops.accepted != 1
+        || arrow_drops.lost != 0
+        || arrow_victim_after != Some(0)
+        || arrow_damage != MobKind::Zombie.max_health()
+        || !session.arrows().is_empty()
+        || flesh_after_arrow != flesh_before + 2
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "arrow hits={mob_hits} kills={arrow_kills} drops={} lost={} health={arrow_victim_after:?} damage={arrow_damage} arrows={} flesh={flesh_after_arrow}/{flesh_before}",
+                arrow_drops.accepted,
+                arrow_drops.lost,
+                session.arrows().len()
+            ),
+        );
+        return true;
+    }
+    session
+        .mobs_mut()
+        .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
+
+    // 4. Conserve the save witness: both earned units are consumed again, so
+    //    the inventory section (and therefore the 218-byte v7 layout) is
+    //    byte-identical.
+    if session.player.consume_item(flesh_id).is_none()
+        || session.player.consume_item(flesh_id).is_none()
+    {
+        demo.abort("creative", &format!("consume flesh={flesh_after_arrow}"));
+        return true;
+    }
+    let items_after = combat_inventory_units_total(session);
+    let flesh_left = combat_inventory_units(session, flesh_id);
+    if items_after != items_before || flesh_left != flesh_before {
+        demo.abort(
+            "creative",
+            &format!(
+                "inventory items={items_after}/{items_before} flesh={flesh_left}/{flesh_before}"
+            ),
+        );
+        return true;
+    }
+
+    // Restore before the next stage: close the gate, put the stored mode back,
+    // restore the survivors byte-for-byte, and re-pin the player pose the Save
+    // witness expects.
+    session.set_hostile_ai_enabled(false);
+    session.player.set_mode(session.save_mode);
+    *session.mobs_mut() = survivors;
+    session.player.position = pose.0;
+    session.player.yaw = pose.1;
+    session.player.pitch = pose.2;
+    session.player.combat.reset();
+    session.sync_camera();
+    let mobs = session.mobs().len();
+    let health = session.player.survival.health();
+    let cause = session.last_damage_cause();
+    let items_restored = combat_inventory_units_total(session);
+    if mobs != 2
+        || session.player.mode() != session.save_mode
+        || session.is_dead()
+        || health != 20
+        || cause.is_some()
+        || items_restored != items_before
+    {
+        demo.abort(
+            "creative",
+            &format!(
+                "restore mobs={mobs} mode={:?}/{:?} dead={} health={health} cause={cause:?} items={items_restored}/{items_before}",
+                session.player.mode(),
+                session.save_mode,
+                session.is_dead()
+            ),
+        );
+        return true;
+    }
+
+    demo.creative_inert = true;
+    demo.creative_attacks = attacks;
+    demo.creative_shots = shots;
+    demo.creative_damage = damage;
+    demo.creative_melee_damage = melee_damage;
+    demo.creative_arrow_damage = arrow_damage;
+    demo.creative_kills = 2;
+    demo.creative_drops = melee_drops.accepted.saturating_add(arrow_drops.accepted);
+    demo.creative_drops_lost = melee_drops.lost.saturating_add(arrow_drops.lost);
+    demo.creative_inventory_kept = true;
+    demo.creative_digest = Some(demo.creative_digest());
+    demo.stage = CombatStage::Save;
+    false
+}
+
+/// Pin the two surviving hostile records and write the world through the one
+/// production save site, then read the file back and require exactly those two
+/// records.
+///
+/// The Drops stage removes the Pig and the Cow, so the witness is the two
+/// hostile kinds alone: Zombie at 11 health and Skeleton at 14, each at its own
+/// kind-indexed quartet pose and pinned yaw. Everything happens in one call so
+/// no Playing tick can run between the pose assignment and the write. Any
+/// failure latches `stage=save` with the named observed value instead of leaving
+/// a half-written world.
+fn combat_save_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    let (positions, _) = combat_quartet(session.player.position, session.player.yaw, demo.seed);
+    if session.mobs().len() != 2 {
+        demo.abort("save", &format!("mobs={}", session.mobs().len()));
+        return true;
+    }
+    let mut survivors = 0u32;
+    for mob in session.mobs_mut() {
+        if !matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("save", &format!("kind={:?}", mob.kind));
+            return true;
+        }
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == mob.kind) else {
+            demo.abort("save", &format!("kind={:?}", mob.kind));
+            return true;
+        };
+        mob.position = positions[index];
+        mob.yaw = COMBAT_PINNED_YAW[index];
+        mob.health = COMBAT_PINNED_HEALTH[index];
+        survivors += 1;
+    }
+    if survivors != 2 {
+        demo.abort("save", &format!("survivors={survivors}"));
+        return true;
+    }
+    if let Err(error) = save_current_world(session) {
+        demo.abort("save", &format!("error={error}"));
+        return true;
+    }
+    let loaded = match load_world_from_path(&session.save_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            demo.abort("save", &format!("error={error}"));
+            return true;
+        }
+    };
+    if loaded.mobs.len() != 2 {
+        demo.abort("save", &format!("records={}", loaded.mobs.len()));
+        return true;
+    }
+    for record in &loaded.mobs {
+        if !matches!(record.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("save", &format!("records=kind={:?}", record.kind));
+            return true;
+        }
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
+            demo.abort("save", &format!("records=kind={:?}", record.kind));
+            return true;
+        };
+        if record.position != positions[index].to_array()
+            || record.yaw != COMBAT_PINNED_YAW[index]
+            || record.health != COMBAT_PINNED_HEALTH[index]
+        {
+            demo.abort("save", &format!("records=mismatch={index}"));
+            return true;
+        }
+    }
+    demo.saved = 2;
+    demo.records = loaded.mobs.len() as u32;
+    demo.digest = Some(demo.success_digest());
+    demo.stage = CombatStage::Done;
+    true
+}
+
+/// Loaded-save leg: read the save, recompute the quartet from the RESTORED
+/// player pose and seed, and require the two pinned hostile records plus the
+/// earned inventory. The live session is only checked for kinds and health,
+/// because a Playing tick may already have run `tick_mobs` and moved the mobs.
+fn combat_restore_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
+    debug_assert!(!demo.fresh, "the Restore stage is only for a loaded save");
+    let loaded = match load_world_from_path(&session.save_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            demo.abort("restore", &format!("error={error}"));
+            return true;
+        }
+    };
+    if loaded.mobs.len() != 2 {
+        // A v6 save (or any save with an empty mob tail) lands here.
+        demo.abort("restore", &format!("mobs={}", loaded.mobs.len()));
+        return true;
+    }
+    let (positions, _) = combat_quartet(
+        Vec3::from_array(loaded.player.position),
+        loaded.player.yaw,
+        loaded.seed,
+    );
+    let mut kinds_seen = 0u32;
+    let mut positions_ok = true;
+    let mut yaw_ok = true;
+    let mut health_ok = true;
+    let mut health: Vec<String> = Vec::with_capacity(2);
+    for record in &loaded.mobs {
+        // The Drops stage kills the two passive kinds, so the witness must be
+        // exactly the two hostile ones — never "two records of any kind".
+        if !matches!(record.kind, MobKind::Zombie | MobKind::Skeleton) {
+            demo.abort("restore", &format!("kind={:?}", record.kind));
+            return true;
+        }
+        let Some(index) = MobKind::ALL.iter().position(|kind| *kind == record.kind) else {
+            demo.abort("restore", &format!("kind={:?}", record.kind));
+            return true;
+        };
+        kinds_seen += 1;
+        health.push(COMBAT_PINNED_HEALTH[index].to_string());
+        positions_ok &= record.position == positions[index].to_array();
+        // The Save stage pins the facing to COMBAT_PINNED_YAW, not to the
+        // pose-derived turn, so the restore comparison uses the same pin.
+        yaw_ok &= record.yaw == COMBAT_PINNED_YAW[index];
+        health_ok &= record.health == COMBAT_PINNED_HEALTH[index];
+    }
+    if kinds_seen != 2 {
+        demo.abort("restore", &format!("kinds={kinds_seen}"));
+        return true;
+    }
+    if !positions_ok {
+        demo.abort("restore", "positions=false");
+        return true;
+    }
+    if !yaw_ok {
+        demo.abort("restore", "yaw=false");
+        return true;
+    }
+    if !health_ok {
+        demo.abort("restore", "health=false");
+        return true;
+    }
+    let live = session.mobs();
+    if live.len() != 2 {
+        demo.abort("restore", &format!("mobs={}", live.len()));
+        return true;
+    }
+    for kind in [MobKind::Zombie, MobKind::Skeleton] {
+        let Some(index) = MobKind::ALL.iter().position(|candidate| *candidate == kind) else {
+            demo.abort("restore", &format!("live_kind={kind:?}"));
+            return true;
+        };
+        let Some(mob) = live.iter().find(|mob| mob.kind == kind) else {
+            demo.abort("restore", &format!("live_kind={kind:?}"));
+            return true;
+        };
+        if mob.health != COMBAT_PINNED_HEALTH[index] {
+            demo.abort("restore", &format!("live_health={}", mob.health));
+            return true;
+        }
+    }
+
+    // The earned inventory is part of the witness: the wood sword the player
+    // crafted (a full 59 durability), the wood bow the Shot stage earned and
+    // wore twice (57) plus the full 59 the Skeleton stage's rare drop delivered
+    // (worn to 56 by the kill shot), the three arrows left (two from the grant
+    // minus the Shot stage's two shots, then the skeleton's two dropped), one
+    // raw porkchop, one raw beef, the pair's three leather units, and the
+    // skeleton's one bone — exactly eight non-empty stacks, scanned
+    // order-independently across all 36 slots.
+    let mut stacks = 0u32;
+    let mut sword_durability: Option<Option<u16>> = None;
+    let mut bow_durabilities: Vec<Option<u16>> = Vec::new();
+    let mut arrows = 0u32;
+    let mut porkchop = 0u32;
+    let mut beef = 0u32;
+    let mut leather = 0u32;
+    let mut bone = 0u32;
+    for item in loaded
+        .player
+        .inventory
+        .slots()
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+    {
+        stacks += 1;
+        match item.id() {
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            } => {
+                if sword_durability.is_some() {
+                    demo.abort("restore", "items=duplicate_sword");
+                    return true;
+                }
+                sword_durability = Some(item.durability());
+            }
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            } => {
+                // Two bows are expected: the earned, worn one and the
+                // skeleton's rare full-durability drop. A third is drift.
+                if bow_durabilities.len() >= 2 {
+                    demo.abort("restore", "items=duplicate_bow");
+                    return true;
+                }
+                bow_durabilities.push(item.durability());
+            }
+            ItemId::Material(Material::Arrow) => arrows += u32::from(item.count()),
+            ItemId::Material(Material::RawPorkchop) => porkchop += u32::from(item.count()),
+            ItemId::Material(Material::RawBeef) => beef += u32::from(item.count()),
+            ItemId::Material(Material::Leather) => leather += u32::from(item.count()),
+            ItemId::Material(Material::Bone) => bone += u32::from(item.count()),
+            other => {
+                demo.abort("restore", &format!("items=unexpected={other:?}"));
+                return true;
+            }
+        }
+    }
+    if stacks != 8 {
+        demo.abort("restore", &format!("items={stacks}"));
+        return true;
+    }
+    if sword_durability != Some(Some(ToolTier::Wood.max_durability())) {
+        demo.abort("restore", &format!("items=sword={sword_durability:?}"));
+        return true;
+    }
+    // Three player shots wear the earned bow by exactly one point each (two in
+    // the Shot stage, one on the Skeleton stage's victim); the dropped bow
+    // enters at full durability (MEM392 ordering).
+    let worn_bow = ToolTier::Wood.max_durability().saturating_sub(3);
+    bow_durabilities.sort();
+    let expected_bows = vec![Some(worn_bow), Some(ToolTier::Wood.max_durability())];
+    if bow_durabilities != expected_bows {
+        demo.abort("restore", &format!("items=bows={bow_durabilities:?}"));
+        return true;
+    }
+    if arrows != 3 || porkchop != 1 || beef != 1 || leather != 3 || bone != 1 {
+        demo.abort(
+            "restore",
+            &format!(
+                "items=arrows={arrows} porkchop={porkchop} beef={beef} leather={leather} bone={bone}"
+            ),
+        );
+        return true;
+    }
+
+    demo.digest = Some(format!(
+        "combat_demo: seed={} stage=restored mobs={} health={} yaw={} positions={} items={} ok=true",
+        demo.seed,
+        live.len(),
+        health.join("/"),
+        yaw_ok,
+        positions_ok,
+        stacks
+    ));
+    demo.stage = CombatStage::Done;
+    true
+}
+
 /// Hard cap on retained per-frame samples for the demo-shutdown frame-budget
 /// digest (S08-T01). At uncapped frame rates a few minutes of demo is well
 /// under this; the cap only guarantees bounded memory if a run is left going.
@@ -3868,6 +7807,22 @@ struct GameApp {
     /// dt and reset by every left-hold/mining reset boundary so a menu, panel,
     /// focus loss, or session swap can never resume an invisible meal.
     eating: EatingState,
+    /// Melee swing-cooldown accumulator (M009/S03-T05): driven once per
+    /// Playing frame with raw frame dt, never `dt * time_scale` (input
+    /// latency is real time, exactly like mining and eating). Every left-hold
+    /// reset boundary clears it so a stale cooldown can never survive a
+    /// session swap, panel, or focus loss.
+    melee: MeleeState,
+    /// Bow draw accumulator (M009/S07-T05): driven once per Playing frame with
+    /// raw frame dt, never `dt * time_scale` (a draw is real time like mining,
+    /// eating, and the melee cooldown). Every hold/reset boundary clears it so
+    /// a partial or full draw can never survive a session swap, panel, focus
+    /// loss, death, or release.
+    bow: BowState,
+    /// World-swappable idle-call cadence (M009/S09-T04). Reset by
+    /// `on_session_installed` so a new world never inherits a half-drained
+    /// timer from the old one; only the real Playing frame ticks it.
+    mob_idle: MobIdleGate,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -4035,12 +7990,18 @@ struct GameApp {
     /// every normal run; the launch flag arms it and `step_scripted_demos`
     /// drives the content stages on Playing frames.
     content_demo: Option<ContentDemo>,
+    /// Scripted combat seam (`--demo-combat`, M009/S01-T05). `None` for every
+    /// normal run; the launch flag arms it and `step_scripted_demos` drives the
+    /// settle/spawn/walk/save stages on Playing frames. Only a fresh launch may
+    /// be seeded with the demo quartet; a loaded save runs the Restore stage and
+    /// proves the persisted records instead.
+    combat_demo: Option<CombatDemo>,
     /// Whether a failed demo seam requests a non-zero process status. Set by a
     /// self-describing swim or survival abort; `main` reads it after the event
     /// loop exits (the shutdown path itself cannot set a process status).
     exit_failure: bool,
     /// True when the launch requested a scripted demo seam (`--demo-swim`,
-    /// `--demo-survival`, or `--demo-content`) — see
+    /// `--demo-survival`, `--demo-content`, or `--demo-combat`) — see
     /// [`scripted_demo_requested`]. The accelerated-demo watch and its
     /// wall-clock deadline stay disarmed for these runs, so a scripted demo
     /// owns its own bounded completion even when `--time-scale` is present.
@@ -4182,6 +8143,23 @@ impl GameApp {
         } else {
             None
         };
+        // Scripted combat seam (M009/S01-T05, S02-T03): the fresh flag comes
+        // from the session's spawn-settle gate (only a fresh Survival spawn
+        // arms it), so a loaded save starts at the Restore stage instead of
+        // being seeded. The wall-clock deadline only arms for a
+        // direct-to-gameplay launch.
+        let combat_demo = if cli.demo_combat {
+            let seed = session.world.seed();
+            let fresh = session.spawn_settle_pending();
+            let deadline = if startup_screen == LifecycleScreen::Playing {
+                Some(Instant::now() + Duration::from_secs(COMBAT_DEMO_DEADLINE_SECS))
+            } else {
+                None
+            };
+            Some(CombatDemo::new(seed, fresh, deadline))
+        } else {
+            None
+        };
         // The loaded Settings are the single source of truth for video
         // parameters: FOV applies to the session's camera at startup, and
         // render distance to its world (defaults are 75 degrees / 16
@@ -4224,6 +8202,9 @@ impl GameApp {
             cursor_grabbed: startup_screen == LifecycleScreen::Playing,
             mining: MiningState::new(),
             eating: EatingState::new(),
+            melee: MeleeState::new(),
+            bow: BowState::new(),
+            mob_idle: MobIdleGate::default(),
             audio,
             left_mouse_held: false,
             right_mouse_held: false,
@@ -4266,6 +8247,7 @@ impl GameApp {
             swim,
             survival_demo,
             content_demo,
+            combat_demo,
             exit_failure: false,
             scripted_demo,
         }
@@ -4479,6 +8461,8 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
+        self.melee.reset();
         // The inventory and chest screens are Playing-only surfaces. Any
         // lifecycle screen entry drops them (with their transient drag/status)
         // and closes the ephemeral chest station so no stale panel can keep
@@ -4526,6 +8510,8 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
+        self.melee.reset();
         self.pause_message = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
@@ -4584,6 +8570,15 @@ impl GameApp {
             };
             finished |= ended;
         }
+        if let Some(demo) = self.combat_demo.as_mut() {
+            let ended = if playing {
+                combat_demo_step(demo, &mut self.session)
+            } else {
+                demo.abort("screen", &format!("screen={screen:?}"));
+                true
+            };
+            finished |= ended;
+        }
 
         if finished {
             self.demo_seam_ran = true;
@@ -4598,7 +8593,12 @@ impl GameApp {
                 .as_ref()
                 .map(|demo| demo.failed)
                 .unwrap_or(false);
-            self.exit_failure |= survival_failed || content_failed;
+            let combat_failed = self
+                .combat_demo
+                .as_ref()
+                .map(|demo| demo.failed)
+                .unwrap_or(false);
+            self.exit_failure |= survival_failed || content_failed || combat_failed;
         }
     }
 
@@ -4662,6 +8662,9 @@ impl GameApp {
         self.right_mouse_held = false;
         self.mining.reset();
         self.eating.reset();
+        self.bow.reset();
+        self.mob_idle = MobIdleGate::default();
+        self.melee.reset();
         self.inventory.close();
         self.inventory_status = None;
         self.inventory_drag = None;
@@ -4673,13 +8676,14 @@ impl GameApp {
         // digest covers exactly one run, never a blend of two worlds.
         self.frame_budget.reset();
         self.demo_seam_ran = false;
-        // The scripted swim and survival seams belong to the LAUNCH (the
-        // fresh-world startup branch that teleported the player), never to a
-        // session created from the menu: swapping worlds retires them with
-        // the old world.
+        // The scripted swim/survival/content/combat seams belong to the LAUNCH
+        // (the fresh-world startup branch that teleported or seeded the
+        // player), never to a session created from the menu: swapping worlds
+        // retires them with the old world.
         self.swim = None;
         self.survival_demo = None;
         self.content_demo = None;
+        self.combat_demo = None;
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -5417,6 +9421,8 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.bow.reset();
+                self.melee.reset();
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
@@ -5545,6 +9551,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory_drag,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -5570,6 +9577,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.right_mouse_held,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -5593,6 +9601,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory_drag,
                                 &mut self.mining,
                                 &mut self.eating,
+                                &mut self.bow,
                                 &mut self.cursor_grabbed,
                                 window,
                             );
@@ -5726,6 +9735,8 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
+                        self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -5751,6 +9762,8 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
                     return;
                 }
                 // Chest panel (S03-T05): a release never transfers a stack
@@ -5766,6 +9779,8 @@ impl ApplicationHandler for GameApp {
                         self.inventory_drag = None;
                         self.right_mouse_held = false;
                         self.eating.reset();
+                        self.bow.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -5777,6 +9792,8 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
                     return;
                 }
                 // A release can arrive while a menu owns the input, so this
@@ -5786,6 +9803,8 @@ impl ApplicationHandler for GameApp {
                 self.right_mouse_held = false;
                 self.mining.reset();
                 self.eating.reset();
+                self.bow.reset();
+                self.melee.reset();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -5797,8 +9816,32 @@ impl ApplicationHandler for GameApp {
                 // the Left release arm): clearing the right hold and any
                 // partial meal progress is always safe. It is a dedicated arm
                 // so no generic Released branch can swallow the button.
+                //
+                // `release_bow` resets the draw unconditionally (so a release
+                // on a menu or panel frame can never leave a live charge) and
+                // only fires on a Playing frame with a grabbed cursor. Only
+                // `NoAmmo` gets words: it is the one refusal a player cannot
+                // infer from the world, and every other refusal is silent.
                 self.right_mouse_held = false;
                 self.eating.reset();
+                self.melee.reset();
+                let release = release_bow(
+                    &mut self.bow,
+                    &mut self.session,
+                    self.lifecycle.screen() == LifecycleScreen::Playing,
+                    self.cursor_grabbed,
+                );
+                if release.fired {
+                    // Only a real shot is audible: a tap-cancel or a refused
+                    // shot is silent (the notice below covers `NoAmmo`).
+                    self.audio.play(SoundSlot::BowRelease, self.settings.volume);
+                }
+                if let Some(text) = bow_release_notice(release.error) {
+                    self.game_message = Some(MenuMessage {
+                        text: text.to_string(),
+                        ticks_left: menu::MESSAGE_TICKS,
+                    });
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -5888,6 +9931,8 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
+                        self.melee.reset();
                         self.cursor_grabbed = true;
                         set_cursor_grab(window, true);
                         return;
@@ -5970,6 +10015,8 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -5992,6 +10039,8 @@ impl ApplicationHandler for GameApp {
                     self.right_mouse_held = false;
                     self.mining.reset();
                     self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
                     return;
                 }
 
@@ -6050,6 +10099,7 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory_drag,
                                     &mut self.mining,
                                     &mut self.eating,
+                                    &mut self.bow,
                                     &mut self.cursor_grabbed,
                                     &mut self.chest_status,
                                     window,
@@ -6070,9 +10120,18 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory_drag,
                                     &mut self.mining,
                                     &mut self.eating,
+                                    &mut self.bow,
                                     &mut self.cursor_grabbed,
                                     window,
                                 );
+                            }
+                            RightClickOutcome::BowChargeStarted => {
+                                // The press only arms the hold, exactly like
+                                // eating. The draw accumulates on the redraw
+                                // tick and the release arm fires, so a press
+                                // can never shoot and a sub-threshold release
+                                // cancels without consuming ammo.
+                                self.right_mouse_held = true;
                             }
                             RightClickOutcome::EatingStarted => {
                                 // The press only arms the hold. Progress and
@@ -6152,7 +10211,19 @@ impl ApplicationHandler for GameApp {
                 // integration tests drive); inlined here because `gpu` and
                 // `window` already hold disjoint `self` borrows across this
                 // region, so a `&mut self` method call cannot be used.
-                self.session.clock.tick(playing, now, self.time_scale);
+                //
+                // The scripted combat Ambient stage pins an exact clock and
+                // owns its own fixed mob ticks, so the frame clock must stand
+                // down with the frame mob tick: wall-clock drift would change
+                // `time_of_day` between spawn attempts and therefore the
+                // seeded attempt results on a fast versus a slow host.
+                let combat_pins_time = self
+                    .combat_demo
+                    .as_ref()
+                    .is_some_and(CombatDemo::owns_mob_ticks);
+                if !combat_pins_time {
+                    self.session.clock.tick(playing, now, self.time_scale);
+                }
                 // Bounded accelerated demo (S02-T04; N cycles since S06-T05):
                 // `--time-scale` is a test seam, so an accelerated run
                 // self-terminates after `--demo-days` (default 1) full day
@@ -6184,6 +10255,12 @@ impl ApplicationHandler for GameApp {
                 // Settings-from-pause, and Playing keep rendering the session
                 // world (frozen for Pause), so neither stream runs there.
                 let vista = vista::vista_visible(self.lifecycle.screen());
+                // Audible mob/combat events this frame (M009/S09-T04). Declared
+                // outside the `playing` branch so the play site after the
+                // melee/mining block can read it, but only the Playing arm
+                // below ever fills it: a menu/pause frame leaves every flag
+                // false and therefore plays nothing.
+                let mut mob_audio = MobAudioFrame::default();
                 if playing {
                     // Spawn gate (S04-T07): a fresh Survival session holds the
                     // whole gameplay movement block until the feet and support
@@ -6242,6 +10319,52 @@ impl ApplicationHandler for GameApp {
                             &mesh,
                         );
                     }
+                    // Mob runtime (M009/S01-T05): the same game-time rule as
+                    // survival/crops. The session clamps/scales `dt`, runs a
+                    // deterministic fixed 20 Hz accumulator, and freezes mobs
+                    // in unloaded chunks. The batched mob draw reads the
+                    // resulting records; this call is the only production tick
+                    // site. The scripted `--demo-combat` Ambient stage owns its
+                    // own fixed ticks so its pinned population counters cannot
+                    // drift with frame rate; every other stage still gets this
+                    // production tick (the Walk proof depends on it).
+                    // Audible events this frame (M009/S09-T04): pure data from
+                    // the melee arm, the arrow sweep, and the idle gate below,
+                    // played once at the end of the Playing frame.
+                    let combat_owns_mob_ticks = combat_pins_time;
+                    if !combat_owns_mob_ticks {
+                        self.session.tick_mobs(dt, self.time_scale);
+                    }
+                    // Projectile runtime (M009/S07-T05): the same game-time
+                    // rule as mobs. The session clamps/scales `dt`, freezes
+                    // arrows in unloaded chunks, resolves substepped block and
+                    // body hits, and reports every outcome. A player-attributed
+                    // arrow kill reuses the mob-drop overflow notice, so a
+                    // full inventory can never silently lose those drops.
+                    let arrow_tick = self.session.tick_arrows(dt, self.time_scale);
+                    mob_audio = mob_audio.merge(MobAudioFrame::from_arrow_counts(
+                        arrow_tick.mob_hits,
+                        arrow_tick.block_hits,
+                        arrow_tick.player_hits,
+                        arrow_tick.kills,
+                    ));
+                    // Idle calls are a cadence, not a per-frame check: the gate
+                    // only answers once per interval (and retries cheaply while
+                    // nothing is audible). Raw frame dt like the other input-
+                    // driven accumulators (D013).
+                    mob_audio.idle = self.mob_idle.tick(
+                        dt,
+                        self.session.player.position,
+                        self.session.resident_mobs(),
+                    );
+                    if arrow_tick.drops.lost_any() {
+                        self.game_message = Some(MenuMessage {
+                            text: mob_drop_notice(arrow_tick.drops)
+                                .unwrap_or_default()
+                                .to_string(),
+                            ticks_left: menu::MESSAGE_TICKS,
+                        });
+                    }
                     // Open-station state is a world fact (S02-T02/S03-T03):
                     // close a station as soon as its block is removed/replaced
                     // or the player steps out of reach. One bounded lookup per
@@ -6269,6 +10392,20 @@ impl ApplicationHandler for GameApp {
                     {
                         self.session.player.eat_selected(slot, item);
                     }
+                    // Hold-to-draw (M009/S07-T05): raw frame dt, never
+                    // `dt * time_scale`, exactly like eating and the melee
+                    // cooldown. `bow_charge_candidate` is structurally `None`
+                    // on panel frames, a released hold, an ungrabbed cursor,
+                    // death, or a non-bow selection — and movement
+                    // deliberately does NOT cancel a draw. The release arm is
+                    // the only firing site; this tick only accumulates charge.
+                    let bow_target = bow_charge_candidate(
+                        &self.session,
+                        self.right_mouse_held,
+                        gameplay,
+                        self.cursor_grabbed,
+                    );
+                    self.bow.tick(dt, bow_target);
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -6293,6 +10430,8 @@ impl ApplicationHandler for GameApp {
                         self.right_mouse_held = false;
                         self.mining.reset();
                         self.eating.reset();
+                        self.bow.reset();
+                        self.melee.reset();
                         self.game_message = Some(MenuMessage {
                             text: "Chest closed".to_string(),
                             ticks_left: menu::MESSAGE_TICKS,
@@ -6376,11 +10515,27 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Melee candidate (M009/S03-T05): derived once per held Left
+                // frame after the mob runtime and before the mining candidate,
+                // so a resident mob under the crosshair always wins the
+                // press. Only the two plain index/distance words are carried
+                // forward, never a borrow of the session, and the list can
+                // still change before the swing resolves (streaming, death),
+                // so every later step re-reads live state by index.
+                let attack_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
+                    self.session.melee_candidate(
+                        self.session.camera.position,
+                        self.session.camera.forward(),
+                        MELEE_REACH,
+                    )
+                } else {
+                    None
+                };
                 // Hold-to-mine candidate: only a held Left button on the
                 // grabbed gameplay surface feeds the accumulator. Every
                 // other frame passes None, which resets stale progress
                 // (released, paused, or cursor not grabbed).
-                let candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
+                let mining_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
                     // T01: the target carries its effective duration, derived
                     // once from the block's hardness and the selected item,
                     // so tool rules live in `player::tools` and the
@@ -6400,6 +10555,54 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Player melee (M009/S03-T05): re-read the live health by
+                // index because the record may have died or streamed out since
+                // the candidate was captured; `MeleeTarget::new` fail-closes on
+                // a dead mob. Raw frame dt, never `dt * time_scale`: a swing
+                // cooldown is input latency, not game time (D013).
+                let melee_target = attack_candidate.and_then(|hit| {
+                    let health = self.session.mobs().get(hit.index)?.health;
+                    MeleeTarget::new(hit.index, health)
+                });
+                if let MeleeTick::Swing { index } = self.melee.tick(dt, melee_target) {
+                    // The swing itself is the only mutation site: damage is
+                    // derived from the live item/mode/health, the session
+                    // re-checks residency and the i-frame window, and only a
+                    // proven hit wears the selected item once. A miss and an
+                    // i-frame-blocked swing mutate nothing (MEM392).
+                    let target_health = self.session.mobs().get(index).map(|mob| mob.health);
+                    if let Some(target_health) = target_health {
+                        let damage = attack_damage(
+                            self.session.player.selected_item(),
+                            self.session.player.mode(),
+                            target_health,
+                        );
+                        if let Some(hit) =
+                            self.session
+                                .attack_mob(index, damage, self.session.camera.position)
+                        {
+                            mob_audio = mob_audio.merge(MobAudioFrame::from_melee_hit(Some(hit)));
+                            // MEM214/MEM392 ordering: attack -> wear -> drops
+                            // -> notice. Wearing first means a sword that
+                            // breaks on the killing blow frees the slot the
+                            // drop then fills. The notice is only replaced on
+                            // an actual loss, so a clean kill never clears an
+                            // unrelated transient message.
+                            let _wear = wear_after_proven_action(&mut self.session);
+                            if hit.killed {
+                                if let Some(message) =
+                                    after_lethal_player_hit(&mut self.session, index, hit)
+                                {
+                                    self.game_message = Some(message);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Attack-before-mining: a resident mob in reach owns the left
+                // press, so mining never starts behind it. With no attack the
+                // mining candidate is untouched.
+                let candidate = mining_after_attack(attack_candidate, mining_candidate);
                 let mut target_block = hit.map(|h| h.block_pos);
                 if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
                     // The only production break site (S02): hardness
@@ -6442,6 +10645,15 @@ impl ApplicationHandler for GameApp {
                             }
                         }
                     }
+                }
+
+                // Mob/combat audio (M009/S09-T04): the single play site for the
+                // five new slots, on the Playing frame only (the flags above
+                // are never set elsewhere). Same field-disjoint borrows as the
+                // break calls inside the mining block (P005), and the frame's
+                // pure classification never allocates.
+                for slot in mob_audio_slots(mob_audio).into_iter().flatten() {
+                    self.audio.play(slot, self.settings.volume);
                 }
 
                 // Translucent dark panel behind the stats text: the visible
@@ -6580,6 +10792,7 @@ impl ApplicationHandler for GameApp {
                             self.load_message.as_ref(),
                             self.main_menu_message.as_ref(),
                             self.pause_message.as_ref(),
+                            self.session.last_damage_cause(),
                         )
                     };
                     gpu.menu_text.update(
@@ -6664,6 +10877,7 @@ impl ApplicationHandler for GameApp {
                     ));
                     if let Some(bar) = frame_progress_bar(
                         self.eating.progress(),
+                        self.bow.progress(),
                         self.mining.progress(),
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
@@ -6881,6 +11095,10 @@ impl ApplicationHandler for GameApp {
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.vista_store,
+                        // Mobs are session-scoped: the menu panorama never
+                        // draws them, so the vista path passes an empty slice
+                        // and allocates no mob vertex buffer.
+                        &[],
                         vista_camera,
                         self.background.world.render_distance(),
                         None,
@@ -6914,9 +11132,17 @@ impl ApplicationHandler for GameApp {
                     // fog compression inside `effective_fog`.
                     let underwater =
                         eye_is_submerged(&self.session.world, self.session.camera.position);
+                    // Batched mob geometry for this frame (D136): one
+                    // world-space vertex slice for every resident, in-frustum
+                    // mob. Built once per frame from the live session; an
+                    // empty mob list produces an empty slice and therefore no
+                    // GPU buffer allocation inside render_frame.
+                    let aspect = gpu.ctx.config.width as f32 / gpu.ctx.config.height.max(1) as f32;
+                    let mob_vertices = build_mob_batch(&self.session, &self.session.camera, aspect);
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
+                        &mob_vertices,
                         &self.session.camera,
                         self.session.world.render_distance(),
                         target_block,
@@ -7121,6 +11347,62 @@ impl ApplicationHandler for GameApp {
             {
                 let _ = writeln!(stdout, "{line}");
             }
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Ambient stage's separate digest prints immediately after the
+            // pinned `combat_demo:` line so the S02/S04/S10 pins never move.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.spawn_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Hostile stage's digest follows the Ambient line for the same
+            // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
+            // measured 218-byte v7 witness keep their exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.hostile_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Shot stage's digest follows the Hostile line for the same
+            // reason: the pinned `combat_demo:` / `combat_spawn:` /
+            // `combat_hostile:` lines and the v7 witness keep their exact
+            // bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.shot_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Skeleton stage's digest follows the Shot line for the same
+            // reason: every earlier line keeps its exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.skeleton_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
+            // The Creative stage's digest follows the Skeleton line for the
+            // same reason: every earlier line and the 218-byte v7 witness keep
+            // their exact bytes.
+            if let Some(line) = self
+                .combat_demo
+                .as_ref()
+                .and_then(|demo| demo.creative_digest.as_deref())
+            {
+                let _ = writeln!(stdout, "{line}");
+            }
             drop(stdout);
             self.shutdown(event_loop);
             return;
@@ -7207,6 +11489,7 @@ mod tests {
 
     use opencraft::player::camera::Camera;
     use opencraft::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
+    use opencraft::render::texture::NUM_TEX_LAYERS;
     use opencraft::world::persistence::ChunkEditMap;
     use opencraft::world::terrain::{find_spawn_column, terrain_height_at_seeded};
 
@@ -7564,7 +11847,12 @@ mod tests {
         // launch plus the flag still opens the main menu, exactly like a bare
         // launch. (The effect belongs to the fresh startup branch only.)
         let bare = CliConfig::parse_args(Vec::<String>::new());
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             let cli = CliConfig::parse_args([flag]);
             assert!(
                 !cli_has_world_intent(&cli),
@@ -7575,7 +11863,12 @@ mod tests {
 
         // Combined with a real world flag the intent is unchanged (the world
         // flag is still what grants direct gameplay entry).
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             let with_new = CliConfig::parse_args(["--new", flag]);
             assert!(
                 cli_has_world_intent(&with_new),
@@ -7606,7 +11899,12 @@ mod tests {
 
         // Each scripted flag requests the suppression, with or without an
         // accelerated scale on the same command line.
-        for flag in ["--demo-swim", "--demo-survival", "--demo-content"] {
+        for flag in [
+            "--demo-swim",
+            "--demo-survival",
+            "--demo-content",
+            "--demo-combat",
+        ] {
             assert!(
                 scripted_demo_requested(&CliConfig::parse_args([flag])),
                 "{flag} must suppress the accelerated watch"
@@ -8997,6 +13295,1792 @@ mod tests {
         assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
     }
 
+    // ---- Scripted combat seam (M009/S01-T05) ----
+
+    /// Fresh `--demo-combat` pins Survival at the dusk tick; the load branch
+    /// returns before every one of those overrides, so a saved clock, mode,
+    /// and position always win over the flag.
+    #[test]
+    fn combat_demo_fresh_flag_pins_survival_and_dusk_only_for_fresh_worlds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("combat-fresh.mcvx");
+        let path_str = path.to_str().expect("utf8 path");
+
+        let cli =
+            CliConfig::parse_args(["--new", "--seed", "1", "--demo-combat", "--save", path_str]);
+        let session = startup_session(&cli);
+        assert_eq!(session.clock.time_of_day, COMBAT_DUSK_TICK);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert!(!session.player.can_fly());
+        assert!(
+            !session.ambient_spawning(),
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v7 save tail"
+        );
+        assert!(
+            session.spawn_settle_pending(),
+            "a fresh Survival spawn still settles before physics"
+        );
+        assert!(
+            session.mobs().is_empty(),
+            "startup arms the seam but seeds no mobs"
+        );
+
+        // The flag overrides an explicit `--creative` on the fresh branch.
+        let overridden = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--creative",
+            "--demo-combat",
+            "--save",
+            path_str,
+        ]);
+        let session = startup_session(&overridden);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.clock.time_of_day, COMBAT_DUSK_TICK);
+
+        // Load branch: the persisted clock/mode/position win over the flag.
+        let mut data = sample_save(1);
+        data.time_of_day = 5_000;
+        data.mode = GameMode::Creative;
+        data.player.position = [100.0, 40.0, -7.0];
+        save_world_to_path(&path, &data).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            path_str,
+            "--demo-combat",
+        ]));
+        assert_eq!(loaded.clock.time_of_day, 5_000);
+        assert_eq!(loaded.save_mode, GameMode::Creative);
+        assert_eq!(loaded.player.position, Vec3::new(100.0, 40.0, -7.0));
+        assert!(
+            !loaded.spawn_settle_pending(),
+            "a loaded session is never fresh"
+        );
+        assert!(
+            loaded.ambient_spawning(),
+            "only the fresh scripted branch closes the population gate"
+        );
+    }
+
+    #[test]
+    fn startup_session_closes_the_hostile_ai_gate_for_demo_combat_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let demo_path = dir.path().join("hostile-gate-demo.mcvx");
+        let demo_str = demo_path.to_str().expect("utf8 path");
+
+        let fresh = startup_session(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-combat",
+            "--save",
+            demo_str,
+        ]));
+        assert!(
+            !fresh.hostile_ai_enabled(),
+            "a fresh --demo-combat launch must close the hostile gate"
+        );
+
+        save_world_to_path(&demo_path, &sample_save(1)).expect("write save");
+        let loaded = startup_session(&CliConfig::parse_args([
+            "--save",
+            demo_str,
+            "--demo-combat",
+        ]));
+        assert!(
+            !loaded.hostile_ai_enabled(),
+            "a loaded --demo-combat leg must close the hostile gate too"
+        );
+
+        let plain_path = dir.path().join("hostile-gate-plain.mcvx");
+        let plain = startup_session(&CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--save",
+            plain_path.to_str().expect("utf8 path"),
+        ]));
+        assert!(
+            plain.hostile_ai_enabled(),
+            "production launches keep hostile AI enabled"
+        );
+    }
+
+    /// The seam is launch state, not session state: a session swap retires it,
+    /// a menu-first launch arms it without a deadline, and the wrapper aborts
+    /// with `stage=screen` on the non-Playing screen.
+    #[test]
+    fn combat_demo_is_armed_by_the_launch_and_retired_by_a_session_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-arm.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-combat",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("the flag arms the seam");
+        assert_eq!(demo.seed, 1);
+        assert!(
+            demo.fresh,
+            "a fresh Survival spawn is the demo's only fresh world"
+        );
+        assert!(
+            demo.deadline.is_some(),
+            "a direct-to-gameplay combat run carries its 120s wall-clock net"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            app.combat_demo.is_none(),
+            "a menu-created world retires the launch seam"
+        );
+
+        // Menu-first launch: armed without a deadline, and the wrapper aborts
+        // on its non-Playing screen instead of waiting for frames.
+        let menu_cli = CliConfig::parse_args(["--demo-combat"]);
+        let mut menu_app = GameApp::new(
+            menu_cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/menu-combat.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        assert_eq!(menu_app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        let menu_demo = menu_app.combat_demo.as_ref().expect("seam armed");
+        assert_eq!(menu_demo.seed, 1);
+        assert!(menu_demo.deadline.is_none());
+
+        menu_app.step_scripted_demos();
+        let digest = menu_app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("screen abort digest");
+        assert!(digest.contains("stage=screen"), "{digest}");
+        assert!(digest.contains("observed=screen=MainMenu"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(menu_app.demo_finished, "the abort ends the bounded run");
+        assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
+    }
+
+    /// A loaded save with no mob tail (a v6 save, or a v7 save that persisted
+    /// zero mobs) aborts at `stage=restore` with the observed count: the demo
+    /// may never seed mobs into a persisted world.
+    #[test]
+    fn combat_demo_loaded_save_without_mobs_aborts_at_the_restore_stage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-loaded.mcvx");
+        let mut data = sample_save(1);
+        data.time_of_day = 5_000;
+        save_world_to_path(&save_path, &data).expect("write save");
+        let cli = CliConfig::parse_args([
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-combat",
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("seam armed");
+        assert!(!demo.fresh, "a loaded session is never a fresh spawn");
+        assert_eq!(demo.stage, CombatStage::Restore);
+        assert!(demo.deadline.is_some());
+
+        app.step_scripted_demos();
+        let digest = app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("loaded abort digest");
+        assert!(
+            digest.starts_with("combat_demo: seed=1 stage=restore "),
+            "{digest}"
+        );
+        assert!(digest.contains("observed=mobs=0"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(app.demo_finished);
+        assert!(app.exit_failure);
+    }
+
+    /// Insert the fresh player's feet and support chunks, then run the fixed
+    /// 20 Hz tick + one demo step per update until the quartet is walking.
+    #[test]
+    fn combat_demo_headless_success_digest_is_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-demo.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session));
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
+        assert!(!combat_demo_step(&mut demo, &mut session));
+        assert_eq!(demo.stage, CombatStage::Walk);
+        assert_eq!(session.mobs().len(), 4);
+        assert_eq!(
+            session
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>(),
+            MobKind::ALL.to_vec()
+        );
+
+        // The quartet spawns 3.5 blocks ahead of the player, so its feet
+        // chunks stream in on their own here.
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+
+        let mut updates = 0;
+        let mut ended = false;
+        while !ended && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            if demo.stage == CombatStage::Hostile {
+                // This test pins Walk/Fight/Drops/Save; the hostile proof has
+                // its own dedicated test (and needs a lit synthetic world).
+                // Hand straight to Save so the pinned `combat_demo:` digest
+                // stays byte-identical.
+                demo.stage = CombatStage::Save;
+            }
+            ended = combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the walk stage must finish within 600 updates"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert_eq!(demo.walked, 4);
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(
+                "combat_demo: seed=12345 mobs=4 resident=4 walked=4 verts=864 melee_hits=2 melee_damage=4 melee_blocked=1 killed=2 drops=5 drops_lost=0 saved=2 records=2 ok=true"
+            )
+        );
+    }
+
+    /// The synthetic population fixture: a 5x5 chunk-column lit grass plain
+    /// centred on the seeded spawn column, with the grass surface at
+    /// `spawn_position(seed).y - 4` (the +4 spawn rule) and a recomputed sky
+    /// light grid. Placing the player on that surface leaves the cached world
+    /// spawn three blocks above its feet, so both safe radii are real
+    /// constraints instead of no-ops.
+    ///
+    /// The chunks are inserted into the session's existing world rather than
+    /// replacing it, which keeps the session's own seed (the spawn roll's only
+    /// entropy source) intact.
+    fn insert_lit_grass_plain(session: &mut WorldSession, chunk_radius: i32) {
+        use opencraft::world::manager::{MAX_CHUNK_Y, MIN_CHUNK_Y};
+
+        let anchor = WorldSession::spawn_position(session.world.seed());
+        let cs = CHUNK_SIZE as i32;
+        let centre_x = (anchor.x.floor() as i32).div_euclid(cs);
+        let centre_z = (anchor.z.floor() as i32).div_euclid(cs);
+        let surface = anchor.y as i32 - 4;
+        let surface_chunk_y = surface.div_euclid(cs);
+        let surface_local = surface.rem_euclid(cs) as usize;
+
+        for cx in centre_x - chunk_radius..=centre_x + chunk_radius {
+            for cz in centre_z - chunk_radius..=centre_z + chunk_radius {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let chunk = if cy < surface_chunk_y {
+                        Chunk::new_uniform(BlockId::Stone)
+                    } else if cy == surface_chunk_y {
+                        let mut chunk = Chunk::new_uniform(BlockId::Air);
+                        for lz in 0..CHUNK_SIZE {
+                            for lx in 0..CHUNK_SIZE {
+                                for ly in 0..=surface_local {
+                                    chunk.set(lx, ly, lz, BlockId::Stone);
+                                }
+                                chunk.set(lx, surface_local, lz, BlockId::Grass);
+                            }
+                        }
+                        chunk
+                    } else {
+                        Chunk::new_uniform(BlockId::Air)
+                    };
+                    session
+                        .world
+                        .insert_chunk_for_test(ChunkPos::new(cx, cy, cz), chunk);
+                }
+            }
+        }
+        session.world.recompute_light_for_test();
+        session.player.position = Vec3::new(anchor.x, (surface + 1) as f32, anchor.z);
+        session.sync_camera();
+    }
+
+    /// The `combat_spawn:` line is a pinned contract: every field, including the
+    /// trailing literal `ok=true`, must print in exactly this order so the
+    /// real-binary harness can match on one line.
+    #[test]
+    fn combat_spawn_digest_format_is_pinned() {
+        let mut demo = CombatDemo::new(7, true, None);
+        demo.spawn_phase_report = SpawnReport {
+            spawned: 3,
+            despawned: 0,
+            burned: 0,
+            cap_blocked: 2,
+        };
+        demo.spawn_despawned = 1;
+        demo.spawn_burned = 3;
+        demo.ambient_safe = 0;
+        demo.ambient_peak = 5;
+        assert_eq!(
+            demo.spawn_digest(),
+            "combat_spawn: seed=7 spawned=3 despawned=1 burned=3 cap_blocked=2 safe=0 peak=5 ok=true"
+        );
+    }
+
+    /// The `combat_hostile:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the measured attack count and applied damage
+    /// may vary with the seed.
+    #[test]
+    fn combat_hostile_digest_format_is_pinned() {
+        let mut demo = CombatDemo::new(7, true, None);
+        demo.hostile_attacks = 7;
+        demo.hostile_damage = 20;
+        assert_eq!(
+            demo.hostile_digest(),
+            "combat_hostile: seed=7 attacks=7 damage=20 cause=zombie respawn=spawn knockback=true inventory=kept ok=true"
+        );
+    }
+
+    /// The Shot digest is pinned byte for byte: the four proven facts plus the
+    /// measured ammo (four granted minus two fired) and the bow's worn
+    /// durability (59 minus one per shot).
+    #[test]
+    fn combat_shot_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.shot_charged = true;
+        demo.shot_canceled = true;
+        demo.shot_fired = 1;
+        demo.shot_mob_hits = 1;
+        demo.shot_damage = 4;
+        demo.shot_knockback = true;
+        demo.shot_embed = true;
+        demo.shot_expired = true;
+        demo.shot_ammo = 2;
+        demo.shot_bow = Some(57);
+        assert_eq!(
+            demo.shot_digest(),
+            "combat_shot: seed=1 charged=true canceled=true fired=1 mob_hits=1 damage=4 knockback=true embed=true expired=true ammo=2 bow=57 ok=true"
+        );
+    }
+
+    /// The Ambient stage proved against a lit synthetic world: a pinned midnight
+    /// clock spawns surface hostiles through the production `tick_mobs` seam but
+    /// never inside the safe radius, a record moved past the despawn radius is
+    /// removed by the single reap site, and a pinned morning clock burns every
+    /// surface hostile to death. On success the stage restores the pinned dusk
+    /// clock, closes the gate, and latches the exact digest.
+    #[test]
+    fn combat_demo_ambient_stage_proves_night_spawn_despawn_and_burn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-ambient.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 3);
+        // Exactly the fresh-demo startup shape: dusk clock, gate closed.
+        session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
+        session.set_ambient_spawning(false);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Ambient;
+        let mut calls = 0u32;
+        // Drive only the Ambient stage; the quartet stages are pinned by the
+        // save-leg tests above and are not what this test proves.
+        while demo.stage == CombatStage::Ambient && !demo.finished() && calls < 2000 {
+            calls += 1;
+            combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            calls < 2000,
+            "the ambient stage must finish within 2000 calls"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert!(
+            !demo.finished(),
+            "the ambient stage hands over instead of ending the run: {:?}",
+            demo.digest
+        );
+        assert_eq!(
+            demo.stage,
+            CombatStage::Spawn,
+            "the ambient stage hands over to the quartet spawn"
+        );
+        assert_eq!(demo.ambient_safe, 0, "no record may enter the safe radius");
+        assert!(
+            demo.spawn_phase_report.spawned >= 1,
+            "ambient night spawning produced nothing: {:?}",
+            demo.spawn_phase_report
+        );
+        assert_eq!(demo.spawn_despawned, 1, "one record must be culled");
+        assert!(demo.spawn_burned >= 1, "no surface hostile burned at day");
+        assert!(demo.ambient_peak <= MAX_MOBS_TOTAL);
+        assert_eq!(
+            session.clock.time_of_day, COMBAT_DUSK_TICK,
+            "the pinned dusk clock is restored for the quartet stages"
+        );
+        assert!(
+            !session.ambient_spawning(),
+            "the ambient gate is closed again"
+        );
+        // Measured by running this test with placeholder constants and writing
+        // the observed values, never guessed.
+        assert_eq!(
+            demo.spawn_digest.as_deref(),
+            Some("combat_spawn: seed=12345 spawned=22 despawned=1 burned=21 cap_blocked=2 safe=0 peak=22 ok=true")
+        );
+    }
+
+    /// The Hostile stage proved against a lit synthetic world: a Zombie placed
+    /// eight blocks out acquires the player through line of sight and closes to
+    /// melee range, then the production melee seam lands 3 damage per i-frame
+    /// window with knockback until the player dies with a `Zombie` cause. The
+    /// stage then respawns to the deterministic spawn with the inventory kept,
+    /// restores the pinned pose, and hands over to Save.
+    #[test]
+    fn combat_hostile_stage_proves_chase_damage_death_and_respawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-hostile.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        // Only the two records this test places may exist: an ambient spawn
+        // during the chase probe would change the stage's shape check.
+        session.set_ambient_spawning(false);
+
+        // A non-empty inventory makes the "kept across respawn" assertion mean
+        // something instead of comparing 0 to 0.
+        let item = Item::new(ItemId::Material(Material::Stick), 5).expect("stick stack");
+        assert!(
+            session.player.collect_item(item),
+            "the witness inventory must be non-empty"
+        );
+
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        let zombie_feet = player + forward * 8.0;
+        let skeleton_feet = player + forward * 30.0;
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, zombie_feet, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, skeleton_feet, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        let horizontal = |a: Vec3, b: Vec3| {
+            let dx = a.x - b.x;
+            let dz = a.z - b.z;
+            (dx * dx + dz * dz).sqrt()
+        };
+        assert!(horizontal(zombie_feet, player) > 7.0);
+
+        // Chase proof through the production seam: with the hostile gate open
+        // the Zombie must close from eight blocks to three. The probe stops
+        // before melee range (2.0), so the damage proof below starts from full
+        // health and its seven hits are the stage's own.
+        session.set_hostile_ai_enabled(true);
+        let mut closed = 0u32;
+        let mut distance = horizontal(zombie_feet, player);
+        while distance > 3.0 && closed < 200 {
+            closed += 1;
+            session.tick_mobs(0.1, 1.0);
+            let index = session
+                .mobs()
+                .iter()
+                .position(|mob| mob.kind == MobKind::Zombie)
+                .expect("zombie record");
+            distance = horizontal(session.mobs()[index].position, player);
+        }
+        let zombie_index = session
+            .mobs()
+            .iter()
+            .position(|mob| mob.kind == MobKind::Zombie)
+            .expect("zombie record");
+        assert_eq!(
+            session.mobs()[zombie_index].state,
+            MobAiState::Chase,
+            "line of sight at eight blocks must open a chase"
+        );
+        assert!(
+            distance <= 3.0,
+            "the zombie must close from eight blocks: distance={distance} steps={closed}"
+        );
+        assert_eq!(
+            session.player.survival.health(),
+            20,
+            "the chase probe must stop short of melee range"
+        );
+        session.set_hostile_ai_enabled(false);
+
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Hostile;
+        let mut calls = 0u32;
+        while demo.stage == CombatStage::Hostile && !demo.finished() && calls < 200 {
+            calls += 1;
+            assert!(
+                !combat_demo_step(&mut demo, &mut session),
+                "the hostile stage hands over instead of ending the run: {:?}",
+                demo.digest
+            );
+        }
+        assert!(calls < 200, "the hostile stage must finish in one call");
+        assert!(!demo.failed, "unexpected hostile abort: {:?}", demo.digest);
+        assert_eq!(
+            demo.stage,
+            CombatStage::Shot,
+            "the hostile stage hands over to the shot proof"
+        );
+        assert_eq!(demo.hostile_attacks, 7);
+        assert_eq!(demo.hostile_damage, 20);
+        assert!(demo.hostile_cause, "the death must be tagged Zombie");
+        assert!(demo.hostile_respawn);
+        assert!(demo.hostile_inventory_kept);
+        assert!(
+            demo.hostile_knockback,
+            "an accepted hit must push the player"
+        );
+        assert_eq!(
+            demo.hostile_digest.as_deref(),
+            Some("combat_hostile: seed=12345 attacks=7 damage=20 cause=zombie respawn=spawn knockback=true inventory=kept ok=true")
+        );
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert_eq!(session.mobs().len(), 2);
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+        assert!(!session.is_dead(), "respawn revives the player");
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert_eq!(combat_inventory_units_total(&session), items_before);
+
+        // The Save stage that follows still ends the leg on the pinned witness.
+        // The Shot proof has its own dedicated test above; hand straight to Save
+        // so this test keeps pinning the hostile verdict plus the witness.
+        demo.stage = CombatStage::Save;
+        assert!(
+            combat_demo_step(&mut demo, &mut session),
+            "the save stage ends the leg"
+        );
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert!(!demo.failed, "unexpected save abort: {:?}", demo.digest);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
+    }
+
+    /// The Hostile stage refuses a world it does not own: a record shape other
+    /// than exactly one Zombie plus one Skeleton, and a non-Survival player,
+    /// both latch a self-describing abort before any tick, any damage, or any
+    /// save write.
+    #[test]
+    fn combat_hostile_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-hostile-abort.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let zombie_feet = session.player.position + Vec3::X;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, zombie_feet, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Hostile;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=hostile"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert!(!save_path.exists(), "an aborted stage writes no save");
+
+        // Creative is never a valid Hostile-stage subject: production builds no
+        // target at all, so the stage refuses before ticking.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-hostile-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let creative_feet = creative.player.position;
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, creative_feet + Vec3::X, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, creative_feet - Vec3::X, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Hostile;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+    }
+
+    /// The Shot stage against a headless session: the sub-threshold release
+    /// cancels with nothing spent, ten 0.1 s ticks reach a full draw, the fired
+    /// arrow damages the Zombie 20 -> 16 and knocks it away, and a straight-down
+    /// shot embeds in the ground and expires. It also pins the earned inventory
+    /// state the save witness carries (two arrows left, bow worn twice).
+    #[test]
+    fn combat_demo_shot_stage_proves_charge_cancel_fire_hit_and_embed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-shot.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        for y in [spawn.y, spawn.y - 4.0] {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    spawn.x.floor() as i32,
+                    y.floor() as i32,
+                    spawn.z.floor() as i32,
+                ),
+            );
+        }
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, spawn, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, spawn - Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Shot;
+        assert!(
+            !combat_shot_stage(&mut demo, &mut session),
+            "the shot stage advances to the skeleton proof"
+        );
+        assert_eq!(demo.stage, CombatStage::Skeleton);
+        assert!(!demo.failed, "unexpected shot abort: {:?}", demo.digest);
+        assert!(demo.shot_charged);
+        assert!(demo.shot_canceled);
+        assert_eq!(demo.shot_fired, 1);
+        assert_eq!(demo.shot_mob_hits, 1);
+        assert_eq!(demo.shot_damage, 4);
+        assert!(demo.shot_knockback);
+        assert!(demo.shot_embed);
+        assert!(demo.shot_expired);
+        assert_eq!(demo.shot_ammo, 2);
+        assert_eq!(demo.shot_bow, Some(57));
+        assert_eq!(
+            demo.shot_digest.as_deref(),
+            Some(
+                "combat_shot: seed=12345 charged=true canceled=true fired=1 mob_hits=1 damage=4 knockback=true embed=true expired=true ammo=2 bow=57 ok=true"
+            )
+        );
+
+        // Production-seam state after the stage: the shot damaged the Zombie
+        // but did not kill or reap it, and both arrows are gone.
+        let zombie = session
+            .mobs()
+            .iter()
+            .find(|mob| mob.kind == MobKind::Zombie)
+            .expect("the Zombie survives the shot");
+        assert_eq!(zombie.health, 16, "20 -> 16 at full charge");
+        assert!(zombie.hurt > 0.0);
+        assert!(session.arrows().is_empty());
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Arrow)),
+            2
+        );
+        let bow = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .find(|item| {
+                item.id()
+                    == ItemId::Tool {
+                        kind: ToolKind::Bow,
+                        tier: ToolTier::Wood,
+                    }
+            })
+            .expect("the earned bow stays in the inventory");
+        assert_eq!(bow.durability(), Some(57));
+    }
+
+    /// The Skeleton stage proved against a lit synthetic plain: the two pinned
+    /// survivors are parked out of range, the synthetic victim fires a
+    /// gravity-compensated arrow that damages the player for exactly 2 and the
+    /// Death screen names `Skeleton arrow`, the respawn returns to the
+    /// deterministic spawn with the inventory kept and the projectiles cleared,
+    /// and one full-charge player arrow kills the victim for its bone, two
+    /// arrows, and the rare full-durability bow it was pinned to roll.
+    #[test]
+    fn combat_demo_skeleton_stage_proves_shot_damage_cause_and_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            dir.path().join("combat-skeleton.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, player + forward * 2.0, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, player - forward * 20.0, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        // The Shot stage earns the bow and arrows the kill proof spends; running
+        // it for real keeps this test on the production path instead of a
+        // hand-built inventory.
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Shot;
+        assert!(
+            !combat_shot_stage(&mut demo, &mut session),
+            "the shot proof hands over to the skeleton proof"
+        );
+        assert_eq!(demo.stage, CombatStage::Skeleton);
+        assert!(!demo.failed, "unexpected shot abort: {:?}", demo.digest);
+
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+
+        assert!(
+            !combat_skeleton_stage(&mut demo, &mut session),
+            "the skeleton proof hands over to the creative proof"
+        );
+        assert_eq!(demo.stage, CombatStage::Creative);
+        assert!(!demo.failed, "unexpected skeleton abort: {:?}", demo.digest);
+        assert_eq!(demo.skeleton_fired, 1, "one decided shot, one hit");
+        assert_eq!(demo.skeleton_player_hits, 1);
+        assert_eq!(demo.skeleton_damage, 2, "the fixed skeleton-arrow damage");
+        assert!(
+            demo.skeleton_arc,
+            "the aim must point above the straight line"
+        );
+        assert_eq!(demo.skeleton_killed, 1);
+        assert_eq!(demo.skeleton_bones, 1);
+        assert_eq!(demo.skeleton_arrows, 2);
+        assert!(demo.skeleton_bow, "the pinned spot must roll the rare bow");
+        assert!(demo.skeleton_respawn);
+        assert_eq!(
+            demo.skeleton_digest.as_deref(),
+            Some(
+                "combat_skeleton: seed=12345 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+            )
+        );
+
+        // The stage restores the world it borrowed: the two pinned hostiles are
+        // back at their pre-stage pose, the synthetic victim is gone, the gate is
+        // closed, and the player pose is the one the Save witness expects.
+        assert_eq!(session.mobs().len(), 2);
+        assert!(
+            session
+                .mobs()
+                .iter()
+                .all(|mob| matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "the synthetic victim must be removed by its home"
+        );
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert!(!session.is_dead());
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert!(
+            session.arrows().is_empty(),
+            "the respawn clears projectiles"
+        );
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+
+        // The player-attributed drop table landed whole: the bone stack, the two
+        // dropped arrows on top of the one left, and both bows (the earned one
+        // worn by three shots, the dropped one at full durability). The kill
+        // shot spends one of the two arrows the Shot stage left, so the net
+        // change is +3 units.
+        assert_eq!(
+            combat_inventory_units_total(&session),
+            items_before + 3,
+            "one bone + two arrows + one bow, minus the spent kill arrow"
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Bone)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Arrow)),
+            3
+        );
+        let bow_id = ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        };
+        let mut bows: Vec<Option<u16>> = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|item| item.id() == bow_id)
+            .map(|item| item.durability())
+            .collect();
+        bows.sort();
+        assert_eq!(
+            bows,
+            vec![
+                Some(ToolTier::Wood.max_durability() - 3),
+                Some(ToolTier::Wood.max_durability())
+            ]
+        );
+    }
+
+    /// The `combat_skeleton:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the seed and the measured fire/hit numbers may
+    /// vary. The arc, drop counts, rare-bow fact, and respawn are latching
+    /// literals the stage asserts before it prints them.
+    #[test]
+    fn combat_skeleton_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.skeleton_fired = 1;
+        demo.skeleton_player_hits = 1;
+        demo.skeleton_damage = 2;
+        demo.skeleton_arc = true;
+        demo.skeleton_killed = 1;
+        demo.skeleton_bones = 1;
+        demo.skeleton_arrows = 2;
+        demo.skeleton_bow = true;
+        demo.skeleton_respawn = true;
+        assert_eq!(
+            demo.skeleton_digest(),
+            "combat_skeleton: seed=1 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+        );
+    }
+
+    /// The Skeleton stage refuses a world it does not own before any tick, any
+    /// damage, any push, or any drop: a record shape other than exactly one
+    /// Zombie plus one Skeleton and a non-Survival player both latch a
+    /// self-describing abort.
+    #[test]
+    fn combat_skeleton_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-skeleton-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let feet = session.player.position;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Skeleton;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=skeleton"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(combat_inventory_units_total(&session), 0);
+        assert_eq!(session.mobs().len(), 1, "the abort mutates nothing");
+
+        // Creative is never a valid Skeleton-stage subject: production builds no
+        // target and spawns no arrow, so the stage refuses before ticking.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-skeleton-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let feet = creative.player.position;
+        let forward = Vec3::new(creative.player.yaw.cos(), 0.0, creative.player.yaw.sin());
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + forward * 2.0, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, feet - forward * 20.0, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Skeleton;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
+    }
+
+    /// The Creative stage proved against a lit synthetic plain: with the
+    /// hostile gate OPEN and the live player switched to Creative rules, a
+    /// Zombie pinned two blocks away and a full-health synthetic Zombie produce
+    /// zero attacks, zero shots, zero damage, and no chase over 40 fixed steps;
+    /// both direct authority seams refuse a hand-built decision slice; one
+    /// no-weapon swing (20 damage) and one charge-0 arrow (base damage 1) each
+    /// one-shot a full-health Zombie and earn exactly one rotten flesh; and the
+    /// two earned units are consumed again so the inventory total is unchanged.
+    #[test]
+    fn combat_demo_creative_stage_proves_inertness_and_one_shot_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-creative.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 2);
+        // Only the two records this test places may exist: an ambient spawn
+        // during the inertness window would change the stage's shape check.
+        session.set_ambient_spawning(false);
+
+        // A non-empty inventory makes the "conserved" assertion mean something
+        // instead of comparing 0 to 0.
+        let item = Item::new(ItemId::Material(Material::Stick), 5).expect("stick stack");
+        assert!(
+            session.player.collect_item(item),
+            "the witness inventory must be non-empty"
+        );
+
+        let player = session.player.position;
+        let forward = Vec3::new(session.player.yaw.cos(), 0.0, session.player.yaw.sin());
+        session.mobs_mut().clear();
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, player + forward * 7.0, 0.0));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, player + forward * 12.0, 0.0));
+        session.set_hostile_ai_enabled(false);
+
+        let before: Vec<Mob> = session.mobs().to_vec();
+        let pose = (
+            session.player.position,
+            session.player.yaw,
+            session.player.pitch,
+        );
+        let items_before = combat_inventory_units_total(&session);
+        let flesh_id = ItemId::Material(Material::RottenFlesh);
+        assert_eq!(combat_inventory_units(&session, flesh_id), 0);
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(
+            !combat_creative_stage(&mut demo, &mut session),
+            "the creative proof hands over to Save"
+        );
+        assert_eq!(demo.stage, CombatStage::Save);
+        assert!(
+            !demo.finished(),
+            "a successful stage never latches an abort"
+        );
+        assert!(!demo.failed, "unexpected creative abort: {:?}", demo.digest);
+
+        // The inertness verdict is measured, not inferred from the pass.
+        assert!(demo.creative_inert);
+        assert_eq!(demo.creative_attacks, 0, "no melee may be decided");
+        assert_eq!(demo.creative_shots, 0, "no arrow may be decided");
+        assert_eq!(demo.creative_damage, 0, "Creative must take no damage");
+        assert_eq!(demo.creative_melee_damage, 20, "one fist swing one-shots");
+        assert_eq!(demo.creative_arrow_damage, 20, "a charge-0 arrow one-shots");
+        assert_eq!(demo.creative_kills, 2);
+        assert_eq!(demo.creative_drops, 2, "one rotten flesh per kill");
+        assert_eq!(demo.creative_drops_lost, 0);
+        assert!(demo.creative_inventory_kept);
+        assert_eq!(
+            demo.creative_digest.as_deref(),
+            Some(
+                "combat_creative: seed=12345 inert=true attacks=0 shots=0 damage=0 melee_damage=20 arrow_damage=20 kills=2 drops=2 drops_lost=0 inventory=kept ok=true"
+            )
+        );
+
+        // The stage restored the world it borrowed: the survivors are
+        // byte-identical, both synthetic victims are gone by their home, the
+        // player is back in Survival at full health with no cause or flash, and
+        // the inventory total (and the rotten-flesh count) is unchanged.
+        assert_eq!(session.mobs(), before.as_slice());
+        assert_eq!(session.player.mode(), GameMode::Survival);
+        assert_eq!(session.save_mode, GameMode::Survival);
+        assert_eq!(session.player.survival.health(), 20);
+        assert!(!session.is_dead());
+        assert_eq!(session.last_damage_cause(), None);
+        assert_eq!(session.player_hurt_intensity(), 0.0);
+        assert!(session.arrows().is_empty());
+        assert!(!session.hostile_ai_enabled(), "the gate is closed again");
+        assert_eq!(
+            (
+                session.player.position,
+                session.player.yaw,
+                session.player.pitch
+            ),
+            pose,
+            "the pinned pose is restored for the Save witness"
+        );
+        assert_eq!(combat_inventory_units_total(&session), items_before);
+        assert_eq!(combat_inventory_units(&session, flesh_id), 0);
+    }
+
+    /// The `combat_creative:` line is a pinned contract: the harness matches on
+    /// the literal shape, so only the seed may vary. The inert flag, the three
+    /// zeroes, both 20-damage one-shots, and the two-earned/two-consumed drop
+    /// counts are latching literals the stage asserts before it prints them.
+    #[test]
+    fn combat_creative_digest_is_pinned() {
+        let mut demo = CombatDemo::new(1, true, None);
+        demo.creative_inert = true;
+        demo.creative_melee_damage = 20;
+        demo.creative_arrow_damage = 20;
+        demo.creative_kills = 2;
+        demo.creative_drops = 2;
+        demo.creative_inventory_kept = true;
+        assert_eq!(
+            demo.creative_digest(),
+            "combat_creative: seed=1 inert=true attacks=0 shots=0 damage=0 melee_damage=20 arrow_damage=20 kills=2 drops=2 drops_lost=0 inventory=kept ok=true"
+        );
+    }
+
+    /// The Creative stage refuses a world it does not own before any tick, any
+    /// one-shot, any push, or any drop: a record shape other than exactly one
+    /// Zombie plus one Skeleton and an already-Creative session (no stored
+    /// Survival mode to prove the effective-versus-stored distinction against)
+    /// both latch a self-describing abort.
+    #[test]
+    fn combat_creative_stage_aborts_on_the_wrong_record_shape_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-creative-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_lit_grass_plain(&mut session, 0);
+        session.set_ambient_spawning(false);
+        session.mobs_mut().clear();
+        let feet = session.player.position;
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + Vec3::X, 0.0));
+
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.clone().expect("shape abort digest");
+        assert!(digest.contains("stage=creative"), "{digest}");
+        assert!(digest.contains("observed=mobs=1 zombies=1"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(session.player.survival.health(), 20);
+        assert_eq!(combat_inventory_units_total(&session), 0);
+        assert_eq!(session.mobs().len(), 1, "the abort mutates nothing");
+        assert_eq!(session.player.mode(), GameMode::Survival);
+
+        // A session already in Creative has no stored Survival mode, so it is
+        // not a valid subject for the effective-versus-stored proof.
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-creative-mode.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        insert_lit_grass_plain(&mut creative, 0);
+        creative.set_ambient_spawning(false);
+        creative.mobs_mut().clear();
+        let feet = creative.player.position;
+        let forward = Vec3::new(creative.player.yaw.cos(), 0.0, creative.player.yaw.sin());
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Zombie, feet + forward * 2.0, 0.0));
+        creative
+            .mobs_mut()
+            .push(Mob::new(MobKind::Skeleton, feet - forward * 20.0, 0.0));
+        let mut demo = CombatDemo::new(12345, true, None);
+        demo.stage = CombatStage::Creative;
+        assert!(combat_demo_step(&mut demo, &mut creative));
+        let digest = demo.digest.clone().expect("mode abort digest");
+        assert!(digest.contains("observed=mode=Creative"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+        assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
+    }
+
+    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot ->
+    /// Skeleton -> Creative -> Save) to completion and return the session plus
+    /// its finished demo. Both save-leg tests use this so the fresh save is
+    /// always produced by the production Save stage rather than hand-built wire
+    /// data.
+    fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path,
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        // Mirror the production scripted startup: the pinned quartet sits
+        // inside the 16-block aggro, so hostile AI stays off until the
+        // dedicated Hostile stage reopens it. Without this parity the new
+        // skeleton shot seam (S08-T02) fires during Walk and leaves arrows for
+        // the Shot stage's empty-list pin.
+        session.set_hostile_ai_enabled(false);
+
+        // Ground the player like the real Playing frames do during Settle: the
+        // deterministic spawn is four blocks above the terrain surface, and a
+        // headless leg never runs player physics. The Skeleton stage's spot
+        // search requires a supported standing cell next to the player, so this
+        // is fixture parity, not a gameplay change.
+        let feet = terrain_height_at_seeded(spawn.x.floor() as i32, spawn.z.floor() as i32, seed)
+            as f32
+            + 1.0;
+        session.player.position.y = feet;
+        session.sync_camera();
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                feet.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
+        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert_eq!(demo.stage, CombatStage::Walk);
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+        let mut updates = 0;
+        let mut ended = false;
+        while !ended && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            if demo.stage == CombatStage::Hostile {
+                // The hostile proof has its own dedicated test (and needs a lit
+                // synthetic world); this helper pins the fresh
+                // Walk/Fight/Drops/Shot/Save leg, so hand straight to Shot (which
+                // earns the bow and arrows the save witness carries) and keep the
+                // pinned `combat_demo:` digest byte-identical.
+                demo.stage = CombatStage::Shot;
+            }
+            ended = combat_demo_step(&mut demo, &mut session);
+        }
+        assert!(
+            demo.finished(),
+            "the fresh leg must finish within 600 updates"
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        (session, demo)
+    }
+
+    /// The fresh leg writes the v7 save through the production save site, and
+    /// the file itself carries the two surviving hostile records plus the earned
+    /// inventory. The file length and the mob-count offset are MEASURED by
+    /// running the fresh leg, never computed by hand: they depend on the exact
+    /// serialized size of the inventory stacks the demo earns.
+    #[test]
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v7_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-fresh-leg.mcvx");
+        let (session, demo) = run_fresh_combat_leg(seed, save_path.clone());
+
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
+        let digest = demo.digest.as_deref().expect("success digest");
+        assert!(digest.contains("saved=2 records=2"), "{digest}");
+        assert!(digest.contains("ok=true"), "{digest}");
+
+        let bytes = std::fs::read(&save_path).expect("read save");
+        assert_eq!(
+            bytes.len(),
+            COMBAT_SAVE_BYTES,
+            "measured fresh-leg save length"
+        );
+        // Locate the mob count by scanning for the exact two-record tail: the
+        // Zombie record starts immediately after the u32 count. This cross-check
+        // keeps the pinned offset honest if a future stage changes the layout
+        // without re-measuring.
+        let (positions, _) = combat_quartet(session.player.position, session.player.yaw, seed);
+        let mut tail: Vec<u8> = Vec::new();
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
+            tail.push(kind.tag());
+            for c in positions[index].to_array() {
+                tail.extend_from_slice(&c.to_le_bytes());
+            }
+            tail.extend_from_slice(&COMBAT_PINNED_YAW[index].to_le_bytes());
+            tail.extend_from_slice(&COMBAT_PINNED_HEALTH[index].to_le_bytes());
+        }
+        let tail_start = bytes
+            .windows(tail.len())
+            .position(|window| window == tail.as_slice())
+            .expect("two-record mob tail in the save");
+        assert_eq!(
+            tail_start - 4,
+            COMBAT_SAVE_MOB_COUNT_OFFSET,
+            "pinned mob-count offset"
+        );
+        assert_eq!(&bytes[4..8], &7u32.to_le_bytes(), "v7 version word");
+        assert_eq!(
+            &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
+            &2u32.to_le_bytes(),
+            "mob count at the measured offset"
+        );
+        assert_eq!(
+            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len(),
+            bytes.len(),
+            "the mob tail is the last section"
+        );
+
+        let loaded = load_world_from_path(&save_path).expect("load save");
+        assert_eq!(loaded.mobs.len(), 2);
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
+            let record = loaded
+                .mobs
+                .iter()
+                .find(|record| record.kind == kind)
+                .unwrap_or_else(|| panic!("missing {kind:?} record"));
+            assert_eq!(
+                record.position,
+                positions[index].to_array(),
+                "feet {kind:?}"
+            );
+            assert_eq!(record.yaw, COMBAT_PINNED_YAW[index], "yaw {kind:?}");
+            assert_eq!(
+                record.health, COMBAT_PINNED_HEALTH[index],
+                "health {kind:?}"
+            );
+        }
+    }
+
+    /// The Fight stage proves the hit sequence on the real records, the Drops
+    /// stage then kills the two passive records, and the Save stage that follows
+    /// writes only the two surviving hostile records at their pinned damaged
+    /// health: neither the fight nor the kills may leak into the save.
+    #[test]
+    fn combat_demo_fight_stage_hits_the_pig_then_the_save_stays_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-fight.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        for y in [spawn.y, spawn.y - 4.0] {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    spawn.x.floor() as i32,
+                    y.floor() as i32,
+                    spawn.z.floor() as i32,
+                ),
+            );
+        }
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
+        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert_eq!(demo.stage, CombatStage::Walk);
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+
+        // Drive the Fight stage directly (in production it runs in the same
+        // step as the Walk verdict) so the pig's post-fight state is
+        // observable before the Drops stage kills it.
+        demo.stage = CombatStage::Fight;
+        assert!(
+            !combat_fight_stage(&mut demo, &mut session),
+            "the fight advances to Drops instead of ending the run"
+        );
+        assert_eq!(demo.stage, CombatStage::Drops);
+        assert!(!demo.failed, "unexpected fight abort: {:?}", demo.digest);
+        assert_eq!(demo.melee_hits, 2);
+        assert_eq!(demo.melee_damage, SWORD_DAMAGE_WOOD);
+        assert_eq!(demo.melee_blocked, 1);
+
+        // Two 4-damage hits from 10 health: the i-frame window refused the
+        // re-hit, so exactly one hit landed per window and the fight never kills
+        // anything — the Drops stage owns death.
+        let camera = session.camera.position;
+        let pig = &session.mobs()[0];
+        assert_eq!(pig.kind, MobKind::Pig);
+        assert_eq!(pig.health, 2, "10 -> 6 -> 2, two hits of 4 damage");
+        assert!(pig.hurt > 0.0, "the last hit armed the hurt flash");
+        assert!(pig.hurt_iframe > 0.0, "the last hit re-armed i-frames");
+        assert_eq!(pig.death, 0.0, "the fight must not start a collapse");
+        let knockback = Vec3::new(pig.knockback.x, 0.0, pig.knockback.z);
+        let away = Vec3::new(pig.position.x - camera.x, 0.0, pig.position.z - camera.z);
+        assert!(
+            knockback.length_squared() > 0.0,
+            "the hit left a knockback impulse"
+        );
+        assert!(
+            knockback.dot(away) > 0.0,
+            "knockback must point away from the attacker"
+        );
+
+        // The Drops stage kills the Pig and the Cow and delivers their drops.
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "the drops stage advances to Hostile"
+        );
+        assert_eq!(demo.stage, CombatStage::Hostile);
+        assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
+        assert_eq!(demo.killed, 2);
+        assert_eq!(demo.drops, 5, "pig 2 units + cow 3 units");
+        assert_eq!(demo.drops_lost, 0);
+        assert_eq!(session.mobs().len(), 2, "both passive records were reaped");
+
+        // The hostile proof has its own dedicated test, and this fixture has no
+        // lit plain; skip the stage so the pinned save witness is produced by
+        // the same Save stage as before.
+        demo.stage = CombatStage::Save;
+
+        // The immediately following Save stage pins the two survivors and
+        // writes the damaged-health witness the reload leg asserts.
+        assert!(
+            combat_demo_step(&mut demo, &mut session),
+            "the save stage ends the fresh leg"
+        );
+        assert_eq!(demo.stage, CombatStage::Done);
+        assert_eq!(demo.saved, 2);
+        assert_eq!(demo.records, 2);
+        let digest = demo.digest.as_deref().expect("success digest");
+        assert!(
+            digest.contains("melee_hits=2 melee_damage=4 melee_blocked=1 killed=2 drops=5"),
+            "{digest}"
+        );
+
+        let loaded = load_world_from_path(&save_path).expect("load save");
+        assert_eq!(loaded.mobs.len(), 2);
+        assert!(
+            loaded
+                .mobs
+                .iter()
+                .all(|record| matches!(record.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "only the two hostile records may survive: {:?}",
+            loaded.mobs.iter().map(|r| r.kind).collect::<Vec<_>>()
+        );
+        for kind in [MobKind::Zombie, MobKind::Skeleton] {
+            let index = MobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("kind index");
+            let record = loaded
+                .mobs
+                .iter()
+                .find(|record| record.kind == kind)
+                .unwrap_or_else(|| panic!("missing {kind:?} record"));
+            assert_eq!(
+                record.health, COMBAT_PINNED_HEALTH[index],
+                "the fight and drops must not leak into the save ({kind:?})"
+            );
+            assert_eq!(record.yaw, COMBAT_PINNED_YAW[index], "yaw {kind:?}");
+        }
+    }
+
+    /// The Drops stage alone: a hit makes the Pig flee away, a lethal hit
+    /// collapses it and the reaper removes the record, and both kills deliver
+    /// raw meat and leather into the real inventory. Removing flee, the collapse
+    /// timer, the reaper, or the drop grant aborts the stage or leaves the
+    /// inventory short, so this test fails for any of them.
+    #[test]
+    fn combat_demo_drops_stage_proves_flee_collapse_reap_and_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-drops.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        for y in [spawn.y, spawn.y - 4.0] {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    spawn.x.floor() as i32,
+                    y.floor() as i32,
+                    spawn.z.floor() as i32,
+                ),
+            );
+        }
+
+        let mut demo = CombatDemo::new(seed, true, None);
+        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
+        // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
+        // dedicated test, and the 7-chunk demo fixture has no light grids, so
+        // it could never satisfy `column_ready`.
+        demo.stage = CombatStage::Spawn;
+        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert_eq!(demo.stage, CombatStage::Walk);
+        for pos in demo.spawn_positions {
+            insert_generated_chunk_with_generated_face_neighbors(
+                &mut session,
+                IVec3::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ),
+            );
+        }
+
+        // The Walk verdict runs Fight in the same step, which hands over to
+        // Drops. Stopping there proves the Drops stage against the real quartet.
+        let mut updates = 0u32;
+        while demo.stage == CombatStage::Walk && updates < 600 {
+            updates += 1;
+            session.tick_mobs(0.05, 1.0);
+            combat_demo_step(&mut demo, &mut session);
+        }
+        assert_eq!(
+            demo.stage,
+            CombatStage::Drops,
+            "the walk verdict handed over to drops: {:?}",
+            demo.digest
+        );
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(
+            session.mobs().len(),
+            4,
+            "the quartet starts the drops stage"
+        );
+
+        assert!(
+            !combat_drops_stage(&mut demo, &mut session),
+            "the drops stage advances to Hostile"
+        );
+        assert_eq!(demo.stage, CombatStage::Hostile);
+        assert!(!demo.failed, "unexpected drops abort: {:?}", demo.digest);
+        assert_eq!(demo.killed, 2);
+        assert_eq!(demo.drops, 5);
+        assert_eq!(demo.drops_lost, 0);
+        // The hostile proof has its own dedicated test; hand straight to Save so
+        // this test still ends on the pinned save witness.
+        demo.stage = CombatStage::Save;
+
+        // Both passive records were reaped; only the hostiles remain.
+        assert_eq!(session.mobs().len(), 2);
+        assert!(
+            session
+                .mobs()
+                .iter()
+                .all(|mob| matches!(mob.kind, MobKind::Zombie | MobKind::Skeleton)),
+            "dead passive records must be reaped: {:?}",
+            session
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>()
+        );
+
+        // The drops landed in the real 36-slot inventory next to the earned
+        // sword.
+        let sword_id = ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Wood,
+        };
+        assert_eq!(combat_inventory_units(&session, sword_id), 1);
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::RawPorkchop)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::RawBeef)),
+            1
+        );
+        assert_eq!(
+            combat_inventory_units(&session, ItemId::Material(Material::Leather)),
+            3,
+            "pig 1 + cow 2 leather units"
+        );
+
+        // The success digest reports the latched drop verdict.
+        assert!(
+            combat_demo_step(&mut demo, &mut session),
+            "the save stage ends the fresh leg"
+        );
+        assert_eq!(demo.stage, CombatStage::Done);
+        let digest = demo.digest.as_deref().expect("success digest");
+        assert!(
+            digest.contains("killed=2 drops=5 drops_lost=0 saved=2 records=2 ok=true"),
+            "{digest}"
+        );
+    }
+
+    /// The reload leg is a second invocation against the same save path: a
+    /// loaded session starts at Restore, and one step proves the pinned kinds,
+    /// positions, yaw, and damaged health through the real startup path.
+    #[test]
+    fn combat_demo_reload_leg_restores_the_pinned_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 12345;
+        let save_path = dir.path().join("combat-reload.mcvx");
+        let _ = run_fresh_combat_leg(seed, save_path.clone());
+
+        // Relaunch exactly as the binary does: `--save P --demo-combat`, no
+        // `--new`, so the startup path loads the fresh leg's save.
+        let cli = CliConfig::parse_args([
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+            "--demo-combat",
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let demo = app.combat_demo.as_ref().expect("seam armed");
+        assert!(!demo.fresh, "a loaded session is never a fresh spawn");
+        assert_eq!(demo.stage, CombatStage::Restore);
+
+        app.step_scripted_demos();
+        let digest = app
+            .combat_demo
+            .as_ref()
+            .and_then(|demo| demo.digest.clone())
+            .expect("restore digest");
+        assert_eq!(
+            digest,
+            "combat_demo: seed=12345 stage=restored mobs=2 health=11/14 yaw=true positions=true items=8 ok=true"
+        );
+        assert!(!app.exit_failure);
+    }
+
+    /// Deadline and walk-timeout runs latch self-describing aborts (and the
+    /// first outcome wins), so a stalled harness still gets a verdict digest.
+    #[test]
+    fn combat_demo_deadline_and_walk_aborts_are_self_describing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("combat-abort.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut demo = CombatDemo::new(12345, true, Some(past));
+        assert!(combat_demo_step(&mut demo, &mut session));
+        assert!(demo.failed, "a deadline is a failed run");
+        let digest = demo.digest.clone().expect("deadline digest latched");
+        assert!(
+            digest.starts_with("combat_demo: seed=12345 stage=deadline "),
+            "{digest}"
+        );
+        assert!(digest.contains("ok=false"), "{digest}");
+        demo.abort("walk", "synthetic_second_abort");
+        assert_eq!(
+            demo.digest.as_deref(),
+            Some(digest.as_str()),
+            "the first outcome wins"
+        );
+
+        // Walk timeout: a spawned quartet that is never ticked stays unwalked,
+        // and the 600th observation aborts instead of waiting forever.
+        let spawn = WorldSession::spawn_position(12345);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                (spawn.y - 4.0).floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+        let mut demo = CombatDemo::new(12345, true, None);
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "stays in Settle"
+        );
+        assert_eq!(demo.stage, CombatStage::Ambient, "settle hands to ambient");
+        // This test pins the Walk timeout; the 7-chunk fixture has no light
+        // grids, so the Ambient proof lives in its own dedicated test.
+        demo.stage = CombatStage::Spawn;
+        assert!(
+            !combat_demo_step(&mut demo, &mut session),
+            "spawns into Walk"
+        );
+        assert_eq!(demo.stage, CombatStage::Walk);
+        demo.walk_updates = 599;
+        assert!(combat_demo_step(&mut demo, &mut session));
+        let digest = demo.digest.as_deref().expect("walk abort digest");
+        assert!(digest.contains("stage=walk"), "{digest}");
+        assert!(digest.contains("walked=0"), "{digest}");
+        assert!(digest.contains("ok=false"), "{digest}");
+        assert!(demo.failed);
+    }
+
     /// A main-storage item moves into a full hotbar by freeing one slot into an
     /// empty main slot, and the cursor must end empty.
     #[test]
@@ -10028,7 +16112,7 @@ mod tests {
         assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
         let loaded = app.current_pack.as_ref().expect("pack loaded");
         assert_eq!(loaded.display_name, "Alpha Pack");
-        assert_eq!(loaded.layers.len(), 32);
+        assert_eq!(loaded.layers.len(), NUM_TEX_LAYERS as usize);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
@@ -10092,7 +16176,11 @@ mod tests {
 
         assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
         let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(loaded.layers.len(), 32, "fallback still fully usable");
+        assert_eq!(
+            loaded.layers.len(),
+            NUM_TEX_LAYERS as usize,
+            "fallback still fully usable"
+        );
         let message = app.menu.message.as_ref().expect("warning in the menu");
         assert!(
             message.text.contains("grass_top.png"),
@@ -10256,7 +16344,11 @@ mod tests {
             pack.logo.is_none(),
             "corrupt logo falls back to the text title"
         );
-        assert_eq!(pack.layers.len(), 32, "layers stay fully usable");
+        assert_eq!(
+            pack.layers.len(),
+            NUM_TEX_LAYERS as usize,
+            "layers stay fully usable"
+        );
         assert!(
             warnings.iter().any(|w| w.field == "title.png"),
             "warning names the bare logo file: {warnings:?}"
@@ -10832,6 +16924,288 @@ mod tests {
                 session.player.hotbar_stack(slot)
             );
         }
+    }
+
+    /// The production save site must persist live mobs: a Survival session's
+    /// four damaged, non-round-yaw mobs go through `save_current_world`,
+    /// decode back in `(kind, position)` order, and restore through
+    /// `session_from_save` with identical kinds and health.
+    #[test]
+    fn mob_persistence_roundtrips_through_the_production_save_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("mobs.mcvx");
+        let seed = 24680u32;
+        let mut session = WorldSession::new_session_with_mode(
+            seed,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let spawn = WorldSession::spawn_position(seed);
+        insert_generated_chunk_with_generated_face_neighbors(
+            &mut session,
+            IVec3::new(
+                spawn.x.floor() as i32,
+                spawn.y.floor() as i32,
+                spawn.z.floor() as i32,
+            ),
+        );
+
+        let base = Vec3::new(spawn.x.floor() + 0.5, spawn.y, spawn.z.floor() + 0.5);
+        let pinned: [(MobKind, Vec3, f32, u16); 4] = [
+            (MobKind::Pig, base + Vec3::new(2.5, 0.0, -1.25), 0.25, 4),
+            (MobKind::Cow, base + Vec3::new(-3.0, 0.0, 4.5), 0.75, 7),
+            (MobKind::Zombie, base + Vec3::new(1.0, 0.0, 8.0), -1.25, 11),
+            (MobKind::Skeleton, base + Vec3::new(6.5, 0.0, -4.5), 2.5, 14),
+        ];
+        for (kind, position, yaw, health) in pinned {
+            let mut mob = Mob::new(kind, position, yaw);
+            mob.health = health; // simulated combat damage, never max health
+            session.mobs_mut().push(mob);
+        }
+
+        save_current_world(&mut session).expect("save succeeds");
+        let loaded = load_world_from_path(&save_path).expect("load succeeds");
+        let expected: Vec<SavedMob> = pinned
+            .iter()
+            .map(|(kind, position, yaw, health)| SavedMob {
+                kind: *kind,
+                position: position.to_array(),
+                yaw: *yaw,
+                health: *health,
+            })
+            .collect();
+        assert_eq!(
+            loaded.mobs, expected,
+            "the production save site writes all four mobs in (kind, position) order"
+        );
+
+        let restored = WorldSession::session_from_save(loaded, save_path.clone());
+        assert_eq!(restored.mobs().len(), 4);
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.kind)
+                .collect::<Vec<_>>(),
+            pinned.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.health)
+                .collect::<Vec<_>>(),
+            vec![4, 7, 11, 14],
+            "damaged health survives the save/relaunch boundary"
+        );
+        assert_eq!(
+            restored
+                .mobs()
+                .iter()
+                .map(|mob| mob.yaw)
+                .collect::<Vec<_>>(),
+            pinned.iter().map(|(_, _, yaw, _)| *yaw).collect::<Vec<_>>()
+        );
+    }
+
+    /// A session whose chunk `(0, 0, 0)` is resident air, so the melee tests
+    /// can place mobs and the crosshair ray without terrain generating.
+    fn melee_test_session(dir: &std::path::Path, seed: u32, name: &str) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+    }
+
+    /// Aim the test camera east from a head-height origin carving through the
+    /// resident air chunk, so a mob placed on the +X axis is directly ahead.
+    fn aim_camera_east(session: &mut WorldSession) {
+        session.camera.position = Vec3::new(0.5, 9.65, 0.5);
+        session.camera.yaw = 0.0;
+        session.camera.pitch = 0.0;
+    }
+
+    #[test]
+    fn melee_candidate_uses_the_camera_ray_reach_and_residency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A pig centred 2.0 blocks ahead: its box entry is 0.35 before the
+        // centre, so the hit is 1.65 blocks from the eye and inside reach.
+        let mut session = melee_test_session(dir.path(), 4101, "melee-near.mcvx");
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0));
+        let hit = session
+            .melee_candidate(
+                session.camera.position,
+                session.camera.forward(),
+                MELEE_REACH,
+            )
+            .expect("a pig 2.0 blocks ahead is inside reach");
+        assert_eq!(hit.index, 0);
+        assert!(
+            (hit.distance - 1.65).abs() < 1e-4,
+            "entry distance was {}",
+            hit.distance
+        );
+
+        // The same pig geometry 5.0 blocks ahead is outside MELEE_REACH.
+        let mut far = melee_test_session(dir.path(), 4102, "melee-far.mcvx");
+        aim_camera_east(&mut far);
+        far.mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        assert_eq!(
+            far.melee_candidate(far.camera.position, far.camera.forward(), MELEE_REACH),
+            None,
+            "a pig outside MELEE_REACH must not be selected"
+        );
+
+        // A mob in an unloaded chunk is filtered by the same residency gate
+        // rendering and the fixed-rate runtime use.
+        let mut unloaded = melee_test_session(dir.path(), 4103, "melee-unloaded.mcvx");
+        aim_camera_east(&mut unloaded);
+        unloaded
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(100.5, 9.0, 0.5), 0.0));
+        assert!(!unloaded.mob_is_resident(&unloaded.mobs()[0]));
+        assert_eq!(
+            unloaded.melee_candidate(
+                unloaded.camera.position,
+                unloaded.camera.forward(),
+                MELEE_REACH,
+            ),
+            None,
+            "an unloaded mob can never be hit through missing terrain"
+        );
+    }
+
+    #[test]
+    fn attack_mob_applies_damage_flash_knockback_and_refuses_repeats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = melee_test_session(dir.path(), 4104, "melee-hit.mcvx");
+        aim_camera_east(&mut session);
+        let origin = session.camera.position;
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0);
+        pig.health = 10;
+        session.mobs_mut().push(pig);
+
+        let hit = session.attack_mob(0, 4, origin).expect("first hit lands");
+        assert_eq!(hit.damage, 4);
+        assert_eq!(hit.health_after, 6);
+        assert!(!hit.killed);
+        let mob = &session.mobs()[0];
+        assert_eq!(mob.health, 6, "10 - 4 = 6");
+        assert!(mob.hurt > 0.0, "the hurt flash is armed");
+        assert!(
+            mob.knockback.length_squared() > 0.0,
+            "the knockback impulse is non-zero"
+        );
+
+        assert_eq!(
+            session.attack_mob(0, 4, origin),
+            None,
+            "an immediate second hit is inside the i-frame window"
+        );
+        assert_eq!(
+            session.mobs()[0].health,
+            6,
+            "the blocked hit changed nothing"
+        );
+
+        // A dead record stays in the list and can never be hit again.
+        session.mobs_mut()[0].health = 0;
+        session.mobs_mut()[0].hurt_iframe = 0.0;
+        assert_eq!(session.attack_mob(0, 4, origin), None);
+        assert_eq!(session.mobs().len(), 1, "melee never removes a record");
+        assert_eq!(
+            session.attack_mob(9, 4, origin),
+            None,
+            "a missing index is refused"
+        );
+
+        // A non-resident record is refused even with a clear i-frame window.
+        let mut unloaded = melee_test_session(dir.path(), 4105, "melee-hit-unloaded.mcvx");
+        unloaded
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(100.5, 9.0, 0.5), 0.0));
+        assert_eq!(unloaded.attack_mob(0, 4, Vec3::ZERO), None);
+    }
+
+    #[test]
+    fn mining_after_attack_gives_any_attack_priority_over_mining() {
+        let target = MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None)
+            .expect("stone is minable");
+        let attack = Some(MeleeHit {
+            index: 0,
+            distance: 1.0,
+        });
+        assert_eq!(mining_after_attack(attack, Some(target)), None);
+        assert_eq!(mining_after_attack(None, Some(target)), Some(target));
+        assert_eq!(mining_after_attack(attack, None), None);
+        assert_eq!(mining_after_attack(None, None), None);
+    }
+
+    #[test]
+    fn left_press_over_empty_ground_with_no_mob_in_reach_still_mines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = melee_test_session(dir.path(), 4106, "melee-no-target.mcvx");
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        let attack = session.melee_candidate(
+            session.camera.position,
+            session.camera.forward(),
+            MELEE_REACH,
+        );
+        assert_eq!(attack, None, "the only mob is outside reach");
+        let mining = MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None)
+            .expect("stone is minable");
+        assert_eq!(
+            mining_after_attack(attack, Some(mining)),
+            Some(mining),
+            "no attack candidate leaves the mining path unchanged"
+        );
+    }
+
+    /// A live mob with a non-finite position must fail the save closed: the
+    /// codec rejects it before the atomic write, the file is never created,
+    /// and the world keeps its unsaved-changes flag for a later retry.
+    #[test]
+    fn mob_persistence_rejects_a_non_finite_live_mob_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("bad-mobs.mcvx");
+        let mut session = WorldSession::new_session_with_mode(
+            24681,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        let cpos = ChunkPos { x: 0, y: 1, z: 0 };
+        session
+            .world
+            .insert_chunk_for_test(cpos, generate_chunk_seeded(cpos, 24681, Season::Summer));
+        session.world.set_block_immediate(0, 40, 5, BlockId::Brick);
+        assert!(session.world.has_unsaved_changes());
+
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(f32::NAN, 64.0, 0.0), 0.0));
+        let result = save_current_world(&mut session);
+
+        assert!(
+            matches!(result, Err(PersistenceError::InvalidMobState)),
+            "a non-finite mob position is a codec rejection, got {result:?}"
+        );
+        assert!(!save_path.exists(), "no bytes are written on rejection");
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the failed save keeps the retry flag set"
+        );
     }
 
     #[test]
@@ -12718,6 +19092,7 @@ mod tests {
             None,
             app.main_menu_message.as_ref(),
             None,
+            None,
         );
         assert_eq!(text.lines().count(), 5 + 1, "five rows plus the message");
         assert!(text.ends_with(message.text.as_str()));
@@ -12758,6 +19133,7 @@ mod tests {
                 LifecycleScreen::MainMenu,
                 &app.new_game,
                 &app.load,
+                None,
                 None,
                 None,
                 None
@@ -14091,12 +20467,21 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "New Game\nLoad Game\nSettings\nEdit Background\nExit Game"
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Pause, &new_game, &load, None, None, None),
+            compose_screen_text(
+                LifecycleScreen::Pause,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                None
+            ),
             "Resume\nSettings\nSave and Quit"
         );
         // With no message the main menu lists exactly its five rows; a
@@ -14113,7 +20498,7 @@ mod tests {
                 &load,
                 None,
                 Some(&message),
-                None
+                None, None
             ),
             "New Game\nLoad Game\nSettings\nEdit Background\nExit Game\ncould not save world: blocked"
         );
@@ -14129,7 +20514,8 @@ mod tests {
                 &load,
                 None,
                 None,
-                Some(&pause_message)
+                Some(&pause_message),
+                None
             ),
             "Resume\nSettings\nSave and Quit\ncould not save menu background: blocked"
         );
@@ -14143,20 +20529,27 @@ mod tests {
         // unfocused blank seed renders the random hint
         new_game.apply(TextInputAction::InsertText("Deep Dark".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None, None),
             "> World Name: Deep Dark|\n  Seed: (random)\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Tab moves the marker to the seed; its caret follows the text
         new_game.cycle_focus();
         new_game.apply(TextInputAction::InsertText("42".into()));
         assert_eq!(
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None),
+            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None, None),
             "  World Name: Deep Dark\n> Seed: 42|\nRandomize Seed\nSeason Length: 1 day\nGame Mode: Survival\nCreate World\nBack"
         );
         // Inline form errors append as the final line (warnings-as-data).
         new_game.set_message_for_ticks("World name cannot be empty.", 1);
-        let text =
-            compose_screen_text(LifecycleScreen::NewGame, &new_game, &load, None, None, None);
+        let text = compose_screen_text(
+            LifecycleScreen::NewGame,
+            &new_game,
+            &load,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(text.ends_with("World name cannot be empty."));
     }
 
@@ -14193,6 +20586,7 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "(no saved worlds)\nBack"
@@ -14216,6 +20610,7 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             "alpha — 1970-01-01\nbroken — unknown — (cannot load)\nBack"
@@ -14228,6 +20623,7 @@ mod tests {
                 LifecycleScreen::LoadGame,
                 &new_game,
                 &load,
+                None,
                 None,
                 None,
                 None
@@ -14247,6 +20643,7 @@ mod tests {
             Some(&message),
             None,
             None,
+            None,
         );
         assert!(text.ends_with("Could not load world \"alpha\""));
 
@@ -14259,12 +20656,21 @@ mod tests {
                 &load,
                 None,
                 None,
+                None,
                 None
             ),
             String::new()
         );
         assert_eq!(
-            compose_screen_text(LifecycleScreen::Playing, &new_game, &load, None, None, None),
+            compose_screen_text(
+                LifecycleScreen::Playing,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                None
+            ),
             String::new()
         );
     }
@@ -14384,6 +20790,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: rustc_hash::FxHashMap::default(),
+            mobs: Vec::new(),
             chunk_edits: ChunkEditMap::default(),
         }
     }
@@ -14592,9 +20999,10 @@ mod tests {
                 &app.load,
                 None,
                 None,
+                None,
                 None
             ),
-            "You Died\nRespawn\nQuit"
+            "You Died\nCause: Unknown\nRespawn\nQuit"
         );
         assert_eq!(screen_title_tag(LifecycleScreen::Death), " | Dead");
         assert_eq!(
@@ -14615,6 +21023,71 @@ mod tests {
             None,
             "the title line is not clickable"
         );
+    }
+
+    #[test]
+    fn compose_screen_text_names_the_zombie_cause() {
+        let new_game = NewGameScreen::new();
+        let load = LoadScreen::new();
+        assert_eq!(
+            compose_screen_text(
+                LifecycleScreen::Death,
+                &new_game,
+                &load,
+                None,
+                None,
+                None,
+                Some(DamageCause::Zombie)
+            ),
+            "You Died\nCause: Zombie\nRespawn\nQuit"
+        );
+    }
+
+    #[test]
+    fn compose_screen_text_ignores_the_cause_on_non_death_screens() {
+        let new_game = NewGameScreen::new();
+        let mut load = LoadScreen::new();
+        load.set_rows(vec![CatalogRow::loadable(
+            "alpha".into(),
+            "alpha.mcvx".into(),
+            Some(100),
+        )]);
+        let message = MenuMessage {
+            text: "could not save world: blocked".to_string(),
+            ticks_left: menu::MESSAGE_TICKS,
+        };
+        let screens = [
+            LifecycleScreen::MainMenu,
+            LifecycleScreen::Pause,
+            LifecycleScreen::NewGame,
+            LifecycleScreen::LoadGame,
+            LifecycleScreen::Playing,
+            LifecycleScreen::Settings(SettingsCaller::MainMenu),
+        ];
+        for screen in screens {
+            let with_cause = compose_screen_text(
+                screen,
+                &new_game,
+                &load,
+                Some(&message),
+                Some(&message),
+                Some(&message),
+                Some(DamageCause::Zombie),
+            );
+            let without_cause = compose_screen_text(
+                screen,
+                &new_game,
+                &load,
+                Some(&message),
+                Some(&message),
+                Some(&message),
+                None,
+            );
+            assert_eq!(
+                with_cause, without_cause,
+                "{screen:?} must ignore the death cause"
+            );
+        }
     }
 
     #[test]
@@ -15197,6 +21670,126 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // S06-T04: the red damage flash quad on the Playing frame
+    // -----------------------------------------------------------------------
+
+    /// A Survival hit arms the player's hurt timer, so the Playing frame draws
+    /// one extra full-surface translucent red quad AFTER the vitals quads; a
+    /// healed player draws the vitals alone and Creative draws nothing.
+    #[test]
+    fn playing_hud_quads_draws_the_damage_flash_only_while_hurt() {
+        use opencraft::player::combat::DamageCause;
+        use opencraft::ui::hud::{DAMAGE_FLASH_ALPHA, HEART_FILL_COLOR};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("hurt-flash.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        session.sync_camera();
+        let baseline = playing_hud_quads(&session, 1280, 720).len();
+        assert_eq!(
+            baseline, 40,
+            "full vitals draw ten heart pairs plus ten hunger pairs"
+        );
+        assert_eq!(
+            session.player_hurt_intensity(),
+            0.0,
+            "a fresh session has no flash"
+        );
+
+        let feet = session.player.position;
+        let hit = session.player.combat.take_hit(
+            &mut session.player.survival,
+            3,
+            GameMode::Survival,
+            DamageCause::Zombie,
+            feet,
+            feet + Vec3::Z,
+        );
+        assert!(hit.is_some(), "a Survival hit must land");
+
+        let quads = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            quads.len(),
+            40,
+            "the hurt frame is 39 vitals quads (17 hp) plus one flash quad"
+        );
+        let flash = quads.last().expect("the flash is appended last");
+        assert_eq!(flash.x, 0.0);
+        assert_eq!(flash.y, 0.0);
+        assert_eq!(flash.w, 1280.0, "the flash covers the surface width");
+        assert_eq!(flash.h, 720.0, "the flash covers the surface height");
+        assert_eq!(
+            flash.color[3], DAMAGE_FLASH_ALPHA,
+            "a fresh hit draws at peak alpha"
+        );
+        assert!(flash.color[3] > 0.0, "the flash is visible");
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.w == 1280.0 && quad.h == 720.0)
+                .count(),
+            1,
+            "exactly one full-surface quad (the flash) is drawn"
+        );
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .count(),
+            9,
+            "the 3-damage hit leaves 17 hp, so nine and a half hearts draw"
+        );
+
+        // Age the flash through the production fixed-step carrier: 12 steps of
+        // 0.05 s is past the 0.5 s window.
+        session.player.combat.advance(12);
+        assert_eq!(session.player_hurt_intensity(), 0.0, "the flash expires");
+        let healed = playing_hud_quads(&session, 1280, 720);
+        assert_eq!(
+            healed.len(),
+            39,
+            "17 hp draws nine heart fills plus ten hunger pairs"
+        );
+        assert!(
+            healed
+                .iter()
+                .all(|quad| quad.w != 1280.0 || quad.h != 720.0),
+            "a healed player draws only the vitals quads"
+        );
+
+        let mut creative = WorldSession::new_session_with_mode(
+            12345,
+            dir.path().join("hurt-flash-creative.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+        );
+        let feet = creative.player.position;
+        assert!(
+            creative
+                .player
+                .combat
+                .take_hit(
+                    &mut creative.player.survival,
+                    3,
+                    GameMode::Creative,
+                    DamageCause::Zombie,
+                    feet,
+                    feet + Vec3::Z,
+                )
+                .is_none(),
+            "Creative can never be hurt"
+        );
+        assert!(
+            playing_hud_quads(&creative, 1280, 720).is_empty(),
+            "Creative draws neither vitals nor a flash"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // S05-T02: stone-tier reachability acceptance
     // -----------------------------------------------------------------------
 
@@ -15614,6 +22207,10 @@ mod tests {
             // covers only the nine Pickaxe/Axe/Shovel break-centric
             // combinations.
             ToolKind::Hoe => &[],
+            // Swords and bows have no recipes in this S05 matrix, which
+            // deliberately covers only the nine mining combinations (same
+            // precedent as the Hoe arm above).
+            ToolKind::Sword | ToolKind::Bow => &[],
         }
     }
 
@@ -15626,6 +22223,8 @@ mod tests {
             // covers only the nine Pickaxe/Axe/Shovel break-centric
             // combinations.
             ToolKind::Hoe => &[],
+            // See `tool_head_cells`: combat tools are outside this matrix.
+            ToolKind::Sword | ToolKind::Bow => &[],
         }
     }
 
@@ -16165,6 +22764,9 @@ mod tests {
                 ToolKind::Axe => BlockId::Stone,
                 ToolKind::Shovel => BlockId::OakLog,
                 ToolKind::Hoe => unreachable!("hoe recipes are S07"),
+                ToolKind::Sword | ToolKind::Bow => {
+                    unreachable!("sword and bow are not mining tools")
+                }
             };
             let wrong = MiningTarget::from_block(IVec3::new(7, 8, 0), wrong_block, Some(tool))
                 .expect("a mismatched block is still breakable");
@@ -16214,6 +22816,9 @@ mod tests {
                     },
                 ),
                 ToolKind::Hoe => unreachable!("hoe recipes are S07"),
+                ToolKind::Sword | ToolKind::Bow => {
+                    unreachable!("sword and bow are not mining tools")
+                }
             };
             assert_eq!(target_block.break_duration_secs(), Some(base_duration));
             let drop_id = ItemId::Block(target_block.mined_drop());
@@ -16763,6 +23368,108 @@ mod tests {
         assert_eq!(break_rejection_notice(BreakRejection::Unbreakable), None);
         assert_eq!(break_rejection_notice(BreakRejection::StaleTarget), None);
         assert_eq!(break_rejection_notice(BreakRejection::EditRejected), None);
+    }
+
+    #[test]
+    fn mob_drop_notice_names_only_a_loss() {
+        assert_eq!(mob_drop_notice(MobDropReport::default()), None);
+        assert_eq!(mob_drop_notice(MobDropReport::new(2, 0)), None);
+        assert_eq!(
+            mob_drop_notice(MobDropReport::new(1, 1)),
+            Some("Inventory full: some mob drops were lost")
+        );
+    }
+
+    fn full_inventory_with_breaking_sword() -> Inventory {
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 1)
+                .expect("a one-durability sword"),
+        );
+        for slot in &mut slots[1..] {
+            *slot = Some(Item::new(ItemId::Block(BlockId::Stone), 64).expect("stone"));
+        }
+        Inventory::from_parts(slots, None)
+    }
+
+    fn pig_kill_session(dir: &std::path::Path, seed: u32, name: &str) -> WorldSession {
+        let mut session = melee_test_session(dir, seed, name);
+        aim_camera_east(&mut session);
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(2.5, 9.0, 0.5), 0.0));
+        session
+    }
+
+    fn give_inventory(session: &mut WorldSession, inventory: Inventory) {
+        session.player = Player::with_inventory(
+            session.player.position,
+            inventory,
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+    }
+
+    fn lethal_pig_hit(session: &mut WorldSession) -> MobHit {
+        session
+            .attack_mob(0, 10, session.camera.position)
+            .expect("a full-health pig dies to 10 damage")
+    }
+
+    #[test]
+    fn after_lethal_player_hit_maps_overflow_to_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = pig_kill_session(dir.path(), 4201, "drops-notice.mcvx");
+        give_inventory(&mut session, Inventory::empty());
+        let hit = lethal_pig_hit(&mut session);
+
+        assert!(
+            after_lethal_player_hit(&mut session, 0, hit).is_none(),
+            "a clean delivery stays silent"
+        );
+
+        let mut full = pig_kill_session(dir.path(), 4202, "drops-full.mcvx");
+        give_inventory(&mut full, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut full);
+        let message = after_lethal_player_hit(&mut full, 0, hit)
+            .expect("an overflow delivery shows a notice");
+        assert_eq!(message.text, "Inventory full: some mob drops were lost");
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+    }
+
+    #[test]
+    fn mem214_wear_before_drops_frees_the_only_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Production order: attack -> wear -> drops -> notice. The sword
+        // breaks and frees slot 0 before the grant, so the porkchop lands.
+        let mut ordered = pig_kill_session(dir.path(), 4203, "drops-ordered.mcvx");
+        give_inventory(&mut ordered, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut ordered);
+        assert_eq!(
+            wear_after_proven_action(&mut ordered),
+            ToolWearOutcome::Broke
+        );
+        let report = ordered.resolve_mob_kill(0, hit, MobKillCause::Player);
+        assert_eq!(report, MobDropReport::new(1, 1));
+        assert_eq!(
+            ordered.player.inventory().slot(0),
+            Item::new(ItemId::Material(Material::RawPorkchop), 1).ok(),
+            "the freed slot accepts the first drop unit"
+        );
+
+        // Swapped order: drops before wear loses the whole table even though
+        // the wear frees the slot a moment later.
+        let mut swapped = pig_kill_session(dir.path(), 4204, "drops-swapped.mcvx");
+        give_inventory(&mut swapped, full_inventory_with_breaking_sword());
+        let hit = lethal_pig_hit(&mut swapped);
+        let report = swapped.resolve_mob_kill(0, hit, MobKillCause::Player);
+        assert_eq!(report, MobDropReport::new(0, 2));
+        assert_eq!(
+            wear_after_proven_action(&mut swapped),
+            ToolWearOutcome::Broke
+        );
+        assert_eq!(swapped.player.inventory().slot(0), None);
     }
 
     #[test]
@@ -17920,6 +24627,7 @@ mod tests {
         );
         for quiet in [
             RightClickOutcome::EatingStarted,
+            RightClickOutcome::BowChargeStarted,
             RightClickOutcome::Nothing,
             RightClickOutcome::TableOpened,
             RightClickOutcome::ChestOpened(IVec3::ZERO),
@@ -17933,19 +24641,19 @@ mod tests {
     fn eating_frame_progress_bar_prefers_eating_then_mining_then_none() {
         use opencraft::ui::hud::EATING_FILL_COLOR;
 
-        let eating = frame_progress_bar(Some(0.5), Some(0.5), 1280, 720)
-            .expect("eating wins when both bars exist");
+        let eating = frame_progress_bar(Some(0.5), None, Some(0.5), 1280, 720)
+            .expect("eating wins when eating and mining bars exist");
         assert_eq!(eating[1].color, EATING_FILL_COLOR);
 
-        let mining =
-            frame_progress_bar(None, Some(0.5), 1280, 720).expect("mining is the fallback bar");
+        let mining = frame_progress_bar(None, None, Some(0.5), 1280, 720)
+            .expect("mining is the fallback bar");
         assert_eq!(
             mining[1].color,
             mining_progress_quads(0.5, 1280, 720)[1].color
         );
         assert_ne!(eating[1].color, mining[1].color);
 
-        assert!(frame_progress_bar(None, None, 1280, 720).is_none());
+        assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
     }
 
     /// S05-T03: a lifecycle screen entry drops the right hold and any partial
@@ -19010,5 +25718,469 @@ mod tests {
             BlockId::WheatStage2,
             "the rebuilt crop resumes growing from the persisted stage"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T05: right-click bow wiring, release, reset boundaries, HUD bar
+    // -----------------------------------------------------------------------
+
+    fn bow_item() -> Item {
+        Item::tool_with_durability(
+            ToolKind::Bow,
+            ToolTier::Wood,
+            ToolTier::Wood.max_durability(),
+        )
+        .expect("a wood bow is constructible")
+    }
+
+    fn arrow_item(count: u16) -> Item {
+        Item::new(ItemId::Material(Material::Arrow), count).expect("valid arrow stack")
+    }
+
+    /// A session with a wood bow selected in slot 0 and `arrows` in slot 1.
+    fn bow_session(dir: &Path, seed: u32, name: &str, mode: GameMode) -> WorldSession {
+        let mut session =
+            WorldSession::new_session(seed, dir.join(name), DEFAULT_SEASON_LENGTH_DAYS);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(bow_item());
+        slots[1] = Some(arrow_item(3));
+        let mut player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        player.set_mode(mode);
+        assert!(player.select_slot(0));
+        session.player = player;
+        session
+    }
+
+    fn bow_draw_to_full(bow: &mut BowState, session: &WorldSession) {
+        for _ in 0..10 {
+            let target = bow_charge_candidate(session, true, true, true);
+            bow.tick(0.1, target);
+        }
+    }
+
+    fn selected_bow_durability(session: &WorldSession) -> Option<u16> {
+        session
+            .player
+            .selected_item()
+            .and_then(|item| item.durability())
+    }
+
+    fn arrow_count(session: &WorldSession) -> u32 {
+        player_item_count(&session.player, ItemId::Material(Material::Arrow))
+    }
+
+    #[test]
+    fn bow_right_click_priority_matrix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut bow = bow_session(dir.path(), 90, "bow-priority.mcvx", GameMode::Survival);
+        assert!(matches!(
+            right_click_interaction(&mut bow),
+            RightClickOutcome::BowChargeStarted
+        ));
+        assert_eq!(
+            right_click_notice(&RightClickOutcome::BowChargeStarted),
+            None
+        );
+        assert_eq!(bow.world.get_block(0, 6, 0), BlockId::Air);
+
+        // A targeted chest still wins over a held bow.
+        let chest_pos = IVec3::new(0, 5, 0);
+        bow.world
+            .set_block_immediate(chest_pos.x, chest_pos.y, chest_pos.z, BlockId::Chest);
+        aim_table_interaction_at(&mut bow, chest_pos);
+        assert!(matches!(
+            right_click_interaction(&mut bow),
+            RightClickOutcome::ChestOpened(opened) if opened == chest_pos
+        ));
+
+        // Food keeps its own branches when no bow is selected.
+        let mut food =
+            survival_food_session(dir.path(), 91, "bow-priority-food.mcvx", apple_item(3), 10);
+        assert!(matches!(
+            right_click_interaction(&mut food),
+            RightClickOutcome::EatingStarted
+        ));
+        let mut full = survival_food_session(
+            dir.path(),
+            92,
+            "bow-priority-full.mcvx",
+            apple_item(3),
+            MAX_HUNGER,
+        );
+        assert!(matches!(
+            right_click_interaction(&mut full),
+            RightClickOutcome::EatingRefused
+        ));
+
+        // Blocks still fall through to placement.
+        let mut blocks = survival_food_session(
+            dir.path(),
+            93,
+            "bow-priority-block.mcvx",
+            Item::new(ItemId::Block(BlockId::Stone), 2).expect("stone stack"),
+            MAX_HUNGER,
+        );
+        let stone_pos = IVec3::new(0, 5, 0);
+        blocks
+            .world
+            .set_block_immediate(stone_pos.x, stone_pos.y, stone_pos.z, BlockId::Stone);
+        aim_table_interaction_at(&mut blocks, stone_pos);
+        assert!(matches!(
+            right_click_interaction(&mut blocks),
+            RightClickOutcome::Placed(ref remeshed) if !remeshed.is_empty()
+        ));
+
+        // A bow works in Creative too (there is deliberately no mode gate).
+        let mut creative = bow_session(dir.path(), 94, "bow-creative.mcvx", GameMode::Creative);
+        assert!(matches!(
+            right_click_interaction(&mut creative),
+            RightClickOutcome::BowChargeStarted
+        ));
+    }
+
+    #[test]
+    fn bow_charge_candidate_gates_every_cancel_condition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = bow_session(dir.path(), 95, "bow-candidate.mcvx", GameMode::Survival);
+
+        assert_eq!(
+            bow_charge_candidate(&session, true, true, true).map(|target| target.slot()),
+            Some(0),
+            "an idle Survival player holding right click draws"
+        );
+        assert!(bow_charge_candidate(&session, false, true, true).is_none());
+        assert!(bow_charge_candidate(&session, true, false, true).is_none());
+        assert!(bow_charge_candidate(&session, true, true, false).is_none());
+
+        let creative = bow_session(
+            dir.path(),
+            96,
+            "bow-candidate-creative.mcvx",
+            GameMode::Creative,
+        );
+        assert!(
+            bow_charge_candidate(&creative, true, true, true).is_some(),
+            "Creative may draw"
+        );
+
+        let food =
+            survival_food_session(dir.path(), 97, "bow-candidate-food.mcvx", apple_item(1), 10);
+        assert!(
+            bow_charge_candidate(&food, true, true, true).is_none(),
+            "a non-bow selection never starts a draw"
+        );
+
+        let mut dead = bow_session(
+            dir.path(),
+            98,
+            "bow-candidate-dead.mcvx",
+            GameMode::Survival,
+        );
+        dead.player.survival.damage(MAX_HUNGER);
+        assert!(dead.is_dead(), "fixture kills the player");
+        assert!(bow_charge_candidate(&dead, true, true, true).is_none());
+    }
+
+    #[test]
+    fn bow_sub_threshold_release_cancels_without_ammo_or_wear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 99, "bow-tap.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        let target = bow_charge_candidate(&session, true, true, true).expect("bow target");
+
+        bow.tick(0.1, Some(target));
+        assert!(bow.progress().is_some(), "one frame is a live charge");
+        let durability_before = selected_bow_durability(&session);
+        let arrows_before = arrow_count(&session);
+
+        let release = release_bow(&mut bow, &mut session, true, true);
+        assert!(!release.fired, "a tap never fires");
+        assert_eq!(release.error, None, "a tap is a silent cancel");
+        assert_eq!(bow.progress(), None, "release always resets the draw");
+        assert!(session.arrows().is_empty(), "a tap never fires");
+        assert_eq!(arrow_count(&session), arrows_before, "a tap spends no ammo");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before,
+            "a tap wears nothing"
+        );
+    }
+
+    #[test]
+    fn bow_full_charge_fires_exactly_one_arrow_and_wears_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 100, "bow-fire.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        bow_draw_to_full(&mut bow, &session);
+        assert_eq!(bow.progress(), Some(1.0));
+        let arrows_before = arrow_count(&session);
+        let durability_before = selected_bow_durability(&session).expect("tool durability");
+
+        let release = release_bow(&mut bow, &mut session, true, true);
+
+        assert!(release.fired, "a full draw fires");
+        assert_eq!(release.error, None);
+        assert_eq!(session.arrows().len(), 1, "exactly one arrow");
+        assert_eq!(
+            session.arrows()[0].owner,
+            opencraft::world::arrow::ArrowOwner::Player
+        );
+        assert_eq!(session.arrows()[0].damage, 4, "full draw is 4 damage");
+        assert_eq!(arrow_count(&session), arrows_before - 1, "one arrow spent");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before.checked_sub(1),
+            "one point of wear"
+        );
+        assert_eq!(bow.progress(), None);
+    }
+
+    #[test]
+    fn bow_release_on_a_panel_or_ungrabbed_cursor_resets_and_fires_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 101, "bow-release-gate.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+        let arrows_before = arrow_count(&session);
+        let durability_before = selected_bow_durability(&session);
+
+        bow_draw_to_full(&mut bow, &session);
+        let release = release_bow(&mut bow, &mut session, false, true);
+        assert!(!release.fired, "a panel frame never fires");
+        assert_eq!(release.error, None);
+        assert_eq!(bow.progress(), None, "panel frame still resets the draw");
+        assert!(session.arrows().is_empty(), "a panel frame never fires");
+
+        bow_draw_to_full(&mut bow, &session);
+        let release = release_bow(&mut bow, &mut session, true, false);
+        assert!(!release.fired, "an ungrabbed cursor never fires");
+        assert_eq!(release.error, None);
+        assert_eq!(bow.progress(), None, "ungrabbed cursor still resets");
+        assert!(
+            session.arrows().is_empty(),
+            "an ungrabbed cursor never fires"
+        );
+        assert_eq!(arrow_count(&session), arrows_before);
+        assert_eq!(selected_bow_durability(&session), durability_before);
+    }
+
+    #[test]
+    fn bow_release_notice_names_only_no_ammo() {
+        assert_eq!(
+            bow_release_notice(Some(BowFireError::NoAmmo)),
+            Some("No arrows")
+        );
+        for quiet in [
+            None,
+            Some(BowFireError::Dead),
+            Some(BowFireError::NotHoldingBow),
+            Some(BowFireError::ArrowCapReached),
+            Some(BowFireError::InvalidShot),
+        ] {
+            assert_eq!(bow_release_notice(quiet), None);
+        }
+    }
+
+    #[test]
+    fn mob_audio_slots_maps_every_event_to_its_slot() {
+        let cases = [
+            (
+                MobAudioFrame {
+                    idle: true,
+                    ..MobAudioFrame::default()
+                },
+                [Some(SoundSlot::MobIdle), None, None, None, None],
+            ),
+            (
+                MobAudioFrame {
+                    hurt: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, Some(SoundSlot::MobHurt), None, None, None],
+            ),
+            (
+                MobAudioFrame {
+                    death: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, Some(SoundSlot::MobDeath), None, None],
+            ),
+            (
+                MobAudioFrame {
+                    bow_release: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, None, Some(SoundSlot::BowRelease), None],
+            ),
+            (
+                MobAudioFrame {
+                    arrow_impact: true,
+                    ..MobAudioFrame::default()
+                },
+                [None, None, None, None, Some(SoundSlot::ArrowImpact)],
+            ),
+        ];
+        for (frame, expected) in cases {
+            assert_eq!(mob_audio_slots(frame), expected);
+        }
+        assert_eq!(
+            mob_audio_slots(MobAudioFrame {
+                idle: true,
+                hurt: true,
+                death: true,
+                bow_release: true,
+                arrow_impact: true,
+            }),
+            [
+                Some(SoundSlot::MobIdle),
+                Some(SoundSlot::MobHurt),
+                Some(SoundSlot::MobDeath),
+                Some(SoundSlot::BowRelease),
+                Some(SoundSlot::ArrowImpact),
+            ]
+        );
+        assert_eq!(mob_audio_slots(MobAudioFrame::default()), [None; 5]);
+    }
+
+    #[test]
+    fn bow_release_reports_fired_only_on_an_accepted_shot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 103, "bow-fired-flag.mcvx", GameMode::Survival);
+        let mut bow = BowState::new();
+
+        // A sub-threshold tap is a cancel: the draw resets, nothing fires.
+        let target = bow_charge_candidate(&session, true, true, true).expect("bow target");
+        bow.tick(0.1, Some(target));
+        let tap = release_bow(&mut bow, &mut session, true, true);
+        assert!(!tap.fired, "a tap is not a fired shot");
+        assert_eq!(tap.error, None, "a tap is a silent cancel");
+        assert!(session.arrows().is_empty());
+
+        // An accepted full draw fires with no refusal attached.
+        bow_draw_to_full(&mut bow, &session);
+        let accepted = release_bow(&mut bow, &mut session, true, true);
+        assert!(accepted.fired, "a full draw fires");
+        assert_eq!(accepted.error, None);
+        assert_eq!(session.arrows().len(), 1);
+    }
+
+    #[test]
+    fn bow_without_ammo_refuses_without_wear_and_reports_the_exact_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = bow_session(dir.path(), 102, "bow-no-ammo.mcvx", GameMode::Survival);
+        for _ in 0..3 {
+            assert!(session
+                .player
+                .consume_item(ItemId::Material(Material::Arrow))
+                .is_some());
+        }
+        assert_eq!(arrow_count(&session), 0);
+        let durability_before = selected_bow_durability(&session);
+
+        let mut bow = BowState::new();
+        bow_draw_to_full(&mut bow, &session);
+        let release = release_bow(&mut bow, &mut session, true, true);
+
+        assert!(!release.fired, "a refused shot never fires");
+        assert_eq!(release.error, Some(BowFireError::NoAmmo));
+        assert_eq!(bow_release_notice(release.error), Some("No arrows"));
+        assert!(session.arrows().is_empty(), "a refused shot spawns nothing");
+        assert_eq!(
+            selected_bow_durability(&session),
+            durability_before,
+            "a refused shot wears nothing"
+        );
+        assert_eq!(bow.progress(), None);
+    }
+
+    #[test]
+    fn bow_state_cleared_by_enter_screen_enter_playing_death_and_session_swap() {
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut app = GameApp::new(
+            cli,
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+        );
+        let target = BowTarget::new(0, bow_item()).expect("bow target");
+
+        // Every lifecycle screen entry clears a live charge.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_screen(LifecycleScreen::MainMenu);
+        assert_eq!(app.bow.progress(), None, "screen entry clears the draw");
+
+        // Entering Playing clears a draw too (defensive trip-through-menu).
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_playing();
+        assert_eq!(app.bow.progress(), None, "Playing entry clears the draw");
+
+        // A Death entry routes through enter_screen.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.enter_screen(LifecycleScreen::Death);
+        assert_eq!(app.bow.progress(), None, "Death entry clears the draw");
+
+        // A world swap (on_session_installed) clears the draw.
+        app.bow.tick(0.5, Some(target));
+        assert!(app.bow.progress().is_some());
+        app.start_world_session(WorldSession::new_session(
+            42,
+            PathBuf::from("/nonexistent/replacement.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert_eq!(app.bow.progress(), None, "session swap clears the draw");
+    }
+
+    #[test]
+    fn reset_panel_holds_clears_a_live_draw_and_meal() {
+        let mut mining = MiningState::new();
+        let mut eating = EatingState::new();
+        let mut bow = BowState::new();
+        let meal = EatingTarget::new(0, apple_item(1), 10).expect("apple target");
+        eating.tick(0.5, Some(meal));
+        let target = BowTarget::new(0, bow_item()).expect("bow target");
+        bow.tick(0.5, Some(target));
+        assert!(eating.progress().is_some());
+        assert!(bow.progress().is_some());
+
+        reset_panel_holds(&mut mining, &mut eating, &mut bow);
+
+        assert_eq!(eating.progress(), None, "meal cleared");
+        assert_eq!(bow.progress(), None, "draw cleared");
+        assert!(mining.progress().is_none());
+    }
+
+    #[test]
+    fn bow_frame_progress_bar_prefers_eating_then_bow_then_mining() {
+        use opencraft::ui::hud::{BOW_FILL_COLOR, EATING_FILL_COLOR};
+
+        let eating = frame_progress_bar(Some(0.5), Some(0.5), Some(0.5), 1280, 720)
+            .expect("eating wins when every bar exists");
+        assert_eq!(eating[1].color, EATING_FILL_COLOR);
+
+        let bow =
+            frame_progress_bar(None, Some(0.5), Some(0.5), 1280, 720).expect("bow beats mining");
+        assert_eq!(bow[1].color, BOW_FILL_COLOR);
+
+        let mining = frame_progress_bar(None, None, Some(0.5), 1280, 720)
+            .expect("mining is the fallback bar");
+        assert_eq!(
+            mining[1].color,
+            mining_progress_quads(0.5, 1280, 720)[1].color
+        );
+        assert_ne!(eating[1].color, bow[1].color);
+        assert_ne!(bow[1].color, mining[1].color);
+
+        assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
     }
 }

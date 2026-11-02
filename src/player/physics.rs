@@ -1,10 +1,11 @@
 use glam::Vec3;
 
+use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
 use crate::player::eating::food_value;
 use crate::player::inventory::{
-    CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory, InventoryError, Item, ItemId,
-    ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
+    CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
+    InventoryError, Item, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
@@ -183,27 +184,18 @@ pub struct Player {
     table_grid: CraftingGrid,
     /// Dry-land fall measurement and one-shot spawn immunity (S04).
     fall: FallState,
+    /// Player combat carrier: cause-tagged hits, i-frames, hurt flash, and the
+    /// one decaying hostile knockback impulse (S06). Ephemeral — never saved.
+    pub combat: PlayerCombat,
 }
 
+/// Thin player-side wrapper over the shared box-vs-solid predicate.
+///
+/// The epsilon/flooring rule lives in [`crate::world::collision::solid_overlaps`]
+/// so the player and every mob mover cannot drift apart. This wrapper keeps
+/// the existing player-sized [`Aabb`] call sites unchanged.
 fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
-    let eps = 1e-4;
-    let min_x = (aabb.min.x + eps).floor() as i32;
-    let max_x = (aabb.max.x - eps).floor() as i32;
-    let min_y = (aabb.min.y + eps).floor() as i32;
-    let max_y = (aabb.max.y - eps).floor() as i32;
-    let min_z = (aabb.min.z + eps).floor() as i32;
-    let max_z = (aabb.max.z - eps).floor() as i32;
-
-    for y in min_y..=max_y {
-        for z in min_z..=max_z {
-            for x in min_x..=max_x {
-                if get_block(x, y, z).is_solid() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    crate::world::collision::solid_overlaps(aabb.min, aabb.max, get_block)
 }
 
 impl Player {
@@ -225,6 +217,7 @@ impl Player {
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
             fall: FallState::default(),
+            combat: PlayerCombat::default(),
         }
     }
 
@@ -257,6 +250,8 @@ impl Player {
         }
         // A mode change never carries an in-flight fall or spawn immunity.
         self.fall.clear();
+        // A mode change must not carry a hostile impulse or i-frame window.
+        self.combat.reset();
     }
 
     /// Whether the player can actually fly right now.
@@ -400,9 +395,31 @@ impl Player {
         self.inventory.insert(item).is_ok()
     }
 
+    /// Best-effort batch collection in hotbar-then-main order.
+    ///
+    /// Thin forwarder over [`Inventory::collect_items`]. M009 mob drops use
+    /// this instead of [`Player::collect_item`]: a full inventory accepts what
+    /// fits, reports the overflow as [`CollectBatchOutcome::lost`], and never
+    /// touches the cursor or either crafting grid.
+    pub fn collect_items(&mut self, items: &[Item]) -> CollectBatchOutcome {
+        self.inventory.collect_items(items)
+    }
+
     /// Consumes exactly one item from the selected hotbar slot.
     pub fn consume_selected(&mut self) -> Option<Item> {
         self.inventory.consume_one(self.selected_slot)
+    }
+
+    /// Consumes exactly one unit of `id` from the first matching slot.
+    ///
+    /// Thin forwarder over [`Inventory::consume_item`]. A bow lives in the
+    /// selected hotbar slot, so its ammo cannot be spent by slot index: this
+    /// primitive spends a projectile identity from any of the 36 slots in
+    /// hotbar-then-main order and never touches the cursor or either grid.
+    /// Returns the consumed unit and the slot it came from, or `None` with no
+    /// mutation when the identity is absent.
+    pub fn consume_item(&mut self, id: ItemId) -> Option<(usize, Item)> {
+        self.inventory.consume_item(id)
     }
 
     /// Completes one hold-to-eat meal: consumes exactly one `expected` item
@@ -765,6 +782,13 @@ impl Player {
         }
         self.velocity.x = move_dir.x * walk_speed;
         self.velocity.z = move_dir.z * walk_speed;
+        // Hostile knockback is integrated *after* the input assignment above.
+        // Input reassigns `velocity.x/z` every frame, so this is deliberately
+        // not a second owner of the velocity: the impulse itself lives only in
+        // `combat.knockback`, is never persisted, and has no vertical
+        // component so the player is never pushed into the floor or ceiling.
+        self.velocity.x += self.combat.knockback().x;
+        self.velocity.z += self.combat.knockback().z;
 
         // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
         // only (positions, sink/rise, on_ground). Fall distance is measured by
@@ -1069,6 +1093,50 @@ mod tests {
             &before,
             "a rejected item leaves every slot untouched"
         );
+    }
+
+    #[test]
+    fn collect_items_forwarder_reports_acceptance_and_leaves_cursor_and_grids_alone() {
+        // The forwarder really reaches the aggregate: an empty player accepts
+        // the whole batch in hotbar order.
+        let mut player = Player::new(Vec3::ZERO);
+        let sticks = stick_item(3);
+        let apple = apple_item(1);
+        let outcome = player.collect_items(&[sticks, apple]);
+        assert_eq!(outcome, CollectBatchOutcome::new(4, 0));
+        assert!(!outcome.lost_any());
+        assert_eq!(player.inventory().slot(0), Some(sticks));
+        assert_eq!(player.inventory().slot(1), Some(apple));
+
+        // A deliberately full player: 36 tool slots and a tool on the cursor.
+        // Nothing can merge, so the batch is entirely lost and every other
+        // storage surface must stay byte-identical.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid
+            .set(3, Some(stick_item(2)))
+            .expect("player grid cell");
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        table_grid
+            .set(15, Some(block_item(BlockId::Stone, 5)))
+            .expect("table grid cell");
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            full_tool_inventory_with_cursor(),
+            player_grid,
+            table_grid,
+        );
+        let inventory_before = player.inventory().clone();
+        let cursor_before = player.inventory().cursor();
+        let player_grid_before = player.player_grid().clone();
+        let table_grid_before = player.table_grid().clone();
+
+        let outcome = player.collect_items(&[stick_item(10), apple_item(1)]);
+        assert_eq!(outcome, CollectBatchOutcome::new(0, 11));
+        assert!(outcome.lost_any());
+        assert_eq!(player.inventory(), &inventory_before);
+        assert_eq!(player.inventory().cursor(), cursor_before);
+        assert_eq!(player.player_grid(), &player_grid_before);
+        assert_eq!(player.table_grid(), &table_grid_before);
     }
 
     #[test]

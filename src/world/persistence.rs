@@ -15,6 +15,7 @@ use crate::player::survival::{GameMode, SurvivalState};
 use crate::world::block::BlockId;
 use crate::world::chunk::{ChunkPos, CHUNK_VOLUME};
 use crate::world::daycycle::{DAY_TICKS, DEFAULT_TIME_OF_DAY};
+use crate::world::mob::{Mob, MobKind};
 use crate::world::season::{DEFAULT_SEASON_LENGTH_DAYS, MAX_SEASON_LENGTH_DAYS};
 
 pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
@@ -25,10 +26,23 @@ pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 /// appear in the Load Game screen or be deleted from it.
 pub const DEFAULT_BACKGROUND_SAVE_PATH: &str = "saves/background/background.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 6;
+pub const SAVE_VERSION: u32 = 7;
 /// First save version that carries the survival tail: game mode, the
 /// health/hunger/air triple, and the sorted per-position chest records.
 pub const SURVIVAL_VERSION: u32 = 6;
+/// First save version that carries the append-only mob tail: a `u32` count
+/// followed by one fixed-size [`SAVED_MOB_LEN`] record per live mob.
+pub const MOB_VERSION: u32 = 7;
+/// The save version that introduced the current item vocabulary. New
+/// identities take the next free discriminant and are gated to this version.
+pub const ITEM_VOCAB_VERSION: u32 = MOB_VERSION;
+/// Upper bound on persisted mob records. This is a defensive wire bound (a
+/// forged count must never drive an unbounded decode pass), deliberately
+/// unrelated to any future gameplay spawn cap.
+pub const MAX_SAVED_MOBS: usize = 16_384;
+/// Fixed on-disk size of one mob record: `kind: u8` + feet `x/y/z: f32` +
+/// `yaw: f32` + `health: u16 LE`.
+pub const SAVED_MOB_LEN: usize = 19;
 /// Upper bound on persisted chest records. Mirrors the chunk-count bound so a
 /// forged count can never request an unbounded decode pass.
 pub const MAX_SAVED_CHESTS: usize = 1_000_000;
@@ -58,10 +72,19 @@ const MATERIAL_APPLE: u8 = 1;
 const MATERIAL_WHEAT: u8 = 2;
 const MATERIAL_WHEAT_SEEDS: u8 = 3;
 const MATERIAL_BREAD: u8 = 4;
+// Append-only: the melee/drop vocabulary (M009) takes the next free tags.
+const MATERIAL_LEATHER: u8 = 5;
+const MATERIAL_RAW_PORKCHOP: u8 = 6;
+const MATERIAL_RAW_BEEF: u8 = 7;
+const MATERIAL_ROTTEN_FLESH: u8 = 8;
+const MATERIAL_BONE: u8 = 9;
+const MATERIAL_ARROW: u8 = 10;
 const TOOL_KIND_PICKAXE: u8 = 0;
 const TOOL_KIND_AXE: u8 = 1;
 const TOOL_KIND_SHOVEL: u8 = 2;
 const TOOL_KIND_HOE: u8 = 3;
+const TOOL_KIND_SWORD: u8 = 4;
+const TOOL_KIND_BOW: u8 = 5;
 const TOOL_TIER_WOOD: u8 = 0;
 const TOOL_TIER_STONE: u8 = 1;
 const TOOL_TIER_IRON: u8 = 2;
@@ -153,6 +176,11 @@ pub struct CliConfig {
     /// persisted, fresh startup only, and exempt from the accelerated-demo
     /// watch.
     pub demo_content: bool,
+    /// Whether the bounded scripted combat demo (`--demo-combat`, M009/S01-T05)
+    /// is requested. Same bare-switch contract as `demo_swim`/`demo_survival`:
+    /// no value, never a world intent, never persisted, fresh startup only,
+    /// and exempt from the accelerated-demo watch.
+    pub demo_combat: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -177,6 +205,7 @@ impl CliConfig {
         let mut demo_swim = false;
         let mut demo_survival = false;
         let mut demo_content = false;
+        let mut demo_combat = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -245,6 +274,10 @@ impl CliConfig {
                     // Same bare-switch rule as `--demo-swim`.
                     demo_content = true;
                 }
+                "--demo-combat" => {
+                    // Same bare-switch rule as `--demo-swim`.
+                    demo_combat = true;
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -267,6 +300,7 @@ impl CliConfig {
             demo_swim,
             demo_survival,
             demo_content,
+            demo_combat,
             mode,
         }
     }
@@ -318,6 +352,34 @@ pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
 /// chest (which is written as-is rather than dropped).
 pub type ChestMap = FxHashMap<IVec3, Container>;
 
+/// One persisted mob record (save version 7).
+///
+/// Deliberately a flat wire value rather than `Mob`: [`Mob`] carries six
+/// ephemeral runtime fields (home anchor, velocity, AI state, hurt timer,
+/// cooldown, walk phase) that a codec never writes, so a `Vec<Mob>` inside
+/// [`WorldSaveData`] could never round-trip its derived `PartialEq`. The
+/// save stores exactly what a relaunch must preserve: kind, feet position,
+/// facing, and remaining health.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SavedMob {
+    pub kind: MobKind,
+    /// Feet position in world space.
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub health: u16,
+}
+
+impl From<&Mob> for SavedMob {
+    fn from(mob: &Mob) -> Self {
+        SavedMob {
+            kind: mob.kind,
+            position: mob.position.to_array(),
+            yaw: mob.yaw,
+            health: mob.health,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSaveData {
     pub seed: u32,
@@ -342,6 +404,9 @@ pub struct WorldSaveData {
     /// Persisted chest records, written sorted by `(x, y, z)` for a stable
     /// byte layout independent of hash-map iteration order.
     pub chests: ChestMap,
+    /// Persisted live mobs (save version 7), written sorted by kind tag then
+    /// position so the tail is independent of the session's list order.
+    pub mobs: Vec<SavedMob>,
     pub chunk_edits: ChunkEditMap,
 }
 
@@ -378,6 +443,12 @@ pub enum PersistenceError {
     /// Version-6 chest section was malformed (unbounded count, duplicate
     /// position, or internally inconsistent record).
     InvalidChestState,
+    /// Version-7 mob tail carried an unknown [`MobKind`] tag.
+    InvalidMobKind(u8),
+    /// Version-7 mob section was malformed (unbounded count, non-finite
+    /// position or facing, health above the kind maximum, or duplicate
+    /// `(kind, position)` record).
+    InvalidMobState,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -435,6 +506,10 @@ impl fmt::Display for PersistenceError {
             PersistenceError::InvalidChestState => {
                 write!(f, "invalid chest state in save")
             }
+            PersistenceError::InvalidMobKind(tag) => {
+                write!(f, "unknown mob kind {tag} in save")
+            }
+            PersistenceError::InvalidMobState => write!(f, "invalid mob state in save"),
         }
     }
 }
@@ -469,6 +544,37 @@ pub fn save_world_to_bytes(
     // narrowing before the first byte is written: a rejected save must leave
     // `out` untouched (atomic-rejection contract).
     let chest_count = checked_chest_count(data.chests.len())?;
+
+    // The v7 mob tail carries a u32 count and fixed-size records. Validate the
+    // bound, every record, and the duplicate rule before the first byte, then
+    // keep the canonical sort order for the write below. A rejected save must
+    // leave `out` empty, exactly like every earlier section.
+    let mob_count = checked_mob_count(data.mobs.len())?;
+    let mut sorted_mobs = data.mobs.clone();
+    for mob in &sorted_mobs {
+        if !mob.position.iter().all(|c| c.is_finite()) || !mob.yaw.is_finite() {
+            return Err(PersistenceError::InvalidMobState);
+        }
+        if mob.health > mob.kind.max_health() {
+            return Err(PersistenceError::InvalidMobState);
+        }
+    }
+    sorted_mobs.sort_by(|a, b| {
+        a.kind
+            .tag()
+            .cmp(&b.kind.tag())
+            .then_with(|| a.position[0].total_cmp(&b.position[0]))
+            .then_with(|| a.position[1].total_cmp(&b.position[1]))
+            .then_with(|| a.position[2].total_cmp(&b.position[2]))
+    });
+    if sorted_mobs.windows(2).any(|pair| {
+        pair[0].kind == pair[1].kind
+            && pair[0].position[0] == pair[1].position[0]
+            && pair[0].position[1] == pair[1].position[1]
+            && pair[0].position[2] == pair[1].position[2]
+    }) {
+        return Err(PersistenceError::InvalidMobState);
+    }
 
     out.extend_from_slice(SAVE_MAGIC);
     out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
@@ -573,7 +679,28 @@ pub fn save_world_to_bytes(
         }
     }
 
+    // v7 mob tail, appended after the last chest record: the count, then one
+    // fixed-size record per mob in `(kind tag, x, y, z)` order. `health == 0`
+    // is legal (a mob that died in the same tick) and is written as-is.
+    out.extend_from_slice(&mob_count.to_le_bytes());
+    for mob in sorted_mobs {
+        out.push(mob.kind.tag());
+        for c in mob.position {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        out.extend_from_slice(&mob.yaw.to_le_bytes());
+        out.extend_from_slice(&mob.health.to_le_bytes());
+    }
+
     Ok(())
+}
+
+/// Bounds-checks the persisted mob count before any bytes are emitted.
+fn checked_mob_count(len: usize) -> Result<u32, PersistenceError> {
+    if len > MAX_SAVED_MOBS {
+        return Err(PersistenceError::InvalidMobState);
+    }
+    u32::try_from(len).map_err(|_| PersistenceError::InvalidMobState)
 }
 
 /// Bounds-checks the persisted chest count before any bytes are emitted.
@@ -606,6 +733,12 @@ fn material_tag(material: Material) -> u8 {
         Material::Wheat => MATERIAL_WHEAT,
         Material::WheatSeeds => MATERIAL_WHEAT_SEEDS,
         Material::Bread => MATERIAL_BREAD,
+        Material::Leather => MATERIAL_LEATHER,
+        Material::RawPorkchop => MATERIAL_RAW_PORKCHOP,
+        Material::RawBeef => MATERIAL_RAW_BEEF,
+        Material::RottenFlesh => MATERIAL_ROTTEN_FLESH,
+        Material::Bone => MATERIAL_BONE,
+        Material::Arrow => MATERIAL_ARROW,
     }
 }
 
@@ -616,6 +749,12 @@ fn material_from_tag(tag: u8) -> Option<Material> {
         MATERIAL_WHEAT => Some(Material::Wheat),
         MATERIAL_WHEAT_SEEDS => Some(Material::WheatSeeds),
         MATERIAL_BREAD => Some(Material::Bread),
+        MATERIAL_LEATHER => Some(Material::Leather),
+        MATERIAL_RAW_PORKCHOP => Some(Material::RawPorkchop),
+        MATERIAL_RAW_BEEF => Some(Material::RawBeef),
+        MATERIAL_ROTTEN_FLESH => Some(Material::RottenFlesh),
+        MATERIAL_BONE => Some(Material::Bone),
+        MATERIAL_ARROW => Some(Material::Arrow),
         _ => None,
     }
 }
@@ -626,6 +765,8 @@ fn tool_kind_tag(kind: ToolKind) -> u8 {
         ToolKind::Axe => TOOL_KIND_AXE,
         ToolKind::Shovel => TOOL_KIND_SHOVEL,
         ToolKind::Hoe => TOOL_KIND_HOE,
+        ToolKind::Sword => TOOL_KIND_SWORD,
+        ToolKind::Bow => TOOL_KIND_BOW,
     }
 }
 
@@ -635,6 +776,8 @@ fn tool_kind_from_tag(tag: u8) -> Option<ToolKind> {
         TOOL_KIND_AXE => Some(ToolKind::Axe),
         TOOL_KIND_SHOVEL => Some(ToolKind::Shovel),
         TOOL_KIND_HOE => Some(ToolKind::Hoe),
+        TOOL_KIND_SWORD => Some(ToolKind::Sword),
+        TOOL_KIND_BOW => Some(ToolKind::Bow),
         _ => None,
     }
 }
@@ -733,6 +876,19 @@ fn read_f32<R: Read>(r: &mut R) -> Result<f32, PersistenceError> {
     let v = f32::from_le_bytes(b);
     if !v.is_finite() {
         return Err(PersistenceError::InvalidPlayerState);
+    }
+    Ok(v)
+}
+
+/// Reads one finite `f32` inside the v7 mob tail. Kept separate from
+/// [`read_f32`] so a malformed mob record reports `InvalidMobState` rather
+/// than blaming the player record.
+fn read_mob_f32<R: Read>(r: &mut R) -> Result<f32, PersistenceError> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    let v = f32::from_le_bytes(b);
+    if !v.is_finite() {
+        return Err(PersistenceError::InvalidMobState);
     }
     Ok(v)
 }
@@ -905,9 +1061,72 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
         )
     };
 
-    // Exact-length check AFTER the newest known tail so v5 saves load while
-    // trailing bytes still fail closed. v1-v3 never had the check (their
-    // payload is the whole file by construction).
+    // v7 appends the mob tail after the last chest record. v1-v6 decode to
+    // zero mobs. Every record is strictly validated: a forged kind tag, a
+    // non-finite coordinate/facing, health above the kind maximum, a
+    // duplicate `(kind, position)`, or an out-of-bound count fails the whole
+    // load closed. `health == 0` is legal (a mob that died in the same tick).
+    let mobs = if version >= MOB_VERSION {
+        let mob_count = read_u32(&mut cur)?;
+        if mob_count as usize > MAX_SAVED_MOBS {
+            return Err(PersistenceError::InvalidMobState);
+        }
+        let mut mobs: Vec<SavedMob> = Vec::with_capacity(mob_count as usize);
+        for _ in 0..mob_count {
+            let tag = read_u8(&mut cur)?;
+            let Some(kind) = MobKind::from_tag(tag) else {
+                return Err(PersistenceError::InvalidMobKind(tag));
+            };
+            let x = read_mob_f32(&mut cur)?;
+            let y = read_mob_f32(&mut cur)?;
+            let z = read_mob_f32(&mut cur)?;
+            let yaw = read_mob_f32(&mut cur)?;
+            let health = read_u16(&mut cur)?;
+            if health > kind.max_health() {
+                return Err(PersistenceError::InvalidMobState);
+            }
+            mobs.push(SavedMob {
+                kind,
+                position: [x, y, z],
+                yaw,
+                health,
+            });
+        }
+        // Duplicate `(kind, position)` is ambiguous state, not a merge. Sort
+        // a key copy so detection stays O(n log n) at the wire bound.
+        let mut keys: Vec<(u8, f32, f32, f32)> = mobs
+            .iter()
+            .map(|mob| {
+                (
+                    mob.kind.tag(),
+                    mob.position[0],
+                    mob.position[1],
+                    mob.position[2],
+                )
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+                .then_with(|| a.3.total_cmp(&b.3))
+        });
+        if keys.windows(2).any(|pair| {
+            pair[0].0 == pair[1].0
+                && pair[0].1 == pair[1].1
+                && pair[0].2 == pair[1].2
+                && pair[0].3 == pair[1].3
+        }) {
+            return Err(PersistenceError::InvalidMobState);
+        }
+        mobs
+    } else {
+        Vec::new()
+    };
+
+    // Exact-length check AFTER the newest known tail (now the v7 mob section)
+    // so v5/v6 saves still load while trailing bytes still fail closed. v1-v3
+    // never had the check (their payload is the whole file by construction).
     if version >= INVENTORY_EXTENSION_VERSION && cur.position() != bytes.len() as u64 {
         return Err(PersistenceError::InvalidPlayerState);
     }
@@ -931,6 +1150,7 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             survival,
         },
         chests,
+        mobs,
         chunk_edits,
     })
 }
@@ -1009,6 +1229,9 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             if version < SURVIVAL_VERSION && is_survival_only_material_tag(material_raw) {
                 return Err(PersistenceError::InvalidMaterial(material_raw));
             }
+            if version < ITEM_VOCAB_VERSION && is_melee_only_material_tag(material_raw) {
+                return Err(PersistenceError::InvalidMaterial(material_raw));
+            }
             let material = material_from_tag(material_raw)
                 .ok_or(PersistenceError::InvalidMaterial(material_raw))?;
             Item::new(ItemId::Material(material), count)
@@ -1020,6 +1243,11 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             let tier_raw = read_u8(r)?;
             let durability = read_u16(r)?;
             if version < SURVIVAL_VERSION && kind_raw == TOOL_KIND_HOE {
+                return Err(PersistenceError::InvalidToolKind(kind_raw));
+            }
+            if version < ITEM_VOCAB_VERSION
+                && (kind_raw == TOOL_KIND_SWORD || kind_raw == TOOL_KIND_BOW)
+            {
                 return Err(PersistenceError::InvalidToolKind(kind_raw));
             }
             let kind =
@@ -1054,6 +1282,22 @@ fn is_survival_only_material_tag(tag: u8) -> bool {
     matches!(
         tag,
         MATERIAL_APPLE | MATERIAL_WHEAT | MATERIAL_WHEAT_SEEDS | MATERIAL_BREAD
+    )
+}
+
+/// Materials appended in v7 (M009); a pre-v7 payload may not contain them.
+///
+/// Deliberately separate from [`is_survival_only_material_tag`]: that one is
+/// named for, and gated at, the v6 introduction and must not widen.
+fn is_melee_only_material_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        MATERIAL_LEATHER
+            | MATERIAL_RAW_PORKCHOP
+            | MATERIAL_RAW_BEEF
+            | MATERIAL_ROTTEN_FLESH
+            | MATERIAL_BONE
+            | MATERIAL_ARROW
     )
 }
 
@@ -1156,6 +1400,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits,
         };
 
@@ -1210,13 +1455,15 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, SURVIVAL_VERSION);
+        assert_eq!(SAVE_VERSION, MOB_VERSION);
+        assert_eq!(MOB_VERSION, SURVIVAL_VERSION + 1);
         assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
         assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
-        assert_eq!(SAVE_VERSION, 6);
+        assert_eq!(SAVE_VERSION, 7);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
@@ -1300,6 +1547,7 @@ mod tests {
                 survival: SurvivalState::full(),
             },
             chests: ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: edits,
         };
         save_world_to_bytes(&mut valid, &data).unwrap();
@@ -1413,15 +1661,17 @@ mod tests {
             mode: GameMode::Creative,
             player,
             chests: ChestMap::default(),
+            mobs: Vec::new(),
             chunk_edits: ChunkEditMap::default(),
         }
     }
 
-    /// v1-v5 predate the survival tail and all migrate to the same baseline.
+    /// v1-v6 predate the mob tail and all migrate to the same baseline.
     fn assert_v6_migration_defaults(loaded: &WorldSaveData) {
         assert_eq!(loaded.mode, GameMode::Creative);
         assert_eq!(loaded.player.survival, SurvivalState::full());
         assert!(loaded.chests.is_empty());
+        assert!(loaded.mobs.is_empty());
     }
 
     #[test]
@@ -1440,7 +1690,12 @@ mod tests {
         // record (+3 bytes each).
         assert_eq!(
             bytes.len(),
-            V4_EXTENSION_OFFSET + V4_EXTENSION_LEN + V5_SEASON_LEN + V6_HEADER_LEN + 4 * 3
+            V4_EXTENSION_OFFSET
+                + V4_EXTENSION_LEN
+                + V5_SEASON_LEN
+                + V6_HEADER_LEN
+                + 4 * 3
+                + V7_MOB_COUNT_LEN
         );
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
 
@@ -1566,6 +1821,14 @@ mod tests {
     const V6_FIRST_CHEST_OFFSET: usize = V6_CHEST_COUNT_OFFSET + 4;
     /// First item record inside the first chest (after x/y/z).
     const V6_FIRST_CHEST_SLOT_OFFSET: usize = V6_FIRST_CHEST_OFFSET + 12;
+    /// Byte offset of the v7 mob count with no chunk edits and no chests:
+    /// immediately after the empty v6 chest section (149).
+    const V7_MOB_COUNT_OFFSET: usize = V6_FIRST_CHEST_OFFSET;
+    /// v7 tail prefix: the `u32` LE mob count.
+    const V7_MOB_COUNT_LEN: usize = 4;
+    /// First v7 mob record (153 for an edit-free save); each record is
+    /// [`SAVED_MOB_LEN`] bytes.
+    const V7_FIRST_MOB_OFFSET: usize = V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN;
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -1916,24 +2179,43 @@ mod tests {
     }
 
     /// Build a byte-valid v4 save: the current writer's payload with the
-    /// version field patched back to 4 and the v5+v6 tails removed.
+    /// version field patched back to 4 and the v5+v6+v7 tails removed.
     fn v4_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
         assert!(data.chests.is_empty(), "v4 has no chest section");
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(bytes.len() - V6_HEADER_LEN - V5_SEASON_LEN);
+        bytes.truncate(
+            bytes.len()
+                - V6_HEADER_LEN
+                - V5_SEASON_LEN
+                - V7_MOB_COUNT_LEN
+                - SAVED_MOB_LEN * data.mobs.len(),
+        );
         bytes[4..8].copy_from_slice(&INVENTORY_EXTENSION_VERSION.to_le_bytes());
         bytes
     }
 
     /// Build a byte-valid v5 save: the current writer's payload with the
-    /// version field patched back to 5 and the v6 survival tail removed.
+    /// version field patched back to 5 and the v6+v7 tails removed.
     fn v5_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
         assert!(data.chests.is_empty(), "v5 has no chest section");
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(bytes.len() - V6_HEADER_LEN);
+        bytes.truncate(
+            bytes.len() - V6_HEADER_LEN - V7_MOB_COUNT_LEN - SAVED_MOB_LEN * data.mobs.len(),
+        );
         bytes[4..8].copy_from_slice(&SEASON_VERSION.to_le_bytes());
+        bytes
+    }
+
+    /// Build a byte-valid v6 save: the current writer's payload with the
+    /// version field patched back to 6 and the v7 mob tail removed.
+    fn v6_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
+        assert!(data.chests.is_empty(), "v6 helper has no chest section");
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, data).unwrap();
+        bytes.truncate(bytes.len() - V7_MOB_COUNT_LEN - SAVED_MOB_LEN * data.mobs.len());
+        bytes[4..8].copy_from_slice(&SURVIVAL_VERSION.to_le_bytes());
         bytes
     }
 
@@ -2104,8 +2386,8 @@ mod tests {
         let bytes = v6_bytes_with_chest(Container::empty());
         assert_eq!(
             bytes.len(),
-            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS,
-            "one all-empty chest writes a fixed 12 + 27 byte record"
+            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS + V7_MOB_COUNT_LEN,
+            "one all-empty chest writes a fixed 12 + 27 byte record, plus the v7 count"
         );
         bytes
     }
@@ -2248,19 +2530,459 @@ mod tests {
             "a position without a record stays missing"
         );
         // The present-empty record still occupies its full 12 + 27 bytes and
-        // re-saves byte-identically.
-        assert_eq!(bytes.len(), V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS);
+        // re-saves byte-identically; the v7 mob count follows it.
+        assert_eq!(
+            bytes.len(),
+            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS + V7_MOB_COUNT_LEN
+        );
         let mut again = Vec::new();
         save_world_to_bytes(&mut again, &loaded).unwrap();
         assert_eq!(again, bytes);
     }
 
+    // ------------------------------------------------------------------
+    // v7 mob tail: kind, feet position, yaw, health
+    // ------------------------------------------------------------------
+
+    /// Four damaged, non-round yaw mobs covering every [`MobKind`] in tag
+    /// order, so the wire layout pin exercises all four kind bytes.
+    fn pinned_mobs() -> Vec<SavedMob> {
+        vec![
+            SavedMob {
+                kind: MobKind::Pig,
+                position: [1.5, 64.0, -3.25],
+                yaw: 0.25,
+                health: 4,
+            },
+            SavedMob {
+                kind: MobKind::Cow,
+                position: [-2.0, 65.5, 0.5],
+                yaw: 0.75,
+                health: 7,
+            },
+            SavedMob {
+                kind: MobKind::Zombie,
+                position: [3.0, 63.0, 8.0],
+                yaw: -1.25,
+                health: 11,
+            },
+            SavedMob {
+                kind: MobKind::Skeleton,
+                position: [7.5, 70.0, -4.5],
+                yaw: 2.5,
+                health: 14,
+            },
+        ]
+    }
+
+    fn v7_data_with_mobs(mobs: Vec<SavedMob>) -> WorldSaveData {
+        let mut data = sample_data(sample_player());
+        data.mobs = mobs;
+        data
+    }
+
+    fn v7_bytes_with_pinned_mobs() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &v7_data_with_mobs(pinned_mobs())).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn test_v7_roundtrips_mobs_and_pins_the_tail_layout() {
+        // An edit-free, chest-free save keeps every older offset fixed and
+        // puts the mob count at 149 with the first record at 153.
+        assert_eq!(V7_MOB_COUNT_OFFSET, 149);
+        assert_eq!(V7_FIRST_MOB_OFFSET, 153);
+        assert_eq!(SAVED_MOB_LEN, 19);
+
+        let data = v7_data_with_mobs(pinned_mobs());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v7 mob save must succeed");
+
+        assert_eq!(bytes.len(), V7_FIRST_MOB_OFFSET + 4 * SAVED_MOB_LEN);
+        assert_eq!(bytes.len(), 229);
+        assert_eq!(&bytes[4..8], &MOB_VERSION.to_le_bytes());
+        assert_eq!(
+            &bytes[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET],
+            &4u32.to_le_bytes(),
+            "the mob count sits immediately after the empty chest section"
+        );
+
+        // First record: kind u8, x/y/z f32 LE, yaw f32 LE, health u16 LE.
+        let first = V7_FIRST_MOB_OFFSET;
+        assert_eq!(bytes[first], MobKind::Pig.tag());
+        assert_eq!(&bytes[first + 1..first + 5], &1.5f32.to_le_bytes());
+        assert_eq!(&bytes[first + 5..first + 9], &64.0f32.to_le_bytes());
+        assert_eq!(&bytes[first + 9..first + 13], &(-3.25f32).to_le_bytes());
+        assert_eq!(&bytes[first + 13..first + 17], &0.25f32.to_le_bytes());
+        assert_eq!(&bytes[first + 17..first + 19], &4u16.to_le_bytes());
+
+        let loaded = load_world_from_bytes(&bytes).expect("v7 must load");
+        assert_eq!(loaded, data);
+        assert_eq!(loaded.mobs, pinned_mobs());
+
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
+        assert_eq!(again, bytes, "a loaded v7 save re-saves byte-identically");
+    }
+
+    #[test]
+    fn test_v7_writer_sorts_mobs_by_kind_and_position() {
+        let mut scrambled = pinned_mobs();
+        scrambled.reverse();
+        // A second pig proves the position tie-break inside one kind.
+        scrambled.push(SavedMob {
+            kind: MobKind::Pig,
+            position: [-1.0, 64.0, 0.0],
+            yaw: 0.0,
+            health: 10,
+        });
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &v7_data_with_mobs(scrambled)).unwrap();
+        let loaded = load_world_from_bytes(&bytes).expect("scrambled input still loads");
+
+        let keys: Vec<(u8, [f32; 3])> = loaded
+            .mobs
+            .iter()
+            .map(|mob| (mob.kind.tag(), mob.position))
+            .collect();
+        let mut expected = keys.clone();
+        expected.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1[0].total_cmp(&b.1[0]))
+                .then_with(|| a.1[1].total_cmp(&b.1[1]))
+                .then_with(|| a.1[2].total_cmp(&b.1[2]))
+        });
+        assert_eq!(keys, expected, "wire order is sorted, not insertion order");
+        assert_eq!(loaded.mobs[0].kind, MobKind::Pig);
+        assert_eq!(loaded.mobs[0].position, [-1.0, 64.0, 0.0]);
+        assert_eq!(loaded.mobs[1].position, [1.5, 64.0, -3.25]);
+    }
+
+    #[test]
+    fn test_v7_rejects_malformed_mob_records() {
+        let base = v7_bytes_with_pinned_mobs();
+
+        // Truncating one tail byte shortens the final health u16.
+        let truncated = &base[..base.len() - 1];
+        assert!(matches!(
+            load_world_from_bytes(truncated),
+            Err(PersistenceError::Io(_))
+        ));
+
+        // Unknown kind tag.
+        let mut bytes = base.clone();
+        bytes[V7_FIRST_MOB_OFFSET] = 4;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobKind(4))
+        ));
+
+        // Health above the kind maximum (Pig max 10 -> 11).
+        let mut bytes = base.clone();
+        bytes[V7_FIRST_MOB_OFFSET + 17..V7_FIRST_MOB_OFFSET + 19]
+            .copy_from_slice(&(MobKind::Pig.max_health() + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobState)
+        ));
+
+        // A non-finite coordinate reports InvalidMobState, not
+        // InvalidPlayerState (that is what the new reader helper is for).
+        let mut bytes = base.clone();
+        bytes[V7_FIRST_MOB_OFFSET + 1..V7_FIRST_MOB_OFFSET + 5]
+            .copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobState)
+        ));
+
+        // A non-finite facing is equally invalid.
+        let mut bytes = base.clone();
+        bytes[V7_FIRST_MOB_OFFSET + 13..V7_FIRST_MOB_OFFSET + 17]
+            .copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobState)
+        ));
+
+        // Duplicate (kind, position): append the first record and count 5.
+        let mut bytes = base.clone();
+        let record = bytes[V7_FIRST_MOB_OFFSET..V7_FIRST_MOB_OFFSET + SAVED_MOB_LEN].to_vec();
+        bytes.extend_from_slice(&record);
+        bytes[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET].copy_from_slice(&5u32.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobState)
+        ));
+
+        // An out-of-bound count fails before any record is read.
+        let mut bytes = base;
+        bytes[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET]
+            .copy_from_slice(&((MAX_SAVED_MOBS as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidMobState)
+        ));
+    }
+
+    #[test]
+    fn test_v7_writer_rejects_invalid_mobs_before_any_byte() {
+        // Non-finite coordinate.
+        let mut mobs = pinned_mobs();
+        mobs[0].position[1] = f32::NAN;
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut bytes, &v7_data_with_mobs(mobs)),
+            Err(PersistenceError::InvalidMobState)
+        ));
+        assert!(bytes.is_empty(), "a rejected save must not emit bytes");
+
+        // Health above the kind maximum.
+        let mut mobs = pinned_mobs();
+        mobs[0].health = MobKind::Pig.max_health() + 1;
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut bytes, &v7_data_with_mobs(mobs)),
+            Err(PersistenceError::InvalidMobState)
+        ));
+        assert!(bytes.is_empty());
+
+        // Duplicate (kind, position).
+        let mut mobs = pinned_mobs();
+        mobs.push(mobs[0]);
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut bytes, &v7_data_with_mobs(mobs)),
+            Err(PersistenceError::InvalidMobState)
+        ));
+        assert!(bytes.is_empty());
+
+        // The wire bound is enforced before the header is written.
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(
+                &mut bytes,
+                &v7_data_with_mobs(vec![pinned_mobs()[0]; MAX_SAVED_MOBS + 1]),
+            ),
+            Err(PersistenceError::InvalidMobState)
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_v7_zero_health_roundtrips() {
+        // A mob that died in the same tick is legal wire state and must not
+        // be filtered by the writer.
+        let mut mobs = pinned_mobs();
+        mobs[0].health = 0;
+        let data = v7_data_with_mobs(mobs);
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        assert_eq!(
+            &bytes[V7_FIRST_MOB_OFFSET + 17..V7_FIRST_MOB_OFFSET + 19],
+            &0u16.to_le_bytes()
+        );
+        let loaded = load_world_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.mobs[0].health, 0);
+        assert_eq!(loaded, data);
+    }
+
+    // ------------------------------------------------------------------
+    // v7 item vocabulary: new materials and Sword/Bow save records
+    // ------------------------------------------------------------------
+
+    /// The six material identities appended in v7 (M009) with their tags.
+    const V7_MELEE_MATERIALS: [(Material, u8); 6] = [
+        (Material::Leather, MATERIAL_LEATHER),
+        (Material::RawPorkchop, MATERIAL_RAW_PORKCHOP),
+        (Material::RawBeef, MATERIAL_RAW_BEEF),
+        (Material::RottenFlesh, MATERIAL_ROTTEN_FLESH),
+        (Material::Bone, MATERIAL_BONE),
+        (Material::Arrow, MATERIAL_ARROW),
+    ];
+
+    fn v7_melee_item(material: Material, count: u16) -> Item {
+        Item::new(ItemId::Material(material), count).expect("material count is in range")
+    }
+
+    /// Rebuilds a byte-valid v6 payload from an edit-free, chest-free v7
+    /// payload: patch the version back and drop the four-byte mob count.
+    fn v6_bytes_from_v7(bytes: &[u8]) -> Vec<u8> {
+        let mob_count_at = bytes.len() - V7_MOB_COUNT_LEN;
+        assert_eq!(
+            &bytes[mob_count_at..],
+            &0u32.to_le_bytes(),
+            "helper only rewrites a chest-free v7 save with no mobs"
+        );
+        let mut bytes = bytes.to_vec();
+        bytes.truncate(mob_count_at);
+        bytes[4..8].copy_from_slice(&SURVIVAL_VERSION.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn test_v7_roundtrips_new_materials_and_combat_tools_byte_stably() {
+        // Every new material sits in one hotbar slot and one chest slot, and
+        // both combat tool identities carry non-full durability.
+        let mut slots = [None; INVENTORY_SLOTS];
+        for (index, (material, _)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            slots[index] = Some(v7_melee_item(*material, 2 + index as u16));
+        }
+        slots[6] = Some(Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap());
+        slots[7] = Some(Item::tool_with_durability(ToolKind::Bow, ToolTier::Wood, 3).unwrap());
+
+        let mut chest_slots: ChestSlots = [None; CHEST_SLOTS];
+        for (index, (material, _)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            chest_slots[index] = Some(v7_melee_item(*material, 5));
+        }
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(7, 65, -3), Container::from_slots(chest_slots));
+
+        let mut data = sample_data(sample_player());
+        data.player.inventory = Inventory::from_parts(slots, None);
+        data.chests = chests;
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v7 item vocabulary must save");
+        assert_eq!(&bytes[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
+
+        let loaded = load_world_from_bytes(&bytes).expect("v7 item vocabulary must load");
+        assert_eq!(loaded, data);
+
+        for (index, (material, tag)) in V7_MELEE_MATERIALS.iter().enumerate() {
+            // Slot-0 layout for a material record: tag, material tag, count.
+            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4], ITEM_TAG_MATERIAL);
+            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4 + 1], *tag);
+            assert_eq!(
+                loaded.player.inventory.slot(index),
+                Some(v7_melee_item(*material, 2 + index as u16))
+            );
+            assert_eq!(
+                loaded.chests[&IVec3::new(7, 65, -3)].slot(index),
+                Some(v7_melee_item(*material, 5))
+            );
+        }
+
+        // Slot-6/7 layout for a tool record: tag, kind, tier, durability u16.
+        let sword = V4_EXTENSION_OFFSET + 6 * 4;
+        assert_eq!(bytes[sword], ITEM_TAG_TOOL);
+        assert_eq!(bytes[sword + 1], TOOL_KIND_SWORD);
+        assert_eq!(bytes[sword + 2], TOOL_TIER_WOOD);
+        assert_eq!(&bytes[sword + 3..sword + 5], &17u16.to_le_bytes());
+        let bow = sword + 5;
+        assert_eq!(bytes[bow], ITEM_TAG_TOOL);
+        assert_eq!(bytes[bow + 1], TOOL_KIND_BOW);
+        assert_eq!(bytes[bow + 2], TOOL_TIER_WOOD);
+        assert_eq!(&bytes[bow + 3..bow + 5], &3u16.to_le_bytes());
+
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
+        assert_eq!(
+            again, bytes,
+            "a loaded v7 item save re-saves byte-identically"
+        );
+    }
+
+    #[test]
+    fn test_v6_rejects_v7_only_material_and_combat_tool_records() {
+        // Material tag 9 (Bone) was appended in v7: a pre-v7 payload that
+        // claims it fails closed, while the identical v7 payload loads.
+        let bone = v4_bytes_with_slot0(v7_melee_item(Material::Bone, 1));
+        assert!(load_world_from_bytes(&bone).is_ok());
+        assert!(matches!(
+            load_world_from_bytes(&v6_bytes_from_v7(&bone)),
+            Err(PersistenceError::InvalidMaterial(9))
+        ));
+
+        // Tool kind 4 (Sword) is likewise v7-only, and its v6 rejection is
+        // independent of the v6-only Hoe gate.
+        let sword = v4_bytes_with_slot0(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
+        );
+        assert!(load_world_from_bytes(&sword).is_ok());
+        assert!(matches!(
+            load_world_from_bytes(&v6_bytes_from_v7(&sword)),
+            Err(PersistenceError::InvalidToolKind(4))
+        ));
+    }
+
+    #[test]
+    fn test_v7_rejects_forged_stone_bow_record() {
+        // `(Bow, Stone)` is not a constructible tool identity; persistence
+        // decode must funnel through the checked constructor and report the
+        // tier gate instead of accepting the forged pair.
+        let sword = v4_bytes_with_slot0(
+            Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
+        );
+        let mut bytes = sword;
+        bytes[V4_EXTENSION_OFFSET + 1] = TOOL_KIND_BOW;
+        bytes[V4_EXTENSION_OFFSET + 2] = TOOL_TIER_STONE;
+        assert!(matches!(
+            load_world_from_bytes(&bytes),
+            Err(PersistenceError::InvalidItem(ItemError::TierNotAllowed))
+        ));
+    }
+
+    #[test]
+    fn test_v7_edit_free_item_vocabulary_save_keeps_the_153_byte_baseline() {
+        assert_eq!(ITEM_VOCAB_VERSION, MOB_VERSION);
+
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("edit-free v7 save must succeed");
+
+        assert_eq!(bytes.len(), V7_FIRST_MOB_OFFSET);
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(&bytes[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
+        assert_eq!(
+            &bytes[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET],
+            &0u32.to_le_bytes()
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("baseline must load");
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn test_v6_save_loads_with_zero_mobs() {
+        let data = v7_data_with_mobs(pinned_mobs());
+        let bytes = v6_bytes_from_current(&data);
+        let loaded = load_world_from_bytes(&bytes).expect("v6 must migrate, not fail");
+        assert!(loaded.mobs.is_empty());
+        assert_eq!(loaded.chests, data.chests);
+
+        // Re-saving migrates the payload to v7 with an explicit zero count.
+        let mut resaved = Vec::new();
+        save_world_to_bytes(&mut resaved, &loaded).unwrap();
+        assert_eq!(&resaved[4..8], &MOB_VERSION.to_le_bytes());
+        assert_eq!(
+            &resaved[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET],
+            &0u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn test_checked_mob_count_bounds_the_writer_before_any_byte() {
+        assert_eq!(checked_mob_count(0).unwrap(), 0);
+        assert_eq!(
+            checked_mob_count(MAX_SAVED_MOBS).unwrap(),
+            MAX_SAVED_MOBS as u32
+        );
+        assert!(matches!(
+            checked_mob_count(MAX_SAVED_MOBS + 1),
+            Err(PersistenceError::InvalidMobState)
+        ));
+    }
+
     #[test]
     fn test_version_constants_are_coupled() {
-        assert_eq!(SAVE_VERSION, SURVIVAL_VERSION);
+        assert_eq!(SAVE_VERSION, MOB_VERSION);
+        assert_eq!(MOB_VERSION, SURVIVAL_VERSION + 1);
         assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
         assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
-        assert_eq!(SAVE_VERSION, 6);
+        assert_eq!(SAVE_VERSION, 7);
     }
 
     #[test]
@@ -2382,10 +3104,14 @@ mod tests {
             Err(PersistenceError::InvalidChestState)
         ));
 
-        // Duplicate positions are ambiguous state, not a merge.
+        // Duplicate positions are ambiguous state, not a merge. Insert the
+        // copied record before the v7 mob count so the two chest records stay
+        // contiguous.
         let mut bytes = v6_bytes_with_one_empty_chest();
-        let record = bytes[V6_FIRST_CHEST_OFFSET..].to_vec();
-        bytes.extend_from_slice(&record);
+        let record =
+            bytes[V6_FIRST_CHEST_OFFSET..V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS].to_vec();
+        let mob_count_offset = bytes.len() - V7_MOB_COUNT_LEN;
+        bytes.splice(mob_count_offset..mob_count_offset, record);
         bytes[V6_CHEST_COUNT_OFFSET..V6_CHEST_COUNT_OFFSET + 4]
             .copy_from_slice(&2u32.to_le_bytes());
         assert!(matches!(
@@ -2426,10 +3152,11 @@ mod tests {
         let mut material_slot: ChestSlots = [None; CHEST_SLOTS];
         material_slot[0] = Some(Item::new(ItemId::Material(Material::Bread), 1).unwrap());
         let mut bytes = v6_bytes_with_chest(Container::from_slots(material_slot));
-        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 9;
+        // 11 is the first tag past the v7 melee/drop vocabulary.
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = 11;
         assert!(matches!(
             load_world_from_bytes(&bytes),
-            Err(PersistenceError::InvalidMaterial(9))
+            Err(PersistenceError::InvalidMaterial(11))
         ));
 
         // Unknown tool kind inside a chest slot.
@@ -2521,7 +3248,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("v6 survival palette must save");
-        assert_eq!(&bytes[4..8], &SURVIVAL_VERSION.to_le_bytes());
+        assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
         let loaded = load_world_from_bytes(&bytes).expect("v6 survival palette must load");
 
         let loaded_chunk = loaded
@@ -2683,10 +3410,11 @@ mod tests {
         let material_record =
             v4_bytes_with_slot0(Item::new(ItemId::Material(Material::Stick), 4).unwrap());
         let mut bytes = material_record.clone();
-        bytes[V4_EXTENSION_OFFSET + 1] = 9;
+        // 11 is the first tag past the v7 melee/drop vocabulary.
+        bytes[V4_EXTENSION_OFFSET + 1] = 11;
         assert!(matches!(
             load_world_from_bytes(&bytes),
-            Err(PersistenceError::InvalidMaterial(9))
+            Err(PersistenceError::InvalidMaterial(11))
         ));
 
         // Materials cap at MATERIAL_STACK_LIMIT (64).
@@ -2715,12 +3443,28 @@ mod tests {
         assert_eq!(MATERIAL_BREAD, 4);
         assert_eq!(TOOL_KIND_HOE, 3);
 
+        // M009 appends the melee/drop vocabulary at the next free tags too.
+        assert_eq!(MATERIAL_LEATHER, 5);
+        assert_eq!(MATERIAL_RAW_PORKCHOP, 6);
+        assert_eq!(MATERIAL_RAW_BEEF, 7);
+        assert_eq!(MATERIAL_ROTTEN_FLESH, 8);
+        assert_eq!(MATERIAL_BONE, 9);
+        assert_eq!(MATERIAL_ARROW, 10);
+        assert_eq!(TOOL_KIND_SWORD, 4);
+        assert_eq!(TOOL_KIND_BOW, 5);
+
         for (material, tag) in [
             (Material::Stick, MATERIAL_STICK),
             (Material::Apple, MATERIAL_APPLE),
             (Material::Wheat, MATERIAL_WHEAT),
             (Material::WheatSeeds, MATERIAL_WHEAT_SEEDS),
             (Material::Bread, MATERIAL_BREAD),
+            (Material::Leather, MATERIAL_LEATHER),
+            (Material::RawPorkchop, MATERIAL_RAW_PORKCHOP),
+            (Material::RawBeef, MATERIAL_RAW_BEEF),
+            (Material::RottenFlesh, MATERIAL_ROTTEN_FLESH),
+            (Material::Bone, MATERIAL_BONE),
+            (Material::Arrow, MATERIAL_ARROW),
         ] {
             assert_eq!(material_tag(material), tag, "{material:?} tag moved");
             assert_eq!(material_from_tag(tag), Some(material));
@@ -2731,14 +3475,16 @@ mod tests {
             (ToolKind::Axe, TOOL_KIND_AXE),
             (ToolKind::Shovel, TOOL_KIND_SHOVEL),
             (ToolKind::Hoe, TOOL_KIND_HOE),
+            (ToolKind::Sword, TOOL_KIND_SWORD),
+            (ToolKind::Bow, TOOL_KIND_BOW),
         ] {
             assert_eq!(tool_kind_tag(kind), tag, "{kind:?} tag moved");
             assert_eq!(tool_kind_from_tag(tag), Some(kind));
         }
 
         // The next unused discriminants still fail closed.
-        assert_eq!(material_from_tag(5), None);
-        assert_eq!(tool_kind_from_tag(4), None);
+        assert_eq!(material_from_tag(11), None);
+        assert_eq!(tool_kind_from_tag(6), None);
     }
 
     #[test]
@@ -3021,6 +3767,38 @@ mod tests {
         let both = CliConfig::parse_args(["--demo-survival", "--demo-content"]);
         assert!(both.demo_survival);
         assert!(both.demo_content);
+    }
+
+    #[test]
+    fn test_demo_combat_parses_as_a_bare_switch() {
+        // Absent keeps the seam off: a normal launch is byte-identical.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_combat);
+        assert!(!bare.demo_swim);
+        assert!(!bare.demo_survival);
+        assert!(!bare.demo_content);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let combat = CliConfig::parse_args(["--demo-combat"]);
+        assert!(combat.demo_combat);
+        assert!(!combat.force_new_world);
+        assert_eq!(combat.seed_override, None);
+        assert_eq!(
+            combat.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--seed 5` is parsed as the seed, proving the bare
+        // switch never swallowed the next token as its value.
+        let with_seed = CliConfig::parse_args(["--demo-combat", "--seed", "5"]);
+        assert!(with_seed.demo_combat);
+        assert_eq!(with_seed.seed_override, Some(5));
+
+        // A stray non-flag token after the switch is ignored like any other
+        // unknown argument and never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-combat", "5"]);
+        assert!(stray.demo_combat);
+        assert_eq!(stray.seed_override, None);
     }
 
     #[test]

@@ -6,13 +6,17 @@
 //! The [`LoadedPack`] contract is the boundary later slices consume: it always
 //! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
 //! RGBA layers plus optional presentation data. The first
-//! [`AUTHORABLE_TEX_LAYERS`] of those can be overridden by pack files; the
-//! rest stay reserved built-in layers. Loading never fails and never panics on
-//! bad input; every fallback is reported as a structured [`SettingsWarning`].
+//! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layers
+//! 23..=31 are reserved block placeholders, layers 32..=44 are mob part art
+//! from [`MOB_LAYER_FILES`], and layers 45..=47 are reserved spares. Loading
+//! never fails and never panics on bad input; every fallback is reported as a
+//! structured [`SettingsWarning`].
 
 use std::path::Path;
 
-use crate::render::texture::generate_all_texture_layers_rgba;
+use crate::render::texture::{
+    generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
+};
 use crate::settings::SettingsWarning;
 
 pub mod decode;
@@ -24,8 +28,8 @@ pub mod sound;
 ///
 /// Index-aligned with the first [`AUTHORABLE_TEX_LAYERS`] entries of
 /// `BlockId::face_tex_layer`/the procedural layer set. Layers
-/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::NUM_TEX_LAYERS`] are
-/// reserved built-ins that cannot be overridden.
+/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::MOB_LAYER_BASE`] are
+/// reserved block placeholders that cannot be overridden.
 pub const AUTHORABLE_TEX_LAYERS: usize = 23;
 
 /// File names for the 23 authorable block texture layers, index-aligned with
@@ -57,6 +61,25 @@ pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
     "loot_chest.png",   // 22
 ];
 
+/// File names for the 13 authorable mob part layers, index-aligned with
+/// array layers [`crate::render::texture::MOB_LAYER_BASE`]..=44. These names
+/// are the authoring contract for packs; do not reorder.
+pub const MOB_LAYER_FILES: [&str; MOB_AUTHORABLE_TEX_LAYERS] = [
+    "pig_body.png",      // 32
+    "pig_head.png",      // 33
+    "pig_leg.png",       // 34
+    "cow_body.png",      // 35
+    "cow_head.png",      // 36
+    "cow_leg.png",       // 37
+    "zombie_body.png",   // 38
+    "zombie_head.png",   // 39
+    "zombie_leg.png",    // 40
+    "skeleton_body.png", // 41
+    "skeleton_head.png", // 42
+    "skeleton_leg.png",  // 43
+    "arrow.png",         // 44
+];
+
 /// Directory-name convention for packs, resolved relative to the process
 /// working directory (same convention as `saves/` and `settings.toml`).
 pub const PACKS_DIR: &str = "packs";
@@ -78,11 +101,11 @@ pub struct PackLogo {
 ///
 /// `layers` is always exactly [`crate::render::texture::NUM_TEX_LAYERS`]
 /// entries of 16x16 RGBA bytes (1024 bytes each), the same format
-/// [`crate::render::texture::create_block_texture_array`] consumes. The first
-/// [`AUTHORABLE_TEX_LAYERS`] entries come from [`LAYER_FILES`]; the remaining
-/// reserved layers are always the built-in placeholders. Missing, invalid, and
-/// out-of-range files fall back per layer to the procedural texture and appear
-/// in `warnings`.
+/// [`crate::render::texture::create_block_texture_array`] consumes. Layers
+/// 0..22 come from [`LAYER_FILES`], 23..31 are reserved block placeholders,
+/// 32..44 come from [`MOB_LAYER_FILES`], and 45..47 are reserved spares.
+/// Missing, invalid, and out-of-range files fall back per layer to the
+/// procedural texture and appear in `warnings`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedPack {
     pub layers: Vec<Vec<u8>>,
@@ -96,13 +119,13 @@ pub struct LoadedPack {
 /// Load a pack directory, applying per-field and per-file fallback.
 ///
 /// Reads `pack.toml` (missing or unreadable -> default manifest plus one
-/// warning), then resolves each of [`LAYER_FILES`]. A layer file that does not
-/// exist is silently replaced by its procedural layer; a file that exists but
-/// fails to decode, is non-square, or is outside 16..=256 pixels falls back the
-/// same way and emits one warning naming the bare file. Reserved layers
-/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::NUM_TEX_LAYERS`] have
-/// no file name and are never overridable, so a legacy pack that ships only
-/// the original 16 files simply keeps the built-in art for layers 16..22. The
+/// warning), then resolves each of [`LAYER_FILES`] and [`MOB_LAYER_FILES`]. A
+/// layer file that does not exist is silently replaced by its procedural
+/// layer; a file that exists but fails to decode, is non-square, or is outside
+/// 16..=256 pixels falls back the same way and emits one warning naming the
+/// bare file. Reserved layers 23..=31 and 45..=47 have no file name and are
+/// never overridable, so a legacy pack that ships only the original 16 block
+/// files simply keeps the built-in art for layers 16..22 and all mob art. The
 /// optional logo is decoded at native size (failure -> `None` plus a warning).
 /// Unknown files and unknown manifest keys are ignored. Never panics, never
 /// returns `Err`.
@@ -198,7 +221,32 @@ pub fn load_pack_by_name(packs_root: &Path, name: &str) -> LoadedPack {
 fn load_layers(dir: &Path, warnings: &mut Vec<SettingsWarning>) -> Vec<Vec<u8>> {
     let mut layers = generate_all_texture_layers_rgba();
 
-    for (index, file) in LAYER_FILES.iter().enumerate() {
+    apply_layer_files(&mut layers, dir, &LAYER_FILES, 0, warnings);
+    apply_layer_files(
+        &mut layers,
+        dir,
+        &MOB_LAYER_FILES,
+        MOB_LAYER_BASE as usize,
+        warnings,
+    );
+
+    layers
+}
+
+/// Decode one file-name table into `layers`, starting at `base`.
+///
+/// Every file follows the same per-layer fallback: a missing file keeps the
+/// procedural layer silently; a decode, squareness, or size failure keeps it
+/// and pushes one warning whose `field` is the bare file name.
+fn apply_layer_files(
+    layers: &mut [Vec<u8>],
+    dir: &Path,
+    files: &[&str],
+    base: usize,
+    warnings: &mut Vec<SettingsWarning>,
+) {
+    for (offset, file) in files.iter().enumerate() {
+        let index = base + offset;
         let path = dir.join(file);
         if !path.exists() {
             // Missing layer files are legal: use the procedural texture silently.
@@ -240,8 +288,6 @@ fn load_layers(dir: &Path, warnings: &mut Vec<SettingsWarning>) -> Vec<Vec<u8>> 
 
         layers[index] = resample::resample_to_16(&decoded.rgba, decoded.width);
     }
-
-    layers
 }
 
 /// Decode the optional manifest logo at native size, warning on failure.
@@ -380,8 +426,11 @@ whatever = true
         let pack = load_pack_from_dir(&dir);
         let procedural = procedural_layers();
 
-        // Contract: always 32 complete 16x16 RGBA layers.
-        assert_eq!(pack.layers.len(), 32);
+        // Contract: always 48 complete 16x16 RGBA layers.
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
         for (index, layer) in pack.layers.iter().enumerate() {
             assert_eq!(layer.len(), LAYER_BYTES, "layer {index} size");
         }
@@ -448,7 +497,10 @@ whatever = true
         assert_eq!(pack.warnings.len(), 1);
         assert_eq!(pack.warnings[0].field, "pack.toml");
         assert_eq!(pack.layers, procedural);
-        assert_eq!(pack.layers.len(), 32);
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
         assert!(pack.layers.iter().all(|layer| layer.len() == LAYER_BYTES));
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -479,7 +531,10 @@ whatever = true
         let pack = load_pack_by_name(root.path(), "ghost");
 
         assert_eq!(pack.layers, procedural_layers());
-        assert_eq!(pack.layers.len(), 32);
+        assert_eq!(
+            pack.layers.len(),
+            crate::render::texture::NUM_TEX_LAYERS as usize
+        );
         assert!(pack.layers.iter().all(|layer| layer.len() == LAYER_BYTES));
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -627,13 +682,19 @@ whatever = true
             assert_ne!(*layer, procedural[index]);
         }
 
-        // Layers 16..23 (new authored names) and 23..32 (reserved) keep the
-        // built-in art: a legacy pack needs no changes.
+        // Layers 16..23 (new authored names), the reserved ranges, and all
+        // mob art keep the built-in pixels: a legacy pack needs no changes.
         for index in 16..AUTHORABLE_TEX_LAYERS {
             assert_procedural_layer(&pack, &procedural, index);
         }
-        for index in AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize {
+        for index in (AUTHORABLE_TEX_LAYERS..MOB_LAYER_BASE as usize).chain(
+            crate::render::texture::MOB_SPARE_LAYER_BASE as usize
+                ..crate::render::texture::NUM_TEX_LAYERS as usize,
+        ) {
             assert_procedural_layer(&pack, &procedural, index);
+        }
+        for offset in 0..MOB_LAYER_FILES.len() {
+            assert_procedural_layer(&pack, &procedural, MOB_LAYER_BASE as usize + offset);
         }
 
         assert!(
@@ -667,8 +728,12 @@ whatever = true
                 "layer {index} must override the procedural texture"
             );
         }
-        // Reserved layers are never authorable, even in a full pack.
-        for index in AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize {
+        // Reserved block/spare layers are never authorable, even in a full
+        // block pack; mob layers are untouched because no mob file exists.
+        for index in (AUTHORABLE_TEX_LAYERS..MOB_LAYER_BASE as usize).chain(
+            crate::render::texture::MOB_SPARE_LAYER_BASE as usize
+                ..crate::render::texture::NUM_TEX_LAYERS as usize,
+        ) {
             assert_procedural_layer(&pack, &procedural, index);
         }
         assert!(
@@ -719,6 +784,137 @@ whatever = true
         // falls back silently.
         assert_eq!(pack.layers[17], procedural[17]);
         assert_eq!(pack.layers[22], procedural[22]);
+    }
+
+    #[test]
+    fn mob_layer_files_are_index_aligned() {
+        use crate::render::texture::{
+            MOB_ARROW_TEX_LAYER, MOB_LAYER_BASE, MOB_SPARE_LAYER_BASE, NUM_TEX_LAYERS,
+        };
+
+        assert_eq!(MOB_LAYER_FILES.len(), MOB_AUTHORABLE_TEX_LAYERS);
+        assert_eq!(MOB_AUTHORABLE_TEX_LAYERS, 13);
+        assert_eq!(MOB_LAYER_BASE, 32);
+        assert_eq!(MOB_ARROW_TEX_LAYER, 44);
+        assert_eq!(MOB_SPARE_LAYER_BASE, 45);
+        assert_eq!(
+            MOB_LAYER_BASE as usize + MOB_LAYER_FILES.len(),
+            MOB_ARROW_TEX_LAYER as usize + 1
+        );
+
+        // The block contract is byte-for-byte unchanged.
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 23);
+        assert_eq!(LAYER_FILES[0], "grass_top.png");
+        assert_eq!(LAYER_FILES[22], "loot_chest.png");
+
+        assert_eq!(MOB_LAYER_FILES[0], "pig_body.png");
+        assert_eq!(MOB_LAYER_FILES[12], "arrow.png");
+
+        // 23 block + 9 reserved + 13 mob + 3 spare = 48.
+        assert_eq!(
+            NUM_TEX_LAYERS as usize,
+            AUTHORABLE_TEX_LAYERS + 9 + MOB_AUTHORABLE_TEX_LAYERS + 3
+        );
+    }
+
+    #[test]
+    fn mob_pack_overrides_each_part_per_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "mob-parts");
+        read_pack_toml(&dir, "name = \"Mob Parts\"\n");
+
+        // pig_body -> 32, cow_head -> 36, skeleton_leg -> 43.
+        let overrides: [(usize, u32); 3] = [(0, 32), (4, 64), (11, 32)];
+        for (offset, dim) in overrides {
+            write_png(&dir.join(MOB_LAYER_FILES[offset]), dim);
+        }
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+        let base = MOB_LAYER_BASE as usize;
+
+        for (offset, dim) in overrides {
+            let layer = base + offset;
+            let expected = resample::resample_to_16(&gradient(dim, dim), dim);
+            assert_eq!(pack.layers[layer], expected, "mob layer {layer} resample");
+            assert_ne!(
+                pack.layers[layer], procedural[layer],
+                "mob layer {layer} must override the procedural texture"
+            );
+        }
+
+        // Index pins from the authoring contract.
+        assert_eq!(
+            pack.layers[32],
+            resample::resample_to_16(&gradient(32, 32), 32)
+        );
+        assert_eq!(
+            pack.layers[36],
+            resample::resample_to_16(&gradient(64, 64), 64)
+        );
+        assert_eq!(
+            pack.layers[43],
+            resample::resample_to_16(&gradient(32, 32), 32)
+        );
+
+        // Untouched siblings and all reserved ranges keep procedural art.
+        for offset in 0..MOB_LAYER_FILES.len() {
+            if ![0usize, 4, 11].contains(&offset) {
+                assert_procedural_layer(&pack, &procedural, base + offset);
+            }
+        }
+        for index in (AUTHORABLE_TEX_LAYERS..base).chain(
+            crate::render::texture::MOB_SPARE_LAYER_BASE as usize
+                ..crate::render::texture::NUM_TEX_LAYERS as usize,
+        ) {
+            assert_procedural_layer(&pack, &procedural, index);
+        }
+        assert!(pack.warnings.is_empty(), "{:?}", pack.warnings);
+    }
+
+    #[test]
+    fn missing_mob_file_falls_back_silently() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "no-mob-art");
+        read_pack_toml(&dir, "name = \"No Mob Art\"\n");
+        // One block file proves the loader ran; every mob file is absent.
+        write_png(&dir.join(LAYER_FILES[0]), 16);
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        for offset in 0..MOB_LAYER_FILES.len() {
+            assert_procedural_layer(&pack, &procedural, MOB_LAYER_BASE as usize + offset);
+        }
+        assert!(
+            pack.warnings.is_empty(),
+            "missing mob files are silent: {:?}",
+            pack.warnings
+        );
+    }
+
+    #[test]
+    fn corrupt_mob_file_warns_with_bare_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "bad-mob");
+        read_pack_toml(&dir, "name = \"Bad Mob\"\n");
+        fs::write(dir.join(MOB_LAYER_FILES[4]), b"not a png").unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+        let base = MOB_LAYER_BASE as usize;
+
+        assert_procedural_layer(&pack, &procedural, base + 4);
+        assert_eq!(warning_fields(&pack), vec![MOB_LAYER_FILES[4]]);
+        assert!(
+            pack.warnings[0].reason.contains("png") || pack.warnings[0].reason.contains("decode"),
+            "reason should describe the decode failure: {}",
+            pack.warnings[0].reason
+        );
+
+        // Sibling mob parts stay procedural with no extra warnings.
+        assert_procedural_layer(&pack, &procedural, base + 3);
+        assert_procedural_layer(&pack, &procedural, base + 5);
     }
 
     #[test]

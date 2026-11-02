@@ -6,7 +6,7 @@
 //! crop with no new save surface. Growth *progress* is deliberately ephemeral:
 //! [`CropRuntime`] only tracks how long each resident crop has been growing,
 //! rebuilds its candidates from chunk edits at load, and restarts every one at
-//! zero. That keeps `SAVE_VERSION` at 6 and guarantees a crop cannot bank
+//! zero. Growth progress stays out of the save and a crop cannot bank
 //! progress while its chunk is unloaded.
 //!
 //! The runtime takes the world through two closures (`resident` and

@@ -1,0 +1,2 @@
+frame_budget: samples=127 p50=2.147ms p95=7.178ms max=140.969ms target: p95<=16.6ms
+combat_demo: seed=1 mobs=4 resident=4 walked=4 verts=864 melee_hits=2 melee_damage=4 melee_blocked=1 killed=2 drops=5 drops_lost=0 saved=2 records=2 ok=true

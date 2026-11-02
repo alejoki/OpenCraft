@@ -1,0 +1,17 @@
+[keybinds]
+forward = "KeyW"
+backward = "KeyS"
+left = "KeyA"
+right = "KeyD"
+jump_or_up = "Space"
+crouch_or_down = "ShiftLeft"
+sprint = "ControlLeft"
+
+[mouse]
+sensitivity = 0.002199999988079071
+
+[video]
+fov = 75.0
+render_distance = 16
+fullscreen = false
+vsync = false

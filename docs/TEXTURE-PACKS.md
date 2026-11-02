@@ -73,7 +73,7 @@ Save each block texture directly inside the pack folder, using these exact file 
 22. `chest.png`
 23. `loot_chest.png`
 
-The block texture array has 32 layers. Layers 0 to 22 are the twenty-three authorable names above, in the order listed. Layers 23 to 31 are reserved built-in layers that cannot be overridden; a file named `reserved_23.png` or any other name that is not in the list above is ignored.
+The texture array has 48 layers. Layers 0 to 22 are the twenty-three block names above, in the order listed. Layers 23 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_23.png` or any other name that is not in one of the two lists is ignored.
 
 A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. Partial packs may add one texture or all twenty-three.
 
@@ -85,6 +85,36 @@ Image rules:
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
 - Partial packs always work — add one texture or all twenty-three.
 
+## Mob textures
+
+Mob part art shares the same texture array as block art, starting at layer 32. To give the pig your own hide, override one mob part file — for example `pig_body.png` — and leave the other twelve alone. Save each file directly in the pack folder, using these exact names and in this order:
+
+| File | Array layer | Mob part |
+|------|-------------|----------|
+| `pig_body.png` | 32 | Pig body |
+| `pig_head.png` | 33 | Pig head |
+| `pig_leg.png` | 34 | Pig legs |
+| `cow_body.png` | 35 | Cow body |
+| `cow_head.png` | 36 | Cow head |
+| `cow_leg.png` | 37 | Cow legs |
+| `zombie_body.png` | 38 | Zombie body |
+| `zombie_head.png` | 39 | Zombie head |
+| `zombie_leg.png` | 40 | Zombie legs |
+| `skeleton_body.png` | 41 | Skeleton body |
+| `skeleton_head.png` | 42 | Skeleton head |
+| `skeleton_leg.png` | 43 | Skeleton legs |
+| `arrow.png` | 44 | Arrow projectile |
+
+The same image rules as block textures apply to every mob file: square PNG, 16 to 256 pixels per side, resampled to 16x16.
+
+The committed `packs/uat-sound/` folder is the per-file layout example: it shows the flat "one file per override, named exactly" layout a pack uses (its files happen to be sounds, so a mob texture pack keeps the same layout with the `pig_body.png`-style names from the table above).
+
+- Each file is optional and overrides only its own layer.
+- A missing file silently keeps the built-in procedural art for that part.
+- A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
+- A pack may add one mob file or all thirteen. Mob files and block files are independent.
+- Layers 23 to 31 and 45 to 47 are reserved and cannot be overridden. Files named after them, such as `reserved_45.png`, are ignored silently.
+
 ## Title logo and menu tint
 
 - `logo` may be any PNG at its native size and aspect ratio. Non-square logos are fine because the game preserves the image shape; keep each side at 1024 pixels or less.
@@ -93,12 +123,21 @@ Image rules:
 
 ## Sounds
 
-A pack can replace the game's four built-in sounds. Save audio files flat in the pack folder, next to the textures, using these exact base names:
+A pack can replace the game's nine built-in sounds. Save audio files flat in the pack folder, next to the textures, using these exact base names:
 
-1. `break` — breaking a block
-2. `place` — placing a block
-3. `mine_complete` — finishing a block's mining time
-4. `ui_click` — clicking a menu row or button
+| Base name | When it plays |
+| --- | --- |
+| `break` | breaking a block |
+| `place` | placing a block |
+| `mine_complete` | finishing a block's mining time |
+| `ui_click` | clicking a menu row or button |
+| `mob_idle` | a mob's idle grunt |
+| `mob_hurt` | a mob taking damage |
+| `mob_death` | a mob dying |
+| `bow_release` | releasing a drawn bow |
+| `arrow_impact` | an arrow hitting a block or mob |
+
+The first four are the original block and menu sounds; a pack written before mobs existed keeps overriding exactly the same slots, because new sounds are only ever appended to the end of the table.
 
 Each sound may use any of these formats. If several files share a base name, only the highest-priority one is read:
 
@@ -114,13 +153,13 @@ Sound rules:
 
 - A missing sound file is fine and silently keeps the built-in synthesized sound for that slot.
 - A corrupt, oversized, or empty (zero-sample) file also keeps the built-in sound, but the menu shows a warning that names the file.
-- Partial packs always work — add one sound or all four, with or without textures.
+- Partial packs always work — add one sound or all nine, with or without textures.
 - Sounds apply live when you cycle the **Texture Pack** row; no restart is needed.
-- Cycling back to **Default** restores all four built-in sounds.
+- Cycling back to **Default** restores all nine built-in sounds.
 
 ## A complete sound pack
 
-A sound pack is a `pack.toml` manifest plus up to four optional sound files. Copy
+A sound pack is a `pack.toml` manifest plus up to nine optional sound files. Copy
 this manifest and save it as `packs/my-sounds/pack.toml`:
 
 ```toml
@@ -137,6 +176,11 @@ packs/my-sounds/
   place.wav         # optional - block placed
   mine_complete.wav # optional - mining sequence finished
   ui_click.wav      # optional - menu interaction
+  mob_idle.wav      # optional - mob idle grunt
+  mob_hurt.wav      # optional - mob damaged
+  mob_death.wav     # optional - mob died
+  bow_release.wav   # optional - bow released
+  arrow_impact.wav  # optional - arrow landed
 ```
 
 Every sound file is optional. A missing slot silently keeps the built-in sound for
@@ -146,18 +190,26 @@ for the accepted formats and the 1 MiB per-file cap.
 
 ### Runnable example: `packs/uat-sound/`
 
-The project repository ships a ready-made example pack at `packs/uat-sound/`:
+The project repository ships a ready-made example pack at `packs/uat-sound/`. It
+holds seven files: the manifest plus six sounds, five valid and one deliberately
+corrupt.
 
-- `break.wav`, `place.wav`, and `mine_complete.wav` are valid 16-bit stereo PCM WAVs.
-- `ui_click.wav` is deliberately corrupt ASCII so you can see the in-menu fallback
-  warning: the menu reports that the file could not be decoded and keeps playing the
-  built-in tick instead of crashing.
+| File | State | What it proves |
+| --- | --- | --- |
+| `pack.toml` | valid | the manifest and the menu tint |
+| `break.wav` | valid | a replaced block-break sound |
+| `place.wav` | valid | a replaced block-place sound |
+| `mine_complete.wav` | valid | a replaced mining-complete sound |
+| `mob_hurt.wav` | valid | a replaced mob-damage sound (a byte copy of `break.wav`) |
+| `arrow_impact.wav` | valid | a replaced arrow-landing sound (a byte copy of `place.wav`) |
+| `ui_click.wav` | deliberately corrupt ASCII | per-file fallback: the menu reports the decode failure and keeps the built-in tick |
 
 It is a test fixture, not part of a normal game install. To try it, copy the
 `uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
 creating the `packs/` folder yourself first if it does not exist — then cycle the
 **Texture Pack** row to `uat-sound`. Break and place a block and finish a mining
-sequence to hear the custom sounds; open the settings menu to see the corrupt-file
+sequence to hear the custom sounds; hit a mob and land an arrow to hear the pack's
+`mob_hurt` and `arrow_impact` files; open the settings menu to see the corrupt-file
 warning while the built-in click keeps playing. Cycling back to **Default** restores
 the built-in sounds.
 

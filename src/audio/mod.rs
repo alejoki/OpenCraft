@@ -6,9 +6,13 @@
 //! engine stores `sink: None` and every [`AudioEngine::play`] call becomes a
 //! silent no-op. Audio availability must never block launching the game.
 //!
-//! The four [`synth_*`] functions are pure and deterministic, which keeps the
+//! The nine [`synth_*`] functions are pure and deterministic, which keeps the
 //! default sounds testable without a device and lets S05 reuse them as the
 //! per-file fallback when a texture/sound pack does not provide an audio file.
+//!
+//! The slot table grows append-only: the first four indices (block art and UI)
+//! were pinned by the first pack contract and never move, and the five mob and
+//! combat slots are appended after them.
 
 use rodio::buffer::SamplesBuffer;
 use rodio::{ChannelCount, DeviceSinkError, MixerDeviceSink, SampleRate, Source};
@@ -17,24 +21,40 @@ use rodio::{ChannelCount, DeviceSinkError, MixerDeviceSink, SampleRate, Source};
 pub const SAMPLE_RATE: u32 = 44_100;
 /// Channel count of the synthesized buffers (interleaved stereo f32).
 pub const CHANNELS: u16 = 2;
+/// Number of [`SoundSlot`] variants, i.e. one buffer per slot.
+pub const SOUND_SLOT_COUNT: usize = 9;
 
 /// The game's sound slots. Names are stable because S05's pack override maps
 /// file names onto them.
+///
+/// Indices 0..=3 are the original block/UI set; 4..=8 are the mob and combat
+/// slots appended by S09-T03. New variants always go on the end so an existing
+/// pack keeps overriding the same slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SoundSlot {
     Break,
     Place,
     MineComplete,
     UiClick,
+    MobIdle,
+    MobHurt,
+    MobDeath,
+    BowRelease,
+    ArrowImpact,
 }
 
 impl SoundSlot {
     /// Every slot, in buffer order.
-    pub const ALL: [SoundSlot; 4] = [
+    pub const ALL: [SoundSlot; SOUND_SLOT_COUNT] = [
         SoundSlot::Break,
         SoundSlot::Place,
         SoundSlot::MineComplete,
         SoundSlot::UiClick,
+        SoundSlot::MobIdle,
+        SoundSlot::MobHurt,
+        SoundSlot::MobDeath,
+        SoundSlot::BowRelease,
+        SoundSlot::ArrowImpact,
     ];
 
     /// Index into [`AudioEngine::buffers`].
@@ -44,6 +64,11 @@ impl SoundSlot {
             SoundSlot::Place => 1,
             SoundSlot::MineComplete => 2,
             SoundSlot::UiClick => 3,
+            SoundSlot::MobIdle => 4,
+            SoundSlot::MobHurt => 5,
+            SoundSlot::MobDeath => 6,
+            SoundSlot::BowRelease => 7,
+            SoundSlot::ArrowImpact => 8,
         }
     }
 
@@ -54,6 +79,11 @@ impl SoundSlot {
             SoundSlot::Place => "place",
             SoundSlot::MineComplete => "mine_complete",
             SoundSlot::UiClick => "ui_click",
+            SoundSlot::MobIdle => "mob_idle",
+            SoundSlot::MobHurt => "mob_hurt",
+            SoundSlot::MobDeath => "mob_death",
+            SoundSlot::BowRelease => "bow_release",
+            SoundSlot::ArrowImpact => "arrow_impact",
         }
     }
 }
@@ -163,6 +193,102 @@ pub fn synth_ui_click() -> Vec<f32> {
     out
 }
 
+/// Low mob grunt: a slow vibrato body around 110 Hz with a breathy noise tail.
+/// ~0.30 s.
+pub fn synth_mob_idle() -> Vec<f32> {
+    let len = frames(0.30);
+    let mut out = Vec::with_capacity(len * CHANNELS as usize);
+    let mut phase = 0.0f32;
+    let mut rng = XorShift64::new(0x2545_F491_4F6C_DD1D);
+    for i in 0..len {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        // Slow vibrato keeps the grunt feeling alive instead of a flat tone.
+        let vibrato = (std::f32::consts::TAU * 5.0 * t).sin() * 6.0;
+        let freq = 110.0 + vibrato;
+        phase += std::f32::consts::TAU * freq / SAMPLE_RATE as f32;
+        let attack = (t / 0.025).min(1.0);
+        let body_env = attack * (-t / 0.20).exp();
+        let breath_env = attack * (-t / 0.09).exp();
+        let sample = phase.sin() * 0.45 * body_env + rng.bipolar() * 0.10 * breath_env;
+        push_stereo(&mut out, sample);
+    }
+    out
+}
+
+/// Short hurt squeal: pitch falls 320 -> 190 Hz with a bright noise edge.
+/// ~0.18 s.
+pub fn synth_mob_hurt() -> Vec<f32> {
+    let len = frames(0.18);
+    let mut out = Vec::with_capacity(len * CHANNELS as usize);
+    let mut phase = 0.0f32;
+    let mut rng = XorShift64::new(0x853C_49E6_748F_EA9B);
+    for i in 0..len {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        // Descending squeal: 320 Hz down to 190 Hz over the clip.
+        let progress = (t / 0.18).min(1.0);
+        let freq = 320.0 - 130.0 * progress;
+        phase += std::f32::consts::TAU * freq / SAMPLE_RATE as f32;
+        let attack = (t / 0.004).min(1.0);
+        let env = attack * (-t / 0.055).exp();
+        let edge = rng.bipolar() * 0.14 * (-t / 0.02).exp();
+        let sample = phase.sin() * 0.55 * env + edge;
+        push_stereo(&mut out, sample);
+    }
+    out
+}
+
+/// Long mob death growl: pitch falls 240 -> 70 Hz under a slow decay.
+/// ~0.50 s.
+pub fn synth_mob_death() -> Vec<f32> {
+    let len = frames(0.50);
+    let mut out = Vec::with_capacity(len * CHANNELS as usize);
+    let mut phase = 0.0f32;
+    let mut rng = XorShift64::new(0xC4CE_B9FE_1A85_EC53);
+    for i in 0..len {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        // Falling growl: 240 Hz down to 70 Hz, still audible at the tail.
+        let freq = 70.0 + 170.0 * (-t / 0.16).exp();
+        phase += std::f32::consts::TAU * freq / SAMPLE_RATE as f32;
+        let attack = (t / 0.012).min(1.0);
+        let env = attack * (-t / 0.24).exp();
+        let rasp = rng.bipolar() * 0.10 * (-t / 0.18).exp();
+        let sample = phase.sin() * 0.50 * env + rasp;
+        push_stereo(&mut out, sample);
+    }
+    out
+}
+
+/// Plucked bow-string twang: two high partials with a very fast decay.
+/// ~0.12 s.
+pub fn synth_bow_release() -> Vec<f32> {
+    let len = frames(0.12);
+    let mut out = Vec::with_capacity(len * CHANNELS as usize);
+    for i in 0..len {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let attack = (t / 0.0015).min(1.0);
+        // Fundamental plus a slightly sharp harmonic gives the plucked edge.
+        let fundamental = (std::f32::consts::TAU * 880.0 * t).sin() * 0.40;
+        let partial = (std::f32::consts::TAU * 1_320.0 * t).sin() * 0.22;
+        let env = attack * (-t / 0.028).exp();
+        push_stereo(&mut out, (fundamental + partial) * env);
+    }
+    out
+}
+
+/// Dull arrow impact: a short noise burst plus a low click. ~0.10 s.
+pub fn synth_arrow_impact() -> Vec<f32> {
+    let len = frames(0.10);
+    let mut out = Vec::with_capacity(len * CHANNELS as usize);
+    let mut rng = XorShift64::new(0xDB4F_0B21_7354_8E4B);
+    for i in 0..len {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let thud = rng.bipolar() * 0.55 * (-t / 0.018).exp();
+        let click = (std::f32::consts::TAU * 140.0 * t).sin() * 0.35 * (-t / 0.030).exp();
+        push_stereo(&mut out, thud + click);
+    }
+    out
+}
+
 /// One decoded sound, interleaved as f32 with its own channel count and sample
 /// rate.
 ///
@@ -207,13 +333,18 @@ impl SoundBuffer {
     }
 }
 
-/// The four built-in fallback buffers, indexed by [`SoundSlot::index`].
-pub fn default_buffers() -> [SoundBuffer; 4] {
+/// The nine built-in fallback buffers, indexed by [`SoundSlot::index`].
+pub fn default_buffers() -> [SoundBuffer; SOUND_SLOT_COUNT] {
     [
         SoundBuffer::new(synth_break(), CHANNELS, SAMPLE_RATE),
         SoundBuffer::new(synth_place(), CHANNELS, SAMPLE_RATE),
         SoundBuffer::new(synth_mine_complete(), CHANNELS, SAMPLE_RATE),
         SoundBuffer::new(synth_ui_click(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_mob_idle(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_mob_hurt(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_mob_death(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_bow_release(), CHANNELS, SAMPLE_RATE),
+        SoundBuffer::new(synth_arrow_impact(), CHANNELS, SAMPLE_RATE),
     ]
 }
 
@@ -229,7 +360,7 @@ pub fn default_buffers() -> [SoundBuffer; 4] {
 /// synchronization.
 pub struct AudioEngine {
     sink: Option<MixerDeviceSink>,
-    buffers: [SoundBuffer; 4],
+    buffers: [SoundBuffer; SOUND_SLOT_COUNT],
 }
 
 impl AudioEngine {
@@ -267,7 +398,7 @@ impl AudioEngine {
     /// Replaces every slot buffer, e.g. with pack overrides or the synthesized
     /// defaults. Works on a disabled engine (`sink: None`): no device is needed
     /// to swap buffers, which keeps headless tests and startup ordering simple.
-    pub fn set_buffers(&mut self, buffers: [SoundBuffer; 4]) {
+    pub fn set_buffers(&mut self, buffers: [SoundBuffer; SOUND_SLOT_COUNT]) {
         self.buffers = buffers;
     }
 
@@ -328,6 +459,11 @@ mod tests {
         assert_sane(&synth_place());
         assert_sane(&synth_mine_complete());
         assert_sane(&synth_ui_click());
+        assert_sane(&synth_mob_idle());
+        assert_sane(&synth_mob_hurt());
+        assert_sane(&synth_mob_death());
+        assert_sane(&synth_bow_release());
+        assert_sane(&synth_arrow_impact());
     }
 
     #[test]
@@ -336,16 +472,32 @@ mod tests {
         assert_eq!(synth_place(), synth_place());
         assert_eq!(synth_mine_complete(), synth_mine_complete());
         assert_eq!(synth_ui_click(), synth_ui_click());
+        assert_eq!(synth_mob_idle(), synth_mob_idle());
+        assert_eq!(synth_mob_hurt(), synth_mob_hurt());
+        assert_eq!(synth_mob_death(), synth_mob_death());
+        assert_eq!(synth_bow_release(), synth_bow_release());
+        assert_eq!(synth_arrow_impact(), synth_arrow_impact());
     }
 
     #[test]
     fn synth_durations_match_their_slot_character() {
         let sr = SAMPLE_RATE as f32;
         let stereo = CHANNELS as usize;
-        assert!((synth_break().len() / stereo) as f32 / sr > 0.10);
-        assert!((synth_place().len() / stereo) as f32 / sr < 0.10);
-        assert!((synth_mine_complete().len() / stereo) as f32 / sr < 0.10);
-        assert!((synth_ui_click().len() / stereo) as f32 / sr < 0.05);
+        let seconds = |buffer: Vec<f32>| (buffer.len() / stereo) as f32 / sr;
+        assert!(seconds(synth_break()) > 0.10);
+        assert!(seconds(synth_place()) < 0.10);
+        assert!(seconds(synth_mine_complete()) < 0.10);
+        assert!(seconds(synth_ui_click()) < 0.05);
+        // The five S09 slots each keep their documented length: idle/death are
+        // the long mob phrases, hurt is mid-length, bow/arrow are one-shots.
+        assert!(seconds(synth_mob_idle()) >= 0.29 && seconds(synth_mob_idle()) <= 0.31);
+        assert!(seconds(synth_mob_hurt()) >= 0.17 && seconds(synth_mob_hurt()) <= 0.19);
+        assert!(seconds(synth_mob_death()) >= 0.49 && seconds(synth_mob_death()) <= 0.51);
+        assert!(seconds(synth_bow_release()) >= 0.11 && seconds(synth_bow_release()) <= 0.13);
+        assert!(seconds(synth_arrow_impact()) >= 0.09 && seconds(synth_arrow_impact()) <= 0.11);
+        assert!(seconds(synth_mob_death()) > seconds(synth_mob_idle()));
+        assert!(seconds(synth_mob_idle()) > seconds(synth_bow_release()));
+        assert!(seconds(synth_bow_release()) > seconds(synth_arrow_impact()));
     }
 
     #[test]
@@ -387,8 +539,38 @@ mod tests {
         assert_eq!(SoundSlot::Place.name(), "place");
         assert_eq!(SoundSlot::MineComplete.name(), "mine_complete");
         assert_eq!(SoundSlot::UiClick.name(), "ui_click");
+        assert_eq!(SoundSlot::MobIdle.name(), "mob_idle");
+        assert_eq!(SoundSlot::MobHurt.name(), "mob_hurt");
+        assert_eq!(SoundSlot::MobDeath.name(), "mob_death");
+        assert_eq!(SoundSlot::BowRelease.name(), "bow_release");
+        assert_eq!(SoundSlot::ArrowImpact.name(), "arrow_impact");
+        assert_eq!(SoundSlot::ALL.len(), SOUND_SLOT_COUNT);
         for (index, slot) in SoundSlot::ALL.iter().enumerate() {
-            assert_eq!(slot.index(), index);
+            assert_eq!(slot.index(), index, "slot {slot:?} index moved");
+        }
+    }
+
+    #[test]
+    fn synth_functions_cover_every_slot_without_repeats() {
+        // One named synth per slot: a future variant added without a default
+        // cannot silently share another slot's sound.
+        let synths: [(&str, Vec<f32>); SOUND_SLOT_COUNT] = [
+            ("break", synth_break()),
+            ("place", synth_place()),
+            ("mine_complete", synth_mine_complete()),
+            ("ui_click", synth_ui_click()),
+            ("mob_idle", synth_mob_idle()),
+            ("mob_hurt", synth_mob_hurt()),
+            ("mob_death", synth_mob_death()),
+            ("bow_release", synth_bow_release()),
+            ("arrow_impact", synth_arrow_impact()),
+        ];
+        for (index, slot) in SoundSlot::ALL.iter().enumerate() {
+            assert_eq!(
+                synths[index].0,
+                slot.name(),
+                "slot {index} has a mismatched synth"
+            );
         }
     }
 
@@ -430,6 +612,26 @@ mod tests {
             buffers[SoundSlot::UiClick.index()].samples(),
             synth_ui_click()
         );
+        assert_eq!(
+            buffers[SoundSlot::MobIdle.index()].samples(),
+            synth_mob_idle()
+        );
+        assert_eq!(
+            buffers[SoundSlot::MobHurt.index()].samples(),
+            synth_mob_hurt()
+        );
+        assert_eq!(
+            buffers[SoundSlot::MobDeath.index()].samples(),
+            synth_mob_death()
+        );
+        assert_eq!(
+            buffers[SoundSlot::BowRelease.index()].samples(),
+            synth_bow_release()
+        );
+        assert_eq!(
+            buffers[SoundSlot::ArrowImpact.index()].samples(),
+            synth_arrow_impact()
+        );
     }
 
     #[test]
@@ -441,6 +643,11 @@ mod tests {
             SoundBuffer::new(vec![0.3, 0.4], 2, 48_000),
             SoundBuffer::new(vec![0.0; 4], 2, SAMPLE_RATE),
             SoundBuffer::new(vec![-0.5], 1, 8_000),
+            SoundBuffer::new(vec![0.05], 1, 11_025),
+            SoundBuffer::new(vec![-0.2, 0.2], 2, 32_000),
+            SoundBuffer::new(vec![0.7], 1, 16_000),
+            SoundBuffer::new(vec![0.01, 0.02, 0.03], 1, 24_000),
+            SoundBuffer::new(vec![-0.9, 0.9], 2, 96_000),
         ];
         engine.set_buffers(custom.clone());
         for slot in SoundSlot::ALL {
@@ -450,6 +657,8 @@ mod tests {
         assert_eq!(engine.buffer(SoundSlot::Break).channels(), 1);
         assert_eq!(engine.buffer(SoundSlot::Break).sample_rate(), 22_050);
         assert_eq!(engine.buffer(SoundSlot::Place).sample_rate(), 48_000);
+        assert_eq!(engine.buffer(SoundSlot::MobHurt).sample_rate(), 32_000);
+        assert_eq!(engine.buffer(SoundSlot::ArrowImpact).sample_rate(), 96_000);
         assert!(
             engine.is_silent(),
             "swapping buffers must not open a device"
@@ -464,6 +673,11 @@ mod tests {
             SoundBuffer::new(Vec::new(), 1, 44_100),
             SoundBuffer::new(vec![0.0; 3], 2, 48_000),
             SoundBuffer::new(vec![0.25], 1, 8_000),
+            SoundBuffer::new(vec![0.0; 2], 2, SAMPLE_RATE),
+            SoundBuffer::new(vec![0.1], 1, SAMPLE_RATE),
+            SoundBuffer::new(vec![-0.1, 0.1], 2, SAMPLE_RATE),
+            SoundBuffer::new(vec![0.0; 6], 2, SAMPLE_RATE),
+            SoundBuffer::new(vec![0.3], 1, SAMPLE_RATE),
         ]);
         for slot in SoundSlot::ALL {
             engine.play(slot, 0);

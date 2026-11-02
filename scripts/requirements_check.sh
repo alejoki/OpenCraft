@@ -4,23 +4,23 @@
 # Validates the checked-in REQUIREMENTS-REGISTRY.md:
 #   1. the registry file exists,
 #   2. every "### R### — ..." record parses into the nine contract bullets,
-#   3. exactly R001-R044 appear once each, with no duplicate or malformed IDs,
+#   3. exactly R001-R054 appear once each, with no duplicate or malformed IDs,
 #   4. required fields are non-empty and Status is exactly "active" or
 #      "superseded" with a Superseded by: M###/S## line; R005's deliberate
 #      M007/S01 supersession and R033's deliberate M008/S06 supersession are
 #      pinned so they cannot silently revert to active,
 #   5. ownership follows M001/M002 for R001-R004, M003 for R005-R015,
-#      M004 for R016-R020, M005 for R021-R026, M007 for R027-R034, and
-#      M008 for R035-R044,
-#   6. every M003, M004, M005, M007, and M008 slice is covered by at least one
-#      mapped record,
+#      M004 for R016-R020, M005 for R021-R026, M007 for R027-R034,
+#      M008 for R035-R044, and M009 for R045-R054,
+#   6. every M003, M004, M005, M007, M008, and M009 slice is covered by at
+#      least one mapped record,
 #   7. the M003 (criteria 1-5), M004 (criteria 1-7), M005 (criteria 1-8),
-#      M007 (criteria 1-7), and M008 (criteria 1-8) criterion trace tables are
-#      parsed section-scoped and match their expected requirement/slice
-#      mappings with non-empty evidence,
+#      M007 (criteria 1-7), M008 (criteria 1-8), and M009 (criteria 1-9)
+#      criterion trace tables are parsed section-scoped and match their
+#      expected requirement/slice mappings with non-empty evidence,
 #   8. the shipped identity surface (manifest, lockfile, src, scripts) contains
 #      no legacy project-name reference, in any case or separator form,
-#   9. all five validated criterion trace tables are printed.
+#   9. all six validated criterion trace tables are printed.
 #
 # REQUIREMENTS_FILE overrides the registry path (used by the negative-path
 # selftest). The default is <repo-root>/REQUIREMENTS-REGISTRY.md.
@@ -61,7 +61,8 @@ criteria_m4_tmp="$(mktemp)"
 criteria_m5_tmp="$(mktemp)"
 criteria_m7_tmp="$(mktemp)"
 criteria_m8_tmp="$(mktemp)"
-trap 'rm -f "$record_tmp" "$criteria_m3_tmp" "$criteria_m4_tmp" "$criteria_m5_tmp" "$criteria_m7_tmp" "$criteria_m8_tmp"' EXIT
+criteria_m9_tmp="$(mktemp)"
+trap 'rm -f "$record_tmp" "$criteria_m3_tmp" "$criteria_m4_tmp" "$criteria_m5_tmp" "$criteria_m7_tmp" "$criteria_m8_tmp" "$criteria_m9_tmp"' EXIT
 
 # ---------------------------------------------------------------------------
 # 2. Parse each record heading and its contract bullets.
@@ -94,7 +95,7 @@ END { flush() }
 ' "$REGISTRY" > "$record_tmp"
 
 # ---------------------------------------------------------------------------
-# 3. Exactly 44 unique R001-R044 records.
+# 3. Exactly 54 unique R001-R054 records.
 # ---------------------------------------------------------------------------
 declare -A seen=()
 declare -A class_of=()
@@ -126,14 +127,14 @@ while IFS='|' read -r id class status desc why src own supp val supe; do
     record_count=$((record_count + 1))
 done < "$record_tmp"
 
-[[ "$record_count" -eq 44 ]] || fail "expected 44 requirement records, found $record_count"
+[[ "$record_count" -eq 54 ]] || fail "expected 54 requirement records, found $record_count"
 
-for n in $(seq 1 44); do
+for n in $(seq 1 54); do
     id="$(printf 'R%03d' "$n")"
     [[ -n "${seen[$id]:-}" ]] || fail "missing requirement record: $id"
 done
 
-pass "44 requirement records R001-R044 present exactly once with unique IDs"
+pass "54 requirement records R001-R054 present exactly once with unique IDs"
 
 # ---------------------------------------------------------------------------
 # 4. Required fields are non-empty; Status is exactly "active" or
@@ -180,7 +181,7 @@ pass "R033 records the deliberate M008/S06 supersession"
 
 # ---------------------------------------------------------------------------
 # 5. Ownership: R001-R004 -> M001 or M002; R005-R015 -> M003; R016-R020 -> M004;
-#    R021-R026 -> M005; R027-R034 -> M007; R035-R044 -> M008.
+#    R021-R026 -> M005; R027-R034 -> M007; R035-R044 -> M008; R045-R054 -> M009.
 # ---------------------------------------------------------------------------
 for n in $(seq 1 4); do
     id="$(printf 'R%03d' "$n")"
@@ -223,7 +224,14 @@ for n in $(seq 35 44); do
     [[ "$text" == *"M008"* ]] \
         || fail "$id is not owned by M008 (owner/supporting: '$text')"
 done
-pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, M004 for R016-R020, M005 for R021-R026, M007 for R027-R034, and M008 for R035-R044"
+
+for n in $(seq 45 54); do
+    id="$(printf 'R%03d' "$n")"
+    text="${owner_of[$id]} ${supp_of[$id]}"
+    [[ "$text" == *"M009"* ]] \
+        || fail "$id is not owned by M009 (owner/supporting: '$text')"
+done
+pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, M004 for R016-R020, M005 for R021-R026, M007 for R027-R034, M008 for R035-R044, and M009 for R045-R054"
 
 # ---------------------------------------------------------------------------
 # 6. M003 slice coverage. A mapping counts when the slice token appears in the
@@ -313,15 +321,30 @@ has_slice R044 M008/S09 || fail "no requirement maps to M008/S09 (expected R044 
 pass "M008 slices S01-S09 are each mapped to at least one requirement"
 
 # ---------------------------------------------------------------------------
+# 6f. M009 slice coverage.
+# ---------------------------------------------------------------------------
+has_slice R045 M009/S01 || fail "no requirement maps to M009/S01 (expected R045)"
+has_slice R046 M009/S02 || fail "no requirement maps to M009/S02 (expected R046)"
+has_slice R047 M009/S03 || fail "no requirement maps to M009/S03 (expected R047)"
+has_slice R048 M009/S04 || fail "no requirement maps to M009/S04 (expected R048)"
+has_slice R049 M009/S05 || fail "no requirement maps to M009/S05 (expected R049)"
+has_slice R050 M009/S06 || fail "no requirement maps to M009/S06 (expected R050)"
+has_slice R051 M009/S07 || fail "no requirement maps to M009/S07 (expected R051)"
+has_slice R052 M009/S08 || fail "no requirement maps to M009/S08 (expected R052)"
+has_slice R053 M009/S09 || fail "no requirement maps to M009/S09 (expected R053)"
+has_slice R054 M009/S10 || fail "no requirement maps to M009/S10 (expected R054)"
+pass "M009 slices S01-S10 are each mapped to at least one requirement"
+
+# ---------------------------------------------------------------------------
 # 7. Criterion trace tables, parsed section-scoped.
 #
 # A whole-file /^\| [1-5] \|/ match would collide because the M003, M004,
-# M005, M007 and M008 tables all restart their criterion numbers at 1. Track
-# the current table by its exact heading, reset on any other "## " heading
-# ("### R###" record headings do not match), and enforce each table's own
-# criterion range.
+# M005, M007, M008 and M009 tables all restart their criterion numbers at 1.
+# Track the current table by its exact heading, reset on any other "## "
+# heading ("### R###" record headings do not match), and enforce each table's
+# own criterion range.
 # ---------------------------------------------------------------------------
-awk -F'|' -v m3="$criteria_m3_tmp" -v m4="$criteria_m4_tmp" -v m5="$criteria_m5_tmp" -v m7="$criteria_m7_tmp" -v m8="$criteria_m8_tmp" '
+awk -F'|' -v m3="$criteria_m3_tmp" -v m4="$criteria_m4_tmp" -v m5="$criteria_m5_tmp" -v m7="$criteria_m7_tmp" -v m8="$criteria_m8_tmp" -v m9="$criteria_m9_tmp" '
 function emit(c, r, s, e, dest) {
     gsub(/[[:space:]]/, "", c)
     gsub(/[[:space:]]/, "", r)
@@ -335,6 +358,7 @@ function emit(c, r, s, e, dest) {
 /^## M005 Criterion Trace/ { section = "m5"; next }
 /^## M007 Criterion Trace/ { section = "m7"; next }
 /^## M008 Criterion Trace/ { section = "m8"; next }
+/^## M009 Criterion Trace/ { section = "m9"; next }
 /^## /                    { section = ""; next }
 /^\| [0-9]+ \|/ {
     if (section == "") next
@@ -375,10 +399,17 @@ function emit(c, r, s, e, dest) {
             next
         }
         emit($2, $3, $4, $5, m8)
+    } else if (section == "m9") {
+        if (c + 0 < 1 || c + 0 > 9) {
+            print "ERROR: criterion row out of range in M009 table: " c > "/dev/stderr"
+            bad = 1
+            next
+        }
+        emit($2, $3, $4, $5, m9)
     }
 }
 END { exit bad ? 1 : 0 }
-' "$REGISTRY" || fail "criterion trace row out of range (M003 allows 1-5, M004 allows 1-7, M005 allows 1-8, M007 allows 1-7, M008 allows 1-8)"
+' "$REGISTRY" || fail "criterion trace row out of range (M003 allows 1-5, M004 allows 1-7, M005 allows 1-8, M007 allows 1-7, M008 allows 1-8, M009 allows 1-9)"
 
 declare -A crit_req=()
 declare -A crit_sl=()
@@ -652,6 +683,63 @@ for c in 1 2 3 4 5 6 7 8; do
 done
 pass "M008 criterion trace rows 1-8 match expected requirement/slice mappings with evidence"
 
+declare -A crit9_req=()
+declare -A crit9_sl=()
+declare -A crit9_ev=()
+declare -A crit9_count=()
+
+while IFS='|' read -r c r s e; do
+    [[ -n "$c" ]] || continue
+    crit9_count[$c]=$(( ${crit9_count[$c]:-0} + 1 ))
+    crit9_req[$c]="$r"
+    crit9_sl[$c]="$s"
+    crit9_ev[$c]="$e"
+done < "$criteria_m9_tmp"
+
+declare -A expected_req_m9=(
+    [1]="R045,R048,R049"
+    [2]="R049,R050"
+    [3]="R047,R051"
+    [4]="R048,R051,R052"
+    [5]="R046"
+    [6]="R053"
+    [7]="R050"
+    [8]="R045,R053"
+    [9]="R054"
+)
+declare -A expected_sl_m9=(
+    [1]="S01,S04,S05"
+    [2]="S05,S06"
+    [3]="S03,S07"
+    [4]="S04,S07,S08"
+    [5]="S02"
+    [6]="S09"
+    [7]="S06"
+    [8]="S01,S09"
+    [9]="S01,S02,S03,S04,S05,S06,S07,S08,S09,S10"
+)
+
+for c in $(seq 1 9); do
+    [[ "${crit9_count[$c]:-0}" -eq 1 ]] \
+        || fail "M009 criterion $c must have exactly one trace row, found ${crit9_count[$c]:-0}"
+    [[ "${crit9_req[$c]}" == "${expected_req_m9[$c]}" ]] \
+        || fail "M009 criterion $c requirements must be '${expected_req_m9[$c]}', got '${crit9_req[$c]}'"
+    [[ "${crit9_sl[$c]}" == "${expected_sl_m9[$c]}" ]] \
+        || fail "M009 criterion $c slices must be '${expected_sl_m9[$c]}', got '${crit9_sl[$c]}'"
+    [[ -n "${crit9_ev[$c]}" ]] \
+        || fail "M009 criterion $c has an empty Evidence cell"
+
+    IFS=',' read -r -a refs <<< "${crit9_req[$c]}"
+    for rid in "${refs[@]}"; do
+        [[ -n "${seen[$rid]:-}" ]] \
+            || fail "M009 criterion $c references unknown requirement: $rid"
+        text="${owner_of[$rid]} ${supp_of[$rid]}"
+        [[ "$text" == *"M009"* ]] \
+            || fail "M009 criterion $c references requirement $rid which is not M009-owned"
+    done
+done
+pass "M009 criterion trace rows 1-9 match expected requirement/slice mappings with evidence"
+
 # ---------------------------------------------------------------------------
 # 8. Shipped identity. The legacy project name must not survive anywhere in
 #    the manifest, lockfile, source, or scripts. The pattern accepts hyphen,
@@ -677,7 +765,7 @@ done
 pass "shipped identity is opencraft with no legacy project-name references"
 
 # ---------------------------------------------------------------------------
-# 9. Print all five validated criterion trace tables.
+# 9. Print all six validated criterion trace tables.
 # ---------------------------------------------------------------------------
 echo
 echo "M003 Criterion Trace"
@@ -708,6 +796,12 @@ echo "M008 Criterion Trace"
 printf '%-10s %-27s %-9s %s\n' "Criterion" "Requirements" "Slices" "Evidence"
 for c in 1 2 3 4 5 6 7 8; do
     printf '%-10s %-27s %-9s %s\n' "$c" "${crit8_req[$c]}" "${crit8_sl[$c]}" "${crit8_ev[$c]}"
+done
+echo
+echo "M009 Criterion Trace"
+printf '%-10s %-27s %-9s %s\n' "Criterion" "Requirements" "Slices" "Evidence"
+for c in 1 2 3 4 5 6 7 8 9; do
+    printf '%-10s %-27s %-9s %s\n' "$c" "${crit9_req[$c]}" "${crit9_sl[$c]}" "${crit9_ev[$c]}"
 done
 echo
 

@@ -1,7 +1,10 @@
+pub mod bow;
 pub mod camera;
+pub mod combat;
 pub mod container;
 pub mod eating;
 pub mod inventory;
+pub mod melee;
 pub mod mining;
 pub mod physics;
 pub mod raycast;

@@ -1,11 +1,12 @@
 //! GPU-free, never-fail sound overrides for texture/sound packs.
 //!
-//! A pack may ship up to four audio files (one per [`SoundSlot`]) flat in its
+//! A pack may ship up to nine audio files (one per [`SoundSlot`]) flat in its
 //! root, next to the texture layers. This loader mirrors the texture loader's
-//! contract: it always returns a complete `[SoundBuffer; 4]` set and never
-//! returns `Err`, never panics, and never touches an audio device. Every file
-//! problem degrades to that slot's synthesized default plus one structured
-//! warning naming the bare file, so no audio file state can block launch.
+//! contract: it always returns a complete `[SoundBuffer; SOUND_SLOT_COUNT]` set
+//! and never returns `Err`, never panics, and never touches an audio device.
+//! Every file problem degrades to that slot's synthesized default plus one
+//! structured warning naming the bare file, so no audio file state can block
+//! launch.
 //!
 //! The loader stays a separate entry point (rather than living inside
 //! [`crate::pack::LoadedPack`]) because `SoundBuffer` carries `f32` samples and
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rodio::Source;
 
-use crate::audio::{default_buffers, SoundBuffer, SoundSlot};
+use crate::audio::{default_buffers, SoundBuffer, SoundSlot, SOUND_SLOT_COUNT};
 use crate::settings::SettingsWarning;
 
 /// Largest accepted sound file, in bytes. Checked before decoding so a
@@ -35,7 +36,7 @@ pub const SOUND_EXTENSIONS: [&str; 5] = ["wav", "ogg", "flac", "mp3", "m4a"];
 /// synthesized default. A file that exists but is unreadable, larger than
 /// [`SOUND_BYTE_CAP`], fails to decode, or decodes to zero samples produces
 /// exactly one warning whose `field` is the bare file name.
-pub fn load_sound_overrides(dir: &Path) -> ([SoundBuffer; 4], Vec<SettingsWarning>) {
+pub fn load_sound_overrides(dir: &Path) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
     let mut buffers = default_buffers();
     let mut warnings = Vec::new();
 
@@ -210,6 +211,11 @@ mod tests {
             ("place.wav", 2, 44_100),
             ("mine_complete.wav", 1, 8_000),
             ("ui_click.wav", 2, 48_000),
+            ("mob_idle.wav", 1, 32_000),
+            ("mob_hurt.wav", 2, 44_100),
+            ("mob_death.wav", 1, 16_000),
+            ("bow_release.wav", 2, 96_000),
+            ("arrow_impact.wav", 1, 11_025),
         ];
         for (file, channels, rate) in cases {
             let samples = ramp(32 * usize::from(channels));
@@ -228,6 +234,111 @@ mod tests {
                 buffers[index].sample_rate(),
                 *rate,
                 "slot {index} sample rate"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mob_and_combat_slot_maps_its_own_file_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+
+        // Three explicit mob/combat files with distinct formats, written alone
+        // so only their own slot can be touched.
+        let cases = [
+            ("mob_idle", 1u16, 32_000u32, 64usize),
+            ("bow_release", 2, 96_000, 128),
+            ("arrow_impact", 1, 11_025, 64),
+        ];
+        for (stem, channels, rate, len) in cases {
+            write_sound(
+                &dir,
+                &format!("{stem}.wav"),
+                &wav_bytes(channels, rate, &ramp(len)),
+            );
+        }
+
+        let (buffers, warnings) = load_sound_overrides(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let defaults = default_buffers();
+        let expected = [
+            (SoundSlot::MobIdle, 1u16, 32_000u32),
+            (SoundSlot::BowRelease, 2, 96_000),
+            (SoundSlot::ArrowImpact, 1, 11_025),
+        ];
+        for (slot, channels, rate) in expected {
+            let buffer = &buffers[slot.index()];
+            assert_eq!(buffer.channels(), channels, "{} channels", slot.name());
+            assert_eq!(buffer.sample_rate(), rate, "{} rate", slot.name());
+            assert_ne!(
+                buffer.samples(),
+                defaults[slot.index()].samples(),
+                "{} must come from the pack file, not the synth default",
+                slot.name()
+            );
+        }
+
+        // The other six slots keep the synthesized defaults untouched.
+        let provided = [
+            SoundSlot::MobIdle,
+            SoundSlot::BowRelease,
+            SoundSlot::ArrowImpact,
+        ];
+        for slot in SoundSlot::ALL {
+            if provided.contains(&slot) {
+                continue;
+            }
+            assert_eq!(
+                buffers[slot.index()],
+                defaults[slot.index()],
+                "{} must stay on the synth default",
+                slot.name()
+            );
+        }
+    }
+
+    #[test]
+    fn mob_sound_override_touches_only_its_own_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+
+        write_sound(&dir, "mob_hurt.wav", &wav_bytes(2, 44_100, &ramp(128)));
+        write_sound(&dir, "arrow_impact.wav", b"not an audio file at all");
+
+        let (buffers, warnings) = load_sound_overrides(&dir);
+        let defaults = default_buffers();
+
+        // mob_hurt (slot 5) is replaced by the valid file...
+        assert_ne!(
+            buffers[SoundSlot::MobHurt.index()],
+            defaults[SoundSlot::MobHurt.index()],
+            "the valid mob_hurt file must replace slot 5"
+        );
+        assert_eq!(buffers[SoundSlot::MobHurt.index()].channels(), 2);
+        assert_eq!(buffers[SoundSlot::MobHurt.index()].sample_rate(), 44_100);
+
+        // ...while the corrupt arrow_impact (slot 8) falls back to its default.
+        assert_eq!(
+            buffers[SoundSlot::ArrowImpact.index()],
+            defaults[SoundSlot::ArrowImpact.index()],
+            "the corrupt arrow_impact file must fall back to slot 8's default"
+        );
+
+        // Exactly one warning, naming the bare file that failed.
+        assert_eq!(warning_fields(&warnings), vec!["arrow_impact.wav"]);
+        assert!(!warnings[0].reason.is_empty());
+
+        // Slots 0..=4 and 6..=7 are untouched by either file.
+        for slot in SoundSlot::ALL {
+            if slot == SoundSlot::MobHurt || slot == SoundSlot::ArrowImpact {
+                continue;
+            }
+            assert_eq!(
+                buffers[slot.index()],
+                defaults[slot.index()],
+                "{} must not change",
+                slot.name()
             );
         }
     }

@@ -23,6 +23,13 @@
 //!   head-submerged flag, and applies the returned totals to the session's
 //!   transient message/feedback surfaces. It never clears external state and
 //!   never runs an unbounded loop.
+//! * Every damaging rule also names its [`DamageCause`] on the returned
+//!   [`SurvivalTick`]. The survival rules are the only writers of `Fall`,
+//!   `Drowning`, and `Starvation`; the session's mob-melee seam is the only
+//!   writer of `Zombie`. The tag is ambient (never persisted): a loaded dead
+//!   save has no cause and renders "Unknown".
+
+use crate::player::combat::DamageCause;
 
 /// Maximum health points. Zero health is a valid state (death screen, S04).
 pub const MAX_HEALTH: u16 = 20;
@@ -250,6 +257,14 @@ pub struct SurvivalTick {
     pub damage: u16,
     /// Total health regenerated this tick.
     pub healed: u16,
+    /// Ambient cause of the LAST damaging rule that applied health loss this
+    /// tick, or `None` when nothing damaged.
+    ///
+    /// The fixed rule order (fall, drowning, starvation) decides a
+    /// multiple-damage tick: the last rule to land owns the tag. Never
+    /// persisted; the session copies it into its single `last_damage_cause`
+    /// writer only when `damage > 0`.
+    pub cause: Option<DamageCause>,
 }
 
 /// Pure game-time survival rules: fall damage, air/drowning, hunger,
@@ -309,7 +324,11 @@ impl SurvivalRuntime {
         // 1. One-shot fall damage from the physics latch.
         let fall = fall_damage(ctx.fall_distance);
         if fall > 0 {
-            report.damage = report.damage.saturating_add(vitals.damage(fall));
+            let applied = vitals.damage(fall);
+            report.damage = report.damage.saturating_add(applied);
+            if applied > 0 {
+                report.cause = Some(DamageCause::Fall);
+            }
             if vitals.health == 0 {
                 self.reset();
                 return report;
@@ -340,6 +359,9 @@ impl SurvivalRuntime {
                     let steps = steps.min(f32::from(MAX_DROWN_STEPS)) as u16;
                     let applied = vitals.damage(steps.saturating_mul(DROWN_DAMAGE));
                     report.damage = report.damage.saturating_add(applied);
+                    if applied > 0 {
+                        report.cause = Some(DamageCause::Drowning);
+                    }
                     if vitals.health == 0 {
                         self.reset();
                         return report;
@@ -379,6 +401,9 @@ impl SurvivalRuntime {
                 let steps = steps.min(f32::from(MAX_STARVE_STEPS)) as u16;
                 let applied = vitals.damage(steps.saturating_mul(STARVE_DAMAGE));
                 report.damage = report.damage.saturating_add(applied);
+                if applied > 0 {
+                    report.cause = Some(DamageCause::Starvation);
+                }
                 if vitals.health == 0 {
                     self.reset();
                     return report;
@@ -448,6 +473,9 @@ mod tests {
             let tick = runtime.tick(vitals, ctx, dt);
             total.damage = total.damage.saturating_add(tick.damage);
             total.healed = total.healed.saturating_add(tick.healed);
+            if tick.damage > 0 {
+                total.cause = tick.cause;
+            }
         }
         total
     }
@@ -873,6 +901,84 @@ mod tests {
         // Ten clamped game seconds drain 200 air, not the whole lung.
         assert_eq!(tick.damage, 0);
         assert_eq!(vitals.air(), FULL_AIR - 200);
+    }
+
+    #[test]
+    fn fall_only_tick_reports_the_fall_cause() {
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::full();
+        let ctx = SurvivalContext {
+            fall_distance: 5.0,
+            ..survival_ctx()
+        };
+
+        let tick = runtime.tick(&mut vitals, ctx, 0.016);
+        assert_eq!(tick.damage, 2);
+        assert_eq!(tick.cause, Some(DamageCause::Fall));
+    }
+
+    #[test]
+    fn drown_only_tick_reports_the_drowning_cause() {
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            ..survival_ctx()
+        };
+
+        let tick = runtime.tick(&mut vitals, ctx, 1.0);
+        assert_eq!(tick.damage, DROWN_DAMAGE);
+        assert_eq!(tick.cause, Some(DamageCause::Drowning));
+    }
+
+    #[test]
+    fn starve_only_tick_reports_the_starvation_cause() {
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, 0, FULL_AIR).unwrap();
+
+        let tick = runtime.tick(&mut vitals, survival_ctx(), STARVE_INTERVAL_SECS);
+        assert_eq!(tick.damage, STARVE_DAMAGE);
+        assert_eq!(tick.cause, Some(DamageCause::Starvation));
+    }
+
+    #[test]
+    fn undamaging_ticks_report_no_cause() {
+        // Hunger drain only: three clamped 10 s ticks reach the 30 s hunger
+        // interval, so hunger falls but no health is lost.
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::full();
+        let mut damaged = 0u16;
+        for _ in 0..3 {
+            let tick = runtime.tick(&mut vitals, survival_ctx(), MAX_TICK_GAME_SECS);
+            damaged = damaged.saturating_add(tick.damage);
+            assert_eq!(tick.cause, None, "hunger drain is not a damage cause");
+        }
+        assert_eq!(damaged, 0);
+        assert!(vitals.hunger() < MAX_HUNGER, "hunger still drains");
+
+        // Regeneration only: health rises, no cause.
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, MAX_HUNGER, FULL_AIR).unwrap();
+        let tick = runtime.tick(&mut vitals, survival_ctx(), REGEN_INTERVAL_SECS);
+        assert_eq!(tick.healed, 1);
+        assert_eq!(tick.cause, None);
+    }
+
+    #[test]
+    fn the_last_damaging_rule_owns_the_cause_on_a_multi_damage_tick() {
+        // Fall damage (rule 1) and drowning damage (rule 2) land in the same
+        // tick: the fixed rule order means drowning owns the tag.
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            fall_distance: 5.0,
+            ..survival_ctx()
+        };
+
+        let tick = runtime.tick(&mut vitals, ctx, DROWN_INTERVAL_SECS);
+        assert_eq!(tick.damage, 2 + DROWN_DAMAGE);
+        assert_eq!(tick.cause, Some(DamageCause::Drowning));
     }
 
     #[test]

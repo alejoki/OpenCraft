@@ -16,6 +16,7 @@
 
 use crate::world::block::BlockId;
 use crate::world::loot::LootItem;
+use crate::world::mob_loot::MobDropItem;
 
 /// Number of hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
@@ -189,6 +190,14 @@ pub enum Material {
     Wheat,
     WheatSeeds,
     Bread,
+    // Appended in this exact order: it is the append-only wire-tag order the
+    // persistence layer depends on. Never reorder these variants.
+    Leather,
+    RawPorkchop,
+    RawBeef,
+    RottenFlesh,
+    Bone,
+    Arrow,
 }
 
 impl Material {
@@ -199,6 +208,12 @@ impl Material {
             Material::Wheat => "Wheat",
             Material::WheatSeeds => "Wheat Seeds",
             Material::Bread => "Bread",
+            Material::Leather => "Leather",
+            Material::RawPorkchop => "Raw Porkchop",
+            Material::RawBeef => "Raw Beef",
+            Material::RottenFlesh => "Rotten Flesh",
+            Material::Bone => "Bone",
+            Material::Arrow => "Arrow",
         }
     }
 }
@@ -210,6 +225,9 @@ pub enum ToolKind {
     Axe,
     Shovel,
     Hoe,
+    // Appended after Hoe; these are the trades the melee/bow slices need.
+    Sword,
+    Bow,
 }
 
 impl ToolKind {
@@ -219,6 +237,24 @@ impl ToolKind {
             ToolKind::Axe => "Axe",
             ToolKind::Shovel => "Shovel",
             ToolKind::Hoe => "Hoe",
+            ToolKind::Sword => "Sword",
+            ToolKind::Bow => "Bow",
+        }
+    }
+
+    /// Tiers this kind is constructible in.
+    ///
+    /// The bow is deliberately wood-only (D133/MEM396): there is no stone or
+    /// iron bow, so `(Bow, Stone)` and `(Bow, Iron)` must never become a valid
+    /// [`Item`]. Swords exist in all three tiers.
+    pub const fn allowed_tiers(self) -> &'static [ToolTier] {
+        match self {
+            ToolKind::Bow => &[ToolTier::Wood],
+            ToolKind::Pickaxe
+            | ToolKind::Axe
+            | ToolKind::Shovel
+            | ToolKind::Hoe
+            | ToolKind::Sword => &[ToolTier::Wood, ToolTier::Stone, ToolTier::Iron],
         }
     }
 }
@@ -283,23 +319,40 @@ impl ItemId {
     }
 
     /// Human-readable label for HUD/log surfaces.
+    ///
+    /// The match is kind-first so only constructible identities are nameable:
+    /// a bow has exactly one tier, and its name does not pretend otherwise.
     pub fn name(self) -> &'static str {
         match self {
             ItemId::Block(block) => block.name(),
             ItemId::Material(material) => material.name(),
-            ItemId::Tool { kind, tier } => match (tier, kind) {
-                (ToolTier::Wood, ToolKind::Pickaxe) => "Wood Pickaxe",
-                (ToolTier::Wood, ToolKind::Axe) => "Wood Axe",
-                (ToolTier::Wood, ToolKind::Shovel) => "Wood Shovel",
-                (ToolTier::Wood, ToolKind::Hoe) => "Wood Hoe",
-                (ToolTier::Stone, ToolKind::Pickaxe) => "Stone Pickaxe",
-                (ToolTier::Stone, ToolKind::Axe) => "Stone Axe",
-                (ToolTier::Stone, ToolKind::Shovel) => "Stone Shovel",
-                (ToolTier::Stone, ToolKind::Hoe) => "Stone Hoe",
-                (ToolTier::Iron, ToolKind::Pickaxe) => "Iron Pickaxe",
-                (ToolTier::Iron, ToolKind::Axe) => "Iron Axe",
-                (ToolTier::Iron, ToolKind::Shovel) => "Iron Shovel",
-                (ToolTier::Iron, ToolKind::Hoe) => "Iron Hoe",
+            ItemId::Tool { kind, tier } => match kind {
+                ToolKind::Pickaxe => match tier {
+                    ToolTier::Wood => "Wood Pickaxe",
+                    ToolTier::Stone => "Stone Pickaxe",
+                    ToolTier::Iron => "Iron Pickaxe",
+                },
+                ToolKind::Axe => match tier {
+                    ToolTier::Wood => "Wood Axe",
+                    ToolTier::Stone => "Stone Axe",
+                    ToolTier::Iron => "Iron Axe",
+                },
+                ToolKind::Shovel => match tier {
+                    ToolTier::Wood => "Wood Shovel",
+                    ToolTier::Stone => "Stone Shovel",
+                    ToolTier::Iron => "Iron Shovel",
+                },
+                ToolKind::Hoe => match tier {
+                    ToolTier::Wood => "Wood Hoe",
+                    ToolTier::Stone => "Stone Hoe",
+                    ToolTier::Iron => "Iron Hoe",
+                },
+                ToolKind::Sword => match tier {
+                    ToolTier::Wood => "Wood Sword",
+                    ToolTier::Stone => "Stone Sword",
+                    ToolTier::Iron => "Iron Sword",
+                },
+                ToolKind::Bow => "Wood Bow",
             },
         }
     }
@@ -324,6 +377,33 @@ impl From<LootItem> for ItemId {
     }
 }
 
+/// Maps a mob drop identity onto the player item identity it yields.
+///
+/// This is the only bridge from [`MobDropItem`] into this module — the world
+/// layer's drop tables never import the player layer (D094). Bones and arrows
+/// are materials; the rare bow resolves to the wood-tier tool identity, so
+/// `Item::new` grants it full wood-bow durability (the bow is wood-only,
+/// D133/MEM396).
+///
+/// The match is exhaustive by construction: a new [`MobDropItem`] variant is a
+/// compile error here until it is given a real item identity.
+impl From<MobDropItem> for ItemId {
+    fn from(item: MobDropItem) -> Self {
+        match item {
+            MobDropItem::RawPorkchop => ItemId::Material(Material::RawPorkchop),
+            MobDropItem::RawBeef => ItemId::Material(Material::RawBeef),
+            MobDropItem::Leather => ItemId::Material(Material::Leather),
+            MobDropItem::RottenFlesh => ItemId::Material(Material::RottenFlesh),
+            MobDropItem::Bone => ItemId::Material(Material::Bone),
+            MobDropItem::Arrow => ItemId::Material(Material::Arrow),
+            MobDropItem::Bow => ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+        }
+    }
+}
+
 /// Errors from item construction. Every variant is a rejected value, never a
 /// partially built item.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -340,6 +420,22 @@ pub enum ItemError {
     NotATool,
     /// Tool durability must be `1..=tier.max_durability()`.
     InvalidDurability,
+    /// The `(kind, tier)` pair is not a constructible tool identity, e.g. a
+    /// stone or iron bow.
+    TierNotAllowed,
+}
+
+/// Shared tier gate for every tool constructor.
+///
+/// Both [`Item::new`] and [`Item::tool_with_durability`] route through this,
+/// so an unconstructible pair such as `(Bow, Stone)` cannot be represented
+/// even by a forged save record.
+fn check_tool_tier(kind: ToolKind, tier: ToolTier) -> Result<(), ItemError> {
+    if kind.allowed_tiers().contains(&tier) {
+        Ok(())
+    } else {
+        Err(ItemError::TierNotAllowed)
+    }
 }
 
 /// A validated item instance: identity, count, and (for tools) remaining
@@ -366,7 +462,8 @@ impl Item {
             ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
-            ItemId::Tool { tier, .. } => {
+            ItemId::Tool { kind, tier } => {
+                check_tool_tier(kind, tier)?;
                 if count != 1 {
                     return Err(ItemError::StackableTool);
                 }
@@ -402,6 +499,7 @@ impl Item {
         tier: ToolTier,
         durability: u16,
     ) -> Result<Self, ItemError> {
+        check_tool_tier(kind, tier)?;
         if durability == 0 || durability > tier.max_durability() {
             return Err(ItemError::InvalidDurability);
         }
@@ -541,6 +639,31 @@ pub struct CollectOutcome {
     /// Number of items actually accepted. May be less than requested when the
     /// inventory filled up; the caller keeps the remainder.
     pub accepted: u16,
+}
+
+/// Result of [`Inventory::collect_items`]: a best-effort batch with an
+/// explicit accepted/lost report.
+///
+/// Unlike [`CollectOutcome`], this is not tied to a block identity and it
+/// accounts for the whole batch, so callers can decide what to do with the
+/// remainder instead of losing it silently.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CollectBatchOutcome {
+    /// Total units moved into the inventory across every item in the batch.
+    pub accepted: u32,
+    /// Total units that did not fit and stayed with the caller.
+    pub lost: u32,
+}
+
+impl CollectBatchOutcome {
+    pub const fn new(accepted: u32, lost: u32) -> Self {
+        Self { accepted, lost }
+    }
+
+    /// Whether any unit of the batch failed to fit.
+    pub fn lost_any(&self) -> bool {
+        self.lost > 0
+    }
 }
 
 /// Errors from inventory mutation. Every error leaves the inventory exactly
@@ -831,6 +954,68 @@ impl Inventory {
         })
     }
 
+    /// Best-effort batch collection in flat hotbar-then-main order.
+    ///
+    /// This is the best-effort sibling of [`Inventory::insert`] and
+    /// [`Inventory::insert_all`], whose all-or-nothing contracts the chest
+    /// break and wheat-harvest preflights depend on. Every stackable item
+    /// merges into compatible existing stacks first (never past
+    /// [`ItemId::stack_limit`]) and then fills empty slots, splitting with
+    /// [`Item::with_count`]; a non-stackable tool takes at most one empty slot
+    /// as a whole. Whatever still does not fit is counted in
+    /// [`CollectBatchOutcome::lost`] and left for the caller, so a full
+    /// inventory loses only the overflow.
+    ///
+    /// This never touches [`Inventory::cursor`] and the crafting grids live
+    /// outside the aggregate, so neither can be a batch destination. Units are
+    /// conserved per batch: `accepted + lost == sum(items.count)`.
+    pub fn collect_items(&mut self, items: &[Item]) -> CollectBatchOutcome {
+        let mut accepted: u32 = 0;
+        let mut lost: u32 = 0;
+
+        for item in items {
+            if item.is_stackable() {
+                let limit = item.id.stack_limit();
+                let mut remaining = item.count;
+
+                for existing in self.slots.iter_mut().flatten() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if existing.mergeable_with(item) && existing.count < limit {
+                        let moved = remaining.min(limit - existing.count);
+                        existing.count += moved;
+                        remaining -= moved;
+                    }
+                }
+
+                for slot in self.slots.iter_mut() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if slot.is_none() {
+                        let moved = remaining.min(limit);
+                        *slot = Some(
+                            item.with_count(moved)
+                                .expect("partial count stays within the limit"),
+                        );
+                        remaining -= moved;
+                    }
+                }
+
+                accepted += u32::from(item.count - remaining);
+                lost += u32::from(remaining);
+            } else if let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(*item);
+                accepted += u32::from(item.count);
+            } else {
+                lost += u32::from(item.count);
+            }
+        }
+
+        CollectBatchOutcome::new(accepted, lost)
+    }
+
     /// Consumes one unit from `index`, returning it. Clears the slot at zero.
     ///
     /// Out-of-bounds and empty slots return `None` without mutation.
@@ -844,6 +1029,30 @@ impl Inventory {
             item.count -= 1;
         }
         Some(consumed)
+    }
+
+    /// Consumes one unit of `id` from the first matching slot, returning the
+    /// consumed unit and its slot index.
+    ///
+    /// Slots are scanned in their existing flat hotbar-then-main order, so a
+    /// stack sitting in the hotbar is always spent before an identical stack
+    /// in main storage. Exactly one unit is removed: a multi-unit stack shrinks
+    /// by one, and a single-unit slot is cleared. Neither
+    /// [`Inventory::cursor`] nor either crafting grid (which live outside this
+    /// aggregate) is ever a source or a destination.
+    ///
+    /// An identity held nowhere in the 36 slots returns `None` with every
+    /// slot unchanged. This is the by-identity sibling of
+    /// [`Inventory::consume_one`], which requires an already-known index: the
+    /// bow occupies the selected hotbar slot, so spending an arrow must not
+    /// disturb the selection.
+    pub fn consume_item(&mut self, id: ItemId) -> Option<(usize, Item)> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_some_and(|item| item.id() == id))?;
+        let consumed = self.consume_one(index)?;
+        Some((index, consumed))
     }
 
     /// Picks the whole slot stack up onto the cursor.
@@ -1108,6 +1317,11 @@ pub enum RecipeId {
     WoodHoe,
     StoneHoe,
     IronHoe,
+    WoodSword,
+    StoneSword,
+    IronSword,
+    Shortbow,
+    Arrows,
 }
 
 /// Read-only recipe evaluation result.
@@ -1303,12 +1517,66 @@ const RECIPES: &[Recipe] = &[
         },
         output_count: 1,
     },
+    // Swords follow the vanilla 1-wide, 3-tall head-over-handle column. Like
+    // the hoes they structurally cannot fit the 2x2 player grid, so they are
+    // table-only by construction rather than by an explicit grid check.
+    Recipe {
+        id: RecipeId::WoodSword,
+        pattern: &["P", "P", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::StoneSword,
+        pattern: &["C", "C", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Stone,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::IronSword,
+        pattern: &["I", "I", "S"],
+        output: ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Iron,
+        },
+        output_count: 1,
+    },
+    // Ranged entry points. The bow is 3 wide and 3 tall (2 leather, 3 sticks)
+    // so it is table-only by shape, exactly like the hoes and swords. Arrows
+    // are a 1x2 column so the same recipe also fits the 2x2 player grid: a
+    // player who has never placed a table can still make ammo.
+    Recipe {
+        id: RecipeId::Shortbow,
+        pattern: &[" SE", "S E", " S "],
+        output: ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        },
+        output_count: 1,
+    },
+    Recipe {
+        id: RecipeId::Arrows,
+        pattern: &["S", "K"],
+        output: ItemId::Material(Material::Arrow),
+        output_count: 4,
+    },
 ];
 
 /// Pattern character to item identity. Unknown characters never match.
 ///
 /// Known characters: `L` oak log, `P` oak planks, `C` cobblestone,
-/// `I` iron ore, `S` stick, `W` wheat.
+/// `I` iron ore, `S` stick, `W` wheat, `E` leather, `K` coal ore.
+///
+/// There is no `Material::Coal` in this codebase, so the coal ore block is the
+/// only coal identity available — the same convention `I` already uses for
+/// iron ore. Smelting can later swap both head materials without touching the
+/// shaped-recipe machinery.
 fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
@@ -1317,6 +1585,8 @@ fn pattern_item(byte: u8) -> Option<ItemId> {
         b'I' => Some(ItemId::Block(BlockId::IronOre)),
         b'S' => Some(ItemId::Material(Material::Stick)),
         b'W' => Some(ItemId::Material(Material::Wheat)),
+        b'E' => Some(ItemId::Material(Material::Leather)),
+        b'K' => Some(ItemId::Block(BlockId::CoalOre)),
         _ => None,
     }
 }
@@ -1593,6 +1863,36 @@ mod tests {
         for slot in inventory.slots.iter_mut() {
             *slot = Some(full);
         }
+    }
+
+    /// Removes `amount` of `id` from the inventory, failing the test if the
+    /// inventory cannot supply it. Keeps craft-chain accounting honest: every
+    /// unit placed in a grid is withdrawn from somewhere.
+    fn withdraw(inventory: &mut Inventory, id: ItemId, amount: u16) -> Item {
+        let mut remaining = amount;
+        for slot in inventory.slots.iter_mut() {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(existing) = *slot {
+                if existing.id() != id {
+                    continue;
+                }
+                let moved = existing.count.min(remaining);
+                remaining -= moved;
+                *slot = if existing.count == moved {
+                    None
+                } else {
+                    Some(
+                        existing
+                            .with_count(existing.count - moved)
+                            .expect("partial stack is valid"),
+                    )
+                };
+            }
+        }
+        assert_eq!(remaining, 0, "inventory holds the requested ingredient");
+        item(id, amount)
     }
 
     /// Builds a grid of `kind` from an ASCII pattern using the same character
@@ -1932,19 +2232,99 @@ mod tests {
     }
 
     #[test]
-    fn food_and_hoe_identities_have_stable_names_and_limits() {
+    fn mob_drop_vocabulary_maps_to_valid_item_identities() {
+        use crate::world::mob_loot::MobDropItem;
+
+        // Exhaustive on purpose: adding a `MobDropItem` variant must fail this
+        // test (and the `From` match) until it has a pinned identity.
+        let cases = [
+            (MobDropItem::RawPorkchop, Material::RawPorkchop),
+            (MobDropItem::RawBeef, Material::RawBeef),
+            (MobDropItem::Leather, Material::Leather),
+            (MobDropItem::RottenFlesh, Material::RottenFlesh),
+            (MobDropItem::Bone, Material::Bone),
+            (MobDropItem::Arrow, Material::Arrow),
+        ];
+        let every_variant = [
+            MobDropItem::RawPorkchop,
+            MobDropItem::RawBeef,
+            MobDropItem::Leather,
+            MobDropItem::RottenFlesh,
+            MobDropItem::Bone,
+            MobDropItem::Arrow,
+            MobDropItem::Bow,
+        ];
+        assert_eq!(
+            cases.len() + 1,
+            every_variant.len(),
+            "every MobDropItem variant must appear in the mapping table"
+        );
+
+        for (drop, material) in cases {
+            let expected = ItemId::Material(material);
+            let id: ItemId = drop.into();
+            assert_eq!(id, expected, "{drop:?} maps to the wrong identity");
+            assert_eq!(
+                id.stack_limit(),
+                MATERIAL_STACK_LIMIT,
+                "{drop:?} must be a full material stack"
+            );
+            assert_eq!(MATERIAL_STACK_LIMIT, 64);
+            let item = Item::new(id, 1)
+                .unwrap_or_else(|error| panic!("{drop:?} must build an item, got {error:?}"));
+            assert_eq!(item.id(), expected);
+            assert_eq!(item.count(), 1);
+        }
+
+        // The bow is the one non-material drop: a wood-only tool, so the
+        // identity is non-stackable and `Item::new` grants full durability.
+        let bow: ItemId = MobDropItem::Bow.into();
+        assert_eq!(
+            bow,
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(bow.stack_limit(), 1);
+        let bow_item = Item::new(bow, 1).expect("a wood bow must be constructible");
+        assert_eq!(bow_item.id(), bow);
+        assert_eq!(bow_item.count(), 1);
+        assert_eq!(
+            bow_item.durability(),
+            Some(ToolTier::Wood.max_durability()),
+            "a dropped bow must enter at full wood-bow durability"
+        );
+    }
+
+    #[test]
+    fn item_identities_have_stable_names_and_limits() {
         assert_eq!(Material::Stick.name(), "Stick");
         assert_eq!(Material::Apple.name(), "Apple");
         assert_eq!(Material::Wheat.name(), "Wheat");
         assert_eq!(Material::WheatSeeds.name(), "Wheat Seeds");
         assert_eq!(Material::Bread.name(), "Bread");
+        assert_eq!(Material::Leather.name(), "Leather");
+        assert_eq!(Material::RawPorkchop.name(), "Raw Porkchop");
+        assert_eq!(Material::RawBeef.name(), "Raw Beef");
+        assert_eq!(Material::RottenFlesh.name(), "Rotten Flesh");
+        assert_eq!(Material::Bone.name(), "Bone");
+        assert_eq!(Material::Arrow.name(), "Arrow");
         assert_eq!(ToolKind::Hoe.name(), "Hoe");
+        assert_eq!(ToolKind::Sword.name(), "Sword");
+        assert_eq!(ToolKind::Bow.name(), "Bow");
 
         for material in [
             Material::Apple,
             Material::Wheat,
             Material::WheatSeeds,
             Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+            Material::Bone,
+            Material::Arrow,
         ] {
             let id = ItemId::Material(material);
             assert_eq!(id.name(), material.name());
@@ -1991,6 +2371,50 @@ mod tests {
                     .expect("full durability is valid")
                     .durability(),
                 Some(tier.max_durability())
+            );
+        }
+
+        for (tier, name) in [
+            (ToolTier::Wood, "Wood Sword"),
+            (ToolTier::Stone, "Stone Sword"),
+            (ToolTier::Iron, "Iron Sword"),
+        ] {
+            let id = ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier,
+            };
+            assert_eq!(id.name(), name);
+            assert_eq!(id.stack_limit(), 1);
+            let fresh = item(id, 1);
+            assert!(!fresh.is_stackable());
+            assert_eq!(fresh.durability(), Some(tier.max_durability()));
+        }
+
+        let bow = ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        };
+        assert_eq!(ToolKind::Bow.allowed_tiers(), &[ToolTier::Wood]);
+        assert_eq!(bow.name(), "Wood Bow");
+        assert_eq!(bow.stack_limit(), 1);
+        assert!(!item(bow, 1).is_stackable());
+
+        // Forged (bow, stone/iron) records are unrepresentable in both
+        // constructors and surface as TierNotAllowed, never InvalidDurability.
+        for tier in [ToolTier::Stone, ToolTier::Iron] {
+            assert_eq!(
+                Item::new(
+                    ItemId::Tool {
+                        kind: ToolKind::Bow,
+                        tier
+                    },
+                    1
+                ),
+                Err(ItemError::TierNotAllowed)
+            );
+            assert_eq!(
+                Item::tool_with_durability(ToolKind::Bow, tier, tier.max_durability()),
+                Err(ItemError::TierNotAllowed)
             );
         }
 
@@ -2286,6 +2710,217 @@ mod tests {
         assert_eq!(inventory, Inventory::empty());
     }
 
+    // -- Best-effort batch collection ---------------------------------------
+
+    fn slot_units(inventory: &Inventory) -> u32 {
+        inventory
+            .slots()
+            .iter()
+            .flatten()
+            .map(|item| u32::from(item.count()))
+            .sum()
+    }
+
+    #[test]
+    fn collect_items_accepts_everything_on_an_empty_inventory_like_insert_all() {
+        let items = [
+            block(BlockId::Stone, 900),
+            stick(30),
+            tool(ToolKind::Pickaxe, ToolTier::Iron),
+        ];
+        let total: u32 = items.iter().map(|item| u32::from(item.count())).sum();
+
+        let mut collected = Inventory::empty();
+        let outcome = collected.collect_items(&items);
+        assert_eq!(outcome, CollectBatchOutcome::new(total, 0));
+        assert!(!outcome.lost_any());
+
+        let mut inserted = Inventory::empty();
+        inserted.insert_all(&items).expect("all items fit");
+        assert_eq!(
+            collected.slots(),
+            inserted.slots(),
+            "a batch with room left produces the same slots insert_all would"
+        );
+        assert_eq!(slot_units(&collected), total);
+        assert_eq!(collected.cursor(), None, "the cursor is never a target");
+    }
+
+    #[test]
+    fn collect_items_accepts_the_remaining_room_and_reports_the_rest() {
+        // 35 full stick stacks plus one empty slot: only 64 units fit.
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(stick(MATERIAL_STACK_LIMIT));
+        }
+        let outcome =
+            inventory.collect_items(&[stick(MATERIAL_STACK_LIMIT), stick(MATERIAL_STACK_LIMIT)]);
+        assert_eq!(outcome.accepted, u32::from(MATERIAL_STACK_LIMIT));
+        assert_eq!(outcome.lost, u32::from(MATERIAL_STACK_LIMIT));
+        assert!(outcome.lost_any());
+        assert_eq!(
+            inventory.slot(INVENTORY_SLOTS - 1).map(|item| item.count()),
+            Some(MATERIAL_STACK_LIMIT)
+        );
+
+        // 35 full stacks plus one unit of room: exactly one unit is accepted.
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(stick(MATERIAL_STACK_LIMIT));
+        }
+        inventory.slots[INVENTORY_SLOTS - 1] = Some(stick(MATERIAL_STACK_LIMIT - 1));
+        let outcome = inventory.collect_items(&[stick(MATERIAL_STACK_LIMIT)]);
+        assert_eq!(
+            outcome,
+            CollectBatchOutcome::new(1, u32::from(MATERIAL_STACK_LIMIT) - 1)
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            u32::from(MATERIAL_STACK_LIMIT) * 35 + u32::from(MATERIAL_STACK_LIMIT)
+        );
+    }
+
+    #[test]
+    fn collect_items_merges_across_entries_before_using_an_empty_slot() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(stick(30));
+
+        let outcome = inventory.collect_items(&[stick(20), stick(20)]);
+        assert_eq!(outcome, CollectBatchOutcome::new(40, 0));
+        assert_eq!(
+            inventory.hotbar(0).map(|item| item.count()),
+            Some(MATERIAL_STACK_LIMIT),
+            "both entries top up the existing stack first"
+        );
+        assert_eq!(
+            inventory.hotbar(1).map(|item| item.count()),
+            Some(6),
+            "only the true remainder opens a new slot"
+        );
+        assert_eq!(inventory.hotbar(2), None);
+    }
+
+    #[test]
+    fn collect_items_never_exceeds_a_stack_limit_in_hotbar_or_main() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[HOTBAR_SLOTS] = Some(block(BlockId::Stone, MAX_STACK_COUNT - 2));
+
+        let items = [
+            block(BlockId::Stone, MAX_STACK_COUNT),
+            stick(MATERIAL_STACK_LIMIT),
+            stick(5),
+        ];
+        let outcome = inventory.collect_items(&items);
+        assert!(!outcome.lost_any());
+        for (index, slot) in inventory.slots().iter().enumerate() {
+            if let Some(item) = slot {
+                assert!(
+                    item.count() <= item.id().stack_limit(),
+                    "slot {index} holds {} above the limit {}",
+                    item.count(),
+                    item.id().stack_limit()
+                );
+            }
+        }
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::Stone)),
+            u32::from(MAX_STACK_COUNT) - 2 + u32::from(MAX_STACK_COUNT)
+        );
+    }
+
+    #[test]
+    fn collect_items_on_a_full_inventory_loses_everything_without_mutation() {
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        let mut inventory = Inventory::from_parts(*inventory.slots(), Some(stick(3)));
+        let before = inventory.clone();
+
+        let outcome = inventory.collect_items(&[
+            stick(10),
+            tool(ToolKind::Pickaxe, ToolTier::Iron),
+            block(BlockId::Dirt, 5),
+        ]);
+        assert_eq!(outcome, CollectBatchOutcome::new(0, 16));
+        assert_eq!(inventory, before, "a full aggregate mutates nothing");
+        assert_eq!(inventory.cursor(), Some(stick(3)));
+    }
+
+    #[test]
+    fn collect_items_gives_a_tool_one_empty_slot_and_loses_the_second() {
+        let mut inventory = Inventory::empty();
+        for slot in inventory.slots.iter_mut().take(INVENTORY_SLOTS - 1) {
+            *slot = Some(block(BlockId::Brick, MAX_STACK_COUNT));
+        }
+
+        let pickaxe = tool(ToolKind::Pickaxe, ToolTier::Iron);
+        let axe = tool(ToolKind::Axe, ToolTier::Iron);
+        let outcome = inventory.collect_items(&[pickaxe, axe]);
+        assert_eq!(outcome, CollectBatchOutcome::new(1, 1));
+        assert_eq!(inventory.slot(INVENTORY_SLOTS - 1), Some(pickaxe));
+        assert_eq!(
+            inventory
+                .slots()
+                .iter()
+                .flatten()
+                .filter(|item| item.is_tool())
+                .count(),
+            1,
+            "tools never merge and the overflow is lost, not duplicated"
+        );
+    }
+
+    #[test]
+    fn collect_items_conserves_counts_across_hotbar_and_main() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, 10));
+        inventory.slots[HOTBAR_SLOTS] = Some(stick(60));
+        inventory.slots[HOTBAR_SLOTS + 3] = Some(block(BlockId::Dirt, MAX_STACK_COUNT));
+        let before = slot_units(&inventory);
+
+        let items = [stick(20), block(BlockId::Stone, 5), stick(3)];
+        let requested: u32 = items.iter().map(|item| u32::from(item.count())).sum();
+        let outcome = inventory.collect_items(&items);
+        let after = slot_units(&inventory);
+
+        assert_eq!(before + outcome.accepted, after, "no unit is duplicated");
+        assert_eq!(
+            before + requested - outcome.lost,
+            after,
+            "only the reported overflow is dropped"
+        );
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            60 + 20 + 3 - outcome.lost
+        );
+    }
+
+    #[test]
+    fn collect_items_leaves_the_cursor_untouched() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(block(BlockId::Stone, MAX_STACK_COUNT));
+        let mut inventory =
+            Inventory::from_parts(*inventory.slots(), Some(block(BlockId::Stone, 7)));
+
+        let outcome = inventory.collect_items(&[block(BlockId::Stone, MAX_STACK_COUNT)]);
+        assert_eq!(outcome.accepted, u32::from(MAX_STACK_COUNT));
+        assert_eq!(
+            inventory.cursor(),
+            Some(block(BlockId::Stone, 7)),
+            "a matching cursor is never a batch destination"
+        );
+    }
+
+    #[test]
+    fn collect_items_accepts_an_empty_batch_without_mutation() {
+        let mut inventory = Inventory::empty();
+        inventory.cursor = Some(stick(2));
+        let before = inventory.clone();
+
+        assert_eq!(inventory.collect_items(&[]), CollectBatchOutcome::default());
+        assert!(!inventory.collect_items(&[]).lost_any());
+        assert_eq!(inventory, before);
+    }
+
     #[test]
     fn consume_one_decrements_clears_and_bounds_checks() {
         let mut inventory = Inventory::empty();
@@ -2305,6 +2940,74 @@ mod tests {
         assert_eq!(inventory.hotbar(0), None);
         assert_eq!(inventory.consume_one(0), None);
         assert_eq!(inventory.consume_one(INVENTORY_SLOTS), None);
+    }
+
+    #[test]
+    fn consume_item_spends_one_unit_and_leaves_the_rest() {
+        let mut inventory = Inventory::empty();
+        inventory.insert(arrow(4)).expect("stack fits");
+
+        let (index, consumed) = inventory.consume_item(arrow_id()).expect("one unit");
+        assert_eq!(index, 0);
+        assert_eq!(consumed, arrow(1));
+        assert_eq!(inventory.slot(0).map(|item| item.count()), Some(3));
+        assert_eq!(total_of(&inventory, arrow_id()), 3);
+    }
+
+    #[test]
+    fn consume_item_clears_a_single_unit_slot_and_then_reports_none() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(arrow(1));
+
+        assert_eq!(inventory.consume_item(arrow_id()), Some((0, arrow(1))));
+        assert_eq!(inventory.slot(0), None);
+        assert_eq!(inventory.consume_item(arrow_id()), None);
+        assert_eq!(inventory.slot(0), None);
+    }
+
+    #[test]
+    fn consume_item_picks_the_earliest_matching_slot_in_flat_order() {
+        let mut inventory = Inventory::empty();
+        // Main storage first (slot 12), then hotbar (slot 3): the hotbar copy
+        // must win because the scan is hotbar-then-main.
+        inventory.slots[12] = Some(arrow(2));
+        inventory.slots[3] = Some(arrow(5));
+
+        assert_eq!(inventory.consume_item(arrow_id()).map(|(i, _)| i), Some(3));
+        assert_eq!(inventory.slot(3).map(|item| item.count()), Some(4));
+        assert_eq!(inventory.slot(12).map(|item| item.count()), Some(2));
+    }
+
+    #[test]
+    fn consume_item_never_touches_the_cursor_or_the_crafting_grids() {
+        let mut inventory = Inventory::empty();
+        inventory.insert(arrow(2)).expect("stack fits");
+        inventory.cursor = Some(arrow(9));
+        let before_cursor = inventory.cursor();
+
+        assert!(inventory.consume_item(arrow_id()).is_some());
+        assert_eq!(inventory.cursor(), before_cursor);
+        assert_eq!(inventory.slot(0).map(|item| item.count()), Some(1));
+    }
+
+    #[test]
+    fn consume_item_returns_none_without_mutation_for_an_absent_identity() {
+        let mut inventory = Inventory::empty();
+        inventory.slots[0] = Some(stick(3));
+        inventory.slots[9] = Some(block(BlockId::Stone, 1));
+        inventory.cursor = Some(arrow(1));
+        let before = inventory.clone();
+
+        assert_eq!(inventory.consume_item(arrow_id()), None);
+        assert_eq!(inventory, before, "an absent identity mutates nothing");
+    }
+
+    fn arrow(count: u16) -> Item {
+        item(ItemId::Material(Material::Arrow), count)
+    }
+
+    fn arrow_id() -> ItemId {
+        ItemId::Material(Material::Arrow)
     }
 
     // -- Cursor transfers ---------------------------------------------------
@@ -2938,7 +3641,7 @@ mod tests {
 
     #[test]
     fn every_tool_recipe_is_shaped_and_produces_a_full_durability_instance() {
-        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 12] = [
+        let cases: [(RecipeId, ToolKind, ToolTier, &[&str]); 16] = [
             (
                 RecipeId::WoodPickaxe,
                 ToolKind::Pickaxe,
@@ -3010,6 +3713,30 @@ mod tests {
                 ToolKind::Hoe,
                 ToolTier::Iron,
                 &["II", " S", " S"],
+            ),
+            (
+                RecipeId::WoodSword,
+                ToolKind::Sword,
+                ToolTier::Wood,
+                &["P", "P", "S"],
+            ),
+            (
+                RecipeId::StoneSword,
+                ToolKind::Sword,
+                ToolTier::Stone,
+                &["C", "C", "S"],
+            ),
+            (
+                RecipeId::IronSword,
+                ToolKind::Sword,
+                ToolTier::Iron,
+                &["I", "I", "S"],
+            ),
+            (
+                RecipeId::Shortbow,
+                ToolKind::Bow,
+                ToolTier::Wood,
+                &[" SE", "S E", " S "],
             ),
         ];
 
@@ -3141,6 +3868,212 @@ mod tests {
     }
 
     #[test]
+    fn sword_recipes_are_table_only() {
+        let cases: [(RecipeId, &[&str]); 3] = [
+            (RecipeId::WoodSword, &["P", "P", "S"]),
+            (RecipeId::StoneSword, &["C", "C", "S"]),
+            (RecipeId::IronSword, &["I", "I", "S"]),
+        ];
+        for (recipe_id, pattern) in cases {
+            // Swords are a 1-wide, 3-tall column while the player grid is two
+            // rows tall, so the full shape can never be placed there.
+            assert_eq!(pattern.len(), 3);
+            assert!(GridKind::Player.dim() < pattern.len());
+
+            let ids = [
+                pattern_item(pattern[0].as_bytes()[0]).expect("head"),
+                pattern_item(pattern[1].as_bytes()[0]).expect("head"),
+                pattern_item(pattern[2].as_bytes()[0]).expect("handle"),
+            ];
+
+            // Placing the only rows a 2x2 grid can hold (both heads) must
+            // never produce the sword. The wood sword's two planks are
+            // legitimately the sticks recipe, so this asserts "not this
+            // sword" rather than "no recipe".
+            let mut partial = CraftingGrid::new(GridKind::Player);
+            partial.set(0, Some(item(ids[0], 1))).expect("cell 0");
+            partial
+                .set(GridKind::Player.dim(), Some(item(ids[1], 1)))
+                .expect("cell 2");
+            assert_ne!(
+                partial.preview().map(|preview| preview.recipe),
+                Some(recipe_id),
+                "{recipe_id:?} cannot be completed in the 2x2 player grid"
+            );
+
+            // Even squeezing all three ingredients into the 2x2 L leaves no
+            // sword recipe.
+            let mut packed = CraftingGrid::new(GridKind::Player);
+            for (index, id) in ids.into_iter().enumerate() {
+                packed.set(index, Some(item(id, 1))).expect("player cell");
+            }
+            assert_eq!(
+                packed.preview(),
+                None,
+                "{recipe_id:?} cannot fit the 2x2 player grid"
+            );
+
+            let table = grid_from_pattern(GridKind::Table, pattern);
+            assert_eq!(
+                table.preview().map(|preview| preview.recipe),
+                Some(recipe_id),
+                "{recipe_id:?} matches on the table"
+            );
+        }
+    }
+
+    #[test]
+    fn sword_recipe_matches_at_an_offset_on_the_table() {
+        let mut grid = CraftingGrid::new(GridKind::Table);
+        let dim = GridKind::Table.dim();
+        // Wood sword shifted one row down and one column right.
+        grid.set(dim + 1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("first head cell");
+        grid.set(2 * dim + 1, Some(block(BlockId::OakPlanks, 1)))
+            .expect("second head cell");
+        grid.set(3 * dim + 1, Some(stick(1))).expect("handle cell");
+        assert_eq!(
+            grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::WoodSword)
+        );
+
+        let mut inventory = Inventory::empty();
+        let crafted = grid.take_result(&mut inventory).expect("offset craft");
+        assert_eq!(
+            crafted.id(),
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn sword_recipe_rejects_a_wrong_head_material() {
+        // Both heads must be the sword tier's material; mixing tiers in the
+        // head column matches nothing.
+        let mixed_heads = grid_from_pattern(GridKind::Table, &["P", "C", "S"]);
+        assert_eq!(mixed_heads.preview(), None);
+
+        // A plank in the handle cell is not a wood sword either.
+        let wrong_handle = grid_from_pattern(GridKind::Table, &["P", "P", "P"]);
+        assert_eq!(wrong_handle.preview(), None);
+
+        // And an iron-column handle with stone heads is still not a sword.
+        let iron_handle = grid_from_pattern(GridKind::Table, &["C", "C", "I"]);
+        assert_eq!(iron_handle.preview(), None);
+    }
+
+    #[test]
+    fn wood_sword_craft_chain_starts_from_one_oak_log() {
+        // The slice demo opens with "craft a wood sword from planks and
+        // sticks". Every step moves items between the inventory and a grid,
+        // so the totals account for every unit: nothing is spawned.
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(block(BlockId::OakLog, 1))
+            .expect("inventory holds the starting log");
+
+        // Step 1: the single oak log becomes four planks in the 2x2 grid.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        let log = withdraw(&mut inventory, ItemId::Block(BlockId::OakLog), 1);
+        player.set(0, Some(log)).expect("player cell");
+        let planks = player.take_result(&mut inventory).expect("planks craft");
+        assert_eq!(planks.id(), ItemId::Block(BlockId::OakPlanks));
+        assert_eq!(planks.count(), 4);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakPlanks)), 4);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 0);
+        assert!(player.is_empty());
+
+        // Step 2: two of those four planks become four sticks.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(
+                0,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Block(BlockId::OakPlanks),
+                    1,
+                )),
+            )
+            .expect("player cell");
+        player
+            .set(
+                GridKind::Player.dim(),
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Block(BlockId::OakPlanks),
+                    1,
+                )),
+            )
+            .expect("player cell");
+        let sticks = player.take_result(&mut inventory).expect("sticks craft");
+        assert_eq!(sticks.id(), ItemId::Material(Material::Stick));
+        assert_eq!(sticks.count(), 4);
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            2,
+            "two planks remain"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 4);
+        assert!(player.is_empty());
+
+        // Step 3: the two remaining planks plus one stick become the sword.
+        let mut table = CraftingGrid::new(GridKind::Table);
+        let dim = table.dim();
+        for index in [0, dim] {
+            table
+                .set(
+                    index,
+                    Some(withdraw(
+                        &mut inventory,
+                        ItemId::Block(BlockId::OakPlanks),
+                        1,
+                    )),
+                )
+                .expect("head cell");
+        }
+        table
+            .set(
+                2 * dim,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Material(Material::Stick),
+                    1,
+                )),
+            )
+            .expect("handle cell");
+
+        let preview = table.preview().expect("wood sword pattern matches");
+        assert_eq!(preview.recipe, RecipeId::WoodSword);
+
+        let sword = table.take_result(&mut inventory).expect("sword craft");
+        assert_eq!(
+            sword.id(),
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(sword.count(), 1);
+        assert_eq!(sword.durability(), Some(59));
+        assert!(table.is_empty());
+
+        // Conservation: the log and both head planks are gone, the handle
+        // consumed exactly one stick, and the sword is the only new stack.
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakLog)), 0);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::OakPlanks)), 0);
+        assert_eq!(
+            total_of(&inventory, ItemId::Material(Material::Stick)),
+            3,
+            "only the handle stick is consumed"
+        );
+        assert_eq!(total_of(&inventory, sword.id()), 1);
+    }
+
+    #[test]
     fn take_result_revalidates_a_stale_preview() {
         let mut grid = grid_from_pattern(GridKind::Player, &["P", "P"]);
         let stale = grid.preview().expect("initial preview");
@@ -3212,8 +4145,209 @@ mod tests {
     }
 
     #[test]
+    fn ranged_recipes_are_reachable_without_a_furnace() {
+        // -- Shortbow: 3 sticks + 2 leather, table-only by shape ------------
+        let bow_pattern = [" SE", "S E", " S "];
+        assert_eq!(bow_pattern.len(), 3);
+        assert!(GridKind::Player.dim() < bow_pattern.len());
+
+        let bow_grid = grid_from_pattern(GridKind::Table, &bow_pattern);
+        let preview = bow_grid.preview().expect("shortbow pattern matches");
+        assert_eq!(preview.recipe, RecipeId::Shortbow);
+        assert_eq!(
+            preview.output,
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(preview.output_count, 1);
+
+        // The 2x2 player grid is only two rows tall, so the bow can never be
+        // completed there even when every cell is filled with a bow material.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        player_grid.set(0, Some(stick(1))).expect("cell 0");
+        player_grid
+            .set(1, Some(item(ItemId::Material(Material::Leather), 1)))
+            .expect("cell 1");
+        player_grid.set(2, Some(stick(1))).expect("cell 2");
+        player_grid
+            .set(3, Some(item(ItemId::Material(Material::Leather), 1)))
+            .expect("cell 3");
+        assert_ne!(
+            player_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Shortbow),
+            "the shortbow must stay table-only"
+        );
+
+        // -- Arrows: 1 stick + 1 coal ore -> 4 arrows -----------------------
+        let arrow_grid = grid_from_pattern(GridKind::Player, &["S", "K"]);
+        let preview = arrow_grid
+            .preview()
+            .expect("arrow pattern matches on the 2x2 player grid");
+        assert_eq!(preview.recipe, RecipeId::Arrows);
+        assert_eq!(preview.output, ItemId::Material(Material::Arrow));
+        assert_eq!(preview.output_count, 4);
+
+        let table_arrow_grid = grid_from_pattern(GridKind::Table, &["S", "K"]);
+        assert_eq!(
+            table_arrow_grid.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Arrows),
+            "the same arrow shape also matches on the table"
+        );
+
+        // -- Full chain: one oak log + 2 leather + 1 coal ore ---------------
+        //
+        // Every step moves items between the inventory and a grid, so the
+        // totals account for every unit: nothing is spawned.
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(block(BlockId::OakLog, 1))
+            .expect("inventory holds the starting log");
+        inventory
+            .insert(item(ItemId::Material(Material::Leather), 2))
+            .expect("inventory holds the leather");
+        inventory
+            .insert(item(ItemId::Block(BlockId::CoalOre), 1))
+            .expect("inventory holds the coal ore");
+
+        // Step 1: the single oak log becomes four planks in the 2x2 grid.
+        let mut player = CraftingGrid::new(GridKind::Player);
+        player
+            .set(
+                0,
+                Some(withdraw(&mut inventory, ItemId::Block(BlockId::OakLog), 1)),
+            )
+            .expect("player cell");
+        let planks = player.take_result(&mut inventory).expect("planks craft");
+        assert_eq!(planks.id(), ItemId::Block(BlockId::OakPlanks));
+        assert_eq!(planks.count(), 4);
+        assert!(player.is_empty());
+
+        // Step 2: two rounds of two planks become four sticks each.
+        for round in 0..2 {
+            let mut sticks_grid = CraftingGrid::new(GridKind::Player);
+            for index in [0, GridKind::Player.dim()] {
+                sticks_grid
+                    .set(
+                        index,
+                        Some(withdraw(
+                            &mut inventory,
+                            ItemId::Block(BlockId::OakPlanks),
+                            1,
+                        )),
+                    )
+                    .expect("plank cell");
+            }
+            let crafted = sticks_grid
+                .take_result(&mut inventory)
+                .expect("planks craft into sticks");
+            assert_eq!(crafted.id(), ItemId::Material(Material::Stick));
+            assert_eq!(crafted.count(), 4, "round {round}");
+            assert!(sticks_grid.is_empty());
+        }
+        assert_eq!(
+            total_of(&inventory, ItemId::Block(BlockId::OakPlanks)),
+            0,
+            "one log is exactly four planks and eight sticks"
+        );
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 8);
+
+        // Step 3: three sticks plus two leather become one shortbow.
+        let mut table = CraftingGrid::new(GridKind::Table);
+        let dim = table.dim();
+        let bow_cells = [
+            (1, ItemId::Material(Material::Stick)),
+            (2, ItemId::Material(Material::Leather)),
+            (dim, ItemId::Material(Material::Stick)),
+            (dim + 2, ItemId::Material(Material::Leather)),
+            (2 * dim + 1, ItemId::Material(Material::Stick)),
+        ];
+        for (index, id) in bow_cells {
+            let ingredient = withdraw(&mut inventory, id, 1);
+            table.set(index, Some(ingredient)).expect("bow cell");
+        }
+        assert_eq!(
+            table.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Shortbow)
+        );
+        let bow_item = table.take_result(&mut inventory).expect("bow craft");
+        assert_eq!(
+            bow_item.id(),
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }
+        );
+        assert_eq!(bow_item.count(), 1);
+        assert_eq!(
+            bow_item.durability(),
+            Some(59),
+            "a wood bow starts at the full wood-tier durability"
+        );
+        assert!(table.is_empty(), "the bow consumes all five cells");
+
+        // Step 4: one stick plus the coal ore become four arrows, entirely in
+        // the 2x2 player grid.
+        let mut arrow_cells = CraftingGrid::new(GridKind::Player);
+        arrow_cells
+            .set(
+                0,
+                Some(withdraw(
+                    &mut inventory,
+                    ItemId::Material(Material::Stick),
+                    1,
+                )),
+            )
+            .expect("stick cell");
+        arrow_cells
+            .set(
+                GridKind::Player.dim(),
+                Some(withdraw(&mut inventory, ItemId::Block(BlockId::CoalOre), 1)),
+            )
+            .expect("coal cell");
+        assert_eq!(
+            arrow_cells.preview().map(|preview| preview.recipe),
+            Some(RecipeId::Arrows)
+        );
+        let arrows = arrow_cells
+            .take_result(&mut inventory)
+            .expect("arrow craft");
+        assert_eq!(arrows.id(), ItemId::Material(Material::Arrow));
+        assert_eq!(arrows.count(), 4);
+        assert!(arrow_cells.is_empty(), "the arrows consume both cells");
+
+        // Exact unit conservation: eight sticks paid 3 for the bow and 1 for
+        // the arrows, so four remain; both leather and the coal ore are spent.
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Stick)), 4);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Arrow)), 4);
+        assert_eq!(total_of(&inventory, ItemId::Material(Material::Leather)), 0);
+        assert_eq!(total_of(&inventory, ItemId::Block(BlockId::CoalOre)), 0);
+        assert_eq!(total_of(&inventory, bow_item.id()), 1);
+        let tools: Vec<ItemId> = inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id().is_tool())
+            .map(|item| item.id())
+            .collect();
+        assert_eq!(
+            tools,
+            vec![ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            }],
+            "the chain produces exactly one tool: the shortbow"
+        );
+    }
+
+    #[test]
     fn recipe_table_patterns_are_unambiguous() {
-        assert_eq!(RECIPES.len(), 17, "13 pre-farming recipes plus 4 new ones");
+        assert_eq!(
+            RECIPES.len(),
+            22,
+            "13 pre-farming + 4 farming + 3 swords + 2 ranged"
+        );
         for recipe in RECIPES {
             let mut grid = CraftingGrid::new(GridKind::Table);
             for (row, line) in recipe.pattern.iter().enumerate() {
