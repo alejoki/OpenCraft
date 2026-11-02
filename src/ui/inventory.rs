@@ -17,7 +17,7 @@ use glam::IVec3;
 
 use crate::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
-    INVENTORY_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
+    HOTBAR_SLOTS, INVENTORY_SLOTS, MAIN_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
 };
 use crate::ui::Quad;
 use crate::world::block::BlockId;
@@ -49,9 +49,20 @@ const SECTION_GAP: f32 = 12.0;
 const RESULT_GAP: f32 = 16.0;
 const FOOTER_HEIGHT: f32 = 52.0;
 
-/// Hotbar slots form row 0 of the 9x4 slot grid.
-const SLOT_COLUMNS: usize = 9;
-const SLOTS_W: f32 = 9.0 * SLOT_SIZE + 8.0 * SLOT_GAP;
+/// Natural gap between the three main-storage rows and the hotbar row, in px.
+/// The separator line is centered inside this gap.
+pub const HOTBAR_GAP: f32 = 16.0;
+/// Natural thickness of the separator line drawn inside [`HOTBAR_GAP`], in px.
+pub const HOTBAR_SEPARATOR_THICKNESS: f32 = 2.0;
+
+/// The inventory uses a 9-column grid: three main-storage rows on top and the
+/// hotbar as the bottom row. The public slot index order is unchanged
+/// (`0..9` hotbar, `9..36` storage); only the y placement differs.
+const SLOT_COLUMNS: usize = HOTBAR_SLOTS;
+const STORAGE_ROWS: usize = MAIN_SLOTS / SLOT_COLUMNS;
+const SLOTS_W: f32 = SLOT_COLUMNS as f32 * SLOT_SIZE + (SLOT_COLUMNS as f32 - 1.0) * SLOT_GAP;
+const STORAGE_H: f32 =
+    STORAGE_ROWS as f32 * SLOT_SIZE + (STORAGE_ROWS as f32 - 1.0) * SLOT_GAP;
 const PLAYER_GRID_W: f32 = 2.0 * SLOT_SIZE + SLOT_GAP;
 const PLAYER_GRID_H: f32 = PLAYER_GRID_W;
 const TABLE_GRID_W: f32 = 4.0 * SLOT_SIZE + 3.0 * SLOT_GAP;
@@ -60,9 +71,17 @@ const CRAFT_X: f32 = PANEL_PAD + SLOTS_W + COLUMN_GAP;
 const CRAFT_W: f32 = TABLE_GRID_W + RESULT_GAP + SLOT_SIZE;
 const CRAFT_H: f32 = PLAYER_GRID_H + SECTION_GAP + TABLE_GRID_H;
 const SLOTS_TOP: f32 = PANEL_PAD + TITLE_HEIGHT + TITLE_GAP;
+const HOTBAR_TOP: f32 = SLOTS_TOP + STORAGE_H + HOTBAR_GAP;
+const SLOTS_H: f32 = STORAGE_H + HOTBAR_GAP + SLOT_SIZE;
+const HOTBAR_SEPARATOR_TOP: f32 =
+    SLOTS_TOP + STORAGE_H + (HOTBAR_GAP - HOTBAR_SEPARATOR_THICKNESS) * 0.5;
 const TABLE_TOP: f32 = SLOTS_TOP + PLAYER_GRID_H + SECTION_GAP;
+// The crafting column is taller than the slot block, so the footer clears the
+// hotbar by CRAFT_H - SLOTS_H px today. Taking the max keeps that guarantee
+// if either column is resized later.
+const PANEL_CONTENT_H: f32 = if CRAFT_H > SLOTS_H { CRAFT_H } else { SLOTS_H };
 const PANEL_W: f32 = 2.0 * PANEL_PAD + SLOTS_W + COLUMN_GAP + CRAFT_W;
-const PANEL_H: f32 = SLOTS_TOP + CRAFT_H + FOOTER_HEIGHT + PANEL_PAD;
+const PANEL_H: f32 = SLOTS_TOP + PANEL_CONTENT_H + FOOTER_HEIGHT + PANEL_PAD;
 
 const PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.94];
 const SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
@@ -101,7 +120,8 @@ pub type Rect = (f32, f32, f32, f32);
 /// One clickable inventory target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryTarget {
-    /// One of the 36 inventory slots (`0..9` hotbar, `9..36` main storage).
+    /// One of the 36 inventory slots (`0..9` hotbar bottom row, `9..36` main
+    /// storage rows). The index order is unchanged by the visual arrangement.
     Slot(usize),
     /// One active crafting cell in the given grid.
     GridCell { kind: GridKind, index: usize },
@@ -192,8 +212,12 @@ impl InventoryScreen {
 pub struct InventoryLayout {
     /// Dark backdrop panel.
     pub panel: Rect,
-    /// 36 slots: `0..9` hotbar row, `9..36` three main-storage rows.
+    /// 36 slots: `9..36` are the three main-storage rows at the top, and
+    /// `0..9` are the hotbar's bottom row below them.
     pub slots: [Rect; INVENTORY_SLOTS],
+    /// Divider line centered in [`HOTBAR_GAP`] between the storage rows and
+    /// the hotbar row, spanning the panel's inner width.
+    pub hotbar_separator: Rect,
     /// Active 2x2 player cells, row-major.
     pub player_grid: [Rect; PLAYER_GRID_DIM * PLAYER_GRID_DIM],
     /// All 16 table cells, row-major. Populated in every mode; only
@@ -237,10 +261,18 @@ pub fn layout(surface_w: u32, surface_h: u32, _mode: InventoryMode) -> Inventory
 
     let slots = std::array::from_fn(|index| {
         let col = index % SLOT_COLUMNS;
-        let row = index / SLOT_COLUMNS;
+        let y = if index < HOTBAR_SLOTS {
+            // Public hotbar indices stay 0..9; only their row moves to the
+            // bottom of the slot block.
+            HOTBAR_TOP
+        } else {
+            let storage_index = index - HOTBAR_SLOTS;
+            let row = storage_index / SLOT_COLUMNS;
+            SLOTS_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP)
+        };
         to_px(
             PANEL_PAD + col as f32 * (SLOT_SIZE + SLOT_GAP),
-            SLOTS_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP),
+            y,
             SLOT_SIZE,
             SLOT_SIZE,
         )
@@ -271,6 +303,12 @@ pub fn layout(surface_w: u32, surface_h: u32, _mode: InventoryMode) -> Inventory
     InventoryLayout {
         panel: to_px(0.0, 0.0, PANEL_W, PANEL_H),
         slots,
+        hotbar_separator: to_px(
+            PANEL_PAD,
+            HOTBAR_SEPARATOR_TOP,
+            PANEL_W - 2.0 * PANEL_PAD,
+            HOTBAR_SEPARATOR_THICKNESS,
+        ),
         player_grid,
         table_grid,
         player_result: to_px(
@@ -794,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_has_exactly_36_distinct_targets_with_hotbar_first() {
+    fn layout_has_exactly_36_distinct_targets_with_hotbar_last() {
         let layout = layout(1280, 720, InventoryMode::Player);
         let panel = layout.panel;
 
@@ -812,32 +850,109 @@ mod tests {
         }
         assert_eq!(layout.slots.len(), HOTBAR_SLOTS + MAIN_SLOTS);
 
-        // Row 0 is the hotbar: same top, increasing left, uniform size.
+        // Indices 9..36 are the three main-storage rows at the top: each row
+        // shares one top, left increases by column, and rows descend.
+        let mut row_tops = [f32::NAN; STORAGE_ROWS];
+        for (row, row_top) in row_tops.iter_mut().enumerate() {
+            let first = HOTBAR_SLOTS + row * SLOT_COLUMNS;
+            *row_top = layout.slots[first].1;
+            let mut last_left = f32::NEG_INFINITY;
+            for col in 0..SLOT_COLUMNS {
+                let rect = layout.slots[first + col];
+                assert_eq!(
+                    rect.1, *row_top,
+                    "storage row {row} col {col} shares the row top"
+                );
+                assert!(
+                    rect.0 > last_left,
+                    "storage row {row} col {col} left is increasing"
+                );
+                last_left = rect.0;
+            }
+        }
+        for row in 1..STORAGE_ROWS {
+            assert!(
+                row_tops[row] > row_tops[row - 1],
+                "storage row {row} sits below row {}",
+                row - 1
+            );
+        }
+
+        // Indices 0..9 are the hotbar: one row at the bottom of the slot
+        // block, sharing the lowest top and separated from storage by at
+        // least HOTBAR_GAP.
         let hotbar_top = layout.slots[0].1;
         let mut last_left = f32::NEG_INFINITY;
         for index in 0..HOTBAR_SLOTS {
             let rect = layout.slots[index];
             assert_eq!(rect.1, hotbar_top, "hotbar slot {index} top");
             assert!(rect.0 > last_left, "hotbar slot {index} left is increasing");
+            assert!(
+                rect.1 > row_tops[STORAGE_ROWS - 1],
+                "hotbar slot {index} must sit below every storage row"
+            );
             last_left = rect.0;
         }
+        let storage_bottom = row_tops[STORAGE_ROWS - 1]
+            + layout.slots[HOTBAR_SLOTS + (STORAGE_ROWS - 1) * SLOT_COLUMNS].3;
+        let scale = layout.slots[0].2 / SLOT_SIZE;
+        assert!(
+            hotbar_top - storage_bottom >= HOTBAR_GAP * scale - 1e-3,
+            "storage bottom {storage_bottom} to hotbar top {hotbar_top} is narrower than HOTBAR_GAP"
+        );
 
-        // Rows 1..4 are the main storage: three distinct rows of nine.
-        let mut row_tops = [f32::NAN; 3];
-        for (row, row_top) in row_tops.iter_mut().enumerate() {
-            let first = HOTBAR_SLOTS + row * HOTBAR_SLOTS;
-            *row_top = layout.slots[first].1;
-            for col in 0..HOTBAR_SLOTS {
-                let rect = layout.slots[first + col];
-                assert_eq!(
-                    rect.1, *row_top,
-                    "main row {row} col {col} shares the row top"
+        // The separator spans the panel's inner width, sits inside the gap,
+        // and overlaps no slot.
+        let separator = layout.hotbar_separator;
+        assert!(inside_panel(separator, panel), "separator escapes the panel");
+        let pad = panel.2 * (PANEL_PAD / PANEL_W);
+        assert!((separator.0 - (panel.0 + pad)).abs() <= f32::EPSILON);
+        assert!((separator.2 - (panel.2 - 2.0 * pad)).abs() <= f32::EPSILON);
+        assert!(
+            separator.1 >= storage_bottom,
+            "separator starts above the storage bottom"
+        );
+        assert!(
+            separator.1 + separator.3 <= hotbar_top,
+            "separator ends below the hotbar top"
+        );
+        assert!(separator.3 > 0.0, "separator has a visible thickness");
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert!(
+                !rects_overlap(separator, *rect),
+                "slot {index} overlaps the separator"
+            );
+        }
+    }
+
+    #[test]
+    fn slots_stay_at_least_18px_and_panel_fits_at_720p_and_1080p() {
+        for (w, h) in [(1280_u32, 720_u32), (1920, 1080)] {
+            let layout = layout(w, h, InventoryMode::Table);
+            let panel = layout.panel;
+            assert!(
+                inside_panel(panel, (0.0, 0.0, w as f32, h as f32)),
+                "{w}x{h} panel {panel:?} escapes the surface"
+            );
+            assert!(
+                panel.2 <= w as f32 + f32::EPSILON && panel.3 <= h as f32 + f32::EPSILON,
+                "{w}x{h} panel {panel:?} is larger than the surface"
+            );
+            assert!(
+                inside_panel(layout.hotbar_separator, panel),
+                "{w}x{h} separator escapes the panel"
+            );
+            for (index, rect) in layout.slots.iter().enumerate() {
+                assert!(
+                    rect.2 >= 18.0 && rect.3 >= 18.0,
+                    "{w}x{h} slot {index} is smaller than 18 px: {rect:?}"
+                );
+                assert!(
+                    inside_panel(*rect, panel),
+                    "{w}x{h} slot {index} escapes the panel"
                 );
             }
         }
-        assert!(row_tops[0] > hotbar_top);
-        assert!(row_tops[1] > row_tops[0]);
-        assert!(row_tops[2] > row_tops[1]);
     }
 
     #[test]
@@ -1022,6 +1137,7 @@ mod tests {
             ] {
                 let layout = layout(w, h, mode);
                 let rects = std::iter::once(layout.panel)
+                    .chain([layout.hotbar_separator])
                     .chain(layout.slots)
                     .chain(layout.player_grid)
                     .chain(layout.table_grid)
