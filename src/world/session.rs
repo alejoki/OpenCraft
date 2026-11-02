@@ -38,7 +38,9 @@ use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
 use crate::world::season::{season_of, Season};
-use crate::world::spawning::{SpawnContext, SpawnReport, SpawnRuntime};
+use crate::world::spawning::{
+    SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
+};
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
@@ -932,6 +934,33 @@ impl WorldSession {
         self.world_spawn
     }
 
+    /// Whether every chunk column that could hold a spawn candidate is
+    /// resident and lit.
+    ///
+    /// [`SpawnWorld::column_ready`] is a mandatory gate before a spawn attempt
+    /// may read light: a not-yet-streamed column silently refuses the attempt.
+    /// A scripted proof that pins exact population counters therefore cannot
+    /// start its attempt sequence while the set of ready columns is still
+    /// growing — the same seed would place different mobs on a fast (release)
+    /// and a slow (debug) streamer. This square covers the full
+    /// `SAFE_RADIUS..=SPAWN_MAX_RADIUS` ring plus one block of rounding slack on
+    /// every side.
+    pub fn spawn_ring_ready(&self) -> bool {
+        let reach = SPAWN_MAX_RADIUS + 1.0;
+        let (min_chunk, _) = world_to_chunk_and_local(
+            (self.player.position.x - reach).floor() as i32,
+            0,
+            (self.player.position.z - reach).floor() as i32,
+        );
+        let (max_chunk, _) = world_to_chunk_and_local(
+            (self.player.position.x + reach).floor() as i32,
+            0,
+            (self.player.position.z + reach).floor() as i32,
+        );
+        (min_chunk.x..=max_chunk.x)
+            .all(|cx| (min_chunk.z..=max_chunk.z).all(|cz| self.world.column_ready(cx, cz)))
+    }
+
     /// The ambient cause of the last player damage event, or `None` when the
     /// player has taken no damage since construction or respawn.
     ///
@@ -1012,6 +1041,18 @@ impl WorldSession {
     /// deterministic attempt sequence, so a demo stage can re-measure a window.
     pub fn reset_spawn_report(&mut self) {
         self.spawn_runtime.reset_report();
+    }
+
+    /// Resets the fixed-rate mob runtime's step accumulator and tick index.
+    ///
+    /// The frame loop owns the production accumulator, so a scripted stage that
+    /// pins exact fixed-step outcomes would otherwise inherit a fractional
+    /// leftover (and a timing-dependent tick index) from however many frames
+    /// ran before it. Resetting here gives the stage the same starting state on
+    /// every host and frame rate; the mob list itself is untouched, and the
+    /// caller owns any record pinning it needs.
+    pub fn reset_mob_runtime(&mut self) {
+        self.mob_runtime = MobRuntime::new(self.world.seed());
     }
 
     /// Advances the fixed-rate 20 Hz mob runtime AND the deterministic

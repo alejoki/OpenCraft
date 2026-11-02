@@ -4454,6 +4454,18 @@ impl CombatDemo {
         self.digest.is_some()
     }
 
+    /// Whether this demo currently owns mob time.
+    ///
+    /// The Ambient stage drives its own fixed `tick_mobs(0.05)` calls and pins
+    /// exact population counters. The real Playing frame would otherwise add a
+    /// profile-dependent number of extra ticks (and therefore spawn attempts)
+    /// between observations, so the frame loop must stand down for this stage.
+    /// Every other stage keeps the production tick: the Walk stage's proof is
+    /// that the real frame loop moves the quartet.
+    fn owns_mob_ticks(&self) -> bool {
+        !self.finished() && self.stage == CombatStage::Ambient
+    }
+
     /// Latch a self-describing abort. Idempotent: the first outcome wins.
     fn abort(&mut self, stage: &'static str, observed: &str) {
         if self.finished() {
@@ -4803,11 +4815,24 @@ fn combat_ambient_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
     match demo.ambient_phase {
         AmbientPhase::Spawn => {
             if demo.ambient_updates == 0 {
-                // First entry: a known night clock, a zero report baseline, and
-                // an open gate. The attempt sequence is ephemeral, so this is
-                // deterministic from a fixed seed.
+                // The Ambient stage pins exact population counters, and a spawn
+                // attempt against a not-yet-streamed column is silently
+                // refused. Wait until every candidate column in the 24..48
+                // block ring is resident and lit so debug and release see the
+                // same ready set for the whole attempt sequence. The frame
+                // loop stands down for this stage (see
+                // [`CombatDemo::owns_mob_ticks`]), so nothing ticks while the
+                // ring streams in.
+                if !session.spawn_ring_ready() {
+                    return false;
+                }
+                // First entry: a known night clock, a zero report baseline, an
+                // open gate, and a fresh fixed-step runtime. The attempt
+                // sequence and the wander ticks are then a pure function of
+                // the seed.
                 session.clock = GameClock::from_time(COMBAT_NIGHT_TICK);
                 session.reset_spawn_report();
+                session.reset_mob_runtime();
                 session.set_ambient_spawning(true);
                 demo.ambient_peak = 0;
                 demo.ambient_safe = 0;
@@ -4821,13 +4846,17 @@ fn combat_ambient_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
 
             // A record inside either safe radius is a hard contract failure:
             // the layer must never place a mob on the player or the spawn pad.
+            // The safe radius is a *placement* rule: a record must never be
+            // spawned on the player or the world-spawn pad. Wandering after a
+            // legal placement is ordinary gameplay (the burn phase even pins
+            // records back to `home` for the same reason), so the violation is
+            // measured on the immutable spawn anchor, never the live feet.
             let safe_violations = session
                 .mobs()
                 .iter()
                 .filter(|mob| {
-                    combat_horizontal_distance(mob.position, session.player.position) < SAFE_RADIUS
-                        || combat_horizontal_distance(mob.position, session.world_spawn())
-                            < SAFE_RADIUS
+                    combat_horizontal_distance(mob.home, session.player.position) < SAFE_RADIUS
+                        || combat_horizontal_distance(mob.home, session.world_spawn()) < SAFE_RADIUS
                 })
                 .count();
             demo.ambient_safe += safe_violations as u32;
@@ -5788,6 +5817,17 @@ fn combat_hostile_spot_ok(session: &WorldSession, feet: Vec3, eye: Vec3) -> bool
     opencraft::world::mob_ai::has_line_of_sight(&session.world, feet + Vec3::Y * 1.5, eye)
 }
 
+/// Snap a player's feet height to the block top it is standing on.
+///
+/// Physics leaves a resting player within a few ULPs of the integer block top.
+/// A spot search that floors the raw float can therefore pick the block *below*
+/// the feet on one run and the feet block on the next, which is exactly the
+/// kind of sub-millimetre drift a pinned real-binary proof must not inherit.
+/// The game has no half blocks, so the epsilon floor is the physical feet cell.
+fn combat_spot_feet_y(y: f32) -> f32 {
+    (y + 1e-3).floor()
+}
+
 /// The Hostile stage: the slice's real-binary proof that a Zombie acquires the
 /// player through line of sight, closes to melee range, and lands repeated
 /// 3-damage hits at a 1.0 s cadence with knockback until the player dies with a
@@ -5845,7 +5885,7 @@ fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
     // then the same radius at 45-degree yaw offsets in a fixed order, so a
     // terrain edge cannot make the stage flaky while the choice stays
     // deterministic. The seed-1 demo pose is measured against this list.
-    let feet_y = session.player.position.y;
+    let feet_y = combat_spot_feet_y(session.player.position.y);
     let eye = session.player.eye_position();
     let mut spot = None;
     for step in 0..8u32 {
@@ -5861,7 +5901,20 @@ fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bo
         }
     }
     let Some(spot) = spot else {
-        demo.abort("hostile", "observed=spot");
+        demo.abort(
+            "hostile",
+            &format!(
+                "observed=spot player=({:.3},{:.3},{:.3}) yaw={:.3} pitch={:.3} eye=({:.3},{:.3},{:.3})",
+                session.player.position.x,
+                session.player.position.y,
+                session.player.position.z,
+                session.player.yaw,
+                session.player.pitch,
+                eye.x,
+                eye.y,
+                eye.z
+            ),
+        );
         return true;
     };
 
@@ -7023,7 +7076,7 @@ fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
     // Spot selection: the exact bounded 8-angle, 2.0-block loop the Hostile
     // stage uses, so the two stages cannot disagree about a legal spot. The
     // loop order is fixed and no RNG or clock enters it.
-    let feet_y = player_feet.y;
+    let feet_y = combat_spot_feet_y(player_feet.y);
     let eye = session.player.eye_position();
     let mut spot = None;
     for step in 0..8u32 {
@@ -10158,7 +10211,19 @@ impl ApplicationHandler for GameApp {
                 // integration tests drive); inlined here because `gpu` and
                 // `window` already hold disjoint `self` borrows across this
                 // region, so a `&mut self` method call cannot be used.
-                self.session.clock.tick(playing, now, self.time_scale);
+                //
+                // The scripted combat Ambient stage pins an exact clock and
+                // owns its own fixed mob ticks, so the frame clock must stand
+                // down with the frame mob tick: wall-clock drift would change
+                // `time_of_day` between spawn attempts and therefore the
+                // seeded attempt results on a fast versus a slow host.
+                let combat_pins_time = self
+                    .combat_demo
+                    .as_ref()
+                    .is_some_and(CombatDemo::owns_mob_ticks);
+                if !combat_pins_time {
+                    self.session.clock.tick(playing, now, self.time_scale);
+                }
                 // Bounded accelerated demo (S02-T04; N cycles since S06-T05):
                 // `--time-scale` is a test seam, so an accelerated run
                 // self-terminates after `--demo-days` (default 1) full day
@@ -10258,12 +10323,18 @@ impl ApplicationHandler for GameApp {
                     // survival/crops. The session clamps/scales `dt`, runs a
                     // deterministic fixed 20 Hz accumulator, and freezes mobs
                     // in unloaded chunks. The batched mob draw reads the
-                    // resulting records; this call is the only tick site, so
-                    // the scripted `--demo-combat` seam never double-steps.
+                    // resulting records; this call is the only production tick
+                    // site. The scripted `--demo-combat` Ambient stage owns its
+                    // own fixed ticks so its pinned population counters cannot
+                    // drift with frame rate; every other stage still gets this
+                    // production tick (the Walk proof depends on it).
                     // Audible events this frame (M009/S09-T04): pure data from
                     // the melee arm, the arrow sweep, and the idle gate below,
                     // played once at the end of the Playing frame.
-                    self.session.tick_mobs(dt, self.time_scale);
+                    let combat_owns_mob_ticks = combat_pins_time;
+                    if !combat_owns_mob_ticks {
+                        self.session.tick_mobs(dt, self.time_scale);
+                    }
                     // Projectile runtime (M009/S07-T05): the same game-time
                     // rule as mobs. The session clamps/scales `dt`, freezes
                     // arrows in unloaded chunks, resolves substepped block and
@@ -13660,7 +13731,7 @@ mod tests {
             DEFAULT_SEASON_LENGTH_DAYS,
             GameMode::Survival,
         );
-        insert_lit_grass_plain(&mut session, 2);
+        insert_lit_grass_plain(&mut session, 3);
         // Exactly the fresh-demo startup shape: dusk clock, gate closed.
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
         session.set_ambient_spawning(false);
