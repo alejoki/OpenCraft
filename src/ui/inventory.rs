@@ -84,6 +84,9 @@ const PANEL_W: f32 = 2.0 * PANEL_PAD + SLOTS_W + COLUMN_GAP + CRAFT_W;
 const PANEL_H: f32 = SLOTS_TOP + PANEL_CONTENT_H + FOOTER_HEIGHT + PANEL_PAD;
 
 const PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.94];
+/// Subtle divider tint for [`InventoryLayout::hotbar_separator`]: lighter than
+/// the panel and the slot outlines so it reads as a rule, not another slot.
+const SEPARATOR_COLOR: [f32; 4] = [0.34, 0.35, 0.40, 1.0];
 const SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 const GRID_COLOR: [f32; 4] = [0.17, 0.18, 0.21, 1.0];
 const RESULT_COLOR: [f32; 4] = [0.28, 0.25, 0.14, 1.0];
@@ -532,8 +535,11 @@ fn preview_fill(rect: Rect, preview: RecipePreview) -> Option<Quad> {
     Some(rect_quad(cell_fill(rect), item_color(item)))
 }
 
-/// All quads for one frame: backdrop, slot/grid outlines, item fills, result
-/// previews, and the cursor ghost. Empty for a closed screen.
+/// All quads for one frame: backdrop, the storage/hotbar separator, slot/grid
+/// outlines, item fills, result previews, and the cursor ghost. Empty for a
+/// closed screen. Draw order is intentional: the separator lands after the
+/// panel background and before any slot fill, so slot outlines and item fills
+/// always paint over it.
 pub fn screen_quads(
     mode: InventoryMode,
     layout: &InventoryLayout,
@@ -548,6 +554,10 @@ pub fn screen_quads(
     }
     let mut quads = Vec::new();
     quads.push(rect_quad(layout.panel, PANEL_COLOR));
+    // Separator between the three storage rows and the hotbar row. It is
+    // emitted before the slots so the slot fills (which never overlap the
+    // separator by layout construction) keep their own draw order.
+    quads.push(rect_quad(layout.hotbar_separator, SEPARATOR_COLOR));
 
     for (index, rect) in layout.slots.iter().enumerate() {
         quads.push(rect_quad(*rect, SLOT_COLOR));
@@ -955,6 +965,120 @@ mod tests {
         }
     }
 
+    fn assert_quad(quad: &Quad, rect: Rect, color: [f32; 4]) {
+        assert_eq!((quad.x, quad.y, quad.w, quad.h), rect);
+        assert_eq!(quad.color, color);
+    }
+
+    #[test]
+    fn screen_quads_draws_separator_before_slots_and_no_slot_overlaps_it() {
+        let layout = layout(1280, 720, InventoryMode::Player);
+        let quads = screen_quads(
+            InventoryMode::Player,
+            &layout,
+            &Inventory::empty(),
+            &CraftingGrid::new(GridKind::Player),
+            &CraftingGrid::new(GridKind::Table),
+            None,
+            None,
+        );
+
+        // Backdrop first, then the separator, then every slot outline in
+        // public index order (0..9 hotbar, 9..36 storage). No remapping.
+        assert_quad(&quads[0], layout.panel, PANEL_COLOR);
+        assert_quad(&quads[1], layout.hotbar_separator, SEPARATOR_COLOR);
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert_quad(&quads[2 + index], *rect, SLOT_COLOR);
+        }
+
+        // The separator sits strictly between the storage rows and the
+        // hotbar row, and no slot outline intersects it.
+        let separator = layout.hotbar_separator;
+        let storage_bottom = layout.slots[HOTBAR_SLOTS..]
+            .iter()
+            .map(|rect| rect.1 + rect.3)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let hotbar_top = layout.slots[..HOTBAR_SLOTS]
+            .iter()
+            .map(|rect| rect.1)
+            .fold(f32::INFINITY, f32::min);
+        assert!(separator.1 >= storage_bottom);
+        assert!(separator.1 + separator.3 <= hotbar_top);
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert!(
+                !rects_overlap(separator, *rect),
+                "slot {index} overlaps the rendered separator"
+            );
+        }
+    }
+
+    #[test]
+    fn full_inventory_labels_every_count_inside_panel_at_720p_and_1080p() {
+        let inventory = filled_inventory();
+        let player_grid = full_grid(GridKind::Player, ItemId::Block(BlockId::OakPlanks));
+        let table_grid = full_grid(GridKind::Table, ItemId::Block(BlockId::OakPlanks));
+
+        for (w, h) in [(1280_u32, 720_u32), (1920, 1080)] {
+            let layout = layout(w, h, InventoryMode::Table);
+            let labels = screen_labels(
+                InventoryMode::Table,
+                &layout,
+                &inventory,
+                &player_grid,
+                &table_grid,
+                Some("full"),
+            );
+            assert!(labels.len() <= MAX_LABELS, "{w}x{h}: {} labels", labels.len());
+
+            // Every occupied slot contributes its count label. Slot 0 is the
+            // worn pickaxe (count 1 plus a durability line); the rest are
+            // stone stacks 2..=36.
+            let slot_counts: Vec<String> = (0..INVENTORY_SLOTS)
+                .map(|index| inventory.slot(index).expect("slot is full").count().to_string())
+                .collect();
+            for (index, count) in slot_counts.iter().enumerate() {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|label| label.text == *count),
+                    "{w}x{h}: slot {index} count {count} is missing"
+                );
+            }
+
+            for label in &labels {
+                let (px, py, pw, ph) = layout.panel;
+                assert!(
+                    label.left >= px
+                        && label.top >= py
+                        && label.left <= px + pw
+                        && label.top + LABEL_LINE_HEIGHT <= py + ph,
+                    "{w}x{h}: label {:?} at ({}, {}) escapes panel {layout:?}",
+                    label.text,
+                    label.left,
+                    label.top
+                );
+            }
+
+            // The footer derives from PANEL_H, so the hint/status rows stay
+            // below the hotbar row and inside the panel.
+            let hotbar_bottom = layout.slots[..HOTBAR_SLOTS]
+                .iter()
+                .map(|rect| rect.1 + rect.3)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let hint = labels
+                .iter()
+                .find(|label| {
+                    label.text == "Left click moves a stack, right click splits or places one"
+                })
+                .expect("hint label is always emitted");
+            assert!(
+                hint.top >= hotbar_bottom,
+                "{w}x{h}: hint at {} lands on the hotbar row ending at {hotbar_bottom}",
+                hint.top
+            );
+        }
+    }
+
     #[test]
     fn player_mode_hit_tests_slots_grid_and_result_and_ignores_table() {
         let layout = layout(1280, 720, InventoryMode::Player);
@@ -1006,8 +1130,8 @@ mod tests {
             None,
             None,
         );
-        // panel + 36 slots + 4 player cells + player result
-        assert_eq!(quads.len(), 42);
+        // panel + separator + 36 slots + 4 player cells + player result
+        assert_eq!(quads.len(), 43);
     }
 
     #[test]
@@ -1061,8 +1185,8 @@ mod tests {
             None,
             None,
         );
-        // 42 player-mode quads + 16 table cells + table result
-        assert_eq!(quads.len(), 42 + 16 + 1);
+        // 43 player-mode quads + 16 table cells + table result
+        assert_eq!(quads.len(), 43 + 16 + 1);
     }
 
     #[test]

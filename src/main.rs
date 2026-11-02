@@ -10894,8 +10894,11 @@ impl ApplicationHandler for GameApp {
                 // list, after the HUD/mining quads and before the single
                 // `set_quads` upload, so the panel always draws above the
                 // world and the HUD with no new pipeline (P003/P004).
-                // Geometry comes only from the pure T01 module; a closed
-                // screen extends nothing.
+                // Geometry comes only from the pure T01/T02 module; a closed
+                // screen extends nothing. Slot indices stay 0..9 hotbar /
+                // 9..36 storage even though the hotbar renders as the bottom
+                // row, so quads, icons, labels, and hit testing all consume the
+                // same index order with no remapping here.
                 let inventory_mode = self.inventory.mode(self.session.open_table_position());
                 let inventory_layout = if inventory_mode.is_open() {
                     let layout =
@@ -18319,8 +18322,9 @@ mod tests {
         )
         .is_empty());
 
-        // Empty player mode: backdrop + 36 slot outlines + 4 grid cells + the
-        // player result slot. Table mode adds the 16 table cells and result.
+        // Empty player mode: backdrop + storage/hotbar separator + 36 slot
+        // outlines + 4 grid cells + the player result slot. Table mode adds the
+        // 16 table cells and result.
         let player_quads = screen_quads(
             InventoryMode::Player,
             &layout,
@@ -18330,7 +18334,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(player_quads.len(), 1 + INVENTORY_SLOTS + 4 + 1);
+        assert_eq!(player_quads.len(), 1 + 1 + INVENTORY_SLOTS + 4 + 1);
         let table_quads = screen_quads(
             InventoryMode::Table,
             &layout,
@@ -18342,7 +18346,7 @@ mod tests {
         );
         assert_eq!(
             table_quads.len(),
-            1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
+            1 + 1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
         );
 
         // Occupied state adds exactly one fill per occupied cell plus the
@@ -18368,7 +18372,7 @@ mod tests {
         );
         assert_eq!(
             player_quads.len(),
-            1 + INVENTORY_SLOTS + 4 + 1 // chrome
+            1 + 1 + INVENTORY_SLOTS + 4 + 1 // chrome (panel + separator)
                 + 1 // slot 0 fill
                 + 1 // player cell 0 fill
                 + 1 // cursor ghost
@@ -18384,7 +18388,7 @@ mod tests {
         );
         assert_eq!(
             table_quads.len(),
-            1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
+            1 + 1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
                 + 1 // slot 0 fill
                 + 1 // player cell 0 fill
                 + 1 // table cell 15 fill
