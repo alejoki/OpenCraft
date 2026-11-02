@@ -1,6 +1,7 @@
 pub mod chest;
 pub mod hud;
 pub mod inventory;
+pub mod item_icon;
 pub mod lifecycle;
 pub mod logo;
 pub mod menu;
