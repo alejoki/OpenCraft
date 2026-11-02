@@ -9,6 +9,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
 *   **Survival and Creative Modes**: New worlds default to Survival. Survival has 20 health, 20 hunger, and 300 air, shown as a hearts/hunger/air HUD; fall, drowning, and starvation damage; a Death screen with Respawn and Quit (respawn at the deterministic spawn with your inventory kept); hold-to-eat apples and bread; hoe-based wheat farming that pauses in Winter; 27-slot chests; and deterministic ruin loot. Creative keeps flying and building, is invulnerable, never hungry, never loses air, is never targeted or damaged by mobs, and one-shots any mob with its drops intact. The mode is chosen at creation and locked; the mob rule follows the *effective* mode, so Edit Background inherits Creative's immunity and one-shot swings while the background world keeps its stored mode.
+*   **Mobs and Combat**: Four mobs share the world — Pig and Cow are passive, Zombie and Skeleton are hostile. Passives spawn on lit grass by day and flee when hit; hostiles spawn at night or in caves, with zombies chasing and meleeing while skeletons keep their distance and shoot arrows. Fight with your fists, a sword, or a shortbow, and kills drop straight into your inventory. Spawns respect a 24-block safe radius, a 32-mob global cap, and at most 4 mobs per 32-block region. The Death screen names the cause (Zombie or Skeleton arrow, alongside Fall, Drowning, and Starvation). Live mobs persist in version 7 saves with kind, position, facing, and health. Creative players are never targeted or damaged and one-shot any mob with drops intact. Mob art and audio are pack-overridable.
 *   **Mob and Combat Audio**: Nine built-in generated sounds — block break, block place, mine-complete, UI click, mob idle, mob hurt, mob death, bow release, and arrow impact. A texture pack can override any of them per file; a missing file silently keeps the built-in sound and a corrupt one falls back with a menu warning. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md#sounds).
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
@@ -26,6 +27,25 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Chest screen (27 chest slots plus the 36-slot player inventory) and Death screen (Respawn and Quit).
     *   In-game settings menu for live adjustments.
     *   UI logic is decoupled from rendering, built with `glyphon` for text rendering.
+
+## 🐷 Mobs and Combat
+
+Four mobs share the world: **Pig**, **Cow**, **Zombie**, and **Skeleton**. The first two are passive and the last two are hostile. Creative players are never targeted or damaged by them. The spawn and fight rules below describe Survival; ambient spawning itself runs in both modes.
+
+### Where mobs come from
+
+| Rule | Value |
+| --- | --- |
+| Safe radius | 24 blocks around the player and around the world spawn — no mob spawns inside it |
+| Spawn ring | 24-48 blocks from the player |
+| Despawn | Past 96 blocks from the player |
+| Global cap | 32 live mobs |
+| Regional cap | At most 4 mobs per 32-block region, counted across loaded and unloaded chunks |
+| Passive spawn | Full sky light on a grass block, during the day |
+| Hostile spawn | Sky light 7 or less at any hour, or full sky light at night |
+| Daylight burn | A hostile on the lit surface loses 1 health every 0.5 s; cover or water at its feet stops the burn |
+
+Spawn attempts are deterministic for a seed and continue while you play. A mob that is more than 96 blocks away is removed; living mobs inside that radius are saved with the world.
 
 ## 🛠️ Built With
 
@@ -66,12 +86,29 @@ You can also launch directly into a world using command-line flags, bypassing th
 *   `--seed <NUMBER>`: Specify a seed for world generation.
 *   `--save <PATH>`: Set the path for the save file (e.g., `my_world.mcvx`).
 *   `--creative` / `--survival`: Select the game mode for a fresh world only. The last flag wins; a loaded world keeps its stored mode.
+*   `--demo-combat`: Run the scripted mob/combat capstone — dusk spawn, walking, melee and drops, a zombie fight, a bow shot, a skeleton shot, Creative inertness, save, and a relaunch restore — then exit. This is a development flag, not a player feature.
 
 For example, to start a new world with seed 4242:
 
 ```bash
 cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 ```
+
+### Demo and smoke scripts
+
+The repository's real-binary checks live under `scripts/`. `scripts/combat_smoke.sh` builds the game and runs the full `--demo-combat` capstone in an isolated temporary directory, then asserts the pinned digest lines, the 218-byte version 7 save witness, and the frame p95 budget. Debug is the default:
+
+```bash
+bash scripts/combat_smoke.sh
+```
+
+For the release binary, opt in with `SMOKE_PROFILE`:
+
+```bash
+SMOKE_PROFILE=release bash scripts/combat_smoke.sh
+```
+
+The script proves the assembled seam (spawn, walk, melee, drops, zombie fight, bow shot, skeleton shot, Creative inertness, save, relaunch restore). It is not a player feature.
 
 ## 🎮 Controls
 

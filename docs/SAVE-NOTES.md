@@ -216,6 +216,24 @@ When health reaches zero, the Death screen appears. **Respawn** restores full he
 - Surface ruins can contain a LootChest. Its contents are deterministic for the world seed and the ruin, so the same save always yields the same loot. A LootChest you have emptied stays recorded as empty and never re-rolls. Breaking it yields one ordinary Chest.
 - There are no item-drop entities. Blocks and crops go straight into your inventory, and death keeps your inventory.
 
+## Mobs, spawning, and combat
+
+Four mobs can live in a world: Pig and Cow are passive, Zombie and Skeleton are hostile. Spawning is deterministic for a seed and obeys these rules:
+
+- The safe radius is 24 blocks around the player and around the world spawn; no mob spawns inside it.
+- New mobs appear in a ring 24-48 blocks from the player.
+- A mob more than 96 blocks from the player is removed.
+- At most 32 mobs exist at once, and at most 4 of them occupy any one 32-block region, counted across loaded and unloaded chunks.
+- Passive mobs need full sky light on a grass block and spawn during the day.
+- Hostile mobs need sky light 7 or less at any hour, or full sky light at night.
+- A hostile on the lit surface loses 1 health every 0.5 seconds; cover or water at its feet stops the burn.
+
+Version 7 stores each live mob as a fixed 19-byte record: kind (1 byte), feet x/y/z (4 bytes each), facing yaw (4 bytes), and health (2 bytes, little-endian). Loading is fail-closed: an unknown kind, a non-finite position or facing, health above the kind's maximum, a duplicate kind-and-position record, or an out-of-bound count rejects the whole save instead of skipping a record. Saves from versions 1-6 load with zero mobs and gain the mob tail only when saved again as version 7.
+
+The `--demo-combat` capstone produces a measured 218-byte version 7 save. Version 7 is at offset 4, the mob count of 2 is at offset 176, and the two 19-byte records fill 180..218: a Zombie at 11 health and a Skeleton at 14 health. The rest of the layout is the earned inventory described above, so the pinned size is measured from a real run rather than derived.
+
+Arrows in flight, mob knockback, and the damage cause are ephemeral. They are live-session state only and are never written to a save; version 7 added no arrow or knockback tail. Creative rules follow the effective mode, so a Creative player is never targeted or damaged by a mob and one-shots it with drops intact, including while editing the menu background.
+
 ## The menu background is a save too
 
 The rotating scenery behind the main menu is a real world save, kept separately from your playable worlds at `saves/background/background.mcvx`. It uses the same format as any other save: seed, your block edits, position, inventory, clock, and calendar.
@@ -260,5 +278,5 @@ These guarantees survived the terrain rewrite:
 - A save with an out-of-range render distance is rejected rather than guessed at.
 - Hand-editing a save file is not supported. Corrupt or unknown data either fails the load with a named error or falls back to a safe default, depending on the field.
 - The menu background's viewpoint is wherever you stood when you last saved the editor. Building across that spot can put geometry in front of or around the camera; move before saving to reframe it.
-- Development flags for demos and smoke tests (`--new`, `--seed`, `--save`, `--time-scale`, `--season-length`, `--demo-days`, `--demo-swim`, `--demo-survival`, `--demo-content`, `--demo-combat`) are not part of the normal player flow. They change how a launch runs (some demos advance the calendar and save before exiting), not how an existing save file is interpreted. `--demo-survival` and `--demo-content` are bounded scripted demo switches that save and exit for the smokes. `--creative` and `--survival` select the mode of a fresh world only (the last flag wins); a loaded world keeps its stored mode.
+- Development flags for demos and smoke tests (`--new`, `--seed`, `--save`, `--time-scale`, `--season-length`, `--demo-days`, `--demo-swim`, `--demo-survival`, `--demo-content`, `--demo-combat`) are not part of the normal player flow. They change how a launch runs (some demos advance the calendar and save before exiting), not how an existing save file is interpreted. `--demo-survival` and `--demo-content` are bounded scripted demo switches that save and exit for the smokes. `--creative` and `--survival` select the mode of a fresh world only (the last flag wins); a loaded world keeps its stored mode. The mob/combat capstone is reproduced outside the game with `bash scripts/combat_smoke.sh`; set `SMOKE_PROFILE=release` to run the same assertions against the release binary.
 - There are no item-drop entities and no death drops; death keeps your inventory. There is no creative inventory palette. Chest overflow is refused rather than dropping items. Crop growth progress is ephemeral and is not saved. There is no saturation, and no water or fertilizer farming.
