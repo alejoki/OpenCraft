@@ -21,11 +21,14 @@ pub const HOTBAR_COUNT_FONT_SIZE: f32 = 14.0;
 /// Line height for per-slot hotbar count labels, in physical pixels.
 pub const HOTBAR_COUNT_LINE_HEIGHT: f32 = 16.0;
 
-/// Pixel size of one vitals icon (heart, hunger pip, or air bubble).
+/// Base pixel size of one vitals icon (heart, hunger pip, or air bubble).
+///
+/// This is the unscaled reference size; [`vitals_metrics`] multiplies it by a
+/// continuous scale derived from the measured hotbar width.
 pub const VITALS_ICON_SIZE: f32 = 16.0;
-/// Horizontal gap between adjacent icons in one vitals row, in pixels.
+/// Base horizontal gap between adjacent icons in one vitals row, in pixels.
 pub const VITALS_ICON_GAP: f32 = 2.0;
-/// Vertical gap between the vitals rows, in pixels.
+/// Base vertical gap between the vitals rows, in pixels.
 pub const VITALS_ROW_GAP: f32 = 4.0;
 /// Dark background behind every vitals icon, so empty ones stay legible.
 pub const VITALS_BACKGROUND_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
@@ -45,9 +48,58 @@ pub const DAMAGE_FLASH_ALPHA: f32 = 0.35;
 
 /// Icons per vitals row: ten two-point hearts / hunger pips.
 const VITALS_ICON_COUNT: usize = (MAX_HEALTH / 2) as usize;
-/// Full width of one ten-icon vitals row, including its interior gaps.
-const VITALS_ROW_WIDTH: f32 =
+/// Full width of one ten-icon vitals row at base scale, including its gaps.
+pub const VITALS_ROW_WIDTH_BASE: f32 =
     VITALS_ICON_COUNT as f32 * VITALS_ICON_SIZE + (VITALS_ICON_COUNT - 1) as f32 * VITALS_ICON_GAP;
+/// Total width of both vitals rows plus their center gap at base scale.
+pub const VITALS_TOTAL_WIDTH_BASE: f32 = 2.0 * VITALS_ROW_WIDTH_BASE + VITALS_ICON_GAP;
+
+/// Pixel geometry of the Survival vitals HUD for one surface.
+///
+/// Every field is the base constant scaled by the same continuous ratio, so a
+/// single hotbar measurement keeps the whole stack proportional.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VitalsMetrics {
+    /// Width and height of one icon, in physical pixels.
+    pub icon_size: f32,
+    /// Horizontal gap between adjacent icons in one row, in physical pixels.
+    pub icon_gap: f32,
+    /// Vertical gap between the heart/hunger row and the air row, in pixels.
+    pub row_gap: f32,
+    /// Width of one ten-icon row, in physical pixels.
+    pub row_width: f32,
+}
+
+/// Vitals geometry scaled continuously from the measured hotbar width.
+///
+/// The hotbar is the single geometry source for the whole HUD. At base scale
+/// one ten-icon row is [`VITALS_ROW_WIDTH_BASE`] px and the two rows plus their
+/// center gap span [`VITALS_TOTAL_WIDTH_BASE`] px; scaling by
+/// `hotbar_w / VITALS_TOTAL_WIDTH_BASE` keeps hearts and hunger inside the
+/// hotbar and separated at every resolution, without breakpoints.
+///
+/// A non-finite or non-positive measured width falls back to the unscaled base
+/// constants so degenerate surfaces still produce finite geometry.
+pub fn vitals_metrics(surface_w: u32, surface_h: u32) -> VitalsMetrics {
+    let rects = hotbar_slot_rects(surface_w, surface_h);
+    let hotbar_w = (rects[HOTBAR_SLOTS - 1].0 + rects[HOTBAR_SLOTS - 1].2) - rects[0].0;
+    vitals_metrics_from_hotbar_width(hotbar_w)
+}
+
+/// Scale the base vitals constants by one ratio derived from `hotbar_w`.
+fn vitals_metrics_from_hotbar_width(hotbar_w: f32) -> VitalsMetrics {
+    let scale = if hotbar_w.is_finite() && hotbar_w > 0.0 {
+        hotbar_w / VITALS_TOTAL_WIDTH_BASE
+    } else {
+        1.0
+    };
+    VitalsMetrics {
+        icon_size: VITALS_ICON_SIZE * scale,
+        icon_gap: VITALS_ICON_GAP * scale,
+        row_gap: VITALS_ROW_GAP * scale,
+        row_width: VITALS_ROW_WIDTH_BASE * scale,
+    }
+}
 
 /// Hotbar slot rects in physical pixels `(x, y, w, h)` (top-left origin).
 ///
@@ -292,14 +344,17 @@ pub fn vitals_quads(
     let (first_x, hotbar_top, _, _) = rects[0];
     let (last_x, _, last_w, _) = rects[HOTBAR_SLOTS - 1];
     let right_edge = last_x + last_w;
+    let metrics = vitals_metrics_from_hotbar_width(right_edge - first_x);
 
     // Hunger and air are right-aligned to the hotbar's right edge; hearts are
     // left-aligned to its left edge. Both rows share the same ten-icon width,
-    // and the row gap lifts them clear of the hotbar and each other.
-    let heart_y = hotbar_top - VITALS_ROW_GAP - VITALS_ICON_SIZE;
-    let air_y = heart_y - VITALS_ROW_GAP - VITALS_ICON_SIZE;
-    let hunger_x = right_edge - VITALS_ROW_WIDTH;
-    let step = VITALS_ICON_SIZE + VITALS_ICON_GAP;
+    // and the row gap lifts them clear of the hotbar and each other. The icon
+    // size, gap, and row height all scale from the measured hotbar width, so
+    // the two rows can never overlap.
+    let heart_y = hotbar_top - metrics.row_gap - metrics.icon_size;
+    let air_y = heart_y - metrics.row_gap - metrics.icon_size;
+    let hunger_x = right_edge - metrics.row_width;
+    let step = metrics.icon_size + metrics.icon_gap;
 
     let mut quads = Vec::with_capacity(VITALS_ICON_COUNT * 6);
     for index in 0..VITALS_ICON_COUNT {
@@ -307,6 +362,7 @@ pub fn vitals_quads(
             &mut quads,
             first_x + index as f32 * step,
             heart_y,
+            metrics.icon_size,
             heart_fill(vitals.health(), index),
             HEART_FILL_COLOR,
         );
@@ -316,6 +372,7 @@ pub fn vitals_quads(
             &mut quads,
             hunger_x + index as f32 * step,
             heart_y,
+            metrics.icon_size,
             hunger_fill(vitals.hunger(), index),
             HUNGER_FILL_COLOR,
         );
@@ -328,6 +385,7 @@ pub fn vitals_quads(
                 &mut quads,
                 hunger_x + index as f32 * step,
                 air_y,
+                metrics.icon_size,
                 fill,
                 AIR_FILL_COLOR,
             );
@@ -368,12 +426,22 @@ pub fn damage_flash_quad(intensity: f32, surface_w: u32, surface_h: u32) -> Opti
 
 /// One vitals icon: an always-present dark background plus an optional colored
 /// fill scaled horizontally by `fill` (odd hearts/hunger show half an icon).
-fn push_vitals_icon(quads: &mut Vec<Quad>, x: f32, y: f32, fill: f32, fill_color: [f32; 4]) {
+///
+/// `icon_size` is the hotbar-scaled icon edge; both the background and the
+/// half/full fill use it so a row keeps one proportional size.
+fn push_vitals_icon(
+    quads: &mut Vec<Quad>,
+    x: f32,
+    y: f32,
+    icon_size: f32,
+    fill: f32,
+    fill_color: [f32; 4],
+) {
     quads.push(Quad {
         x,
         y,
-        w: VITALS_ICON_SIZE,
-        h: VITALS_ICON_SIZE,
+        w: icon_size,
+        h: icon_size,
         color: VITALS_BACKGROUND_COLOR,
     });
     let fill = if fill.is_finite() {
@@ -385,8 +453,8 @@ fn push_vitals_icon(quads: &mut Vec<Quad>, x: f32, y: f32, fill: f32, fill_color
         quads.push(Quad {
             x,
             y,
-            w: VITALS_ICON_SIZE * fill,
-            h: VITALS_ICON_SIZE,
+            w: icon_size * fill,
+            h: icon_size,
             color: fill_color,
         });
     }
@@ -860,18 +928,19 @@ mod tests {
 
         let one = SurvivalState::new(1, 1, FULL_AIR).expect("valid vitals");
         let quads = vitals_quads(&one, GameMode::Survival, false, 1280, 720);
+        let icon_size = vitals_metrics(1280, 720).icon_size;
         let hearts: Vec<_> = quads
             .iter()
             .filter(|quad| quad.color == HEART_FILL_COLOR)
             .collect();
         assert_eq!(hearts.len(), 1, "one half heart");
-        assert_close(hearts[0].w, VITALS_ICON_SIZE * 0.5, "half-heart width");
+        assert_close(hearts[0].w, icon_size * 0.5, "half-heart width");
         let hunger: Vec<_> = quads
             .iter()
             .filter(|quad| quad.color == HUNGER_FILL_COLOR)
             .collect();
         assert_eq!(hunger.len(), 1, "one half hunger pip");
-        assert_close(hunger[0].w, VITALS_ICON_SIZE * 0.5, "half-pip width");
+        assert_close(hunger[0].w, icon_size * 0.5, "half-pip width");
     }
 
     #[test]
@@ -881,6 +950,8 @@ mod tests {
         let rects = hotbar_slot_rects(surface_w, surface_h);
         let hotbar_top = rects[0].1;
         let last_right = rects[HOTBAR_SLOTS - 1].0 + rects[HOTBAR_SLOTS - 1].2;
+        let hotbar_w = last_right - rects[0].0;
+        let metrics = vitals_metrics(surface_w, surface_h);
         let quads = vitals_quads(
             &SurvivalState::full(),
             GameMode::Survival,
@@ -906,7 +977,7 @@ mod tests {
         assert_close(hearts_left, rects[0].0, "hearts left-aligned to slot 0");
         assert_close(
             hearts_right,
-            rects[0].0 + VITALS_ROW_WIDTH,
+            rects[0].0 + metrics.row_width,
             "ten hearts span one icon row",
         );
 
@@ -923,8 +994,18 @@ mod tests {
         let hunger_left = hunger.iter().map(|q| q.x).fold(f32::MAX, f32::min);
         assert_close(
             hunger_left,
-            last_right - VITALS_ROW_WIDTH,
+            last_right - metrics.row_width,
             "hunger row is right-aligned as one block",
+        );
+        assert!(
+            hearts_right + metrics.icon_gap <= hunger_left + 1e-3,
+            "a visible center gap separates hearts from hunger: {hearts_right} + {} > {hunger_left}",
+            metrics.icon_gap
+        );
+        assert!(
+            metrics.row_width * 2.0 + metrics.icon_gap <= hotbar_w + 1e-3,
+            "both scaled rows fit inside the measured hotbar width: {} > {hotbar_w}",
+            metrics.row_width * 2.0 + metrics.icon_gap
         );
 
         let air: Vec<_> = quads

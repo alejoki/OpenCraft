@@ -21847,7 +21847,7 @@ mod tests {
     #[test]
     fn playing_hud_quads_tracks_low_vitals_and_the_air_row() {
         use opencraft::ui::hud::{
-            HEART_FILL_COLOR, HUNGER_FILL_COLOR, VITALS_BACKGROUND_COLOR, VITALS_ICON_SIZE,
+            vitals_metrics, HEART_FILL_COLOR, HUNGER_FILL_COLOR, VITALS_BACKGROUND_COLOR,
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -21866,7 +21866,12 @@ mod tests {
             .filter(|quad| quad.color == HEART_FILL_COLOR)
             .collect();
         assert_eq!(hearts.len(), 1, "one health point is one half heart");
-        assert_eq!(hearts[0].w, VITALS_ICON_SIZE * 0.5, "half-heart width");
+        let half_heart = vitals_metrics(1280, 720).icon_size * 0.5;
+        assert!(
+            (hearts[0].w - half_heart).abs() < 1e-4,
+            "half-heart width: {} != {half_heart}",
+            hearts[0].w
+        );
         assert_eq!(
             quads
                 .iter()
