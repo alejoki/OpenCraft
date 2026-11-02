@@ -11722,6 +11722,20 @@ impl ApplicationHandler for GameApp {
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
+    if cli.demo_ui {
+        let (lines, ok) = opencraft::ui::demo::ui_demo_digest_lines();
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let session = startup_session(&cli);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
@@ -12140,6 +12154,33 @@ mod tests {
                 "{flag} + --new keeps intent"
             );
         }
+    }
+
+    #[test]
+    fn main_demo_ui_short_circuit_precedes_world_startup() {
+        // The headless UI digest must run before any world/session startup:
+        // no save, settings file, window, or GPU work is allowed on this
+        // launch. Pin the ordering in the real binary source so a later
+        // refactor cannot silently move the seam behind `startup_session`.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_ui_at = body
+            .find("cli.demo_ui")
+            .expect("fn main must branch on cli.demo_ui");
+        let digest_at = body
+            .find("ui_demo_digest_lines")
+            .expect("fn main must call ui_demo_digest_lines");
+        let startup_at = body
+            .find("startup_session(&cli)")
+            .expect("fn main must call startup_session(&cli)");
+        assert!(demo_ui_at < startup_at, "cli.demo_ui must precede startup");
+        assert!(
+            digest_at < startup_at,
+            "ui_demo_digest_lines must precede startup"
+        );
     }
 
     #[test]
