@@ -1,4 +1,5 @@
 pub mod chest;
+pub mod demo;
 pub mod hud;
 pub mod inventory;
 pub mod item_icon;
