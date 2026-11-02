@@ -449,6 +449,106 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M008/S08
 - Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo fmt --all -- --check; cargo clippy --all-targets -- -D warnings; cargo test --locked; bash scripts/survival_smoke.sh; bash scripts/content_smoke.sh; cargo test --release --locked; SMOKE_PROFILE=release bash scripts/survival_smoke.sh; SMOKE_PROFILE=release bash scripts/content_smoke.sh; recorded human windowed UAT
 
+### R045 — Batched four-mob box-model rendering and animation
+- Class: core-capability
+- Status: active
+- Description: Pig, Cow, Zombie, and Skeleton render through a batched four-mob box-model path with procedural walk, hurt, and death animation and thirteen pack-overridable mob texture layers.
+- Why it matters: Mobs must be visible as distinct creatures whose movement and damage are readable in the world.
+- Source: M009 / S01 rendering
+- Primary owning slice: M009/S01
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- render::mob; cargo test --locked --lib -- world::mob; bash scripts/pack_smoke.sh
+
+### R046 — Save v7 mob persistence and migration
+- Class: continuity
+- Status: active
+- Description: Save format v7 persists each mob's kind, feet position, yaw, and health, validates those records fail-closed, and migrates v1-v6 saves with zero mobs.
+- Why it matters: A world must restore its mobs exactly and must never load a corrupt mob record into play.
+- Source: M009 / S02 persistence
+- Primary owning slice: M009/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::session; bash scripts/combat_smoke.sh
+
+### R047 — Item vocabulary and player melee
+- Class: core-capability
+- Status: active
+- Description: The player fights with fists plus wood, stone, and iron swords at 4/5/6 damage, a ~0.6 s cooldown, 0.5 s invulnerability frames, and knockback, with attack-before-mining input priority.
+- Why it matters: Melee is the baseline combat loop, and its timing and priority rules decide whether fighting feels responsive and fair.
+- Source: M009 / S03 melee
+- Primary owning slice: M009/S03
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- player::melee; cargo test --locked --lib -- player::inventory; bash scripts/combat_smoke.sh
+
+### R048 — Passive flee/death lifecycle and deterministic drops
+- Class: core-capability
+- Status: active
+- Description: Passive mobs flee when hurt and run a death lifecycle, and Pig/Cow drops land deterministically through the best-effort inventory path with an overflow-only notice.
+- Why it matters: Hunting passives must produce predictable rewards without silently losing items.
+- Source: M009 / S04 passive lifecycle and loot
+- Primary owning slice: M009/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::mob_loot; cargo test --locked --lib -- player::inventory; bash scripts/combat_smoke.sh
+
+### R049 — Light-and-clock mob spawning
+- Class: core-capability
+- Status: active
+- Description: Mobs spawn from light and clock rules with a ~24-block safe radius, a global cap of 32 plus at most 4 per region, despawn beyond 96 blocks, and 0.5 s daylight burning.
+- Why it matters: Spawn rules keep the world populated without ambushing the player at home or overrunning the frame budget.
+- Source: M009 / S05 spawning
+- Primary owning slice: M009/S05
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::spawning; cargo test --locked --lib -- world::daycycle; bash scripts/combat_smoke.sh
+
+### R050 — Hostile steering AI, zombie melee, and damage feedback
+- Class: core-capability
+- Status: active
+- Description: Hostiles chase by line of sight with one-block step-up, cliff guarding, and stuck re-aggro; zombies melee the player, damage shows feedback, and the ephemeral death cause renders on the Death screen.
+- Why it matters: Hostiles must pursue believably, and the player must be able to read damage and the reason for death.
+- Source: M009 / S06 hostile AI and combat
+- Primary owning slice: M009/S06
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::mob_ai; cargo test --locked --lib -- player::combat; bash scripts/combat_smoke.sh
+
+### R051 — Shortbow and shared arrow physics
+- Class: core-capability
+- Status: active
+- Description: The shortbow supports charge, release, and cancel, and shares gravity-affected arrow physics with block embedding and entity hits.
+- Why it matters: Ranged combat is the player's answer to skeletons, and shared physics keeps every arrow consistent.
+- Source: M009 / S07 bow and arrows
+- Primary owning slice: M009/S07
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- player::bow; cargo test --locked --lib -- world::arrow; bash scripts/combat_smoke.sh
+
+### R052 — Skeleton ranged AI and skeleton drops
+- Class: core-capability
+- Status: active
+- Description: Skeletons use ranged AI and drop bones, arrows, and a rare bow, and a skeleton arrow records the `Skeleton arrow` death cause.
+- Why it matters: Skeleton encounters need a distinct threat and reward identity that the death screen can explain.
+- Source: M009 / S08 skeleton combat
+- Primary owning slice: M009/S08
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::mob_ai; cargo test --locked --lib -- world::mob_loot; bash scripts/combat_smoke.sh
+
+### R053 — Creative inertness and mob/combat audio
+- Class: integration
+- Status: active
+- Description: Creative mode stays inert at both authority sites, and nine mob/combat audio slots play with per-file texture-pack fallback.
+- Why it matters: Creative must not fight or take damage, and combat needs audible feedback that pack authors can override.
+- Source: M009 / S09 creative and audio
+- Primary owning slice: M009/S09
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- creative_; cargo test --locked --lib -- world::mob_audio; bash scripts/pack_smoke.sh; bash scripts/combat_smoke.sh
+
+### R054 — M009 closure surface
+- Class: admin/support
+- Status: active
+- Description: M009 closes with the combat smoke proving the full real-binary capstone in debug and release, the registry and criterion trace carrying R045-R053, the docs updated, and the recorded human UAT prepared.
+- Why it matters: Closure must be reproducible on the assembled tree, and the sensory outcomes need recorded human judgment rather than inferred claims.
+- Source: M009 / S10 closure
+- Primary owning slice: M009/S10
+- Supporting slices: M009/S01, M009/S02, M009/S03, M009/S04, M009/S05, M009/S06, M009/S07, M009/S08, M009/S09
+- Validation: bash scripts/combat_smoke.sh; SMOKE_PROFILE=release bash scripts/combat_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -508,3 +608,17 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 6 | R043 | S01, S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session |
 | 7 | R044 | S08, S09 | cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --locked && bash scripts/requirements_check.sh && bash scripts/survival_smoke.sh && bash scripts/content_smoke.sh && cargo test --release --locked && bash scripts/requirements_check_selftest.sh && SMOKE_PROFILE=release bash scripts/survival_smoke.sh && SMOKE_PROFILE=release bash scripts/content_smoke.sh |
 | 8 | R044 | S04, S05, S06, S07, S09 | recorded human windowed UAT with screenshots |
+
+## M009 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R045, R048, R049 | S01, S04, S05 | cargo test --locked --lib -- render::mob && cargo test --locked --lib -- world::mob_loot && cargo test --locked --lib -- world::spawning && bash scripts/combat_smoke.sh |
+| 2 | R049, R050 | S05, S06 | cargo test --locked --lib -- world::spawning && cargo test --locked --lib -- world::mob_ai && bash scripts/combat_smoke.sh |
+| 3 | R047, R051 | S03, S07 | cargo test --locked --lib -- player::melee && cargo test --locked --lib -- player::bow && bash scripts/combat_smoke.sh |
+| 4 | R048, R051, R052 | S04, S07, S08 | cargo test --locked --lib -- world::mob_loot && cargo test --locked --lib -- world::arrow && cargo test --locked --lib -- world::mob_ai && bash scripts/combat_smoke.sh |
+| 5 | R046 | S02 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session && bash scripts/combat_smoke.sh |
+| 6 | R053 | S09 | cargo test --locked --lib -- creative_ && cargo test --locked --lib -- world::mob_audio && bash scripts/pack_smoke.sh && bash scripts/combat_smoke.sh |
+| 7 | R050 | S06 | cargo test --locked --lib -- world::mob_ai && cargo test --locked --lib -- player::combat && bash scripts/combat_smoke.sh |
+| 8 | R045, R053 | S01, S09 | cargo test --locked --lib -- render::mob && cargo test --locked --lib -- world::mob_audio && bash scripts/pack_smoke.sh && bash scripts/combat_smoke.sh |
+| 9 | R054 | S01, S02, S03, S04, S05, S06, S07, S08, S09, S10 | bash scripts/combat_smoke.sh && SMOKE_PROFILE=release bash scripts/combat_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |
