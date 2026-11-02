@@ -1156,6 +1156,208 @@ mod tests {
     }
 
     #[test]
+    fn vitals_metrics_never_overlap_across_supported_resolutions() {
+        // The acceptance contract S07's smoke and UAT rely on: at every
+        // supported surface the scaled vitals stack fits the measured hotbar,
+        // hearts and hunger stay separated by a visible gap, the air row keeps
+        // its own line, and no quad covers the selected-name strip band.
+        const SURFACES: [(u32, u32); 9] = [
+            (640, 480),
+            (800, 600),
+            (1280, 720),
+            (1366, 768),
+            (1920, 1080),
+            (2560, 1440),
+            (3840, 2160),
+            (720, 1280),
+            (1080, 1920),
+        ];
+
+        for (surface_w, surface_h) in SURFACES {
+            let rects = hotbar_slot_rects(surface_w, surface_h);
+            let hotbar_w = (rects[HOTBAR_SLOTS - 1].0 + rects[HOTBAR_SLOTS - 1].2) - rects[0].0;
+            let metrics = vitals_metrics(surface_w, surface_h);
+            assert!(
+                metrics.row_width * 2.0 + metrics.icon_gap <= hotbar_w + 1e-3,
+                "both scaled rows fit inside the hotbar at {surface_w}x{surface_h}: {} > {hotbar_w}",
+                metrics.row_width * 2.0 + metrics.icon_gap
+            );
+
+            let quads = vitals_quads(
+                &SurvivalState::full(),
+                GameMode::Survival,
+                true,
+                surface_w,
+                surface_h,
+            );
+
+            let hearts: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .collect();
+            let hunger: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .collect();
+            assert_eq!(
+                hearts.len(),
+                10,
+                "ten heart fills on {surface_w}x{surface_h}"
+            );
+            assert_eq!(
+                hunger.len(),
+                10,
+                "ten hunger fills on {surface_w}x{surface_h}"
+            );
+
+            let hearts_left = hearts.iter().map(|q| q.x).fold(f32::MAX, f32::min);
+            let hearts_right = hearts.iter().map(|q| q.x + q.w).fold(f32::MIN, f32::max);
+            let hunger_left = hunger.iter().map(|q| q.x).fold(f32::MAX, f32::min);
+            assert!(
+                (hearts_left - rects[0].0).abs() < 1e-3,
+                "hearts left-align to slot 0 at {surface_w}x{surface_h}: {hearts_left} != {}",
+                rects[0].0
+            );
+            assert!(
+                hunger_left - hearts_right >= metrics.icon_gap - 1e-3,
+                "visible center gap at {surface_w}x{surface_h}: {} - {} < {}",
+                hunger_left,
+                hearts_right,
+                metrics.icon_gap
+            );
+
+            let strip_top = selected_name_rect(surface_w, surface_h).1;
+            let surface_w_px = surface_w as f32;
+            let surface_h_px = surface_h as f32;
+            for quad in &quads {
+                assert!(
+                    quad.x >= 0.0,
+                    "quad x {} leaves the surface at {surface_w}x{surface_h}",
+                    quad.x
+                );
+                assert!(
+                    quad.x + quad.w <= surface_w_px + 1e-3,
+                    "quad right {} leaves the surface at {surface_w}x{surface_h}",
+                    quad.x + quad.w
+                );
+                assert!(
+                    quad.y >= 0.0,
+                    "quad y {} leaves the surface at {surface_w}x{surface_h}",
+                    quad.y
+                );
+                assert!(
+                    quad.y + quad.h <= surface_h_px + 1e-3,
+                    "quad bottom {} leaves the surface at {surface_w}x{surface_h}",
+                    quad.y + quad.h
+                );
+                assert!(
+                    quad.y + quad.h <= strip_top + 1e-3,
+                    "quad bottom {} covers the strip top {strip_top} at {surface_w}x{surface_h}",
+                    quad.y + quad.h
+                );
+            }
+
+            let air: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .collect();
+            assert_eq!(air.len(), 10, "ten air fills on {surface_w}x{surface_h}");
+            let air_bottom = air.iter().map(|q| q.y + q.h).fold(f32::MIN, f32::max);
+            let hunger_top = hunger.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+            assert!(
+                air_bottom < hunger_top,
+                "air keeps its own line above hunger at {surface_w}x{surface_h}: {air_bottom} !< {hunger_top}"
+            );
+        }
+
+        // Pinned geometry: the same continuous ratio must produce these exact
+        // scaled sizes, so a future constant change cannot silently drift.
+        for (surface_w, surface_h, icon, row_width) in [
+            (1280u32, 720u32, 14.5770f32, 162.1689f32),
+            (1920, 1080, 21.8655, 243.2534),
+            (3840, 2160, 43.7309, 486.5068),
+        ] {
+            let metrics = vitals_metrics(surface_w, surface_h);
+            assert!(
+                (metrics.icon_size - icon).abs() < 1e-3,
+                "pinned icon size at {surface_w}x{surface_h}: {} != {icon}",
+                metrics.icon_size
+            );
+            assert!(
+                (metrics.row_width - row_width).abs() < 1e-3,
+                "pinned row width at {surface_w}x{surface_h}: {} != {row_width}",
+                metrics.row_width
+            );
+        }
+
+        // 16:9 growth is strict and proportional: bigger surfaces scale the
+        // whole stack, not just some fields.
+        let mut previous: Option<(f32, f32)> = None;
+        for height in [720u32, 1080, 1440, 2160] {
+            let width = height / 9 * 16;
+            let metrics = vitals_metrics(width, height);
+            let ratio = metrics.icon_size / height as f32;
+            if let Some((previous_icon, previous_ratio)) = previous {
+                assert!(
+                    metrics.icon_size > previous_icon,
+                    "icon size must grow at 16:9 height {height}: {} !> {previous_icon}",
+                    metrics.icon_size
+                );
+                assert!(
+                    (ratio - previous_ratio).abs() < 1e-4,
+                    "icon/height ratio must stay constant at 16:9 height {height}: {ratio} != {previous_ratio}"
+                );
+            }
+            previous = Some((metrics.icon_size, ratio));
+        }
+    }
+
+    #[test]
+    fn vitals_metrics_stay_finite_on_portrait_and_tiny_surfaces() {
+        // Portrait and degenerate surfaces are finite-only: the vitals may sit
+        // off-screen on a 1x1 surface, but they must never panic or go NaN.
+        for (surface_w, surface_h) in [(400u32, 800u32), (0, 0), (1, 1), (8, 8)] {
+            let metrics = vitals_metrics(surface_w, surface_h);
+            assert!(
+                metrics.icon_size.is_finite(),
+                "icon size finite on {surface_w}x{surface_h}"
+            );
+            assert!(
+                metrics.icon_gap.is_finite() && metrics.icon_gap >= 0.0,
+                "icon gap finite and non-negative on {surface_w}x{surface_h}"
+            );
+            assert!(
+                metrics.row_gap.is_finite() && metrics.row_gap >= 0.0,
+                "row gap finite and non-negative on {surface_w}x{surface_h}"
+            );
+            assert!(
+                metrics.row_width.is_finite() && metrics.row_width >= 0.0,
+                "row width finite and non-negative on {surface_w}x{surface_h}"
+            );
+
+            let quads = vitals_quads(
+                &SurvivalState::full(),
+                GameMode::Survival,
+                true,
+                surface_w,
+                surface_h,
+            );
+            assert!(
+                !quads.is_empty(),
+                "vitals still draw on {surface_w}x{surface_h}"
+            );
+            for quad in &quads {
+                for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+                    assert!(
+                        value.is_finite(),
+                        "{name} finite on {surface_w}x{surface_h}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn vitals_quads_stay_finite_on_degenerate_surfaces() {
         for (w, h) in [(0, 0), (1, 1), (8, 8)] {
             for mode in [GameMode::Survival, GameMode::Creative] {
