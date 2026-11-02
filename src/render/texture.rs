@@ -1,8 +1,8 @@
 pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
 ///
-/// Layers 0..=22 are authored block art (23 layers, see
-/// [`crate::pack::LAYER_FILES`]); 23..=31 are reserved block placeholders no
+/// Layers 0..=24 are authored block art (25 layers, see
+/// [`crate::pack::LAYER_FILES`]); 25..=31 are reserved block placeholders no
 /// pack can override. Layers 32..=44 are the 13 authorable mob part layers
 /// (see [`crate::pack::MOB_LAYER_FILES`]) and 45..=47 are reserved spares.
 /// The WGSL `w1 & 255` wire format still holds because all 48 layers fit in
@@ -344,12 +344,85 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 ]
             }
         }),
+        // 23: Crafting Table Top - warm workbench board with a carved grid,
+        // dark border, and small metal/wood tool accents.
+        make_layer(32, |x, y, j| {
+            let border = x == 0 || y == 0 || x == 15 || y == 15;
+            let grid = x % 5 == 0 || y % 5 == 0;
+            let handle = x == 12 && (3..=7).contains(&y);
+            let blade = (3..=5).contains(&x) && y == 11;
+            let nail = (x == 9 && y == 4) || (x == 6 && y == 9);
+            if border {
+                [
+                    clamp_u8(92 + j / 2),
+                    clamp_u8(58 + j / 2),
+                    clamp_u8(30 + j / 2),
+                ]
+            } else if blade {
+                [
+                    clamp_u8(184 + j / 3),
+                    clamp_u8(184 + j / 3),
+                    clamp_u8(192 + j / 3),
+                ]
+            } else if handle {
+                [
+                    clamp_u8(120 + j / 2),
+                    clamp_u8(78 + j / 2),
+                    clamp_u8(40 + j / 2),
+                ]
+            } else if nail {
+                [
+                    clamp_u8(214 + j / 3),
+                    clamp_u8(168 + j / 3),
+                    clamp_u8(78 + j / 3),
+                ]
+            } else if grid {
+                [
+                    clamp_u8(126 + j / 2),
+                    clamp_u8(86 + j / 2),
+                    clamp_u8(44 + j / 2),
+                ]
+            } else {
+                [clamp_u8(188 + j), clamp_u8(140 + j), clamp_u8(82 + j)]
+            }
+        }),
+        // 24: Crafting Table Side - plank-toned body, darker top band, and
+        // vertical legs joined by a horizontal brace.
+        make_layer(33, |x, y, j| {
+            let top_band = y < 3;
+            let leg = x <= 2 || x >= 13;
+            let brace = (3..=12).contains(&x) && (9..=10).contains(&y);
+            let seam = y % 4 == 0;
+            if top_band {
+                [
+                    clamp_u8(110 + j / 2),
+                    clamp_u8(72 + j / 2),
+                    clamp_u8(36 + j / 2),
+                ]
+            } else if brace {
+                let d = if seam { -10 } else { 0 };
+                [
+                    clamp_u8(118 + d + j / 2),
+                    clamp_u8(82 + d + j / 2),
+                    clamp_u8(44 + d + j / 2),
+                ]
+            } else if leg {
+                [clamp_u8(96 + j), clamp_u8(64 + j), clamp_u8(32 + j)]
+            } else {
+                let d = if seam { -20 } else { 0 };
+                [
+                    clamp_u8(160 + d + j),
+                    clamp_u8(116 + d + j),
+                    clamp_u8(64 + d + j),
+                ]
+            }
+        }),
     ];
 
-    // 23..32: reserved block layers. They are not authorable (no pack file
+    // 25..32: reserved block layers. They are not authorable (no pack file
     // name maps to them). A deterministic magenta checker, offset per layer,
     // keeps each one opaque and visibly distinct from every authored layer.
-    layers.extend((23..MOB_LAYER_BASE).map(reserved_checker));
+    layers.extend((25..MOB_LAYER_BASE).map(reserved_checker));
 
     // 32..=44: the 13 authorable mob part layers, in `MOB_LAYER_FILES` order.
     // Each is deterministic, opaque (make_layer forces alpha 255), and
@@ -492,7 +565,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         }),
     ]);
 
-    // 45..48: reserved spare layers, same magenta checker rule as 23..32.
+    // 45..48: reserved spare layers, same magenta checker rule as 25..32.
     layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(reserved_checker));
 
     debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
@@ -677,7 +750,7 @@ mod tests {
     #[test]
     fn test_new_block_texture_layers_are_distinct() {
         let layers = generate_all_texture_layers_rgba();
-        let authored_new = [16usize, 17, 18, 19, 20, 21, 22];
+        let authored_new = [16usize, 17, 18, 19, 20, 21, 22, 23, 24];
 
         // Every new layer differs from every other new layer.
         for (offset, a) in authored_new.iter().enumerate() {
@@ -694,10 +767,19 @@ mod tests {
         }
         assert_ne!(layers[21], layers[9], "chest must differ from planks");
         assert_ne!(layers[22], layers[21], "loot chest must differ from chest");
+        // The crafting-table faces ship dedicated art instead of reusing the
+        // oak-plank layer (9) that the block sampled before this change.
+        assert_ne!(layers[23], layers[9], "table top must differ from planks");
+        assert_ne!(layers[24], layers[9], "table side must differ from planks");
+        assert_ne!(layers[23], layers[24], "table top and side must differ");
 
         // Every new layer is real art, not a flat color.
         for index in authored_new {
             let (pixels, _) = layers[index].as_chunks::<4>();
+            assert!(
+                pixels.iter().all(|px| px[3] == 255),
+                "layer {index} must stay opaque"
+            );
             let first = &pixels[0];
             assert!(
                 pixels.iter().any(|px| px != first),
@@ -709,15 +791,16 @@ mod tests {
     #[test]
     fn test_reserved_texture_layers_are_distinct_opaque_placeholders() {
         let layers = generate_all_texture_layers_rgba();
-        let authorable = 23usize;
+        let authorable = 25usize;
+        assert_eq!(authorable, 25, "authored block art coverage is 25 layers");
         assert_eq!(NUM_TEX_LAYERS as usize, 48);
 
-        // Block-reserved 23..32 and spare 45..48 both use the reserved rule;
+        // Block-reserved 25..32 and spare 45..48 both use the reserved rule;
         // neither range may alias authored art or mob art.
         let reserved: Vec<usize> = (authorable..MOB_LAYER_BASE as usize)
             .chain(MOB_SPARE_LAYER_BASE as usize..NUM_TEX_LAYERS as usize)
             .collect();
-        assert_eq!(reserved.len(), 9 + 3);
+        assert_eq!(reserved.len(), 7 + 3);
 
         for &index in &reserved {
             for authored in 0..authorable {
@@ -784,7 +867,7 @@ mod tests {
                 pixels.iter().any(|px| px != first),
                 "mob layer {index} must not be a flat color"
             );
-            for authored in 0..23usize {
+            for authored in 0..25usize {
                 assert_ne!(
                     layers[index], layers[authored],
                     "mob layer {index} must differ from authored layer {authored}"

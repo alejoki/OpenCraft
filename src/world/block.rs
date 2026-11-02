@@ -210,9 +210,14 @@ impl BlockId {
             BlockId::Bedrock => 12,
             BlockId::CoalOre => 14,
             BlockId::IronOre => 15,
-            // No dedicated crafting-table texture exists yet; reuse the oak
-            // plank layer so the block reads as wood until pack art arrives.
-            BlockId::CraftingTable => 9,
+            // Dedicated workbench art: the top face reads as a gridded board,
+            // the four sides as a braced plank body, and the underside stays
+            // oak planks against neighbouring blocks.
+            BlockId::CraftingTable => match face_dir {
+                2 => 23, // crafting table top
+                3 => 9,  // oak planks underside
+                _ => 24, // crafting table side
+            },
             // Placeholder only: water surfaces are carried on a separate,
             // deliberately un-uploaded mesh field, so this layer is never
             // sampled by the opaque GPU path. Kept inside 0..=31 so the
@@ -364,9 +369,32 @@ mod tests {
         assert_eq!(BlockId::CraftingTable.name(), "Crafting Table");
         assert!(BlockId::CraftingTable.is_solid());
         assert_eq!(BlockId::CraftingTable.break_duration_secs(), Some(0.8));
-        for face_dir in 0u8..6 {
-            assert_eq!(BlockId::CraftingTable.face_tex_layer(face_dir), 9);
+        assert_eq!(BlockId::CraftingTable.face_tex_layer(2), 23);
+        assert_eq!(BlockId::CraftingTable.face_tex_layer(3), 9);
+        for face_dir in [0u8, 1, 4, 5] {
+            assert_eq!(BlockId::CraftingTable.face_tex_layer(face_dir), 24);
         }
+    }
+
+    #[test]
+    fn test_crafting_table_face_layers_and_unchanged_neighbours() {
+        let face_layers =
+            |block: BlockId| [0u8, 1, 2, 3, 4, 5].map(|face| block.face_tex_layer(face));
+
+        // +X, -X, +Y(top), -Y(bottom), +Z, -Z
+        assert_eq!(
+            face_layers(BlockId::CraftingTable),
+            [24, 24, 23, 9, 24, 24],
+            "crafting table must use table top, plank underside, and table sides"
+        );
+
+        // No other block mapping moved while the table gained its own art.
+        assert_eq!(face_layers(BlockId::OakPlanks), [9; 6]);
+        assert_eq!(face_layers(BlockId::Chest), [21; 6]);
+        assert_eq!(face_layers(BlockId::LootChest), [22; 6]);
+        assert_eq!(face_layers(BlockId::Farmland), [16; 6]);
+        assert_eq!(face_layers(BlockId::OakLog), [7, 7, 6, 6, 7, 7]);
+        assert_eq!(face_layers(BlockId::Grass), [1, 1, 0, 2, 1, 1]);
     }
 
     #[test]

@@ -1468,7 +1468,7 @@ mod tests {
         assert_eq!((log.top, log.left, log.right), (6, 7, 7));
 
         let table = block_icon_layers(BlockId::CraftingTable);
-        assert_eq!((table.top, table.left, table.right), (9, 9, 9));
+        assert_eq!((table.top, table.left, table.right), (23, 24, 24));
     }
 
     #[test]
