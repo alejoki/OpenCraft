@@ -1913,10 +1913,7 @@ mod tests {
             1,
         )
         .expect("fresh tool is valid");
-        assert_eq!(
-            tooltip_lines(fresh),
-            vec!["Wood Axe", "Durability 59/59"]
-        );
+        assert_eq!(tooltip_lines(fresh), vec!["Wood Axe", "Durability 59/59"]);
     }
 
     #[test]

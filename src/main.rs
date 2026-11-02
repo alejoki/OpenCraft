@@ -47,11 +47,11 @@ use opencraft::ui::chest::{
 use opencraft::ui::hud::{
     bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
     hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
-    vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    selected_name_rect, vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
-    hit_test, layout, screen_labels, screen_quads, InventoryMode, InventoryScreen, InventoryTarget,
-    MAX_LABELS,
+    hit_test, hovered_item, layout, screen_labels, screen_quads, tooltip_lines, tooltip_rect,
+    InventoryMode, InventoryScreen, InventoryTarget, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
 use opencraft::ui::logo;
@@ -66,6 +66,7 @@ use opencraft::ui::screens::{
     NewGameScreen, NewGameTarget, PauseRow, ScreenKeyAction, DEATH_ROWS, DEATH_TITLE,
     MAIN_MENU_ROWS, NEW_GAME_ROWS, PAUSE_ROWS,
 };
+use opencraft::ui::selection::SelectionLabel;
 use opencraft::ui::{
     DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
     LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
@@ -1226,6 +1227,24 @@ fn gameplay_surface(playing: bool, inventory_open: bool, chest_open: bool) -> bo
 /// long message or a tiny surface always stays on screen. Pure so the layout
 /// is provable without GPU/window state.
 fn gameplay_notice_rect(surface_w: u32, surface_h: u32, text_width: f32) -> (f32, f32, f32, f32) {
+    let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
+        .iter()
+        .map(|rect| rect.1)
+        .fold(surface_h.max(1) as f32, f32::min);
+    gameplay_notice_rect_above(surface_w, surface_h, text_width, hotbar_top)
+}
+
+/// Backing-panel rect for the transient gameplay notice above `bottom`.
+///
+/// `bottom` is the lowest edge the notice may occupy. The selected-name strip
+/// passes its own top edge, so a notice never covers the transient item name;
+/// every other caller passes the hotbar top (the historical placement).
+fn gameplay_notice_rect_above(
+    surface_w: u32,
+    surface_h: u32,
+    text_width: f32,
+    bottom: f32,
+) -> (f32, f32, f32, f32) {
     let w_px = surface_w.max(1) as f32;
     let h_px = surface_h.max(1) as f32;
     let text_width = if text_width.is_finite() {
@@ -1233,15 +1252,53 @@ fn gameplay_notice_rect(surface_w: u32, surface_h: u32, text_width: f32) -> (f32
     } else {
         0.0
     };
+    let bottom = if bottom.is_finite() {
+        bottom.clamp(0.0, h_px)
+    } else {
+        h_px
+    };
     let width = (text_width + 16.0).min(w_px);
     let height = (LINE_HEIGHT + 8.0).min(h_px);
-    let hotbar_top = hotbar_slot_rects(surface_w, surface_h)
-        .iter()
-        .map(|rect| rect.1)
-        .fold(h_px, f32::min);
     let x = ((w_px - width) * 0.5).clamp(0.0, (w_px - width).max(0.0));
-    let y = (hotbar_top - height - 6.0).clamp(0.0, (h_px - height).max(0.0));
+    let y = (bottom - height - 6.0).clamp(0.0, (h_px - height).max(0.0));
     (x, y, width, height)
+}
+
+/// Tooltip text body plus its line count for one item.
+///
+/// Kept pure so the frame loop and the tests agree on the exact buffer text
+/// (`tooltip_lines` joined by newlines) and the line count fed to
+/// [`tooltip_rect`].
+fn tooltip_text(item: Item) -> (String, usize) {
+    let lines = tooltip_lines(item);
+    let line_count = lines.len();
+    (lines.join("\n"), line_count)
+}
+
+/// Whether the transient selected-name strip should draw this frame.
+///
+/// Requires a Playing screen, no inventory/chest panel owning the pointer, and
+/// a visible label (a non-empty selected stack inside its fade window).
+fn selected_name_should_draw(
+    playing: bool,
+    inventory_open: bool,
+    chest_open: bool,
+    label: &SelectionLabel,
+) -> bool {
+    playing && !inventory_open && !chest_open && label.is_visible()
+}
+
+/// glyphon default color for the selected-name label at `alpha`.
+///
+/// Non-finite values collapse to fully transparent rather than producing a
+/// corrupted color byte, and the result is always in `0..=255`.
+fn selected_name_color(alpha: f32) -> glyphon::Color {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    glyphon::Color::rgba(255, 255, 255, (alpha * 255.0).round() as u8)
 }
 
 /// Where a press-drag-release ends: only a different cell than the press origin
@@ -1965,6 +2022,14 @@ struct Ready {
     /// Load-screen "Delete" label column (S05-T02): same as
     /// `load_play_text`, positioned at `load_delete_rect`'s left/top.
     load_delete_text: StatsOverlay,
+    /// Hovered-stack tooltip (S05-T02): one change-gated buffer for the
+    /// name/count/durability lines, drawn in the same UI pass after the
+    /// inventory/chest panel labels. Sized once at startup.
+    tooltip_text: StatsOverlay,
+    /// Transient selected-item name above the hotbar (S05-T02): one
+    /// change-gated buffer whose glyphon default color carries the fade
+    /// alpha from `SelectionLabel`.
+    selected_name_text: StatsOverlay,
     /// Per-slot hotbar count labels (S03-T04): one change-gated buffer per
     /// slot, positioned at the same `hotbar_slot_rects` the outlines use.
     hotbar_counts: [StatsOverlay; HOTBAR_SLOTS],
@@ -7862,6 +7927,10 @@ struct GameApp {
     /// pattern as the screen messages, but it renders above the hotbar instead
     /// of on a menu panel.
     game_message: Option<MenuMessage>,
+    /// Transient selected-item name above the hotbar (S05-T02): observed and
+    /// ticked on every Playing frame, drawn only while no panel owns the
+    /// pointer. `new()` starts hidden, so a bare launch shows nothing.
+    selection_label: SelectionLabel,
     last_frame: Instant,
     title_timer: Instant,
     last_saved_badge: Option<Instant>,
@@ -8215,6 +8284,7 @@ impl GameApp {
             chest: ChestScreen::new(),
             chest_status: None,
             game_message: None,
+            selection_label: SelectionLabel::new(),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -9330,6 +9400,19 @@ impl ApplicationHandler for GameApp {
         );
         let load_play_text = StatsOverlay::new(&mut ui.font_system);
         let load_delete_text = StatsOverlay::new(&mut ui.font_system);
+        // Tooltip and transient selected-name buffers (S05-T02): same
+        // change-gated overlay type/metrics as the hotbar count labels, so a
+        // hover or selection only re-shapes when its text changes.
+        let tooltip_text = StatsOverlay::with_metrics(
+            &mut ui.font_system,
+            HOTBAR_COUNT_FONT_SIZE,
+            HOTBAR_COUNT_LINE_HEIGHT,
+        );
+        let selected_name_text = StatsOverlay::with_metrics(
+            &mut ui.font_system,
+            HOTBAR_COUNT_FONT_SIZE,
+            HOTBAR_COUNT_LINE_HEIGHT,
+        );
         let hotbar_counts = std::array::from_fn(|_| {
             StatsOverlay::with_metrics(
                 &mut ui.font_system,
@@ -9392,6 +9475,8 @@ impl ApplicationHandler for GameApp {
             title_text,
             load_play_text,
             load_delete_text,
+            tooltip_text,
+            selected_name_text,
             hotbar_counts,
             inventory_labels,
             chest_labels,
@@ -10267,6 +10352,16 @@ impl ApplicationHandler for GameApp {
                 // false and therefore plays nothing.
                 let mut mob_audio = MobAudioFrame::default();
                 if playing {
+                    // Transient selected-item name (S05-T02): observe and tick
+                    // on every Playing frame, including frames where an open
+                    // panel freezes gameplay, so selecting a slot while the
+                    // inventory is open still restarts the fade. Drawing is
+                    // gated separately (no panel may own the pointer).
+                    self.selection_label.observe(
+                        self.session.player.selected_slot(),
+                        self.session.player.selected_item(),
+                    );
+                    self.selection_label.tick(dt);
                     // Spawn gate (S04-T07): a fresh Survival session holds the
                     // whole gameplay movement block until the feet and support
                     // chunks are resident, so the body cannot fall through
@@ -10844,6 +10939,16 @@ impl ApplicationHandler for GameApp {
                             Some(gpu.load_delete_text.text_area(delete_x, play_y));
                     }
                 }
+                // Selected-item name (S05-T02): visible only while Playing,
+                // with no panel owning the pointer, and while the label's
+                // fade timer still has an item. Computed once here so the
+                // transient gameplay notice can move above it.
+                let selected_name_visible = selected_name_should_draw(
+                    playing,
+                    self.inventory.is_open(),
+                    self.chest.is_open(),
+                    &self.selection_label,
+                );
                 // Gameplay transient notice (S03-T05): a station that vanished
                 // under the player while Playing is reported above the hotbar
                 // through the existing menu text buffer and the same UI pass —
@@ -10858,7 +10963,18 @@ impl ApplicationHandler for GameApp {
                             &message.text,
                         );
                         let measured = gpu.menu_text.measured_width();
-                        let (x, y, w, h) = gameplay_notice_rect(surface_w, surface_h, measured);
+                        // When the selected-name strip is on screen, sit the
+                        // notice above it instead of sharing its row.
+                        let (x, y, w, h) = if selected_name_visible {
+                            gameplay_notice_rect_above(
+                                surface_w,
+                                surface_h,
+                                measured,
+                                selected_name_rect(surface_w, surface_h).1,
+                            )
+                        } else {
+                            gameplay_notice_rect(surface_w, surface_h, measured)
+                        };
                         quads.push(Quad {
                             x,
                             y,
@@ -10936,6 +11052,93 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Hover tooltips (S05-T02): a held stack is described when the
+                // pointer is not over an occupied target; otherwise the target
+                // itself is described through the same `hit_test`/`ChestTarget`
+                // model the click handlers use. Closed screens produce nothing.
+                let tooltip_hover = self.cursor_pos.and_then(|cursor| {
+                    if let Some(layout) = inventory_layout.as_ref() {
+                        hovered_item(
+                            inventory_mode,
+                            layout,
+                            self.session.player.inventory(),
+                            self.session.player.player_grid(),
+                            self.session.player.table_grid(),
+                            cursor,
+                        )
+                        .or_else(|| self.session.player.inventory().cursor())
+                    } else if let Some(layout) = chest_layout_value.as_ref() {
+                        let chest_item =
+                            chest_hit_test(&self.chest, layout, cursor).and_then(|target| {
+                                match target {
+                                    ChestTarget::ChestSlot(index) => self
+                                        .session
+                                        .open_chest_contents()
+                                        .and_then(|chest| chest.slot(index)),
+                                    ChestTarget::InventorySlot(index) => {
+                                        self.session.player.inventory().slot(index)
+                                    }
+                                }
+                            });
+                        chest_item.or_else(|| self.session.player.inventory().cursor())
+                    } else {
+                        None
+                    }
+                });
+                let mut tooltip_text_area = None;
+                if let (Some(item), Some(cursor)) = (tooltip_hover, self.cursor_pos) {
+                    let (text, line_count) = tooltip_text(item);
+                    debug_assert!(
+                        line_count <= 3,
+                        "tooltip_lines is capped at name + count + durability"
+                    );
+                    let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                    gpu.tooltip_text.update(
+                        &mut gpu.ui.font_system,
+                        surface_w as f32,
+                        surface_h as f32,
+                        &text,
+                    );
+                    let measured = gpu.tooltip_text.measured_width();
+                    let (x, y, w, h) =
+                        tooltip_rect(cursor, measured, line_count, surface_w, surface_h);
+                    quads.push(Quad {
+                        x,
+                        y,
+                        w,
+                        h,
+                        color: [0.05, 0.05, 0.08, 0.95],
+                    });
+                    tooltip_text_area = Some((x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y));
+                }
+                // Transient selected-item name (S05-T02): a dark one-line
+                // strip above the hotbar, faded through the glyphon default
+                // color. Only quads/text already in the same UI pass are used
+                // (no new pipeline), and panels hide it entirely.
+                let mut selected_name_text_area = None;
+                if selected_name_visible {
+                    if let Some(label) = self.selection_label.label() {
+                        let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        gpu.selected_name_text.update(
+                            &mut gpu.ui.font_system,
+                            surface_w as f32,
+                            surface_h as f32,
+                            &label,
+                        );
+                        let measured = gpu.selected_name_text.measured_width();
+                        let (x, y, w, h) = selected_name_rect(surface_w, surface_h);
+                        let left = x + ((w - measured).max(0.0)) * 0.5;
+                        let top = y + ((h - HOTBAR_COUNT_LINE_HEIGHT).max(0.0)) * 0.5;
+                        quads.push(Quad {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color: [0.0, 0.0, 0.0, 0.7],
+                        });
+                        selected_name_text_area = Some((left, top, self.selection_label.alpha()));
+                    }
+                }
                 gpu.ui.set_quads(
                     &gpu.ctx.device,
                     &quads,
@@ -11092,6 +11295,24 @@ impl ApplicationHandler for GameApp {
                 debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
                 for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
                     areas.push(buffer.text_area(label.left, label.top));
+                }
+                // Tooltip text rides the same UI pass, after the panel labels.
+                debug_assert!(tooltip_text_area.is_none() || tooltip_hover.is_some());
+                if let Some((left, top)) = tooltip_text_area {
+                    areas.push(gpu.tooltip_text.text_area_with_color(
+                        left,
+                        top,
+                        glyphon::Color::rgba(255, 255, 255, 255),
+                    ));
+                }
+                // Selected-name text rides the same UI pass, after the panel
+                // labels, with the fade alpha carried by the glyphon color.
+                if let Some((left, top, alpha)) = selected_name_text_area {
+                    areas.push(gpu.selected_name_text.text_area_with_color(
+                        left,
+                        top,
+                        selected_name_color(alpha),
+                    ));
                 }
                 let prepare_ok = gpu
                     .ui
@@ -23308,6 +23529,152 @@ mod tests {
         let (x, y, w, h) = gameplay_notice_rect(1, 1, 50.0);
         assert!(x >= 0.0 && y >= 0.0);
         assert!(x + w <= 1.0 && y + h <= 1.0);
+    }
+
+    #[test]
+    fn tooltip_text_and_placement_stay_inside_at_every_corner_and_tiny_surfaces() {
+        let stack = Item::new(ItemId::Block(BlockId::Stone), 64).expect("stack");
+        let (text, line_count) = tooltip_text(stack);
+        assert_eq!(text, "Stone\nx64");
+        assert_eq!(line_count, 2);
+
+        let pickaxe =
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("pickaxe");
+        let (text, line_count) = tooltip_text(pickaxe);
+        assert_eq!(text, "Iron Pickaxe\nDurability 137/250");
+        assert_eq!(line_count, 2);
+
+        let (surface_w, surface_h) = (1280u32, 720u32);
+        for anchor in [(0.0, 0.0), (1279.0, 0.0), (0.0, 719.0), (1279.0, 719.0)] {
+            let (x, y, w, h) = tooltip_rect(anchor, 120.0, line_count, surface_w, surface_h);
+            assert!(x >= 0.0 && y >= 0.0);
+            assert!(x + w <= surface_w as f32 && y + h <= surface_h as f32);
+        }
+
+        for (sw, sh) in [(0u32, 0u32), (1, 1), (8, 8)] {
+            let (x, y, w, h) = tooltip_rect((0.5, 0.5), 40.0, line_count, sw, sh);
+            assert!(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite());
+            assert!(x + w <= sw.max(1) as f32);
+            assert!(y + h <= sh.max(1) as f32);
+        }
+    }
+
+    fn stone(count: u16) -> Item {
+        Item::new(ItemId::Block(BlockId::Stone), count).expect("stone")
+    }
+
+    #[test]
+    fn selected_name_draw_gate_covers_playing_panels_and_lifecycle_screens() {
+        use opencraft::ui::selection::SELECTED_NAME_SECS;
+
+        let mut label = SelectionLabel::new();
+        assert!(
+            !selected_name_should_draw(true, false, false, &label),
+            "a fresh label is hidden until a selection is observed"
+        );
+
+        label.observe(3, Some(stone(1)));
+        assert!(selected_name_should_draw(true, false, false, &label));
+        assert!(
+            !selected_name_should_draw(true, true, false, &label),
+            "the inventory panel owns the pointer"
+        );
+        assert!(
+            !selected_name_should_draw(true, false, true, &label),
+            "the chest panel owns the pointer"
+        );
+        for screen in ["main menu", "pause", "death"] {
+            assert!(
+                !selected_name_should_draw(false, false, false, &label),
+                "{screen} frames must not draw the selected-name strip"
+            );
+        }
+
+        // Count changes restart the timer; the fade reaches zero at 2 s.
+        label.tick(1.5);
+        assert!(label.observe(3, Some(stone(4))));
+        assert_eq!(label.remaining(), SELECTED_NAME_SECS);
+        label.tick(SELECTED_NAME_SECS - 0.01);
+        assert!(label.is_visible() && label.alpha() > 0.0);
+        label.tick(0.02);
+        assert!(!label.is_visible());
+        assert!(!selected_name_should_draw(true, false, false, &label));
+    }
+
+    #[test]
+    fn selected_name_color_is_alpha_bounded_and_non_finite_safe() {
+        assert_eq!(
+            selected_name_color(1.0),
+            glyphon::Color::rgba(255, 255, 255, 255)
+        );
+        assert_eq!(
+            selected_name_color(0.0),
+            glyphon::Color::rgba(255, 255, 255, 0)
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0] {
+            assert_eq!(
+                selected_name_color(bad),
+                glyphon::Color::rgba(255, 255, 255, 0),
+                "alpha {bad} must collapse to transparent"
+            );
+        }
+        assert_eq!(selected_name_color(0.5).as_rgba()[3], 128);
+    }
+
+    #[test]
+    fn gameplay_notice_moves_above_the_selected_name_strip() {
+        let (surface_w, surface_h) = (1280u32, 720u32);
+        let strip = selected_name_rect(surface_w, surface_h);
+        let (x, y, w, h) = gameplay_notice_rect_above(surface_w, surface_h, 200.0, strip.1);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(x + w <= surface_w as f32);
+        assert!(
+            y + h <= strip.1,
+            "notice bottom {} must clear strip top {}",
+            y + h,
+            strip.1
+        );
+    }
+
+    #[test]
+    fn tooltip_and_selected_name_text_use_the_same_ui_pass_after_panel_labels() {
+        let src = include_str!("main.rs");
+        let inventory_labels = src
+            .find("// Inventory panel labels ride the same UI pass")
+            .expect("inventory label push is present");
+        let chest_labels = src
+            .find("// Chest panel labels ride the same UI pass")
+            .expect("chest label push is present");
+        let tooltip = src
+            .find("// Tooltip text rides the same UI pass")
+            .expect("tooltip text area push is present");
+        let selected = src
+            .find("// Selected-name text rides the same UI pass")
+            .expect("selected-name text area push is present");
+        let prepare = src
+            .find("&mut gpu.ui.swash_cache")
+            .expect("the single UI prepare call is present");
+
+        assert!(
+            tooltip > inventory_labels && tooltip > chest_labels,
+            "tooltip text must be appended after inventory/chest labels"
+        );
+        assert!(
+            selected > inventory_labels && selected > chest_labels,
+            "selected-name text must be appended after inventory/chest labels"
+        );
+        assert!(
+            tooltip < prepare && selected < prepare,
+            "both texts must ride the same UI prepare pass"
+        );
+        assert!(
+            src.contains("gpu.tooltip_text.text_area_with_color("),
+            "the tooltip must use the colored text area"
+        );
+        assert!(
+            src.contains(".text_area_with_color(left, top, selected_name_color(alpha))"),
+            "the selected-name label must use the faded colored text area"
+        );
     }
 
     #[test]
