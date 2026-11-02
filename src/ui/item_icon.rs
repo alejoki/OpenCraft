@@ -15,7 +15,9 @@ use wgpu::util::DeviceExt;
 
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
 use super::inventory::{InventoryLayout, InventoryMode, Rect};
-use crate::player::inventory::{CraftingGrid, Inventory, Item, ItemId};
+use crate::player::inventory::{
+    CraftingGrid, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
+};
 use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
 
@@ -95,6 +97,577 @@ pub const fn block_icon_layers(block: BlockId) -> BlockIconLayers {
         left: block.face_tex_layer(4),
         right: block.face_tex_layer(0),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Procedural item sprites
+// ---------------------------------------------------------------------------
+
+/// Number of layers in the UI-only procedural item sprite texture array.
+pub const ITEM_SPRITE_LAYERS: u32 = 32;
+
+/// Edge length, in texels, of every procedural item sprite layer.
+pub const ITEM_SPRITE_SIZE: u32 = 16;
+
+/// Byte length of one RGBA sprite layer (`16 * 16 * 4`).
+pub const ITEM_SPRITE_BYTES: usize = (ITEM_SPRITE_SIZE * ITEM_SPRITE_SIZE * 4) as usize;
+
+/// Where a carryable item's icon geometry and texture come from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IconSource {
+    /// Three-face cube sampled from the world block texture array.
+    Block(BlockIconLayers),
+    /// Axis-aligned quad sampled from the UI-only procedural sprite array.
+    Sprite(u32),
+}
+
+/// Append-only, index-pinned item sprite table.
+///
+/// These indices are a persistent contract: the sprite array is uploaded once
+/// per renderer and every icon batch refers to a layer by number. Never
+/// reorder, renumber, or reuse a slot; append new identities at the end (or in
+/// the next free block of their own kind).
+const ITEM_SPRITE_TABLE: [(ItemId, u32); 27] = [
+    (ItemId::Material(Material::Stick), 0),
+    (ItemId::Material(Material::Apple), 1),
+    (ItemId::Material(Material::Wheat), 2),
+    (ItemId::Material(Material::WheatSeeds), 3),
+    (ItemId::Material(Material::Bread), 4),
+    (ItemId::Material(Material::Leather), 5),
+    (ItemId::Material(Material::RawPorkchop), 6),
+    (ItemId::Material(Material::RawBeef), 7),
+    (ItemId::Material(Material::RottenFlesh), 8),
+    (ItemId::Material(Material::Bone), 9),
+    (ItemId::Material(Material::Arrow), 10),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Pickaxe,
+            tier: ToolTier::Wood,
+        },
+        11,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Pickaxe,
+            tier: ToolTier::Stone,
+        },
+        12,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Pickaxe,
+            tier: ToolTier::Iron,
+        },
+        13,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Axe,
+            tier: ToolTier::Wood,
+        },
+        14,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Axe,
+            tier: ToolTier::Stone,
+        },
+        15,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Axe,
+            tier: ToolTier::Iron,
+        },
+        16,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Shovel,
+            tier: ToolTier::Wood,
+        },
+        17,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Shovel,
+            tier: ToolTier::Stone,
+        },
+        18,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Shovel,
+            tier: ToolTier::Iron,
+        },
+        19,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Wood,
+        },
+        20,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Stone,
+        },
+        21,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Hoe,
+            tier: ToolTier::Iron,
+        },
+        22,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Wood,
+        },
+        23,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Stone,
+        },
+        24,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Sword,
+            tier: ToolTier::Iron,
+        },
+        25,
+    ),
+    (
+        ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        },
+        26,
+    ),
+];
+
+/// Procedural sprite layer for a material or constructible tool identity.
+///
+/// Blocks use the block texture array instead and return `None`. An
+/// unconstructible tool pair (for example a stone bow) also returns `None`, so
+/// a forged identity can never select a sprite that does not exist.
+pub fn item_sprite_layer(id: ItemId) -> Option<u32> {
+    if let ItemId::Tool { kind, tier } = id {
+        if !kind.allowed_tiers().contains(&tier) {
+            return None;
+        }
+    }
+    if matches!(id, ItemId::Block(_)) {
+        return None;
+    }
+    ITEM_SPRITE_TABLE
+        .iter()
+        .find_map(|(entry, layer)| (*entry == id).then_some(*layer))
+}
+
+/// Total icon-source mapping for every item identity.
+///
+/// Carryable blocks yield [`IconSource::Block`]; materials and constructible
+/// tools yield [`IconSource::Sprite`]. Uncarryable blocks and unconstructible
+/// tool pairs yield `None`. Every carryable identity has exactly one source,
+/// so a slot can never silently render empty.
+pub fn icon_source(id: ItemId) -> Option<IconSource> {
+    match id {
+        ItemId::Block(block) => block
+            .is_carryable()
+            .then(|| IconSource::Block(block_icon_layers(block))),
+        ItemId::Material(_) | ItemId::Tool { .. } => item_sprite_layer(id).map(IconSource::Sprite),
+    }
+}
+
+// Sprite palette. Every color is opaque; the canvas starts fully transparent.
+const WOOD: [u8; 4] = [0x8B, 0x5A, 0x2B, 0xFF];
+const WOOD_LIGHT: [u8; 4] = [0xB0, 0x7A, 0x3E, 0xFF];
+const WOOD_DARK: [u8; 4] = [0x5C, 0x3A, 0x1B, 0xFF];
+const APPLE_RED: [u8; 4] = [0xD3, 0x2F, 0x2F, 0xFF];
+const APPLE_LIGHT: [u8; 4] = [0xFF, 0x70, 0x70, 0xFF];
+const APPLE_DARK: [u8; 4] = [0x8E, 0x1A, 0x1A, 0xFF];
+const LEAF: [u8; 4] = [0x3F, 0xA3, 0x3F, 0xFF];
+const WHEAT_GOLD: [u8; 4] = [0xE0, 0xB8, 0x4C, 0xFF];
+const WHEAT_DARK: [u8; 4] = [0xB8, 0x8A, 0x2E, 0xFF];
+const STALK: [u8; 4] = [0x8C, 0x7A, 0x2E, 0xFF];
+const SEED: [u8; 4] = [0xD8, 0xB9, 0x6E, 0xFF];
+const SEED_DARK: [u8; 4] = [0x8C, 0x6B, 0x2F, 0xFF];
+const BREAD: [u8; 4] = [0xC8, 0x8A, 0x45, 0xFF];
+const BREAD_LIGHT: [u8; 4] = [0xE6, 0xB8, 0x74, 0xFF];
+const BREAD_DARK: [u8; 4] = [0x8B, 0x5A, 0x2B, 0xFF];
+const LEATHER: [u8; 4] = [0x9B, 0x5A, 0x2B, 0xFF];
+const LEATHER_DARK: [u8; 4] = [0x6B, 0x3A, 0x18, 0xFF];
+const LEATHER_LIGHT: [u8; 4] = [0xC8, 0x8A, 0x55, 0xFF];
+const PORK: [u8; 4] = [0xE8, 0x8B, 0x9A, 0xFF];
+const PORK_DARK: [u8; 4] = [0xC0, 0x5F, 0x70, 0xFF];
+const FAT: [u8; 4] = [0xF7, 0xE3, 0xE3, 0xFF];
+const BEEF: [u8; 4] = [0xA8, 0x33, 0x33, 0xFF];
+const BEEF_DARK: [u8; 4] = [0x7A, 0x1F, 0x1F, 0xFF];
+const BEEF_FAT: [u8; 4] = [0xE8, 0xC9, 0xB0, 0xFF];
+const ROTTEN: [u8; 4] = [0x7D, 0x8B, 0x3A, 0xFF];
+const ROTTEN_DARK: [u8; 4] = [0x4E, 0x5C, 0x24, 0xFF];
+const ROTTEN_BROWN: [u8; 4] = [0x8A, 0x63, 0x33, 0xFF];
+const BONE: [u8; 4] = [0xE8, 0xE0, 0xC8, 0xFF];
+const BONE_SHADOW: [u8; 4] = [0xB8, 0xAE, 0x94, 0xFF];
+const ARROW_SHAFT: [u8; 4] = [0x8B, 0x5A, 0x2B, 0xFF];
+const ARROW_HEAD: [u8; 4] = [0xB8, 0xBC, 0xC0, 0xFF];
+const FLETCH_WHITE: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
+const FLETCH_RED: [u8; 4] = [0xC0, 0x30, 0x30, 0xFF];
+const TIER_WOOD: [u8; 4] = [0xA9, 0x74, 0x38, 0xFF];
+const TIER_STONE: [u8; 4] = [0x8C, 0x8C, 0x8C, 0xFF];
+const TIER_IRON: [u8; 4] = [0xD9, 0xDD, 0xE2, 0xFF];
+const STRING: [u8; 4] = [0xD8, 0xD8, 0xD8, 0xFF];
+
+/// Tiny deterministic RGBA pixel canvas. The background starts fully
+/// transparent so the inventory/hotbar slot shows through every sprite.
+struct SpriteCanvas {
+    pixels: Vec<u8>,
+}
+
+impl SpriteCanvas {
+    fn new() -> Self {
+        Self {
+            pixels: vec![0; ITEM_SPRITE_BYTES],
+        }
+    }
+
+    fn pixel(&mut self, x: i32, y: i32, color: [u8; 4]) {
+        if x < 0 || y < 0 || x >= ITEM_SPRITE_SIZE as i32 || y >= ITEM_SPRITE_SIZE as i32 {
+            return;
+        }
+        let index = ((y as usize) * ITEM_SPRITE_SIZE as usize + x as usize) * 4;
+        self.pixels[index..index + 4].copy_from_slice(&color);
+    }
+
+    fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        for py in y..y + h {
+            for px in x..x + w {
+                self.pixel(px, py, color);
+            }
+        }
+    }
+
+    /// Bresenham line, one pixel wide.
+    fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            self.pixel(x, y, color);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    /// Stamp a square brush along a line.
+    fn line_thick(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, thickness: i32, color: [u8; 4]) {
+        let thickness = thickness.max(1);
+        for offset in 0..thickness {
+            self.line(x0 + offset, y0 + offset, x1 + offset, y1 + offset, color);
+        }
+    }
+
+    fn into_rgba(self) -> Vec<u8> {
+        self.pixels
+    }
+}
+
+/// Fill one-pixel-tall centered rows, top-down, from an array of widths.
+fn fill_centered_rows(canvas: &mut SpriteCanvas, top: i32, widths: &[i32], color: [u8; 4]) {
+    for (offset, width) in widths.iter().enumerate() {
+        let x = ITEM_SPRITE_SIZE as i32 / 2 - width / 2;
+        canvas.fill_rect(x, top + offset as i32, *width, 1, color);
+    }
+}
+
+const fn tier_color(tier: ToolTier) -> [u8; 4] {
+    match tier {
+        ToolTier::Wood => TIER_WOOD,
+        ToolTier::Stone => TIER_STONE,
+        ToolTier::Iron => TIER_IRON,
+    }
+}
+
+const fn tier_light(tier: ToolTier) -> [u8; 4] {
+    match tier {
+        ToolTier::Wood => [0xC9, 0x94, 0x52, 0xFF],
+        ToolTier::Stone => [0xB0, 0xB0, 0xB0, 0xFF],
+        ToolTier::Iron => [0xF2, 0xF5, 0xF8, 0xFF],
+    }
+}
+
+const fn tier_dark(tier: ToolTier) -> [u8; 4] {
+    match tier {
+        ToolTier::Wood => [0x7A, 0x4E, 0x22, 0xFF],
+        ToolTier::Stone => [0x5F, 0x5F, 0x5F, 0xFF],
+        ToolTier::Iron => [0x9A, 0xA0, 0xA8, 0xFF],
+    }
+}
+
+fn draw_stick(canvas: &mut SpriteCanvas) {
+    for step in 0..9 {
+        let x = 3 + step;
+        let y = 12 - step;
+        canvas.fill_rect(x, y, 2, 2, WOOD);
+        canvas.pixel(x, y, WOOD_LIGHT);
+    }
+    canvas.pixel(6, 8, WOOD_DARK);
+    canvas.pixel(9, 5, WOOD_DARK);
+}
+
+fn draw_apple(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 5, &[6, 8, 10, 10, 10, 8, 6, 4], APPLE_RED);
+    canvas.fill_rect(5, 7, 2, 2, APPLE_LIGHT);
+    canvas.pixel(11, 10, APPLE_DARK);
+    canvas.pixel(10, 11, APPLE_DARK);
+    canvas.pixel(9, 12, APPLE_DARK);
+    canvas.fill_rect(8, 2, 2, 3, WOOD_DARK);
+    canvas.fill_rect(10, 2, 3, 2, LEAF);
+    canvas.pixel(10, 2, [0x6F, 0xC8, 0x6F, 0xFF]);
+}
+
+fn draw_wheat(canvas: &mut SpriteCanvas) {
+    for x in [4, 8, 12] {
+        canvas.line(x, 13, x, 4, STALK);
+        canvas.pixel(x, 3, WHEAT_GOLD);
+        for y in [4, 6, 8, 10] {
+            canvas.fill_rect(x - 1, y, 2, 2, WHEAT_GOLD);
+            canvas.fill_rect(x + 1, y + 1, 2, 2, WHEAT_DARK);
+        }
+    }
+}
+
+fn draw_wheat_seeds(canvas: &mut SpriteCanvas) {
+    for (x, y) in [(3, 3), (8, 2), (5, 8), (10, 7), (7, 12), (11, 11)] {
+        canvas.fill_rect(x, y, 2, 3, SEED);
+        canvas.pixel(x + 1, y + 2, SEED_DARK);
+    }
+}
+
+fn draw_bread(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 5, &[6, 8, 10, 10, 10, 10, 8, 6], BREAD);
+    canvas.fill_rect(5, 5, 6, 1, BREAD_LIGHT);
+    canvas.line(6, 8, 7, 9, BREAD_DARK);
+    canvas.line(9, 8, 10, 9, BREAD_DARK);
+    canvas.line(12, 8, 13, 9, BREAD_DARK);
+    canvas.fill_rect(5, 12, 6, 1, BREAD_DARK);
+}
+
+fn draw_leather(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 4, &[6, 10, 10, 10, 10, 10, 10, 8], LEATHER);
+    canvas.fill_rect(5, 4, 6, 1, LEATHER_DARK);
+    canvas.fill_rect(4, 11, 8, 1, LEATHER_DARK);
+    for x in [5, 7, 9, 11] {
+        canvas.pixel(x, 6, LEATHER_LIGHT);
+        canvas.pixel(x, 10, LEATHER_LIGHT);
+    }
+    canvas.fill_rect(7, 7, 2, 2, LEATHER_DARK);
+}
+
+fn draw_raw_porkchop(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 5, &[7, 10, 10, 10, 10, 10, 8], PORK);
+    canvas.fill_rect(3, 7, 8, 1, FAT);
+    canvas.fill_rect(4, 9, 7, 1, FAT);
+    canvas.fill_rect(5, 11, 4, 1, PORK_DARK);
+    canvas.fill_rect(2, 8, 2, 3, BONE);
+    canvas.pixel(2, 8, BONE_SHADOW);
+}
+
+fn draw_raw_beef(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 5, &[6, 10, 10, 10, 10, 10, 8], BEEF);
+    canvas.line(5, 7, 8, 9, BEEF_FAT);
+    canvas.line(9, 6, 12, 8, BEEF_FAT);
+    canvas.fill_rect(5, 10, 5, 1, BEEF_DARK);
+    canvas.pixel(11, 9, BEEF_DARK);
+}
+
+fn draw_rotten_flesh(canvas: &mut SpriteCanvas) {
+    fill_centered_rows(canvas, 4, &[5, 8, 10, 10, 10, 8, 6], ROTTEN);
+    canvas.fill_rect(5, 6, 2, 2, ROTTEN_DARK);
+    canvas.fill_rect(10, 8, 2, 2, ROTTEN_BROWN);
+    canvas.fill_rect(7, 10, 2, 1, ROTTEN_DARK);
+    canvas.pixel(4, 8, ROTTEN_BROWN);
+    canvas.pixel(11, 5, ROTTEN_DARK);
+}
+
+fn draw_bone(canvas: &mut SpriteCanvas) {
+    canvas.fill_rect(7, 4, 2, 8, BONE);
+    canvas.fill_rect(5, 2, 3, 3, BONE);
+    canvas.fill_rect(9, 2, 3, 3, BONE);
+    canvas.fill_rect(5, 11, 3, 3, BONE);
+    canvas.fill_rect(9, 11, 3, 3, BONE);
+    canvas.fill_rect(10, 4, 1, 7, BONE_SHADOW);
+    canvas.pixel(11, 4, BONE_SHADOW);
+    canvas.pixel(7, 11, BONE_SHADOW);
+    canvas.pixel(5, 13, BONE_SHADOW);
+}
+
+fn draw_arrow(canvas: &mut SpriteCanvas) {
+    canvas.line_thick(3, 13, 10, 6, 1, ARROW_SHAFT);
+    canvas.fill_rect(9, 4, 2, 2, ARROW_HEAD);
+    canvas.fill_rect(10, 3, 2, 2, ARROW_HEAD);
+    canvas.fill_rect(11, 2, 2, 2, ARROW_HEAD);
+    canvas.pixel(13, 2, ARROW_HEAD);
+    canvas.fill_rect(2, 12, 2, 3, FLETCH_WHITE);
+    canvas.fill_rect(3, 14, 2, 2, FLETCH_RED);
+    canvas.pixel(2, 15, FLETCH_WHITE);
+}
+
+fn draw_handle(canvas: &mut SpriteCanvas) {
+    canvas.line_thick(3, 13, 10, 6, 2, WOOD);
+    canvas.line(3, 13, 10, 6, WOOD_LIGHT);
+    canvas.pixel(4, 14, WOOD_DARK);
+}
+
+fn draw_pickaxe(canvas: &mut SpriteCanvas, tier: ToolTier) {
+    draw_handle(canvas);
+    let head = tier_color(tier);
+    canvas.fill_rect(5, 3, 8, 2, head);
+    canvas.fill_rect(4, 4, 2, 2, head);
+    canvas.fill_rect(12, 4, 2, 2, head);
+    canvas.fill_rect(5, 3, 7, 1, tier_light(tier));
+    canvas.fill_rect(6, 5, 5, 1, tier_dark(tier));
+}
+
+fn draw_axe(canvas: &mut SpriteCanvas, tier: ToolTier) {
+    draw_handle(canvas);
+    let head = tier_color(tier);
+    canvas.fill_rect(9, 2, 4, 7, head);
+    canvas.fill_rect(12, 3, 1, 5, tier_light(tier));
+    canvas.fill_rect(9, 8, 3, 1, tier_dark(tier));
+    canvas.pixel(8, 3, head);
+    canvas.pixel(8, 4, head);
+}
+
+fn draw_shovel(canvas: &mut SpriteCanvas, tier: ToolTier) {
+    draw_handle(canvas);
+    let head = tier_color(tier);
+    canvas.fill_rect(9, 2, 3, 2, head);
+    canvas.fill_rect(8, 4, 5, 3, head);
+    canvas.fill_rect(9, 7, 3, 1, head);
+    canvas.fill_rect(9, 3, 2, 2, tier_light(tier));
+    canvas.fill_rect(9, 7, 3, 1, tier_dark(tier));
+}
+
+fn draw_hoe(canvas: &mut SpriteCanvas, tier: ToolTier) {
+    draw_handle(canvas);
+    let head = tier_color(tier);
+    canvas.fill_rect(7, 3, 7, 2, head);
+    canvas.fill_rect(12, 5, 2, 3, head);
+    canvas.fill_rect(7, 3, 6, 1, tier_light(tier));
+    canvas.fill_rect(13, 5, 1, 3, tier_dark(tier));
+}
+
+fn draw_sword(canvas: &mut SpriteCanvas, tier: ToolTier) {
+    let blade = tier_color(tier);
+    canvas.fill_rect(7, 1, 2, 9, blade);
+    canvas.fill_rect(7, 0, 2, 1, blade);
+    canvas.fill_rect(7, 1, 1, 8, tier_light(tier));
+    canvas.fill_rect(8, 2, 1, 7, tier_dark(tier));
+    canvas.fill_rect(4, 10, 8, 2, tier_dark(tier));
+    canvas.fill_rect(4, 10, 8, 1, tier_light(tier));
+    canvas.fill_rect(7, 12, 2, 3, WOOD);
+    canvas.fill_rect(7, 12, 1, 3, WOOD_LIGHT);
+    canvas.fill_rect(6, 15, 4, 1, WOOD_DARK);
+}
+
+fn draw_bow(canvas: &mut SpriteCanvas) {
+    let points = [
+        (5, 13),
+        (4, 11),
+        (4, 9),
+        (4, 7),
+        (5, 5),
+        (6, 4),
+        (7, 3),
+        (8, 2),
+    ];
+    for pair in points.windows(2) {
+        canvas.line_thick(pair[0].0, pair[0].1, pair[1].0, pair[1].1, 2, WOOD);
+    }
+    for (x, y) in points {
+        canvas.pixel(x, y, WOOD_LIGHT);
+    }
+    canvas.fill_rect(3, 8, 2, 3, WOOD_DARK);
+    canvas.line(5, 13, 8, 2, STRING);
+    canvas.pixel(8, 2, STRING);
+    canvas.pixel(5, 13, STRING);
+}
+
+fn draw_material(material: Material, canvas: &mut SpriteCanvas) {
+    match material {
+        Material::Stick => draw_stick(canvas),
+        Material::Apple => draw_apple(canvas),
+        Material::Wheat => draw_wheat(canvas),
+        Material::WheatSeeds => draw_wheat_seeds(canvas),
+        Material::Bread => draw_bread(canvas),
+        Material::Leather => draw_leather(canvas),
+        Material::RawPorkchop => draw_raw_porkchop(canvas),
+        Material::RawBeef => draw_raw_beef(canvas),
+        Material::RottenFlesh => draw_rotten_flesh(canvas),
+        Material::Bone => draw_bone(canvas),
+        Material::Arrow => draw_arrow(canvas),
+    }
+}
+
+fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
+    match id {
+        ItemId::Block(_) => {}
+        ItemId::Material(material) => draw_material(material, canvas),
+        ItemId::Tool { kind, tier } => {
+            if !kind.allowed_tiers().contains(&tier) {
+                return;
+            }
+            match kind {
+                ToolKind::Pickaxe => draw_pickaxe(canvas, tier),
+                ToolKind::Axe => draw_axe(canvas, tier),
+                ToolKind::Shovel => draw_shovel(canvas, tier),
+                ToolKind::Hoe => draw_hoe(canvas, tier),
+                ToolKind::Sword => draw_sword(canvas, tier),
+                ToolKind::Bow => draw_bow(canvas),
+            }
+        }
+    }
+}
+
+/// Generate every procedural item sprite layer as tightly packed RGBA bytes.
+///
+/// Returns exactly [`ITEM_SPRITE_LAYERS`] layers of [`ITEM_SPRITE_BYTES`]
+/// bytes. The result is deterministic: no randomness, clocks, or floating
+/// point, so two calls always compare byte-for-byte. Layers `27..32` are
+/// reserved and stay fully transparent.
+pub fn generate_item_sprite_layers_rgba() -> Vec<Vec<u8>> {
+    let mut layers = vec![vec![0u8; ITEM_SPRITE_BYTES]; ITEM_SPRITE_LAYERS as usize];
+    for (id, layer) in ITEM_SPRITE_TABLE {
+        let mut canvas = SpriteCanvas::new();
+        draw_item(id, &mut canvas);
+        layers[layer as usize] = canvas.into_rgba();
+    }
+    layers
 }
 
 /// Inset one slot rect into the icon area.
@@ -1189,6 +1762,254 @@ mod tests {
         assert!(
             renderer_at < ui_at,
             "the renderer must be constructed before the UI so its texture handles exist"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Procedural item sprite atlas and total icon mapping (S02-T01)
+    // -----------------------------------------------------------------------
+
+    const ALL_BLOCKS: [BlockId; 23] = [
+        BlockId::Air,
+        BlockId::Grass,
+        BlockId::Dirt,
+        BlockId::Stone,
+        BlockId::Cobblestone,
+        BlockId::Sand,
+        BlockId::OakLog,
+        BlockId::OakLeaves,
+        BlockId::OakPlanks,
+        BlockId::Brick,
+        BlockId::Snow,
+        BlockId::Bedrock,
+        BlockId::CoalOre,
+        BlockId::IronOre,
+        BlockId::CraftingTable,
+        BlockId::Water,
+        BlockId::Farmland,
+        BlockId::WheatStage0,
+        BlockId::WheatStage1,
+        BlockId::WheatStage2,
+        BlockId::WheatStage3,
+        BlockId::Chest,
+        BlockId::LootChest,
+    ];
+
+    const ALL_MATERIALS: [Material; 11] = [
+        Material::Stick,
+        Material::Apple,
+        Material::Wheat,
+        Material::WheatSeeds,
+        Material::Bread,
+        Material::Leather,
+        Material::RawPorkchop,
+        Material::RawBeef,
+        Material::RottenFlesh,
+        Material::Bone,
+        Material::Arrow,
+    ];
+
+    const TIERED_KINDS: [ToolKind; 5] = [
+        ToolKind::Pickaxe,
+        ToolKind::Axe,
+        ToolKind::Shovel,
+        ToolKind::Hoe,
+        ToolKind::Sword,
+    ];
+
+    const ALL_TIERS: [ToolTier; 3] = [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron];
+
+    fn all_tools() -> Vec<ItemId> {
+        let mut ids = Vec::new();
+        for kind in TIERED_KINDS {
+            for tier in ALL_TIERS {
+                ids.push(ItemId::Tool { kind, tier });
+            }
+        }
+        ids.push(ItemId::Tool {
+            kind: ToolKind::Bow,
+            tier: ToolTier::Wood,
+        });
+        ids
+    }
+
+    fn stable_hash(bytes: &[u8]) -> u64 {
+        // FNV-1a: tiny, deterministic, and stable across platforms.
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    #[test]
+    fn every_carryable_item_has_exactly_one_icon_source() {
+        let mut carryable_blocks = 0;
+        for block in ALL_BLOCKS {
+            let id = ItemId::Block(block);
+            match icon_source(id) {
+                Some(IconSource::Block(layers)) => {
+                    assert!(block.is_carryable(), "{block:?} is not carryable");
+                    assert_eq!(layers, block_icon_layers(block));
+                    assert_eq!(item_sprite_layer(id), None, "blocks never use sprites");
+                    carryable_blocks += 1;
+                }
+                Some(IconSource::Sprite(_)) => {
+                    panic!("block {block:?} must use the block texture array")
+                }
+                None => assert!(
+                    !block.is_carryable(),
+                    "carryable block {block:?} has no icon source"
+                ),
+            }
+        }
+        let expected_carryable = ALL_BLOCKS.iter().filter(|b| b.is_carryable()).count();
+        assert_eq!(carryable_blocks, expected_carryable);
+
+        for material in ALL_MATERIALS {
+            let id = ItemId::Material(material);
+            match icon_source(id) {
+                Some(IconSource::Sprite(layer)) => {
+                    assert_eq!(item_sprite_layer(id), Some(layer))
+                }
+                other => panic!("material {material:?} icon source {other:?}"),
+            }
+        }
+
+        for id in all_tools() {
+            match icon_source(id) {
+                Some(IconSource::Sprite(layer)) => {
+                    assert_eq!(item_sprite_layer(id), Some(layer))
+                }
+                other => panic!("tool {id:?} icon source {other:?}"),
+            }
+        }
+
+        // Unconstructible tool pairs are unrepresentable as icons too.
+        for tier in [ToolTier::Stone, ToolTier::Iron] {
+            let id = ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier,
+            };
+            assert_eq!(item_sprite_layer(id), None, "{tier:?} bow must not exist");
+            assert_eq!(icon_source(id), None, "{tier:?} bow must not exist");
+        }
+    }
+
+    #[test]
+    fn sprite_atlas_has_32_layers_of_16x16_rgba() {
+        let layers = generate_item_sprite_layers_rgba();
+        assert_eq!(layers.len(), ITEM_SPRITE_LAYERS as usize);
+        for (index, layer) in layers.iter().enumerate() {
+            assert_eq!(
+                layer.len(),
+                ITEM_SPRITE_BYTES,
+                "layer {index} must be 16*16*4 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn used_sprite_layers_are_opaque_deterministic_and_pairwise_distinct() {
+        let first = generate_item_sprite_layers_rgba();
+        let second = generate_item_sprite_layers_rgba();
+        assert_eq!(first, second, "sprite generation must be deterministic");
+
+        let mut used = Vec::new();
+        for (_, layer) in ITEM_SPRITE_TABLE {
+            used.push(layer);
+        }
+        assert_eq!(used.len(), 27, "the pinned table has 27 identities");
+
+        let mut hashes = std::collections::HashSet::new();
+        for layer in &used {
+            let bytes = &first[*layer as usize];
+            let opaque = bytes.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+            assert!(
+                opaque >= 24,
+                "layer {layer} must be a real sprite, only {opaque} opaque pixels"
+            );
+            assert!(
+                hashes.insert(stable_hash(bytes)),
+                "layer {layer} duplicates another sprite"
+            );
+        }
+        assert_eq!(hashes.len(), 27, "every used sprite must be distinct");
+
+        for layer in 27..ITEM_SPRITE_LAYERS {
+            assert!(
+                first[layer as usize].iter().all(|byte| *byte == 0),
+                "reserved layer {layer} must stay fully transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tool_tier_sprite_differs_from_its_siblings() {
+        let layers = generate_item_sprite_layers_rgba();
+        let sprite = |kind: ToolKind, tier: ToolTier| {
+            let id = ItemId::Tool { kind, tier };
+            let layer = item_sprite_layer(id).expect("constructible tool has a sprite");
+            &layers[layer as usize]
+        };
+
+        for kind in TIERED_KINDS {
+            let wood = sprite(kind, ToolTier::Wood);
+            let stone = sprite(kind, ToolTier::Stone);
+            let iron = sprite(kind, ToolTier::Iron);
+            assert_ne!(wood, stone, "{kind:?} wood and stone must differ");
+            assert_ne!(stone, iron, "{kind:?} stone and iron must differ");
+            assert_ne!(wood, iron, "{kind:?} wood and iron must differ");
+        }
+
+        // The wood-only bow must not alias any tiered tool sprite.
+        let bow = sprite(ToolKind::Bow, ToolTier::Wood);
+        for kind in TIERED_KINDS {
+            assert_ne!(bow, sprite(kind, ToolTier::Wood), "bow must be unique");
+        }
+    }
+
+    #[test]
+    fn sprite_layer_indices_are_pinned_and_append_only() {
+        for (index, material) in ALL_MATERIALS.iter().enumerate() {
+            assert_eq!(
+                item_sprite_layer(ItemId::Material(*material)),
+                Some(index as u32),
+                "material {material:?} index moved"
+            );
+        }
+
+        assert_eq!(
+            item_sprite_layer(ItemId::Material(Material::Stick)),
+            Some(0)
+        );
+        assert_eq!(
+            item_sprite_layer(ItemId::Material(Material::Arrow)),
+            Some(10)
+        );
+
+        for (kind_index, kind) in TIERED_KINDS.iter().enumerate() {
+            for (tier_index, tier) in ALL_TIERS.iter().enumerate() {
+                let expected = 11 + kind_index as u32 * 3 + tier_index as u32;
+                assert_eq!(
+                    item_sprite_layer(ItemId::Tool {
+                        kind: *kind,
+                        tier: *tier
+                    }),
+                    Some(expected),
+                    "{kind:?} {tier:?} index moved"
+                );
+            }
+        }
+
+        assert_eq!(
+            item_sprite_layer(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood
+            }),
+            Some(26),
+            "the bow is pinned to the final used layer"
         );
     }
 }
