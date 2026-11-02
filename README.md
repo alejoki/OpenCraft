@@ -110,6 +110,20 @@ SMOKE_PROFILE=release bash scripts/combat_smoke.sh
 
 The script proves the assembled seam (spawn, walk, melee, drops, zombie fight, bow shot, skeleton shot, Creative inertness, save, relaunch restore). It is not a player feature.
 
+`scripts/ui_smoke.sh` is the real-binary UI polish proof for M013. It builds the game, runs the headless `--demo-ui` digest seam, and compares its three lines byte-for-byte against pinned 1280x720, 1920x1080, and 3840x2160 contracts for textured item icons, the separated hotbar, table art, tooltip flip, selection fade, and vitals spacing. It then launches a real 10-second world and requires the timeout kill (exit 124) with no panic, proving the production UI pipelines initialize on the event loop:
+
+```bash
+bash scripts/ui_smoke.sh
+```
+
+For the release binary, opt in with `SMOKE_PROFILE`:
+
+```bash
+SMOKE_PROFILE=release bash scripts/ui_smoke.sh
+```
+
+`--demo-ui` can also be run directly (`target/debug/opencraft --demo-ui`). It prints the same three pinned `ui_demo:` lines and exits before creating a world, loading a save, or opening a window.
+
 ## 🎮 Controls
 
 ### General
