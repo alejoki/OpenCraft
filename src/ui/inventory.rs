@@ -61,8 +61,7 @@ pub const HOTBAR_SEPARATOR_THICKNESS: f32 = 2.0;
 const SLOT_COLUMNS: usize = HOTBAR_SLOTS;
 const STORAGE_ROWS: usize = MAIN_SLOTS / SLOT_COLUMNS;
 const SLOTS_W: f32 = SLOT_COLUMNS as f32 * SLOT_SIZE + (SLOT_COLUMNS as f32 - 1.0) * SLOT_GAP;
-const STORAGE_H: f32 =
-    STORAGE_ROWS as f32 * SLOT_SIZE + (STORAGE_ROWS as f32 - 1.0) * SLOT_GAP;
+const STORAGE_H: f32 = STORAGE_ROWS as f32 * SLOT_SIZE + (STORAGE_ROWS as f32 - 1.0) * SLOT_GAP;
 const PLAYER_GRID_W: f32 = 2.0 * SLOT_SIZE + SLOT_GAP;
 const PLAYER_GRID_H: f32 = PLAYER_GRID_W;
 const TABLE_GRID_W: f32 = 4.0 * SLOT_SIZE + 3.0 * SLOT_GAP;
@@ -914,7 +913,10 @@ mod tests {
         // The separator spans the panel's inner width, sits inside the gap,
         // and overlaps no slot.
         let separator = layout.hotbar_separator;
-        assert!(inside_panel(separator, panel), "separator escapes the panel");
+        assert!(
+            inside_panel(separator, panel),
+            "separator escapes the panel"
+        );
         let pad = panel.2 * (PANEL_PAD / PANEL_W);
         assert!((separator.0 - (panel.0 + pad)).abs() <= f32::EPSILON);
         assert!((separator.2 - (panel.2 - 2.0 * pad)).abs() <= f32::EPSILON);
@@ -1028,19 +1030,27 @@ mod tests {
                 &table_grid,
                 Some("full"),
             );
-            assert!(labels.len() <= MAX_LABELS, "{w}x{h}: {} labels", labels.len());
+            assert!(
+                labels.len() <= MAX_LABELS,
+                "{w}x{h}: {} labels",
+                labels.len()
+            );
 
             // Every occupied slot contributes its count label. Slot 0 is the
             // worn pickaxe (count 1 plus a durability line); the rest are
             // stone stacks 2..=36.
             let slot_counts: Vec<String> = (0..INVENTORY_SLOTS)
-                .map(|index| inventory.slot(index).expect("slot is full").count().to_string())
+                .map(|index| {
+                    inventory
+                        .slot(index)
+                        .expect("slot is full")
+                        .count()
+                        .to_string()
+                })
                 .collect();
             for (index, count) in slot_counts.iter().enumerate() {
                 assert!(
-                    labels
-                        .iter()
-                        .any(|label| label.text == *count),
+                    labels.iter().any(|label| label.text == *count),
                     "{w}x{h}: slot {index} count {count} is missing"
                 );
             }
