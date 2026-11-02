@@ -101,6 +101,19 @@ fn vitals_metrics_from_hotbar_width(hotbar_w: f32) -> VitalsMetrics {
     }
 }
 
+/// Top edge of the air row, i.e. the topmost pixel the vitals stack occupies.
+///
+/// The stack hangs below the selected-name strip band: the heart/hunger row
+/// sits one row gap plus one icon below the strip's top edge, and the air row
+/// sits the same distance above that. Reserving the strip band unconditionally
+/// keeps the vitals from jumping when the transient name appears or fades.
+/// Every value is finite on degenerate surfaces because
+/// [`selected_name_rect`] and [`vitals_metrics`] both clamp their output.
+pub fn vitals_stack_top(surface_w: u32, surface_h: u32) -> f32 {
+    let metrics = vitals_metrics(surface_w, surface_h);
+    selected_name_rect(surface_w, surface_h).1 - 2.0 * (metrics.row_gap + metrics.icon_size)
+}
+
 /// Hotbar slot rects in physical pixels `(x, y, w, h)` (top-left origin).
 ///
 /// Derived from the same NDC helper the overlay outlines use, so labels and
@@ -318,9 +331,13 @@ pub fn air_bubbles(air: u16) -> u8 {
 /// Creative is structurally exempt: it draws nothing even when vitals are low
 /// or the head is submerged. Survival draws ten hearts anchored to the first
 /// hotbar slot's left edge and ten hunger pips anchored to the last hotbar
-/// slot's right edge, both one row above the hotbar. When the head is
-/// submerged or the lungs are not full, ten air bubbles appear one row above
-/// the hunger row, right-aligned to the same hotbar edge.
+/// slot's right edge, both one row above the selected-name strip band. When
+/// the head is submerged or the lungs are not full, ten air bubbles appear one
+/// row above the hunger row, right-aligned to the same hotbar edge.
+///
+/// The strip band is reserved unconditionally (see [`vitals_stack_top`]), so
+/// the vitals never jump when the transient selected name appears or fades,
+/// and the strip can never paint over hearts or hunger.
 ///
 /// Every icon gets a dark background quad so an empty row is still legible;
 /// a filled icon adds a colored quad scaled by its fill fraction (a half heart
@@ -341,17 +358,20 @@ pub fn vitals_quads(
     }
 
     let rects = hotbar_slot_rects(surface_w, surface_h);
-    let (first_x, hotbar_top, _, _) = rects[0];
+    let (first_x, _, _, _) = rects[0];
     let (last_x, _, last_w, _) = rects[HOTBAR_SLOTS - 1];
     let right_edge = last_x + last_w;
     let metrics = vitals_metrics_from_hotbar_width(right_edge - first_x);
 
     // Hunger and air are right-aligned to the hotbar's right edge; hearts are
-    // left-aligned to its left edge. Both rows share the same ten-icon width,
-    // and the row gap lifts them clear of the hotbar and each other. The icon
-    // size, gap, and row height all scale from the measured hotbar width, so
-    // the two rows can never overlap.
-    let heart_y = hotbar_top - metrics.row_gap - metrics.icon_size;
+    // left-aligned to its left edge. Both rows share the same ten-icon width.
+    // The stack hangs below the selected-name strip band, not the hotbar: the
+    // strip is painted later, so anchoring here keeps hearts and hunger visible
+    // whether or not the transient name is showing. The icon size, gap, and row
+    // height all scale from the measured hotbar width, so the two rows can
+    // never overlap.
+    let strip_top = selected_name_rect(surface_w, surface_h).1;
+    let heart_y = strip_top - metrics.row_gap - metrics.icon_size;
     let air_y = heart_y - metrics.row_gap - metrics.icon_size;
     let hunger_x = right_edge - metrics.row_width;
     let step = metrics.icon_size + metrics.icon_gap;
@@ -952,6 +972,7 @@ mod tests {
         let last_right = rects[HOTBAR_SLOTS - 1].0 + rects[HOTBAR_SLOTS - 1].2;
         let hotbar_w = last_right - rects[0].0;
         let metrics = vitals_metrics(surface_w, surface_h);
+        let strip_top = selected_name_rect(surface_w, surface_h).1;
         let quads = vitals_quads(
             &SurvivalState::full(),
             GameMode::Survival,
@@ -965,6 +986,10 @@ mod tests {
                 quad.y + quad.h <= hotbar_top + 1e-4,
                 "every vitals row sits above the hotbar top"
             );
+            assert!(
+                quad.y + quad.h <= strip_top + 1e-3,
+                "every vitals quad clears the selected-name strip top {strip_top}"
+            );
         }
 
         let hearts: Vec<_> = quads
@@ -972,6 +997,12 @@ mod tests {
             .filter(|quad| quad.color == HEART_FILL_COLOR)
             .collect();
         assert_eq!(hearts.len(), 10);
+        let hearts_top = hearts.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+        assert_close(
+            hearts_top,
+            strip_top - metrics.row_gap - metrics.icon_size,
+            "hearts sit one row gap and one icon below the strip top",
+        );
         let hearts_left = hearts.iter().map(|q| q.x).fold(f32::MAX, f32::min);
         let hearts_right = hearts.iter().map(|q| q.x + q.w).fold(f32::MIN, f32::max);
         assert_close(hearts_left, rects[0].0, "hearts left-aligned to slot 0");
@@ -1021,8 +1052,112 @@ mod tests {
     }
 
     #[test]
+    fn vitals_stack_hangs_below_the_selected_name_strip_on_every_surface() {
+        for (surface_w, surface_h) in [(640u32, 480u32), (1280, 720), (1920, 1080), (720, 1280)] {
+            let strip = selected_name_rect(surface_w, surface_h);
+            let metrics = vitals_metrics(surface_w, surface_h);
+            let quads = vitals_quads(
+                &SurvivalState::full(),
+                GameMode::Survival,
+                true,
+                surface_w,
+                surface_h,
+            );
+            assert_eq!(
+                quads.len(),
+                VITALS_ICON_COUNT * 6,
+                "full vitals and a submerged head draw hearts, hunger, and air"
+            );
+
+            let hearts: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == HEART_FILL_COLOR)
+                .collect();
+            let hearts_top = hearts.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+            assert_close(
+                hearts_top,
+                strip.1 - metrics.row_gap - metrics.icon_size,
+                "hearts top anchors to the reserved strip band",
+            );
+
+            let air: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == AIR_FILL_COLOR)
+                .collect();
+            let hunger: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.color == HUNGER_FILL_COLOR)
+                .collect();
+            let air_bottom = air.iter().map(|q| q.y + q.h).fold(f32::MIN, f32::max);
+            let hunger_top = hunger.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+            assert!(
+                air_bottom < hunger_top,
+                "air row stays on its own line above hunger on {surface_w}x{surface_h}"
+            );
+
+            let surface_w_px = surface_w as f32;
+            let surface_h_px = surface_h as f32;
+            for quad in &quads {
+                assert!(
+                    quad.y + quad.h <= strip.1 + 1e-3,
+                    "quad bottom {} covers the strip top {} on {surface_w}x{surface_h}",
+                    quad.y + quad.h,
+                    strip.1
+                );
+                assert!(
+                    quad.x >= 0.0 && quad.x + quad.w <= surface_w_px + 1e-3,
+                    "quad x span {}..{} leaves {surface_w}x{surface_h}",
+                    quad.x,
+                    quad.x + quad.w
+                );
+                assert!(
+                    quad.y >= 0.0 && quad.y + quad.h <= surface_h_px + 1e-3,
+                    "quad y span {}..{} leaves {surface_w}x{surface_h}",
+                    quad.y,
+                    quad.y + quad.h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vitals_stack_stays_finite_on_degenerate_surfaces() {
+        for (surface_w, surface_h) in [(0u32, 0u32), (1, 1), (8, 8)] {
+            let stack_top = vitals_stack_top(surface_w, surface_h);
+            assert!(
+                stack_top.is_finite(),
+                "stack top finite on {surface_w}x{surface_h}"
+            );
+            let metrics = vitals_metrics(surface_w, surface_h);
+            assert!(metrics.icon_size.is_finite() && metrics.icon_size >= 0.0);
+            assert!(metrics.icon_gap.is_finite() && metrics.icon_gap >= 0.0);
+            assert!(metrics.row_gap.is_finite() && metrics.row_gap >= 0.0);
+            assert!(metrics.row_width.is_finite() && metrics.row_width >= 0.0);
+
+            // Negative y is acceptable on a surface too small for the stack;
+            // the vitals must stay finite and panic-free, not be clamped into
+            // the hotbar.
+            let quads = vitals_quads(
+                &SurvivalState::full(),
+                GameMode::Survival,
+                true,
+                surface_w,
+                surface_h,
+            );
+            for quad in &quads {
+                for (name, value) in [("x", quad.x), ("y", quad.y), ("w", quad.w), ("h", quad.h)] {
+                    assert!(
+                        value.is_finite(),
+                        "{name} finite on {surface_w}x{surface_h}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn vitals_quads_stay_finite_on_degenerate_surfaces() {
-        for (w, h) in [(0, 0), (1, 1)] {
+        for (w, h) in [(0, 0), (1, 1), (8, 8)] {
             for mode in [GameMode::Survival, GameMode::Creative] {
                 let quads = vitals_quads(&SurvivalState::full(), mode, true, w, h);
                 for quad in &quads {

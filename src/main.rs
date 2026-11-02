@@ -47,7 +47,8 @@ use opencraft::ui::chest::{
 use opencraft::ui::hud::{
     bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
     hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
-    selected_name_rect, vitals_quads, HOTBAR_COUNT_FONT_SIZE, HOTBAR_COUNT_LINE_HEIGHT,
+    selected_name_rect, vitals_quads, vitals_stack_top, HOTBAR_COUNT_FONT_SIZE,
+    HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, hovered_item, layout, screen_labels, screen_quads, tooltip_lines, tooltip_rect,
@@ -10964,13 +10965,15 @@ impl ApplicationHandler for GameApp {
                         );
                         let measured = gpu.menu_text.measured_width();
                         // When the selected-name strip is on screen, sit the
-                        // notice above it instead of sharing its row.
+                        // notice above the vitals stack, which itself hangs
+                        // below the reserved strip band, instead of sharing
+                        // its row.
                         let (x, y, w, h) = if selected_name_visible {
                             gameplay_notice_rect_above(
                                 surface_w,
                                 surface_h,
                                 measured,
-                                selected_name_rect(surface_w, surface_h).1,
+                                vitals_stack_top(surface_w, surface_h),
                             )
                         } else {
                             gameplay_notice_rect(surface_w, surface_h, measured)
@@ -23627,12 +23630,18 @@ mod tests {
     }
 
     #[test]
-    fn gameplay_notice_moves_above_the_selected_name_strip() {
+    fn gameplay_notice_moves_above_the_selected_name_strip_and_vitals_stack() {
         let (surface_w, surface_h) = (1280u32, 720u32);
         let strip = selected_name_rect(surface_w, surface_h);
-        let (x, y, w, h) = gameplay_notice_rect_above(surface_w, surface_h, 200.0, strip.1);
+        let stack_top = vitals_stack_top(surface_w, surface_h);
+        let (x, y, w, h) = gameplay_notice_rect_above(surface_w, surface_h, 200.0, stack_top);
         assert!(x >= 0.0 && y >= 0.0);
         assert!(x + w <= surface_w as f32);
+        assert!(
+            y + h <= stack_top,
+            "notice bottom {} must clear the vitals stack top {stack_top}",
+            y + h
+        );
         assert!(
             y + h <= strip.1,
             "notice bottom {} must clear strip top {}",
