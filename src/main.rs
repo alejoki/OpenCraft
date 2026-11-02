@@ -9305,7 +9305,11 @@ impl ApplicationHandler for GameApp {
         }
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
-        let mut ui = UiRenderer::new(&ctx);
+        let mut ui = UiRenderer::new(
+            &ctx,
+            &renderer.block_texture_view,
+            &renderer.block_texture_sampler,
+        );
         // Startup logo upload (M004/S04): the texture is created exactly once
         // per pack selection, never on the render hot path. Default (`None`)
         // leaves the logo renderer empty so the text title shows instead.

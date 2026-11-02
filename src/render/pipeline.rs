@@ -695,6 +695,14 @@ pub struct VoxelRenderer {
     /// re-upload layer data into the existing texture (MEM111). The view and
     /// bind group above stay valid because only the contents change.
     pub block_texture: wgpu::Texture,
+    /// D2Array view over [`Self::block_texture`], exposed so the UI icon
+    /// pipeline can sample the same pack layers the world uses. The view
+    /// points at the texture object, so `write_block_layers` re-uploads keep
+    /// it valid without recreating either handle.
+    pub block_texture_view: wgpu::TextureView,
+    /// Nearest-filtered sampler matching the block array; shared with the
+    /// icon pipeline so icons read texels exactly like the world does.
+    pub block_texture_sampler: wgpu::Sampler,
     pub voxel_pipeline: wgpu::RenderPipeline,
     /// Opaque, depth-writing pipeline for the batched box-model mob batch.
     /// Drawn inside the main pass strictly between the opaque chunk loop and
@@ -1014,6 +1022,8 @@ impl VoxelRenderer {
 
         Self {
             block_texture,
+            block_texture_view: tex_view,
+            block_texture_sampler: sampler,
             voxel_pipeline,
             mob_pipeline,
             water_pipeline,
@@ -1978,5 +1988,32 @@ mod tests {
         assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
         assert!(x0.is_finite() && y0.is_finite());
         assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
+    }
+
+    #[test]
+    fn block_texture_view_and_sampler_are_exposed_for_ui_icons() {
+        // Source pin: the UI icon pipeline samples the same texture array the
+        // world uses, taken straight from create_block_texture_array. The
+        // texture itself stays the retained upload target, so pack changes
+        // re-upload contents without recreating the view/sampler.
+        let src = include_str!("pipeline.rs");
+        assert!(src.contains("pub block_texture_view: wgpu::TextureView"));
+        assert!(src.contains("pub block_texture_sampler: wgpu::Sampler"));
+        assert!(src.contains("block_texture_view: tex_view,"));
+        assert!(src.contains("block_texture_sampler: sampler,"));
+
+        let new_at = src
+            .find("pub fn new(ctx: &RenderContext) -> Self")
+            .expect("VoxelRenderer::new exists");
+        let new_block = &src[new_at..];
+        assert!(new_block.contains("create_block_texture_array(&ctx.device, &ctx.queue)"));
+
+        let write_at = src
+            .find("pub fn write_block_layers")
+            .expect("write_block_layers exists");
+        assert!(
+            src[write_at..].contains("upload_block_layers(&self.block_texture, queue, layers)"),
+            "pack re-uploads must write into the same retained texture"
+        );
     }
 }

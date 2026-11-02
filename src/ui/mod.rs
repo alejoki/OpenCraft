@@ -40,6 +40,8 @@ use crate::render::pipeline::UiPass;
 pub use quad::{Quad, QuadRenderer};
 pub use text::{StatsOverlay, FONT_SIZE, LINE_HEIGHT};
 
+use item_icon::{IconRenderer, IconVertex};
+
 /// Owns the UI rendering stack for the color-only pass: filled quads
 /// (tint/panels/buttons), the optional pack logo, plus the glyphon text
 /// renderer.
@@ -53,10 +55,15 @@ pub struct UiRenderer {
     pub text_renderer: glyphon::TextRenderer,
     quad_renderer: QuadRenderer,
     logo_renderer: logo::LogoRenderer,
+    icon_renderer: IconRenderer,
 }
 
 impl UiRenderer {
-    pub fn new(ctx: &RenderContext) -> Self {
+    pub fn new(
+        ctx: &RenderContext,
+        block_texture_view: &wgpu::TextureView,
+        block_texture_sampler: &wgpu::Sampler,
+    ) -> Self {
         // ColorMode::Accurate: proper sRGB texture, matching our sRGB surface format.
         // (glyphon 0.5.0 has no `Color` variant; Accurate/Web are the only modes.)
         let mut atlas = glyphon::TextAtlas::with_color_mode(
@@ -80,6 +87,7 @@ impl UiRenderer {
             text_renderer,
             quad_renderer: QuadRenderer::new(ctx),
             logo_renderer: logo::LogoRenderer::new(ctx),
+            icon_renderer: IconRenderer::new(ctx, block_texture_view, block_texture_sampler),
         }
     }
 
@@ -108,6 +116,20 @@ impl UiRenderer {
         self.logo_renderer.set_logo(device, queue, logo);
     }
 
+    /// Rebuild the per-frame item-icon vertex buffer (block cube icons).
+    /// Pure CPU work; call once per frame before the render pass opens. An
+    /// empty list clears the buffer so nothing is drawn.
+    pub fn set_icons(
+        &mut self,
+        device: &wgpu::Device,
+        icons: &[IconVertex],
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        self.icon_renderer
+            .set_icons(device, icons, surface_w, surface_h);
+    }
+
     /// Rebuild the per-frame logo quad. `None` clears it, which also keeps a
     /// logo from drawing on non-vista screens.
     pub fn set_logo_frame(
@@ -124,10 +146,11 @@ impl UiRenderer {
 
 impl UiPass for UiRenderer {
     fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        // Quads first (panorama tint/panels), then the pack logo, then text
-        // on top.
+        // Quads first (panorama tint/panels), then the pack logo, then item
+        // icons (block cubes), then text on top.
         self.quad_renderer.draw(pass);
         self.logo_renderer.draw(pass);
+        self.icon_renderer.draw(pass);
         let _ = self.text_renderer.render(&self.atlas, pass);
     }
 }

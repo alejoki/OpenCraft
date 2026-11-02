@@ -11,9 +11,11 @@
 //! `y_ndc = 1 - 2y/sh`, surface dimensions guarded with `.max(1)`).
 
 use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 
 use super::inventory::Rect;
 use crate::player::inventory::{Item, ItemId};
+use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
 
 /// Fraction of the icon's smaller edge kept as empty padding on each side.
@@ -225,6 +227,232 @@ pub fn icon_vertices_for_item(
     }
 }
 
+/// Filter a CPU icon batch down to the vertices the GPU can safely consume.
+///
+/// Inputs are already in clip space, so the surface dimensions do not affect
+/// the result; they stay in the signature to mirror the other UI upload
+/// helpers and make the caller's "this batch belongs to this surface"
+/// contract explicit. Non-finite vertices are dropped rather than uploaded,
+/// which keeps a malformed caller from poisoning the whole buffer.
+pub fn sanitize_icon_vertices(
+    icons: &[IconVertex],
+    _surface_w: u32,
+    _surface_h: u32,
+) -> Vec<IconVertex> {
+    icons
+        .iter()
+        .copied()
+        .filter(|v| v.clip_pos.iter().all(|c| c.is_finite()))
+        .collect()
+}
+
+/// Textured UI icon shader: `IconVertex` in, one `texture_2d_array` sample
+/// out, with the texture-array layer carried per vertex.
+const ICON_SHADER_WGSL: &str = r#"
+struct IconOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) layer: u32,
+};
+
+@group(0) @binding(0) var tex: texture_2d_array<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@vertex
+fn vs_main(
+    @location(0) clip_pos: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) layer: u32,
+) -> IconOutput {
+    var out: IconOutput;
+    out.clip_pos = clip_pos;
+    out.uv = uv;
+    out.layer = layer;
+    return out;
+}
+
+@fragment
+fn fs_main(in: IconOutput) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv, i32(in.layer));
+}
+"#;
+
+/// Draws textured item icons (block cube faces) inside the color-only UI
+/// pass, sampling the world's block texture array.
+///
+/// The texture view/sampler are borrowed once at construction (they come from
+/// [`crate::render::pipeline::VoxelRenderer`]) and then owned by the bind
+/// group. Only the per-frame vertex buffer is rebuilt in
+/// [`set_icons`](Self::set_icons), the same pattern as `QuadRenderer` and
+/// `LogoRenderer`.
+///
+/// Draw this strictly after the quad and logo renderers and strictly before
+/// glyphon text, so icons sit above panels/tint and below labels/counts.
+pub struct IconRenderer {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: Option<wgpu::BindGroup>,
+    vertex_buffer: Option<wgpu::Buffer>,
+    vertex_count: u32,
+}
+
+impl IconRenderer {
+    pub fn new(
+        ctx: &RenderContext,
+        texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ui_item_icon_shader"),
+                source: wgpu::ShaderSource::Wgsl(ICON_SHADER_WGSL.into()),
+            });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ui_item_icon_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2Array,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ui_item_icon_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ui_item_icon_pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: ICON_VERTEX_LAYOUT.stride as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: ICON_VERTEX_LAYOUT.clip_pos_offset as wgpu::BufferAddress,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: ICON_VERTEX_LAYOUT.uv_offset as wgpu::BufferAddress,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: ICON_VERTEX_LAYOUT.layer_offset as wgpu::BufferAddress,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Uint32,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: ctx.config.format,
+                        // Straight-alpha blending, same convention as quads
+                        // and the logo: pack art composites over panels.
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui_item_icon_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+
+        Self {
+            pipeline,
+            bind_group: Some(bind_group),
+            vertex_buffer: None,
+            vertex_count: 0,
+        }
+    }
+
+    /// Rebuild the per-frame icon vertex buffer. Pure CPU work (no texture
+    /// upload); call once per frame before the UI pass opens. An empty slice
+    /// clears the buffer so nothing is drawn.
+    pub fn set_icons(
+        &mut self,
+        device: &wgpu::Device,
+        icons: &[IconVertex],
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        let verts = sanitize_icon_vertices(icons, surface_w, surface_h);
+        self.vertex_count = verts.len() as u32;
+        self.vertex_buffer = if verts.is_empty() {
+            None
+        } else {
+            Some(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui_item_icon_vbuf"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            )
+        };
+    }
+
+    /// Draw pending icons into the UI pass. No-op when nothing is queued.
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        if self.vertex_count == 0 {
+            return;
+        }
+        let (Some(bind_group), Some(buffer)) = (&self.bind_group, &self.vertex_buffer) else {
+            return;
+        };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +644,100 @@ mod tests {
             tier: ToolTier::Wood,
         });
         assert!(icon_vertices_for_item(pickaxe, SLOT, 800, 600).is_none());
+    }
+
+    #[test]
+    fn icon_shader_samples_the_texture_array_with_a_per_vertex_layer() {
+        assert!(
+            ICON_SHADER_WGSL.contains("texture_2d_array<f32>"),
+            "the icon pipeline must bind the world block texture array"
+        );
+        assert!(
+            ICON_SHADER_WGSL.contains("textureSample(tex, samp, in.uv, i32(in.layer))"),
+            "the fragment stage must sample the layer carried by the vertex"
+        );
+        assert!(
+            ICON_SHADER_WGSL.contains("@interpolate(flat) layer: u32"),
+            "the integer layer must be flat-interpolated"
+        );
+    }
+
+    #[test]
+    fn ui_draw_order_is_quads_then_logo_then_icons_then_text() {
+        // Source pin on UiRenderer::draw_ui: icons must sit above panel/tint
+        // quads and the pack logo, but below glyphon text (counts/labels).
+        let src = include_str!("mod.rs");
+        let quads_at = src
+            .find("self.quad_renderer.draw(pass)")
+            .expect("quad draw exists");
+        let logo_at = src
+            .find("self.logo_renderer.draw(pass)")
+            .expect("logo draw exists");
+        let icons_at = src
+            .find("self.icon_renderer.draw(pass)")
+            .expect("icon draw exists");
+        let text_at = src
+            .find("self.text_renderer.render(&self.atlas, pass)")
+            .expect("text draw exists");
+        assert!(
+            quads_at < logo_at && logo_at < icons_at && icons_at < text_at,
+            "UI order must be quads -> logo -> icons -> text"
+        );
+    }
+
+    #[test]
+    fn empty_icon_batches_clear_the_gpu_buffer() {
+        // Source pin: an empty slice must leave vertex_count 0 and no buffer,
+        // so closing every inventory never uploads or draws anything.
+        let src = include_str!("item_icon.rs");
+        let set_icons_at = src.find("pub fn set_icons").expect("set_icons exists");
+        let set_icons_block = &src[set_icons_at..];
+        assert!(set_icons_block.contains("self.vertex_count = verts.len() as u32"));
+        assert!(set_icons_block.contains("if verts.is_empty()"));
+        assert!(set_icons_block.contains("None"));
+    }
+
+    #[test]
+    fn sanitize_icons_drops_non_finite_vertices_and_accepts_empty() {
+        assert!(sanitize_icon_vertices(&[], 1280, 720).is_empty());
+
+        let good = IconVertex::new([0.0, 0.0, 0.0, 1.0], [0.0, 0.0], 3);
+        let bad = IconVertex::new([f32::NAN, 0.0, 0.0, 1.0], [0.0, 0.0], 3);
+        let kept = sanitize_icon_vertices(&[good, bad], 1280, 720);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].layer, 3);
+    }
+
+    #[test]
+    fn zero_and_non_finite_surfaces_still_produce_finite_icon_vertices() {
+        let layers = block_icon_layers(BlockId::Stone);
+        for (sw, sh) in [(0, 0), (1, 1)] {
+            let verts =
+                cube_icon_vertices((f32::NAN, f32::NEG_INFINITY, 32.0, 32.0), layers, sw, sh);
+            assert_eq!(verts.len(), 18);
+            assert!(verts
+                .iter()
+                .all(|v| v.clip_pos.iter().all(|c| c.is_finite())));
+        }
+    }
+
+    #[test]
+    fn main_wires_the_world_block_texture_into_the_ui_icon_renderer() {
+        // Source pin: the UI is built after the renderer and handed the same
+        // block texture view/sampler, so icons always match the active pack.
+        let src = include_str!("../main.rs");
+        let ui_at = src
+            .find("let mut ui = UiRenderer::new(")
+            .expect("UiRenderer::new call exists");
+        let ui_block = &src[ui_at..];
+        assert!(ui_block.contains("&renderer.block_texture_view"));
+        assert!(ui_block.contains("&renderer.block_texture_sampler"));
+        let renderer_at = src
+            .find("let renderer = VoxelRenderer::new(&ctx);")
+            .expect("renderer construction exists");
+        assert!(
+            renderer_at < ui_at,
+            "the renderer must be constructed before the UI so its texture handles exist"
+        );
     }
 }
