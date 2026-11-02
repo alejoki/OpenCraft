@@ -549,6 +549,76 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M009/S01, M009/S02, M009/S03, M009/S04, M009/S05, M009/S06, M009/S07, M009/S08, M009/S09
 - Validation: bash scripts/combat_smoke.sh; SMOKE_PROFILE=release bash scripts/combat_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
 
+### R055 — Textured item icons for every carryable stack
+- Class: core-capability
+- Status: active
+- Description: Every carryable item draws an icon in the 36 inventory slots, both crafting grids and result previews, the cursor ghost, and the nine hotbar slots: blocks as textured three-face cubes sampled from the active pack, materials and tools as deterministic procedural sprites, and empty slots with no icon.
+- Why it matters: A stack must be recognizable at a glance in both the inventory and the hotbar, and the icon must follow the active texture pack.
+- Source: M013 / S01, S02 item icon renderer
+- Primary owning slice: M013/S01
+- Supporting slices: M013/S02
+- Validation: cargo test --locked --lib -- ui::item_icon; bash scripts/ui_smoke.sh
+
+### R056 — Inventory hotbar as a separated bottom row
+- Class: primary-user-loop
+- Status: active
+- Description: The inventory panel draws the nine hotbar slots as a visually separated bottom row below the three storage rows, with slot indices 0..8 still the hotbar and every hit-test, drag, split, and stack-transfer semantic unchanged.
+- Why it matters: Players must read storage and hotbar as distinct groups without relearning the inventory.
+- Source: M013 / S03 inventory layout
+- Primary owning slice: M013/S03
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::inventory; bash scripts/ui_smoke.sh
+
+### R057 — Dedicated pack-overridable crafting-table art
+- Class: integration
+- Status: active
+- Description: The crafting table has dedicated top and side textures (authorable layers 23 and 24) visibly different from oak planks, and packs can override them with crafting_table_top.png and crafting_table_side.png while missing files fall back silently and corrupt files warn and fall back.
+- Why it matters: The crafting table must read as a distinct workstation and remain authorable without breaking existing packs.
+- Source: M013 / S04 crafting-table textures
+- Primary owning slice: M013/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- render::texture; cargo test --locked --lib -- world::block; cargo test --locked --lib -- pack::; bash scripts/pack_smoke.sh
+
+### R058 — Clamped item tooltips on inventory hover
+- Class: primary-user-loop
+- Status: active
+- Description: Hovering an occupied inventory slot, crafting cell, result slot, or cursor stack shows a tooltip with the item name and count/durability detail; the tooltip stays inside the surface, flips away from edges, and disappears when the hover ends.
+- Why it matters: Players need to identify stacks and tool condition before moving or using them.
+- Source: M013 / S05 inventory tooltips
+- Primary owning slice: M013/S05
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::inventory; cargo test --locked --bin opencraft -- tooltip; bash scripts/ui_smoke.sh
+
+### R059 — Transient selected-hotbar-item name
+- Class: primary-user-loop
+- Status: active
+- Description: Selecting a hotbar slot shows the item name above the hotbar on a dark strip, fades out after about two seconds, restarts on a new selection or stack change, and draws nothing for an empty slot or while a panel owns the pointer.
+- Why it matters: The player needs quick confirmation of the active item without opening the inventory.
+- Source: M013 / S05 selected-item name
+- Primary owning slice: M013/S05
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::selection; cargo test --locked --bin opencraft -- selected_name; bash scripts/ui_smoke.sh
+
+### R060 — Resolution-safe vitals HUD scaling
+- Class: quality-attribute
+- Status: active
+- Description: Vitals icons, gaps, and rows scale continuously from the measured hotbar width so hearts and hunger never overlap at 1280x720, 1920x1080, and 3840x2160, stay above the hotbar and inside the surface, and keep the air row on its own line.
+- Why it matters: HUD legibility must survive the full range of supported resolutions without resolution-specific breakpoints.
+- Source: M013 / S06 vitals scaling
+- Primary owning slice: M013/S06
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::hud::tests::vitals; cargo test --locked --bin opencraft -- playing_hud_quads; bash scripts/ui_smoke.sh
+
+### R061 — M013 closure surface
+- Class: admin/support
+- Status: active
+- Description: M013 closes with a real-binary scripts/ui_smoke.sh proving the pinned UI digests and bounded launch in debug and release, the registry and criterion trace carrying R055-R060, the docs updated, and the recorded 720p/1080p human UAT prepared.
+- Why it matters: Closure must be reproducible on the assembled tree, and the sensory outcomes need recorded human judgment rather than inferred claims.
+- Source: M013 / S07 closure
+- Primary owning slice: M013/S07
+- Supporting slices: M013/S01, M013/S02, M013/S03, M013/S04, M013/S05, M013/S06
+- Validation: bash scripts/ui_smoke.sh; SMOKE_PROFILE=release bash scripts/ui_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -622,3 +692,16 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 7 | R050 | S06 | cargo test --locked --lib -- world::mob_ai && cargo test --locked --lib -- player::combat && bash scripts/combat_smoke.sh |
 | 8 | R045, R053 | S01, S09 | cargo test --locked --lib -- render::mob && cargo test --locked --lib -- world::mob_audio && bash scripts/pack_smoke.sh && bash scripts/combat_smoke.sh |
 | 9 | R054 | S01, S02, S03, S04, S05, S06, S07, S08, S09, S10 | bash scripts/combat_smoke.sh && SMOKE_PROFILE=release bash scripts/combat_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |
+
+## M013 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R055 | S01, S02 | cargo test --locked --lib -- ui::item_icon && bash scripts/ui_smoke.sh |
+| 2 | R056 | S03 | cargo test --locked --lib -- ui::inventory && bash scripts/ui_smoke.sh |
+| 3 | R057 | S04 | cargo test --locked --lib -- render::texture && cargo test --locked --lib -- world::block && cargo test --locked --lib -- pack:: && bash scripts/pack_smoke.sh |
+| 4 | R058 | S05 | cargo test --locked --lib -- ui::inventory && cargo test --locked --bin opencraft -- tooltip && bash scripts/ui_smoke.sh |
+| 5 | R059 | S05 | cargo test --locked --lib -- ui::selection && cargo test --locked --bin opencraft -- selected_name && bash scripts/ui_smoke.sh |
+| 6 | R060 | S06 | cargo test --locked --lib -- ui::hud::tests::vitals && cargo test --locked --bin opencraft -- playing_hud_quads && bash scripts/ui_smoke.sh |
+| 7 | R061 | S01, S02, S03, S04, S05, S06, S07 | cargo test --locked && cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && bash scripts/ui_smoke.sh && SMOKE_PROFILE=release bash scripts/ui_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |
+| 8 | R061 | S01, S02, S03, S04, S05, S06, S07 | recorded human UAT with 1280x720 and 1920x1080 screenshots |
