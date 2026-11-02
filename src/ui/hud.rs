@@ -6,6 +6,7 @@
 use crate::player::inventory::{Inventory, Item, ItemStack, HOTBAR_SLOTS};
 use crate::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HEALTH, MAX_HUNGER};
 use crate::render::pipeline::hotbar_slot_rect_ndc;
+use crate::ui::inventory::Rect;
 use crate::ui::quad::Quad;
 
 /// Width of the crosshair mining progress bar in physical pixels.
@@ -67,6 +68,30 @@ pub fn hotbar_slot_rects(surface_w: u32, surface_h: u32) -> [(f32, f32, f32, f32
             (y1 - y0) / 2.0 * h_px,
         )
     })
+}
+
+/// Height of the transient selected-item name strip above the hotbar, in px.
+pub const SELECTED_NAME_HEIGHT: f32 = 20.0;
+/// Vertical gap between the selected-item strip and the hotbar top, in px.
+pub const SELECTED_NAME_GAP: f32 = 6.0;
+
+/// Backing rect for the transient selected-item name above the hotbar.
+///
+/// The strip spans the hotbar's full width and sits one gap above it, which
+/// centers it on screen because the hotbar itself is centered. It is clamped
+/// into the surface so a tiny or zero-sized surface still yields a finite,
+/// on-screen rect (matching [`hotbar_slot_rects`]).
+pub fn selected_name_rect(surface_w: u32, surface_h: u32) -> Rect {
+    let w_px = surface_w.max(1) as f32;
+    let h_px = surface_h.max(1) as f32;
+    let rects = hotbar_slot_rects(surface_w, surface_h);
+    let (first_x, hotbar_top, _, _) = rects[0];
+    let (last_x, _, last_w, _) = rects[HOTBAR_SLOTS - 1];
+    let width = ((last_x + last_w) - first_x).clamp(0.0, w_px);
+    let height = SELECTED_NAME_HEIGHT.min(h_px);
+    let x = first_x.clamp(0.0, (w_px - width).max(0.0));
+    let y = (hotbar_top - SELECTED_NAME_GAP - height).clamp(0.0, (h_px - height).max(0.0));
+    (x, y, width, height)
 }
 
 /// Count label for a slot: `""` when empty, otherwise the decimal count.
@@ -937,6 +962,76 @@ mod tests {
         assert!(!quads.is_empty());
         for quad in quads {
             assert!(quad.x.is_finite() && quad.y.is_finite());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Selected-item name strip (S05-T01)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn selected_name_rect_sits_above_the_hotbar_and_stays_on_screen() {
+        for (w, h) in [(1280, 720), (1920, 1080), (720, 1280), (1080, 1920)] {
+            let rect = selected_name_rect(w, h);
+            let hotbar_top = hotbar_slot_rects(w, h)[0].1;
+            let (x, y, rw, rh) = rect;
+            for (name, value) in [("x", x), ("y", y), ("w", rw), ("h", rh)] {
+                assert!(value.is_finite(), "{name} finite on {w}x{h}");
+            }
+            assert!(rw >= 0.0 && rh >= 0.0, "positive strip on {w}x{h}");
+            assert!(x >= 0.0 && y >= 0.0, "starts on screen at {w}x{h}");
+            assert!(
+                x + rw <= w as f32 + 1e-4,
+                "right edge on screen at {w}x{h}: {rect:?}"
+            );
+            assert!(
+                y + rh <= h as f32 + 1e-4,
+                "bottom edge on screen at {w}x{h}: {rect:?}"
+            );
+            assert!(
+                y + rh <= hotbar_top + 1e-4,
+                "strip sits above the hotbar at {w}x{h}: {rect:?} vs {hotbar_top}"
+            );
+            assert!(
+                (x + rw * 0.5 - w as f32 * 0.5).abs() < 1e-3,
+                "strip is horizontally centered at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_name_rect_uses_the_hotbar_width_and_a_fixed_line_height() {
+        let rects = hotbar_slot_rects(1280, 720);
+        let first = rects[0];
+        let last = rects[HOTBAR_SLOTS - 1];
+        let rect = selected_name_rect(1280, 720);
+        assert_close(rect.0, first.0, "left edge matches slot 0");
+        assert_close(rect.2, (last.0 + last.2) - first.0, "spans the hotbar");
+        assert_close(rect.3, SELECTED_NAME_HEIGHT, "one-line strip height");
+        assert_close(
+            rect.1 + rect.3,
+            first.1 - SELECTED_NAME_GAP,
+            "gap above the hotbar",
+        );
+    }
+
+    #[test]
+    fn selected_name_rect_stays_finite_on_degenerate_surfaces() {
+        for (w, h) in [(0, 0), (1, 1), (8, 8)] {
+            let rect = selected_name_rect(w, h);
+            let (x, y, rw, rh) = rect;
+            for (name, value) in [("x", x), ("y", y), ("w", rw), ("h", rh)] {
+                assert!(value.is_finite(), "{name} finite on {w}x{h}");
+            }
+            assert!(x >= 0.0 && y >= 0.0, "starts on screen at {w}x{h}");
+            assert!(
+                x + rw <= w.max(1) as f32 + 1e-4,
+                "right edge on screen at {w}x{h}"
+            );
+            assert!(
+                y + rh <= h.max(1) as f32 + 1e-4,
+                "bottom edge on screen at {w}x{h}"
+            );
         }
     }
 

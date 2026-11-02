@@ -7,6 +7,7 @@ pub mod logo;
 pub mod menu;
 pub mod quad;
 pub mod screens;
+pub mod selection;
 pub mod text;
 pub mod text_input;
 
