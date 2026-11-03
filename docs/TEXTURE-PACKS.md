@@ -47,6 +47,59 @@ Rules that apply to every field:
 - Unknown keys, unknown tables, and unknown files are ignored silently, so future versions can add features without breaking older ones.
 - A missing or unreadable `pack.toml` uses built-in default values and shows a warning that names the pack.
 
+## Format v2 (preview)
+
+Set `format_version = 2` to add blocks, items, custom tool tiers and tools, shaped recipes and declarative worldgen from the same `pack.toml`. Version 1 packs keep working unchanged: without `format_version = 2`, a content array is ignored with one warning while the pack's textures and sounds still load. A `format_version` newer than 2 is ignored the same way, with one warning.
+
+```toml
+format_version = 2
+name = "Ruby Mod"
+version = "1.0.0"
+
+[[blocks]]
+id = "mymod:ruby_ore"
+name = "Ruby Ore"
+textures = { all = "ruby_ore.png" }
+hardness = 3.0
+drop = "mymod:ruby"
+tool = "pickaxe"
+stack = 64
+
+[[items]]
+id = "mymod:ruby"
+icon = "ruby.png"
+nutrition = 4
+eat_seconds = 1.2
+
+[[tiers]]
+id = "mymod:ruby"
+speed = 9.0
+durability = 900
+damage = 6
+
+[[tools]]
+id = "mymod:ruby_pickaxe"
+kind = "pickaxe"
+tier = "mymod:ruby"
+icon = "ruby_pickaxe.png"
+
+[[recipes]]
+id = "mymod:ruby_pickaxe"
+pattern = ["RRR", " S ", " S "]
+key = { R = "mymod:ruby", S = "stick" }
+output = "mymod:ruby_pickaxe"
+count = 1
+```
+
+A block needs `id`, `textures` (at least one of `all`, `top`, `bottom`, `side`) and a finite `hardness` from 0 to 3600. `drop`, `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) and `stack` (1 to 999, default 999) are optional. An item needs `id` and `icon`; `stack` defaults to 64, and `nutrition` (1 to 20) makes it food with an optional `eat_seconds` (0.1 to 10, default 1.2). A tier needs `speed`, `durability` and `damage`; a tool needs `kind`, `tier` and `icon`. A recipe needs a 1-to-4-row `pattern` of 1-to-4 characters, a `key` mapping each pattern character to an item, an `output` and a `count` from 1 to 999. Worldgen entries use `type = "ore"` (with `vein` 1 to 8 and `attempts` 1 to 32) or `type = "patch"` (with a non-empty `biomes` list of `plains`, `forest`, `mountains` or `ocean`, and a `chance` from 0 to 1). Both kinds need `block`, `replace`, and `min_y`/`max_y` within -64 to 128 with `min_y < max_y`.
+
+Entry rules:
+
+- New ids are namespaced (`mymod:ruby_ore`) with lowercase letters, digits and `_`; the `opencraft`, `builtin` and `minecraft` namespaces are reserved. Blocks, items and tools share one namespace; tiers and recipes are independent.
+- References (`drop`, recipe `key`/`output`, tool `tier`, worldgen `block`/`replace`, patch `drop`) must name a built-in or an entry in the same pack. Cross-pack references are not supported in this format.
+- One bad entry never fails the pack: a missing or wrong field, malformed/duplicate id, unknown reference, or over-limit array rejects only that entry and reports a diagnostic while its valid siblings load. Unknown keys are ignored.
+- Asset paths are relative to the pack folder. Absolute paths, `.`/`..` components and symlink escapes are rejected, each file is limited to 1 MiB, images must be square and 16 to 256 pixels per side, and a pack may load at most 8 MiB of raw asset bytes.
+
 ## Block textures
 
 Save each block texture directly inside the pack folder, using these exact file names and in this order (the order is the block layer contract; do not reorder them):

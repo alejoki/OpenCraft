@@ -9,7 +9,7 @@
 //! (or, for blocks, the frozen raw id order `0..=22`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
-use crate::player::inventory::{Material, RecipeId, ToolKind, ToolTier};
+use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolTier};
 use crate::world::block::BlockId;
 
 /// Built-in block id names, index-aligned to raw ids `0..=22`.
@@ -103,8 +103,131 @@ pub const RECIPE_ID_NAMES: [&str; 22] = [
     "arrows",
 ];
 
+/// Biome names accepted by declarative worldgen patches.
+pub const BIOME_NAMES: [&str; 4] = ["plains", "forest", "mountains", "ocean"];
+
 /// Namespaces reserved for the engine and built-in content.
 pub const RESERVED_NAMESPACES: [&str; 3] = ["opencraft", "builtin", "minecraft"];
+
+/// Canonical biome name for `name`, or `None` when it is unknown.
+pub fn biome_from_name(name: &str) -> Option<&'static str> {
+    BIOME_NAMES.iter().copied().find(|known| *known == name)
+}
+
+/// Reverse lookup for a built-in block short name.
+pub fn builtin_block_id_by_name(name: &str) -> Option<BlockId> {
+    BLOCK_ID_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map(|raw| BlockId::from_raw(raw as u16))
+}
+
+/// Reverse lookup for a built-in material short name.
+pub fn builtin_material_by_name(name: &str) -> Option<Material> {
+    MATERIAL_ID_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map(|index| MATERIAL_VALUES[index])
+}
+
+/// Reverse lookup for a built-in tool tier short name.
+pub fn builtin_tier_by_name(name: &str) -> Option<ToolTier> {
+    TIER_ID_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map(|index| TIER_VALUES[index])
+}
+
+/// Reverse lookup for a built-in constructible tool short name.
+pub fn builtin_tool_id_by_name(name: &str) -> Option<ItemId> {
+    for (index, candidate) in TOOL_ID_NAMES.iter().enumerate() {
+        if *candidate != name {
+            continue;
+        }
+        if index == 15 {
+            return Some(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            });
+        }
+        let kind = KIND_VALUES[index % 5];
+        let tier = TIER_VALUES[index / 5];
+        return Some(ItemId::Tool { kind, tier });
+    }
+    None
+}
+
+/// Reverse lookup for a built-in recipe short name.
+pub fn builtin_recipe_id_by_name(name: &str) -> Option<RecipeId> {
+    RECIPE_ID_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map(|index| RECIPE_VALUES[index])
+}
+
+/// Resolve an unqualified built-in item name.
+///
+/// A block name maps to [`ItemId::Block`], a material name to
+/// [`ItemId::Material`], and a tool name to [`ItemId::Tool`]. Namespaced pack
+/// ids are not built-in and return `None`.
+pub fn builtin_item_id_by_name(name: &str) -> Option<ItemId> {
+    if let Some(block) = builtin_block_id_by_name(name) {
+        return Some(ItemId::Block(block));
+    }
+    if let Some(material) = builtin_material_by_name(name) {
+        return Some(ItemId::Material(material));
+    }
+    builtin_tool_id_by_name(name)
+}
+
+const MATERIAL_VALUES: [Material; 11] = [
+    Material::Stick,
+    Material::Apple,
+    Material::Wheat,
+    Material::WheatSeeds,
+    Material::Bread,
+    Material::Leather,
+    Material::RawPorkchop,
+    Material::RawBeef,
+    Material::RottenFlesh,
+    Material::Bone,
+    Material::Arrow,
+];
+
+const TIER_VALUES: [ToolTier; 3] = [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron];
+
+const KIND_VALUES: [ToolKind; 5] = [
+    ToolKind::Pickaxe,
+    ToolKind::Axe,
+    ToolKind::Shovel,
+    ToolKind::Hoe,
+    ToolKind::Sword,
+];
+
+const RECIPE_VALUES: [RecipeId; 22] = [
+    RecipeId::Planks,
+    RecipeId::Sticks,
+    RecipeId::CraftingTable,
+    RecipeId::Chest,
+    RecipeId::WoodPickaxe,
+    RecipeId::WoodAxe,
+    RecipeId::WoodShovel,
+    RecipeId::StonePickaxe,
+    RecipeId::StoneAxe,
+    RecipeId::StoneShovel,
+    RecipeId::IronPickaxe,
+    RecipeId::IronAxe,
+    RecipeId::IronShovel,
+    RecipeId::Bread,
+    RecipeId::WoodHoe,
+    RecipeId::StoneHoe,
+    RecipeId::IronHoe,
+    RecipeId::WoodSword,
+    RecipeId::StoneSword,
+    RecipeId::IronSword,
+    RecipeId::Shortbow,
+    RecipeId::Arrows,
+];
 
 /// Stable short name for a built-in block id, or `None` for [`BlockId::Modded`].
 pub fn builtin_block_id_name(id: BlockId) -> Option<&'static str> {
@@ -471,6 +594,72 @@ mod tests {
         ] {
             assert!(!is_namespaced_id(invalid), "{invalid} should be invalid");
         }
+    }
+
+    #[test]
+    fn reverse_lookups_cover_every_table_entry() {
+        for (raw, name) in BLOCK_ID_NAMES.iter().enumerate() {
+            let id = builtin_block_id_by_name(name)
+                .unwrap_or_else(|| panic!("missing block lookup for {name}"));
+            assert_eq!(usize::from(id.to_raw()), raw);
+            assert_eq!(builtin_item_id_by_name(name), Some(ItemId::Block(id)));
+        }
+        assert_eq!(builtin_block_id_by_name("mymod:ruby"), None);
+
+        for (index, name) in MATERIAL_ID_NAMES.iter().enumerate() {
+            let material = builtin_material_by_name(name)
+                .unwrap_or_else(|| panic!("missing material lookup for {name}"));
+            assert_eq!(builtin_material_id_name(material), MATERIAL_ID_NAMES[index]);
+            assert_eq!(
+                builtin_item_id_by_name(name),
+                Some(ItemId::Material(material))
+            );
+        }
+
+        for (index, name) in TIER_ID_NAMES.iter().enumerate() {
+            let tier = builtin_tier_by_name(name)
+                .unwrap_or_else(|| panic!("missing tier lookup for {name}"));
+            assert_eq!(builtin_tier_id_name(tier), TIER_ID_NAMES[index]);
+        }
+
+        for (index, name) in TOOL_ID_NAMES.iter().enumerate() {
+            let tool = builtin_tool_id_by_name(name)
+                .unwrap_or_else(|| panic!("missing tool lookup for {name}"));
+            assert_eq!(tool.name(), builtin_item_id_by_name(name).unwrap().name());
+            if index != 15 {
+                assert_eq!(
+                    builtin_tool_id_name(
+                        match tool {
+                            ItemId::Tool { kind, .. } => kind,
+                            _ => unreachable!(),
+                        },
+                        match tool {
+                            ItemId::Tool { tier, .. } => tier,
+                            _ => unreachable!(),
+                        },
+                    ),
+                    Some(*name)
+                );
+            }
+        }
+        assert_eq!(builtin_tool_id_by_name("mymod:ruby_pickaxe"), None);
+
+        for (index, name) in RECIPE_ID_NAMES.iter().enumerate() {
+            let recipe = builtin_recipe_id_by_name(name)
+                .unwrap_or_else(|| panic!("missing recipe lookup for {name}"));
+            assert_eq!(builtin_recipe_id_name(recipe), RECIPE_ID_NAMES[index]);
+        }
+        assert_eq!(builtin_recipe_id_by_name("mymod:ruby"), None);
+    }
+
+    #[test]
+    fn biome_names_are_canonical_and_reject_unknown() {
+        assert_eq!(BIOME_NAMES, ["plains", "forest", "mountains", "ocean"]);
+        for name in BIOME_NAMES {
+            assert_eq!(biome_from_name(name), Some(name));
+        }
+        assert_eq!(biome_from_name("desert"), None);
+        assert_eq!(biome_from_name("Plains"), None);
     }
 
     #[test]

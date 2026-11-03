@@ -10,6 +10,9 @@
 //! the GPU or the save layer.
 
 pub mod names;
+pub mod spec;
+
+pub use spec::{ContentDiagnostic, PackContentSpec, Severity};
 
 use std::sync::OnceLock;
 

@@ -15,11 +15,15 @@
 
 use std::path::Path;
 
+use crate::content::spec::{ContentDiagnostic, PackContentSpec};
+use crate::pack::asset;
 use crate::pack::decode;
 use crate::pack::manifest;
+use crate::pack::manifest::PackFormat;
 use crate::pack::resample;
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
+use crate::pack::v2;
 use crate::pack::{LoadedPack, PackLogo, AUTHORABLE_TEX_LAYERS, LAYER_FILES, MOB_LAYER_FILES};
 use crate::render::texture::{
     generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
@@ -27,9 +31,9 @@ use crate::render::texture::{
 use crate::settings::SettingsWarning;
 
 /// Smallest accepted layer side length, in pixels.
-const MIN_LAYER_SIDE: u32 = 16;
+pub(crate) const MIN_LAYER_SIDE: u32 = 16;
 /// Largest accepted layer side length, in pixels.
-const MAX_LAYER_SIDE: u32 = 256;
+pub(crate) const MAX_LAYER_SIDE: u32 = 256;
 
 /// What one pack authors, before any fallback is applied.
 ///
@@ -44,6 +48,10 @@ const MAX_LAYER_SIDE: u32 = 256;
 pub struct PackSpec {
     /// Pack folder name, used as the fallback display name.
     pub folder: String,
+    /// Declared pack format (defaults to v1).
+    pub format_version: PackFormat,
+    /// Optional human-readable pack version, part of the registry digest.
+    pub version: Option<String>,
     /// Parsed v1 manifest fields (`None` = unauthored).
     pub manifest: manifest::PackManifest,
     /// Authored block layers, index-aligned with [`LAYER_FILES`].
@@ -54,6 +62,10 @@ pub struct PackSpec {
     pub logo: Option<PackLogo>,
     /// Authored sound presence.
     pub sound: SoundSpec,
+    /// Accepted v2 content entries (empty for v1 packs).
+    pub content: PackContentSpec,
+    /// Rejected v2 entries and asset failures (empty for v1 packs).
+    pub diagnostics: Vec<ContentDiagnostic>,
     /// Manifest/layer/logo fallbacks, in the v1 warning order.
     pub warnings: Vec<SettingsWarning>,
 }
@@ -69,20 +81,29 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     let mut warnings = Vec::new();
 
     let manifest_path = dir.join("pack.toml");
-    let manifest = match std::fs::read_to_string(&manifest_path) {
-        Ok(text) => {
-            let (manifest, mut manifest_warnings) = manifest::parse_manifest(&text);
-            warnings.append(&mut manifest_warnings);
-            manifest
-        }
+    let (manifest, root, mut manifest_warnings) = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => manifest::parse_pack_file(&text),
         Err(err) => {
             warnings.push(SettingsWarning {
                 field: "pack.toml".to_string(),
                 reason: format!("failed to read {}: {err}", manifest_path.display()),
             });
-            manifest::PackManifest::default()
+            (manifest::PackManifest::default(), None, Vec::new())
         }
     };
+    warnings.append(&mut manifest_warnings);
+
+    // The v2 gate owns the v1 "content arrays require format_version = 2"
+    // warning and the future-version warning. A syntactically invalid manifest
+    // has no root and produced its own warning above.
+    let (mut content, mut content_warnings, mut diagnostics) = match &root {
+        Some(root) => v2::parse_content(root, manifest.format_version),
+        None => (PackContentSpec::default(), Vec::new(), Vec::new()),
+    };
+    warnings.append(&mut content_warnings);
+    if manifest.format_version == PackFormat::V2 {
+        v2::load_content_assets(dir, &mut content, &mut diagnostics);
+    }
 
     // Warning order mirrors v1: manifest, then block layers, then mob layers,
     // then the logo. Missing files stay silent.
@@ -104,11 +125,15 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
 
     PackSpec {
         folder,
+        format_version: manifest.format_version,
+        version: manifest.version.clone(),
         manifest,
         block_layers,
         mob_layers,
         logo,
         sound: sound::load_sound_spec(dir),
+        content,
+        diagnostics,
         warnings,
     }
 }
@@ -167,7 +192,16 @@ fn load_logo(
     warnings: &mut Vec<SettingsWarning>,
 ) -> Option<PackLogo> {
     let logo = logo?;
-    let path = dir.join(logo);
+    let path = match asset::resolve_asset_path(dir, logo) {
+        Ok(path) => path,
+        Err(reason) => {
+            warnings.push(SettingsWarning {
+                field: logo.to_string(),
+                reason,
+            });
+            return None;
+        }
+    };
     match decode::decode_png_native(&path) {
         Ok(decoded) => Some(PackLogo {
             rgba: decoded.rgba,
@@ -666,5 +700,155 @@ overlay_tint = [9, 8, 7, 6]
         assert_eq!(pack.overlay_tint, None);
         assert_eq!(pack.description, None);
         assert!(pack.warnings.is_empty());
+    }
+
+    #[test]
+    fn v2_fixture_loads_content_assets_and_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "ruby");
+
+        fs::write(
+            dir.join("pack.toml"),
+            r#"
+format_version = 2
+name = "Ruby Mod"
+version = "1.0.0"
+
+[[blocks]]
+id = "mymod:ruby_ore"
+textures = { all = "ruby_ore.png" }
+hardness = 3.0
+drop = "mymod:ruby"
+
+[[blocks]]
+textures = { all = "missing_id.png" }
+hardness = 1.0
+
+[[items]]
+id = "mymod:ruby"
+icon = "ruby_ore.png"
+"#,
+        )
+        .unwrap();
+        write_png(&dir.join("ruby_ore.png"), 32);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V2);
+        assert_eq!(spec.version.as_deref(), Some("1.0.0"));
+        assert_eq!(spec.content.blocks.len(), 1);
+        assert_eq!(spec.content.blocks[0].id, "mymod:ruby_ore");
+        assert_eq!(spec.content.items.len(), 1);
+        assert_eq!(spec.content.assets.len(), 1);
+        assert_eq!(
+            spec.content.assets["ruby_ore.png"].rgba,
+            resample::resample_to_16(&gradient(32, 32), 32)
+        );
+
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert!(spec.diagnostics[0]
+            .reason
+            .contains("missing required field `id`"));
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn v1_fixture_keeps_content_empty_and_adds_no_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "plain");
+        fs::write(dir.join("pack.toml"), "name = \"Plain\"\n").unwrap();
+        write_png(&dir.join("stone.png"), 16);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V1);
+        assert_eq!(
+            spec.content,
+            crate::content::spec::PackContentSpec::default()
+        );
+        assert!(spec.diagnostics.is_empty());
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+        assert!(spec.block_layers[3].is_some());
+    }
+
+    #[test]
+    fn v1_content_array_warns_once_and_keeps_textures() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "legacy");
+        fs::write(
+            dir.join("pack.toml"),
+            r#"
+name = "Legacy"
+
+[[blocks]]
+id = "mymod:ruby"
+textures = { all = "ruby.png" }
+hardness = 1.0
+"#,
+        )
+        .unwrap();
+        write_png(&dir.join("stone.png"), 16);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V1);
+        assert!(spec.content.blocks.is_empty());
+        assert!(spec.diagnostics.is_empty());
+        assert!(spec.block_layers[3].is_some());
+        assert_eq!(spec.warnings.len(), 1);
+        assert_eq!(spec.warnings[0].field, "pack.toml");
+        assert!(spec.warnings[0]
+            .reason
+            .contains("content arrays require format_version = 2"));
+    }
+
+    #[test]
+    fn logo_path_escape_warns_and_never_reads_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "escape");
+        fs::write(dir.join("pack.toml"), "[menu]\nlogo = \"../outside.png\"\n").unwrap();
+        write_png(&root.path().join("outside.png"), 16);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.logo, None);
+        assert_eq!(spec.warnings.len(), 1);
+        assert_eq!(spec.warnings[0].field, "../outside.png");
+        assert!(spec.warnings[0].reason.contains("must not contain `..`"));
+    }
+
+    #[test]
+    fn future_format_warns_once_and_still_loads_textures() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "future");
+        fs::write(
+            dir.join("pack.toml"),
+            r#"
+format_version = 3
+name = "From The Future"
+
+[[blocks]]
+id = "mymod:ruby"
+textures = { all = "ruby.png" }
+hardness = 1.0
+"#,
+        )
+        .unwrap();
+        write_png(&dir.join("stone.png"), 16);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(
+            spec.format_version,
+            crate::pack::manifest::PackFormat::Future(3)
+        );
+        assert!(spec.content.blocks.is_empty());
+        assert!(spec.diagnostics.is_empty());
+        assert!(
+            spec.block_layers[3].is_some(),
+            "v1 texture loading continues"
+        );
+        assert_eq!(spec.warnings.len(), 1);
+        assert!(spec.warnings[0].reason.contains("newer than 2"));
     }
 }

@@ -17,11 +17,13 @@ use std::path::Path;
 use crate::render::texture::{generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS};
 use crate::settings::SettingsWarning;
 
+pub mod asset;
 pub mod decode;
 pub mod manifest;
 pub mod resample;
 pub mod sound;
 pub mod spec;
+pub mod v2;
 
 /// Load an ordered stack of pack folders under `packs_root`.
 pub use spec::load_stack;
