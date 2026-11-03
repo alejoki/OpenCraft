@@ -64,3 +64,21 @@ count = 1
 [[recipe_patches]]
 id = "shortbow"
 enabled = false
+
+[[worldgen]]
+type = "ore"
+block = "mymod:ruby_ore"
+replace = "stone"
+min_y = 4
+max_y = 40
+vein = 4
+attempts = 8
+
+[[worldgen]]
+type = "patch"
+block = "mymod:ruby_ore"
+replace = "grass"
+biomes = ["plains", "forest"]
+min_y = 40
+max_y = 110
+chance = 0.02

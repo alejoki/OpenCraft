@@ -14,7 +14,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
-use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity};
+use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
 use opencraft::mesh::quad::ChunkMesh;
 use opencraft::pack::spec::PackSpec;
 use opencraft::pack::{self, LoadedPack};
@@ -87,10 +87,12 @@ use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
-use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, CHUNK_SIZE};
+use opencraft::world::chunk::{
+    linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE,
+};
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
-use opencraft::world::manager::WorldManager;
+use opencraft::world::manager::{WorldManager, MAX_CHUNK_Y, MIN_CHUNK_Y};
 use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind, MobShot};
 use opencraft::world::mob_ai::MobAttack;
 use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
@@ -110,8 +112,8 @@ use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
 };
 use opencraft::world::terrain::{
-    biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
-    DEFAULT_WORLD_SEED, SEA_LEVEL,
+    biome_at_seeded, generate_chunk_seeded, generate_chunk_seeded_with, ruin_at_seeded,
+    ruin_loot_chest_at, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -13248,6 +13250,283 @@ fn crafting_demo_lines(
     }
 }
 
+/// Seed pinned for the `--demo-worldgen` digest.
+///
+/// A plain constant (never a clock or `random_seed`) so the digest is a pure
+/// function of the checked-in pack plus this seed.
+const WORLDGEN_DEMO_SEED: u32 = 424_242;
+
+/// The 8x8 chunk-column window the digest scans: `x in -1..=6`,
+/// `z in -1..=6`, across every world chunk layer (`MIN_CHUNK_Y..=MAX_CHUNK_Y`,
+/// six layers) — 384 chunk generations per leg. Wide enough to hold authored
+/// ore and patch cells at the pinned seed (the 4x4 window had no patch hit)
+/// while staying bounded and deterministic.
+const WORLDGEN_DEMO_MIN_CX: i32 = -1;
+const WORLDGEN_DEMO_MAX_CX: i32 = 6;
+const WORLDGEN_DEMO_MIN_CZ: i32 = -1;
+const WORLDGEN_DEMO_MAX_CZ: i32 = 6;
+
+/// Generate the pinned digest window with `rules` through the production seam.
+fn worldgen_demo_window(rules: &[WorldgenRule]) -> Vec<(ChunkPos, Chunk)> {
+    let mut chunks = Vec::new();
+    for cz in WORLDGEN_DEMO_MIN_CZ..=WORLDGEN_DEMO_MAX_CZ {
+        for cx in WORLDGEN_DEMO_MIN_CX..=WORLDGEN_DEMO_MAX_CX {
+            for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                let pos = ChunkPos::new(cx, cy, cz);
+                chunks.push((
+                    pos,
+                    generate_chunk_seeded_with(pos, WORLDGEN_DEMO_SEED, Season::Summer, rules),
+                ));
+            }
+        }
+    }
+    chunks
+}
+
+/// Every world cell in `chunks` holding `block` for which `keep` is true.
+fn worldgen_demo_cells(
+    chunks: &[(ChunkPos, Chunk)],
+    block: BlockId,
+    keep: impl Fn(i32, i32, i32) -> bool,
+) -> Vec<(i32, i32, i32)> {
+    let mut cells = Vec::new();
+    for (pos, chunk) in chunks {
+        let base_x = pos.x * CHUNK_SIZE as i32;
+        let base_y = pos.y * CHUNK_SIZE as i32;
+        let base_z = pos.z * CHUNK_SIZE as i32;
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if chunk.get(lx, ly, lz) != block {
+                        continue;
+                    }
+                    let wx = base_x + lx as i32;
+                    let wy = base_y + ly as i32;
+                    let wz = base_z + lz as i32;
+                    if keep(wx, wy, wz) {
+                        cells.push((wx, wy, wz));
+                    }
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Whether two chunks hold the same block in every cell.
+fn worldgen_demo_chunks_equal(a: &Chunk, b: &Chunk) -> bool {
+    (0..CHUNK_SIZE)
+        .all(|y| (0..CHUNK_SIZE).all(|z| (0..CHUNK_SIZE).all(|x| a.get(x, y, z) == b.get(x, y, z))))
+}
+
+/// Stable lowercase name for an authored patch biome.
+fn worldgen_demo_biome_name(biome: Biome) -> &'static str {
+    match biome {
+        Biome::Plains => "plains",
+        Biome::Forest => "forest",
+        Biome::Mountains => "mountains",
+        Biome::Ocean => "ocean",
+    }
+}
+
+/// Build the deterministic `--demo-worldgen` digest.
+///
+/// Every leg runs through a production seam: [`ContentRegistry::worldgen_rules`],
+/// [`WorldSession::new_session_with_mode_and_registry`],
+/// [`generate_chunk_seeded_with`] and [`generate_chunk_seeded`]. Each line is
+/// machine-independent (names, counts, booleans), so `scripts/worldgen_smoke.sh`
+/// can pin them whole-line. The caller exits non-zero when the latch fails.
+fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    let rules = registry.worldgen_rules();
+    let ore_rules = rules
+        .iter()
+        .filter(|rule| matches!(rule, WorldgenRule::Ore { .. }))
+        .count();
+    let patch_rules = rules
+        .iter()
+        .filter(|rule| matches!(rule, WorldgenRule::Patch { .. }))
+        .count();
+    lines.push(format!(
+        "worldgen_demo: leg=registry rules={} ore={} patch={}",
+        rules.len(),
+        ore_rules,
+        patch_rules,
+    ));
+    if rules.len() != 2 || ore_rules != 1 || patch_rules != 1 {
+        failed.get_or_insert("registry");
+    }
+
+    // Authored bands and biomes, read from the same frozen rules the generator
+    // consumes. A missing or malformed pair fails the corresponding leg below.
+    let mut ore_band = None;
+    let mut patch_band = None;
+    let mut patch_biomes: Vec<Biome> = Vec::new();
+    for rule in rules {
+        match rule {
+            WorldgenRule::Ore { min_y, max_y, .. } => ore_band = Some((*min_y, *max_y)),
+            WorldgenRule::Patch {
+                biomes,
+                min_y,
+                max_y,
+                ..
+            } => {
+                patch_band = Some((*min_y, *max_y));
+                patch_biomes = biomes.clone();
+            }
+        }
+    }
+
+    // (a) The session seam: a registry-built session must expose exactly the
+    // frozen registry's rules on its WorldManager (proves T02 wiring without
+    // touching the async streaming loop).
+    let session_path = std::env::temp_dir().join(format!(
+        "opencraft-worldgen-demo-{}.mcvx",
+        std::process::id()
+    ));
+    let session = WorldSession::new_session_with_mode_and_registry(
+        WORLDGEN_DEMO_SEED,
+        session_path,
+        opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        GameMode::Creative,
+        Arc::clone(registry),
+    );
+    let session_rules = session.world.worldgen_rules();
+    let session_matches = session_rules.as_ref() == rules;
+    lines.push(format!(
+        "worldgen_demo: leg=session rules={} matches={}",
+        session_rules.len(),
+        session_matches,
+    ));
+    if !session_matches {
+        failed.get_or_insert("session");
+    }
+
+    let rule_chunks = worldgen_demo_window(rules);
+    let authored_block = registry.block_by_name("mymod:ruby_ore").map(|def| def.id);
+
+    // (b) Ore leg: authored ore below the surface must exist only inside the
+    // authored y band and strictly inside the stone band (above bedrock, at
+    // least four blocks below the column surface). Surface cells are excluded
+    // here — the patch leg owns those.
+    let mut ore_cells: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(block) = authored_block {
+        ore_cells = worldgen_demo_cells(&rule_chunks, block, |wx, wy, wz| {
+            wy < terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED)
+        });
+    }
+    let ore_observed_min = ore_cells.iter().map(|cell| cell.1).min();
+    let ore_observed_max = ore_cells.iter().map(|cell| cell.1).max();
+    let ore_in_band = match (ore_band, ore_observed_min, ore_observed_max) {
+        (Some((min_y, max_y)), Some(observed_min), Some(observed_max)) => {
+            !ore_cells.is_empty()
+                && min_y <= observed_min
+                && observed_max <= max_y
+                && ore_cells.iter().all(|&(wx, wy, wz)| {
+                    wy > -32 && wy < terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED) - 3
+                })
+        }
+        _ => false,
+    };
+    lines.push(format!(
+        "worldgen_demo: leg=ore block=mymod:ruby_ore cells={} min_y={} max_y={} in_band={}",
+        ore_cells.len(),
+        ore_observed_min.unwrap_or(0),
+        ore_observed_max.unwrap_or(0),
+        ore_in_band,
+    ));
+    if !ore_in_band {
+        failed.get_or_insert("ore");
+    }
+
+    // (c) Patch leg: the authored block at `wy == h` is unambiguously a patch
+    // cell (ore never reaches the surface), so every such cell must sit in an
+    // authored biome and inside the authored band.
+    let mut patch_cells: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(block) = authored_block {
+        patch_cells = worldgen_demo_cells(&rule_chunks, block, |wx, wy, wz| {
+            wy == terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED)
+        });
+    }
+    let patch_biomes_ok = !patch_cells.is_empty()
+        && !patch_biomes.is_empty()
+        && patch_cells.iter().all(|&(wx, _, wz)| {
+            patch_biomes.contains(&biome_at_seeded(wx, wz, WORLDGEN_DEMO_SEED))
+        })
+        && patch_cells.iter().all(|&(_, wy, _)| {
+            patch_band
+                .map(|(min_y, max_y)| (min_y..=max_y).contains(&wy))
+                .unwrap_or(false)
+        });
+    let patch_biome_list = patch_biomes
+        .iter()
+        .map(|biome| worldgen_demo_biome_name(*biome))
+        .collect::<Vec<_>>()
+        .join(",");
+    lines.push(format!(
+        "worldgen_demo: leg=patch block=mymod:ruby_ore cells={} biomes={} biomes_ok={}",
+        patch_cells.len(),
+        patch_biome_list,
+        patch_biomes_ok,
+    ));
+    if !patch_biomes_ok {
+        failed.get_or_insert("patch");
+    }
+
+    // (d) Coal/iron equality: pack rules must never move a built-in ore cell.
+    let empty_chunks = worldgen_demo_window(&[]);
+    let coal = worldgen_demo_cells(&rule_chunks, BlockId::CoalOre, |_, _, _| true);
+    let iron = worldgen_demo_cells(&rule_chunks, BlockId::IronOre, |_, _, _| true);
+    let mut coal_sorted = coal.clone();
+    coal_sorted.sort_unstable();
+    let mut iron_sorted = iron.clone();
+    iron_sorted.sort_unstable();
+    let mut empty_coal = worldgen_demo_cells(&empty_chunks, BlockId::CoalOre, |_, _, _| true);
+    empty_coal.sort_unstable();
+    let mut empty_iron = worldgen_demo_cells(&empty_chunks, BlockId::IronOre, |_, _, _| true);
+    empty_iron.sort_unstable();
+    let unchanged = coal_sorted == empty_coal && iron_sorted == empty_iron;
+    lines.push(format!(
+        "worldgen_demo: leg=coal_iron coal={} iron={} unchanged={}",
+        coal.len(),
+        iron.len(),
+        unchanged,
+    ));
+    if !unchanged {
+        failed.get_or_insert("coal_iron");
+    }
+
+    // (e) Empty-rule identity: the wrapper must reproduce the pre-M010 chunks.
+    let mut identical = true;
+    for (pos, chunk) in &empty_chunks {
+        let legacy = generate_chunk_seeded(*pos, WORLDGEN_DEMO_SEED, Season::Summer);
+        if !worldgen_demo_chunks_equal(chunk, &legacy) {
+            identical = false;
+            break;
+        }
+    }
+    lines.push(format!(
+        "worldgen_demo: leg=empty_rules identical={}",
+        identical,
+    ));
+    if !identical {
+        failed.get_or_insert("empty_rules");
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("worldgen_demo: ok=false failed={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("worldgen_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -13335,6 +13614,30 @@ fn main() {
             None
         };
         let (lines, ok) = crafting_demo_lines(&registry, fixture);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-worldgen` is the headless worldgen digest: it reads the settings
+    // file and the persisted pack stack (read-only), builds the same frozen
+    // registry a launch would, and generates the pinned chunk window through
+    // the production terrain seam. It runs before `StartupContent::load`, so no
+    // window, GPU, audio engine, event loop, settings write or save happens
+    // here.
+    if cli.demo_worldgen {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let (lines, ok) = worldgen_demo_lines(&registry);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -14117,6 +14420,53 @@ stack = 64
         ];
         assert_eq!(lines, expected);
         assert!(fixture.is_file(), "the --save fixture must be written");
+    }
+
+    #[test]
+    fn worldgen_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let (lines, ok) = worldgen_demo_lines(&registry);
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test (D143/MEM368).
+        let expected = vec![
+            "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
+            "worldgen_demo: leg=session rules=2 matches=true".to_string(),
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2460 min_y=4 max_y=40 in_band=true"
+                .to_string(),
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=347 biomes=plains,forest biomes_ok=true"
+                .to_string(),
+            "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
+            "worldgen_demo: leg=empty_rules identical=true".to_string(),
+            "worldgen_demo: ok=true".to_string(),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn worldgen_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = worldgen_demo_lines(&ContentRegistry::builtin_arc());
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("worldgen_demo: ok=false failed=registry")
+        );
     }
 
     #[test]
