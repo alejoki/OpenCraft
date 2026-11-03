@@ -16,11 +16,12 @@ use std::path::Path;
 
 use glam::Vec3;
 
+use crate::content::ContentRegistry;
 use crate::player::physics::PLAYER_EYE_HEIGHT;
 use crate::world::daycycle::{GameClock, VISTA_GOLDEN_HOUR};
 use crate::world::manager::WorldManager;
 use crate::world::persistence::{
-    load_world_from_path, ChunkEditMap, PersistenceError, WorldSaveData,
+    load_world_from_path_with, ChunkEditMap, PersistenceError, WorldSaveData,
 };
 use crate::world::season::{season_of, Season, DEFAULT_SEASON_LENGTH_DAYS};
 use crate::world::vista::{self, VISTA_SEED};
@@ -99,10 +100,26 @@ impl BackgroundScene {
     /// Load the background save at `path`, falling back deterministically.
     ///
     /// Read-only: a missing file creates nothing and an invalid file is never
-    /// repaired, rewritten, or deleted here.
+    /// repaired, rewritten, or deleted here. This built-in wrapper is used by
+    /// callers that have no pack registry to resolve against.
     pub fn load(path: &Path, render_distance: i32) -> BackgroundLoad {
-        match load_world_from_path(path) {
-            Ok(data) => BackgroundLoad::Loaded(Self::from_save(data, render_distance)),
+        Self::load_with(path, render_distance, ContentRegistry::builtin())
+    }
+
+    /// Load the background save at `path` against `registry`.
+    ///
+    /// The menu background deliberately computes and surfaces NO changed-stack
+    /// notice (D179): a v8 backdrop whose pack was removed still loads, with
+    /// unknown names resolving to deterministic placeholders, and the caller
+    /// only ever sees the ordinary `Missing`/`Loaded`/`Invalid` outcome. The
+    /// `LoadedWorld` metadata and `unresolved` count are dropped here.
+    pub fn load_with(
+        path: &Path,
+        render_distance: i32,
+        registry: &ContentRegistry,
+    ) -> BackgroundLoad {
+        match load_world_from_path_with(path, registry) {
+            Ok(loaded) => BackgroundLoad::Loaded(Self::from_save(loaded.data, render_distance)),
             Err(PersistenceError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 BackgroundLoad::Missing(Self::new_default(render_distance))
             }
@@ -134,7 +151,7 @@ mod tests {
     use crate::world::chunk::{linear_index, ChunkPos};
     use crate::world::persistence::{
         load_world_from_bytes, load_world_from_path, save_world_to_bytes, save_world_to_path,
-        ChestMap, SavedPlayerState,
+        save_world_to_path_with, ChestMap, SavedPlayerState,
     };
     use crate::world::vista::VISTA_SEASON;
     use rustc_hash::FxHashMap;
@@ -274,6 +291,42 @@ mod tests {
             Vec3::from_array(data.player.position) + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0)
         );
         assert!(scene.persisted);
+    }
+
+    #[test]
+    fn v8_background_with_unknown_content_loads_as_a_scene() {
+        use crate::world::block::BlockId;
+
+        let path = temp_path("unknown-content");
+        let _ = std::fs::remove_file(&path);
+
+        // A writer registry knows a pack block; the loader below is the
+        // built-in registry, exactly like a player who removed the pack.
+        let mut writer = ContentRegistry::builtin().clone();
+        let ruby_ore = writer.append_placeholder_block("mymod:ruby_ore");
+        let mut data = sample_save();
+        let mut blocks = FxHashMap::default();
+        blocks.insert(linear_index(4, 5, 6) as u16, ruby_ore);
+        data.chunk_edits.insert(ChunkPos::new(2, 0, 2), blocks);
+        save_world_to_path_with(&path, &data, &writer).expect("write v8 background");
+
+        let load = BackgroundScene::load_with(&path, 16, ContentRegistry::builtin());
+        let BackgroundLoad::Loaded(scene) = load else {
+            panic!("a v8 background with unknown content must still load");
+        };
+        assert!(scene.persisted);
+        assert_eq!(scene.world.seed(), data.seed);
+        assert_eq!(
+            scene
+                .world
+                .chunk_edits()
+                .get(&ChunkPos::new(2, 0, 2))
+                .and_then(|chunk| chunk.get(&(linear_index(4, 5, 6) as u16))),
+            Some(&BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT)),
+            "the unknown name loaded as a deterministic placeholder block"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

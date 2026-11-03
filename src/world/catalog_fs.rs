@@ -26,11 +26,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::content::ContentRegistry;
 use crate::world::catalog::{
     self, CatalogRow, PendingDelete, RowProblem, RowStatus, WorldNameError,
 };
 use crate::world::persistence::{
-    load_world_from_path, save_world_to_path, PersistenceError, WorldSaveData, DEFAULT_SAVE_PATH,
+    load_world_from_path, load_world_from_path_with, save_world_to_path, LoadedWorld,
+    PersistenceError, WorldSaveData, DEFAULT_SAVE_PATH,
 };
 
 /// Saves directory derived from the existing default save path
@@ -288,21 +290,42 @@ impl WorldCatalogFs {
     }
 
     /// Load a `Loadable` catalog row through the existing
-    /// `load_world_from_path`. Corrupt rows fail before touching the
-    /// filesystem; load failures (vanished file, malformed body) are
-    /// surfaced with the world name for display.
-    pub fn load_row(&self, row: &CatalogRow) -> Result<WorldSaveData, CatalogLoadError> {
+    /// `load_world_from_path_with`, resolving content against `registry`.
+    /// Corrupt rows fail before touching the filesystem; load failures
+    /// (vanished file, malformed body) are surfaced with the world name for
+    /// display. A v8 save whose pack was removed still loads: unknown but
+    /// well-formed names become deterministic placeholders in the returned
+    /// [`LoadedWorld::registry`] (and are counted in `unresolved`).
+    pub fn load_row_loaded(
+        &self,
+        row: &CatalogRow,
+        registry: &ContentRegistry,
+    ) -> Result<LoadedWorld, CatalogLoadError> {
         match row.status {
-            RowStatus::Loadable => load_world_from_path(&self.saves_dir.join(&row.file_name))
-                .map_err(|source| CatalogLoadError::Load {
-                    name: row.name.clone(),
-                    source,
-                }),
+            RowStatus::Loadable => {
+                load_world_from_path_with(&self.saves_dir.join(&row.file_name), registry).map_err(
+                    |source| CatalogLoadError::Load {
+                        name: row.name.clone(),
+                        source,
+                    },
+                )
+            }
             RowStatus::Corrupt(problem) => Err(CatalogLoadError::Corrupt {
                 name: row.name.clone(),
                 problem,
             }),
         }
+    }
+
+    /// Load a `Loadable` catalog row through the existing
+    /// `load_world_from_path` with the built-in registry.
+    ///
+    /// Compatibility wrapper for callers that only need the world data; the
+    /// app's Play path uses [`WorldCatalogFs::load_row_loaded`] so pack content
+    /// resolves and a changed stack reports placeholders.
+    pub fn load_row(&self, row: &CatalogRow) -> Result<WorldSaveData, CatalogLoadError> {
+        self.load_row_loaded(row, ContentRegistry::builtin())
+            .map(|loaded| loaded.data)
     }
 
     /// Delete the world save named by a **confirmed** delete request.
@@ -337,7 +360,7 @@ mod tests {
         ConfirmOutcome, DeleteConfirmation, RowStatus, WORLD_FILE_EXTENSION,
     };
     use crate::world::chunk::ChunkPos;
-    use crate::world::persistence::SavedPlayerState;
+    use crate::world::persistence::{save_world_to_path_with, SavedPlayerState};
     use std::thread::sleep;
     use std::time::{Duration, SystemTime};
 
@@ -692,6 +715,89 @@ mod tests {
         // Validated path resolution trims and joins the saves directory.
         let resolved = catalog_fs.world_path("  My World  ").expect("valid");
         assert_eq!(resolved, dir.path().join("My World.mcvx"));
+    }
+
+    #[test]
+    fn load_row_loaded_resolves_pack_content_and_names() {
+        use crate::content::registry::build_registry;
+        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset, PackContentSpec};
+        use crate::content::ContentRegistry;
+        use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby_ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.assets.insert(
+            "ruby_ore.png".to_string(),
+            PackAsset {
+                rgba: vec![0x44; 1024],
+                source_side: 16,
+            },
+        );
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                crate::content::registry::PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "fixture pack is clean: {report:?}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+        let modded = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let mut data = sample_save(77);
+        let mut chunk = rustc_hash::FxHashMap::default();
+        chunk.insert(4u16, modded);
+        data.chunk_edits.insert(ChunkPos::new(1, 2, 3), chunk);
+        let path = dir.path().join("modded.mcvx");
+        save_world_to_path_with(&path, &data, &registry).expect("write v8 save");
+
+        // Row probing stays built-in, so a pack-resolved v8 row is Loadable
+        // even when the probe has to create throwaway placeholders.
+        let rows = catalog_fs.list_rows();
+        let row = row_for(&rows, "modded");
+        assert!(row.is_loadable());
+
+        let loaded = catalog_fs
+            .load_row_loaded(row, &registry)
+            .expect("pack-aware load");
+        assert_eq!(loaded.unresolved, 0, "the matching pack resolves the name");
+        let def = loaded.registry.block(modded).expect("ruby ore registered");
+        assert_eq!(def.name, "mymod:ruby_ore");
+        assert!(!def.placeholder);
+        assert_eq!(
+            loaded
+                .data
+                .chunk_edits
+                .get(&ChunkPos::new(1, 2, 3))
+                .and_then(|chunk| chunk.get(&4)),
+            Some(&modded),
+            "the saved modded block survives the load"
+        );
+
+        // The built-in compatibility wrapper still loads with placeholders.
+        let builtin = catalog_fs.load_row(row).expect("built-in load");
+        assert_eq!(
+            builtin
+                .chunk_edits
+                .get(&ChunkPos::new(1, 2, 3))
+                .and_then(|chunk| chunk.get(&4)),
+            Some(&modded)
+        );
     }
 
     #[test]

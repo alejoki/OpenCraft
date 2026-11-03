@@ -1622,6 +1622,10 @@ fn demo_owns_world_witness(cli: &CliConfig) -> bool {
 /// fresh `WorldSession::new_session` at
 /// `cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED)` with the same save
 /// path.
+///
+/// Test-only built-in wrapper: production builds [`StartupContent`] first and
+/// calls [`startup_session_with`] with its base registry.
+#[cfg(test)]
 fn startup_session(cli: &CliConfig) -> WorldSession {
     startup_session_with(cli, &ContentRegistry::builtin_arc())
 }
@@ -7903,6 +7907,75 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
+/// Everything the pack-aware startup path builds before `GameApp` exists.
+///
+/// Production loads this ONCE in `main` and hands the same instance to both
+/// the startup `WorldSession` and `GameApp`, so the pack registry that names a
+/// fresh world's content is the same registry the app adopts as its base. A
+/// test-only `GameApp::new_with_paths` builds one internally from the same
+/// settings/packs conventions the pre-M010 constructor used.
+struct StartupContent {
+    settings: Settings,
+    startup_warnings: Vec<SettingsWarning>,
+    current_pack: Option<LoadedPack>,
+    available_packs: Vec<String>,
+    audio: AudioEngine,
+    /// The settings file this startup content was loaded from. `GameApp` keeps
+    /// it as the save target for every settings mutation; injecting it through
+    /// this bundle keeps one source of truth for production and tests.
+    settings_path: PathBuf,
+    packs_root: PathBuf,
+    /// The launch pack-stack registry: the immutable base every loaded session
+    /// and every newly created world is resolved against. It is replaced only
+    /// by a pack-stack change, and then only for the NEXT load (MEM512).
+    base_registry: Arc<ContentRegistry>,
+}
+
+impl StartupContent {
+    /// Load settings, the persisted pack stack, sound overrides and the
+    /// session content registry in the historical warning order.
+    fn load(settings_path: &Path, packs_root: PathBuf) -> StartupContent {
+        // Startup settings load: never blocks launch — a missing or corrupt
+        // settings.toml yields defaults plus structured warnings, surfaced
+        // as menu text on the first open.
+        let (settings, mut startup_warnings) = load_with_warnings(settings_path);
+        // Pack discovery and startup apply (M004/S03): the persisted choice
+        // is re-applied on every launch. A missing/deleted pack folder still
+        // yields a fully usable procedural pack plus one warning naming it,
+        // surfaced through the existing first-Settings-open message path
+        // (D031/MEM121, MEM009: warnings are data, never logs).
+        let available_packs = pack::available_pack_names(&packs_root);
+        let (current_pack, pack_specs, pack_warnings) =
+            load_startup_stack(&packs_root, &settings.pack_stack);
+        startup_warnings.extend(pack_warnings);
+        // Startup sound overrides (M005/S05): resolved independently of the
+        // texture result, so a pack whose layers partially failed still
+        // supplies its sounds. The never-fail loader returns a complete
+        // buffer set; its warnings merge into the same one-time Settings-entry
+        // message path as every other startup warning (MEM009/D054). The
+        // engine is constructed first because `set_buffers` is device-free.
+        let mut audio = new_audio_engine();
+        let (startup_sounds, sound_warnings) = pack::sound::resolve_sounds(&pack_specs);
+        audio.set_buffers(startup_sounds);
+        startup_warnings.extend(sound_warnings);
+        // Session content registry (M010/S02): built once from the ordered
+        // stack over the built-in table, then frozen for the whole session.
+        // Registry diagnostics join the same one-time warning path.
+        let (base_registry, registry_report) = build_session_registry(&pack_specs);
+        startup_warnings.extend(registry_warnings(&registry_report));
+        StartupContent {
+            settings,
+            startup_warnings,
+            current_pack,
+            available_packs,
+            audio,
+            settings_path: settings_path.to_path_buf(),
+            packs_root,
+            base_registry,
+        }
+    }
+}
+
 struct GameApp {
     window: Option<Arc<Window>>,
     gpu: Option<Ready>,
@@ -8077,10 +8150,15 @@ struct GameApp {
     /// the built-in procedural Default pack (MEM113). Never holds a
     /// half-loaded pack: `load_stack` always returns usable layers.
     current_pack: Option<LoadedPack>,
-    /// The session's immutable content registry, built once at startup from
-    /// the then-current pack stack and never replaced while the session runs
-    /// (MEM512). Only presentation applies live; a toggled content change is
-    /// reported as a deferred-until-next-load warning.
+    /// The launch pack-stack registry: the base every new/loaded world is
+    /// resolved against and the reference for a live pack-change digest
+    /// comparison. A Packs toggle replaces this (for the NEXT load) but never
+    /// `session_registry` (MEM512/D181).
+    base_registry: Arc<ContentRegistry>,
+    /// The CURRENT session's immutable content registry. A loaded v8 world
+    /// carries the placeholder-augmented registry it was decoded with; a fresh
+    /// world carries a clone of `base_registry`. Re-adopted by
+    /// `on_session_installed`, never replaced while a session runs.
     session_registry: Arc<ContentRegistry>,
     /// Set whenever the pack stack changes presentation, so the next
     /// `RedrawRequested` uploads the merged layers and logo once. Startup
@@ -8162,6 +8240,7 @@ impl GameApp {
         event_loop.exit();
     }
 
+    #[cfg(test)]
     fn new(cli: CliConfig, session: WorldSession) -> Self {
         Self::new_with_paths(
             cli,
@@ -8171,46 +8250,45 @@ impl GameApp {
         )
     }
 
-    /// Constructor with injectable settings and background paths.
+    /// Test-only constructor with injectable settings and background paths.
     ///
-    /// Production goes through [`GameApp::new`]; headless tests point both
-    /// paths at a tempdir so a developer's real settings.toml or background
-    /// save can never change a test outcome.
+    /// Production goes through [`GameApp::new_with_content`] after building
+    /// [`StartupContent`] once in `main`; headless tests point both paths at a
+    /// tempdir so a developer's real settings.toml or background save can
+    /// never change a test outcome.
+    #[cfg(test)]
     fn new_with_paths(
         cli: CliConfig,
-        mut session: WorldSession,
+        session: WorldSession,
         settings_path: PathBuf,
         background_path: PathBuf,
     ) -> Self {
-        // Startup settings load: never blocks launch — a missing or corrupt
-        // settings.toml yields defaults plus structured warnings, surfaced
-        // as menu text on the first open.
-        let (settings, mut startup_warnings) = load_with_warnings(&settings_path);
-        // Pack discovery and startup apply (M004/S03): the persisted choice
-        // is re-applied on every launch. A missing/deleted pack folder still
-        // yields a fully usable procedural pack plus one warning naming it,
-        // surfaced through the existing first-Settings-open message path
-        // (D031/MEM121, MEM009: warnings are data, never logs).
-        let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
-        let available_packs = pack::available_pack_names(&packs_root);
-        let (current_pack, pack_specs, pack_warnings) =
-            load_startup_stack(&packs_root, &settings.pack_stack);
-        startup_warnings.extend(pack_warnings);
-        // Startup sound overrides (M005/S05): resolved independently of the
-        // texture result, so a pack whose layers partially failed still
-        // supplies its sounds. The never-fail loader returns a complete
-        // buffer set; its warnings merge into the same one-time Settings-entry
-        // message path as every other startup warning (MEM009/D054). The
-        // engine is constructed first because `set_buffers` is device-free.
-        let mut audio = new_audio_engine();
-        let (startup_sounds, sound_warnings) = pack::sound::resolve_sounds(&pack_specs);
-        audio.set_buffers(startup_sounds);
-        startup_warnings.extend(sound_warnings);
-        // Session content registry (M010/S02): built once from the ordered
-        // stack over the built-in table, then frozen for the whole session.
-        // Registry diagnostics join the same one-time warning path.
-        let (session_registry, registry_report) = build_session_registry(&pack_specs);
-        startup_warnings.extend(registry_warnings(&registry_report));
+        let content =
+            StartupContent::load(&settings_path, Path::new(pack::PACKS_DIR).to_path_buf());
+        Self::new_with_content(cli, session, content, background_path)
+    }
+
+    /// Constructor from already-loaded startup content.
+    ///
+    /// Production builds [`StartupContent`] once in `main` and shares the same
+    /// base registry with the startup session; this body only assembles the app
+    /// (no settings/pack/sound/registry I/O).
+    fn new_with_content(
+        cli: CliConfig,
+        mut session: WorldSession,
+        content: StartupContent,
+        background_path: PathBuf,
+    ) -> Self {
+        let StartupContent {
+            settings,
+            startup_warnings,
+            current_pack,
+            available_packs,
+            audio,
+            settings_path,
+            packs_root,
+            base_registry,
+        } = content;
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8320,21 +8398,37 @@ impl GameApp {
         // file is the deterministic demo; a corrupt file falls back to the
         // same demo and the reason becomes menu data (D006/MEM009). Loading is
         // read-only: this path never creates, repairs, or rewrites the file.
-        let (background, background_warning) =
-            match BackgroundScene::load(&background_path, settings.render_distance) {
-                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => (scene, None),
-                BackgroundLoad::Invalid { scene, error } => (
-                    scene,
-                    Some(format!(
-                        "could not load menu background: {error}; showing the default scenery (editing will replace it)"
-                    )),
-                ),
-            };
+        let (background, background_warning) = match BackgroundScene::load_with(
+            &background_path,
+            settings.render_distance,
+            base_registry.as_ref(),
+        ) {
+            BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => (scene, None),
+            BackgroundLoad::Invalid { scene, error } => (
+                scene,
+                Some(format!(
+                    "could not load menu background: {error}; showing the default scenery (editing will replace it)"
+                )),
+            ),
+        };
         let main_menu_message = if startup_screen == LifecycleScreen::MainMenu {
             background_warning.map(|text| MenuMessage {
                 text,
                 ticks_left: menu::MESSAGE_TICKS,
             })
+        } else {
+            None
+        };
+        // The session registry is the load-time registry: a loaded v8 world
+        // keeps its placeholder-augmented registry, a fresh world the launch
+        // base. Only `on_session_installed` re-adopts it on a swap (MEM512).
+        let session_registry = Arc::clone(&session.registry);
+        // Seed the changed-stack notice once, and only for a launch that
+        // starts in gameplay (D193). Menu-first launches keep it queued on the
+        // session; the usual `on_session_installed` path surfaces it when a
+        // world is actually opened.
+        let startup_content_notice = if startup_screen == LifecycleScreen::Playing {
+            session.take_content_notice()
         } else {
             None
         };
@@ -8360,7 +8454,10 @@ impl GameApp {
             inventory_drag: None,
             chest: ChestScreen::new(),
             chest_status: None,
-            game_message: None,
+            game_message: startup_content_notice.map(|text| MenuMessage {
+                text,
+                ticks_left: menu::MESSAGE_TICKS,
+            }),
             selection_label: SelectionLabel::new(),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
@@ -8386,6 +8483,7 @@ impl GameApp {
             available_packs,
             current_pack,
             session_registry,
+            base_registry,
             pack_presentation_dirty: false,
             packs_message: None,
             time_scale: cli.time_scale,
@@ -8552,7 +8650,8 @@ impl GameApp {
 
     /// Reload the ordered stack and apply every live surface: merged layers,
     /// logo, tunes, and the Packs screen's warning message. The session's
-    /// content registry is deliberately NOT replaced (MEM512); a changed
+    /// content registry is deliberately NOT replaced (MEM512); the candidate
+    /// becomes the new `base_registry` for the NEXT load, and a changed
     /// definition digest only warns that content applies on the next load.
     fn apply_pack_stack(&mut self) {
         let (loaded, specs, mut warnings) =
@@ -8565,10 +8664,13 @@ impl GameApp {
         warnings.extend(sound_warnings);
         let (candidate, report) = build_session_registry(&specs);
         warnings.extend(registry_warnings(&report));
-        let changed = candidate.digest() != self.session_registry.digest();
+        let changed = candidate.digest() != self.base_registry.digest();
 
         self.current_pack = loaded;
         self.pack_presentation_dirty = true;
+        // The candidate becomes the base for the NEXT load. The live session
+        // keeps its frozen registry untouched (MEM512/D181).
+        self.base_registry = candidate;
 
         if warnings.is_empty() && !changed {
             self.packs_message = None;
@@ -8847,6 +8949,17 @@ impl GameApp {
         self.chest.close();
         self.chest_status = None;
         self.game_message = None;
+        // The installed session owns the registry every save names content
+        // through: a loaded world keeps its placeholder-augmented registry, a
+        // fresh world the base it was built from (MEM512/D181). Its one-shot
+        // changed-stack notice becomes the existing transient notice.
+        self.session_registry = Arc::clone(&self.session.registry);
+        if let Some(text) = self.session.take_content_notice() {
+            self.game_message = Some(MenuMessage {
+                text,
+                ticks_left: menu::MESSAGE_TICKS,
+            });
+        }
         self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
@@ -8903,17 +9016,26 @@ impl GameApp {
     /// menu anchor, with the scene's clock; saving it creates the file.
     fn build_background_edit_session(&self) -> Result<WorldSession, String> {
         let mut session = if self.background.persisted {
-            let data = load_world_from_path(&self.background_path)
-                .map_err(|error| format!("could not open menu background for editing: {error}"))?;
-            WorldSession::session_from_save(data, self.background_path.clone())
+            let loaded =
+                load_world_from_path_with(&self.background_path, self.base_registry.as_ref())
+                    .map_err(|error| {
+                        format!("could not open menu background for editing: {error}")
+                    })?;
+            let mut session = WorldSession::from_loaded_world(loaded, self.background_path.clone());
+            // D179: the menu background owns no content-notice channel, so the
+            // edit session must not surface the changed-stack note either. The
+            // placeholders still render, keeping the scene readable.
+            session.take_content_notice();
+            session
         } else {
             let position = self.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
-            WorldSession::new_at(
+            WorldSession::new_at_with_registry(
                 self.background.world.seed(),
                 self.background_path.clone(),
                 self.background.season_length_days,
                 position,
                 self.background.clock,
+                Arc::clone(&self.base_registry),
             )
         };
         // Edit Background always runs Creative movement rules over the live
@@ -8939,25 +9061,32 @@ impl GameApp {
     /// an empty store and a blank panorama. Restores the suspended session, so
     /// the menu returns to the pre-edit session rather than keeping the editor.
     fn finish_background_edit(&mut self) {
-        let reloaded =
-            match BackgroundScene::load(&self.background_path, self.settings.render_distance) {
-                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => scene,
-                BackgroundLoad::Invalid { scene, error } => {
-                    self.main_menu_message = Some(MenuMessage {
-                        text: format!(
-                            "could not reload menu background: {error}; showing the default scenery"
-                        ),
-                        ticks_left: menu::MESSAGE_TICKS,
-                    });
-                    scene
-                }
-            };
+        let reloaded = match BackgroundScene::load_with(
+            &self.background_path,
+            self.settings.render_distance,
+            self.base_registry.as_ref(),
+        ) {
+            BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => scene,
+            BackgroundLoad::Invalid { scene, error } => {
+                self.main_menu_message = Some(MenuMessage {
+                    text: format!(
+                        "could not reload menu background: {error}; showing the default scenery"
+                    ),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                scene
+            }
+        };
         self.background = reloaded;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.vista_store.clear();
         }
         if let Some(previous) = self.suspended_session.take() {
             self.session = previous;
+            // The restored session's frozen registry is the current session
+            // registry again; the edit session's registry (and any one-shot
+            // notice) does not leak into menus or the next save.
+            self.session_registry = Arc::clone(&self.session.registry);
         }
     }
 
@@ -9218,11 +9347,12 @@ impl GameApp {
         // The New Game row owns the season length (S02-T04) and the game mode
         // (S08-T01 T05): the screen's cycler values, defaulting to one game
         // day per season and Survival.
-        let session = WorldSession::new_session_with_mode(
+        let session = WorldSession::new_session_with_mode_and_registry(
             seed,
             save_path,
             self.new_game.season_length_days(),
             self.new_game.mode(),
+            Arc::clone(&self.base_registry),
         );
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
@@ -9261,8 +9391,11 @@ impl GameApp {
     /// degraded or vanished rows are displayed, never swallowed — the
     /// crate stays log-free). A loadable row starts the real world session:
     /// the persisted `WorldSaveData` (seed, player state, chunk edits)
-    /// rebuilds the session via `session::session_from_save` at the row's
-    /// own file path (`<saves_dir>/<file_name>`), and the S01 decision
+    /// rebuilds the session via `WorldSession::from_loaded_world` at the row's
+    /// own file path (`<saves_dir>/<file_name>`), resolved against the app's
+    /// `base_registry` so pack content keeps its real definitions and a
+    /// changed stack produces deterministic placeholders plus the one-shot
+    /// notice. The S01 decision
     /// `LoadWorld` (from dispatching `LoadGameIntent::Load`) drives the
     /// swap through the one `start_world_session` boundary and enters
     /// Playing semantics (cursor grab via `enter_playing`; the lifecycle
@@ -9274,8 +9407,11 @@ impl GameApp {
         let Some(row) = self.load.rows().get(index).cloned() else {
             return;
         };
-        let save = match self.catalog.load_row(&row) {
-            Ok(save) => save,
+        let loaded = match self
+            .catalog
+            .load_row_loaded(&row, self.base_registry.as_ref())
+        {
+            Ok(loaded) => loaded,
             Err(err) => {
                 self.load_message = Some(MenuMessage {
                     text: err.to_string(),
@@ -9285,7 +9421,7 @@ impl GameApp {
             }
         };
         let session =
-            WorldSession::session_from_save(save, self.catalog.saves_dir().join(&row.file_name));
+            WorldSession::from_loaded_world(loaded, self.catalog.saves_dir().join(&row.file_name));
         // Unreachable: play_row only runs while the load screen is
         // open, and that screen accepts Load.
         if let Ok(LifecycleDecision::LoadWorld) = self
@@ -11975,12 +12111,25 @@ fn main() {
         return;
     }
 
-    let session = startup_session(&cli);
+    // Build the pack-aware startup content ONCE: the same base registry names
+    // the fresh/loaded startup session and becomes the app's base registry.
+    // `--validate-pack` and `--demo-ui` returned above, so no window, GPU,
+    // settings file or save is touched for those short-circuits.
+    let content = StartupContent::load(
+        Path::new(DEFAULT_SETTINGS_PATH),
+        Path::new(pack::PACKS_DIR).to_path_buf(),
+    );
+    let session = startup_session_with(&cli, &content.base_registry);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = GameApp::new(cli, session);
+    let mut app = GameApp::new_with_content(
+        cli,
+        session,
+        content,
+        Path::new(DEFAULT_BACKGROUND_SAVE_PATH).to_path_buf(),
+    );
     event_loop.run_app(&mut app).expect("Event loop error");
     // A failed scripted demo seam (a self-describing swim abort) exits non-zero
     // so a bounded smoke can distinguish "ran to a verdict and failed" from
@@ -12430,8 +12579,8 @@ mod tests {
             .find("validate_pack_lines")
             .expect("fn main must call validate_pack_lines");
         let startup_at = body
-            .find("startup_session(&cli)")
-            .expect("fn main must call startup_session(&cli)");
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
         assert!(
             validate_at < startup_at,
             "cli.validate_pack must precede startup"
@@ -12464,8 +12613,8 @@ mod tests {
             .find("ui_demo_digest_lines")
             .expect("fn main must call ui_demo_digest_lines");
         let startup_at = body
-            .find("startup_session(&cli)")
-            .expect("fn main must call startup_session(&cli)");
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
         assert!(demo_ui_at < startup_at, "cli.demo_ui must precede startup");
         assert!(
             digest_at < startup_at,
@@ -16911,12 +17060,14 @@ mod tests {
             ContentRegistry::builtin().digest(),
             "the fixture changes content identity"
         );
+        app.base_registry = Arc::clone(&registry);
         app.session_registry = registry;
         let session_digest = app.session_registry.digest();
         let session_ptr = Arc::as_ptr(&app.session_registry);
 
         // Toggling every content pack off changes the candidate digest, but
-        // the frozen session registry must survive untouched (MEM512).
+        // the frozen session registry must survive untouched (MEM512) while
+        // the base adopts the new stack for the next load.
         app.settings.pack_stack.clear();
         app.apply_pack_stack();
 
@@ -16929,11 +17080,157 @@ mod tests {
             message.text
         );
         assert_eq!(
+            app.base_registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the base registry adopts the cleared stack for the next load"
+        );
+        assert_eq!(
             Arc::as_ptr(&app.session_registry),
             session_ptr,
             "the Arc is never replaced mid-session"
         );
         assert_eq!(app.session_registry.digest(), session_digest);
+    }
+
+    #[test]
+    fn play_row_surfaces_a_changed_stack_warning_and_opens_with_placeholders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let saves = dir.path().join("saves");
+        std::fs::create_dir_all(&saves).expect("create saves dir");
+        let registry = main_ruby_registry();
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        let save_path = saves.join("Modded.mcvx");
+        save_world_to_path_with(&save_path, &modded_sample_save(31), registry.as_ref())
+            .expect("write v8 save with pack content");
+
+        // A temp settings path means an empty pack stack, so the launch base
+        // is the built-in registry even if the developer's real packs exist.
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            dir.path().join("settings.toml"),
+            dir.path().join("background/background.mcvx"),
+        );
+        assert_eq!(
+            app.base_registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the launch base is the built-in registry"
+        );
+        app.catalog = WorldCatalogFs::new(&saves);
+        app.enter_screen(LifecycleScreen::LoadGame);
+        app.play_row(0);
+
+        // The world opens (never blocked) with deterministic placeholders and
+        // the readable one-shot changed-stack notice above the hotbar.
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            app.session
+                .world
+                .chunk_edits()
+                .get(&ChunkPos::new(1, 2, 3))
+                .and_then(|chunk| chunk.get(&10)),
+            Some(&ruby_ore),
+            "the saved modded block kept its raw id as a placeholder"
+        );
+        assert_eq!(
+            app.session.registry.block_name(ruby_ore),
+            Some("mymod:ruby_ore")
+        );
+        assert!(
+            app.session
+                .registry
+                .block(ruby_ore)
+                .expect("placeholder block registered")
+                .placeholder,
+            "a missing pack renders as a placeholder, not a failure"
+        );
+        let message = app.game_message.as_ref().expect("changed-stack notice");
+        assert!(
+            message.text.contains("missing pack"),
+            "notice names the missing pack: {}",
+            message.text
+        );
+        assert!(
+            message.text.contains("placeholder"),
+            "notice counts the placeholders: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+
+        // The same save loaded under the matching pack registry resolves real
+        // definitions and produces NO notice (no modal, no warning state).
+        let matched_dir = tempfile::tempdir().expect("tempdir");
+        let matched_saves = matched_dir.path().join("saves");
+        std::fs::create_dir_all(&matched_saves).expect("create saves dir");
+        let matched_path = matched_saves.join("Modded.mcvx");
+        save_world_to_path_with(&matched_path, &modded_sample_save(32), registry.as_ref())
+            .expect("write v8 save with matching content");
+        let mut matched = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            matched_dir.path().join("settings.toml"),
+            matched_dir.path().join("background/background.mcvx"),
+        );
+        matched.base_registry = Arc::clone(&registry);
+        matched.catalog = WorldCatalogFs::new(&matched_saves);
+        matched.enter_screen(LifecycleScreen::LoadGame);
+        matched.play_row(0);
+
+        assert_eq!(matched.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            matched.session.registry.block_name(ruby_ore),
+            Some("mymod:ruby_ore")
+        );
+        assert!(
+            !matched
+                .session
+                .registry
+                .block(ruby_ore)
+                .expect("real ruby ore registered")
+                .placeholder,
+            "the matching pack keeps the real definition"
+        );
+        assert!(
+            matched.game_message.is_none(),
+            "a matching stack is quiet: {:?}",
+            matched.game_message.as_ref().map(|message| &message.text)
+        );
+
+        // A v8 MENU BACKGROUND with unknown content loads as a scene and never
+        // surfaces a content notice (D179): no menu message, no game message.
+        let background_dir = tempfile::tempdir().expect("tempdir");
+        let background_path = background_dir.path().join("background/background.mcvx");
+        std::fs::create_dir_all(background_path.parent().expect("parent"))
+            .expect("create background dir");
+        save_world_to_path_with(&background_path, &modded_sample_save(33), registry.as_ref())
+            .expect("write v8 menu background with pack content");
+        let background_app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            background_dir.path().join("settings.toml"),
+            background_path,
+        );
+        assert!(
+            background_app.background.persisted,
+            "the v8 background with unknown content loads as a scene"
+        );
+        assert!(
+            background_app.main_menu_message.is_none(),
+            "the menu background suppresses the content notice"
+        );
+        assert!(background_app.game_message.is_none());
     }
 
     #[test]
