@@ -46,6 +46,9 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
         | BlockId::WheatStage1
         | BlockId::WheatStage2
         | BlockId::WheatStage3 => None,
+        // No acceleration until the registry resolves a tool class in S04:
+        // fail closed rather than guessing a built-in material.
+        BlockId::Modded(_) => None,
     }
 }
 

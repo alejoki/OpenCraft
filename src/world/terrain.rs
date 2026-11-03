@@ -1954,7 +1954,15 @@ mod tests {
                                 for lx in 0..CHUNK_SIZE {
                                     let block = chunk.get(lx, ly, lz);
                                     if matches!(block, BlockId::CoalOre | BlockId::IronOre) {
-                                        layout.push((pos.x, pos.y, pos.z, lx, ly, lz, block as u8));
+                                        layout.push((
+                                            pos.x,
+                                            pos.y,
+                                            pos.z,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            block.to_raw() as u8,
+                                        ));
                                     }
                                 }
                             }
@@ -3266,7 +3274,7 @@ mod tests {
                                         cx * CHUNK_SIZE as i32 + lx as i32,
                                         cy * CHUNK_SIZE as i32 + ly as i32,
                                         cz * CHUNK_SIZE as i32 + lz as i32,
-                                        block as u8,
+                                        block.to_raw() as u8,
                                     ));
                                 }
                             }
@@ -3464,7 +3472,7 @@ mod tests {
         );
         let brick_cells = blocks
             .iter()
-            .filter(|b| b.3 == BlockId::Brick as u8)
+            .filter(|b| b.3 == BlockId::Brick.to_raw() as u8)
             .count();
         assert!(
             brick_cells >= 4,
@@ -3506,7 +3514,8 @@ mod tests {
             let on_shell = covering.iter().any(|spec| {
                 let dx = wx - spec.anchor_x;
                 let dz = wz - spec.anchor_z;
-                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF && ruin_wall_block(dx, dz) as u8 == id
+                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF
+                    && ruin_wall_block(dx, dz).to_raw() as u8 == id
             });
             assert!(
                 on_shell,
@@ -5067,8 +5076,9 @@ mod tests {
     /// FNV-1a 64 over every cell in `linear_index` order (x fastest, then z,
     /// then y), hashing each block id as a little-endian `u16`.
     ///
-    /// Deliberately local to this test module: T02 swaps the `block as u8`
-    /// expression for `to_raw()` without moving the pinned literals.
+    /// Deliberately local to this test module: the identity refactor swapped
+    /// the `block as u8` expression for `to_raw()` without moving the pinned
+    /// literals.
     fn fnv1a64_chunk_baseline(chunk: &Chunk) -> (Option<BlockId>, usize, u64) {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut non_air = 0usize;
@@ -5080,7 +5090,7 @@ mod tests {
                     if block != BlockId::Air {
                         non_air += 1;
                     }
-                    for byte in (block as u8 as u16).to_le_bytes() {
+                    for byte in block.to_raw().to_le_bytes() {
                         hash ^= byte as u64;
                         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
                     }

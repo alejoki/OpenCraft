@@ -429,7 +429,7 @@ pub enum PersistenceError {
     Io(std::io::Error),
     InvalidMagic,
     UnsupportedVersion(u32),
-    InvalidBlockId(u8),
+    InvalidBlockId(u16),
     InvalidLocalIndex(u16),
     InvalidPlayerState,
     /// Version-4 inventory extension carried an unknown item tag.
@@ -530,10 +530,82 @@ impl fmt::Display for PersistenceError {
 
 impl std::error::Error for PersistenceError {}
 
+/// Rejects every block id the v1-v7 wire format cannot represent.
+///
+/// Each block byte on disk is a `u8` and the decoder accepts only the frozen
+/// built-in ids `0..=22`, so a [`BlockId::Modded`] id would silently truncate
+/// into a different built-in id. This scan runs before the first output byte
+/// so such a save is rejected with an empty buffer instead.
+fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> {
+    fn check_block(block: BlockId) -> Result<(), PersistenceError> {
+        if !block.is_builtin() {
+            return Err(PersistenceError::InvalidBlockId(block.to_raw()));
+        }
+        Ok(())
+    }
+
+    fn check_item(item: Option<Item>) -> Result<(), PersistenceError> {
+        if let Some(item) = item {
+            if let ItemId::Block(block) = item.id() {
+                check_block(block)?;
+            }
+        }
+        Ok(())
+    }
+
+    for edits in data.chunk_edits.values() {
+        for &block in edits.values() {
+            check_block(block)?;
+            // Water is worldgen-only. A liquid in a chunk edit would
+            // round-trip a value this schema deliberately refuses to load, so
+            // refuse to write it (still before the first byte).
+            if block.is_liquid() {
+                return Err(PersistenceError::InvalidBlockId(block.to_raw()));
+            }
+        }
+    }
+
+    for slot in data.player.inventory.slots() {
+        check_item(*slot)?;
+    }
+    check_item(data.player.inventory.cursor())?;
+
+    // The v2/v3 hotbar header is a separate block-only projection of the
+    // inventory; validate it explicitly so the header can never emit a
+    // truncated id even if the projection changes.
+    let legacy_hotbar = data.player.legacy_hotbar();
+    for stack in legacy_hotbar.stacks().iter().flatten() {
+        check_block(stack.block)?;
+    }
+
+    // Both crafting grids: `slot` is bounds-checked and returns `None` past
+    // the grid's own slot count, so scanning the full MAX_GRID_SLOTS range is
+    // safe for the 2x2 and 4x4 grids alike.
+    for index in 0..MAX_GRID_SLOTS {
+        check_item(data.player.player_grid.slot(index))?;
+        check_item(data.player.table_grid.slot(index))?;
+    }
+
+    for container in data.chests.values() {
+        for slot in container.slots() {
+            check_item(*slot)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn save_world_to_bytes(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
 ) -> Result<(), PersistenceError> {
+    // The v1-v7 wire vocabulary is built-in only (a block id is one `u8` and
+    // the decoder accepts 0..=22). Reject every unrepresentable block before
+    // writing a single byte so a modded id can never be truncated into a
+    // different built-in id on disk, and a rejected save leaves `out`
+    // untouched (atomic-rejection contract).
+    validate_legacy_blocks(data)?;
+
     // The two persisted grid positions are fixed, so a grid whose kind
     // disagrees with its slot would be unloadable. Validate before writing a
     // single byte so a rejected save leaves `out` untouched.
@@ -541,17 +613,6 @@ pub fn save_world_to_bytes(
         || data.player.table_grid.kind() != GridKind::Table
     {
         return Err(PersistenceError::InvalidCraftingState);
-    }
-
-    // Water is worldgen-only. A liquid in a chunk edit would round-trip a
-    // value this schema deliberately refuses to load, so refuse to write it
-    // (still before the first byte, keeping the atomic-write contract).
-    for edits in data.chunk_edits.values() {
-        for &block in edits.values() {
-            if block.is_liquid() {
-                return Err(PersistenceError::InvalidBlockId(block as u8));
-            }
-        }
     }
 
     // The chest section carries a u32 count. Validate the bound and the
@@ -613,7 +674,12 @@ pub fn save_world_to_bytes(
     for stack in legacy_hotbar.stacks() {
         match stack {
             Some(stack) => {
-                out.push(stack.block as u8);
+                out.push(
+                    stack
+                        .block
+                        .builtin_u8()
+                        .ok_or(PersistenceError::InvalidBlockId(stack.block.to_raw()))?,
+                );
                 out.extend_from_slice(&stack.count.to_le_bytes());
             }
             None => {
@@ -647,7 +713,11 @@ pub fn save_world_to_bytes(
         out.extend_from_slice(&(sorted_edits.len() as u32).to_le_bytes());
         for (idx, block) in sorted_edits {
             out.extend_from_slice(&idx.to_le_bytes());
-            out.push(block as u8);
+            out.push(
+                block
+                    .builtin_u8()
+                    .ok_or(PersistenceError::InvalidBlockId(block.to_raw()))?,
+            );
         }
     }
 
@@ -658,7 +728,7 @@ pub fn save_world_to_bytes(
         &data.player.inventory,
         &data.player.player_grid,
         &data.player.table_grid,
-    );
+    )?;
 
     // v5 world calendar tail: `day_index` then `season_length_days`, both
     // `u32` LE, immediately after the v4 extension. The season length is
@@ -689,7 +759,7 @@ pub fn save_world_to_bytes(
         out.extend_from_slice(&pos.y.to_le_bytes());
         out.extend_from_slice(&pos.z.to_le_bytes());
         for slot in container.slots() {
-            write_item(out, *slot);
+            write_item(out, *slot)?;
         }
     }
 
@@ -814,14 +884,23 @@ fn tool_tier_from_tag(tag: u8) -> Option<ToolTier> {
 }
 
 /// Appends one fixed-size item record: `tag` then a tag-specific payload.
-/// Items are already validated, so encoding cannot fail.
-fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
+///
+/// Block payloads narrow through [`BlockId::builtin_u8`] and surface
+/// [`PersistenceError::InvalidBlockId`] instead of truncating a modded id. The
+/// pre-write [`validate_legacy_blocks`] scan makes that branch unreachable for
+/// a save that reached the writer, but the writer keeps the check explicit so
+/// no unchecked cast can be reintroduced.
+fn write_item(out: &mut Vec<u8>, item: Option<Item>) -> Result<(), PersistenceError> {
     match item {
         None => out.push(ITEM_TAG_EMPTY),
         Some(item) => match item.id() {
             ItemId::Block(block) => {
                 out.push(ITEM_TAG_BLOCK);
-                out.push(block as u8);
+                out.push(
+                    block
+                        .builtin_u8()
+                        .ok_or(PersistenceError::InvalidBlockId(block.to_raw()))?,
+                );
                 out.extend_from_slice(&item.count().to_le_bytes());
             }
             ItemId::Material(material) => {
@@ -837,13 +916,15 @@ fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
             }
         },
     }
+    Ok(())
 }
 
-fn write_grid(out: &mut Vec<u8>, grid: &CraftingGrid) {
+fn write_grid(out: &mut Vec<u8>, grid: &CraftingGrid) -> Result<(), PersistenceError> {
     out.push(grid_kind_tag(grid.kind()));
     for index in 0..grid.kind().slot_count() {
-        write_item(out, grid.slot(index));
+        write_item(out, grid.slot(index))?;
     }
+    Ok(())
 }
 
 fn write_inventory_extension(
@@ -851,13 +932,14 @@ fn write_inventory_extension(
     inventory: &Inventory,
     player_grid: &CraftingGrid,
     table_grid: &CraftingGrid,
-) {
+) -> Result<(), PersistenceError> {
     for item in inventory.slots() {
-        write_item(out, *item);
+        write_item(out, *item)?;
     }
-    write_item(out, inventory.cursor());
-    write_grid(out, player_grid);
-    write_grid(out, table_grid);
+    write_item(out, inventory.cursor())?;
+    write_grid(out, player_grid)?;
+    write_grid(out, table_grid)?;
+    Ok(())
 }
 
 fn read_u8<R: Read>(r: &mut R) -> Result<u8, PersistenceError> {
@@ -975,21 +1057,21 @@ pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceE
             }
             let block_raw = read_u8(&mut cur)?;
             let Some(block) = BlockId::from_u8(block_raw) else {
-                return Err(PersistenceError::InvalidBlockId(block_raw));
+                return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             };
             // v4 validation keeps rejecting id 15 even though `from_u8` now
             // accepts it: water is generated only by the terrain pass and must
             // never round-trip through a persisted chunk edit. Treating a
             // forged water edit as an unknown id fails the whole save closed.
             if block.is_liquid() {
-                return Err(PersistenceError::InvalidBlockId(block_raw));
+                return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
             // Ids 16..=22 are v6 wire identities. A pre-v6 payload that
             // claims one is corrupt (or forged), so fail closed instead of
             // inventing a block under a version that never could have
             // written it. Water keeps its own unconditional rejection above.
             if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
-                return Err(PersistenceError::InvalidBlockId(block_raw));
+                return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
             edits.insert(local_idx, block);
         }
@@ -1183,7 +1265,7 @@ fn read_hotbar<R: Read>(r: &mut R, version: u32) -> Result<Hotbar, PersistenceEr
         let block_raw = read_u8(r)?;
         let count = read_u16(r)?;
 
-        if block_raw == BlockId::Air as u8 {
+        if u16::from(block_raw) == BlockId::Air.to_raw() {
             if count != 0 {
                 return Err(PersistenceError::InvalidPlayerState);
             }
@@ -1191,10 +1273,10 @@ fn read_hotbar<R: Read>(r: &mut R, version: u32) -> Result<Hotbar, PersistenceEr
         }
 
         let Some(block) = BlockId::from_u8(block_raw) else {
-            return Err(PersistenceError::InvalidBlockId(block_raw));
+            return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
         };
         if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
-            return Err(PersistenceError::InvalidBlockId(block_raw));
+            return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
         }
         if matches!(block, BlockId::Air | BlockId::Bedrock | BlockId::Water) {
             return Err(PersistenceError::InvalidPlayerState);
@@ -1228,10 +1310,10 @@ fn read_item<R: Read>(r: &mut R, version: u32) -> Result<Option<Item>, Persisten
             let block_raw = read_u8(r)?;
             let count = read_u16(r)?;
             let Some(block) = BlockId::from_u8(block_raw) else {
-                return Err(PersistenceError::InvalidBlockId(block_raw));
+                return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             };
             if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
-                return Err(PersistenceError::InvalidBlockId(block_raw));
+                return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
             Item::new(ItemId::Block(block), count)
                 .map(Some)
@@ -1383,7 +1465,7 @@ mod tests {
     use super::*;
     use crate::player::inventory::{MAIN_SLOTS, MAX_STACK_COUNT};
     use crate::player::survival::{MAX_AIR, MAX_HEALTH, MAX_HUNGER};
-    use crate::world::block::BlockId;
+    use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
     use crate::world::chunk::{linear_index, ChunkPos};
 
     #[test]
@@ -1523,9 +1605,10 @@ mod tests {
         assert_eq!(loaded_chunk.len(), expected.len());
         for (index, block) in expected {
             assert_eq!(
-                loaded_chunk[&index], block,
+                loaded_chunk[&index],
+                block,
                 "{block:?} (id {}) must round-trip",
-                block as u8
+                block.to_raw() as u8
             );
         }
     }
@@ -1577,7 +1660,7 @@ mod tests {
             Err(PersistenceError::InvalidBlockId(99))
         ));
 
-        valid[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Stone as u8;
+        valid[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Stone.to_raw() as u8;
         valid[FIRST_EDIT_INDEX_OFFSET..FIRST_EDIT_INDEX_OFFSET + 2]
             .copy_from_slice(&40000u16.to_le_bytes());
         assert!(matches!(
@@ -1604,8 +1687,11 @@ mod tests {
         // One chunk, one edit: the block byte follows chunk_count, the 12-byte
         // chunk position, edit_count, and the u16 local index.
         const FIRST_EDIT_BLOCK_OFFSET: usize = 89;
-        assert_eq!(bytes[FIRST_EDIT_BLOCK_OFFSET], BlockId::Stone as u8);
-        bytes[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Water as u8;
+        assert_eq!(
+            bytes[FIRST_EDIT_BLOCK_OFFSET],
+            BlockId::Stone.to_raw() as u8
+        );
+        bytes[FIRST_EDIT_BLOCK_OFFSET] = BlockId::Water.to_raw() as u8;
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidBlockId(15))
@@ -1628,9 +1714,62 @@ mod tests {
     }
 
     #[test]
+    fn rejects_modded_chunk_edit_before_first_byte() {
+        // A registry-local id has no v1-v7 wire identity: the writer must
+        // reject it rather than truncate it into a built-in byte.
+        let data = v6_data_with_block_edit(BlockId::Modded(BUILTIN_BLOCK_COUNT));
+        let mut out = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut out, &data),
+            Err(PersistenceError::InvalidBlockId(raw)) if raw == BUILTIN_BLOCK_COUNT
+        ));
+        assert!(out.is_empty(), "a rejected save must not emit bytes");
+    }
+
+    #[test]
+    fn rejects_modded_inventory_block_before_first_byte() {
+        // Block identity is also written by the v4 inventory extension; a
+        // modded stack in slot 0 must fail before the header is emitted, not
+        // halfway through the payload.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::new(ItemId::Block(BlockId::Modded(BUILTIN_BLOCK_COUNT)), 1)
+                .expect("a one-count modded block item is structurally valid"),
+        );
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let mut out = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut out, &sample_data(player)),
+            Err(PersistenceError::InvalidBlockId(raw)) if raw == BUILTIN_BLOCK_COUNT
+        ));
+        assert!(out.is_empty(), "a rejected save must not emit bytes");
+    }
+
+    #[test]
+    fn rejects_modded_chest_block_before_first_byte() {
+        // Chest slots are a third block-carrying section (v6 tail); the
+        // pre-write scan must cover them too.
+        let mut chest_slots: ChestSlots = [None; CHEST_SLOTS];
+        chest_slots[0] = Some(
+            Item::new(ItemId::Block(BlockId::Modded(BUILTIN_BLOCK_COUNT)), 1)
+                .expect("a one-count modded block item is structurally valid"),
+        );
+        let mut chests = ChestMap::default();
+        chests.insert(IVec3::new(1, 2, 3), Container::from_slots(chest_slots));
+        let data = v6_data_with_chests(chests);
+        let mut out = Vec::new();
+        assert!(matches!(
+            save_world_to_bytes(&mut out, &data),
+            Err(PersistenceError::InvalidBlockId(raw)) if raw == BUILTIN_BLOCK_COUNT
+        ));
+        assert!(out.is_empty(), "a rejected save must not emit bytes");
+    }
+
+    #[test]
     fn test_v2_hotbar_rejects_water() {
         let mut bytes = valid_v3_bytes();
-        set_v2_slot(&mut bytes, 0, BlockId::Water as u8, 1);
+        set_v2_slot(&mut bytes, 0, BlockId::Water.to_raw() as u8, 1);
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
@@ -1770,10 +1909,10 @@ mod tests {
         bytes.extend_from_slice(&2u32.to_le_bytes());
         let coal_index = linear_index(1, 2, 3) as u16;
         bytes.extend_from_slice(&coal_index.to_le_bytes());
-        bytes.push(BlockId::CoalOre as u8);
+        bytes.push(BlockId::CoalOre.to_raw() as u8);
         let iron_index = linear_index(4, 5, 6) as u16;
         bytes.extend_from_slice(&iron_index.to_le_bytes());
-        bytes.push(BlockId::IronOre as u8);
+        bytes.push(BlockId::IronOre.to_raw() as u8);
 
         let loaded = load_world_from_bytes(&bytes).expect("v1 must migrate, not fail");
 
@@ -1866,7 +2005,7 @@ mod tests {
         for stack in hotbar.stacks() {
             match stack {
                 Some(stack) => {
-                    bytes.push(stack.block as u8);
+                    bytes.push(stack.block.to_raw() as u8);
                     bytes.extend_from_slice(&stack.count.to_le_bytes());
                 }
                 None => {
@@ -2007,7 +2146,7 @@ mod tests {
     fn test_v2_hotbar_rejects_invalid_slots() {
         // Empty sentinel must carry count 0.
         let mut bytes = valid_v3_bytes();
-        set_v2_slot(&mut bytes, 0, BlockId::Air as u8, 5);
+        set_v2_slot(&mut bytes, 0, BlockId::Air.to_raw() as u8, 5);
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
@@ -2015,7 +2154,7 @@ mod tests {
 
         // A non-empty block id may not carry count 0.
         let mut bytes = valid_v3_bytes();
-        set_v2_slot(&mut bytes, 0, BlockId::Grass as u8, 0);
+        set_v2_slot(&mut bytes, 0, BlockId::Grass.to_raw() as u8, 0);
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
@@ -2023,7 +2162,7 @@ mod tests {
 
         // Bedrock cannot be carried.
         let mut bytes = valid_v3_bytes();
-        set_v2_slot(&mut bytes, 0, BlockId::Bedrock as u8, 1);
+        set_v2_slot(&mut bytes, 0, BlockId::Bedrock.to_raw() as u8, 1);
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
@@ -2039,7 +2178,12 @@ mod tests {
 
         // Counts above MAX_STACK_COUNT are invalid.
         let mut bytes = valid_v3_bytes();
-        set_v2_slot(&mut bytes, 0, BlockId::CoalOre as u8, MAX_STACK_COUNT + 1);
+        set_v2_slot(
+            &mut bytes,
+            0,
+            BlockId::CoalOre.to_raw() as u8,
+            MAX_STACK_COUNT + 1,
+        );
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidPlayerState)
@@ -2159,7 +2303,7 @@ mod tests {
         // The legacy block-only header cannot express the tool: it stays the
         // empty sentinel while the v4 extension is authoritative.
         let header_slot = V2_HOTBAR_OFFSET + 3;
-        assert_eq!(bytes[header_slot], BlockId::Air as u8);
+        assert_eq!(bytes[header_slot], BlockId::Air.to_raw() as u8);
         assert_eq!(
             &bytes[header_slot + 1..header_slot + 3],
             &0u16.to_le_bytes()
@@ -3156,7 +3300,7 @@ mod tests {
         let mut water_slot: ChestSlots = [None; CHEST_SLOTS];
         water_slot[0] = Some(Item::new(ItemId::Block(BlockId::CoalOre), 1).unwrap());
         let mut bytes = v6_bytes_with_chest(Container::from_slots(water_slot));
-        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = BlockId::Water as u8;
+        bytes[V6_FIRST_CHEST_SLOT_OFFSET + 1] = BlockId::Water.to_raw() as u8;
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidItem(ItemError::UncarryableBlock))
@@ -3293,7 +3437,7 @@ mod tests {
             assert!(
                 matches!(
                     load_world_from_bytes(&bytes),
-                    Err(PersistenceError::InvalidBlockId(raw)) if raw == block as u8
+                    Err(PersistenceError::InvalidBlockId(raw)) if raw == block.to_raw()
                 ),
                 "a v5 chunk edit may not claim {block:?}"
             );
@@ -3302,7 +3446,7 @@ mod tests {
         // Legacy-hotbar funnel: forge block id 16 into slot 0 of a byte-valid
         // v5 save (36-byte header, then 9 * 3 hotbar bytes).
         let mut bytes = v5_bytes_from_current(&sample_data(sample_player()));
-        bytes[V2_HOTBAR_OFFSET] = BlockId::Farmland as u8;
+        bytes[V2_HOTBAR_OFFSET] = BlockId::Farmland.to_raw() as u8;
         bytes[V2_HOTBAR_OFFSET + 1..V2_HOTBAR_OFFSET + 3].copy_from_slice(&1u16.to_le_bytes());
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -3388,7 +3532,7 @@ mod tests {
         ));
 
         let mut bytes = block_record.clone();
-        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Air as u8;
+        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Air.to_raw() as u8;
         bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(matches!(
@@ -3397,7 +3541,7 @@ mod tests {
         ));
 
         let mut bytes = block_record.clone();
-        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Water as u8;
+        bytes[V4_EXTENSION_OFFSET + 1] = BlockId::Water.to_raw() as u8;
         bytes[V4_EXTENSION_OFFSET + 2..V4_EXTENSION_OFFSET + 4]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(matches!(

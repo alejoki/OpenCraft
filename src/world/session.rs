@@ -2463,7 +2463,7 @@ mod tests {
         for stack in hotbar.stacks() {
             match stack {
                 Some(stack) => {
-                    bytes.push(stack.block as u8);
+                    bytes.push(stack.block.to_raw() as u8);
                     bytes.extend_from_slice(&stack.count.to_le_bytes());
                 }
                 None => {

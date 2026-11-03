@@ -1,3 +1,13 @@
+/// Stable block identity for built-in terrain plus registry-local modded
+/// content.
+///
+/// Built-in variants keep explicit discriminants `0..=22`, which are the
+/// frozen save-vocabulary raw ids decoded by [`BlockId::from_u8`].
+///
+/// `#[repr(u8)]` is required: Rust rejects explicit discriminants on an enum
+/// with a non-unit variant without a primitive representation (E0732). The tag
+/// stays `u8`; the payload variant makes the enum four bytes until the storage
+/// refactor (T03) moves dense cells to raw `u16`.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BlockId {
@@ -35,7 +45,19 @@ pub enum BlockId {
     Chest = 21,
     /// Loot-bearing chest variant; world-only, breaks into an ordinary Chest.
     LootChest = 22,
+    /// Registry-local modded block identity.
+    ///
+    /// The payload is a dense registry index with the invariant
+    /// `raw >= BUILTIN_BLOCK_COUNT`; it can therefore never alias a built-in
+    /// discriminant. Such ids are session-only: the v1-v7 writer refuses them
+    /// before the first output byte (see
+    /// [`crate::world::persistence::save_world_to_bytes`]).
+    Modded(u16),
 }
+
+/// Number of built-in block ids: `0..=22` are the frozen save vocabulary and
+/// every modded registry index starts here.
+pub const BUILTIN_BLOCK_COUNT: u16 = 23;
 
 /// The four wheat growth stages in ascending order, index-aligned with
 /// [`BlockId::wheat_stage`].
@@ -150,6 +172,92 @@ impl BlockId {
         matches!(self, BlockId::Chest | BlockId::LootChest)
     }
 
+    /// The stable raw identity of this block: the built-in discriminant for
+    /// `0..=22`, or the registry index for [`BlockId::Modded`].
+    ///
+    /// Total over every representable value, so it is the storage and
+    /// comparison identity used by dense chunks, meshes and the registry.
+    pub const fn to_raw(self) -> u16 {
+        match self {
+            BlockId::Air => 0,
+            BlockId::Grass => 1,
+            BlockId::Dirt => 2,
+            BlockId::Stone => 3,
+            BlockId::Cobblestone => 4,
+            BlockId::Sand => 5,
+            BlockId::OakLog => 6,
+            BlockId::OakLeaves => 7,
+            BlockId::OakPlanks => 8,
+            BlockId::Brick => 9,
+            BlockId::Snow => 10,
+            BlockId::Bedrock => 11,
+            BlockId::CoalOre => 12,
+            BlockId::IronOre => 13,
+            BlockId::CraftingTable => 14,
+            BlockId::Water => 15,
+            BlockId::Farmland => 16,
+            BlockId::WheatStage0 => 17,
+            BlockId::WheatStage1 => 18,
+            BlockId::WheatStage2 => 19,
+            BlockId::WheatStage3 => 20,
+            BlockId::Chest => 21,
+            BlockId::LootChest => 22,
+            BlockId::Modded(raw) => {
+                debug_assert!(raw >= BUILTIN_BLOCK_COUNT);
+                raw
+            }
+        }
+    }
+
+    /// Inverse of [`BlockId::to_raw`], total over every `u16`.
+    ///
+    /// Raw values `0..=22` decode to their built-in variant; anything else is
+    /// a registry-local [`BlockId::Modded`] index.
+    pub const fn from_raw(raw: u16) -> Self {
+        match raw {
+            0 => BlockId::Air,
+            1 => BlockId::Grass,
+            2 => BlockId::Dirt,
+            3 => BlockId::Stone,
+            4 => BlockId::Cobblestone,
+            5 => BlockId::Sand,
+            6 => BlockId::OakLog,
+            7 => BlockId::OakLeaves,
+            8 => BlockId::OakPlanks,
+            9 => BlockId::Brick,
+            10 => BlockId::Snow,
+            11 => BlockId::Bedrock,
+            12 => BlockId::CoalOre,
+            13 => BlockId::IronOre,
+            14 => BlockId::CraftingTable,
+            15 => BlockId::Water,
+            16 => BlockId::Farmland,
+            17 => BlockId::WheatStage0,
+            18 => BlockId::WheatStage1,
+            19 => BlockId::WheatStage2,
+            20 => BlockId::WheatStage3,
+            21 => BlockId::Chest,
+            22 => BlockId::LootChest,
+            _ => BlockId::Modded(raw),
+        }
+    }
+
+    /// The built-in discriminant as a byte, or `None` for a modded id.
+    ///
+    /// The v1-v7 writer narrows through this so a modded id can never be
+    /// truncated into a built-in id on disk.
+    pub const fn builtin_u8(self) -> Option<u8> {
+        match self {
+            BlockId::Modded(_) => None,
+            _ => Some(self.to_raw() as u8),
+        }
+    }
+
+    /// Whether this is one of the frozen built-in ids `0..=22`.
+    pub const fn is_builtin(self) -> bool {
+        !matches!(self, BlockId::Modded(_))
+    }
+
     #[inline]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -230,6 +338,10 @@ impl BlockId {
             BlockId::WheatStage3 => 20,
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
+            // First reserved block placeholder layer (25..=31 are reserved,
+            // see `src/render/texture.rs`). Modded content gets real art when
+            // the registry owns the texture vocabulary.
+            BlockId::Modded(_) => 25,
         }
     }
 
@@ -258,6 +370,7 @@ impl BlockId {
             BlockId::WheatStage3 => "Wheat Stage 3",
             BlockId::Chest => "Chest",
             BlockId::LootChest => "Loot Chest",
+            BlockId::Modded(_) => "Modded Block",
         }
     }
 
@@ -293,6 +406,10 @@ impl BlockId {
             | BlockId::WheatStage2
             | BlockId::WheatStage3 => Some(0.05),
             BlockId::Chest | BlockId::LootChest => Some(0.8),
+            // Fail closed until the registry answers hardness in S04: a
+            // modded block is unbreakable rather than silently defaulting to
+            // a built-in timing.
+            BlockId::Modded(_) => None,
         }
     }
 
@@ -321,6 +438,9 @@ impl BlockId {
             // Unbreakable ids never reach a drop path; returning the id keeps
             // the mapping total without inventing an item.
             BlockId::Water => BlockId::Water,
+            // Modded ids are unbreakable in S01 (`break_duration_secs` is
+            // `None`), so no break path can reach this arm; identity keeps
+            // the mapping total without inventing a built-in item.
             _ => self,
         }
     }
@@ -346,12 +466,16 @@ mod tests {
     fn test_block_ids_roundtrip_and_ore_metadata() {
         for id in 0u8..=22 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
-            assert_eq!(block as u8, id, "block id {id} must round-trip");
+            assert_eq!(
+                block.to_raw(),
+                u16::from(id),
+                "block id {id} must round-trip"
+            );
         }
         assert_eq!(BlockId::from_u8(23), None);
         assert_eq!(BlockId::from_u8(99), None);
 
-        assert_eq!(BlockId::Water as u8, 15);
+        assert_eq!(BlockId::Water.to_raw(), 15);
         assert_eq!(BlockId::Water.name(), "Water");
 
         assert_eq!(BlockId::CoalOre.name(), "Coal Ore");
@@ -365,7 +489,7 @@ mod tests {
         }
 
         // Crafting table identity is durable block data for the item domain.
-        assert_eq!(BlockId::CraftingTable as u8, 14);
+        assert_eq!(BlockId::CraftingTable.to_raw(), 14);
         assert_eq!(BlockId::CraftingTable.name(), "Crafting Table");
         assert!(BlockId::CraftingTable.is_solid());
         assert_eq!(BlockId::CraftingTable.break_duration_secs(), Some(0.8));
@@ -551,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_water_metadata_is_worldgen_only() {
-        assert_eq!(BlockId::Water as u8, 15);
+        assert_eq!(BlockId::Water.to_raw(), 15);
         assert_eq!(BlockId::Water.name(), "Water");
         assert_eq!(BlockId::Water.break_duration_secs(), None);
         assert_eq!(BlockId::Water.mined_drop(), BlockId::Water);
@@ -688,7 +812,7 @@ mod tests {
         ];
 
         for (block, id, name, duration, drop) in cases {
-            assert_eq!(block as u8, id, "{name} id must be stable");
+            assert_eq!(block.to_raw(), u16::from(id), "{name} id must be stable");
             assert_eq!(block.name(), name, "{name} display name drifted");
             assert_eq!(block.break_duration_secs(), Some(duration));
             assert_eq!(block.mined_drop(), drop, "{name} drop drifted");
@@ -702,8 +826,8 @@ mod tests {
         }
 
         // The palette appends without renumbering any existing id.
-        assert_eq!(BlockId::Water as u8, 15);
-        assert_eq!(BlockId::CraftingTable as u8, 14);
+        assert_eq!(BlockId::Water.to_raw(), 15);
+        assert_eq!(BlockId::CraftingTable.to_raw(), 14);
     }
 
     #[test]
@@ -796,7 +920,7 @@ mod tests {
         for (raw, display_name, faces, hardness, drop) in contract {
             let block = BlockId::from_u8(raw as u8)
                 .unwrap_or_else(|| panic!("built-in raw id {raw} must decode"));
-            assert_eq!(block as u8 as u16, raw, "{display_name} raw id drifted");
+            assert_eq!(block.to_raw(), raw, "{display_name} raw id drifted");
             assert_eq!(block.name(), display_name, "{display_name} name drifted");
             let expected_faces = [0u8, 1, 2, 3, 4, 5].map(|face| block.face_tex_layer(face));
             assert_eq!(faces, expected_faces, "{display_name} face layers drifted");
@@ -807,5 +931,100 @@ mod tests {
             );
             assert_eq!(block.mined_drop(), drop, "{display_name} drop drifted");
         }
+    }
+
+    #[test]
+    fn block_raw_round_trip_is_total() {
+        for raw in 0..=u16::MAX {
+            let block = BlockId::from_raw(raw);
+            assert_eq!(block.to_raw(), raw, "raw id {raw} must round-trip");
+            if raw < BUILTIN_BLOCK_COUNT {
+                assert!(block.is_builtin(), "raw id {raw} must be a built-in");
+                assert_eq!(
+                    BlockId::from_u8(raw as u8),
+                    Some(block),
+                    "raw id {raw} must decode through the legacy u8 funnel"
+                );
+            } else {
+                assert!(!block.is_builtin(), "raw id {raw} must be modded");
+                assert_eq!(block, BlockId::Modded(raw));
+            }
+        }
+        // Explicit anchors for both sides of the boundary.
+        assert_eq!(BlockId::from_raw(22), BlockId::LootChest);
+        assert_eq!(BlockId::from_raw(23), BlockId::Modded(23));
+        assert_eq!(BlockId::from_raw(u16::MAX), BlockId::Modded(u16::MAX));
+    }
+
+    #[test]
+    fn from_u8_still_rejects_23_to_255() {
+        // The legacy decode funnel is deliberately u8-only and builtin-only:
+        // widening the enum must not let a save byte name modded content.
+        for raw in 23..=u8::MAX {
+            assert_eq!(BlockId::from_u8(raw), None, "from_u8 must reject {raw}");
+        }
+        for raw in 0..=22u8 {
+            assert!(BlockId::from_u8(raw).is_some(), "from_u8 must accept {raw}");
+        }
+    }
+
+    #[test]
+    fn builtin_u8_is_none_for_modded() {
+        for raw in 0..=22u8 {
+            let block = BlockId::from_u8(raw).expect("built-in must decode");
+            assert_eq!(
+                block.builtin_u8(),
+                Some(raw),
+                "built-in {raw} must narrow to its discriminant"
+            );
+        }
+        for raw in [BUILTIN_BLOCK_COUNT, 24, 255, u16::MAX] {
+            let block = BlockId::Modded(raw);
+            assert_eq!(block.builtin_u8(), None, "modded {raw} must not narrow");
+            assert_eq!(block.to_raw(), raw);
+        }
+    }
+
+    #[test]
+    fn modded_defaults_are_fail_closed() {
+        let modded = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        // Solid, non-liquid, carryable by construction until the registry
+        // owns the per-block answers.
+        assert!(modded.is_solid());
+        assert!(!modded.is_liquid());
+        assert!(modded.is_carryable());
+        assert!(!modded.is_wheat_stage());
+        assert!(modded.next_wheat_stage().is_none());
+        // Fail-closed behavior: reserved placeholder art, generic name, no
+        // break timing, self drop, and no station interaction.
+        for face_dir in 0u8..6 {
+            assert_eq!(modded.face_tex_layer(face_dir), 25);
+        }
+        assert_eq!(modded.name(), "Modded Block");
+        assert_eq!(modded.break_duration_secs(), None);
+        assert_eq!(modded.mined_drop(), modded);
+        assert!(!modded.is_table_interactable());
+        assert!(!modded.is_container_interactable());
+    }
+
+    #[test]
+    fn builtin_block_count_matches_from_u8() {
+        assert_eq!(BUILTIN_BLOCK_COUNT, 23, "the built-in count is frozen");
+        let decodable = (0..=u8::MAX)
+            .filter(|&raw| BlockId::from_u8(raw).is_some())
+            .count();
+        assert_eq!(
+            decodable,
+            usize::from(BUILTIN_BLOCK_COUNT),
+            "from_u8 must accept exactly the built-in ids"
+        );
+        assert_eq!(
+            BlockId::from_raw(BUILTIN_BLOCK_COUNT - 1),
+            BlockId::LootChest
+        );
+        assert_eq!(
+            BlockId::from_raw(BUILTIN_BLOCK_COUNT),
+            BlockId::Modded(BUILTIN_BLOCK_COUNT)
+        );
     }
 }
