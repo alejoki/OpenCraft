@@ -12671,6 +12671,583 @@ fn presentation_demo_lines(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Headless crafting digest (`--demo-crafting`, M010/S05-T06)
+// ---------------------------------------------------------------------------
+
+/// Build a shaped grid from authored `rows` and a `char -> ItemId` key.
+///
+/// Every cell is constructed through [`Item::new_with`] so pack ingredients
+/// carry their authored stack limits, exactly like a real pick-up.
+fn crafting_demo_grid(
+    registry: &ContentRegistry,
+    kind: GridKind,
+    rows: &[&str],
+    key: &[(char, ItemId)],
+) -> CraftingGrid {
+    let mut grid = CraftingGrid::new(kind);
+    let dim = kind.dim();
+    for (row, line) in rows.iter().enumerate() {
+        for (col, character) in line.chars().enumerate() {
+            if character == ' ' {
+                continue;
+            }
+            let id = key
+                .iter()
+                .find(|(key, _)| *key == character)
+                .map(|(_, id)| *id)
+                .expect("fixture pattern characters have a key");
+            let item = Item::new_with(registry, id, 1).expect("fixture ingredient constructs");
+            grid.set(row * dim + col, Some(item))
+                .expect("fixture cell is inside the grid");
+        }
+    }
+    grid
+}
+
+/// The stable authored name of an [`ItemId`], or `None` for an unknown index.
+///
+/// The digest prints the same names the registry resolved, never a display
+/// label and never an opaque index.
+fn crafting_demo_item_name(registry: &ContentRegistry, id: ItemId) -> Option<String> {
+    match id {
+        ItemId::Block(block) => registry.block_name(block).map(str::to_string),
+        ItemId::ModTool(index) => registry.tool_def_name(index).map(str::to_string),
+        ItemId::Item(index) => registry.item_def_name(index).map(str::to_string),
+        other => Some(other.name().to_string()),
+    }
+}
+
+/// Total item units across the 36 slots, the cursor, and both grids — the
+/// conservation invariant a failed craft must preserve.
+fn crafting_demo_units(player: &Player) -> u32 {
+    let mut total = 0u32;
+    for item in player.inventory().slots().iter().flatten() {
+        total += u32::from(item.count());
+    }
+    if let Some(cursor) = player.inventory().cursor() {
+        total += u32::from(cursor.count());
+    }
+    for grid in [player.player_grid(), player.table_grid()] {
+        for index in 0..grid.kind().slot_count() {
+            if let Some(item) = grid.slot(index) {
+                total += u32::from(item.count());
+            }
+        }
+    }
+    total
+}
+
+/// Mine one authored block with `tool` through the production break path and
+/// report `(ticks, remaining_durability)`.
+///
+/// The accumulator and the world edit are the same pair the frame loop uses:
+/// [`MiningTarget::from_block_with`] + [`MiningState::tick_with`] for the
+/// timing, then [`break_mined_block`] for the edit, wear and drop. A fresh
+/// synthetic air chunk keeps the measurement independent of terrain.
+fn crafting_demo_break(
+    registry: &Arc<ContentRegistry>,
+    block: BlockId,
+    tool: Item,
+) -> Option<(usize, u16)> {
+    let mut session = WorldSession::new_session_with_mode_and_registry(
+        0x00C0_FFEE,
+        PathBuf::from("crafting-demo-break.mcvx"),
+        opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        GameMode::Creative,
+        Arc::clone(registry),
+    );
+    let chunk_pos = ChunkPos::new(0, 0, 0);
+    session.world.insert_chunk_for_test(
+        chunk_pos,
+        opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+    );
+    for neighbor in [
+        ChunkPos::new(1, 0, 0),
+        ChunkPos::new(-1, 0, 0),
+        ChunkPos::new(0, 1, 0),
+        ChunkPos::new(0, -1, 0),
+        ChunkPos::new(0, 0, 1),
+        ChunkPos::new(0, 0, -1),
+    ] {
+        session.world.insert_chunk_for_test(
+            neighbor,
+            opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+        );
+    }
+    let ore_pos = IVec3::new(0, 10, 0);
+    session
+        .world
+        .set_block_immediate(ore_pos.x, ore_pos.y, ore_pos.z, block);
+    session.player.collect_item(tool);
+    if !session.player.select_slot(0) {
+        return None;
+    }
+
+    let target = MiningTarget::from_block_with(registry, ore_pos, block, Some(tool))?;
+    let mut mining = MiningState::new();
+    let mut ticks = 0usize;
+    let mut broke = false;
+    while ticks < 10_000 {
+        ticks += 1;
+        match mining.tick_with(registry, 0.05, Some(target)) {
+            MiningTick::Broke { .. } => {
+                broke = true;
+                break;
+            }
+            MiningTick::Mining { .. } => {}
+            MiningTick::Idle => return None,
+        }
+    }
+    if !broke {
+        return None;
+    }
+
+    match break_mined_block(&mut session, ore_pos, block) {
+        BreakOutcome::Applied { wear, .. } => match wear {
+            ToolWearOutcome::Worn { remaining } => Some((ticks, remaining)),
+            ToolWearOutcome::Broke => Some((ticks, 0)),
+            ToolWearOutcome::Nothing => None,
+        },
+        BreakOutcome::Rejected(_) => None,
+    }
+}
+
+/// Build the deterministic `--demo-crafting` digest.
+///
+/// Every leg runs through a production function: the frozen registry resolved
+/// from the launch stack, [`apply_inventory_click_button_with`], the mining
+/// accumulator + [`break_mined_block`], [`EatingTarget::new_with`] +
+/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the v8 save/load
+/// codec. Each structural line is machine-independent (names, counts,
+/// booleans) and the caller exits non-zero when the latch is `crafting:
+/// failed`.
+fn crafting_demo_lines(
+    registry: &Arc<ContentRegistry>,
+    fixture: Option<&Path>,
+) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // Resolve the authored identities once; every leg uses the same frozen
+    // registry the launch would freeze.
+    let ruby_index = registry.item_by_name("mymod:ruby").map(|def| def.index);
+    let stew_index = registry
+        .item_by_name("mymod:ruby_stew")
+        .map(|def| def.index);
+    let pickaxe_index = registry
+        .tool_by_name("mymod:ruby_pickaxe")
+        .map(|def| def.index);
+    let ore = registry.block_by_name("mymod:ruby_ore").map(|def| def.id);
+
+    // (a) Craft the ruby pickaxe at the 4x4 table through the production
+    // result-slot seam.
+    let table_craft = match (ruby_index, pickaxe_index) {
+        (Some(ruby), Some(_pickaxe)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let stick =
+                Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Table,
+                &["RRR", " S ", " S "],
+                &[('R', ruby_item.id()), ('S', stick.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                CraftingGrid::new(GridKind::Player),
+                grid,
+            );
+            let mut screen = InventoryScreen::new();
+            screen.open_table();
+            let outcome = apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                Some(IVec3::new(0, 5, 0)),
+                InventoryTarget::ResultSlot(GridKind::Table),
+                InventoryClickButton::Left,
+            );
+            match outcome {
+                Ok(InventoryClickOutcome::Crafted(item)) => {
+                    let name = crafting_demo_item_name(registry, item.id())
+                        .unwrap_or_else(|| "unresolved".to_string());
+                    (
+                        name,
+                        item.count(),
+                        item.durability().unwrap_or(0),
+                        item.max_durability().unwrap_or(0),
+                    )
+                }
+                _ => ("none".to_string(), 0, 0, 0),
+            }
+        }
+        _ => ("none".to_string(), 0, 0, 0),
+    };
+    lines.push(format!(
+        "crafting: leg=table item={} count={} durability={} max={}",
+        table_craft.0, table_craft.1, table_craft.2, table_craft.3,
+    ));
+    if table_craft.0 != "mymod:ruby_pickaxe"
+        || table_craft.1 != 1
+        || table_craft.2 != 900
+        || table_craft.3 != 900
+    {
+        failed.get_or_insert("table");
+    }
+
+    // (b) Craft the ruby stew at the 2x2 player grid.
+    let stew_stack_limit = stew_index
+        .and_then(|index| registry.item(index))
+        .map(|def| def.stack_limit)
+        .unwrap_or(0);
+    let player_craft = match (ruby_index, stew_index) {
+        (Some(ruby), Some(_stew)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let wheat =
+                Item::new(ItemId::Material(Material::Wheat), 1).expect("wheat is carryable");
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Player,
+                &["RR", "WW"],
+                &[('R', ruby_item.id()), ('W', wheat.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                grid,
+                CraftingGrid::new(GridKind::Table),
+            );
+            let mut screen = InventoryScreen::new();
+            screen.open_player();
+            let outcome = apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                None,
+                InventoryTarget::ResultSlot(GridKind::Player),
+                InventoryClickButton::Left,
+            );
+            match outcome {
+                Ok(InventoryClickOutcome::Crafted(item)) => (
+                    crafting_demo_item_name(registry, item.id())
+                        .unwrap_or_else(|| "unresolved".to_string()),
+                    item.count(),
+                ),
+                _ => ("none".to_string(), 0),
+            }
+        }
+        _ => ("none".to_string(), 0),
+    };
+    lines.push(format!(
+        "crafting: leg=player item={} count={} stack={}",
+        player_craft.0, player_craft.1, stew_stack_limit,
+    ));
+    if player_craft.0 != "mymod:ruby_stew" || player_craft.1 != 1 || stew_stack_limit != 16 {
+        failed.get_or_insert("player");
+    }
+
+    // (c) Break the ruby ore with ruby and iron; both durations and both worn
+    // durabilities come from the production mining path.
+    let mine = match (ore, pickaxe_index) {
+        (Some(ore), Some(pickaxe)) => {
+            let ruby_tool = Item::new_with(registry, ItemId::ModTool(pickaxe), 1)
+                .expect("the authored pickaxe constructs");
+            let iron_tool = Item::new(
+                ItemId::Tool {
+                    kind: ToolKind::Pickaxe,
+                    tier: ToolTier::Iron,
+                },
+                1,
+            )
+            .expect("an iron pickaxe constructs");
+            match (
+                crafting_demo_break(registry, ore, ruby_tool),
+                crafting_demo_break(registry, ore, iron_tool),
+            ) {
+                (Some((ruby_ticks, ruby_wear)), Some((iron_ticks, iron_wear))) => {
+                    Some((ruby_ticks, iron_ticks, ruby_wear, iron_wear))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (ruby_ticks, iron_ticks, ruby_wear, iron_wear) = mine.unwrap_or((0, 0, 0, 0));
+    lines.push(format!(
+        "crafting: leg=mine block=mymod:ruby_ore ruby_ticks={} iron_ticks={} ruby_wear={} iron_wear={}",
+        ruby_ticks, iron_ticks, ruby_wear, iron_wear,
+    ));
+    if !(ruby_ticks > 0 && ruby_ticks < iron_ticks && ruby_wear == 899 && iron_wear == 249) {
+        failed.get_or_insert("mine");
+    }
+
+    // (d) Eat the stew through the real hold-to-eat flow.
+    let eat = match stew_index {
+        Some(stew) => {
+            let stew_item = Item::new_with(registry, ItemId::Item(stew), 1)
+                .expect("the authored stew constructs");
+            let mut inventory = Inventory::empty();
+            inventory
+                .insert(stew_item)
+                .expect("an empty inventory holds one stew");
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                inventory,
+                CraftingGrid::new(GridKind::Player),
+                CraftingGrid::new(GridKind::Table),
+            );
+            player.survival =
+                SurvivalState::new(20, 5, FULL_AIR).expect("5 hunger is a valid vitals value");
+            player.select_slot(0);
+            let mut eating = EatingState::new();
+            let mut completed = None;
+            for _ in 0..1_000 {
+                let target =
+                    EatingTarget::new_with(registry, 0, stew_item, player.survival.hunger());
+                match eating.tick(0.05, target) {
+                    EatingTick::Ate {
+                        slot,
+                        item,
+                        restore,
+                    } => {
+                        completed = player
+                            .eat_selected_with(registry, slot, item)
+                            .map(|applied| (applied, restore));
+                        break;
+                    }
+                    EatingTick::Eating { .. } => {}
+                    EatingTick::Idle => break,
+                }
+            }
+            completed.map(|(applied, _)| (applied, player.survival.hunger()))
+        }
+        None => None,
+    };
+    let (restored, hunger_after) = eat.unwrap_or((0, 0));
+    lines.push(format!(
+        "crafting: leg=eat item=mymod:ruby_stew restored={} hunger={}",
+        restored, hunger_after,
+    ));
+    if restored != 7 || hunger_after != 12 {
+        failed.get_or_insert("eat");
+    }
+
+    // (e) The disabled built-in shortbow has no preview and cannot craft.
+    let shortbow = if registry
+        .recipe_by_name("shortbow")
+        .map(|recipe| !recipe.enabled)
+        .unwrap_or(false)
+    {
+        let stick = Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+        let leather =
+            Item::new(ItemId::Material(Material::Leather), 1).expect("leather is carryable");
+        let grid = crafting_demo_grid(
+            registry,
+            GridKind::Table,
+            &[" SE", "S E", " S "],
+            &[('S', stick.id()), ('E', leather.id())],
+        );
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            grid,
+        );
+        let preview = player
+            .craft_preview_with(registry, GridKind::Table)
+            .is_some();
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        let crafted = matches!(
+            apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                Some(IVec3::new(0, 5, 0)),
+                InventoryTarget::ResultSlot(GridKind::Table),
+                InventoryClickButton::Left,
+            ),
+            Ok(InventoryClickOutcome::Crafted(_))
+        );
+        (preview, crafted)
+    } else {
+        (true, true)
+    };
+    lines.push(format!(
+        "crafting: leg=shortbow preview={} craft={}",
+        shortbow.0, shortbow.1,
+    ));
+    if shortbow.0 || shortbow.1 {
+        failed.get_or_insert("shortbow");
+    }
+
+    // (f) A grid missing one ingredient never matches and consumes nothing.
+    let missing = match (ruby_index, pickaxe_index) {
+        (Some(ruby), Some(_)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let stick =
+                Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+            // The pickaxe pattern with the middle stick omitted.
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Table,
+                &["RRR", "   ", " S "],
+                &[('R', ruby_item.id()), ('S', stick.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                CraftingGrid::new(GridKind::Player),
+                grid,
+            );
+            let before = crafting_demo_units(&player);
+            let preview = player
+                .craft_preview_with(registry, GridKind::Table)
+                .is_some();
+            let mut screen = InventoryScreen::new();
+            screen.open_table();
+            let crafted = matches!(
+                apply_inventory_click_button_with(
+                    &mut player,
+                    registry,
+                    &screen,
+                    Some(IVec3::new(0, 5, 0)),
+                    InventoryTarget::ResultSlot(GridKind::Table),
+                    InventoryClickButton::Left,
+                ),
+                Ok(InventoryClickOutcome::Crafted(_))
+            );
+            let consumed = before.saturating_sub(crafting_demo_units(&player));
+            (preview, crafted, consumed)
+        }
+        _ => (true, true, 1),
+    };
+    lines.push(format!(
+        "crafting: leg=missing preview={} craft={} consumed={}",
+        missing.0, missing.1, missing.2,
+    ));
+    if missing.0 || missing.1 || missing.2 != 0 {
+        failed.get_or_insert("missing");
+    }
+
+    // (g)/(h) Save and reload the ruby pickaxe, then reload the same bytes
+    // with no pack at all.
+    let (fixture_path, remove_fixture) = match fixture {
+        Some(path) => (path.to_path_buf(), false),
+        None => (
+            std::env::temp_dir().join(format!(
+                "opencraft-crafting-demo-{}.mcvx",
+                std::process::id()
+            )),
+            true,
+        ),
+    };
+    let mut reloaded = (0u16, usize::MAX, false);
+    let mut placeholder = (0usize, 0u16, false);
+    if let Some(pickaxe) = pickaxe_index {
+        match Item::tool_with_durability_with(registry, ItemId::ModTool(pickaxe), 850) {
+            Ok(tool) => {
+                let mut session = WorldSession::new_session_with_mode_and_registry(
+                    0x00C0_FFEE,
+                    fixture_path.clone(),
+                    opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+                    GameMode::Creative,
+                    Arc::clone(registry),
+                );
+                session.player.collect_item(tool);
+                session.player.select_slot(0);
+                if save_current_world(&mut session).is_err() {
+                    failed.get_or_insert("save_write");
+                } else {
+                    match load_world_from_path_with(&fixture_path, registry.as_ref()) {
+                        Ok(loaded) => {
+                            let resolved = loaded
+                                .data
+                                .player
+                                .inventory
+                                .slot(0)
+                                .map(|item| (item.durability().unwrap_or(0), item.id()));
+                            let name_ok = resolved
+                                .and_then(|(_, id)| crafting_demo_item_name(registry, id))
+                                .map(|name| name == "mymod:ruby_pickaxe")
+                                .unwrap_or(false);
+                            reloaded = (
+                                resolved.map(|(durability, _)| durability).unwrap_or(0),
+                                loaded.unresolved,
+                                name_ok,
+                            );
+                        }
+                        Err(_) => {
+                            failed.get_or_insert("save_reload");
+                        }
+                    }
+
+                    match load_world_from_path_with(&fixture_path, ContentRegistry::builtin()) {
+                        Ok(loaded) => {
+                            let item = loaded.data.player.inventory.slot(0);
+                            let is_placeholder = item
+                                .and_then(|item| match item.id() {
+                                    ItemId::Item(index) => {
+                                        loaded.registry.item(index).map(|def| def.placeholder)
+                                    }
+                                    _ => Some(false),
+                                })
+                                .unwrap_or(false);
+                            placeholder = (
+                                loaded.unresolved,
+                                item.map(|item| item.count()).unwrap_or(0),
+                                is_placeholder,
+                            );
+                        }
+                        Err(_) => {
+                            failed.get_or_insert("placeholder_reload");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                failed.get_or_insert("save_construct");
+            }
+        }
+    } else {
+        failed.get_or_insert("save_construct");
+    }
+    lines.push(format!(
+        "crafting: leg=save durability={} unresolved={} resolved={}",
+        reloaded.0, reloaded.1, reloaded.2,
+    ));
+    if reloaded.0 != 850 || reloaded.1 != 0 || !reloaded.2 {
+        failed.get_or_insert("save");
+    }
+    lines.push(format!(
+        "crafting: leg=placeholder name=mymod:ruby_pickaxe unresolved={} count={} placeholder={}",
+        placeholder.0, placeholder.1, placeholder.2,
+    ));
+    if placeholder.0 != 1 || placeholder.1 != 1 || !placeholder.2 {
+        failed.get_or_insert("placeholder");
+    }
+    if remove_fixture {
+        let _ = std::fs::remove_file(&fixture_path);
+        let _ = std::fs::remove_file(fixture_path.with_extension("mcvx.tmp"));
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("crafting: failed reason={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("crafting: ok".to_string());
+            (lines, true)
+        }
+    }
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -12728,6 +13305,36 @@ fn main() {
             None
         };
         let (lines, ok) = presentation_demo_lines(&registry, fixture);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-crafting` is the headless crafting digest: it reads the settings
+    // file and the persisted pack stack (read-only), builds the same frozen
+    // registry a launch would, and exercises crafting, mining, eating and the
+    // v8 save/load placeholder policy through production seams. It runs before
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop, or
+    // settings write happens here. The only write is the fixture save (at the
+    // demo's `--save` path when given, otherwise a temp file).
+    if cli.demo_crafting {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let fixture = if cli.save_path != Path::new(DEFAULT_SAVE_PATH) {
+            Some(cli.save_path.as_path())
+        } else {
+            None
+        };
+        let (lines, ok) = crafting_demo_lines(&registry, fixture);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -13289,6 +13896,52 @@ mod tests {
     }
 
     #[test]
+    fn main_demo_crafting_short_circuit_precedes_world_startup() {
+        // The crafting digest must run after the presentation digest and before
+        // any world/session startup: no save (other than its fixture), settings
+        // write, window, GPU, audio engine or event loop is allowed here.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_presentation_at = body
+            .find("cli.demo_presentation")
+            .expect("fn main must branch on cli.demo_presentation");
+        let demo_crafting_at = body
+            .find("cli.demo_crafting")
+            .expect("fn main must branch on cli.demo_crafting");
+        let digest_at = body
+            .find("crafting_demo_lines(")
+            .expect("fn main must call crafting_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_presentation_at < demo_crafting_at,
+            "the crafting digest must follow the presentation branch"
+        );
+        assert!(
+            demo_crafting_at < startup_at,
+            "cli.demo_crafting must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "crafting_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_crafting_is_a_launch_switch_and_never_a_world_intent() {
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let crafting = CliConfig::parse_args(["--demo-crafting"]);
+        assert!(!cli_has_world_intent(&crafting));
+        assert_eq!(cli_has_world_intent(&crafting), cli_has_world_intent(&bare));
+        let with_new = CliConfig::parse_args(["--new", "--demo-crafting"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
     fn demo_presentation_is_a_launch_switch_and_never_a_world_intent() {
         // The flag alone must not bypass the menus: it is a headless digest,
         // not a world parameter.
@@ -13426,6 +14079,57 @@ stack = 64
         assert!(!ok, "a broken pack must fail closed: {lines:#?}");
         let last = lines.last().expect("the digest always prints a verdict");
         assert_eq!(last, "presentation_demo: ok=false failed=ruby_ore");
+    }
+
+    #[test]
+    fn crafting_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = dir.path().join("fixture.mcvx");
+        let (lines, ok) = crafting_demo_lines(&registry, Some(&fixture));
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test.
+        let expected = vec![
+            "crafting: leg=table item=mymod:ruby_pickaxe count=1 durability=900 max=900"
+                .to_string(),
+            "crafting: leg=player item=mymod:ruby_stew count=1 stack=16".to_string(),
+            "crafting: leg=mine block=mymod:ruby_ore ruby_ticks=7 iron_ticks=10 ruby_wear=899 iron_wear=249".to_string(),
+            "crafting: leg=eat item=mymod:ruby_stew restored=7 hunger=12".to_string(),
+            "crafting: leg=shortbow preview=false craft=false".to_string(),
+            "crafting: leg=missing preview=false craft=false consumed=0".to_string(),
+            "crafting: leg=save durability=850 unresolved=0 resolved=true".to_string(),
+            "crafting: leg=placeholder name=mymod:ruby_pickaxe unresolved=1 count=1 placeholder=true".to_string(),
+            "crafting: ok".to_string(),
+        ];
+        assert_eq!(lines, expected);
+        assert!(fixture.is_file(), "the --save fixture must be written");
+    }
+
+    #[test]
+    fn crafting_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = crafting_demo_lines(&ContentRegistry::builtin_arc(), None);
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("crafting: failed reason=table")
+        );
     }
 
     #[test]

@@ -1,0 +1,66 @@
+format_version = 2
+name = "Ruby Mod"
+description = "M010 reference pack: ruby ore, ruby tools, ruby stew and a disabled shortbow recipe"
+version = "1.0.0"
+
+[[blocks]]
+id = "mymod:ruby_ore"
+name = "Ruby Ore"
+textures = { all = "textures/ruby_ore.png" }
+hardness = 3.0
+drop = "mymod:ruby"
+tool = "pickaxe"
+stack = 64
+
+[[items]]
+id = "mymod:ruby"
+name = "Ruby"
+icon = "textures/ruby.png"
+stack = 64
+
+[[items]]
+id = "mymod:ruby_stew"
+name = "Ruby Stew"
+icon = "textures/ruby_stew.png"
+stack = 16
+nutrition = 7
+eat_seconds = 0.8
+
+[[tiers]]
+id = "mymod:ruby"
+name = "Ruby"
+speed = 9.0
+durability = 900
+damage = 9
+
+[[tools]]
+id = "mymod:ruby_pickaxe"
+name = "Ruby Pickaxe"
+kind = "pickaxe"
+tier = "mymod:ruby"
+icon = "textures/ruby_pickaxe.png"
+
+[[tools]]
+id = "mymod:ruby_sword"
+name = "Ruby Sword"
+kind = "sword"
+tier = "mymod:ruby"
+icon = "textures/ruby_sword.png"
+
+[[recipes]]
+id = "mymod:ruby_pickaxe"
+pattern = ["RRR", " S ", " S "]
+key = { R = "mymod:ruby", S = "stick" }
+output = "mymod:ruby_pickaxe"
+count = 1
+
+[[recipes]]
+id = "mymod:ruby_stew"
+pattern = ["RR", "WW"]
+key = { R = "mymod:ruby", W = "wheat" }
+output = "mymod:ruby_stew"
+count = 1
+
+[[recipe_patches]]
+id = "shortbow"
+enabled = false
