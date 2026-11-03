@@ -87,10 +87,12 @@ pub struct Settings {
     pub render_distance: i32,
     pub fullscreen: bool,
     pub vsync: bool,
-    /// Selected texture pack folder name under `packs/`. `None` means the
-    /// built-in Default textures, so a default save contains no `[packs]`
-    /// section at all (byte-identical to the pre-S03 format).
-    pub texture_pack: Option<String>,
+    /// Ordered, enabled texture pack folder names under `packs/`. Empty
+    /// means the built-in Default textures only, so a default save contains
+    /// no `[packs]` section at all (byte-identical to the pre-S03 format).
+    /// Later entries apply later in the stack; until the Packs screen lands
+    /// (T07), the first entry is the legacy single-pack selection.
+    pub pack_stack: Vec<String>,
     /// Master volume in percent (0..=100). 100 is the default, so a default
     /// save contains no `[audio]` section at all. Clamped on load; the menu
     /// clamps live adjustments against `VOLUME_MIN`/`VOLUME_MAX`.
@@ -106,7 +108,7 @@ impl Default for Settings {
             render_distance: DEFAULT_RENDER_DISTANCE,
             fullscreen: false,
             vsync: false,
-            texture_pack: None,
+            pack_stack: Vec::new(),
             volume: DEFAULT_VOLUME,
         }
     }
@@ -203,8 +205,8 @@ impl Settings {
                 fullscreen: self.fullscreen,
                 vsync: self.vsync,
             },
-            packs: self.texture_pack.as_ref().map(|name| PacksToml {
-                texture_pack: Some(name.clone()),
+            packs: (!self.pack_stack.is_empty()).then(|| PacksToml {
+                stack: self.pack_stack.clone(),
             }),
             audio: (self.volume != DEFAULT_VOLUME).then(|| AudioToml {
                 volume: u32::from(self.volume),
@@ -282,8 +284,8 @@ struct VideoToml {
 
 #[derive(serde::Serialize)]
 struct PacksToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    texture_pack: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stack: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -443,19 +445,61 @@ pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
         }
     }
 
-    // Optional section: missing `[packs]` or missing `texture_pack` keeps
-    // Default silently. An empty string is accepted as-is (runtime pack
-    // resolution simply won't find a folder named "").
+    // Optional section: missing `[packs]` keeps the empty stack silently.
+    // The v2 ordered `stack` array wins over the legacy single
+    // `texture_pack` key, which is still read so pre-S02 settings files
+    // migrate to a one-entry stack (the compatibility contract for this
+    // milestone). An empty string is accepted as-is (runtime pack resolution
+    // simply won't find a folder named "").
     if let Some(packs_value) = root.get("packs") {
         match packs_value.as_table() {
             Some(table) => {
-                settings.texture_pack = load_optional_string(
-                    table,
-                    "texture_pack",
-                    settings.texture_pack,
-                    "packs.texture_pack",
-                    &mut warnings,
-                );
+                let mut stack_loaded = false;
+                if let Some(stack_value) = table.get("stack") {
+                    match stack_value.as_array() {
+                        Some(items) => {
+                            let mut stack = Vec::with_capacity(items.len());
+                            for (index, item) in items.iter().enumerate() {
+                                match item.as_str() {
+                                    Some(name) => {
+                                        // Duplicates keep the first occurrence
+                                        // (a later duplicate cannot change the
+                                        // effective stack order).
+                                        if !stack.iter().any(|existing: &String| existing == name) {
+                                            stack.push(name.to_string());
+                                        }
+                                    }
+                                    None => warnings.push(SettingsWarning {
+                                        field: "packs.stack".to_string(),
+                                        reason: format!(
+                                            "expected a string at index {index}, found {}",
+                                            item.type_str()
+                                        ),
+                                    }),
+                                }
+                            }
+                            settings.pack_stack = stack;
+                            stack_loaded = true;
+                        }
+                        None => warnings.push(SettingsWarning {
+                            field: "packs.stack".to_string(),
+                            reason: format!("expected an array, found {}", stack_value.type_str()),
+                        }),
+                    }
+                }
+                // A valid `stack` suppresses the legacy key entirely (no
+                // warning): the file is already in the v2 format.
+                if !stack_loaded {
+                    if let Some(name) = load_optional_string(
+                        table,
+                        "texture_pack",
+                        None,
+                        "packs.texture_pack",
+                        &mut warnings,
+                    ) {
+                        settings.pack_stack = vec![name];
+                    }
+                }
             }
             None => warnings.push(SettingsWarning {
                 field: "packs".to_string(),
@@ -956,7 +1000,7 @@ vsync = false
             render_distance: 24,
             fullscreen: true,
             vsync: true,
-            texture_pack: None,
+            pack_stack: Vec::new(),
             volume: 60,
         };
         original.save(&path).unwrap();
@@ -997,6 +1041,7 @@ vsync = false
             "default save must omit [packs]:\n{text}"
         );
         assert!(!text.contains("texture_pack"));
+        assert!(!text.contains("stack ="));
         // Default volume means no [audio] section at all, keeping the default
         // save byte-identical to the pre-audio format.
         assert!(
@@ -1006,7 +1051,7 @@ vsync = false
         assert!(!text.contains("volume"));
 
         let with_pack = Settings {
-            texture_pack: Some("dungeon".to_string()),
+            pack_stack: vec!["dungeon".to_string()],
             ..Settings::default()
         };
         with_pack.save(&path).unwrap();
@@ -1015,7 +1060,11 @@ vsync = false
             text.contains("[packs]"),
             "named pack must emit [packs]:\n{text}"
         );
-        assert!(text.contains("texture_pack = \"dungeon\""));
+        assert!(
+            text.contains("stack = [\"dungeon\"]"),
+            "a one-entry stack uses the v2 array form:\n{text}"
+        );
+        assert!(!text.contains("texture_pack"));
 
         let with_volume = Settings {
             volume: 60,
@@ -1031,17 +1080,105 @@ vsync = false
     }
 
     #[test]
-    fn texture_pack_round_trips_through_save_and_load() {
+    fn pack_stack_round_trips_in_order() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         let original = Settings {
-            texture_pack: Some("dungeon".to_string()),
+            pack_stack: vec!["alpha".to_string(), "beta".to_string()],
             ..Settings::default()
         };
         original.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("stack = ["),
+            "a non-empty stack emits the v2 array key:\n{text}"
+        );
         let (loaded, warnings) = load_with_warnings(&path);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(loaded, original);
+        assert_eq!(loaded.pack_stack, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn legacy_texture_pack_migrates_to_a_one_entry_stack() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\ntexture_pack = \"dungeon\"\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(settings.pack_stack, vec!["dungeon"]);
+
+        // Re-saving a migrated file emits the v2 array form, never the legacy
+        // key again.
+        settings.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("stack = [\"dungeon\"]"), "{text}");
+        assert!(!text.contains("texture_pack"), "{text}");
+    }
+
+    #[test]
+    fn stack_wins_over_legacy_texture_pack() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(
+            &dir,
+            "[packs]\nstack = [\"alpha\", \"beta\"]\ntexture_pack = \"legacy\"\n",
+        );
+        let (settings, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(settings.pack_stack, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn wrong_type_stack_warns_and_falls_back_to_legacy_texture_pack() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(
+            &dir,
+            "[packs]\nstack = \"alpha\"\ntexture_pack = \"legacy\"\n",
+        );
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.pack_stack, vec!["legacy"]);
+        assert_eq!(warning_fields(&warnings), vec!["packs.stack"]);
+        assert!(warnings[0].reason.contains("expected an array"));
+        assert!(warnings[0].reason.contains("string"));
+    }
+
+    #[test]
+    fn non_string_stack_members_are_skipped_with_warnings() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\nstack = [\"alpha\", 7, \"beta\"]\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings.pack_stack, vec!["alpha", "beta"]);
+        assert_eq!(warning_fields(&warnings), vec!["packs.stack"]);
+        assert!(
+            warnings[0].reason.contains("index 1"),
+            "reason names the bad index: {}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].reason.contains("integer"));
+    }
+
+    #[test]
+    fn empty_stack_array_is_accepted_and_omits_packs_on_save() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\nstack = []\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(settings.pack_stack.is_empty());
+
+        settings.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("[packs]"),
+            "an empty stack must omit the section: {text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_stack_names_keep_the_first_occurrence() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[packs]\nstack = [\"alpha\", \"beta\", \"alpha\"]\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty(), "duplicates are silent: {warnings:?}");
+        assert_eq!(settings.pack_stack, vec!["alpha", "beta"]);
     }
 
     #[test]
@@ -1049,7 +1186,7 @@ vsync = false
         let dir = tempdir().unwrap();
         let path = write_settings_file(&dir, "[packs]\ntexture_pack = 7\n");
         let (settings, warnings) = load_with_warnings(&path);
-        assert_eq!(settings.texture_pack, None);
+        assert!(settings.pack_stack.is_empty());
         assert_eq!(warning_fields(&warnings), vec!["packs.texture_pack"]);
         assert!(warnings[0].reason.contains("expected a string"));
         assert!(warnings[0].reason.contains("integer"));
@@ -1061,12 +1198,12 @@ vsync = false
 
         let no_section = write_settings_file(&dir, "[video]\nvsync = false\n");
         let (settings, warnings) = load_with_warnings(&no_section);
-        assert_eq!(settings.texture_pack, None);
+        assert!(settings.pack_stack.is_empty());
         assert!(warnings.is_empty());
 
         let empty_section = write_settings_file(&dir, "[packs]\nunknown = 1\n");
         let (settings, warnings) = load_with_warnings(&empty_section);
-        assert_eq!(settings.texture_pack, None);
+        assert!(settings.pack_stack.is_empty());
         assert!(warnings.is_empty());
     }
 
@@ -1075,7 +1212,7 @@ vsync = false
         let dir = tempdir().unwrap();
         let path = write_settings_file(&dir, "[packs]\ntexture_pack = \"\"\n");
         let (settings, warnings) = load_with_warnings(&path);
-        assert_eq!(settings.texture_pack.as_deref(), Some(""));
+        assert_eq!(settings.pack_stack, vec![""]);
         assert!(warnings.is_empty());
     }
 
@@ -1084,7 +1221,7 @@ vsync = false
         let dir = tempdir().unwrap();
         let path = write_settings_file(&dir, "packs = 3\n");
         let (settings, warnings) = load_with_warnings(&path);
-        assert_eq!(settings.texture_pack, None);
+        assert!(settings.pack_stack.is_empty());
         assert_eq!(warning_fields(&warnings), vec!["packs"]);
     }
 

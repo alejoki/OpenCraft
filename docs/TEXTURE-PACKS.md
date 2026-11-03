@@ -295,7 +295,8 @@ The exit code is `0` when there are no errors (warnings still pass) and `1` when
 
 - Open **Settings** and click the **Texture Pack** row. Each click advances through `Default` and every pack folder found under `packs/`, wrapping back to `Default`.
 - The change applies immediately — no restart is needed. The logo, the menu tint, the block textures, and the pack's sounds update live.
-- The choice is saved in `settings.toml` under `[packs]` as `texture_pack = "folder-name"`, so it comes back on the next launch.
+- The selection is saved in `settings.toml` under `[packs]` as an ordered stack, `stack = ["folder-name", ...]`, so it comes back on the next launch. A legacy file with `texture_pack = "folder-name"` is read as a one-entry stack and rewritten in the `stack` form on the next save.
+- The single Cycling **Texture Pack** row is being replaced by a dedicated **Packs** screen that toggles and reorders the stack (T07); until then the row still cycles the first entry.
 - If the selected pack folder is deleted or renamed, the game keeps running with the built-in Default textures and shows an in-menu warning naming the pack. Cycle the row back to `Default` (or to the new folder name) to clear the stale selection.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
 

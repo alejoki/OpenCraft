@@ -8123,7 +8123,7 @@ impl GameApp {
         let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
         let available_packs = pack::available_pack_names(&packs_root);
         let (current_pack, pack_warnings) =
-            load_startup_pack(&packs_root, settings.texture_pack.as_deref());
+            load_startup_pack(&packs_root, settings.pack_stack.first().map(String::as_str));
         startup_warnings.extend(pack_warnings);
         // Startup sound overrides (M005/S05): resolved independently of the
         // texture result, so a pack whose layers partially failed still
@@ -8133,7 +8133,7 @@ impl GameApp {
         // engine is constructed first because `set_buffers` is device-free.
         let mut audio = new_audio_engine();
         let (startup_sounds, sound_warnings) =
-            load_startup_sounds(&packs_root, settings.texture_pack.as_deref());
+            load_startup_sounds(&packs_root, settings.pack_stack.first().map(String::as_str));
         audio.set_buffers(startup_sounds);
         startup_warnings.extend(sound_warnings);
         // Startup screen (app-state routing): a CLI world intent — the
@@ -8476,9 +8476,13 @@ impl GameApp {
     /// the exact click semantics without a live event loop; the live GPU
     /// re-upload stays in the caller (P005 borrow split).
     fn apply_texture_pack_cycle(&mut self) {
-        let next =
-            menu::cycle_texture_pack(self.settings.texture_pack.as_deref(), &self.available_packs);
-        self.settings.texture_pack = next.clone();
+        let next = menu::cycle_texture_pack(
+            self.settings.pack_stack.first().map(String::as_str),
+            &self.available_packs,
+        );
+        // Until the Packs screen lands (T07), the cycle row maps the single
+        // legacy selection onto a one-entry stack (empty = Default).
+        self.settings.pack_stack = next.clone().map(|name| vec![name]).unwrap_or_default();
         match next {
             None => {
                 // Cycling back to Default restores the synthesized sounds
@@ -11877,7 +11881,7 @@ mod tests {
             render_distance: 24,
             fullscreen: true,
             vsync: true,
-            texture_pack: None,
+            pack_stack: Vec::new(),
             volume: 100,
         };
         let menu = menu::SettingsMenu::new();
@@ -16447,7 +16451,7 @@ mod tests {
         app.settings_path = dir.join("settings.toml");
         app.packs_root = dir.join("packs");
         app.available_packs = pack::available_pack_names(&app.packs_root);
-        app.settings.texture_pack = None;
+        app.settings.pack_stack.clear();
         app.current_pack = None;
         app
     }
@@ -16531,7 +16535,7 @@ mod tests {
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
+        assert_eq!(app.settings.pack_stack, vec!["alpha"]);
         let loaded = app.current_pack.as_ref().expect("pack loaded");
         assert_eq!(loaded.display_name, "Alpha Pack");
         assert_eq!(loaded.layers.len(), NUM_TEX_LAYERS as usize);
@@ -16545,7 +16549,7 @@ mod tests {
         // The choice is durable at the injected path.
         let (reloaded, warnings) = load_with_warnings(&app.settings_path);
         assert!(warnings.is_empty());
-        assert_eq!(reloaded.texture_pack.as_deref(), Some("alpha"));
+        assert_eq!(reloaded.pack_stack, vec!["alpha"]);
     }
 
     #[test]
@@ -16555,16 +16559,16 @@ mod tests {
         let packs_root = app.packs_root.clone();
         write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         app.available_packs = pack::available_pack_names(&packs_root);
-        app.settings.texture_pack = Some("alpha".to_string());
+        app.settings.pack_stack = vec!["alpha".to_string()];
         app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
+        assert!(app.settings.pack_stack.is_empty(), "wraps to Default");
         assert!(app.current_pack.is_none(), "Default holds no pack data");
         let (reloaded, warnings) = load_with_warnings(&app.settings_path);
         assert!(warnings.is_empty());
-        assert_eq!(reloaded.texture_pack, None);
+        assert!(reloaded.pack_stack.is_empty());
     }
 
     #[test]
@@ -16575,12 +16579,12 @@ mod tests {
         write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         app.available_packs = pack::available_pack_names(&packs_root);
         // The persisted choice names a pack that is no longer on disk.
-        app.settings.texture_pack = Some("deleted".to_string());
+        app.settings.pack_stack = vec!["deleted".to_string()];
         app.current_pack = Some(pack::load_pack_by_name(&packs_root, "deleted"));
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack, None);
+        assert!(app.settings.pack_stack.is_empty());
         assert!(app.current_pack.is_none());
     }
 
@@ -16596,7 +16600,7 @@ mod tests {
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
+        assert_eq!(app.settings.pack_stack, vec!["broken"]);
         let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
         assert_eq!(
             loaded.layers.len(),
@@ -16627,7 +16631,7 @@ mod tests {
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("soundy"));
+        assert_eq!(app.settings.pack_stack, vec!["soundy"]);
         let swapped = app.audio.buffer(SoundSlot::Break);
         assert_eq!(swapped.channels(), 1, "mono WAV keeps its channel count");
         assert_eq!(swapped.sample_rate(), 22_050, "rate passes through");
@@ -16660,7 +16664,7 @@ mod tests {
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken-sound"));
+        assert_eq!(app.settings.pack_stack, vec!["broken-sound"]);
         let message = app
             .menu
             .message
@@ -16688,7 +16692,7 @@ mod tests {
         app.available_packs = pack::available_pack_names(&packs_root);
         // Start on the pack with its sounds already applied, as a real run
         // would after cycling onto it.
-        app.settings.texture_pack = Some("alpha".to_string());
+        app.settings.pack_stack = vec!["alpha".to_string()];
         app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
         let (pack_buffers, _) = pack::sound::load_sound_overrides(&packs_root.join("alpha"));
         app.audio.set_buffers(pack_buffers);
@@ -16699,7 +16703,7 @@ mod tests {
 
         app.apply_texture_pack_cycle();
 
-        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
+        assert!(app.settings.pack_stack.is_empty(), "wraps to Default");
         for slot in SoundSlot::ALL {
             assert_eq!(
                 *app.audio.buffer(slot),
