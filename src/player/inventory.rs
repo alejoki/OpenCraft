@@ -14,6 +14,7 @@
 //! ([`Inventory::hotbar_stack`], [`Inventory::to_legacy_hotbar`]) so those
 //! consumers can migrate without regaining mutable slot arrays.
 
+use crate::content::ContentRegistry;
 use crate::world::block::BlockId;
 use crate::world::loot::LootItem;
 use crate::world::mob_loot::MobDropItem;
@@ -301,6 +302,9 @@ pub enum ItemId {
     /// A registry-allocated pack generic item: a dense index into
     /// [`crate::content::ContentRegistry::items`].
     Item(u16),
+    /// A registry-allocated pack tool: a dense index into
+    /// [`crate::content::ContentRegistry::tools`].
+    ModTool(u16),
 }
 
 impl ItemId {
@@ -311,11 +315,12 @@ impl ItemId {
             ItemId::Material(_) => MATERIAL_STACK_LIMIT,
             ItemId::Tool { .. } => 1,
             ItemId::Item(_) => MAX_STACK_COUNT,
+            ItemId::ModTool(_) => 1,
         }
     }
 
     pub const fn is_tool(self) -> bool {
-        matches!(self, ItemId::Tool { .. })
+        matches!(self, ItemId::Tool { .. } | ItemId::ModTool(_))
     }
 
     pub const fn tool(self) -> Option<(ToolKind, ToolTier)> {
@@ -336,6 +341,9 @@ impl ItemId {
             // A registry-allocated pack item has no static label; callers that
             // have the registry read the real display name from its `ItemDef`.
             ItemId::Item(_) => "Modded Item",
+            // A pack tool index is not a `(kind, tier)` pair, so it has no
+            // static kind-first label either; the registry names it.
+            ItemId::ModTool(_) => "Modded Tool",
             ItemId::Tool { kind, tier } => match kind {
                 ToolKind::Pickaxe => match tier {
                     ToolTier::Wood => "Wood Pickaxe",
@@ -433,6 +441,11 @@ pub enum ItemError {
     /// The `(kind, tier)` pair is not a constructible tool identity, e.g. a
     /// stone or iron bow.
     TierNotAllowed,
+    /// A registry identity was built without a registry. Pack items and pack
+    /// tools must go through the `_with` constructors.
+    RegistryRequired,
+    /// A registry lookup failed: the index is not present in the registry.
+    UnknownContent,
 }
 
 /// Shared tier gate for every tool constructor.
@@ -459,6 +472,10 @@ pub struct Item {
     id: ItemId,
     count: u16,
     durability: Option<u16>,
+    /// Maximum durability captured at construction. Built-in tiers derive it
+    /// from `ToolTier`; pack tools store the authored `TierDef::durability`,
+    /// so HUD and inventory labels stay registry-free.
+    max_durability: Option<u16>,
 }
 
 impl Item {
@@ -478,10 +495,67 @@ impl Item {
                 if count != 1 {
                     return Err(ItemError::StackableTool);
                 }
+                let max_durability = tier.max_durability();
                 Ok(Self {
                     id,
                     count: 1,
-                    durability: Some(tier.max_durability()),
+                    durability: Some(max_durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            ItemId::ModTool(_) => Err(ItemError::RegistryRequired),
+        }
+    }
+
+    /// Builds a fully-repaired instance of `id` against `registry`.
+    ///
+    /// Pack generic items use their authored stack limit and pack tools start
+    /// at full authored durability. Built-in ids answer byte-identically to
+    /// [`Item::new`] because the registry built-ins are derived from the same
+    /// frozen tables.
+    pub fn new_with(registry: &ContentRegistry, id: ItemId, count: u16) -> Result<Self, ItemError> {
+        match id {
+            ItemId::Block(block) => {
+                if !block.is_carryable() {
+                    return Err(ItemError::UncarryableBlock);
+                }
+                let limit = registry
+                    .block(block)
+                    .map_or(MAX_STACK_COUNT, |def| def.stack_limit)
+                    .clamp(1, MAX_STACK_COUNT);
+                Self::stackable(id, count, limit)
+            }
+            ItemId::Item(index) => {
+                let def = registry.item(index).ok_or(ItemError::UnknownContent)?;
+                let limit = def.stack_limit.clamp(1, MAX_STACK_COUNT);
+                Self::stackable(id, count, limit)
+            }
+            ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
+            ItemId::Tool { kind, tier } => {
+                check_tool_tier(kind, tier)?;
+                if count != 1 {
+                    return Err(ItemError::StackableTool);
+                }
+                let max_durability = tier.max_durability();
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(max_durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            ItemId::ModTool(index) => {
+                let def = registry.tool(index).ok_or(ItemError::UnknownContent)?;
+                let tier = registry.tier(def.tier).ok_or(ItemError::UnknownContent)?;
+                if count != 1 {
+                    return Err(ItemError::StackableTool);
+                }
+                let durability = tier.durability.max(1);
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(durability),
+                    max_durability: Some(durability),
                 })
             }
         }
@@ -498,6 +572,7 @@ impl Item {
             id,
             count,
             durability: None,
+            max_durability: None,
         })
     }
 
@@ -518,7 +593,40 @@ impl Item {
             id: ItemId::Tool { kind, tier },
             count: 1,
             durability: Some(durability),
+            max_durability: Some(tier.max_durability()),
         })
+    }
+
+    /// Builds a tool identity with explicit remaining durability against
+    /// `registry`.
+    ///
+    /// Accepts a built-in `(kind, tier)` pair (same strict rule as
+    /// [`Item::tool_with_durability`]) or a pack tool index, whose durability
+    /// must be `1..=authored maximum`. Clamping is a persistence policy and is
+    /// deliberately not performed here.
+    pub fn tool_with_durability_with(
+        registry: &ContentRegistry,
+        id: ItemId,
+        durability: u16,
+    ) -> Result<Self, ItemError> {
+        match id {
+            ItemId::Tool { kind, tier } => Self::tool_with_durability(kind, tier, durability),
+            ItemId::ModTool(index) => {
+                let def = registry.tool(index).ok_or(ItemError::UnknownContent)?;
+                let tier = registry.tier(def.tier).ok_or(ItemError::UnknownContent)?;
+                let max_durability = tier.durability.max(1);
+                if durability == 0 || durability > max_durability {
+                    return Err(ItemError::InvalidDurability);
+                }
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            _ => Err(ItemError::NotATool),
+        }
     }
 
     /// Converts a legacy block stack, reusing the same validation rules.
@@ -541,7 +649,7 @@ impl Item {
 
     /// Maximum durability of this tool, or `None` for non-tools.
     pub fn max_durability(&self) -> Option<u16> {
-        self.id.tool().map(|(_, tier)| tier.max_durability())
+        self.max_durability
     }
 
     pub const fn is_tool(&self) -> bool {
@@ -1355,6 +1463,9 @@ pub enum RecipeId {
     IronSword,
     Shortbow,
     Arrows,
+    /// A registry-allocated pack recipe: a dense index into
+    /// [`crate::content::ContentRegistry::recipes`] (`>= 22`).
+    Modded(u16),
 }
 
 /// Read-only recipe evaluation result.
@@ -1878,6 +1989,92 @@ mod tests {
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {
         item(ItemId::Tool { kind, tier }, 1)
+    }
+
+    /// A deterministic pack registry with one tier (durability 900) and one
+    /// tool pointing at it, built through the public registry builder so the
+    /// test exercises the same allocation path as a real pack.
+    fn fixture_registry() -> crate::content::ContentRegistry {
+        use crate::content::build_registry;
+        use crate::content::spec::{PackAsset, PackContentSpec, TierEntry, ToolEntry};
+        use crate::content::PackIdentity;
+
+        let mut spec = PackContentSpec {
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "ruby_pickaxe.png".to_string(),
+            }],
+            ..PackContentSpec::default()
+        };
+        spec.assets.insert(
+            "ruby_pickaxe.png".to_string(),
+            PackAsset {
+                rgba: vec![0u8; 16 * 16 * 4],
+                source_side: 16,
+            },
+        );
+        let (registry, report) = build_registry(
+            crate::content::ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "fixture registry must not error");
+        registry
+    }
+
+    fn all_carryable_builtin_blocks() -> Vec<BlockId> {
+        (0..crate::world::block::BUILTIN_BLOCK_COUNT)
+            .map(BlockId::from_raw)
+            .filter(|block| block.is_carryable())
+            .collect()
+    }
+
+    fn all_materials() -> [Material; 11] {
+        [
+            Material::Stick,
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+            Material::Bone,
+            Material::Arrow,
+        ]
+    }
+
+    fn all_constructible_tools() -> Vec<ItemId> {
+        let mut ids = Vec::new();
+        for kind in [
+            ToolKind::Pickaxe,
+            ToolKind::Axe,
+            ToolKind::Shovel,
+            ToolKind::Hoe,
+            ToolKind::Sword,
+            ToolKind::Bow,
+        ] {
+            for &tier in kind.allowed_tiers() {
+                ids.push(ItemId::Tool { kind, tier });
+            }
+        }
+        ids
     }
 
     fn total_of(inventory: &Inventory, id: ItemId) -> u32 {
@@ -2535,6 +2732,173 @@ mod tests {
                 kind: ToolKind::Axe,
                 tier: ToolTier::Stone
             }
+        );
+    }
+
+    #[test]
+    fn new_with_matches_new_for_every_builtin_identity() {
+        let registry = ContentRegistry::builtin();
+
+        for block in all_carryable_builtin_blocks() {
+            let id = ItemId::Block(block);
+            for count in [1, 2, MAX_STACK_COUNT] {
+                assert_eq!(
+                    Item::new_with(registry, id, count),
+                    Item::new(id, count),
+                    "block {block:?} count {count} must answer identically"
+                );
+            }
+            assert_eq!(
+                Item::new_with(registry, id, MAX_STACK_COUNT + 1),
+                Item::new(id, MAX_STACK_COUNT + 1)
+            );
+            assert_eq!(
+                Item::new_with(registry, id, 0),
+                Item::new(id, 0),
+                "zero counts stay EmptyStack"
+            );
+        }
+
+        for material in all_materials() {
+            let id = ItemId::Material(material);
+            for count in [1, MATERIAL_STACK_LIMIT] {
+                assert_eq!(
+                    Item::new_with(registry, id, count),
+                    Item::new(id, count),
+                    "material {material:?} count {count} must answer identically"
+                );
+            }
+            assert_eq!(
+                Item::new_with(registry, id, MATERIAL_STACK_LIMIT + 1),
+                Item::new(id, MATERIAL_STACK_LIMIT + 1)
+            );
+        }
+
+        for id in all_constructible_tools() {
+            assert_eq!(
+                Item::new_with(registry, id, 1),
+                Item::new(id, 1),
+                "tool {id:?} must answer identically"
+            );
+            assert_eq!(
+                Item::new_with(registry, id, 2),
+                Item::new(id, 2),
+                "tool stack rejection must match"
+            );
+        }
+
+        // Uncarryable blocks and unconstructible tool pairs stay rejected.
+        assert_eq!(
+            Item::new_with(registry, ItemId::Block(BlockId::Water), 1),
+            Err(ItemError::UncarryableBlock)
+        );
+        assert_eq!(
+            Item::new_with(
+                registry,
+                ItemId::Tool {
+                    kind: ToolKind::Bow,
+                    tier: ToolTier::Iron
+                },
+                1
+            ),
+            Err(ItemError::TierNotAllowed)
+        );
+    }
+
+    #[test]
+    fn mod_tool_item_carries_full_authored_durability() {
+        let registry = fixture_registry();
+        assert_eq!(
+            registry.tool(0).map(|def| def.name.as_str()),
+            Some("mymod:ruby_pickaxe")
+        );
+        assert_eq!(registry.tier(3).map(|def| def.durability), Some(900));
+
+        let id = ItemId::ModTool(0);
+        assert_eq!(id.stack_limit(), 1);
+        assert!(id.is_tool());
+        assert_eq!(id.tool(), None);
+        assert_eq!(id.name(), "Modded Tool");
+
+        let fresh = Item::new_with(&registry, id, 1).expect("pack tool is constructible");
+        assert_eq!(fresh.id(), id);
+        assert_eq!(fresh.count(), 1);
+        assert_eq!(fresh.durability(), Some(900));
+        assert_eq!(fresh.max_durability(), Some(900));
+        assert!(fresh.is_tool());
+        assert!(!fresh.is_stackable());
+        assert_eq!(
+            fresh.use_tool_once(),
+            Ok(Some(
+                Item::tool_with_durability_with(&registry, id, 899).expect("899 is in range")
+            ))
+        );
+
+        // The built-in constructors cannot express a pack tool.
+        assert_eq!(Item::new(id, 1), Err(ItemError::RegistryRequired));
+    }
+
+    #[test]
+    fn new_with_rejects_unknown_content_and_bad_counts() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+
+        assert_eq!(
+            Item::new_with(&registry, id, 2),
+            Err(ItemError::StackableTool)
+        );
+        assert_eq!(
+            Item::new_with(&registry, id, 0),
+            Err(ItemError::StackableTool)
+        );
+        assert_eq!(
+            Item::new_with(&registry, ItemId::ModTool(99), 1),
+            Err(ItemError::UnknownContent)
+        );
+        assert_eq!(
+            Item::new_with(&registry, ItemId::Item(0), 1),
+            Err(ItemError::UnknownContent)
+        );
+    }
+
+    #[test]
+    fn tool_with_durability_with_accepts_authored_range_only() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, id, 0),
+            Err(ItemError::InvalidDurability)
+        );
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, id, 901),
+            Err(ItemError::InvalidDurability)
+        );
+        for durability in [1, 900] {
+            let item = Item::tool_with_durability_with(&registry, id, durability)
+                .expect("authored durability is valid");
+            assert_eq!(item.durability(), Some(durability));
+            assert_eq!(item.max_durability(), Some(900));
+        }
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, ItemId::ModTool(99), 1),
+            Err(ItemError::UnknownContent)
+        );
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, ItemId::Material(Material::Stick), 1),
+            Err(ItemError::NotATool)
+        );
+        // Built-in ids delegate to the strict built-in rule.
+        assert_eq!(
+            Item::tool_with_durability_with(
+                &registry,
+                ItemId::Tool {
+                    kind: ToolKind::Pickaxe,
+                    tier: ToolTier::Iron
+                },
+                ToolTier::Iron.max_durability() + 1
+            ),
+            Err(ItemError::InvalidDurability)
         );
     }
 

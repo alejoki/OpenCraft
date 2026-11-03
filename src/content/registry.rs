@@ -902,6 +902,12 @@ impl Digest {
                 self.u8(3);
                 self.u16(index);
             }
+            // A pack tool hashes by its dense tool index. Built-in recipes
+            // cannot produce one, so existing digests are unchanged.
+            ItemId::ModTool(index) => {
+                self.u8(4);
+                self.u16(index);
+            }
         }
     }
 

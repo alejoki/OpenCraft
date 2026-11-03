@@ -293,32 +293,21 @@ pub fn builtin_tool_id_name(kind: ToolKind, tier: ToolTier) -> Option<&'static s
     Some(TOOL_ID_NAMES[tier_index * 5 + kind_index])
 }
 
-/// Stable short name for a recipe.
-pub fn builtin_recipe_id_name(recipe: RecipeId) -> &'static str {
-    RECIPE_ID_NAMES[match recipe {
-        RecipeId::Planks => 0,
-        RecipeId::Sticks => 1,
-        RecipeId::CraftingTable => 2,
-        RecipeId::Chest => 3,
-        RecipeId::WoodPickaxe => 4,
-        RecipeId::WoodAxe => 5,
-        RecipeId::WoodShovel => 6,
-        RecipeId::StonePickaxe => 7,
-        RecipeId::StoneAxe => 8,
-        RecipeId::StoneShovel => 9,
-        RecipeId::IronPickaxe => 10,
-        RecipeId::IronAxe => 11,
-        RecipeId::IronShovel => 12,
-        RecipeId::Bread => 13,
-        RecipeId::WoodHoe => 14,
-        RecipeId::StoneHoe => 15,
-        RecipeId::IronHoe => 16,
-        RecipeId::WoodSword => 17,
-        RecipeId::StoneSword => 18,
-        RecipeId::IronSword => 19,
-        RecipeId::Shortbow => 20,
-        RecipeId::Arrows => 21,
-    }]
+/// Stable short name for a recipe, or `None` for a registry pack recipe.
+pub fn builtin_recipe_id_name(recipe: RecipeId) -> Option<&'static str> {
+    RECIPE_ID_NAMES.get(builtin_recipe_index(recipe)?).copied()
+}
+
+/// The recipe at `index` in the frozen built-in recipe order.
+pub fn builtin_recipe_by_index(index: u16) -> Option<RecipeId> {
+    RECIPE_VALUES.get(usize::from(index)).copied()
+}
+
+/// The frozen index of a built-in recipe, or `None` for [`RecipeId::Modded`].
+pub fn builtin_recipe_index(recipe: RecipeId) -> Option<usize> {
+    RECIPE_VALUES
+        .iter()
+        .position(|candidate| *candidate == recipe)
 }
 
 /// Whether `namespace` is reserved for the engine or built-in content.
@@ -574,10 +563,11 @@ mod tests {
         for (index, recipe) in recipes.into_iter().enumerate() {
             assert_eq!(
                 builtin_recipe_id_name(recipe),
-                RECIPE_ID_NAMES[index],
+                Some(RECIPE_ID_NAMES[index]),
                 "recipe table misaligned at {index}"
             );
         }
+        assert_eq!(builtin_recipe_id_name(RecipeId::Modded(22)), None);
     }
 
     #[test]
@@ -654,9 +644,25 @@ mod tests {
         for (index, name) in RECIPE_ID_NAMES.iter().enumerate() {
             let recipe = builtin_recipe_id_by_name(name)
                 .unwrap_or_else(|| panic!("missing recipe lookup for {name}"));
-            assert_eq!(builtin_recipe_id_name(recipe), RECIPE_ID_NAMES[index]);
+            assert_eq!(builtin_recipe_id_name(recipe), Some(RECIPE_ID_NAMES[index]));
         }
         assert_eq!(builtin_recipe_id_by_name("mymod:ruby"), None);
+    }
+
+    #[test]
+    fn builtin_recipe_indices_round_trip_and_reject_modded() {
+        for (index, name) in RECIPE_ID_NAMES.iter().enumerate() {
+            let recipe = builtin_recipe_by_index(index as u16)
+                .unwrap_or_else(|| panic!("missing recipe index {index}"));
+            assert_eq!(builtin_recipe_index(recipe), Some(index));
+            assert_eq!(builtin_recipe_id_name(recipe), Some(*name));
+            assert_eq!(builtin_recipe_id_by_name(name), Some(recipe));
+        }
+        assert_eq!(builtin_recipe_by_index(22), None);
+        assert_eq!(builtin_recipe_by_index(u16::MAX), None);
+        assert_eq!(builtin_recipe_index(RecipeId::Modded(0)), None);
+        assert_eq!(builtin_recipe_index(RecipeId::Modded(22)), None);
+        assert_eq!(builtin_recipe_id_name(RecipeId::Modded(22)), None);
     }
 
     #[test]

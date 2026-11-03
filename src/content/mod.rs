@@ -84,14 +84,13 @@ impl ItemRef {
         }
     }
 
-    /// The insertable [`ItemId`] for this reference, or `None` for a pack tool
-    /// identity that `ItemId` cannot express until S05 widens it.
+    /// The insertable [`ItemId`] for this reference.
     pub const fn item_id(self) -> Option<ItemId> {
         match self {
             ItemRef::Block(block) => Some(ItemId::Block(block)),
             ItemRef::Builtin(id) => Some(id),
             ItemRef::Item(index) => Some(ItemId::Item(index)),
-            ItemRef::Tool(_) => None,
+            ItemRef::Tool(index) => Some(ItemId::ModTool(index)),
         }
     }
 }
@@ -362,6 +361,39 @@ impl ContentRegistry {
     /// The saved name of the generic item at dense `index`.
     pub fn item_def_name(&self, index: u16) -> Option<&str> {
         self.item(index).map(|def| def.name.as_str())
+    }
+
+    /// The saved name of the pack tool at dense `index`.
+    pub fn tool_def_name(&self, index: u16) -> Option<&str> {
+        self.tool(index).map(|def| def.name.as_str())
+    }
+
+    /// The display name for `id`, resolved through the registry where the
+    /// identity is registry-allocated.
+    ///
+    /// Blocks, generic items and pack tools read their definition's authored
+    /// display name. Materials and built-in tools have static `ItemId` labels
+    /// and fall back to [`ItemId::name`]. Unknown registry indices return
+    /// `None` rather than panicking on forged content.
+    pub fn item_display_name(&self, id: ItemId) -> Option<String> {
+        match id {
+            ItemId::Block(block) => self.block(block).map(|def| def.display_name.clone()),
+            ItemId::Item(index) => self.item(index).map(|def| def.display_name.clone()),
+            ItemId::ModTool(index) => self.tool(index).map(|def| def.display_name.clone()),
+            ItemId::Material(_) | ItemId::Tool { .. } => Some(id.name().to_string()),
+        }
+    }
+
+    /// The tool class of `id`, resolved through the registry for pack tools.
+    ///
+    /// Built-in tools answer from their `(kind, tier)` identity; pack tools
+    /// read their `ToolDef`. Non-tools and unknown indices return `None`.
+    pub fn tool_kind(&self, id: ItemId) -> Option<ToolKind> {
+        match id {
+            ItemId::Tool { kind, .. } => Some(kind),
+            ItemId::ModTool(index) => self.tool(index).map(|def| def.kind),
+            _ => None,
+        }
     }
 
     /// All registered block definitions in raw id order.
@@ -646,7 +678,9 @@ fn builtin_recipe_def(index: u16, recipe: &Recipe) -> RecipeDef {
     }
     RecipeDef {
         index,
-        name: names::builtin_recipe_id_name(recipe.id).to_string(),
+        name: names::builtin_recipe_id_name(recipe.id)
+            .expect("every built-in recipe has a frozen name")
+            .to_string(),
         pattern: recipe
             .pattern
             .iter()
@@ -1020,8 +1054,81 @@ mod tests {
         assert_eq!(ItemRef::Item(7).item_id(), Some(ItemId::Item(7)));
         assert_eq!(
             ItemRef::Tool(3).item_id(),
-            None,
-            "pack tools are unrepresentable until S05 widens ItemId"
+            Some(ItemId::ModTool(3)),
+            "pack tools map to the widened modded tool identity"
+        );
+        assert_eq!(ItemRef::Tool(0).item_id(), Some(ItemId::ModTool(0)));
+    }
+
+    #[test]
+    fn registry_names_and_kinds_resolve_pack_tools() {
+        use crate::content::spec::{PackAsset, TierEntry, ToolEntry};
+        use crate::player::inventory::Material;
+
+        let mut spec = PackContentSpec {
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "ruby_pickaxe.png".to_string(),
+            }],
+            ..PackContentSpec::default()
+        };
+        spec.assets.insert(
+            "ruby_pickaxe.png".to_string(),
+            PackAsset {
+                rgba: vec![0u8; 16 * 16 * 4],
+                source_side: 16,
+            },
+        );
+        let (registry, report) =
+            build_registry(ContentRegistry::builtin(), &[pack("fixture", None, spec)]);
+        assert_eq!(report.errors(), 0);
+
+        assert_eq!(registry.tool_def_name(0), Some("mymod:ruby_pickaxe"));
+        assert_eq!(registry.tool_def_name(99), None);
+        assert_eq!(
+            registry.item_display_name(ItemId::ModTool(0)),
+            Some("Ruby Pickaxe".to_string())
+        );
+        assert_eq!(
+            registry.tool_kind(ItemId::ModTool(0)),
+            Some(ToolKind::Pickaxe)
+        );
+        assert_eq!(registry.item_display_name(ItemId::ModTool(99)), None);
+        assert_eq!(registry.tool_kind(ItemId::ModTool(99)), None);
+        assert_eq!(registry.tool_kind(ItemId::Material(Material::Stick)), None);
+
+        // Built-ins keep their static labels; blocks read the registry def.
+        assert_eq!(
+            registry.item_display_name(ItemId::Material(Material::Stick)),
+            Some("Stick".to_string())
+        );
+        assert_eq!(
+            registry.item_display_name(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron
+            }),
+            Some("Iron Pickaxe".to_string())
+        );
+        assert_eq!(
+            registry.item_display_name(ItemId::Block(BlockId::Stone)),
+            Some("Stone".to_string())
+        );
+        assert_eq!(
+            registry.tool_kind(ItemId::Tool {
+                kind: ToolKind::Axe,
+                tier: ToolTier::Wood
+            }),
+            Some(ToolKind::Axe)
         );
     }
 

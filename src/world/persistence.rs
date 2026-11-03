@@ -1061,6 +1061,9 @@ fn write_item(out: &mut Vec<u8>, item: Option<Item>) -> Result<(), PersistenceEr
                 out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
             }
             ItemId::Item(_) => return Err(PersistenceError::UnsupportedItem),
+            // Pack tools are v8-only content (T05). Legacy versions fail
+            // closed rather than truncating the tool index.
+            ItemId::ModTool(_) => return Err(PersistenceError::UnsupportedItem),
         },
     }
     Ok(())
@@ -1145,6 +1148,9 @@ fn content_name_of_item(registry: &ContentRegistry, item: Item) -> Result<&str, 
         ItemId::Item(index) => registry
             .item_def_name(index)
             .ok_or(PersistenceError::UnknownItemIndex(index)),
+        // Pack tools are v8-only content (T05); until then they cannot be
+        // named by the legacy writer.
+        ItemId::ModTool(_) => Err(PersistenceError::UnsupportedItem),
     }
 }
 
@@ -1286,6 +1292,8 @@ fn write_v8_item(
                 out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.count().to_le_bytes());
             }
+            // Pack tools are v8-only content (T05).
+            ItemId::ModTool(_) => return Err(PersistenceError::UnsupportedItem),
         },
     }
     Ok(())
@@ -5436,6 +5444,76 @@ mod tests {
         let (registry, report) = build_registry(ContentRegistry::builtin(), &[ruby_pack()]);
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
         registry
+    }
+
+    /// A registry with the same ruby item plus an authored tier and pack tool,
+    /// so widened `ModTool` identities can be constructed in writer tests.
+    fn ruby_tool_registry() -> ContentRegistry {
+        use crate::content::spec::{TierEntry, ToolEntry};
+
+        let mut spec = PackContentSpec {
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "ruby_pickaxe.png".to_string(),
+            }],
+            ..PackContentSpec::default()
+        };
+        spec.assets.insert(
+            "ruby_pickaxe.png".to_string(),
+            PackAsset {
+                rgba: vec![0x33; 1024],
+                source_side: 16,
+            },
+        );
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod-ruby-tool".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    #[test]
+    fn pack_tools_fail_closed_in_legacy_and_v8_writers() {
+        let registry = ruby_tool_registry();
+        let tool = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack tool");
+        assert_eq!(tool.durability(), Some(900));
+
+        // The legacy writer rejects the widened identity before any byte.
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_item(&mut out, Some(tool)),
+            Err(PersistenceError::UnsupportedItem)
+        ));
+        assert!(out.is_empty(), "legacy writer must reject before writing");
+
+        // The v8 name-table pass is the atomic pre-write gate; until T05 it
+        // fails closed on a pack tool instead of emitting a wrong name.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(tool);
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let data = sample_data(player);
+        assert!(matches!(
+            ContentNameTable::collect(&data, &registry),
+            Err(PersistenceError::UnsupportedItem)
+        ));
     }
 
     fn v8_data_with_ruby_content() -> WorldSaveData {

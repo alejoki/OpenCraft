@@ -317,6 +317,11 @@ pub fn icon_source(id: ItemId) -> Option<IconSource> {
         ItemId::Item(_) => Some(IconSource::Sprite(u32::from(
             crate::content::PLACEHOLDER_ICON_LAYER,
         ))),
+        // A pack tool has no procedural art yet; the reserved placeholder
+        // sprite keeps the slot visible until a registry icon path resolves.
+        ItemId::ModTool(_) => Some(IconSource::Sprite(u32::from(
+            crate::content::PLACEHOLDER_ICON_LAYER,
+        ))),
     }
 }
 
@@ -347,6 +352,11 @@ pub fn icon_source_with(registry: &ContentRegistry, id: ItemId) -> Option<IconSo
         ItemId::Item(index) => Some(IconSource::Sprite(u32::from(
             registry
                 .item(index)
+                .map_or(crate::content::PLACEHOLDER_ICON_LAYER, |def| def.icon_layer),
+        ))),
+        ItemId::ModTool(index) => Some(IconSource::Sprite(u32::from(
+            registry
+                .tool(index)
                 .map_or(crate::content::PLACEHOLDER_ICON_LAYER, |def| def.icon_layer),
         ))),
         ItemId::Material(_) | ItemId::Tool { .. } => icon_source(id),
@@ -706,6 +716,8 @@ fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
         // Layer 27 is the reserved transparent checker slot: a placeholder
         // pack item draws no art until a pack supplies an icon.
         ItemId::Item(_) => {}
+        // Pack tool art is registry-authored; there is no procedural fallback.
+        ItemId::ModTool(_) => {}
         ItemId::Material(material) => draw_material(material, canvas),
         ItemId::Tool { kind, tier } => {
             if !kind.allowed_tiers().contains(&tier) {

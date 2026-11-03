@@ -12129,6 +12129,10 @@ fn presentation_item_label(registry: &ContentRegistry, id: ItemId) -> String {
             .item_def_name(index)
             .map(str::to_string)
             .unwrap_or_else(|| format!("item:{index}")),
+        ItemId::ModTool(index) => registry
+            .tool_def_name(index)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("tool:{index}")),
         ItemId::Material(material) => material.name().to_string(),
         ItemId::Tool { kind, tier } => format!("{}_{}", tier.name(), kind.name()),
     }

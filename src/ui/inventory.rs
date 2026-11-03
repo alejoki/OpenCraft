@@ -558,6 +558,8 @@ pub fn item_color(item: Item) -> [f32; 4] {
         ItemId::Tool { kind, tier } => tool_color(kind, tier),
         // Placeholder pack item: neutral checker grey until a pack icon lands.
         ItemId::Item(_) => [0.35, 0.35, 0.35, 1.0],
+        // Placeholder pack tool: the same neutral grey until a pack icon lands.
+        ItemId::ModTool(_) => [0.35, 0.35, 0.35, 1.0],
     }
 }
 
