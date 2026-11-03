@@ -85,6 +85,11 @@ const ITEM_TAG_MATERIAL: u8 = 2;
 const ITEM_TAG_TOOL: u8 = 3;
 /// v8 generic registry item record: `u16 name_index + u16 count`.
 const ITEM_TAG_GENERIC: u8 = 4;
+/// v8 pack tool record: `u16 name_index + u16 remaining_durability`.
+///
+/// Pack tools are v8-only content: the legacy v1-v7 reader and writer keep
+/// rejecting the widened identity instead of truncating its index.
+const ITEM_TAG_MOD_TOOL: u8 = 5;
 
 const MATERIAL_STICK: u8 = 0;
 // Append-only: new material identities take the next unused discriminant.
@@ -566,7 +571,8 @@ pub enum PersistenceError {
     /// A content name was malformed, reserved, or used under the wrong kind
     /// (for example a pack item name persisted as a block).
     InvalidContentName(String),
-    /// A generic item index is not present in the load registry.
+    /// A registry-allocated item or pack-tool index is not present in the
+    /// registry that is naming or loading it.
     UnknownItemIndex(u16),
     /// The v8 pack-identity + digest tail was malformed (unbounded pack
     /// count, oversized/duplicate folder, or trailing bytes).
@@ -1194,7 +1200,17 @@ impl ContentNameTable {
             registry: &ContentRegistry,
             item: Item,
         ) -> Result<(), PersistenceError> {
-            add_name(set, content_name_of_item(registry, item)?)
+            match item.id() {
+                // Pack tools are named by the v8 table through their authored
+                // stable id; the legacy naming helper stays fail-closed.
+                ItemId::ModTool(index) => {
+                    let name = registry
+                        .tool_def_name(index)
+                        .ok_or(PersistenceError::UnknownItemIndex(index))?;
+                    add_name(set, name)
+                }
+                _ => add_name(set, content_name_of_item(registry, item)?),
+            }
         }
 
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1257,7 +1273,15 @@ impl ContentNameTable {
         registry: &ContentRegistry,
         item: Item,
     ) -> Result<u16, PersistenceError> {
-        self.index_of(content_name_of_item(registry, item)?)
+        match item.id() {
+            ItemId::ModTool(index) => {
+                let name = registry
+                    .tool_def_name(index)
+                    .ok_or(PersistenceError::UnknownItemIndex(index))?;
+                self.index_of(name)
+            }
+            _ => self.index_of(content_name_of_item(registry, item)?),
+        }
     }
 }
 
@@ -1292,8 +1316,11 @@ fn write_v8_item(
                 out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.count().to_le_bytes());
             }
-            // Pack tools are v8-only content (T05).
-            ItemId::ModTool(_) => return Err(PersistenceError::UnsupportedItem),
+            ItemId::ModTool(_) => {
+                out.push(ITEM_TAG_MOD_TOOL);
+                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
+            }
         },
     }
     Ok(())
@@ -1959,6 +1986,46 @@ impl<'a> V8Resolver<'a> {
         }
     }
 
+    /// Resolves a v8 pack-tool record.
+    ///
+    /// A name present as a live pack tool resolves to its dense identity. A
+    /// name that is absent (or only known through a placeholder item created
+    /// by an earlier load) degrades to a count-one placeholder item, exactly
+    /// like a generic item placeholder. Any other known kind is a forged
+    /// cross-kind reference and fails closed.
+    fn mod_tool(&mut self, index: u16) -> Result<ItemId, PersistenceError> {
+        let name = self.name(index)?;
+        if let Some(def) = self.registry.tool_by_name(name) {
+            return Ok(ItemId::ModTool(def.index));
+        }
+        if let Some(def) = self.registry.item_by_name(name) {
+            if def.placeholder {
+                return Ok(ItemId::Item(def.index));
+            }
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if names::builtin_item_id_by_name(name).is_some()
+            || self.registry.block_by_name(name).is_some()
+            || self.registry.tier_by_name(name).is_some()
+            || self.registry.recipe_by_name(name).is_some()
+        {
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if is_placeholder_content_name(name) {
+            let item_index = self.registry.append_placeholder_item(name);
+            self.unresolved += 1;
+            return Ok(ItemId::Item(item_index));
+        }
+        Err(PersistenceError::InvalidContentName(name.to_string()))
+    }
+
+    /// Authored maximum durability of the pack tool at dense `index`.
+    fn mod_tool_max_durability(&self, index: u16) -> Option<u16> {
+        let def = self.registry.tool(index)?;
+        let tier = self.registry.tier(def.tier)?;
+        Some(tier.durability.max(1))
+    }
+
     fn item(&mut self, index: u16) -> Result<ItemId, PersistenceError> {
         let name = self.name(index)?;
         if let Some(def) = self.registry.item_by_name(name) {
@@ -2017,6 +2084,32 @@ fn read_v8_item<R: Read>(
             Item::new(id, count)
                 .map(Some)
                 .map_err(PersistenceError::InvalidItem)
+        }
+        ITEM_TAG_MOD_TOOL => {
+            let index = read_u16(r)?;
+            let durability = read_u16(r)?;
+            if durability == 0 {
+                return Err(PersistenceError::InvalidItem(ItemError::InvalidDurability));
+            }
+            let id = resolver.mod_tool(index)?;
+            match id {
+                ItemId::ModTool(tool_index) => {
+                    // Persistence policy: a saved durability above the
+                    // authored maximum clamps instead of bricking the world.
+                    // `tool_with_durability_with` itself stays strict.
+                    let max = resolver.mod_tool_max_durability(tool_index).ok_or(
+                        PersistenceError::InvalidContentName(resolver.name(index)?.to_string()),
+                    )?;
+                    Item::tool_with_durability_with(&resolver.registry, id, durability.min(max))
+                        .map(Some)
+                        .map_err(PersistenceError::InvalidItem)
+                }
+                // A degraded pack tool becomes a count-one placeholder item;
+                // its stale durability is intentionally not carried over.
+                placeholder => Item::new_with(&resolver.registry, placeholder, 1)
+                    .map(Some)
+                    .map_err(PersistenceError::InvalidItem),
+            }
         }
         other => Err(PersistenceError::InvalidItemTag(other)),
     }
@@ -5490,30 +5583,196 @@ mod tests {
     }
 
     #[test]
-    fn pack_tools_fail_closed_in_legacy_and_v8_writers() {
+    fn pack_tools_fail_closed_in_the_legacy_writer_and_name_in_v8() {
         let registry = ruby_tool_registry();
         let tool = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack tool");
         assert_eq!(tool.durability(), Some(900));
 
-        // The legacy writer rejects the widened identity before any byte.
+        // The legacy writer keeps rejecting the widened identity before any
+        // byte; the v1-v7 wire format must never truncate a tool index.
         let mut out = Vec::new();
         assert!(matches!(
             write_item(&mut out, Some(tool)),
             Err(PersistenceError::UnsupportedItem)
         ));
         assert!(out.is_empty(), "legacy writer must reject before writing");
+        assert!(matches!(
+            content_name_of_item(&registry, tool),
+            Err(PersistenceError::UnsupportedItem)
+        ));
 
-        // The v8 name-table pass is the atomic pre-write gate; until T05 it
-        // fails closed on a pack tool instead of emitting a wrong name.
+        // The v8 name-table pass names the pack tool through its authored
+        // stable id instead of failing closed (T05).
         let mut slots = [None; INVENTORY_SLOTS];
         slots[0] = Some(tool);
         let mut player = sample_player();
         player.inventory = Inventory::from_parts(slots, None);
         let data = sample_data(player);
+        let table = ContentNameTable::collect(&data, &registry).expect("v8 names pack tools");
+        assert_eq!(
+            table
+                .index_of("mymod:ruby_pickaxe")
+                .expect("tool name is tabled"),
+            0
+        );
+    }
+
+    /// One inventory slot holding a pack tool at `durability`.
+    fn pack_tool_player(registry: &ContentRegistry, durability: u16) -> SavedPlayerState {
+        let tool = Item::tool_with_durability_with(registry, ItemId::ModTool(0), durability)
+            .expect("pack tool");
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(tool);
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        player
+    }
+
+    /// Absolute offset of the first v8 inventory slot for a save with no
+    /// chunk edits: header + content table + hotbar + time + chunk count.
+    fn v8_first_inventory_slot(bytes: &[u8]) -> usize {
+        let mut cur = Cursor::new(&bytes[36..]);
+        let count = usize::try_from(read_u32(&mut cur).unwrap()).unwrap();
+        let mut offset = 40usize;
+        for _ in 0..count {
+            let len = usize::from(read_u16(&mut cur).unwrap());
+            cur.set_position(cur.position() + len as u64);
+            offset += 2 + len;
+        }
+        offset + HOTBAR_SLOTS * 3 + 4 + 4
+    }
+
+    #[test]
+    fn v8_roundtrips_pack_tool_identity_and_durability() {
+        let registry = ruby_tool_registry();
+        let data = sample_data(pack_tool_player(&registry, 875));
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &data, &registry).expect("v8 names a pack tool");
+        assert_eq!(v8_content_names(&bytes), vec!["mymod:ruby_pickaxe"]);
+
+        let loaded = load_world_from_bytes_with(&bytes, &registry).expect("pack tool loads");
+        assert_eq!(loaded.unresolved, 0);
+        let tool = loaded.data.player.inventory.slots()[0].expect("tool survived");
+        assert_eq!(tool.id(), ItemId::ModTool(0));
+        assert_eq!(tool.count(), 1);
+        assert_eq!(tool.durability(), Some(875));
+        assert_eq!(tool.max_durability(), Some(900));
+
+        let mut second = Vec::new();
+        save_world_to_bytes_with(&mut second, &loaded.data, &loaded.registry).unwrap();
+        assert_eq!(
+            second, bytes,
+            "a pack-tool reload must re-save byte-identically"
+        );
+    }
+
+    #[test]
+    fn v8_missing_pack_degrades_a_pack_tool_to_a_count_one_placeholder() {
+        let registry = ruby_tool_registry();
+        let data = sample_data(pack_tool_player(&registry, 875));
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &data, &registry).unwrap();
+
+        let missing = load_world_from_bytes_with(&bytes, ContentRegistry::builtin())
+            .expect("a missing pack never blocks the world");
+        assert_eq!(missing.unresolved, 1);
+        let placeholder = missing.data.player.inventory.slots()[0]
+            .expect("the degraded tool still occupies its slot");
+        assert_eq!(placeholder.id(), ItemId::Item(0));
+        assert_eq!(placeholder.count(), 1);
+        let def = missing
+            .registry
+            .item(0)
+            .expect("the placeholder item is registered");
+        assert_eq!(def.name, "mymod:ruby_pickaxe");
+        assert!(def.placeholder);
+
+        // Restoring the pack resolves the same wire name back to the live
+        // tool instead of leaving the placeholder behind.
+        let restored = load_world_from_bytes_with(&bytes, &registry).expect("pack resolves");
+        assert_eq!(restored.unresolved, 0);
+        let tool = restored.data.player.inventory.slots()[0].expect("tool");
+        assert_eq!(tool.id(), ItemId::ModTool(0));
+        assert_eq!(tool.durability(), Some(875));
+    }
+
+    #[test]
+    fn v8_clamps_pack_tool_durability_but_builtin_tools_stay_strict() {
+        let registry = ruby_tool_registry();
+        let data = sample_data(pack_tool_player(&registry, 900));
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &data, &registry).unwrap();
+        let slot = v8_first_inventory_slot(&bytes);
+        assert_eq!(bytes[slot], ITEM_TAG_MOD_TOOL);
+        let durability_at = slot + 3;
+        bytes[durability_at..durability_at + 2].copy_from_slice(&901u16.to_le_bytes());
+
+        let loaded = load_world_from_bytes_with(&bytes, &registry).expect("901 clamps to 900");
+        let tool = loaded.data.player.inventory.slots()[0].expect("tool survived");
+        assert_eq!(tool.durability(), Some(900));
+        assert_eq!(tool.max_durability(), Some(900));
+
+        // Zero durability is never a legal tool state, even for packs.
+        let mut zero = bytes.clone();
+        zero[durability_at..durability_at + 2].copy_from_slice(&0u16.to_le_bytes());
         assert!(matches!(
-            ContentNameTable::collect(&data, &registry),
-            Err(PersistenceError::UnsupportedItem)
+            load_world_from_bytes_with(&zero, &registry),
+            Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
         ));
+
+        // Built-in tools keep the strict reject-above-max policy.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 250)
+                .expect("full iron pickaxe"),
+        );
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let mut builtin = Vec::new();
+        save_world_to_bytes_with(
+            &mut builtin,
+            &sample_data(player),
+            ContentRegistry::builtin(),
+        )
+        .unwrap();
+        let slot = v8_first_inventory_slot(&builtin);
+        assert_eq!(builtin[slot], ITEM_TAG_TOOL);
+        let durability_at = slot + 3;
+        builtin[durability_at..durability_at + 2].copy_from_slice(&251u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes_with(&builtin, ContentRegistry::builtin()),
+            Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
+        ));
+    }
+
+    #[test]
+    fn v8_roundtrips_pack_tool_in_cursor_and_crafting_grids() {
+        let registry = ruby_tool_registry();
+        let tool =
+            Item::tool_with_durability_with(&registry, ItemId::ModTool(0), 42).expect("pack tool");
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts([None; INVENTORY_SLOTS], Some(tool));
+        player.player_grid.set(0, Some(tool)).unwrap();
+        player.table_grid.set(15, Some(tool)).unwrap();
+        let data = sample_data(player);
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &data, &registry).expect("v8 names grid tools");
+        let loaded = load_world_from_bytes_with(&bytes, &registry).unwrap();
+        assert_eq!(loaded.unresolved, 0);
+        assert_eq!(loaded.data.player.inventory.cursor(), Some(tool));
+        assert_eq!(loaded.data.player.player_grid.slot(0), Some(tool));
+        assert_eq!(loaded.data.player.table_grid.slot(15), Some(tool));
+
+        // The same single name degrades to one placeholder shared by all
+        // three records; it is counted once, like any repeated item name.
+        let missing = load_world_from_bytes_with(&bytes, ContentRegistry::builtin()).unwrap();
+        assert_eq!(missing.unresolved, 1);
+        let degraded = Item::new(ItemId::Item(0), 1).expect("placeholder item");
+        assert_eq!(missing.data.player.inventory.cursor(), Some(degraded));
+        assert_eq!(missing.data.player.player_grid.slot(0), Some(degraded));
+        assert_eq!(missing.data.player.table_grid.slot(15), Some(degraded));
     }
 
     fn v8_data_with_ruby_content() -> WorldSaveData {
