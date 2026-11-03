@@ -7,10 +7,12 @@
 //! GameApp the way S01's lifecycle contracts were wired in S02).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
+use crate::content::ContentRegistry;
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
 use crate::player::combat::DamageCause;
@@ -36,7 +38,7 @@ use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
-use crate::world::persistence::{ChestMap, ChunkEditMap, WorldSaveData};
+use crate::world::persistence::{ChestMap, ChunkEditMap, LoadedWorld, WorldSaveData};
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
@@ -113,6 +115,15 @@ pub struct WorldSession {
     /// at save time; the frame loop never iterates it.
     pub chests: ChestMap,
     pub save_path: PathBuf,
+    /// The immutable content registry this session was built with. Every save
+    /// names its references through this registry, and the load path freezes
+    /// the registry it resolved against here too. A live pack-stack change
+    /// never replaces it (MEM512/D181); the next loaded world does.
+    pub registry: Arc<ContentRegistry>,
+    /// Ephemeral changed-stack note computed once at load time and consumed by
+    /// [`WorldSession::take_content_notice`]. Never persisted and never
+    /// re-derived per frame.
+    content_notice: Option<String>,
     /// Ephemeral crafting-station state: the position of the table whose
     /// interface is open, if any. Deliberately not persisted (`SAVE_VERSION`
     /// unchanged) and reset by both constructors, so a restart always starts
@@ -208,6 +219,29 @@ impl WorldSession {
         season_length_days: u32,
         mode: GameMode,
     ) -> WorldSession {
+        Self::new_session_with_mode_and_registry(
+            seed,
+            save_path,
+            season_length_days,
+            mode,
+            ContentRegistry::builtin_arc(),
+        )
+    }
+
+    /// A fresh world whose persisted and effective mode is `mode`, resolved
+    /// against `registry`.
+    ///
+    /// The registry is frozen for the session's lifetime (MEM512/D181).
+    /// Production callers pass the registry built from the launch pack stack;
+    /// [`WorldSession::new_session_with_mode`] is the built-in wrapper for
+    /// every existing test and demo.
+    pub fn new_session_with_mode_and_registry(
+        seed: u32,
+        save_path: PathBuf,
+        season_length_days: u32,
+        mode: GameMode,
+        registry: Arc<ContentRegistry>,
+    ) -> WorldSession {
         let mut player = Player::new_with_mode(Self::spawn_position(seed), mode);
         // The player starts on the deterministic world spawn, so the cached
         // anchor is that same position: no second land search.
@@ -227,6 +261,8 @@ impl WorldSession {
             save_mode: mode,
             chests: ChestMap::default(),
             save_path,
+            registry,
+            content_notice: None,
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
@@ -269,6 +305,29 @@ impl WorldSession {
         position: Vec3,
         clock: GameClock,
     ) -> WorldSession {
+        Self::new_at_with_registry(
+            seed,
+            save_path,
+            season_length_days,
+            position,
+            clock,
+            ContentRegistry::builtin_arc(),
+        )
+    }
+
+    /// A fresh world starting at a caller-supplied position and clock, resolved
+    /// against `registry`.
+    ///
+    /// [`WorldSession::new_at`] is the built-in wrapper; production callers
+    /// pass the launch pack registry so the editor save names modded content.
+    pub fn new_at_with_registry(
+        seed: u32,
+        save_path: PathBuf,
+        season_length_days: u32,
+        position: Vec3,
+        clock: GameClock,
+        registry: Arc<ContentRegistry>,
+    ) -> WorldSession {
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(position),
@@ -280,6 +339,8 @@ impl WorldSession {
             save_mode: GameMode::Creative,
             chests: ChestMap::default(),
             save_path,
+            registry,
+            content_notice: None,
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
@@ -315,6 +376,39 @@ impl WorldSession {
     /// selection or a grid stored under the wrong kind. `set_mode` runs after
     /// the raw fly assignment, so a Survival record cannot restore flight.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
+        Self::session_from_save_with_registry(data, save_path, ContentRegistry::builtin_arc(), None)
+    }
+
+    /// Rebuild a session from a registry-aware load, preserving the placeholder
+    /// registry and the one-shot changed-stack notice.
+    ///
+    /// The notice is computed by [`LoadedWorld::content_notice`] before the
+    /// loaded world is destructured, then stored ephemerally: it is presented
+    /// once by the UI and never persisted.
+    pub fn from_loaded_world(loaded: LoadedWorld, save_path: PathBuf) -> WorldSession {
+        let content_notice = loaded.content_notice();
+        Self::session_from_save_with_registry(
+            loaded.data,
+            save_path,
+            Arc::new(loaded.registry),
+            content_notice,
+        )
+    }
+
+    /// Takes the pending changed-stack notice, if any.
+    ///
+    /// At most one consumer sees it; the notice is never re-derived and never
+    /// persisted.
+    pub fn take_content_notice(&mut self) -> Option<String> {
+        self.content_notice.take()
+    }
+
+    fn session_from_save_with_registry(
+        data: WorldSaveData,
+        save_path: PathBuf,
+        registry: Arc<ContentRegistry>,
+        content_notice: Option<String>,
+    ) -> WorldSession {
         let WorldSaveData {
             seed,
             time_of_day,
@@ -378,6 +472,8 @@ impl WorldSession {
             save_mode: mode,
             chests,
             save_path,
+            registry,
+            content_notice,
             open_table: None,
             open_chest: None,
             survival_runtime: SurvivalRuntime::default(),
@@ -7056,5 +7152,82 @@ mod tests {
                 .accepted,
             1
         );
+    }
+
+    #[test]
+    fn from_loaded_world_keeps_the_placeholder_registry_and_consumes_the_notice_once() {
+        use crate::content::PackIdentity;
+        use crate::world::persistence::{LoadedWorld, SaveContentMeta};
+
+        let mut registry = ContentRegistry::builtin().clone();
+        let raw = u16::try_from(registry.blocks().len()).expect("test table fits u16");
+        registry.append_placeholder_block("mymod:ruby_ore");
+        let loaded = LoadedWorld {
+            data: make_save(11),
+            registry,
+            saved_content: Some(SaveContentMeta {
+                packs: vec![PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: Some("1.0".to_string()),
+                }],
+                digest: 0x1234,
+            }),
+            unresolved: 1,
+        };
+
+        let mut session =
+            WorldSession::from_loaded_world(loaded, PathBuf::from("/tmp/loaded.mcvx"));
+        assert_eq!(
+            session.registry.block_name(BlockId::Modded(raw)),
+            Some("mymod:ruby_ore"),
+            "the placeholder-augmented registry is installed on the session"
+        );
+        let notice = session
+            .take_content_notice()
+            .expect("a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod`"), "{notice}");
+        assert!(
+            notice.contains("1 saved content name is unavailable and render as placeholders"),
+            "{notice}"
+        );
+        assert_eq!(
+            session.take_content_notice(),
+            None,
+            "the notice is one-shot"
+        );
+    }
+
+    #[test]
+    fn registry_constructors_freeze_the_supplied_registry() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let mut fresh = WorldSession::new_session_with_mode_and_registry(
+            7,
+            PathBuf::from("/tmp/fresh-registry.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        assert!(Arc::ptr_eq(&fresh.registry, &registry));
+        assert_eq!(fresh.take_content_notice(), None);
+
+        let at = WorldSession::new_at_with_registry(
+            7,
+            PathBuf::from("/tmp/at-registry.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.0, 20.0, 2.0),
+            GameClock::new(),
+            Arc::clone(&registry),
+        );
+        assert!(Arc::ptr_eq(&at.registry, &registry));
+
+        let plain = WorldSession::session_from_save(
+            make_save(7),
+            PathBuf::from("/tmp/legacy-wrapper.mcvx"),
+        );
+        assert!(Arc::ptr_eq(
+            &plain.registry,
+            &ContentRegistry::builtin_arc()
+        ));
+        assert_eq!(plain.registry.digest(), crate::content::EMPTY_DIGEST);
     }
 }

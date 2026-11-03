@@ -483,6 +483,77 @@ impl ContentRegistry {
     }
 }
 
+/// Builds a readable, non-blocking note describing how `current` differs from
+/// the registry that wrote a v8 save.
+///
+/// Pack identities are compared as folder → version maps in sorted-folder
+/// order: missing packs, added packs and version changes are reported
+/// individually. A digest difference that no pack-level change explains adds
+/// `content definitions changed`, so an edited definition is never silently
+/// swallowed. `unresolved` is the number of saved names that loaded as
+/// deterministic placeholders. Returns `None` iff packs, versions, digest and
+/// placeholder count all agree.
+pub fn content_mismatch_note(
+    saved_packs: &[PackIdentity],
+    saved_digest: u64,
+    current: &ContentRegistry,
+    unresolved: usize,
+) -> Option<String> {
+    let saved: BTreeMap<&str, Option<&str>> = saved_packs
+        .iter()
+        .map(|pack| (pack.folder.as_str(), pack.version.as_deref()))
+        .collect();
+    let loaded: BTreeMap<&str, Option<&str>> = current
+        .packs()
+        .iter()
+        .map(|pack| (pack.folder.as_str(), pack.version.as_deref()))
+        .collect();
+
+    let mut notes = Vec::new();
+    for folder in saved.keys() {
+        if !loaded.contains_key(folder) {
+            notes.push(format!("missing pack `{folder}`"));
+        }
+    }
+    for folder in loaded.keys() {
+        if !saved.contains_key(folder) {
+            notes.push(format!("added pack `{folder}`"));
+        }
+    }
+    for (folder, saved_version) in &saved {
+        let Some(loaded_version) = loaded.get(folder) else {
+            continue;
+        };
+        if saved_version != loaded_version {
+            notes.push(format!(
+                "pack `{folder}` version changed from {} to {}",
+                saved_version.unwrap_or("unspecified"),
+                loaded_version.unwrap_or("unspecified"),
+            ));
+        }
+    }
+
+    // A digest difference with identical pack identities means a definition
+    // (or an authored asset key) changed underneath the same stack.
+    if saved_digest != current.digest() && notes.is_empty() {
+        notes.push("content definitions changed".to_string());
+    }
+
+    if unresolved > 0 {
+        notes.push(format!(
+            "{unresolved} saved content name{} {} unavailable and render as placeholders",
+            if unresolved == 1 { "" } else { "s" },
+            if unresolved == 1 { "is" } else { "are" },
+        ));
+    }
+
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    }
+}
+
 fn builtin_blocks() -> Vec<BlockDef> {
     (0..BUILTIN_BLOCK_COUNT)
         .map(|raw| {
@@ -762,6 +833,140 @@ mod tests {
         assert_eq!(
             first.packs().len(),
             ContentRegistry::builtin().packs().len()
+        );
+    }
+
+    fn pack(
+        folder: &str,
+        version: Option<&str>,
+        spec: PackContentSpec,
+    ) -> (PackIdentity, PackContentSpec) {
+        (
+            PackIdentity {
+                folder: folder.to_string(),
+                version: version.map(str::to_string),
+            },
+            spec,
+        )
+    }
+
+    /// A stack entry that changes the digest without introducing new ids: it
+    /// patches a built-in display name, so no assets are needed.
+    fn stone_display(display: &str) -> PackContentSpec {
+        let mut spec = PackContentSpec::default();
+        spec.block_patches.push(crate::content::spec::BlockPatch {
+            id: "stone".to_string(),
+            display_name: Some(display.to_string()),
+            hardness: None,
+            drop: None,
+            tool: None,
+            stack_limit: None,
+        });
+        spec
+    }
+
+    #[test]
+    fn content_mismatch_note_is_none_for_matching_content() {
+        assert_eq!(
+            content_mismatch_note(&[], EMPTY_DIGEST, ContentRegistry::builtin(), 0),
+            None
+        );
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Stone"))],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(
+            content_mismatch_note(registry.packs(), registry.digest(), &registry, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn content_mismatch_note_reports_missing_packs_and_placeholders() {
+        let (saved, _) = build_registry(
+            ContentRegistry::builtin(),
+            &[
+                pack("alpha", Some("1.0"), stone_display("Stone")),
+                pack("beta", Some("2.0"), stone_display("Rock")),
+            ],
+        );
+        let (current, _) = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Stone"))],
+        );
+
+        let note = content_mismatch_note(saved.packs(), saved.digest(), &current, 2)
+            .expect("a missing pack is a mismatch");
+        assert!(note.contains("missing pack `beta`"), "{note}");
+        assert!(
+            note.contains("2 saved content names are unavailable and render as placeholders"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("content definitions changed"),
+            "a pack-level difference explains the digest: {note}"
+        );
+    }
+
+    #[test]
+    fn content_mismatch_note_reports_added_packs_and_version_changes() {
+        let saved = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Stone"))],
+        )
+        .0;
+        let added = build_registry(
+            ContentRegistry::builtin(),
+            &[
+                pack("alpha", Some("1.0"), stone_display("Stone")),
+                pack("beta", None, PackContentSpec::default()),
+            ],
+        )
+        .0;
+        let note = content_mismatch_note(saved.packs(), saved.digest(), &added, 0)
+            .expect("an added pack is a mismatch");
+        assert_eq!(note, "added pack `beta`");
+
+        let changed = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("2.0"), stone_display("Stone"))],
+        )
+        .0;
+        let note = content_mismatch_note(saved.packs(), saved.digest(), &changed, 0)
+            .expect("a version change is a mismatch");
+        assert_eq!(note, "pack `alpha` version changed from 1.0 to 2.0");
+    }
+
+    #[test]
+    fn content_mismatch_note_reports_an_unexplained_digest_change() {
+        let saved = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Stone"))],
+        )
+        .0;
+        let changed = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Rock"))],
+        )
+        .0;
+        assert_ne!(saved.digest(), changed.digest());
+        assert_eq!(
+            content_mismatch_note(saved.packs(), saved.digest(), &changed, 0),
+            Some("content definitions changed".to_string())
+        );
+    }
+
+    #[test]
+    fn content_mismatch_note_uses_singular_and_plural_placeholder_counts() {
+        assert_eq!(
+            content_mismatch_note(&[], EMPTY_DIGEST, ContentRegistry::builtin(), 1),
+            Some("1 saved content name is unavailable and render as placeholders".to_string())
+        );
+        assert_eq!(
+            content_mismatch_note(&[], EMPTY_DIGEST, ContentRegistry::builtin(), 3),
+            Some("3 saved content names are unavailable and render as placeholders".to_string())
         );
     }
 }

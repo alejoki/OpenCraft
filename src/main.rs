@@ -91,10 +91,12 @@ use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind, MobShot};
 use opencraft::world::mob_ai::MobAttack;
 use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
+#[cfg(test)]
+use opencraft::world::persistence::save_world_to_path;
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
-    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
-    DEFAULT_TIME_SCALE,
+    load_world_from_path, load_world_from_path_with, save_world_to_path_with, CliConfig,
+    PersistenceError, SavedMob, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
+    DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -281,7 +283,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
-    let result = save_world_to_path(&session.save_path, &data);
+    let result = save_world_to_path_with(&session.save_path, &data, session.registry.as_ref());
     if result.is_ok() {
         session.world.mark_saved();
     }
@@ -1621,9 +1623,19 @@ fn demo_owns_world_witness(cli: &CliConfig) -> bool {
 /// `cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED)` with the same save
 /// path.
 fn startup_session(cli: &CliConfig) -> WorldSession {
+    startup_session_with(cli, &ContentRegistry::builtin_arc())
+}
+
+/// The startup world session resolved against `registry`.
+///
+/// The load branch keeps the placeholder-augmented registry and the one-shot
+/// changed-stack notice; the fresh branch freezes the supplied registry on the
+/// new session. [`startup_session`] is the built-in wrapper every existing
+/// test and demo launch uses.
+fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> WorldSession {
     if !cli.force_new_world && cli.save_path.exists() {
-        if let Ok(save) = load_world_from_path(&cli.save_path) {
-            let mut session = WorldSession::session_from_save(save, cli.save_path.clone());
+        if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
+            let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
             // A bounded accelerated watch that reloads a save must keep the
             // same pinned witness as its fresh leg: no ambient records may
             // appear in the next saved tail. The scripted demos are
@@ -1661,8 +1673,13 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // over a launch flag. The mode follows the same rule: `--creative` /
     // `--survival` pick the fresh world's persisted mode, while a loaded save
     // restores its own stored mode and ignores the flag.
-    let mut session =
-        WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
+    let mut session = WorldSession::new_session_with_mode_and_registry(
+        seed,
+        cli.save_path.clone(),
+        cli.season_length,
+        mode,
+        Arc::clone(registry),
+    );
     if cli.demo_combat {
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
@@ -4214,17 +4231,21 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// stage earns the wood bow and its arrows, and the Save stage writes the two
 /// surviving hostile records.
 ///
-/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v7_save`)
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v8_save`)
 /// and reading the file back, never computed by hand: every earned stack changes
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 218;
-/// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
-/// record starts 4 bytes later and the Skeleton record follows it, so the tail
-/// ends at [`COMBAT_SAVE_BYTES`].
+const COMBAT_SAVE_BYTES: usize = 307;
+/// Bytes of the v8 pack-identity + digest tail after the mob records: a `u32`
+/// pack count (zero here) plus the `u64` FNV-1a digest.
 #[cfg(test)]
-const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
+const COMBAT_SAVE_TAIL_BYTES: usize = 12;
+/// Measured offset of the v8 mob-count word in that save: the 19-byte Zombie
+/// record starts 4 bytes later and the Skeleton record follows it, so the tail
+/// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
+#[cfg(test)]
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
@@ -15187,13 +15208,13 @@ mod tests {
         (session, demo)
     }
 
-    /// The fresh leg writes the v7 save through the production save site, and
+    /// The fresh leg writes the v8 save through the production save site, and
     /// the file itself carries the two surviving hostile records plus the earned
     /// inventory. The file length and the mob-count offset are MEASURED by
     /// running the fresh leg, never computed by hand: they depend on the exact
     /// serialized size of the inventory stacks the demo earns.
     #[test]
-    fn combat_demo_fresh_leg_writes_and_verifies_a_v7_save() {
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v8_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = 12345;
         let save_path = dir.path().join("combat-fresh-leg.mcvx");
@@ -15239,16 +15260,16 @@ mod tests {
             COMBAT_SAVE_MOB_COUNT_OFFSET,
             "pinned mob-count offset"
         );
-        assert_eq!(&bytes[4..8], &7u32.to_le_bytes(), "v7 version word");
+        assert_eq!(&bytes[4..8], &8u32.to_le_bytes(), "v8 version word");
         assert_eq!(
             &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
             &2u32.to_le_bytes(),
             "mob count at the measured offset"
         );
         assert_eq!(
-            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len(),
+            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len() + COMBAT_SAVE_TAIL_BYTES,
             bytes.len(),
-            "the mob tail is the last section"
+            "the mob tail is followed only by the pack+digest tail"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
@@ -27000,5 +27021,177 @@ mod tests {
         assert_ne!(bow[1].color, mining[1].color);
 
         assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
+    }
+
+    /// A two-entry pack registry (one block, one item) with real, non-placeholder
+    /// definitions, built from an inline spec rather than the crate's `packs/`.
+    fn main_ruby_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby_ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 64,
+            food: None,
+        });
+        for path in ["ruby_ore.png", "ruby.png"] {
+            spec.assets.insert(
+                path.to_string(),
+                PackAsset {
+                    rgba: vec![0x33; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+
+        let packs = vec![(
+            PackIdentity {
+                folder: "mymod-ruby".to_string(),
+                version: Some("1.0".to_string()),
+            },
+            spec,
+        )];
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        Arc::new(registry)
+    }
+
+    fn modded_sample_save(seed: u32) -> WorldSaveData {
+        let mut data = sample_save(seed);
+        let mut chunk = FxHashMap::default();
+        chunk.insert(
+            10,
+            BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT),
+        );
+        data.chunk_edits.insert(ChunkPos::new(1, 2, 3), chunk);
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Item(0), 5).expect("ruby stack"))
+            .expect("the empty inventory accepts the stack");
+        data.player.inventory = inventory;
+        data
+    }
+
+    #[test]
+    fn save_current_world_names_modded_content_through_the_session_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-session.mcvx");
+        let registry = main_ruby_registry();
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            4242,
+            path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+        session
+            .player
+            .collect_item(Item::new(ItemId::Item(0), 5).expect("ruby stack"));
+
+        save_current_world(&mut session).expect("the session save writes");
+
+        let loaded =
+            opencraft::world::persistence::load_world_from_path_with(&path, registry.as_ref())
+                .expect("the save loads with the pack registry");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "no placeholders against the same pack"
+        );
+        let block = loaded.registry.block(ruby_ore).expect("ruby ore resolves");
+        assert_eq!(block.name, "mymod:ruby_ore");
+        assert!(
+            !block.placeholder,
+            "the real definition was written by name"
+        );
+        let item = loaded.registry.item(0).expect("ruby resolves");
+        assert_eq!(item.name, "mymod:ruby");
+        assert!(!item.placeholder);
+        assert_eq!(
+            loaded.data.player.inventory.slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(0))
+        );
+        assert_eq!(
+            loaded
+                .data
+                .chunk_edits
+                .get(&ChunkPos::new(0, 0, 0))
+                .and_then(|chunk| chunk.get(&(linear_index(0, 10, 0) as u16)))
+                .copied(),
+            Some(ruby_ore)
+        );
+    }
+
+    #[test]
+    fn startup_session_with_loads_v8_content_through_the_pack_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-startup.mcvx");
+        let path_str = path.to_str().expect("utf8 path");
+        let registry = main_ruby_registry();
+        save_world_to_path_with(&path, &modded_sample_save(33), registry.as_ref())
+            .expect("write modded save");
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+
+        let cli = CliConfig::parse_args(["--save", path_str]);
+        let mut loaded = startup_session_with(&cli, &registry);
+        assert_eq!(
+            loaded
+                .registry
+                .block(ruby_ore)
+                .map(|block| block.name.as_str()),
+            Some("mymod:ruby_ore")
+        );
+        assert!(!loaded.registry.block(ruby_ore).unwrap().placeholder);
+        assert_eq!(loaded.registry.item_def_name(0), Some("mymod:ruby"));
+        assert_eq!(loaded.take_content_notice(), None, "same stack is silent");
+        assert_eq!(
+            loaded.player.inventory().slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(0)),
+            "the saved item id survives the registry-aware load"
+        );
+
+        // The same save under the built-in registry still opens, with the saved
+        // names as placeholders and a readable non-blocking notice.
+        let mut builtin = startup_session_with(&cli, &ContentRegistry::builtin_arc());
+        assert_eq!(
+            builtin
+                .registry
+                .block(ruby_ore)
+                .map(|block| block.name.as_str()),
+            Some("mymod:ruby_ore"),
+            "the placeholder keeps the saved name"
+        );
+        assert!(builtin.registry.block(ruby_ore).unwrap().placeholder);
+        let notice = builtin
+            .take_content_notice()
+            .expect("a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod-ruby`"), "{notice}");
+        assert!(
+            notice.contains("2 saved content names are unavailable and render as placeholders"),
+            "{notice}"
+        );
+
+        // A fresh branch freezes exactly the supplied registry.
+        let fresh = startup_session_with(
+            &CliConfig::parse_args(["--new", "--seed", "9", "--save", path_str]),
+            &registry,
+        );
+        assert!(Arc::ptr_eq(&fresh.registry, &registry));
     }
 }

@@ -486,6 +486,23 @@ pub struct LoadedWorld {
     pub unresolved: usize,
 }
 
+impl LoadedWorld {
+    /// A readable, non-blocking note describing how the registry that loaded
+    /// this world differs from the one that saved it.
+    ///
+    /// `None` for v1-v7 payloads (they carry no pack identity or digest) and
+    /// for a v8 save loaded against the exact same content stack.
+    pub fn content_notice(&self) -> Option<String> {
+        let saved = self.saved_content.as_ref()?;
+        crate::content::content_mismatch_note(
+            &saved.packs,
+            saved.digest,
+            &self.registry,
+            self.unresolved,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
@@ -5537,6 +5554,40 @@ mod tests {
         let mut resolved_bytes = Vec::new();
         save_world_to_bytes_with(&mut resolved_bytes, &resolved.data, &resolved.registry).unwrap();
         assert_eq!(resolved_bytes, bytes);
+    }
+
+    #[test]
+    fn loaded_world_content_notice_is_none_for_legacy_and_matching_stacks() {
+        // v1-v7 carries no pack identity or digest, so it never warns.
+        let legacy =
+            load_world_from_bytes_with(&hand_built_v1_bytes(), ContentRegistry::builtin()).unwrap();
+        assert!(legacy.saved_content.is_none());
+        assert_eq!(legacy.content_notice(), None);
+
+        let v7 = legacy_world_bytes(&migration_data(7), 7);
+        let v7 = load_world_from_bytes_with(&v7, ContentRegistry::builtin()).unwrap();
+        assert!(v7.saved_content.is_none());
+        assert_eq!(v7.content_notice(), None);
+
+        // A v8 save loaded against the exact same stack is silent.
+        let pack_registry = ruby_registry();
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &v8_data_with_ruby_content(), &pack_registry).unwrap();
+        let same = load_world_from_bytes_with(&bytes, &pack_registry).unwrap();
+        assert_eq!(same.unresolved, 0);
+        assert_eq!(same.content_notice(), None);
+
+        // Removing the pack names it and counts the placeholders that stood in
+        // for the two saved names, without blocking the load.
+        let missing = load_world_from_bytes_with(&bytes, ContentRegistry::builtin()).unwrap();
+        let notice = missing
+            .content_notice()
+            .expect("a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod-ruby`"), "{notice}");
+        assert!(
+            notice.contains("2 saved content names are unavailable and render as placeholders"),
+            "{notice}"
+        );
     }
 
     #[test]
