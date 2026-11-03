@@ -722,4 +722,90 @@ mod tests {
         let brick = BlockId::Brick.break_duration_secs().unwrap();
         assert!(brick > cobblestone, "brick must be slower than cobblestone");
     }
+
+    #[test]
+    fn builtin_block_contract_is_frozen() {
+        // 23-row literal table captured from pre-M010. Every field the rest
+        // of the engine consumes (raw id, display name, per-face texture
+        // layers, hardness, mined drop) is pinned here so S01's storage and
+        // registry refactor cannot silently renumber or re-skin a built-in.
+        // The stable snake_case registry name arrives in T04, not here.
+        let contract: [(u16, &str, [u8; 6], Option<f32>, BlockId); 23] = [
+            (0, "Air", [0, 0, 0, 0, 0, 0], None, BlockId::Air),
+            (1, "Grass", [1, 1, 0, 2, 1, 1], Some(0.5), BlockId::Grass),
+            (2, "Dirt", [2; 6], Some(0.45), BlockId::Dirt),
+            (3, "Stone", [3; 6], Some(1.2), BlockId::Cobblestone),
+            (4, "Cobblestone", [4; 6], Some(1.5), BlockId::Cobblestone),
+            (5, "Sand", [5; 6], Some(0.45), BlockId::Sand),
+            (6, "Oak Log", [7, 7, 6, 6, 7, 7], Some(0.9), BlockId::OakLog),
+            (7, "Oak Leaves", [8; 6], Some(0.2), BlockId::OakLeaves),
+            (8, "Oak Planks", [9; 6], Some(0.8), BlockId::OakPlanks),
+            (9, "Brick", [10; 6], Some(1.8), BlockId::Brick),
+            (
+                10,
+                "Snow",
+                [13, 13, 11, 2, 13, 13],
+                Some(0.3),
+                BlockId::Snow,
+            ),
+            (11, "Bedrock", [12; 6], None, BlockId::Bedrock),
+            (12, "Coal Ore", [14; 6], Some(1.6), BlockId::CoalOre),
+            (13, "Iron Ore", [15; 6], Some(2.2), BlockId::IronOre),
+            (
+                14,
+                "Crafting Table",
+                [24, 24, 23, 9, 24, 24],
+                Some(0.8),
+                BlockId::CraftingTable,
+            ),
+            (15, "Water", [0; 6], None, BlockId::Water),
+            (16, "Farmland", [16; 6], Some(0.55), BlockId::Dirt),
+            (
+                17,
+                "Wheat Stage 0",
+                [17; 6],
+                Some(0.05),
+                BlockId::WheatStage0,
+            ),
+            (
+                18,
+                "Wheat Stage 1",
+                [18; 6],
+                Some(0.05),
+                BlockId::WheatStage1,
+            ),
+            (
+                19,
+                "Wheat Stage 2",
+                [19; 6],
+                Some(0.05),
+                BlockId::WheatStage2,
+            ),
+            (
+                20,
+                "Wheat Stage 3",
+                [20; 6],
+                Some(0.05),
+                BlockId::WheatStage3,
+            ),
+            (21, "Chest", [21; 6], Some(0.8), BlockId::Chest),
+            (22, "Loot Chest", [22; 6], Some(0.8), BlockId::Chest),
+        ];
+        assert_eq!(contract.len(), 23, "built-in block count is frozen at 23");
+
+        for (raw, display_name, faces, hardness, drop) in contract {
+            let block = BlockId::from_u8(raw as u8)
+                .unwrap_or_else(|| panic!("built-in raw id {raw} must decode"));
+            assert_eq!(block as u8 as u16, raw, "{display_name} raw id drifted");
+            assert_eq!(block.name(), display_name, "{display_name} name drifted");
+            let expected_faces = [0u8, 1, 2, 3, 4, 5].map(|face| block.face_tex_layer(face));
+            assert_eq!(faces, expected_faces, "{display_name} face layers drifted");
+            assert_eq!(
+                block.break_duration_secs(),
+                hardness,
+                "{display_name} hardness drifted"
+            );
+            assert_eq!(block.mined_drop(), drop, "{display_name} drop drifted");
+        }
+    }
 }

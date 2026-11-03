@@ -5063,4 +5063,57 @@ mod tests {
             "shoreline tree at ({wx}, {wz}) lost its canopy top at ({wx}, {top}, {wz})"
         );
     }
+
+    /// FNV-1a 64 over every cell in `linear_index` order (x fastest, then z,
+    /// then y), hashing each block id as a little-endian `u16`.
+    ///
+    /// Deliberately local to this test module: T02 swaps the `block as u8`
+    /// expression for `to_raw()` without moving the pinned literals.
+    fn fnv1a64_chunk_baseline(chunk: &Chunk) -> (Option<BlockId>, usize, u64) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut non_air = 0usize;
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    debug_assert_eq!(linear_index(x, y, z), y * 1024 + z * 32 + x);
+                    let block = chunk.get(x, y, z);
+                    if block != BlockId::Air {
+                        non_air += 1;
+                    }
+                    for byte in (block as u8 as u16).to_le_bytes() {
+                        hash ^= byte as u64;
+                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+            }
+        }
+        (chunk.is_uniform(), non_air, hash)
+    }
+
+    #[test]
+    fn pinned_terrain_generation_matches_pre_m010_baseline() {
+        let cases = [
+            (ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer),
+            (ChunkPos::new(0, 1, 0), 1337, Season::Winter),
+            (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
+        ];
+        // (uniform, non_air_cells, FNV-1a 64 digest) captured from the
+        // unmodified pre-M010 generator. These are the behavior-preservation
+        // gate for S01: any terrain drift must fail here, not merely differ
+        // from a second run of the same code.
+        let expected: [(Option<BlockId>, usize, u64); 3] = [
+            (None, 26_913, 5_429_992_561_724_371_152),
+            (None, 20_878, 8_773_073_591_056_755_479),
+            (Some(BlockId::Air), 0, 16_934_947_671_703_429_925),
+        ];
+
+        for ((pos, seed, season), expected) in cases.into_iter().zip(expected) {
+            let chunk = generate_chunk_seeded(pos, seed, season);
+            let actual = fnv1a64_chunk_baseline(&chunk);
+            assert_eq!(
+                actual, expected,
+                "pre-M010 terrain baseline drifted for pos {pos:?}, seed {seed}, {season:?}"
+            );
+        }
+    }
 }

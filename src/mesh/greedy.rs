@@ -690,4 +690,82 @@ mod tests {
         // on the -X side; water is not solid, so all six faces are opaque.
         assert_eq!(mesh.total_quads(), 6);
     }
+
+    /// FNV-1a 64 over the mesh quad stream in a fixed order: bucket count,
+    /// each bucket's length, every opaque quad word (dir 0..6), then the water
+    /// quad count and every water quad word. Local to this test module so T02
+    /// only has to change the block-id encoding inside the generators.
+    fn fnv1a64_mesh_baseline(mesh: &ChunkMesh) -> ([usize; 6], usize, usize, u64) {
+        fn feed(hash: &mut u64, bytes: &[u8]) {
+            for &byte in bytes {
+                *hash ^= byte as u64;
+                *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let bucket_counts = [0, 1, 2, 3, 4, 5].map(|dir| mesh.buckets[dir].len());
+        feed(&mut hash, &(mesh.buckets.len() as u64).to_le_bytes());
+        for count in bucket_counts {
+            feed(&mut hash, &(count as u64).to_le_bytes());
+        }
+
+        let mut opaque_count = 0usize;
+        for bucket in &mesh.buckets {
+            for quad in bucket {
+                feed(&mut hash, &quad.0[0].to_le_bytes());
+                feed(&mut hash, &quad.0[1].to_le_bytes());
+                opaque_count += 1;
+            }
+        }
+
+        let water_count = mesh.water_quads.len();
+        feed(&mut hash, &(water_count as u64).to_le_bytes());
+        for quad in &mesh.water_quads {
+            feed(&mut hash, &quad.0[0].to_le_bytes());
+            feed(&mut hash, &quad.0[1].to_le_bytes());
+        }
+
+        (bucket_counts, opaque_count, water_count, hash)
+    }
+
+    #[test]
+    fn pinned_greedy_mesh_matches_pre_m010_baseline() {
+        use crate::world::chunk::ChunkPos;
+        use crate::world::season::Season;
+        use crate::world::terrain::{generate_chunk_seeded, DEFAULT_WORLD_SEED};
+
+        // Case A: a real generated chunk pushed through the real halo/mesher.
+        let generated =
+            generate_chunk_seeded(ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer);
+        let mesh_a = mesh_chunk(&PaddedChunk::from_center_only(&generated));
+
+        // Case B: a synthetic chunk with one isolated cell per interesting
+        // block family (opaque, log faces, liquid, wheat, brick).
+        let mut synthetic = Chunk::new_uniform(BlockId::Air);
+        synthetic.set(5, 6, 7, BlockId::Stone);
+        synthetic.set(8, 9, 10, BlockId::Grass);
+        synthetic.set(12, 13, 14, BlockId::OakLog);
+        synthetic.set(15, 16, 17, BlockId::Water);
+        synthetic.set(20, 21, 22, BlockId::WheatStage3);
+        synthetic.set(25, 26, 27, BlockId::Brick);
+        let mesh_b = mesh_chunk(&PaddedChunk::from_center_only(&synthetic));
+
+        // Captured from the unmodified pre-M010 mesher. Any greedy-merge,
+        // AO/light, quad packing or water-emission drift fails here.
+        let expected: [([usize; 6], usize, usize, u64); 2] = [
+            (
+                [370, 482, 402, 471, 274, 471],
+                2_470,
+                0,
+                7_499_183_456_375_510_007,
+            ),
+            ([5, 5, 5, 5, 5, 5], 30, 6, 8_967_597_396_962_111_883),
+        ];
+        let actual = [
+            fnv1a64_mesh_baseline(&mesh_a),
+            fnv1a64_mesh_baseline(&mesh_b),
+        ];
+        assert_eq!(actual, expected, "pre-M010 greedy-mesh baseline drifted");
+    }
 }
