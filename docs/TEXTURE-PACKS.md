@@ -102,6 +102,46 @@ Entry rules:
 
 Pack content ids allocate deterministically: blocks take dense ids from 23 in sorted id order after the 23 built-in blocks, items and tools from 0, tiers after the three built-ins, and recipes after the 22 built-ins. Block face layers append from texture-array layer 48 (at most 160 pack layers) and item/tool icons from layer 32 (at most 192 icons), deduplicated per pack folder and authored path. A registry digest (FNV-1a 64) covers pack identities and every definition field so a validation run and a game load agree, but it deliberately excludes image bytes: recolouring an existing PNG does not change content identity.
 
+## Declarative worldgen
+
+`[[worldgen]]` entries in a `format_version = 2` pack turn authored blocks into real terrain in newly generated chunks. The fields are part of the Format v2 schema described above; this section describes what they do to a world.
+
+```toml
+[[worldgen]]
+type = "ore"
+block = "mymod:ruby_ore"
+replace = "stone"
+min_y = 4
+max_y = 40
+vein = 4
+attempts = 8
+
+[[worldgen]]
+type = "patch"
+block = "mymod:ruby_ore"
+replace = "grass"
+biomes = ["plains", "forest"]
+min_y = 40
+max_y = 110
+chance = 0.02
+```
+
+**Applied order.** A chunk is generated in this order, all before it is cached or streamed: built-in terrain, caves and trees; built-in coal and iron; pack ore veins; trees and ruins; pack surface patches. Every rule in the selected stack runs, in pack order, and each rule is independent of the others.
+
+**Ore rules** (`type = "ore"`) replace the `replace` block only where the cell still holds that block, strictly inside the stone band (above bedrock and at least four blocks below that column's surface) and inside `min_y..=max_y`. Each vein starts with up to `vein` cells and grows through in-chunk neighbours; up to `attempts` starts are tried per chunk. An ore rule can never punch through the surface.
+
+**Patch rules** (`type = "patch"`) replace only the column's own surface cell, only in the authored `biomes`, only when the surface height `h` is inside `min_y..=max_y` and the surface still holds `replace`, and then only with probability `chance` per column. Trees, leaves, ruin shells and loot chests sit at or above the surface and are never touched.
+
+**Season and biome coupling.** The surface block depends on the season and terrain: it is `grass` in Spring, Summer and Autumn but `snow` in Winter, and beaches or altitude caps change it too. A patch authored with `replace = "grass"` therefore does not fire in Winter. Ore rules carry no biome field — biomes are a surface-patch concept only.
+
+**Caps.** At most 8 worldgen rules load per stack; a rule beyond the cap reports an error diagnostic and is dropped while its valid siblings load. `vein` is 1 to 8, `attempts` is 1 to 32, and `min_y`/`max_y` must sit inside -64 to 128 with `min_y < max_y`.
+
+**Determinism.** Each rule draws from its own seed-derived stream, so the same seed and stack always produce the same chunks, and adding or removing a rule never moves built-in coal or iron. `air` is a legal authored `block` or `replace`: as a `block` it fills air, and as a `replace` it clears the host block.
+
+**Drift.** Generated content is not saved. Unedited chunks regenerate from the currently selected stack, so removing a pack removes its generated ore and patches, while player edits survive as placeholders. Changing the stack requires a world reload to take effect.
+
+**Observable.** `opencraft --demo-worldgen` prints a deterministic digest of the selected stack (rule counts, authored ore cells and y band, patch cells and biomes, coal/iron stability versus no rules, and empty-rule byte identity), and `scripts/worldgen_smoke.sh` pins that digest plus bounded real-binary launches with the pack present and removed.
+
 ## Block textures
 
 Save each block texture directly inside the pack folder, using these exact file names and in this order (the order is the block layer contract; do not reorder them):
