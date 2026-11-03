@@ -24,6 +24,7 @@ pub mod resample;
 pub mod sound;
 pub mod spec;
 pub mod v2;
+pub mod validate;
 
 /// Load an ordered stack of pack folders under `packs_root`.
 pub use spec::load_stack;

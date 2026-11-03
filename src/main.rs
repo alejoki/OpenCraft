@@ -11767,6 +11767,27 @@ impl ApplicationHandler for GameApp {
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
+    // `--validate-pack` is a headless, pre-startup short-circuit: it prints
+    // stable per-entry lines and exits 0/1 without a session, event loop,
+    // window, GPU, save, settings file or world. The empty-name case (a
+    // `--validate-pack` typo with no value) fails closed here.
+    if let Some(name) = cli.validate_pack.as_deref() {
+        let (lines, ok) = opencraft::pack::validate::validate_pack_lines(
+            std::path::Path::new(pack::PACKS_DIR),
+            name,
+        );
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if cli.demo_ui {
         let (lines, ok) = opencraft::ui::demo::ui_demo_digest_lines();
         use std::io::Write as _;
@@ -12199,6 +12220,56 @@ mod tests {
                 "{flag} + --new keeps intent"
             );
         }
+    }
+
+    #[test]
+    fn validate_pack_is_a_launch_switch_and_never_a_world_intent() {
+        // Validation is a headless one-shot: naming a pack must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let validate = CliConfig::parse_args(["--validate-pack", "mymod-ruby"]);
+        assert!(!cli_has_world_intent(&validate));
+        assert_eq!(cli_has_world_intent(&validate), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the validation switch is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
+        assert!(cli_has_world_intent(&with_new));
+        assert_eq!(with_new.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn main_validate_pack_short_circuit_precedes_world_startup() {
+        // Validation must run before any world/session startup: no save,
+        // settings file, window, or GPU work is allowed on this launch. Pin
+        // the ordering in the real binary source so a later refactor cannot
+        // silently move the seam behind `startup_session`.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let lines_at = body
+            .find("validate_pack_lines")
+            .expect("fn main must call validate_pack_lines");
+        let startup_at = body
+            .find("startup_session(&cli)")
+            .expect("fn main must call startup_session(&cli)");
+        assert!(
+            validate_at < startup_at,
+            "cli.validate_pack must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "validate_pack_lines must precede startup"
+        );
+        assert!(
+            validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
+            "validate-pack must precede the demo-ui branch"
+        );
     }
 
     #[test]

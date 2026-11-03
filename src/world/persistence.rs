@@ -188,6 +188,13 @@ pub struct CliConfig {
     /// before `startup_session`, so it never reaches the event loop, a world,
     /// a save, a settings file, a window, or the GPU.
     pub demo_ui: bool,
+    /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
+    /// `main` consumes it before `startup_session`, so validation never opens
+    /// a window, GPU, world, save or settings file. A switch with no following
+    /// token stores `Some(String::new())` so the typo fails closed instead of
+    /// launching the game. Like `demo_ui` it is a launch switch, never a world
+    /// intent (it never affects `cli_has_world_intent`) and is never persisted.
+    pub validate_pack: Option<String>,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -214,6 +221,7 @@ impl CliConfig {
         let mut demo_content = false;
         let mut demo_combat = false;
         let mut demo_ui = false;
+        let mut validate_pack = None;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -291,6 +299,16 @@ impl CliConfig {
                     // short-circuits on this before any world startup.
                     demo_ui = true;
                 }
+                "--validate-pack" => {
+                    // Value switch: consume the next token. A missing value
+                    // stores an empty name so the request fails closed in
+                    // `main` instead of falling through to a normal launch.
+                    validate_pack = Some(
+                        iter.next()
+                            .map(|val| val.as_ref().to_string())
+                            .unwrap_or_default(),
+                    );
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -315,6 +333,7 @@ impl CliConfig {
             demo_content,
             demo_combat,
             demo_ui,
+            validate_pack,
             mode,
         }
     }
@@ -3988,6 +4007,36 @@ mod tests {
         let stray = CliConfig::parse_args(["--demo-ui", "5"]);
         assert!(stray.demo_ui);
         assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_validate_pack_is_a_value_switch_and_launch_only() {
+        // Absent keeps the seam off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.validate_pack, None);
+
+        // The switch consumes exactly the following token as the pack name.
+        let one = CliConfig::parse_args(["--validate-pack", "mymod-ruby"]);
+        assert_eq!(one.validate_pack.as_deref(), Some("mymod-ruby"));
+        assert!(!one.force_new_world);
+        assert_eq!(one.seed_override, None);
+        assert_eq!(one.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A following flag is not swallowed as a value: the missing name
+        // fails closed instead of becoming a pack called `--seed`.
+        let missing = CliConfig::parse_args(["--validate-pack"]);
+        assert_eq!(missing.validate_pack.as_deref(), Some(""));
+
+        // Other arguments keep parsing independently around it.
+        let with_seed = CliConfig::parse_args(["--validate-pack", "demo", "--seed", "5"]);
+        assert_eq!(with_seed.validate_pack.as_deref(), Some("demo"));
+        assert_eq!(with_seed.seed_override, Some(5));
+
+        // It is a launch switch, never a world intent (which lives in
+        // main.rs), and never persisted: parse result alone carries it.
+        let world_flag = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
+        assert!(world_flag.force_new_world);
+        assert_eq!(world_flag.validate_pack.as_deref(), Some("demo"));
     }
 
     #[test]

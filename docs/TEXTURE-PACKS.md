@@ -272,6 +272,25 @@ sequence to hear the custom sounds; hit a mob and land an arrow to hear the pack
 warning while the built-in click keeps playing. Cycling back to **Default** restores
 the built-in sounds.
 
+## Validating a pack
+
+Check a pack without launching a world, opening a window, or touching `settings.toml`, `saves/`, or any pack file:
+
+```bash
+opencraft --validate-pack my-first-pack
+```
+
+The folder name is the same one used under `packs/`. Each accepted authored entry prints an `ok:` line, a rejected entry prints an `error:` line naming the entry and reason, and non-fatal fallbacks (a corrupt PNG, a v1 pack declaring v2 content arrays) print a `warning:` line:
+
+```text
+ok: block mymod:ruby_ore
+ok: item mymod:ruby
+warning: pack.toml: content arrays require format_version = 2
+validate-pack: my-first-pack: 2 entries, 0 errors, 1 warnings
+```
+
+The exit code is `0` when there are no errors (warnings still pass) and `1` when an entry was rejected or the pack folder is missing. Validation builds the same registry a normal load builds over the built-in content, so references must name a built-in block/item or an entry in the same pack — cross-pack references are not supported.
+
 ## Selecting a pack in game
 
 - Open **Settings** and click the **Texture Pack** row. Each click advances through `Default` and every pack folder found under `packs/`, wrapping back to `Default`.
