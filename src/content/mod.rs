@@ -11,6 +11,7 @@
 //! the GPU or the save layer. It may import *pure* player rules (inventory,
 //! tools) and world enums (block ids, biomes).
 
+pub mod faces;
 pub mod names;
 pub mod registry;
 pub mod spec;

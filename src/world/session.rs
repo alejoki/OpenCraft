@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
+use crate::content::faces::BlockFaces;
 use crate::content::ContentRegistry;
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
@@ -252,6 +253,9 @@ impl WorldSession {
             // the spawn chunks stream in.
             player.arm_spawn_immunity();
         }
+        // Build the face table from the registry *before* the registry moves
+        // into the session, so mesh workers never hold the registry itself.
+        let faces = Arc::new(BlockFaces::from_registry(&registry));
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player,
@@ -278,6 +282,7 @@ impl WorldSession {
             // Death screen can never name a cause the player did not earn.
             last_damage_cause: None,
         };
+        session.world.set_block_faces(faces);
         session.sync_camera();
         session
     }
@@ -328,6 +333,9 @@ impl WorldSession {
         clock: GameClock,
         registry: Arc<ContentRegistry>,
     ) -> WorldSession {
+        // Build the face table from the registry *before* the registry moves
+        // into the session, so mesh workers never hold the registry itself.
+        let faces = Arc::new(BlockFaces::from_registry(&registry));
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(position),
@@ -358,6 +366,7 @@ impl WorldSession {
             world_spawn: Self::spawn_position(seed),
             last_damage_cause: None,
         };
+        session.world.set_block_faces(faces);
         session.sync_camera();
         session
     }
@@ -459,6 +468,10 @@ impl WorldSession {
                 )
             })
             .collect();
+        // S03 appends placeholders while decoding, so the table must be built
+        // from the already-augmented registry (a known pack block still maps
+        // to its authored layer; an unresolved name maps to the checker).
+        let faces = Arc::new(BlockFaces::from_registry(&registry));
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 saved.render_distance as i32,
@@ -502,6 +515,7 @@ impl WorldSession {
             // a loaded dead save starts causeless and renders "Unknown".
             last_damage_cause: None,
         };
+        session.world.set_block_faces(faces);
         session.sync_camera();
         session
     }
@@ -7229,5 +7243,104 @@ mod tests {
             &ContentRegistry::builtin_arc()
         ));
         assert_eq!(plain.registry.digest(), crate::content::EMPTY_DIGEST);
+    }
+
+    /// A pack registry's face table must reach the manager via every
+    /// registry-aware constructor, so mesh jobs resolve authored layers.
+    #[test]
+    fn registry_constructors_install_the_registry_face_table() {
+        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE};
+        use crate::world::block::BUILTIN_BLOCK_COUNT;
+
+        let mut spec = PackContentSpec::default();
+        spec.assets.insert(
+            "ruby.png".to_string(),
+            PackAsset {
+                rgba: vec![0x5A; 1024],
+                source_side: 16,
+            },
+        );
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_block".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.5,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        let registry = Arc::new(registry);
+        let modded = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+
+        let fresh = WorldSession::new_session_with_mode_and_registry(
+            7,
+            PathBuf::from("/tmp/fresh-faces.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        for face in 0u8..6 {
+            assert_eq!(
+                fresh.world.block_faces().layer(modded, face),
+                PACK_LAYER_BASE,
+                "fresh session face {face} must use the pack layer"
+            );
+        }
+
+        let at = WorldSession::new_at_with_registry(
+            7,
+            PathBuf::from("/tmp/at-faces.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.0, 20.0, 2.0),
+            GameClock::new(),
+            registry,
+        );
+        for face in 0u8..6 {
+            assert_eq!(at.world.block_faces().layer(modded, face), PACK_LAYER_BASE);
+        }
+    }
+
+    /// The save-load constructor builds its table from the placeholder-
+    /// augmented registry S03 produces, so an unresolved name renders as the
+    /// reserved checker and a known pack block keeps its authored layer.
+    #[test]
+    fn save_load_install_a_placeholder_augmented_face_table() {
+        use crate::world::persistence::LoadedWorld;
+
+        let mut registry = ContentRegistry::builtin().clone();
+        let placeholder = registry.append_placeholder_block("mymod:missing");
+        let raw = u16::try_from(registry.blocks().len()).expect("test table fits u16");
+        let loaded = LoadedWorld {
+            data: make_save(7),
+            registry,
+            saved_content: None,
+            unresolved: 0,
+        };
+        let session =
+            WorldSession::from_loaded_world(loaded, PathBuf::from("/tmp/faces-load.mcvx"));
+        assert_eq!(
+            session.world.block_faces().layer(placeholder, 0),
+            crate::content::PLACEHOLDER_BLOCK_LAYER
+        );
+        // The next free raw id was never appended, so it stays unknown.
+        assert_eq!(
+            session.world.block_faces().layer(BlockId::Modded(raw), 0),
+            crate::content::PLACEHOLDER_BLOCK_LAYER
+        );
     }
 }

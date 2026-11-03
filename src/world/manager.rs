@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::mesh::greedy::{mesh_chunk, PaddedChunk};
+use crate::content::faces::BlockFaces;
+use crate::mesh::greedy::{mesh_chunk_with, PaddedChunk};
 use crate::mesh::quad::ChunkMesh;
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE};
@@ -68,6 +70,11 @@ pub struct WorldManager {
     /// rather than a first load. Exactly the rollover dispatches, so a result
     /// is only ever swapped in place when the wave produced it.
     season_rollover_inflight: FxHashSet<ChunkPos>,
+    /// Flat face-layer table every mesh job resolves against. Shared behind
+    /// `Arc` so a rayon job clones a pointer, never the table or the content
+    /// registry. The built-in table is the default; a session with a pack
+    /// stack installs the registry-derived table through `set_block_faces`.
+    block_faces: Arc<BlockFaces>,
 }
 
 /// Result of one rayon sky-light job. Produced entirely off the frame thread;
@@ -201,7 +208,24 @@ impl WorldManager {
             season_rollover_target: None,
             season_rollover: VecDeque::new(),
             season_rollover_inflight: FxHashSet::default(),
+            block_faces: BlockFaces::builtin(),
         }
+    }
+
+    /// Replaces the face-layer table used by every subsequent mesh job.
+    ///
+    /// Callers install it once at session construction, before any chunk is
+    /// meshed, so a resident chunk is never meshed half through one table and
+    /// half through another. Already-meshed chunks keep their old quads until
+    /// the next remesh; the session boundary is the only supported swap.
+    pub fn set_block_faces(&mut self, faces: Arc<BlockFaces>) {
+        self.block_faces = faces;
+    }
+
+    /// The face-layer table this manager meshes against.
+    #[inline]
+    pub fn block_faces(&self) -> &Arc<BlockFaces> {
+        &self.block_faces
     }
 
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
@@ -962,7 +986,7 @@ impl WorldManager {
         for dpos in dirty {
             self.pending_mesh.remove(&dpos);
             if let Some(padded) = self.build_padded_chunk(dpos) {
-                let mesh = mesh_chunk(&padded);
+                let mesh = mesh_chunk_with(&padded, &self.block_faces);
                 self.meshed_chunks.insert(dpos);
                 self.dirty_mesh_queue.remove(&dpos);
                 out.push((dpos, mesh));
@@ -1326,8 +1350,11 @@ impl WorldManager {
             }
             self.pending_mesh.insert(pos);
             let tx = self.mesh_tx.clone();
+            // Clone the shared table before the `move` closure: the worker
+            // owns a pointer, not a borrow of the manager.
+            let faces = Arc::clone(&self.block_faces);
             rayon::spawn(move || {
-                let mesh = mesh_chunk(&padded);
+                let mesh = mesh_chunk_with(&padded, &faces);
                 let _ = tx.send((pos, mesh));
             });
         }
@@ -2617,7 +2644,7 @@ mod tests {
                     let padded = mgr
                         .build_padded_chunk(pos)
                         .expect("measured chunks keep their face-neighbour ring resident");
-                    mesh_chunk(&padded).total_quads()
+                    mesh_chunk_with(&padded, mgr.block_faces()).total_quads()
                 })
                 .sum()
         };
@@ -2658,6 +2685,96 @@ mod tests {
         );
     }
 
+    /// A face table built from a one-block pack stack: `mymod:ruby_block`
+    /// occupies the first modded raw id and every face is layer 48.
+    fn pack_faces() -> Arc<crate::content::faces::BlockFaces> {
+        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::{build_registry, ContentRegistry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec::default();
+        spec.assets.insert(
+            "ruby.png".to_string(),
+            PackAsset {
+                rgba: vec![0x5A; 1024],
+                source_side: 16,
+            },
+        );
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_block".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.5,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        Arc::new(crate::content::faces::BlockFaces::from_registry(&registry))
+    }
+
+    /// The session installs the pack-derived table on the manager; the edit
+    /// path then meshes the modded cell at its authored layer instead of the
+    /// built-in placeholder.
+    #[test]
+    fn test_set_block_immediate_uses_the_installed_face_table() {
+        use crate::content::PACK_LAYER_BASE;
+        use crate::world::block::BUILTIN_BLOCK_COUNT;
+
+        let center = ChunkPos::new(0, 0, 0);
+        let mut mgr = WorldManager::new(4);
+        mgr.insert_chunk_for_test(center, Chunk::new_uniform(BlockId::Air));
+        for dir in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            mgr.insert_chunk_for_test(dir, Chunk::new_uniform(BlockId::Air));
+        }
+
+        // Before installation the built-in table applies: the modded id has no
+        // entry there, so its faces use the reserved checker layer.
+        assert_eq!(
+            mgr.block_faces()
+                .layer(BlockId::Modded(BUILTIN_BLOCK_COUNT), 0),
+            25
+        );
+
+        let faces = pack_faces();
+        mgr.set_block_faces(Arc::clone(&faces));
+        assert!(Arc::ptr_eq(mgr.block_faces(), &faces));
+
+        let modded = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let remeshed = mgr.set_block_immediate(5, 5, 5, modded);
+        assert_eq!(remeshed.len(), 1, "the edited chunk is remeshed");
+        let (pos, mesh) = &remeshed[0];
+        assert_eq!(*pos, center);
+        assert_eq!(mesh.total_quads(), 6, "one isolated cell emits six faces");
+        for (dir, bucket) in mesh.buckets.iter().enumerate() {
+            assert_eq!(bucket.len(), 1, "bucket {dir} must hold one quad");
+            assert_eq!(
+                bucket[0].unpack().6,
+                PACK_LAYER_BASE,
+                "bucket {dir} must sample the authored pack layer"
+            );
+        }
+    }
+
     /// A chunk whose only content is water must still be dispatched through
     /// the mesher: the `!has_any_solid` fast skip used to drop it silently.
     #[test]
@@ -2685,7 +2802,7 @@ mod tests {
             .expect("the center keeps its full face-neighbour ring");
         assert!(padded.has_any_liquid, "water reaches the padded snapshot");
         assert!(!padded.has_any_solid, "water is not solid");
-        let direct = mesh_chunk(&padded);
+        let direct = mesh_chunk_with(&padded, mgr.block_faces());
         assert!(!direct.is_empty(), "a water-only mesh is not empty");
         assert_eq!(
             direct.total_quads(),

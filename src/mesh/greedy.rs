@@ -1,3 +1,4 @@
+use crate::content::faces::BlockFaces;
 use crate::mesh::quad::{ChunkMesh, PackedQuad};
 use crate::world::block::BlockId;
 use crate::world::chunk::{Chunk, CHUNK_SIZE};
@@ -152,7 +153,21 @@ fn get_axis_coord(axis: usize, d: usize, u: usize, v: usize) -> (usize, usize, u
     }
 }
 
+/// Meshes `padded` against the built-in face-layer table.
+///
+/// Every pre-M010 caller keeps this signature and therefore its exact output:
+/// [`BlockFaces::builtin`] is derived from [`BlockId::face_tex_layer`].
 pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
+    mesh_chunk_with(padded, &BlockFaces::builtin())
+}
+
+/// Meshes `padded` resolving each visible face through `faces`.
+///
+/// The session-owned table is built from the frozen [`crate::content::ContentRegistry`]
+/// so pack-authored blocks reach the world without threading the registry
+/// into rayon workers. The job shape and per-face cost stay unchanged: the
+/// inner loop performs one slice lookup.
+pub fn mesh_chunk_with(padded: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
     let mut mesh = ChunkMesh::new();
     // Water-only chunks must still be meshed (open ocean surface); only a
     // chunk with neither solid nor liquid geometry can produce no faces.
@@ -210,7 +225,7 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                         let pd = d + 1;
                         let (px, py, pz) = get_axis_coord(axis, pd, pu, pv);
                         let block = padded.get(px, py, pz);
-                        let tex_layer = block.face_tex_layer(face_dir);
+                        let tex_layer = faces.layer(block, face_dir);
 
                         let air_d = if is_pos { pd + 1 } else { pd - 1 };
                         let air_bit = 1u64 << air_d;
@@ -711,6 +726,90 @@ mod tests {
         let copied = PaddedChunk::from_center_only(&chunk);
         assert_eq!(copied.get(4, 5, 6), BlockId::Modded(23));
         assert!(copied.has_any_solid);
+    }
+
+    /// A face table built from a one-block pack stack: `mymod:ruby_block`
+    /// occupies raw id [`BUILTIN_BLOCK_COUNT`] and every face is layer 48.
+    fn pack_faces() -> crate::content::faces::BlockFaces {
+        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::{build_registry, ContentRegistry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec::default();
+        spec.assets.insert(
+            "ruby.png".to_string(),
+            PackAsset {
+                rgba: vec![0x5A; 1024],
+                source_side: 16,
+            },
+        );
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_block".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.5,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        crate::content::faces::BlockFaces::from_registry(&registry)
+    }
+
+    #[test]
+    fn modded_block_meshes_at_its_authored_pack_layer() {
+        use crate::content::PACK_LAYER_BASE;
+        use crate::world::block::BUILTIN_BLOCK_COUNT;
+
+        let faces = pack_faces();
+        let modded = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, modded);
+        let padded = PaddedChunk::from_center_only(&chunk);
+
+        let mesh = mesh_chunk_with(&padded, &faces);
+        assert_eq!(mesh.total_quads(), 6, "one isolated cell emits six faces");
+        for (dir, bucket) in mesh.buckets.iter().enumerate() {
+            assert_eq!(bucket.len(), 1, "bucket {dir} must hold one quad");
+            assert_eq!(
+                bucket[0].unpack().6,
+                PACK_LAYER_BASE,
+                "bucket {dir} must sample the authored pack layer"
+            );
+        }
+        assert_eq!(mesh.water_quad_count(), 0);
+
+        // The built-in wrapper keeps the pre-M010 placeholder policy: a modded
+        // id has no built-in table entry and falls back to the checker layer.
+        let builtin_mesh = mesh_chunk(&padded);
+        assert_eq!(builtin_mesh.total_quads(), 6);
+        for bucket in &builtin_mesh.buckets {
+            assert_eq!(bucket[0].unpack().6, 25);
+        }
+    }
+
+    #[test]
+    fn builtin_wrapper_matches_mesh_chunk_with_builtin_faces() {
+        let chunk = Chunk::new_uniform(BlockId::OakLog);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        let wrapper = mesh_chunk(&padded);
+        let explicit = mesh_chunk_with(&padded, &BlockFaces::builtin());
+        for dir in 0..6 {
+            assert_eq!(wrapper.buckets[dir], explicit.buckets[dir], "dir {dir}");
+        }
+        assert_eq!(wrapper.water_quads, explicit.water_quads);
     }
 
     /// FNV-1a 64 over the mesh quad stream in a fixed order: bucket count,
