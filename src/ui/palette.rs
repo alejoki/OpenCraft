@@ -618,7 +618,7 @@ mod tests {
     }
 
     /// A synthetic screen with `count` distinct entries, all filtered in, for
-    /// scroll/clamp tests that need more than the 46-entry reference stock.
+    /// scroll/clamp tests that need more than the 47-entry reference stock.
     fn synthetic_screen(count: usize) -> PaletteScreen {
         let mut screen = PaletteScreen::new();
         screen.open = true;
@@ -635,10 +635,10 @@ mod tests {
     }
 
     #[test]
-    fn reference_registry_lists_46_entries_sorted_by_display_then_id() {
+    fn reference_registry_lists_47_entries_sorted_by_display_then_id() {
         let registry = reference_registry();
         let entries = entries(&registry);
-        assert_eq!(entries.len(), 46);
+        assert_eq!(entries.len(), 47);
 
         let mut builtin_blocks = 0;
         let mut pack_blocks = 0;
@@ -657,7 +657,7 @@ mod tests {
             }
         }
         assert_eq!(builtin_blocks, 14);
-        assert_eq!(pack_blocks, 1);
+        assert_eq!(pack_blocks, 2);
         assert_eq!(materials, 11);
         assert_eq!(builtin_tools, 16);
         assert_eq!(pack_items, 2);
@@ -692,22 +692,23 @@ mod tests {
             filtered_names(&entries, "rub"),
             vec![
                 "mymod:ruby".to_string(),
+                "mymod:ruby_block".to_string(),
                 "mymod:ruby_ore".to_string(),
                 "mymod:ruby_pickaxe".to_string(),
                 "mymod:ruby_stew".to_string(),
                 "mymod:ruby_sword".to_string(),
             ]
         );
-        assert_eq!(filtered_names(&entries, " RUB ").len(), 5);
-        assert_eq!(filtered_names(&entries, "mymod").len(), 5);
+        assert_eq!(filtered_names(&entries, " RUB ").len(), 6);
+        assert_eq!(filtered_names(&entries, "mymod").len(), 6);
         assert_eq!(filtered_names(&entries, "builtin").len(), 41);
         assert_eq!(filtered_names(&entries, "Ruby Ore"), vec!["mymod:ruby_ore"]);
         assert_eq!(
             filtered_names(&entries, "wood_pickaxe"),
             vec!["wood_pickaxe"]
         );
-        assert_eq!(filtered_names(&entries, "").len(), 46);
-        assert_eq!(filtered_names(&entries, "   ").len(), 46);
+        assert_eq!(filtered_names(&entries, "").len(), 47);
+        assert_eq!(filtered_names(&entries, "   ").len(), 47);
         assert!(filtered_names(&entries, "no-such-content").is_empty());
     }
 
@@ -735,7 +736,7 @@ mod tests {
         );
 
         let entries = entries(&with_placeholders);
-        assert_eq!(entries.len(), 46);
+        assert_eq!(entries.len(), 47);
         assert!(entries.iter().all(|entry| entry.name != "ghost_ore"));
         assert!(entries
             .iter()
@@ -753,7 +754,7 @@ mod tests {
         screen.move_selection(-100);
         assert_eq!(screen.selected, 0);
         screen.move_selection(10_000);
-        assert_eq!(screen.selected, 45);
+        assert_eq!(screen.selected, 46);
         assert_eq!(screen.scroll(), 0);
         screen.scroll_by(-10);
         assert_eq!(screen.scroll(), 0);
@@ -781,7 +782,7 @@ mod tests {
         let registry = reference_registry();
         let mut screen = PaletteScreen::new();
         screen.open(&registry);
-        assert_eq!(screen.filtered().len(), 46);
+        assert_eq!(screen.filtered().len(), 47);
         assert_eq!(
             screen.selected_entry().map(|entry| entry.name.as_str()),
             Some("apple")
@@ -789,7 +790,7 @@ mod tests {
 
         assert!(screen.apply(TextInputAction::InsertText("rub".to_string())));
         assert_eq!(screen.query().value(), "rub");
-        assert_eq!(screen.filtered().len(), 5);
+        assert_eq!(screen.filtered().len(), 6);
         assert_eq!(
             screen.selected_entry().map(|entry| entry.name.as_str()),
             Some("mymod:ruby")
@@ -799,17 +800,17 @@ mod tests {
         screen.move_selection(2);
         assert_eq!(
             screen.selected_entry().map(|entry| entry.name.as_str()),
-            Some("mymod:ruby_pickaxe")
+            Some("mymod:ruby_ore")
         );
         assert!(!screen.apply(TextInputAction::Submit));
-        assert_eq!(screen.filtered().len(), 5);
+        assert_eq!(screen.filtered().len(), 6);
         assert_eq!(
             screen.selected_entry().map(|entry| entry.name.as_str()),
-            Some("mymod:ruby_pickaxe")
+            Some("mymod:ruby_ore")
         );
 
         assert!(screen.apply(TextInputAction::Clear));
-        assert_eq!(screen.filtered().len(), 46);
+        assert_eq!(screen.filtered().len(), 47);
         assert_eq!(screen.selected, 0);
         assert_eq!(screen.scroll(), 0);
         // Cursor movement reports `Changed`, so it also resets selection; a
@@ -911,7 +912,7 @@ mod tests {
         assert_eq!(labels[0].text, "Creative Palette");
         assert_eq!(labels[1].text, "Search...");
         assert_eq!(labels[2].text, "Apple (apple)");
-        assert!(labels[3].text.contains("46/46 items"));
+        assert!(labels[3].text.contains("47/47 items"));
     }
 
     #[test]
@@ -935,7 +936,7 @@ mod tests {
         let labels = screen_labels(&screen, &layout);
         assert_eq!(labels.len(), 4);
         assert_eq!(labels[2].text, "no matches");
-        assert!(labels[3].text.contains("0/46 items"));
+        assert!(labels[3].text.contains("0/47 items"));
     }
 
     #[test]

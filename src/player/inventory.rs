@@ -5274,7 +5274,10 @@ mod tests {
         let mut inventory = Inventory::empty();
 
         assert_eq!(inventory.grant_hotbar(stick(7), 4), 0);
-        assert_eq!(inventory.slot(0).map(|item| (item.id(), item.count())), Some((ItemId::Material(Material::Stick), 7)));
+        assert_eq!(
+            inventory.slot(0).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Stick), 7))
+        );
 
         assert_eq!(inventory.grant_hotbar(wheat(3), 4), 1);
         assert_eq!(
@@ -5333,9 +5336,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert_eq!(inventory.grant_hotbar(item(ItemId::Material(material), 1), 0), slot);
+            assert_eq!(
+                inventory.grant_hotbar(item(ItemId::Material(material), 1), 0),
+                slot
+            );
         }
-        assert!(inventory.slots()[..HOTBAR_SLOTS].iter().all(Option::is_some));
+        assert!(inventory.slots()[..HOTBAR_SLOTS]
+            .iter()
+            .all(Option::is_some));
 
         assert_eq!(inventory.grant_hotbar(block(BlockId::Stone, 999), 6), 6);
         assert_eq!(
@@ -5345,7 +5353,10 @@ mod tests {
 
         // Out-of-range preferred values clamp to the last hotbar slot.
         assert_eq!(inventory.grant_hotbar(block(BlockId::Dirt, 999), 99), 8);
-        assert_eq!(inventory.slot(8).map(|item| item.id()), Some(ItemId::Block(BlockId::Dirt)));
+        assert_eq!(
+            inventory.slot(8).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Dirt))
+        );
     }
 
     #[test]

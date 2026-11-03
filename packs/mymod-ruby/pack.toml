@@ -1,6 +1,6 @@
 format_version = 2
 name = "Ruby Mod"
-description = "M010 reference pack: ruby ore, ruby tools, ruby stew and a disabled shortbow recipe"
+description = "M010 reference pack: ruby ore, ruby block, ruby tools, ruby stew and a disabled shortbow recipe"
 version = "1.0.0"
 
 [[blocks]]
@@ -9,6 +9,14 @@ name = "Ruby Ore"
 textures = { all = "textures/ruby_ore.png" }
 hardness = 3.0
 drop = "mymod:ruby"
+tool = "pickaxe"
+stack = 64
+
+[[blocks]]
+id = "mymod:ruby_block"
+name = "Ruby Block"
+textures = { all = "textures/ruby_block.png" }
+hardness = 4.0
 tool = "pickaxe"
 stack = 64
 

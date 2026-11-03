@@ -3246,7 +3246,8 @@ mod tests {
             },
             spec.content.clone(),
         );
-        let (registry, report) = crate::content::build_registry(ContentRegistry::builtin(), &[pack]);
+        let (registry, report) =
+            crate::content::build_registry(ContentRegistry::builtin(), &[pack]);
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
         registry
     }
@@ -3280,7 +3281,11 @@ mod tests {
             .grant_palette_item_with(&registry, ItemId::Item(stew))
             .expect("pack stew is grantable");
         assert_eq!(slot, 1);
-        assert_eq!(item.count(), 16, "16 is the authored stew limit, not 64 or 999");
+        assert_eq!(
+            item.count(),
+            16,
+            "16 is the authored stew limit, not 64 or 999"
+        );
         assert_eq!(player.selected_slot(), 1);
 
         let pickaxe = registry

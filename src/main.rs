@@ -13957,10 +13957,10 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         builtin_blocks != 14
             || builtin_items != 11
             || builtin_tools != 16
-            || pack_blocks != 1
+            || pack_blocks != 2
             || pack_items != 2
             || pack_tools != 2
-            || total != 46,
+            || total != 47,
         "entries"
     );
 
@@ -13999,9 +13999,9 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         rub.len()
     ));
     fail_if!(
-        rub.len() != 5
+        rub.len() != 6
             || rub_names
-                != "mymod:ruby,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword",
+                != "mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword",
         "filter"
     );
 
@@ -14010,7 +14010,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         "palette: leg=filter query=mymod matched={}",
         namespaced.len()
     ));
-    fail_if!(namespaced.len() != 5, "filter");
+    fail_if!(namespaced.len() != 6, "filter");
 
     let builtin_matches = palette::filter_entries(&entries, "builtin");
     lines.push(format!(
@@ -14038,7 +14038,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     }
     let grant_specs = [
         GrantSpec {
-            name: "mymod:ruby_ore",
+            name: "mymod:ruby_block",
             slot: 0,
             count: 64,
             tool: false,
@@ -14046,8 +14046,16 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
             placeable: true,
         },
         GrantSpec {
-            name: "mymod:ruby",
+            name: "mymod:ruby_ore",
             slot: 1,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: true,
+        },
+        GrantSpec {
+            name: "mymod:ruby",
+            slot: 2,
             count: 64,
             tool: false,
             durability: None,
@@ -14055,7 +14063,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         },
         GrantSpec {
             name: "mymod:ruby_stew",
-            slot: 2,
+            slot: 3,
             count: 16,
             tool: false,
             durability: None,
@@ -14063,7 +14071,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         },
         GrantSpec {
             name: "mymod:ruby_pickaxe",
-            slot: 3,
+            slot: 4,
             count: 1,
             tool: true,
             durability: Some(900),
@@ -14071,7 +14079,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         },
         GrantSpec {
             name: "mymod:ruby_sword",
-            slot: 4,
+            slot: 5,
             count: 1,
             tool: true,
             durability: Some(900),
@@ -14125,8 +14133,8 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         return (lines, false);
     };
     player.survival = SurvivalState::new(20, 12, FULL_AIR).expect("valid vitals");
-    player.select_slot(2);
-    let restored = player.eat_selected_with(registry, 2, stew_id);
+    player.select_slot(3);
+    let restored = player.eat_selected_with(registry, 3, stew_id);
     let hunger = player.survival.hunger();
     lines.push(format!(
         "palette: leg=use item=mymod:ruby_stew restored={} hunger={hunger}",
@@ -14148,7 +14156,7 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
         placeholder_entries.len()
     ));
     fail_if!(
-        placeholder_entries.len() != 46 || ghosts_listed,
+        placeholder_entries.len() != 47 || ghosts_listed,
         "placeholder"
     );
 
@@ -15157,9 +15165,9 @@ stack = 64
         let expected = vec![
             "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
             "worldgen_demo: leg=session rules=2 matches=true".to_string(),
-            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2460 min_y=4 max_y=40 in_band=true"
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2476 min_y=4 max_y=40 in_band=true"
                 .to_string(),
-            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=347 biomes=plains,forest biomes_ok=true"
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=334 biomes=plains,forest biomes_ok=true"
                 .to_string(),
             "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
             "worldgen_demo: leg=empty_rules identical=true".to_string(),
@@ -15215,18 +15223,19 @@ stack = 64
         // Literals measured from a real run of the checked-in pack, never
         // derived from the registry under test (D143/MEM368).
         let expected = vec![
-            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=1 pack_items=2 pack_tools=2 total=46".to_string(),
+            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=47".to_string(),
             "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4".to_string(),
-            "palette: leg=filter query=rub matched=5 names=mymod:ruby,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
-            "palette: leg=filter query=mymod matched=5".to_string(),
+            "palette: leg=filter query=rub matched=6 names=mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
+            "palette: leg=filter query=mymod matched=6".to_string(),
             "palette: leg=filter query=builtin matched=41".to_string(),
-            "palette: leg=grant slot=0 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
-            "palette: leg=grant slot=1 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
-            "palette: leg=grant slot=2 item=mymod:ruby_stew count=16 tool=false placeable=false".to_string(),
-            "palette: leg=grant slot=3 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
-            "palette: leg=grant slot=4 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
+            "palette: leg=grant slot=0 item=mymod:ruby_block count=64 tool=false placeable=true".to_string(),
+            "palette: leg=grant slot=1 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
+            "palette: leg=grant slot=2 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=3 item=mymod:ruby_stew count=16 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=4 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
+            "palette: leg=grant slot=5 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
             "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19".to_string(),
-            "palette: leg=placeholder excluded=2 total=46".to_string(),
+            "palette: leg=placeholder excluded=2 total=47".to_string(),
             "palette: leg=key key=C creative=true survival=false".to_string(),
             "palette: ok".to_string(),
         ];
