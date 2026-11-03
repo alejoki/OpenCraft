@@ -10,7 +10,7 @@ use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::mob::{create_mob_pipeline, MobVertex};
 use crate::render::sky;
 use crate::render::texture::{
-    block_layers_match_shape, create_block_texture_array, upload_block_layers,
+    block_array_layers_match_shape, create_block_texture_array, upload_block_layers,
 };
 use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
@@ -691,9 +691,11 @@ pub trait UiPass {
 }
 
 pub struct VoxelRenderer {
-    /// The 48-layer block texture array retained so live pack changes can
-    /// re-upload layer data into the existing texture (MEM111). The view and
-    /// bind group above stay valid because only the contents change.
+    /// The 256-layer block texture array retained so live pack changes can
+    /// re-upload layer data into the existing texture (MEM111). Layers 0..=47
+    /// are the authored/procedural base, 48..=207 are pack-authored faces and
+    /// 208..=255 are reserved checker placeholders. The view and bind group
+    /// above stay valid because only the contents change.
     pub block_texture: wgpu::Texture,
     /// D2Array view over [`Self::block_texture`], exposed so the UI icon
     /// pipeline can sample the same pack layers the world uses. The view
@@ -1045,8 +1047,8 @@ impl VoxelRenderer {
     /// the camera bind group (MEM111).
     pub fn write_block_layers(&self, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
         debug_assert!(
-            block_layers_match_shape(layers),
-            "texture array must match NUM_TEX_LAYERS of 16x16 RGBA bytes"
+            block_array_layers_match_shape(layers),
+            "texture array must match BLOCK_ARRAY_LAYERS of 16x16 RGBA bytes"
         );
         upload_block_layers(&self.block_texture, queue, layers);
     }

@@ -13,46 +13,35 @@
 #         starvation death, respawn with inventory kept, Survival mode, and
 #         the loaded v6 vitals at 20/20/300.
 #     (d) the save exists, starts with the `MCVX` magic, its version word is
-#         7, and its exact length is 159 bytes (an edit-free v7 save with
-#         zero chests, exactly two occupied inventory slots, and a zero mob
-#         count).
+#         8, and its exact length is 191 bytes (an edit-free v8 save with
+#         zero chests, exactly two occupied inventory slots, a two-name
+#         content table, and a zero mob count).
 #     (e) the save's chunk count is 0, proving the demo performed no chunk
 #         edits.
 #     (f) the v6 survival header at the pinned offsets decodes to mode 0
 #         (Survival), health 20, hunger 20, air 300, chest count 0, and the
-#         v7 mob count at offset 155 is 0.
+#         v7 mob count at offset 175 is 0; the v8 pack count at 179 is 0 and
+#         the 12-byte digest tail ends at EOF.
 #
 # Why the offsets are fixed here: the survival demo is edit-free by
 # construction (it never mines, places, or edits a chunk), so the
 # variable-length chunk section writes a zero chunk count. With an EMPTY
-# inventory the layout would be the header (36 + 27) + time_of_day (4) +
-# chunk count (4) + v4 inventory extension (59) = 130 bytes before the v5
-# calendar tail (8 bytes), then the v6 survival header (mode u8 + health u16 +
-# hunger u16 + air u16 + chest count u32 = 11 bytes), then the v7 mob count
-# (u32 = 4 bytes), i.e. exactly 153 bytes. Those empty-inventory offsets are
-# pinned by the persistence.rs test
-# constants (V5_SEASON_OFFSET/V5_SEASON_LEN/V6_*), and the script copies them:
-#   V5_SEASON_OFFSET      = 130
-#   V5_SEASON_LEN         = 8
-#   V6_MODE_OFFSET        = 138
-#   V6_HEALTH_OFFSET      = 139
-#   V6_HUNGER_OFFSET      = 141
-#   V6_AIR_OFFSET         = 143
-#   V6_CHEST_COUNT_OFFSET = 145
-#   V6_FIRST_CHEST_OFFSET = 149
-#   V7_MOB_COUNT_OFFSET   = 149 (V6_FIRST_CHEST_OFFSET)
-#   V7_MOB_COUNT_LEN      = 4
+# inventory the v8 layout would be the header (36) + content table (4) +
+# hotbar (27) + time_of_day (4) + chunk count (4) + v4 inventory extension
+# (59) = 134 bytes before the v5 calendar tail (8 bytes), then the v6
+# survival header (11 bytes), the v7 mob count (4 bytes), and the v8 tail
+# (u32 pack count + u64 digest = 12 bytes), i.e. exactly 169 bytes.
 # The survival demo, however, must prove `inventory_kept=true`: it eats one
 # of two Apples and keeps the Stick marker, so at save time it holds exactly
-# two stacks (Apple x1 and Stick x1). Each occupied 4-byte item record
-# replaces a 1-byte empty record, so the v4 extension grows by 3 + 3 = 6
-# bytes, the v5 calendar tail moves to 136, the v6 header to 144, the v7 mob
-# count to 155, and the edit-free save is exactly 159 bytes. This script
-# asserts that shifted layout
-# (base constants + SURVIVAL_INVENTORY_EXPANSION) together with the exact
-# size, so a header move or an inventory change fails loudly. A future header
-# move must update the persistence.rs test constants first, then this script,
-# then the expansion shift here.
+# two stacks (Apple x1 and Stick x1). The save-local content table then holds
+# two names (`apple` and `stick`): 4-byte count plus (2 + 5) + (2 + 5) = 18
+# bytes. Each occupied v8 item record is 5 bytes (tag + u16 name index + u16
+# payload) instead of the legacy 4, so the v4 extension grows by 2. The v5
+# calendar tail therefore moves to 130 + 18 + 8 = 156, the v6 header to 164,
+# the v7 mob count to 175, and the v8 tail ends at 191.
+# This script asserts that shifted layout together with the exact size, so a
+# header move or an inventory change fails loudly. A future header move must
+# update the persistence.rs test constants first, then this script.
 #
 # The content smoke deliberately does not use fixed offsets: its chunk edits
 # shift the variable-length chunk section (see scripts/content_smoke.sh).
@@ -135,35 +124,43 @@ cleanup() {
 trap cleanup EXIT
 
 # Survival wire layout (see the header comment and persistence.rs). The
-# V6_* constants below are the empty-inventory offsets pinned by the
-# persistence.rs unit tests; the survival demo keeps two marker stacks, so
-# every later offset shifts by the 6-byte inventory expansion.
-V5_SEASON_OFFSET=130
+# LEGACY_V5_SEASON_OFFSET is the empty-inventory offset pinned by the
+# persistence.rs unit tests. v8 inserts an 18-byte content table (`apple` and
+# `stick`) after render_distance, and the two occupied items each grow by one
+# byte over the legacy record, so every later offset shifts by 26.
+LEGACY_V5_SEASON_OFFSET=130
 V5_SEASON_LEN=8
-V6_MODE_OFFSET=138
-V6_HEALTH_OFFSET=139
-V6_HUNGER_OFFSET=141
-V6_AIR_OFFSET=143
-V6_CHEST_COUNT_OFFSET=145
-V6_FIRST_CHEST_OFFSET=149
+V8_CONTENT_TABLE_OFFSET=36
+# Measured: count u32 + "apple" (2+5) + "stick" (2+5).
+V8_CONTENT_TABLE_LEN=18
+# Two occupied v8 item records at 5 bytes each instead of the legacy 4.
+SURVIVAL_INVENTORY_EXPANSION=8
+V5_SEASON_OFFSET=$((LEGACY_V5_SEASON_OFFSET + V8_CONTENT_TABLE_LEN + SURVIVAL_INVENTORY_EXPANSION))
+V6_MODE_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN))
+V6_HEALTH_OFFSET=$((V6_MODE_OFFSET + 1))
+V6_HUNGER_OFFSET=$((V6_HEALTH_OFFSET + 2))
+V6_AIR_OFFSET=$((V6_HUNGER_OFFSET + 2))
+V6_CHEST_COUNT_OFFSET=$((V6_AIR_OFFSET + 2))
+V6_FIRST_CHEST_OFFSET=$((V6_CHEST_COUNT_OFFSET + 4))
 
 # The v7 mob tail appends a u32 count after the last chest record. The
-# survival demo never spawns a mob, so the count is 0 and nothing follows it.
+# survival demo never spawns a mob, so the count is 0.
 V7_MOB_COUNT_LEN=4
+# v8 tail: a u32 pack count (zero for a built-in-only stack) plus the u64
+# FNV-1a digest.
+V8_TAIL_LEN=12
+# The content table precedes the hotbar, so it shifts the chunk count too.
+CHUNK_COUNT_OFFSET=$((67 + V8_CONTENT_TABLE_LEN))
 
-# Two occupied inventory slots (Apple x1 + Stick x1) each add 3 bytes over the
-# empty record: 4-byte item record vs the 1-byte empty tag.
-SURVIVAL_INVENTORY_EXPANSION=6
-CHUNK_COUNT_OFFSET=67
-
-SAVE_MODE_OFFSET=$((V6_MODE_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
-SAVE_HEALTH_OFFSET=$((V6_HEALTH_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
-SAVE_HUNGER_OFFSET=$((V6_HUNGER_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
-SAVE_AIR_OFFSET=$((V6_AIR_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
-SAVE_CHEST_COUNT_OFFSET=$((V6_CHEST_COUNT_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
-SAVE_FIRST_CHEST_OFFSET=$((V6_FIRST_CHEST_OFFSET + SURVIVAL_INVENTORY_EXPANSION))
+SAVE_MODE_OFFSET=$V6_MODE_OFFSET
+SAVE_HEALTH_OFFSET=$V6_HEALTH_OFFSET
+SAVE_HUNGER_OFFSET=$V6_HUNGER_OFFSET
+SAVE_AIR_OFFSET=$V6_AIR_OFFSET
+SAVE_CHEST_COUNT_OFFSET=$V6_CHEST_COUNT_OFFSET
+SAVE_FIRST_CHEST_OFFSET=$V6_FIRST_CHEST_OFFSET
 SAVE_MOB_COUNT_OFFSET=$SAVE_FIRST_CHEST_OFFSET
-SURVIVAL_SAVE_LEN=$((SAVE_FIRST_CHEST_OFFSET + V7_MOB_COUNT_LEN))
+SAVE_PACK_COUNT_OFFSET=$((SAVE_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN))
+SURVIVAL_SAVE_LEN=$((SAVE_PACK_COUNT_OFFSET + V8_TAIL_LEN))
 
 # The demo's own wall-clock deadline is 120 s; the outer timeout is only a
 # backstop for a hang, and a kill here is an explicit failure.
@@ -249,7 +246,7 @@ done
 
 SAVE_SIZE=$(wc -c <"$SAVE")
 if [[ "$SAVE_SIZE" -ne "$SURVIVAL_SAVE_LEN" ]]; then
-    echo "SURVIVAL SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $SURVIVAL_SAVE_LEN: an edit-free v7 save with zero chests, zero mobs, and two occupied inventory slots)"
+    echo "SURVIVAL SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $SURVIVAL_SAVE_LEN: an edit-free v8 save with zero chests, zero mobs, a two-name content table, and two occupied inventory slots)"
     exit 1
 fi
 
@@ -260,8 +257,14 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 7 ]]; then
-    echo "SURVIVAL SMOKE FAIL: save version is $VERSION (expected 7)"
+if [[ "$VERSION" -ne 8 ]]; then
+    echo "SURVIVAL SMOKE FAIL: save version is $VERSION (expected 8)"
+    exit 1
+fi
+
+CONTENT_NAME_COUNT=$(read_u32_le "$SAVE" "$V8_CONTENT_TABLE_OFFSET")
+if [[ "$CONTENT_NAME_COUNT" -ne 2 ]]; then
+    echo "SURVIVAL SMOKE FAIL: v8 content table holds $CONTENT_NAME_COUNT names (expected 2: apple and stick)"
     exit 1
 fi
 
@@ -303,9 +306,15 @@ fi
 
 MOB_COUNT=$(read_u32_le "$SAVE" "$SAVE_MOB_COUNT_OFFSET")
 if [[ "$MOB_COUNT" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v7 mob count is $MOB_COUNT (expected 0)"
+    echo "SURVIVAL SMOKE FAIL: v8 mob count is $MOB_COUNT (expected 0)"
     exit 1
 fi
 
-echo "SURVIVAL SMOKE PASS [profile=$PROFILE]: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote an edit-free ${SURVIVAL_SAVE_LEN}-byte v7 save (mode Survival, vitals 20/20/300, 0 chests, 0 mobs, 0 chunk edits, 2 kept inventory stacks)"
+PACK_COUNT=$(read_u32_le "$SAVE" "$SAVE_PACK_COUNT_OFFSET")
+if [[ "$PACK_COUNT" -ne 0 ]]; then
+    echo "SURVIVAL SMOKE FAIL: v8 pack count is $PACK_COUNT (expected 0 for a built-in-only stack)"
+    exit 1
+fi
+
+echo "SURVIVAL SMOKE PASS [profile=$PROFILE]: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote an edit-free ${SURVIVAL_SAVE_LEN}-byte v8 save (mode Survival, vitals 20/20/300, 0 chests, 0 mobs, 0 chunk edits, 2 kept inventory stacks, 2 content names, 0 packs)"
 echo "SURVIVAL SMOKE EVIDENCE: $SURVIVAL_LINE"

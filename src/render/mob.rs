@@ -79,7 +79,7 @@ pub fn mob_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 /// shared camera view-projection, and derives the distance fog factor from the
 /// existing [`crate::render::pipeline::CameraUniform`] (`camera_pos` plus
 /// `fog_start_end.xy`) so the 112-byte uniform layout is untouched. The
-/// fragment stage samples the same 48-layer block texture array from the
+/// fragment stage samples the same 256-layer block texture array from the
 /// camera bind group (`uv`, flat `tex_layer`), multiplies by the CPU-baked
 /// face shade, applies the hurt flash tint, and fades into `fog_color`.
 ///

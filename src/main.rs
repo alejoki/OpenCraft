@@ -37,7 +37,7 @@ use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
-use opencraft::render::texture::generate_all_texture_layers_rgba;
+use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
@@ -1603,7 +1603,7 @@ fn scripted_demo_requested(cli: &CliConfig) -> bool {
 /// for every production launch.
 ///
 /// Those runs pin exact save layouts — several real-binary scripts assert a
-/// zero v7 mob count on an "edit-free fresh world" — so the ambient population
+/// zero v8 mob count on an "edit-free fresh world" — so the ambient population
 /// layer stays closed for their whole life. That is the same ephemeral demo
 /// switch `--demo-combat` uses around its own pinned stages (M009/S05-T03):
 /// creation and daylight burning are off, the distance cull still runs.
@@ -1688,7 +1688,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
     // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v7 save tail must describe only what that
+    // digest and every bounded demo's v8 save tail must describe only what that
     // demo placed, so ambient spawning and daylight burning stay off for the
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {
@@ -4295,8 +4295,8 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 /// to Creative rules — no target selection, no melee, no arrows, no damage —
 /// and then that one melee swing and one charge-0 arrow each one-shot a
 /// full-health Zombie with the pinned drop table intact. It consumes exactly
-/// the two rotten-flesh units its kills earned, so the 218-byte v7 witness and
-/// every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
+/// the two rotten-flesh units its kills earned, so the measured 307-byte v8
+/// witness and every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
 /// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
 /// Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5981,7 +5981,7 @@ fn combat_spot_feet_y(y: f32) -> f32 {
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
 /// * the player pose is restored afterwards, so the Shot stage and the Save
-///   witness start from the same pinned pose (the v7 layout itself is measured
+///   witness start from the same pinned pose (the v8 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
 ///
 /// The Skeleton is left where Drops left it: it is hostile and will chase, but
@@ -7115,7 +7115,7 @@ fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
 ///    the real projectile sweep, granting exactly one more rotten flesh.
 /// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
 ///    again and the inventory total must return to its pre-stage value, which
-///    is what keeps the 218-byte v7 save byte-identical.
+///    is what keeps the measured 307-byte v8 save byte-identical.
 ///
 /// Documented demo pins, not gameplay rules: the two survivors are parked 20
 /// blocks behind the camera (position *and* leash anchor, so the synthetic
@@ -7438,8 +7438,8 @@ fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
         .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
 
     // 4. Conserve the save witness: both earned units are consumed again, so
-    //    the inventory section (and therefore the 218-byte v7 layout) is
-    //    byte-identical.
+    //    the inventory section (and therefore the measured 307-byte v8 layout)
+    //    is byte-identical.
     if session.player.consume_item(flesh_id).is_none()
         || session.player.consume_item(flesh_id).is_none()
     {
@@ -9651,10 +9651,15 @@ impl ApplicationHandler for GameApp {
         // Re-apply the persisted texture pack to the freshly created GPU
         // texture (M004/S03): the renderer is still a local here, so the
         // initial upload reuses the same live-apply path as cycling. A
-        // missing pack still carries usable procedural layers.
-        if let Some(pack) = &self.current_pack {
-            renderer.write_block_layers(&ctx.queue, &pack.layers);
-        }
+        // missing pack still carries usable procedural layers. The 256-layer
+        // GPU array is always composed from the 48-layer base plus the
+        // frozen session registry's pack faces; unused slots are checker.
+        let base = match &self.current_pack {
+            Some(pack) => pack.layers.clone(),
+            None => generate_all_texture_layers_rgba(),
+        };
+        let pack_layers = self.base_registry.pack_layers().to_vec();
+        renderer.write_block_layers(&ctx.queue, &compose_block_array_layers(&base, &pack_layers));
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(
@@ -10516,15 +10521,17 @@ impl ApplicationHandler for GameApp {
                 // returns. Content definitions stay frozen in
                 // `session_registry` (MEM512).
                 if self.pack_presentation_dirty {
-                    let layers = match &self.current_pack {
+                    let base = match &self.current_pack {
                         Some(pack) => pack.layers.clone(),
                         None => generate_all_texture_layers_rgba(),
                     };
+                    let pack_layers = self.base_registry.pack_layers().to_vec();
                     let logo = self
                         .current_pack
                         .as_ref()
                         .and_then(|pack| pack.logo.clone());
-                    gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
+                    let composed = compose_block_array_layers(&base, &pack_layers);
+                    gpu.renderer.write_block_layers(&gpu.ctx.queue, &composed);
                     gpu.ui
                         .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
                     self.pack_presentation_dirty = false;
@@ -11984,7 +11991,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 218-byte v7 witness keep their exact bytes.
+            // measured 307-byte v8 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -11994,7 +12001,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Shot stage's digest follows the Hostile line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` /
-            // `combat_hostile:` lines and the v7 witness keep their exact
+            // `combat_hostile:` lines and the v8 witness keep their exact
             // bytes.
             if let Some(line) = self
                 .combat_demo
@@ -12013,7 +12020,7 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             // The Creative stage's digest follows the Skeleton line for the
-            // same reason: every earlier line and the 218-byte v7 witness keep
+            // same reason: every earlier line and the 307-byte v8 witness keep
             // their exact bytes.
             if let Some(line) = self
                 .combat_demo
@@ -14060,7 +14067,7 @@ mod tests {
         assert!(!session.player.can_fly());
         assert!(
             !session.ambient_spawning(),
-            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v7 save tail"
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v8 save tail"
         );
         assert!(
             session.spawn_settle_pending(),

@@ -1,3 +1,5 @@
+use crate::content::{PACK_LAYER_BASE, PACK_LAYER_CAP};
+
 pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
 ///
@@ -8,6 +10,20 @@ pub const TEX_SIZE: u32 = 16;
 /// The WGSL `w1 & 255` wire format still holds because all 48 layers fit in
 /// a byte with room to spare.
 pub const NUM_TEX_LAYERS: u32 = 48;
+/// Total GPU layers in the block texture array.
+///
+/// The authored/procedural contract stays [`NUM_TEX_LAYERS`] (48) layers; the
+/// GPU array is grown to 256 so pack-authored block faces can live at
+/// [`PACK_LAYER_BASE`]..[`PACK_LAYER_CAP`] without changing the wire format
+/// (the WGSL `w1 & 255` decode already addresses 0..=255). Every remaining
+/// layer is filled with the reserved checker placeholder.
+pub const BLOCK_ARRAY_LAYERS: u32 = 256;
+
+const _: () = assert!(PACK_LAYER_BASE as u32 == NUM_TEX_LAYERS);
+const _: () = assert!(PACK_LAYER_CAP as u32 <= BLOCK_ARRAY_LAYERS);
+
+/// Bytes per 16x16 RGBA layer.
+const LAYER_BYTES: usize = (TEX_SIZE * TEX_SIZE * 4) as usize;
 /// First array layer holding mob part art ([`MOB_LAYER_BASE`]..=[`MOB_ARROW_TEX_LAYER`]).
 pub const MOB_LAYER_BASE: u32 = 32;
 /// Count of mob part layers a texture pack may author.
@@ -608,10 +624,52 @@ pub fn downsample_rgba_2x(src: &[u8], src_dim: u32) -> Vec<u8> {
 /// exactly [`NUM_TEX_LAYERS`] layers, each [`TEX_SIZE`] × [`TEX_SIZE`] × 4
 /// RGBA bytes. Used to guard live re-uploads (MEM111) in debug builds.
 pub fn block_layers_match_shape(layers: &[Vec<u8>]) -> bool {
-    layers.len() == NUM_TEX_LAYERS as usize
-        && layers
-            .iter()
-            .all(|layer| layer.len() == (TEX_SIZE * TEX_SIZE * 4) as usize)
+    layers.len() == NUM_TEX_LAYERS as usize && layers.iter().all(|layer| layer.len() == LAYER_BYTES)
+}
+
+/// True when `layers` matches the fixed 256-layer GPU block array contract:
+/// exactly [`BLOCK_ARRAY_LAYERS`] layers, each [`TEX_SIZE`] × [`TEX_SIZE`] × 4
+/// RGBA bytes. Used to guard live re-uploads (MEM111) in debug builds.
+pub fn block_array_layers_match_shape(layers: &[Vec<u8>]) -> bool {
+    layers.len() == BLOCK_ARRAY_LAYERS as usize
+        && layers.iter().all(|layer| layer.len() == LAYER_BYTES)
+}
+
+/// Compose the 256-layer GPU block array from the 48 authored/procedural base
+/// layers plus the frozen session registry's pack layers.
+///
+/// Layer indices 0..=47 are copied byte-for-byte from `base` (the built-in
+/// presentation contract), pack layers fill 48..=207 in registry order, and
+/// 208..=255 are reserved checker placeholders. `base` is never mutated. A
+/// malformed base or pack layer is replaced by its reserved checker rather
+/// than panicking so a bad pack can never take down the renderer; the output
+/// shape is always 256 × 1024 bytes.
+pub fn compose_block_array_layers(base: &[Vec<u8>], pack_layers: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut layers = Vec::with_capacity(BLOCK_ARRAY_LAYERS as usize);
+
+    for index in 0..NUM_TEX_LAYERS as usize {
+        match base.get(index) {
+            Some(layer) if layer.len() == LAYER_BYTES => layers.push(layer.clone()),
+            _ => layers.push(reserved_checker(index as u32)),
+        }
+    }
+
+    let pack_slot_count = (PACK_LAYER_CAP - PACK_LAYER_BASE) as usize;
+    for (slot, layer) in pack_layers.iter().take(pack_slot_count).enumerate() {
+        let gpu_index = PACK_LAYER_BASE as usize + slot;
+        if layer.len() == LAYER_BYTES {
+            layers.push(layer.clone());
+        } else {
+            layers.push(reserved_checker(gpu_index as u32));
+        }
+    }
+
+    while layers.len() < BLOCK_ARRAY_LAYERS as usize {
+        layers.push(reserved_checker(layers.len() as u32));
+    }
+
+    debug_assert!(block_array_layers_match_shape(&layers));
+    layers
 }
 
 /// Upload every layer's base mip and its box-filtered mip chain into an
@@ -660,11 +718,11 @@ pub fn create_block_texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
-    let layers = generate_all_texture_layers_rgba();
+    let layers = compose_block_array_layers(&generate_all_texture_layers_rgba(), &[]);
     let size = wgpu::Extent3d {
         width: TEX_SIZE,
         height: TEX_SIZE,
-        depth_or_array_layers: NUM_TEX_LAYERS,
+        depth_or_array_layers: BLOCK_ARRAY_LAYERS,
     };
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -683,7 +741,7 @@ pub fn create_block_texture_array(
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("block_texture_array_view"),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
-        array_layer_count: Some(NUM_TEX_LAYERS),
+        array_layer_count: Some(BLOCK_ARRAY_LAYERS),
         ..Default::default()
     });
 
@@ -893,6 +951,99 @@ mod tests {
         more.push(vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize]);
         assert_eq!(more.len(), NUM_TEX_LAYERS as usize + 1);
         assert!(!block_layers_match_shape(&more));
+    }
+
+    #[test]
+    fn compose_keeps_base_layers_byte_identical_and_pads_with_checker() {
+        let base = generate_all_texture_layers_rgba();
+        let composed = compose_block_array_layers(&base, &[]);
+
+        assert_eq!(NUM_TEX_LAYERS, 48);
+        assert_eq!(composed.len(), BLOCK_ARRAY_LAYERS as usize);
+        assert_eq!(&composed[..NUM_TEX_LAYERS as usize], &base[..]);
+
+        for index in NUM_TEX_LAYERS as usize..BLOCK_ARRAY_LAYERS as usize {
+            assert_eq!(
+                composed[index],
+                reserved_checker(index as u32),
+                "unused layer {index} must be the reserved checker"
+            );
+        }
+        assert!(block_array_layers_match_shape(&composed));
+    }
+
+    #[test]
+    fn compose_places_pack_layers_at_the_pack_base_and_fills_the_rest() {
+        let base = generate_all_texture_layers_rgba();
+        let pack0 = vec![0x11u8; LAYER_BYTES];
+        let pack1 = vec![0x22u8; LAYER_BYTES];
+        let composed = compose_block_array_layers(&base, &[pack0.clone(), pack1.clone()]);
+
+        assert_eq!(composed[PACK_LAYER_BASE as usize], pack0);
+        assert_eq!(composed[PACK_LAYER_BASE as usize + 1], pack1);
+        for index in PACK_LAYER_BASE as usize + 2..BLOCK_ARRAY_LAYERS as usize {
+            assert_eq!(composed[index], reserved_checker(index as u32));
+        }
+    }
+
+    #[test]
+    fn compose_always_returns_a_256_layer_array_and_rejects_the_48_layer_base() {
+        let base = generate_all_texture_layers_rgba();
+        let composed = compose_block_array_layers(&base, &[]);
+
+        assert_eq!(composed.len(), 256);
+        assert!(composed.iter().all(|layer| layer.len() == 1024));
+        assert!(block_array_layers_match_shape(&composed));
+        assert!(
+            !block_array_layers_match_shape(&base),
+            "the 48-layer authored base is not the GPU array shape"
+        );
+        assert!(!block_array_layers_match_shape(&[]));
+    }
+
+    #[test]
+    fn compose_caps_pack_layers_at_the_pack_layer_cap() {
+        let base = generate_all_texture_layers_rgba();
+        let pack: Vec<Vec<u8>> = (0..200u32)
+            .map(|index| vec![index as u8; LAYER_BYTES])
+            .collect();
+        let composed = compose_block_array_layers(&base, &pack);
+
+        for index in PACK_LAYER_BASE as usize..PACK_LAYER_CAP as usize {
+            assert_eq!(composed[index], pack[index - PACK_LAYER_BASE as usize]);
+        }
+        for index in PACK_LAYER_CAP as usize..BLOCK_ARRAY_LAYERS as usize {
+            assert_eq!(composed[index], reserved_checker(index as u32));
+        }
+    }
+
+    #[test]
+    fn compose_falls_back_to_checker_for_malformed_layers_without_panicking() {
+        let base = generate_all_texture_layers_rgba();
+        let malformed_pack = vec![9u8; LAYER_BYTES - 1];
+        let composed = compose_block_array_layers(&base, &[malformed_pack]);
+
+        assert_eq!(composed[PACK_LAYER_BASE as usize], reserved_checker(48));
+        assert!(block_array_layers_match_shape(&composed));
+
+        // A short base is also patched per-index rather than panicking.
+        let short_base = base[..NUM_TEX_LAYERS as usize - 1].to_vec();
+        let composed = compose_block_array_layers(&short_base, &[]);
+        assert_eq!(
+            composed[NUM_TEX_LAYERS as usize - 1],
+            reserved_checker(NUM_TEX_LAYERS - 1)
+        );
+        assert!(block_array_layers_match_shape(&composed));
+    }
+
+    #[test]
+    fn compose_never_mutates_the_base() {
+        let base = generate_all_texture_layers_rgba();
+        let original = base.clone();
+        let _ = compose_block_array_layers(&base, &[vec![7u8; LAYER_BYTES]]);
+
+        assert_eq!(base, original);
+        assert_eq!(base.len(), NUM_TEX_LAYERS as usize);
     }
 
     #[test]
