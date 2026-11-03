@@ -1,11 +1,14 @@
 pub mod chest;
+pub mod demo;
 pub mod hud;
 pub mod inventory;
+pub mod item_icon;
 pub mod lifecycle;
 pub mod logo;
 pub mod menu;
 pub mod quad;
 pub mod screens;
+pub mod selection;
 pub mod text;
 pub mod text_input;
 
@@ -39,6 +42,8 @@ use crate::render::pipeline::UiPass;
 pub use quad::{Quad, QuadRenderer};
 pub use text::{StatsOverlay, FONT_SIZE, LINE_HEIGHT};
 
+use item_icon::{IconRenderer, IconVertex};
+
 /// Owns the UI rendering stack for the color-only pass: filled quads
 /// (tint/panels/buttons), the optional pack logo, plus the glyphon text
 /// renderer.
@@ -52,10 +57,19 @@ pub struct UiRenderer {
     pub text_renderer: glyphon::TextRenderer,
     quad_renderer: QuadRenderer,
     logo_renderer: logo::LogoRenderer,
+    icon_renderer: IconRenderer,
+    /// Single-quad overlay drawn after icons and before text. The hover
+    /// tooltip needs to sit above slot art and below its own text, so it uses
+    /// its own tiny buffer instead of joining the main panel quad batch.
+    tooltip_quad_renderer: QuadRenderer,
 }
 
 impl UiRenderer {
-    pub fn new(ctx: &RenderContext) -> Self {
+    pub fn new(
+        ctx: &RenderContext,
+        block_texture_view: &wgpu::TextureView,
+        block_texture_sampler: &wgpu::Sampler,
+    ) -> Self {
         // ColorMode::Accurate: proper sRGB texture, matching our sRGB surface format.
         // (glyphon 0.5.0 has no `Color` variant; Accurate/Web are the only modes.)
         let mut atlas = glyphon::TextAtlas::with_color_mode(
@@ -79,6 +93,8 @@ impl UiRenderer {
             text_renderer,
             quad_renderer: QuadRenderer::new(ctx),
             logo_renderer: logo::LogoRenderer::new(ctx),
+            icon_renderer: IconRenderer::new(ctx, block_texture_view, block_texture_sampler),
+            tooltip_quad_renderer: QuadRenderer::new(ctx),
         }
     }
 
@@ -107,6 +123,45 @@ impl UiRenderer {
         self.logo_renderer.set_logo(device, queue, logo);
     }
 
+    /// Rebuild the per-frame item-icon vertex buffers (block cubes and
+    /// procedural material/tool sprites). Pure CPU work; call once per frame
+    /// before the render pass opens. An empty batch clears that buffer so
+    /// nothing is drawn for it.
+    pub fn set_icons(
+        &mut self,
+        device: &wgpu::Device,
+        block_icons: &[IconVertex],
+        sprite_icons: &[IconVertex],
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        self.icon_renderer
+            .set_icons(device, block_icons, sprite_icons, surface_w, surface_h);
+    }
+
+    /// Set the one hover-tooltip background quad for this frame.
+    ///
+    /// `None` clears the buffer. The quad is drawn after icons so it covers
+    /// slot art, and before text so the tooltip's own text (plus any label
+    /// that survives culling) renders on top.
+    pub fn set_tooltip_quad(
+        &mut self,
+        device: &wgpu::Device,
+        quad: Option<Quad>,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        match quad {
+            Some(quad) => {
+                self.tooltip_quad_renderer
+                    .set_quads(device, &[quad], surface_w, surface_h)
+            }
+            None => self
+                .tooltip_quad_renderer
+                .set_quads(device, &[], surface_w, surface_h),
+        }
+    }
+
     /// Rebuild the per-frame logo quad. `None` clears it, which also keeps a
     /// logo from drawing on non-vista screens.
     pub fn set_logo_frame(
@@ -123,10 +178,14 @@ impl UiRenderer {
 
 impl UiPass for UiRenderer {
     fn draw_ui<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        // Quads first (panorama tint/panels), then the pack logo, then text
-        // on top.
+        // Quads first (panorama tint/panels), then the pack logo, then item
+        // icons (block cubes, then material/tool sprites), then text on top.
         self.quad_renderer.draw(pass);
         self.logo_renderer.draw(pass);
+        self.icon_renderer.draw(pass);
+        // Tooltip background sits above icons/panels but below the text pass;
+        // the frame loop culls labels under it and pushes the tooltip text last.
+        self.tooltip_quad_renderer.draw(pass);
         let _ = self.text_renderer.render(&self.atlas, pass);
     }
 }

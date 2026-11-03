@@ -72,10 +72,12 @@ Save each block texture directly inside the pack folder, using these exact file 
 21. `wheat_stage3.png`
 22. `chest.png`
 23. `loot_chest.png`
+24. `crafting_table_top.png`
+25. `crafting_table_side.png`
 
-The texture array has 48 layers. Layers 0 to 22 are the twenty-three block names above, in the order listed. Layers 23 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_23.png` or any other name that is not in one of the two lists is ignored.
+The texture array has 48 layers. Layers 0 to 24 are the twenty-five block names above, in the order listed. Layers 25 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_25.png` or any other name that is not in one of the two lists is ignored.
 
-A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. Partial packs may add one texture or all twenty-three.
+A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. The same is true for packs that shipped only the original 23 block names — `crafting_table_top.png` (layer 23) and `crafting_table_side.png` (layer 24) are optional additions, so such packs remain valid unchanged. Partial packs may add one texture or all twenty-five.
 
 Image rules:
 
@@ -83,7 +85,7 @@ Image rules:
 - Any size in that range is resampled to the game's 16-by-16 texture grid, so you can author at 16, 32, 64, 128, or 256 pixels and still get a crisp result.
 - A missing file is fine and silently keeps the built-in texture for that block.
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
-- Partial packs always work — add one texture or all twenty-three.
+- Partial packs always work — add one texture or all twenty-five.
 
 ## Mob textures
 
@@ -113,7 +115,7 @@ The committed `packs/uat-sound/` folder is the per-file layout example: it shows
 - A missing file silently keeps the built-in procedural art for that part.
 - A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
 - A pack may add one mob file or all thirteen. Mob files and block files are independent.
-- Layers 23 to 31 and 45 to 47 are reserved and cannot be overridden. Files named after them, such as `reserved_45.png`, are ignored silently.
+- Layers 25 to 31 and 45 to 47 are reserved and cannot be overridden. Files named after them, such as `reserved_45.png`, are ignored silently.
 
 ## Title logo and menu tint
 

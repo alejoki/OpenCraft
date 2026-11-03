@@ -17,7 +17,7 @@ use glam::IVec3;
 
 use crate::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
-    INVENTORY_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
+    HOTBAR_SLOTS, INVENTORY_SLOTS, MAIN_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
 };
 use crate::ui::Quad;
 use crate::world::block::BlockId;
@@ -49,9 +49,19 @@ const SECTION_GAP: f32 = 12.0;
 const RESULT_GAP: f32 = 16.0;
 const FOOTER_HEIGHT: f32 = 52.0;
 
-/// Hotbar slots form row 0 of the 9x4 slot grid.
-const SLOT_COLUMNS: usize = 9;
-const SLOTS_W: f32 = 9.0 * SLOT_SIZE + 8.0 * SLOT_GAP;
+/// Natural gap between the three main-storage rows and the hotbar row, in px.
+/// The separator line is centered inside this gap.
+pub const HOTBAR_GAP: f32 = 16.0;
+/// Natural thickness of the separator line drawn inside [`HOTBAR_GAP`], in px.
+pub const HOTBAR_SEPARATOR_THICKNESS: f32 = 2.0;
+
+/// The inventory uses a 9-column grid: three main-storage rows on top and the
+/// hotbar as the bottom row. The public slot index order is unchanged
+/// (`0..9` hotbar, `9..36` storage); only the y placement differs.
+const SLOT_COLUMNS: usize = HOTBAR_SLOTS;
+const STORAGE_ROWS: usize = MAIN_SLOTS / SLOT_COLUMNS;
+const SLOTS_W: f32 = SLOT_COLUMNS as f32 * SLOT_SIZE + (SLOT_COLUMNS as f32 - 1.0) * SLOT_GAP;
+const STORAGE_H: f32 = STORAGE_ROWS as f32 * SLOT_SIZE + (STORAGE_ROWS as f32 - 1.0) * SLOT_GAP;
 const PLAYER_GRID_W: f32 = 2.0 * SLOT_SIZE + SLOT_GAP;
 const PLAYER_GRID_H: f32 = PLAYER_GRID_W;
 const TABLE_GRID_W: f32 = 4.0 * SLOT_SIZE + 3.0 * SLOT_GAP;
@@ -60,11 +70,22 @@ const CRAFT_X: f32 = PANEL_PAD + SLOTS_W + COLUMN_GAP;
 const CRAFT_W: f32 = TABLE_GRID_W + RESULT_GAP + SLOT_SIZE;
 const CRAFT_H: f32 = PLAYER_GRID_H + SECTION_GAP + TABLE_GRID_H;
 const SLOTS_TOP: f32 = PANEL_PAD + TITLE_HEIGHT + TITLE_GAP;
+const HOTBAR_TOP: f32 = SLOTS_TOP + STORAGE_H + HOTBAR_GAP;
+const SLOTS_H: f32 = STORAGE_H + HOTBAR_GAP + SLOT_SIZE;
+const HOTBAR_SEPARATOR_TOP: f32 =
+    SLOTS_TOP + STORAGE_H + (HOTBAR_GAP - HOTBAR_SEPARATOR_THICKNESS) * 0.5;
 const TABLE_TOP: f32 = SLOTS_TOP + PLAYER_GRID_H + SECTION_GAP;
+// The crafting column is taller than the slot block, so the footer clears the
+// hotbar by CRAFT_H - SLOTS_H px today. Taking the max keeps that guarantee
+// if either column is resized later.
+const PANEL_CONTENT_H: f32 = if CRAFT_H > SLOTS_H { CRAFT_H } else { SLOTS_H };
 const PANEL_W: f32 = 2.0 * PANEL_PAD + SLOTS_W + COLUMN_GAP + CRAFT_W;
-const PANEL_H: f32 = SLOTS_TOP + CRAFT_H + FOOTER_HEIGHT + PANEL_PAD;
+const PANEL_H: f32 = SLOTS_TOP + PANEL_CONTENT_H + FOOTER_HEIGHT + PANEL_PAD;
 
 const PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.94];
+/// Subtle divider tint for [`InventoryLayout::hotbar_separator`]: lighter than
+/// the panel and the slot outlines so it reads as a rule, not another slot.
+const SEPARATOR_COLOR: [f32; 4] = [0.34, 0.35, 0.40, 1.0];
 const SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 const GRID_COLOR: [f32; 4] = [0.17, 0.18, 0.21, 1.0];
 const RESULT_COLOR: [f32; 4] = [0.28, 0.25, 0.14, 1.0];
@@ -101,7 +122,8 @@ pub type Rect = (f32, f32, f32, f32);
 /// One clickable inventory target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryTarget {
-    /// One of the 36 inventory slots (`0..9` hotbar, `9..36` main storage).
+    /// One of the 36 inventory slots (`0..9` hotbar bottom row, `9..36` main
+    /// storage rows). The index order is unchanged by the visual arrangement.
     Slot(usize),
     /// One active crafting cell in the given grid.
     GridCell { kind: GridKind, index: usize },
@@ -192,8 +214,12 @@ impl InventoryScreen {
 pub struct InventoryLayout {
     /// Dark backdrop panel.
     pub panel: Rect,
-    /// 36 slots: `0..9` hotbar row, `9..36` three main-storage rows.
+    /// 36 slots: `9..36` are the three main-storage rows at the top, and
+    /// `0..9` are the hotbar's bottom row below them.
     pub slots: [Rect; INVENTORY_SLOTS],
+    /// Divider line centered in [`HOTBAR_GAP`] between the storage rows and
+    /// the hotbar row, spanning the panel's inner width.
+    pub hotbar_separator: Rect,
     /// Active 2x2 player cells, row-major.
     pub player_grid: [Rect; PLAYER_GRID_DIM * PLAYER_GRID_DIM],
     /// All 16 table cells, row-major. Populated in every mode; only
@@ -237,10 +263,18 @@ pub fn layout(surface_w: u32, surface_h: u32, _mode: InventoryMode) -> Inventory
 
     let slots = std::array::from_fn(|index| {
         let col = index % SLOT_COLUMNS;
-        let row = index / SLOT_COLUMNS;
+        let y = if index < HOTBAR_SLOTS {
+            // Public hotbar indices stay 0..9; only their row moves to the
+            // bottom of the slot block.
+            HOTBAR_TOP
+        } else {
+            let storage_index = index - HOTBAR_SLOTS;
+            let row = storage_index / SLOT_COLUMNS;
+            SLOTS_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP)
+        };
         to_px(
             PANEL_PAD + col as f32 * (SLOT_SIZE + SLOT_GAP),
-            SLOTS_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP),
+            y,
             SLOT_SIZE,
             SLOT_SIZE,
         )
@@ -271,6 +305,12 @@ pub fn layout(surface_w: u32, surface_h: u32, _mode: InventoryMode) -> Inventory
     InventoryLayout {
         panel: to_px(0.0, 0.0, PANEL_W, PANEL_H),
         slots,
+        hotbar_separator: to_px(
+            PANEL_PAD,
+            HOTBAR_SEPARATOR_TOP,
+            PANEL_W - 2.0 * PANEL_PAD,
+            HOTBAR_SEPARATOR_THICKNESS,
+        ),
         player_grid,
         table_grid,
         player_result: to_px(
@@ -368,6 +408,137 @@ pub fn target_rect(
         }
         InventoryTarget::ResultSlot(GridKind::Table) => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hover resolution + tooltip geometry
+// ---------------------------------------------------------------------------
+
+/// Distance from the cursor to the tooltip's near edge, in px.
+pub const TOOLTIP_OFFSET: f32 = 12.0;
+/// Horizontal padding inside the tooltip box, in px.
+pub const TOOLTIP_PAD_X: f32 = 8.0;
+/// Vertical padding inside the tooltip box, in px.
+pub const TOOLTIP_PAD_Y: f32 = 4.0;
+
+/// The item under the cursor, resolved through the same [`hit_test`] the
+/// click handler uses.
+///
+/// Inventory slots report their stack, active grid cells report their cell,
+/// and result slots report the preview output so hovering a craftable result
+/// shows what the click would take. Empty cells, empty screen space, and
+/// table-only targets in `Player`/`Closed` mode all report `None`.
+pub fn hovered_item(
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    cursor: (f32, f32),
+) -> Option<Item> {
+    let target = hit_test(mode, layout, cursor)?;
+    match target {
+        InventoryTarget::Slot(index) => inventory.slot(index),
+        InventoryTarget::GridCell { kind, index } => match kind {
+            GridKind::Player => player_grid.slot(index),
+            GridKind::Table if mode == InventoryMode::Table => table_grid.slot(index),
+            GridKind::Table => None,
+        },
+        InventoryTarget::ResultSlot(GridKind::Player) => preview_item(player_grid),
+        InventoryTarget::ResultSlot(GridKind::Table) if mode == InventoryMode::Table => {
+            preview_item(table_grid)
+        }
+        InventoryTarget::ResultSlot(GridKind::Table) => None,
+    }
+}
+
+/// The output stack a grid would craft, or `None` when it matches no recipe.
+///
+/// Static recipes are validated by construction, so the `Item::new` failure
+/// branch is unreachable; `ok()` keeps this helper total instead of panicking.
+fn preview_item(grid: &CraftingGrid) -> Option<Item> {
+    grid.preview()
+        .and_then(|preview| Item::new(preview.output, preview.output_count).ok())
+}
+
+/// Tooltip body lines for an item: name first, then optional detail lines.
+///
+/// A stack larger than one adds `x{count}`; a tool adds
+/// `Durability {remaining}/{max}`. Empty detail lines are never emitted, so a
+/// single block produces just its name and a tool produces name + durability.
+pub fn tooltip_lines(item: Item) -> Vec<String> {
+    let mut lines = Vec::with_capacity(3);
+    lines.push(item.id().name().to_string());
+    if item.count() > 1 {
+        lines.push(format!("x{}", item.count()));
+    }
+    if let (Some(remaining), Some(max)) = (item.durability(), item.max_durability()) {
+        lines.push(format!("Durability {remaining}/{max}"));
+    }
+    lines
+}
+
+/// Tooltip box for `line_count` lines of `text_width` px near the cursor.
+///
+/// The box is placed [`TOOLTIP_OFFSET`] px right/below `anchor`, flipped to
+/// the left/above side when it would cross the right/bottom edge, and finally
+/// clamped into the surface. Width is padded and capped to the surface width;
+/// height derives from [`LABEL_LINE_HEIGHT`] and is capped to the surface
+/// height. A zero-sized surface uses the same `max(1)` convention as the rest
+/// of the UI, and a non-finite anchor or text width collapses to a finite
+/// position/width rather than producing NaN geometry.
+pub fn tooltip_rect(
+    anchor: (f32, f32),
+    text_width: f32,
+    line_count: usize,
+    surface_w: u32,
+    surface_h: u32,
+) -> Rect {
+    let w_px = surface_w.max(1) as f32;
+    let h_px = surface_h.max(1) as f32;
+
+    let anchor_x = if anchor.0.is_finite() { anchor.0 } else { 0.0 };
+    let anchor_y = if anchor.1.is_finite() { anchor.1 } else { 0.0 };
+    let text_width = if text_width.is_finite() {
+        text_width.max(0.0)
+    } else {
+        0.0
+    };
+
+    let width = (text_width + 2.0 * TOOLTIP_PAD_X).min(w_px).max(0.0);
+    let height = ((line_count.max(1) as f32) * LABEL_LINE_HEIGHT + 2.0 * TOOLTIP_PAD_Y)
+        .min(h_px)
+        .max(0.0);
+
+    let mut x = anchor_x + TOOLTIP_OFFSET;
+    if x + width > w_px {
+        x = anchor_x - TOOLTIP_OFFSET - width;
+    }
+    let mut y = anchor_y + TOOLTIP_OFFSET;
+    if y + height > h_px {
+        y = anchor_y - TOOLTIP_OFFSET - height;
+    }
+    (
+        x.clamp(0.0, (w_px - width).max(0.0)),
+        y.clamp(0.0, (h_px - height).max(0.0)),
+        width,
+        height,
+    )
+}
+
+/// Whether two pixel-space rects overlap by a positive area.
+///
+/// Used by the frame loop to cull hotbar counts and panel labels that would
+/// otherwise draw over the tooltip box. Touching edges do not count, and a
+/// non-finite rect never claims an overlap.
+pub fn rects_intersect(a: Rect, b: Rect) -> bool {
+    if ![a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return false;
+    }
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
 // ---------------------------------------------------------------------------
@@ -494,8 +665,11 @@ fn preview_fill(rect: Rect, preview: RecipePreview) -> Option<Quad> {
     Some(rect_quad(cell_fill(rect), item_color(item)))
 }
 
-/// All quads for one frame: backdrop, slot/grid outlines, item fills, result
-/// previews, and the cursor ghost. Empty for a closed screen.
+/// All quads for one frame: backdrop, the storage/hotbar separator, slot/grid
+/// outlines, item fills, result previews, and the cursor ghost. Empty for a
+/// closed screen. Draw order is intentional: the separator lands after the
+/// panel background and before any slot fill, so slot outlines and item fills
+/// always paint over it.
 pub fn screen_quads(
     mode: InventoryMode,
     layout: &InventoryLayout,
@@ -510,6 +684,10 @@ pub fn screen_quads(
     }
     let mut quads = Vec::new();
     quads.push(rect_quad(layout.panel, PANEL_COLOR));
+    // Separator between the three storage rows and the hotbar row. It is
+    // emitted before the slots so the slot fills (which never overlap the
+    // separator by layout construction) keep their own draw order.
+    quads.push(rect_quad(layout.hotbar_separator, SEPARATOR_COLOR));
 
     for (index, rect) in layout.slots.iter().enumerate() {
         quads.push(rect_quad(*rect, SLOT_COLOR));
@@ -794,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_has_exactly_36_distinct_targets_with_hotbar_first() {
+    fn layout_has_exactly_36_distinct_targets_with_hotbar_last() {
         let layout = layout(1280, 720, InventoryMode::Player);
         let panel = layout.panel;
 
@@ -812,32 +990,234 @@ mod tests {
         }
         assert_eq!(layout.slots.len(), HOTBAR_SLOTS + MAIN_SLOTS);
 
-        // Row 0 is the hotbar: same top, increasing left, uniform size.
+        // Indices 9..36 are the three main-storage rows at the top: each row
+        // shares one top, left increases by column, and rows descend.
+        let mut row_tops = [f32::NAN; STORAGE_ROWS];
+        for (row, row_top) in row_tops.iter_mut().enumerate() {
+            let first = HOTBAR_SLOTS + row * SLOT_COLUMNS;
+            *row_top = layout.slots[first].1;
+            let mut last_left = f32::NEG_INFINITY;
+            for col in 0..SLOT_COLUMNS {
+                let rect = layout.slots[first + col];
+                assert_eq!(
+                    rect.1, *row_top,
+                    "storage row {row} col {col} shares the row top"
+                );
+                assert!(
+                    rect.0 > last_left,
+                    "storage row {row} col {col} left is increasing"
+                );
+                last_left = rect.0;
+            }
+        }
+        for row in 1..STORAGE_ROWS {
+            assert!(
+                row_tops[row] > row_tops[row - 1],
+                "storage row {row} sits below row {}",
+                row - 1
+            );
+        }
+
+        // Indices 0..9 are the hotbar: one row at the bottom of the slot
+        // block, sharing the lowest top and separated from storage by at
+        // least HOTBAR_GAP.
         let hotbar_top = layout.slots[0].1;
         let mut last_left = f32::NEG_INFINITY;
         for index in 0..HOTBAR_SLOTS {
             let rect = layout.slots[index];
             assert_eq!(rect.1, hotbar_top, "hotbar slot {index} top");
             assert!(rect.0 > last_left, "hotbar slot {index} left is increasing");
+            assert!(
+                rect.1 > row_tops[STORAGE_ROWS - 1],
+                "hotbar slot {index} must sit below every storage row"
+            );
             last_left = rect.0;
         }
+        let storage_bottom = row_tops[STORAGE_ROWS - 1]
+            + layout.slots[HOTBAR_SLOTS + (STORAGE_ROWS - 1) * SLOT_COLUMNS].3;
+        let scale = layout.slots[0].2 / SLOT_SIZE;
+        assert!(
+            hotbar_top - storage_bottom >= HOTBAR_GAP * scale - 1e-3,
+            "storage bottom {storage_bottom} to hotbar top {hotbar_top} is narrower than HOTBAR_GAP"
+        );
 
-        // Rows 1..4 are the main storage: three distinct rows of nine.
-        let mut row_tops = [f32::NAN; 3];
-        for (row, row_top) in row_tops.iter_mut().enumerate() {
-            let first = HOTBAR_SLOTS + row * HOTBAR_SLOTS;
-            *row_top = layout.slots[first].1;
-            for col in 0..HOTBAR_SLOTS {
-                let rect = layout.slots[first + col];
-                assert_eq!(
-                    rect.1, *row_top,
-                    "main row {row} col {col} shares the row top"
+        // The separator spans the panel's inner width, sits inside the gap,
+        // and overlaps no slot.
+        let separator = layout.hotbar_separator;
+        assert!(
+            inside_panel(separator, panel),
+            "separator escapes the panel"
+        );
+        let pad = panel.2 * (PANEL_PAD / PANEL_W);
+        assert!((separator.0 - (panel.0 + pad)).abs() <= f32::EPSILON);
+        assert!((separator.2 - (panel.2 - 2.0 * pad)).abs() <= f32::EPSILON);
+        assert!(
+            separator.1 >= storage_bottom,
+            "separator starts above the storage bottom"
+        );
+        assert!(
+            separator.1 + separator.3 <= hotbar_top,
+            "separator ends below the hotbar top"
+        );
+        assert!(separator.3 > 0.0, "separator has a visible thickness");
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert!(
+                !rects_overlap(separator, *rect),
+                "slot {index} overlaps the separator"
+            );
+        }
+    }
+
+    #[test]
+    fn slots_stay_at_least_18px_and_panel_fits_at_720p_and_1080p() {
+        for (w, h) in [(1280_u32, 720_u32), (1920, 1080)] {
+            let layout = layout(w, h, InventoryMode::Table);
+            let panel = layout.panel;
+            assert!(
+                inside_panel(panel, (0.0, 0.0, w as f32, h as f32)),
+                "{w}x{h} panel {panel:?} escapes the surface"
+            );
+            assert!(
+                panel.2 <= w as f32 + f32::EPSILON && panel.3 <= h as f32 + f32::EPSILON,
+                "{w}x{h} panel {panel:?} is larger than the surface"
+            );
+            assert!(
+                inside_panel(layout.hotbar_separator, panel),
+                "{w}x{h} separator escapes the panel"
+            );
+            for (index, rect) in layout.slots.iter().enumerate() {
+                assert!(
+                    rect.2 >= 18.0 && rect.3 >= 18.0,
+                    "{w}x{h} slot {index} is smaller than 18 px: {rect:?}"
+                );
+                assert!(
+                    inside_panel(*rect, panel),
+                    "{w}x{h} slot {index} escapes the panel"
                 );
             }
         }
-        assert!(row_tops[0] > hotbar_top);
-        assert!(row_tops[1] > row_tops[0]);
-        assert!(row_tops[2] > row_tops[1]);
+    }
+
+    fn assert_quad(quad: &Quad, rect: Rect, color: [f32; 4]) {
+        assert_eq!((quad.x, quad.y, quad.w, quad.h), rect);
+        assert_eq!(quad.color, color);
+    }
+
+    #[test]
+    fn screen_quads_draws_separator_before_slots_and_no_slot_overlaps_it() {
+        let layout = layout(1280, 720, InventoryMode::Player);
+        let quads = screen_quads(
+            InventoryMode::Player,
+            &layout,
+            &Inventory::empty(),
+            &CraftingGrid::new(GridKind::Player),
+            &CraftingGrid::new(GridKind::Table),
+            None,
+            None,
+        );
+
+        // Backdrop first, then the separator, then every slot outline in
+        // public index order (0..9 hotbar, 9..36 storage). No remapping.
+        assert_quad(&quads[0], layout.panel, PANEL_COLOR);
+        assert_quad(&quads[1], layout.hotbar_separator, SEPARATOR_COLOR);
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert_quad(&quads[2 + index], *rect, SLOT_COLOR);
+        }
+
+        // The separator sits strictly between the storage rows and the
+        // hotbar row, and no slot outline intersects it.
+        let separator = layout.hotbar_separator;
+        let storage_bottom = layout.slots[HOTBAR_SLOTS..]
+            .iter()
+            .map(|rect| rect.1 + rect.3)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let hotbar_top = layout.slots[..HOTBAR_SLOTS]
+            .iter()
+            .map(|rect| rect.1)
+            .fold(f32::INFINITY, f32::min);
+        assert!(separator.1 >= storage_bottom);
+        assert!(separator.1 + separator.3 <= hotbar_top);
+        for (index, rect) in layout.slots.iter().enumerate() {
+            assert!(
+                !rects_overlap(separator, *rect),
+                "slot {index} overlaps the rendered separator"
+            );
+        }
+    }
+
+    #[test]
+    fn full_inventory_labels_every_count_inside_panel_at_720p_and_1080p() {
+        let inventory = filled_inventory();
+        let player_grid = full_grid(GridKind::Player, ItemId::Block(BlockId::OakPlanks));
+        let table_grid = full_grid(GridKind::Table, ItemId::Block(BlockId::OakPlanks));
+
+        for (w, h) in [(1280_u32, 720_u32), (1920, 1080)] {
+            let layout = layout(w, h, InventoryMode::Table);
+            let labels = screen_labels(
+                InventoryMode::Table,
+                &layout,
+                &inventory,
+                &player_grid,
+                &table_grid,
+                Some("full"),
+            );
+            assert!(
+                labels.len() <= MAX_LABELS,
+                "{w}x{h}: {} labels",
+                labels.len()
+            );
+
+            // Every occupied slot contributes its count label. Slot 0 is the
+            // worn pickaxe (count 1 plus a durability line); the rest are
+            // stone stacks 2..=36.
+            let slot_counts: Vec<String> = (0..INVENTORY_SLOTS)
+                .map(|index| {
+                    inventory
+                        .slot(index)
+                        .expect("slot is full")
+                        .count()
+                        .to_string()
+                })
+                .collect();
+            for (index, count) in slot_counts.iter().enumerate() {
+                assert!(
+                    labels.iter().any(|label| label.text == *count),
+                    "{w}x{h}: slot {index} count {count} is missing"
+                );
+            }
+
+            for label in &labels {
+                let (px, py, pw, ph) = layout.panel;
+                assert!(
+                    label.left >= px
+                        && label.top >= py
+                        && label.left <= px + pw
+                        && label.top + LABEL_LINE_HEIGHT <= py + ph,
+                    "{w}x{h}: label {:?} at ({}, {}) escapes panel {layout:?}",
+                    label.text,
+                    label.left,
+                    label.top
+                );
+            }
+
+            // The footer derives from PANEL_H, so the hint/status rows stay
+            // below the hotbar row and inside the panel.
+            let hotbar_bottom = layout.slots[..HOTBAR_SLOTS]
+                .iter()
+                .map(|rect| rect.1 + rect.3)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let hint = labels
+                .iter()
+                .find(|label| {
+                    label.text == "Left click moves a stack, right click splits or places one"
+                })
+                .expect("hint label is always emitted");
+            assert!(
+                hint.top >= hotbar_bottom,
+                "{w}x{h}: hint at {} lands on the hotbar row ending at {hotbar_bottom}",
+                hint.top
+            );
+        }
     }
 
     #[test]
@@ -891,8 +1271,8 @@ mod tests {
             None,
             None,
         );
-        // panel + 36 slots + 4 player cells + player result
-        assert_eq!(quads.len(), 42);
+        // panel + separator + 36 slots + 4 player cells + player result
+        assert_eq!(quads.len(), 43);
     }
 
     #[test]
@@ -946,8 +1326,8 @@ mod tests {
             None,
             None,
         );
-        // 42 player-mode quads + 16 table cells + table result
-        assert_eq!(quads.len(), 42 + 16 + 1);
+        // 43 player-mode quads + 16 table cells + table result
+        assert_eq!(quads.len(), 43 + 16 + 1);
     }
 
     #[test]
@@ -1022,6 +1402,7 @@ mod tests {
             ] {
                 let layout = layout(w, h, mode);
                 let rects = std::iter::once(layout.panel)
+                    .chain([layout.hotbar_separator])
                     .chain(layout.slots)
                     .chain(layout.player_grid)
                     .chain(layout.table_grid)
@@ -1324,6 +1705,311 @@ mod tests {
                 (0.0..=1.0).contains(channel),
                 "water channel {channel} out of range"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hover resolution + tooltips (S05-T01)
+    // -----------------------------------------------------------------------
+
+    fn assert_finite_rect(rect: Rect, what: &str) {
+        let (x, y, w, h) = rect;
+        for (name, value) in [("x", x), ("y", y), ("w", w), ("h", h)] {
+            assert!(value.is_finite(), "{what} {name} must be finite: {rect:?}");
+        }
+        assert!(w >= 0.0, "{what} width non-negative: {rect:?}");
+        assert!(h >= 0.0, "{what} height non-negative: {rect:?}");
+    }
+
+    fn assert_inside_surface(rect: Rect, surface_w: u32, surface_h: u32, what: &str) {
+        assert_finite_rect(rect, what);
+        let (x, y, w, h) = rect;
+        let w_px = surface_w.max(1) as f32;
+        let h_px = surface_h.max(1) as f32;
+        assert!(x >= 0.0 && y >= 0.0, "{what} starts inside: {rect:?}");
+        assert!(
+            x + w <= w_px + 1e-4,
+            "{what} right edge inside: {rect:?} vs {w_px}"
+        );
+        assert!(
+            y + h <= h_px + 1e-4,
+            "{what} bottom edge inside: {rect:?} vs {h_px}"
+        );
+    }
+
+    #[test]
+    fn hover_resolves_every_occupied_inventory_and_grid_target() {
+        let layout = layout(1280, 720, InventoryMode::Table);
+        let inventory = filled_inventory();
+        let player_grid = full_grid(GridKind::Player, ItemId::Material(Material::Stick));
+        let table_grid = iron_pickaxe_grid();
+
+        for (index, rect) in layout.slots.iter().enumerate() {
+            let expected = inventory.slot(index);
+            assert_eq!(
+                hovered_item(
+                    InventoryMode::Table,
+                    &layout,
+                    &inventory,
+                    &player_grid,
+                    &table_grid,
+                    center(*rect),
+                ),
+                expected,
+                "slot {index} hover"
+            );
+        }
+
+        for (index, rect) in layout.player_grid.iter().enumerate() {
+            assert_eq!(
+                hovered_item(
+                    InventoryMode::Table,
+                    &layout,
+                    &inventory,
+                    &player_grid,
+                    &table_grid,
+                    center(*rect),
+                ),
+                player_grid.slot(index),
+                "player grid cell {index} hover"
+            );
+        }
+
+        for (index, rect) in layout.table_grid.iter().enumerate() {
+            assert_eq!(
+                hovered_item(
+                    InventoryMode::Table,
+                    &layout,
+                    &inventory,
+                    &player_grid,
+                    &table_grid,
+                    center(*rect),
+                ),
+                table_grid.slot(index),
+                "table grid cell {index} hover"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_reports_none_for_empty_targets_outside_space_and_hidden_table_targets() {
+        let layout = layout(1280, 720, InventoryMode::Table);
+        let empty_inventory = Inventory::empty();
+        let empty_player = CraftingGrid::new(GridKind::Player);
+        let empty_table = CraftingGrid::new(GridKind::Table);
+
+        for rect in &layout.slots {
+            assert_eq!(
+                hovered_item(
+                    InventoryMode::Table,
+                    &layout,
+                    &empty_inventory,
+                    &empty_player,
+                    &empty_table,
+                    center(*rect),
+                ),
+                None,
+                "empty slot {rect:?}"
+            );
+        }
+        assert_eq!(
+            hovered_item(
+                InventoryMode::Table,
+                &layout,
+                &empty_inventory,
+                &empty_player,
+                &empty_table,
+                (0.0, 0.0),
+            ),
+            None,
+            "outside the panel resolves nothing"
+        );
+        assert_eq!(
+            hovered_item(
+                InventoryMode::Closed,
+                &layout,
+                &filled_inventory(),
+                &full_grid(GridKind::Player, ItemId::Material(Material::Stick)),
+                &empty_table,
+                center(layout.slots[0]),
+            ),
+            None,
+            "a closed screen never resolves a hover"
+        );
+
+        // Table targets are invisible to Player mode: their rects must not
+        // report a stack even when both grids are populated.
+        let populated_table = iron_pickaxe_grid();
+        for rect in &layout.table_grid {
+            assert_eq!(
+                hovered_item(
+                    InventoryMode::Player,
+                    &layout,
+                    &filled_inventory(),
+                    &empty_player,
+                    &populated_table,
+                    center(*rect),
+                ),
+                None,
+                "table cell {rect:?} unreachable in Player mode"
+            );
+        }
+        assert_eq!(
+            hovered_item(
+                InventoryMode::Player,
+                &layout,
+                &filled_inventory(),
+                &empty_player,
+                &populated_table,
+                center(layout.table_result),
+            ),
+            None,
+            "table result unreachable in Player mode"
+        );
+    }
+
+    #[test]
+    fn hover_reports_the_result_preview_output_item() {
+        let layout = layout(1280, 720, InventoryMode::Table);
+        let table_grid = iron_pickaxe_grid();
+        let hovered = hovered_item(
+            InventoryMode::Table,
+            &layout,
+            &Inventory::empty(),
+            &CraftingGrid::new(GridKind::Player),
+            &table_grid,
+            center(layout.table_result),
+        )
+        .expect("the iron pickaxe recipe is craftable");
+        assert_eq!(
+            hovered.id(),
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            }
+        );
+        assert_eq!(hovered.count(), 1);
+        assert_eq!(hovered.durability(), Some(250));
+
+        let no_recipe = full_grid(GridKind::Player, ItemId::Material(Material::Stick));
+        assert_eq!(
+            hovered_item(
+                InventoryMode::Player,
+                &layout,
+                &Inventory::empty(),
+                &no_recipe,
+                &CraftingGrid::new(GridKind::Table),
+                center(layout.player_result),
+            ),
+            None,
+            "an unmatched grid has no result item"
+        );
+    }
+
+    #[test]
+    fn tooltip_lines_cover_name_count_and_durability() {
+        assert_eq!(tooltip_lines(stone(1)), vec!["Stone"]);
+        assert_eq!(tooltip_lines(stone(3)), vec!["Stone", "x3"]);
+
+        let pickaxe = Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 249)
+            .expect("worn iron pickaxe is valid");
+        assert_eq!(
+            tooltip_lines(pickaxe),
+            vec!["Iron Pickaxe", "Durability 249/250"]
+        );
+
+        // A tool at full durability still reports its durability line; tools
+        // never report a count line because they are non-stackable.
+        let fresh = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Axe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("fresh tool is valid");
+        assert_eq!(tooltip_lines(fresh), vec!["Wood Axe", "Durability 59/59"]);
+    }
+
+    #[test]
+    fn tooltip_rect_places_right_and_below_when_room_allows() {
+        let rect = tooltip_rect((100.0, 100.0), 50.0, 2, 1280, 720);
+        assert_eq!(rect.0, 112.0);
+        assert_eq!(rect.1, 112.0);
+        assert_eq!(rect.2, 50.0 + 2.0 * TOOLTIP_PAD_X);
+        assert_eq!(rect.3, 2.0 * LABEL_LINE_HEIGHT + 2.0 * TOOLTIP_PAD_Y);
+        assert_inside_surface(rect, 1280, 720, "right/below placement");
+    }
+
+    #[test]
+    fn tooltip_rect_flips_and_stays_inside_at_every_corner_and_edge() {
+        let anchors = [
+            (0.0, 0.0),
+            (1280.0, 0.0),
+            (0.0, 720.0),
+            (1280.0, 720.0),
+            (1279.0, 360.0),
+            (0.0, 360.0),
+            (640.0, 719.0),
+            (640.0, 0.0),
+            (1270.0, 710.0),
+        ];
+        for anchor in anchors {
+            let rect = tooltip_rect(anchor, 180.0, 3, 1280, 720);
+            assert_inside_surface(rect, 1280, 720, &format!("anchor {anchor:?}"));
+            // Near the right/bottom edge the box must sit on the far side of
+            // the cursor rather than merely being clamped on top of it.
+            if anchor.0 + TOOLTIP_OFFSET + rect.2 > 1280.0 {
+                assert!(
+                    rect.0 + rect.2 <= anchor.0 + 1e-4,
+                    "anchor {anchor:?} flips the tooltip left: {rect:?}"
+                );
+            }
+            if anchor.1 + TOOLTIP_OFFSET + rect.3 > 720.0 {
+                assert!(
+                    rect.1 + rect.3 <= anchor.1 + 1e-4,
+                    "anchor {anchor:?} flips the tooltip above: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rects_intersect_detects_positive_overlap_and_ignores_touching_edges() {
+        let box_rect = (10.0, 10.0, 40.0, 20.0);
+        assert!(rects_intersect(box_rect, (10.0, 10.0, 1.0, 1.0)));
+        assert!(rects_intersect(box_rect, (30.0, 20.0, 30.0, 20.0)));
+        assert!(!rects_intersect(box_rect, (50.0, 10.0, 5.0, 5.0)));
+        assert!(!rects_intersect(box_rect, (10.0, 30.0, 5.0, 5.0)));
+        assert!(!rects_intersect(box_rect, (0.0, 0.0, 10.0, 10.0)));
+        assert!(!rects_intersect(box_rect, (f32::NAN, 0.0, 10.0, 10.0)));
+    }
+
+    #[test]
+    fn tooltip_rect_is_finite_on_tiny_surfaces_and_non_finite_width() {
+        for (w, h) in [(0, 0), (1, 1), (2, 2), (8, 8)] {
+            for width in [0.0, 50.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let rect = tooltip_rect((0.5, 0.5), width, 3, w, h);
+                assert_inside_surface(rect, w, h, &format!("{w}x{h} width {width}"));
+                assert!(
+                    rect.2 <= w.max(1) as f32 + 1e-4,
+                    "width is capped to the surface"
+                );
+                assert!(
+                    rect.3 <= h.max(1) as f32 + 1e-4,
+                    "height is capped to the surface"
+                );
+            }
+        }
+
+        // A non-finite anchor must not poison the geometry either.
+        for anchor in [
+            (f32::NAN, 10.0),
+            (10.0, f32::NAN),
+            (f32::INFINITY, f32::NEG_INFINITY),
+        ] {
+            let rect = tooltip_rect(anchor, 40.0, 1, 640, 480);
+            assert_inside_surface(rect, 640, 480, &format!("anchor {anchor:?}"));
         }
     }
 }

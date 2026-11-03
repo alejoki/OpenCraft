@@ -12,27 +12,31 @@
 # settings.toml, and packs/ are never touched):
 #   0. Doc reader-test gate, no launch: docs/TEXTURE-PACKS.md exists, its
 #      `## Quickstart` ```toml block extracts non-empty with `name =` and
-#      `overlay_tint`, and all 23 block layer names, all 13 mob layer names,
+#      `overlay_tint`, and all 25 block layer names, all 13 mob layer names,
 #      and all 9 sound stems appear in the guide.
 #   1. Selected pack + persistence: a `[packs]`-only settings.toml selects
 #      "demo", whose pack.toml is the extracted Quickstart block verbatim.
-#      The pack also ships a valid hand-crafted break.wav + mob_hurt.wav and
-#      a corrupt ui_click.wav + arrow_impact.wav, so both block and mob sound
-#      overrides are exercised on every launch. Two bounded launches must
-#      survive; settings.toml, pack.toml, and all four sound files must be
-#      byte-identical after each run (settings persist without rewrite, and
-#      the game is read-only on packs/).
-#   2. Corrupt pack: junk pack.toml plus junk stone.png, junk place.wav, and
-#      junk mob_death.wav under a selected "broken" pack degrade per file —
-#      launch survives and every file stays byte-identical.
+#      The pack also ships valid crafting_table_top.png / crafting_table_side.png
+#      with distinct pixels, a valid hand-crafted break.wav + mob_hurt.wav and
+#      a corrupt ui_click.wav + arrow_impact.wav, so block texture, block and
+#      mob sound overrides are exercised on every launch. Two bounded launches
+#      must survive; settings.toml, pack.toml, the two table PNGs, and all four
+#      sound files must be byte-identical after each run (settings persist
+#      without rewrite, and the game is read-only on packs/).
+#   2. Corrupt pack: junk pack.toml plus junk stone.png and
+#      crafting_table_top.png, junk place.wav, and junk mob_death.wav under a
+#      selected "broken" pack degrade per file — launch survives and every file
+#      stays byte-identical.
 #   3. Missing pack: settings point at "ghost" with no packs/ directory —
 #      launch survives on the Default fallback and creates no packs/.
 #
-# Dependencies: bash, timeout, cmp, mktemp, grep, awk. No PNG generation is
-# needed: a manifest-only pack is valid, and missing layer files are a legal
-# silent fallback in the loader contract. The valid WAV fixture is written
-# with printf (canonical 44-byte RIFF/PCM16 header plus 16 payload bytes), so
-# no audio encoder is required either.
+# Dependencies: bash, timeout, cmp, mktemp, grep, awk, base64. Missing layer
+# files are a legal silent fallback in the loader contract, so most of the
+# fixture is manifest-only. The two table PNGs are decoded from embedded
+# base64 blobs of valid 16x16 RGBA PNGs (distinct solid colours), so no PNG
+# encoder is required. The valid WAV fixture is written with printf (canonical
+# 44-byte RIFF/PCM16 header plus 16 payload bytes), so no audio encoder is
+# required either.
 
 set -u
 
@@ -66,7 +70,7 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
-for tool in timeout cmp mktemp grep awk; do
+for tool in timeout cmp mktemp grep awk base64; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool '$tool' not found on PATH"
 done
 
@@ -108,6 +112,18 @@ run_bounded_launch() {
 
     return 0
 }
+
+# Write a valid 16x16 RGBA PNG from an embedded base64 blob to $1. The two
+# blobs below are distinct solid colours, so identical bytes mean the game
+# rewrote the file and differing bytes prove the table textures stay distinct.
+write_valid_png() {
+    local path="$1"
+    local payload="$2"
+    printf '%s' "$payload" | base64 -d > "$path" || return 1
+}
+
+PNG_CRAFTING_TABLE_TOP="iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAFklEQVR42mOYFGdCEmIY1TCqYfhqAACbQSQQed1/SQAAAABJRU5ErkJggg=="
+PNG_CRAFTING_TABLE_SIDE="iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAFklEQVR42mPIcFAhCTGMahjVMHw1AAC5WMwBaEzwLQAAAABJRU5ErkJggg=="
 
 # Write a minimal canonical PCM16 mono WAV to $1: 44-byte RIFF header, 8000 Hz,
 # 8 samples (16 data bytes). Hand-crafted in bash so the harness needs no
@@ -164,6 +180,8 @@ LAYERS=(
     wheat_stage3.png
     chest.png
     loot_chest.png
+    crafting_table_top.png
+    crafting_table_side.png
 )
 for layer in "${LAYERS[@]}"; do
     grep -Fq "$layer" "$DOC" || fail "scenario 0: guide does not document layer '$layer'"
@@ -205,7 +223,7 @@ for sound in "${SOUNDS[@]}"; do
     grep -Fq "$sound" "$DOC" || fail "scenario 0: guide does not document sound stem '$sound'"
 done
 
-echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with name/overlay_tint and all 23 block layer names, 13 mob layer names, and 9 sound stems documented"
+echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with name/overlay_tint and all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: selected pack + persistence across relaunch.
@@ -218,6 +236,9 @@ cat > "$TEMP_DIR_A/settings.toml" <<'EOF'
 texture_pack = "demo"
 EOF
 cp "$QUICKSTART_TOML" "$TEMP_DIR_A/packs/demo/pack.toml" || fail "scenario 1: cannot seed pack.toml"
+write_valid_png "$TEMP_DIR_A/packs/demo/crafting_table_top.png" "$PNG_CRAFTING_TABLE_TOP" || fail "scenario 1: cannot seed valid crafting_table_top.png"
+write_valid_png "$TEMP_DIR_A/packs/demo/crafting_table_side.png" "$PNG_CRAFTING_TABLE_SIDE" || fail "scenario 1: cannot seed valid crafting_table_side.png"
+cmp -s "$TEMP_DIR_A/packs/demo/crafting_table_top.png" "$TEMP_DIR_A/packs/demo/crafting_table_side.png" && fail "scenario 1: table texture fixtures must have distinct pixels"
 write_valid_wav "$TEMP_DIR_A/packs/demo/break.wav" || fail "scenario 1: cannot seed valid break.wav"
 write_valid_wav "$TEMP_DIR_A/packs/demo/mob_hurt.wav" || fail "scenario 1: cannot seed valid mob_hurt.wav"
 printf 'not audio at all\n' > "$TEMP_DIR_A/packs/demo/ui_click.wav" || fail "scenario 1: cannot seed corrupt ui_click.wav"
@@ -227,6 +248,8 @@ EXPECTED_DIR_A="$TEMP_DIR_A/expected"
 mkdir -p "$EXPECTED_DIR_A" || fail "scenario 1: cannot create expected/ dir"
 cp "$TEMP_DIR_A/settings.toml" "$EXPECTED_DIR_A/settings.toml" || fail "scenario 1: cannot snapshot settings.toml"
 cp "$TEMP_DIR_A/packs/demo/pack.toml" "$EXPECTED_DIR_A/pack.toml" || fail "scenario 1: cannot snapshot pack.toml"
+cp "$TEMP_DIR_A/packs/demo/crafting_table_top.png" "$EXPECTED_DIR_A/crafting_table_top.png" || fail "scenario 1: cannot snapshot crafting_table_top.png"
+cp "$TEMP_DIR_A/packs/demo/crafting_table_side.png" "$EXPECTED_DIR_A/crafting_table_side.png" || fail "scenario 1: cannot snapshot crafting_table_side.png"
 cp "$TEMP_DIR_A/packs/demo/break.wav" "$EXPECTED_DIR_A/break.wav" || fail "scenario 1: cannot snapshot break.wav"
 cp "$TEMP_DIR_A/packs/demo/mob_hurt.wav" "$EXPECTED_DIR_A/mob_hurt.wav" || fail "scenario 1: cannot snapshot mob_hurt.wav"
 cp "$TEMP_DIR_A/packs/demo/ui_click.wav" "$EXPECTED_DIR_A/ui_click.wav" || fail "scenario 1: cannot snapshot ui_click.wav"
@@ -237,6 +260,8 @@ run_bounded_launch "$TEMP_DIR_A" "$TEMP_DIR_A/output-1.log" "scenario 1 launch 1
 [[ -f "$TEMP_DIR_A/settings.toml" ]] || fail "scenario 1: settings.toml missing after launch 1"
 cmp -s "$TEMP_DIR_A/settings.toml" "$EXPECTED_DIR_A/settings.toml" || fail "scenario 1: settings.toml was rewritten during launch 1"
 cmp -s "$TEMP_DIR_A/packs/demo/pack.toml" "$EXPECTED_DIR_A/pack.toml" || fail "scenario 1: packs/demo/pack.toml was rewritten during launch 1"
+cmp -s "$TEMP_DIR_A/packs/demo/crafting_table_top.png" "$EXPECTED_DIR_A/crafting_table_top.png" || fail "scenario 1: packs/demo/crafting_table_top.png was rewritten during launch 1"
+cmp -s "$TEMP_DIR_A/packs/demo/crafting_table_side.png" "$EXPECTED_DIR_A/crafting_table_side.png" || fail "scenario 1: packs/demo/crafting_table_side.png was rewritten during launch 1"
 cmp -s "$TEMP_DIR_A/packs/demo/break.wav" "$EXPECTED_DIR_A/break.wav" || fail "scenario 1: packs/demo/break.wav was rewritten during launch 1"
 cmp -s "$TEMP_DIR_A/packs/demo/mob_hurt.wav" "$EXPECTED_DIR_A/mob_hurt.wav" || fail "scenario 1: packs/demo/mob_hurt.wav was rewritten during launch 1"
 cmp -s "$TEMP_DIR_A/packs/demo/ui_click.wav" "$EXPECTED_DIR_A/ui_click.wav" || fail "scenario 1: packs/demo/ui_click.wav was rewritten during launch 1"
@@ -249,12 +274,14 @@ run_bounded_launch "$TEMP_DIR_A" "$TEMP_DIR_A/output-2.log" "scenario 1 relaunch
 [[ -f "$TEMP_DIR_A/settings.toml" ]] || fail "scenario 1: settings.toml missing after relaunch"
 cmp -s "$TEMP_DIR_A/settings.toml" "$EXPECTED_DIR_A/settings.toml" || fail "scenario 1: settings.toml changed across relaunch (selection did not persist unchanged)"
 cmp -s "$TEMP_DIR_A/packs/demo/pack.toml" "$EXPECTED_DIR_A/pack.toml" || fail "scenario 1: packs/demo/pack.toml was rewritten during relaunch"
+cmp -s "$TEMP_DIR_A/packs/demo/crafting_table_top.png" "$EXPECTED_DIR_A/crafting_table_top.png" || fail "scenario 1: packs/demo/crafting_table_top.png was rewritten during relaunch"
+cmp -s "$TEMP_DIR_A/packs/demo/crafting_table_side.png" "$EXPECTED_DIR_A/crafting_table_side.png" || fail "scenario 1: packs/demo/crafting_table_side.png was rewritten during relaunch"
 cmp -s "$TEMP_DIR_A/packs/demo/break.wav" "$EXPECTED_DIR_A/break.wav" || fail "scenario 1: packs/demo/break.wav was rewritten during relaunch"
 cmp -s "$TEMP_DIR_A/packs/demo/mob_hurt.wav" "$EXPECTED_DIR_A/mob_hurt.wav" || fail "scenario 1: packs/demo/mob_hurt.wav was rewritten during relaunch"
 cmp -s "$TEMP_DIR_A/packs/demo/ui_click.wav" "$EXPECTED_DIR_A/ui_click.wav" || fail "scenario 1: packs/demo/ui_click.wav was rewritten during relaunch"
 cmp -s "$TEMP_DIR_A/packs/demo/arrow_impact.wav" "$EXPECTED_DIR_A/arrow_impact.wav" || fail "scenario 1: packs/demo/arrow_impact.wav was rewritten during relaunch"
 
-echo "PACK SMOKE PASS: scenario 1 (selected pack + persistence) — two 10s launches with texture_pack = \"demo\" plus valid break.wav and mob_hurt.wav and corrupt ui_click.wav and arrow_impact.wav, exit 124, no panic, settings.toml, pack.toml, and all four sound files byte-identical after each run"
+echo "PACK SMOKE PASS: scenario 1 (selected pack + persistence) — two 10s launches with texture_pack = \"demo\" plus distinct valid crafting_table_top.png / crafting_table_side.png, valid break.wav and mob_hurt.wav, and corrupt ui_click.wav and arrow_impact.wav, exit 124, no panic, settings.toml, pack.toml, both table PNGs, and all four sound files byte-identical after each run"
 
 # ---------------------------------------------------------------------------
 # Scenario 2: corrupt pack. Junk manifest and junk PNG layer must degrade
@@ -267,6 +294,7 @@ texture_pack = "broken"
 EOF
 printf 'this is not a valid toml manifest [[\n' > "$TEMP_DIR_B/packs/broken/pack.toml" || fail "scenario 2: cannot seed corrupt pack.toml"
 printf 'not a png at all\n' > "$TEMP_DIR_B/packs/broken/stone.png" || fail "scenario 2: cannot seed corrupt stone.png"
+printf 'still not a png\n' > "$TEMP_DIR_B/packs/broken/crafting_table_top.png" || fail "scenario 2: cannot seed corrupt crafting_table_top.png"
 printf 'junk sound bytes, not a wav\n' > "$TEMP_DIR_B/packs/broken/place.wav" || fail "scenario 2: cannot seed corrupt place.wav"
 printf 'junk mob death bytes, not a wav\n' > "$TEMP_DIR_B/packs/broken/mob_death.wav" || fail "scenario 2: cannot seed corrupt mob_death.wav"
 
@@ -274,6 +302,7 @@ EXPECTED_DIR_B="$TEMP_DIR_B/expected"
 mkdir -p "$EXPECTED_DIR_B" || fail "scenario 2: cannot create expected/ dir"
 cp "$TEMP_DIR_B/packs/broken/pack.toml" "$EXPECTED_DIR_B/pack.toml" || fail "scenario 2: cannot snapshot corrupt pack.toml"
 cp "$TEMP_DIR_B/packs/broken/stone.png" "$EXPECTED_DIR_B/stone.png" || fail "scenario 2: cannot snapshot corrupt stone.png"
+cp "$TEMP_DIR_B/packs/broken/crafting_table_top.png" "$EXPECTED_DIR_B/crafting_table_top.png" || fail "scenario 2: cannot snapshot corrupt crafting_table_top.png"
 cp "$TEMP_DIR_B/packs/broken/place.wav" "$EXPECTED_DIR_B/place.wav" || fail "scenario 2: cannot snapshot corrupt place.wav"
 cp "$TEMP_DIR_B/packs/broken/mob_death.wav" "$EXPECTED_DIR_B/mob_death.wav" || fail "scenario 2: cannot snapshot corrupt mob_death.wav"
 
@@ -281,10 +310,11 @@ run_bounded_launch "$TEMP_DIR_B" "$TEMP_DIR_B/output.log" "scenario 2" || exit 1
 
 cmp -s "$TEMP_DIR_B/packs/broken/pack.toml" "$EXPECTED_DIR_B/pack.toml" || fail "scenario 2: corrupt pack.toml was rewritten during the run"
 cmp -s "$TEMP_DIR_B/packs/broken/stone.png" "$EXPECTED_DIR_B/stone.png" || fail "scenario 2: corrupt stone.png was rewritten during the run"
+cmp -s "$TEMP_DIR_B/packs/broken/crafting_table_top.png" "$EXPECTED_DIR_B/crafting_table_top.png" || fail "scenario 2: corrupt crafting_table_top.png was rewritten during the run"
 cmp -s "$TEMP_DIR_B/packs/broken/place.wav" "$EXPECTED_DIR_B/place.wav" || fail "scenario 2: corrupt place.wav was rewritten during the run"
 cmp -s "$TEMP_DIR_B/packs/broken/mob_death.wav" "$EXPECTED_DIR_B/mob_death.wav" || fail "scenario 2: corrupt mob_death.wav was rewritten during the run"
 
-echo "PACK SMOKE PASS: scenario 2 (corrupt pack) — junk pack.toml, junk stone.png, junk place.wav, and junk mob_death.wav fell back per file, exit 124, no panic, all files byte-identical"
+echo "PACK SMOKE PASS: scenario 2 (corrupt pack) — junk pack.toml, junk stone.png, junk crafting_table_top.png, junk place.wav, and junk mob_death.wav fell back per file, exit 124, no panic, all files byte-identical"
 
 # ---------------------------------------------------------------------------
 # Scenario 3: missing pack. The selection names a folder that does not exist

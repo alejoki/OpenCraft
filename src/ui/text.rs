@@ -80,16 +80,54 @@ impl StatsOverlay {
             .fold(0.0, f32::max)
     }
 
-    /// Build the glyphon text area for this overlay. `left`/`top` are physical
-    /// pixels from the surface's top-left corner.
+    /// Build the glyphon text area for this overlay with the historical
+    /// opaque-white default color. `left`/`top` are physical pixels from the
+    /// surface's top-left corner.
     pub fn text_area(&self, left: f32, top: f32) -> TextArea<'_> {
+        self.text_area_with_color(left, top, Color::rgba(255, 255, 255, 255))
+    }
+
+    /// Build the glyphon text area with an explicit default color.
+    ///
+    /// Alpha rides in [`glyphon::Color`], so the transient selected-item name
+    /// can fade through the existing UI text pass without a second pipeline.
+    /// Every existing caller keeps [`StatsOverlay::text_area`] and therefore
+    /// keeps the opaque-white default unchanged.
+    pub fn text_area_with_color(&self, left: f32, top: f32, default_color: Color) -> TextArea<'_> {
         TextArea {
             buffer: &self.buffer,
             left,
             top,
             scale: 1.0,
             bounds: glyphon::TextBounds::default(),
-            default_color: Color::rgba(255, 255, 255, 255),
+            default_color,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_area_with_color_preserves_the_white_default_and_carries_alpha() {
+        let mut font_system = glyphon::FontSystem::new();
+        let overlay = StatsOverlay::new(&mut font_system);
+
+        // The historical constructor is unchanged: opaque white.
+        let white = overlay.text_area(4.0, 6.0);
+        assert_eq!(white.default_color, Color::rgba(255, 255, 255, 255));
+        assert_eq!((white.left, white.top, white.scale), (4.0, 6.0, 1.0));
+        assert!(
+            std::ptr::eq(white.buffer, &overlay.buffer),
+            "the area borrows the same buffer"
+        );
+
+        // The colored variant carries both tint and alpha through glyphon.
+        let tinted = overlay.text_area_with_color(10.0, 12.0, Color::rgba(200, 100, 50, 128));
+        assert_eq!(tinted.default_color, Color::rgba(200, 100, 50, 128));
+        assert_eq!(tinted.default_color.as_rgba(), [200, 100, 50, 128]);
+        assert_eq!((tinted.left, tinted.top), (10.0, 12.0));
+        assert_eq!(tinted.bounds, glyphon::TextBounds::default());
     }
 }
