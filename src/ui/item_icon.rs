@@ -23,6 +23,7 @@ use wgpu::util::DeviceExt;
 
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
 use super::inventory::{InventoryLayout, InventoryMode, Rect};
+use super::palette::{self, PaletteLayout, PaletteScreen};
 use crate::content::{ContentRegistry, PACK_ICON_BASE, PACK_ICON_CAP};
 use crate::player::inventory::{
     CraftingGrid, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
@@ -1138,6 +1139,50 @@ pub fn hotbar_icon_vertices_with(
         let icon_slot = hotbar_icon_rect(*rect);
         out.push_item(inventory.hotbar(slot), icon_slot, surface_w, surface_h);
     }
+    out
+}
+
+/// Item icons for the visible Creative palette grid.
+///
+/// `None` is exactly the registry-free behavior; `Some` clones the frozen
+/// session registry once into the batch so pack blocks/items resolve through
+/// their authored icons. A closed screen returns an empty batch, so the
+/// palette can never change any pre-M010 pinned UI digest while it is closed.
+/// Construction failures (a malformed identity) are ignored rather than
+/// drawing a ghost icon.
+pub fn palette_icon_vertices_with(
+    registry: Option<&Arc<ContentRegistry>>,
+    screen: &PaletteScreen,
+    layout: &PaletteLayout,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    let mut out = match registry {
+        Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
+        None => IconDrawList::new(),
+    };
+    if !screen.is_open() {
+        return out;
+    }
+
+    for (visible, filtered_index) in screen
+        .filtered()
+        .iter()
+        .copied()
+        .skip(screen.scroll())
+        .take(palette::PALETTE_VISIBLE)
+        .enumerate()
+    {
+        let Some(entry) = screen.filtered_entry(filtered_index) else {
+            continue;
+        };
+        let item = match registry {
+            Some(registry) => Item::new_with(registry, entry.id, 1).ok(),
+            None => Item::new(entry.id, 1).ok(),
+        };
+        out.push_item(item, layout.slots[visible], surface_w, surface_h);
+    }
+
     out
 }
 
@@ -3026,5 +3071,97 @@ mod tests {
         let mut with_registry = IconDrawList::with_registry(registry);
         with_registry.push_item(Some(item(ItemId::Block(BlockId::OakLog))), SLOT, 800, 600);
         assert_eq!(layers(&plain), layers(&with_registry));
+    }
+
+    // -----------------------------------------------------------------------
+    // Creative palette icons (M010/S07-T03)
+    // -----------------------------------------------------------------------
+
+    /// The checked-in reference pack through the same production mapping as
+    /// `main.rs::build_session_registry`.
+    fn reference_registry() -> ContentRegistry {
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let pack = (
+            PackIdentity {
+                folder: spec.folder.clone(),
+                version: spec.version.clone(),
+            },
+            spec.content.clone(),
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    #[test]
+    fn palette_icons_are_empty_while_the_screen_is_closed() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let screen = PaletteScreen::new();
+        let layout = palette::layout(1280, 720);
+
+        assert!(
+            palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720).is_empty()
+        );
+        assert!(palette_icon_vertices_with(None, &screen, &layout, 1280, 720).is_empty());
+    }
+
+    #[test]
+    fn open_builtin_palette_emits_block_and_sprite_icons() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            !icons.block.is_empty(),
+            "built-in carryable blocks must draw cube icons"
+        );
+        assert!(
+            !icons.sprite.is_empty(),
+            "built-in materials/tools must draw sprite icons"
+        );
+        for vertex in icons.block.iter().chain(icons.sprite.iter()) {
+            assert!(vertex.clip_pos.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn palette_icons_resolve_pack_blocks_and_items_through_the_registry() {
+        let registry = Arc::new(reference_registry());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        assert!(
+            screen
+                .entries()
+                .iter()
+                .any(|entry| entry.name == "mymod:ruby_ore"),
+            "the pack block must be listed"
+        );
+        assert!(
+            screen
+                .entries()
+                .iter()
+                .any(|entry| entry.name == "mymod:ruby"),
+            "the pack item must be listed"
+        );
+
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            icons
+                .block
+                .iter()
+                .any(|vertex| vertex.layer >= u32::from(PACK_LAYER_BASE)),
+            "the pack block icon must sample a registry-authored layer"
+        );
+        assert!(
+            icons
+                .sprite
+                .iter()
+                .any(|vertex| vertex.layer >= u32::from(PACK_ICON_BASE)),
+            "the pack item/tool icons must sample registry-authored layers"
+        );
     }
 }

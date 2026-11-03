@@ -61,11 +61,12 @@ use opencraft::ui::inventory::{
 };
 use opencraft::ui::item_icon::{
     compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
-    IconDrawList,
+    palette_icon_vertices_with, IconDrawList,
 };
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::packs;
+use opencraft::ui::palette::{self, PaletteScreen, MAX_PALETTE_LABELS};
 use opencraft::ui::screens::{
     death_cause_line, death_panel_rect, death_row_rect, delete_prompt_line, format_row_line,
     hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
@@ -1006,6 +1007,84 @@ fn close_inventory(
     set_cursor_grab(window, true);
 }
 
+/// Opens the searchable Creative palette and releases the pointer to it.
+///
+/// Mirrors [`open_inventory`]: the session registry is frozen (MEM512), so the
+/// entry stock is cached once here rather than rebuilt per frame. Every
+/// gameplay hold is dropped so a held mouse button cannot mine behind the
+/// screen. A free function for the same disjoint-borrow reason (P005).
+#[allow(clippy::too_many_arguments)]
+fn open_palette(
+    screen: &mut PaletteScreen,
+    registry: &Arc<ContentRegistry>,
+    status: &mut Option<String>,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    bow: &mut BowState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.open(registry);
+    *status = None;
+    input.reset();
+    reset_panel_holds(mining, eating, bow);
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *cursor_grabbed = false;
+    set_cursor_grab(window, false);
+}
+
+/// Closes the Creative palette and restores gameplay input ownership.
+///
+/// Escape is the only close path while the palette is open; it re-grabs the
+/// cursor exactly like [`close_inventory`] and clears every hold so no stale
+/// press survives the screen boundary.
+#[allow(clippy::too_many_arguments)]
+fn close_palette(
+    screen: &mut PaletteScreen,
+    status: &mut Option<String>,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    bow: &mut BowState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.close();
+    *status = None;
+    input.reset();
+    reset_panel_holds(mining, eating, bow);
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *cursor_grabbed = true;
+    set_cursor_grab(window, true);
+}
+
+/// Grants the palette entry under `cursor` into the hotbar.
+///
+/// Pure apart from the player inventory mutation: the hit test and filtered
+/// entry resolution come from `ui::palette`, and the grant path is the T02
+/// `Player::grant_palette_item_with` (authored stack limit, exactly one hotbar
+/// slot, granted slot selected). Returns `None` for a closed screen, empty
+/// space, or an entry the registry refuses, so the caller reports one status
+/// line and never mutates on a miss.
+fn apply_palette_click(
+    player: &mut Player,
+    registry: &ContentRegistry,
+    screen: &PaletteScreen,
+    layout: &palette::PaletteLayout,
+    cursor: Option<(f32, f32)>,
+) -> Option<(usize, Item)> {
+    let index = palette::hit_test(screen, layout, cursor?)?;
+    let entry = screen.filtered_entry(index)?;
+    player.grant_palette_item_with(registry, entry.id).ok()
+}
+
 /// Which mouse button issued an inventory command.
 ///
 /// Left is whole-stack movement; right is the split-half / place-one
@@ -1297,8 +1376,13 @@ fn chest_should_close(screen: &ChestScreen, open_chest: Option<IVec3>) -> bool {
 /// gameplay panel open. One helper keeps the redraw `gameplay` gate and every
 /// input guard in agreement, so a panel can never leak a key, wheel, or click
 /// into the world while still freezing movement.
-fn gameplay_surface(playing: bool, inventory_open: bool, chest_open: bool) -> bool {
-    playing && !inventory_open && !chest_open
+fn gameplay_surface(
+    playing: bool,
+    inventory_open: bool,
+    chest_open: bool,
+    palette_open: bool,
+) -> bool {
+    playing && !inventory_open && !chest_open && !palette_open
 }
 
 /// Backing-panel rect for the transient gameplay notice, in physical pixels.
@@ -1363,9 +1447,10 @@ fn selected_name_should_draw(
     playing: bool,
     inventory_open: bool,
     chest_open: bool,
+    palette_open: bool,
     label: &SelectionLabel,
 ) -> bool {
-    playing && !inventory_open && !chest_open && label.is_visible()
+    playing && !inventory_open && !chest_open && !palette_open && label.is_visible()
 }
 
 /// glyphon default color for the selected-name label at `alpha`.
@@ -2149,6 +2234,9 @@ struct Ready {
     /// Chest panel labels (S03-T05): same change-gated pattern, sized once to
     /// the pure `MAX_CHEST_LABELS` bound so no frame allocates a text buffer.
     chest_labels: Vec<StatsOverlay>,
+    /// Creative palette labels (S07-T03): same change-gated pattern, sized once
+    /// to the pure `MAX_PALETTE_LABELS` bound. A closed palette draws none.
+    palette_labels: Vec<StatsOverlay>,
 }
 
 /// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
@@ -8104,6 +8192,14 @@ struct GameApp {
     /// Last chest-click status line, read by the T04 renderer as the footer
     /// message; `None` until the first click of a session.
     chest_status: Option<String>,
+    /// Searchable Creative palette (S07-T03): the T01 pure screen. Open only
+    /// while the lifecycle screen is Playing, and only in Creative mode. The
+    /// entry stock is cached from the frozen session registry at open time.
+    palette: PaletteScreen,
+    /// Last palette grant status line. Mirrors `inventory_status`, but the
+    /// pure `screen_labels` footer reads the screen's own status slot, so the
+    /// render pass syncs this field into it before building labels.
+    palette_status: Option<String>,
     /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
     /// under the player is reported here while still Playing. Same tick-counter
     /// pattern as the screen messages, but it renders above the hotbar instead
@@ -8503,6 +8599,8 @@ impl GameApp {
             inventory_drag: None,
             chest: ChestScreen::new(),
             chest_status: None,
+            palette: PaletteScreen::new(),
+            palette_status: None,
             game_message: startup_content_notice.map(|text| MenuMessage {
                 text,
                 ticks_left: menu::MESSAGE_TICKS,
@@ -8792,6 +8890,8 @@ impl GameApp {
         self.inventory_drag = None;
         self.chest.close();
         self.chest_status = None;
+        self.palette.close();
+        self.palette_status = None;
         self.game_message = None;
         self.session.close_chest();
         self.cursor_grabbed = false;
@@ -8840,6 +8940,8 @@ impl GameApp {
         self.bow.reset();
         self.melee.reset();
         self.pause_message = None;
+        self.palette.close();
+        self.palette_status = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, true);
@@ -8997,6 +9099,8 @@ impl GameApp {
         self.inventory_drag = None;
         self.chest.close();
         self.chest_status = None;
+        self.palette.close();
+        self.palette_status = None;
         self.game_message = None;
         // The installed session owns the registry every save names content
         // through: a loaded world keeps its placeholder-augmented registry, a
@@ -9779,6 +9883,17 @@ impl ApplicationHandler for GameApp {
                 )
             })
             .collect();
+        // Creative palette labels (S07-T03): same overlay type and metrics,
+        // sized once to the pure palette label bound.
+        let palette_labels = (0..MAX_PALETTE_LABELS)
+            .map(|_| {
+                StatsOverlay::with_metrics(
+                    &mut ui.font_system,
+                    HOTBAR_COUNT_FONT_SIZE,
+                    HOTBAR_COUNT_LINE_HEIGHT,
+                )
+            })
+            .collect();
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -9816,6 +9931,7 @@ impl ApplicationHandler for GameApp {
             hotbar_counts,
             inventory_labels,
             chest_labels,
+            palette_labels,
         });
     }
 
@@ -10011,6 +10127,94 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Palette owns the keyboard while open (S07-T03):
+                    // every press and release is consumed, so E/C can only
+                    // type, no digit/movement/F5 binding can fire through the
+                    // screen, and Escape is the only close path. This block
+                    // sits after the inventory/chest early returns and before
+                    // the gameplay match, including its Escape arm.
+                    if self.palette.is_open() {
+                        if !pressed {
+                            return;
+                        }
+                        if event.repeat {
+                            return;
+                        }
+                        match code {
+                            KeyCode::Escape => {
+                                close_palette(
+                                    &mut self.palette,
+                                    &mut self.palette_status,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
+                                    &mut self.mining,
+                                    &mut self.eating,
+                                    &mut self.bow,
+                                    &mut self.cursor_grabbed,
+                                    window,
+                                );
+                            }
+                            KeyCode::Enter => {
+                                if let Some(entry) = self.palette.selected_entry().cloned() {
+                                    match self
+                                        .session
+                                        .player
+                                        .grant_palette_item_with(&self.session_registry, entry.id)
+                                    {
+                                        Ok((slot, _)) => {
+                                            self.palette_status = Some(format!(
+                                                "Added {} to slot {}",
+                                                entry.display_name,
+                                                slot + 1
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            self.palette_status = Some(format!(
+                                                "Cannot add {}: {error:?}",
+                                                entry.display_name
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::ArrowUp => self.palette.move_selection(-1),
+                            KeyCode::ArrowDown => self.palette.move_selection(1),
+                            KeyCode::PageUp => self.palette.scroll_by(-9),
+                            KeyCode::PageDown => self.palette.scroll_by(9),
+                            KeyCode::Backspace => {
+                                self.palette.apply(TextInputAction::Backspace);
+                            }
+                            KeyCode::Delete => {
+                                self.palette.apply(TextInputAction::Delete);
+                            }
+                            KeyCode::ArrowLeft => {
+                                self.palette.apply(TextInputAction::MoveLeft);
+                            }
+                            KeyCode::ArrowRight => {
+                                self.palette.apply(TextInputAction::MoveRight);
+                            }
+                            KeyCode::Home => {
+                                self.palette.apply(TextInputAction::Home);
+                            }
+                            KeyCode::End => {
+                                self.palette.apply(TextInputAction::End);
+                            }
+                            _ => {
+                                if let Some(text) = event.text.as_deref() {
+                                    let printable: String = text
+                                        .chars()
+                                        .filter(|character| !character.is_control())
+                                        .collect();
+                                    if !printable.is_empty() {
+                                        self.palette.apply(TextInputAction::InsertText(printable));
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+
                     match code {
                         // E opens the 9+27 inventory with the 2x2 player grid
                         // (S03-T03). When a table station is already open the
@@ -10081,6 +10285,27 @@ impl ApplicationHandler for GameApp {
                         KeyCode::Digit9 if pressed => {
                             self.session.player.select_slot(8);
                         }
+                        // Creative palette (S07-T03): a documented,
+                        // non-rebindable utility key beside F/F5/digits.
+                        // Survival stays silent — no message, no empty panel
+                        // — because the palette is a Creative capability.
+                        KeyCode::KeyC if pressed && !event.repeat => {
+                            if palette::available_in(self.session.player.mode()) {
+                                open_palette(
+                                    &mut self.palette,
+                                    &self.session_registry,
+                                    &mut self.palette_status,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
+                                    &mut self.mining,
+                                    &mut self.eating,
+                                    &mut self.bow,
+                                    &mut self.cursor_grabbed,
+                                    window,
+                                );
+                            }
+                        }
                         // Rebindable gameplay keys (S04-T03): press sets the
                         // InputState flag, release clears it — both
                         // transitions route through the loaded keybind map
@@ -10107,7 +10332,8 @@ impl ApplicationHandler for GameApp {
                 // consumed — the hotbar is gameplay state and no screen has
                 // a scroll action in this slice. Both gameplay panels consume
                 // it for the same reason (S03-T03/T05): no hotbar selection may
-                // change from inside a panel.
+                // change from inside a panel. The Creative palette consumes
+                // the wheel into its own scroll window instead of the hotbar.
                 if self.lifecycle.screen() != LifecycleScreen::Playing
                     || self.inventory.is_open()
                     || self.chest.is_open()
@@ -10135,7 +10361,11 @@ impl ApplicationHandler for GameApp {
                     }
                 };
                 if step != 0 {
-                    self.session.player.select_relative(step);
+                    if self.palette.is_open() {
+                        self.palette.scroll_by(step);
+                    } else {
+                        self.session.player.select_relative(step);
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -10143,6 +10373,18 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Palette release (S07-T03): the screen never transfers a
+                // stack on release, but clearing every hold keeps a press
+                // that started outside from surviving the close.
+                if self.palette.is_open() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    return;
+                }
                 // Inventory panel (S03-T03): a release resolves the drop for a
                 // press-drag-release gesture and always ends the gesture, so it
                 // can never reach gameplay. A same-cell or off-panel release
@@ -10239,6 +10481,16 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Right,
                 ..
             } => {
+                // Palette release (S07-T03): consume before `release_bow`, so
+                // a right press that never armed a draw cannot fire an arrow
+                // out of the palette.
+                if self.palette.is_open() {
+                    self.right_mouse_held = false;
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    return;
+                }
                 // A release can arrive while a menu owns the input, so this
                 // arm deliberately bypasses the screen routing (exactly like
                 // the Left release arm): clearing the right hold and any
@@ -10309,6 +10561,38 @@ impl ApplicationHandler for GameApp {
                         // tests); gpu is not touched after this call on
                         // this path.
                         self.screen_click(event_loop, button, surface_w, surface_h);
+                    }
+                    return;
+                }
+
+                // Palette press routing (S07-T03): before the click-to-re-grab branch.
+                // While open it owns every press: a left press grants exactly
+                // one authored stack (or reports empty space), a right press is
+                // inert but still consumed. No click can reach placement,
+                // mining arming, or the cursor re-grab below.
+                if self.palette.is_open() {
+                    if button == MouseButton::Left {
+                        let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        let layout = palette::layout(surface_w, surface_h);
+                        let clicked_name = self
+                            .cursor_pos
+                            .and_then(|cursor| palette::hit_test(&self.palette, &layout, cursor))
+                            .and_then(|index| self.palette.filtered_entry(index))
+                            .map(|entry| entry.display_name.clone());
+                        self.palette_status = match apply_palette_click(
+                            &mut self.session.player,
+                            &self.session_registry,
+                            &self.palette,
+                            &layout,
+                            self.cursor_pos,
+                        ) {
+                            Some((slot, _)) => Some(format!(
+                                "Added {} to slot {}",
+                                clicked_name.unwrap_or_else(|| "item".to_string()),
+                                slot + 1
+                            )),
+                            None => Some("No item under the cursor".to_string()),
+                        };
                     }
                     return;
                 }
@@ -10633,8 +10917,12 @@ impl ApplicationHandler for GameApp {
                 // raycast, and hold-to-mine, but NOT the world: time, station
                 // revalidation, streaming, and saves keep running so a panel
                 // opened next to a station cannot freeze the chunk pipeline.
-                let gameplay =
-                    gameplay_surface(playing, self.inventory.is_open(), self.chest.is_open());
+                let gameplay = gameplay_surface(
+                    playing,
+                    self.inventory.is_open(),
+                    self.chest.is_open(),
+                    self.palette.is_open(),
+                );
                 // Game time (S02-T04): advance only on Playing frames, before
                 // the player update, with the app-owned acceleration scale.
                 // The same two lines as `GameApp::tick_clock` (which the
@@ -11330,6 +11618,7 @@ impl ApplicationHandler for GameApp {
                     playing,
                     self.inventory.is_open(),
                     self.chest.is_open(),
+                    self.palette.is_open(),
                     &self.selection_label,
                 );
                 // Gameplay transient notice (S03-T05): a station that vanished
@@ -11432,6 +11721,20 @@ impl ApplicationHandler for GameApp {
                         self.session.open_chest_contents(),
                         self.session.player.inventory(),
                         self.session.player.inventory().cursor(),
+                        self.cursor_pos,
+                    ));
+                    Some(layout)
+                } else {
+                    None
+                };
+                // Palette quads/icons/text ride the single UI pass (S07-T03).
+                // A closed palette extends nothing, so every pre-M010 pinned
+                // digest stays byte-identical.
+                let palette_layout_value = if self.palette.is_open() {
+                    let layout = palette::layout(gpu.ctx.config.width, gpu.ctx.config.height);
+                    quads.extend(palette::screen_quads(
+                        &self.palette,
+                        &layout,
                         self.cursor_pos,
                     ));
                     Some(layout)
@@ -11567,6 +11870,15 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.config.height,
                     ));
                 }
+                if let Some(layout) = palette_layout_value.as_ref() {
+                    icons.append(palette_icon_vertices_with(
+                        Some(&self.session_registry),
+                        &self.palette,
+                        layout,
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ));
+                }
                 gpu.ui.set_icons(
                     &gpu.ctx.device,
                     &icons.block,
@@ -11649,6 +11961,31 @@ impl ApplicationHandler for GameApp {
                     );
                 }
 
+                // Palette panel labels (S07-T03): same two-pass borrow
+                // pattern. The pure screen footer reads `PaletteScreen::status`,
+                // so the grant status cached on the app is synced into the
+                // screen before labels are built. Closed -> no labels, no
+                // re-shape, no text area.
+                let palette_panel_labels = match palette_layout_value {
+                    Some(layout) => {
+                        self.palette.set_status(self.palette_status.clone());
+                        palette::screen_labels(&self.palette, &layout)
+                    }
+                    None => Vec::new(),
+                };
+                for (buffer, label) in gpu
+                    .palette_labels
+                    .iter_mut()
+                    .zip(palette_panel_labels.iter())
+                {
+                    buffer.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &label.text,
+                    );
+                }
+
                 // UI overlay: prepare glyphs each frame; on prepare error
                 // (glyph atlas full) the UI pass is skipped for that frame
                 // (the crate is log-free by convention). The menu's text
@@ -11719,6 +12056,20 @@ impl ApplicationHandler for GameApp {
                 // Chest panel labels ride the same UI pass above the HUD.
                 debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
                 for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
+                    let label_rect = (
+                        label.left,
+                        label.top,
+                        buffer.measured_width(),
+                        LABEL_LINE_HEIGHT,
+                    );
+                    if tooltip_bounds.is_some_and(|bounds| rects_intersect(label_rect, bounds)) {
+                        continue;
+                    }
+                    areas.push(buffer.text_area(label.left, label.top));
+                }
+                // Palette labels ride the same UI pass above the HUD (S07-T03).
+                debug_assert!(palette_panel_labels.len() <= MAX_PALETTE_LABELS);
+                for (buffer, label) in gpu.palette_labels.iter().zip(palette_panel_labels.iter()) {
                     let label_rect = (
                         label.left,
                         label.top,
@@ -26501,13 +26852,15 @@ stack = 64
     }
 
     #[test]
-    fn gameplay_surface_excludes_inventory_and_chest_panels() {
-        assert!(gameplay_surface(true, false, false));
-        assert!(!gameplay_surface(true, true, false));
-        assert!(!gameplay_surface(true, false, true));
-        assert!(!gameplay_surface(true, true, true));
-        assert!(!gameplay_surface(false, false, false));
-        assert!(!gameplay_surface(false, true, true));
+    fn gameplay_surface_excludes_inventory_chest_and_palette_panels() {
+        assert!(gameplay_surface(true, false, false, false));
+        assert!(!gameplay_surface(true, true, false, false));
+        assert!(!gameplay_surface(true, false, true, false));
+        assert!(!gameplay_surface(true, false, false, true));
+        assert!(!gameplay_surface(true, true, true, true));
+        assert!(!gameplay_surface(false, false, false, false));
+        assert!(!gameplay_surface(false, true, true, false));
+        assert!(!gameplay_surface(false, false, false, true));
     }
 
     #[test]
@@ -26578,23 +26931,27 @@ stack = 64
 
         let mut label = SelectionLabel::new();
         assert!(
-            !selected_name_should_draw(true, false, false, &label),
+            !selected_name_should_draw(true, false, false, false, &label),
             "a fresh label is hidden until a selection is observed"
         );
 
         label.observe(3, Some(stone(1)));
-        assert!(selected_name_should_draw(true, false, false, &label));
+        assert!(selected_name_should_draw(true, false, false, false, &label));
         assert!(
-            !selected_name_should_draw(true, true, false, &label),
+            !selected_name_should_draw(true, true, false, false, &label),
             "the inventory panel owns the pointer"
         );
         assert!(
-            !selected_name_should_draw(true, false, true, &label),
+            !selected_name_should_draw(true, false, true, false, &label),
             "the chest panel owns the pointer"
+        );
+        assert!(
+            !selected_name_should_draw(true, false, false, true, &label),
+            "the Creative palette owns the pointer"
         );
         for screen in ["main menu", "pause", "death"] {
             assert!(
-                !selected_name_should_draw(false, false, false, &label),
+                !selected_name_should_draw(false, false, false, false, &label),
                 "{screen} frames must not draw the selected-name strip"
             );
         }
@@ -26607,7 +26964,128 @@ stack = 64
         assert!(label.is_visible() && label.alpha() > 0.0);
         label.tick(0.02);
         assert!(!label.is_visible());
-        assert!(!selected_name_should_draw(true, false, false, &label));
+        assert!(!selected_name_should_draw(
+            true, false, false, false, &label
+        ));
+    }
+
+    #[test]
+    fn palette_click_grants_the_authored_stack_and_selects_its_slot() {
+        let registry = ContentRegistry::builtin();
+        let mut screen = PaletteScreen::new();
+        screen.open(registry);
+        let layout = palette::layout(1280, 720);
+
+        // Entries are display-name sorted, so locate Stone by stable name
+        // instead of assuming slot 0.
+        let visible = (0..screen.filtered().len())
+            .find(|index| {
+                screen
+                    .filtered_entry(*index)
+                    .is_some_and(|entry| entry.name == "stone")
+            })
+            .expect("the built-in stone block is listed");
+        assert!(visible < palette::PALETTE_VISIBLE);
+        let slot_rect = layout.slots[visible];
+        let cursor = (
+            slot_rect.0 + slot_rect.2 * 0.5,
+            slot_rect.1 + slot_rect.3 * 0.5,
+        );
+
+        let mut player = Player::new(Vec3::ZERO);
+        let (slot, item) =
+            apply_palette_click(&mut player, registry, &screen, &layout, Some(cursor))
+                .expect("clicking the stone slot grants a stack");
+        assert_eq!(item.id(), ItemId::Block(BlockId::Stone));
+        assert_eq!(
+            item.count(),
+            opencraft::player::inventory::MAX_STACK_COUNT,
+            "built-in block stack limits are the authored maximum"
+        );
+        assert_eq!(player.selected_slot(), slot);
+        assert_eq!(player.inventory().hotbar(slot), Some(item));
+
+        // A closed screen and empty panel space never grant anything.
+        let closed = PaletteScreen::new();
+        assert!(
+            apply_palette_click(&mut player, registry, &closed, &layout, Some(cursor),).is_none()
+        );
+        assert!(
+            apply_palette_click(&mut player, registry, &screen, &layout, Some((0.0, 0.0)),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn closed_palette_draws_no_quads_labels_or_icons() {
+        let closed = PaletteScreen::new();
+        let layout = palette::layout(1280, 720);
+        let registry = ContentRegistry::builtin_arc();
+
+        assert!(palette::screen_quads(&closed, &layout, Some((10.0, 10.0))).is_empty());
+        assert!(palette::screen_labels(&closed, &layout).is_empty());
+        assert!(
+            palette_icon_vertices_with(Some(&registry), &closed, &layout, 1280, 720).is_empty()
+        );
+    }
+
+    #[test]
+    fn palette_routing_markers_pin_keyboard_mouse_and_label_order() {
+        let src = include_str!("main.rs");
+        let keyboard = src
+            .find("// Palette owns the keyboard while open")
+            .expect("palette keyboard routing marker is present");
+        let escape = src
+            .find("KeyCode::Escape if pressed && !event.repeat =>")
+            .expect("the gameplay Escape arm is present");
+        assert!(
+            keyboard < escape,
+            "palette keyboard handling must precede the gameplay Escape arm"
+        );
+
+        let press = src
+            .find("// Palette press routing (S07-T03): before the click-to-re-grab branch.")
+            .expect("palette press marker is present");
+        let regrab = src
+            .find("if !self.cursor_grabbed {")
+            .expect("the click-to-re-grab branch is present");
+        assert!(
+            press < regrab,
+            "palette press routing must precede the click-to-re-grab branch"
+        );
+
+        let keyc = src
+            .find("KeyCode::KeyC if pressed && !event.repeat =>")
+            .expect("the KeyC arm is present");
+        let guard = src
+            .find("palette::available_in(self.session.player.mode())")
+            .expect("the KeyC arm must be Creative-gated");
+        let rebindable = src
+            .find("// Rebindable gameplay keys (S04-T03)")
+            .expect("the rebindable gameplay arm is present");
+        assert!(
+            keyc < guard && guard < rebindable,
+            "KeyC must be a non-rebindable utility key guarded by available_in"
+        );
+
+        let chest_update = src
+            .find("// Chest panel labels (S03-T05): same two-pass borrow pattern")
+            .expect("chest label update is present");
+        let palette_update = src
+            .find("// Palette panel labels (S07-T03): same two-pass borrow")
+            .expect("palette label update is present");
+        let palette_push = src
+            .find("// Palette labels ride the same UI pass above the HUD (S07-T03).")
+            .expect("palette label push is present");
+        let tooltip_push = src
+            .find("// Tooltip text rides the same UI pass")
+            .expect("tooltip text push is present");
+        assert!(
+            chest_update < palette_update
+                && palette_update < palette_push
+                && palette_push < tooltip_push,
+            "palette labels must update after chest and push before the tooltip"
+        );
     }
 
     #[test]

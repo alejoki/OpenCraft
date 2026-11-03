@@ -25,6 +25,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Comprehensive UI System**:
     *   Main Menu (including Edit Background), New Game, Load Game, and Pause screens.
     *   Chest screen (27 chest slots plus the 36-slot player inventory) and Death screen (Respawn and Quit).
+    *   Searchable Creative palette (Creative mode, key **C**): lists every non-placeholder built-in and pack block, item, and tool; filters by name, display name, or namespace; and grants the full authored stack/durability into the hotbar. Placeholders never appear. Pack changes apply on the next world load because the session registry is frozen.
     *   In-game settings menu for live adjustments.
     *   UI logic is decoupled from rendering, built with `glyphon` for text rendering.
 
@@ -149,6 +150,7 @@ SMOKE_PROFILE=release bash scripts/ui_smoke.sh
 | **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food or draw a selected bow. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
+| **C** (Creative) | Open the searchable Creative palette. Type to filter by name, id or namespace; click an entry to put a full authored stack in the hotbar. Escape closes. |
 | **Escape** | Open the pause menu (settings are available from there). |
 
 ### Survival
