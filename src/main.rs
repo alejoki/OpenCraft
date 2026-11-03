@@ -12146,10 +12146,10 @@ fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16) ->
     let mut chunk_edits = ChunkEditMap::default();
     for (pos, id) in [(ore_pos, ore), (block_pos, block)] {
         let (chunk_pos, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
-        chunk_edits.entry(chunk_pos).or_default().insert(
-            linear_index(lx as usize, ly as usize, lz as usize) as u16,
-            id,
-        );
+        chunk_edits
+            .entry(chunk_pos)
+            .or_default()
+            .insert(linear_index(lx, ly, lz) as u16, id);
     }
     let mut inventory = Inventory::empty();
     inventory
