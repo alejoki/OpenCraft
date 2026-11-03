@@ -208,6 +208,14 @@ pub struct CliConfig {
     /// before `startup_session`, so it never reaches the event loop, a world,
     /// a save, a settings file, a window, or the GPU.
     pub demo_ui: bool,
+    /// Whether the headless presentation digest (`--demo-presentation`,
+    /// M010/S04-T05) is requested. Same bare-switch contract as `demo_ui`: it
+    /// takes no value, is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before `StartupContent::load`, so the digest never opens a window, GPU,
+    /// audio engine, event loop or settings write. The digest's only write is
+    /// the fixture save at the demo's `--save` path (or a temp file).
+    pub demo_presentation: bool,
     /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
     /// `main` consumes it before `startup_session`, so validation never opens
     /// a window, GPU, world, save or settings file. A switch with no following
@@ -241,6 +249,7 @@ impl CliConfig {
         let mut demo_content = false;
         let mut demo_combat = false;
         let mut demo_ui = false;
+        let mut demo_presentation = false;
         let mut validate_pack = None;
         let mut mode = GameMode::Creative;
 
@@ -319,6 +328,11 @@ impl CliConfig {
                     // short-circuits on this before any world startup.
                     demo_ui = true;
                 }
+                "--demo-presentation" => {
+                    // Same bare-switch rule as `--demo-ui`. `main`
+                    // short-circuits on this before `StartupContent::load`.
+                    demo_presentation = true;
+                }
                 "--validate-pack" => {
                     // Value switch: consume the next token. A missing value
                     // stores an empty name so the request fails closed in
@@ -353,6 +367,7 @@ impl CliConfig {
             demo_content,
             demo_combat,
             demo_ui,
+            demo_presentation,
             validate_pack,
             mode,
         }
@@ -5221,6 +5236,43 @@ mod tests {
         // unknown argument and never becomes the seed.
         let stray = CliConfig::parse_args(["--demo-ui", "5"]);
         assert!(stray.demo_ui);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_presentation_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+        assert!(!bare.demo_swim);
+        assert!(!bare.demo_survival);
+        assert!(!bare.demo_content);
+        assert!(!bare.demo_combat);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let presentation = CliConfig::parse_args(["--demo-presentation"]);
+        assert!(presentation.demo_presentation);
+        assert!(!presentation.demo_ui);
+        assert!(!presentation.force_new_world);
+        assert_eq!(presentation.seed_override, None);
+        assert_eq!(
+            presentation.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--save fixture.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value (the fixture-path contract).
+        let with_save = CliConfig::parse_args(["--demo-presentation", "--save", "fixture.mcvx"]);
+        assert!(with_save.demo_presentation);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-presentation", "5"]);
+        assert!(stray.demo_presentation);
         assert_eq!(stray.seed_override, None);
     }
 
