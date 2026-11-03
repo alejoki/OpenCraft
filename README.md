@@ -20,6 +20,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
 *   **Texture Packs**: Swap block and mob textures plus menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. The texture array has 48 layers: 23 authorable block textures (the original 16 plus Farmland, four Wheat stages, Chest, and LootChest) and 13 authorable mob part textures, each with optional per-layer overrides; a pack that supplies only the original 16 block layers falls back per layer to the built-in procedural art. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
+*   **Data-Only Content Packs**: A `format_version = 2` pack adds blocks, items, food, custom tool tiers and tools, shaped recipes, per-field block patches, recipe toggles, and declarative ore or surface worldgen without writing code. Save format 8 stores content by name, so a removed pack's blocks and items survive as readable placeholders and resolve again when the pack returns; a changed stack reports a non-blocking notice, and `--validate-pack` checks a pack headlessly. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#format-v2).
 *   **Customizable Menu Background**: The panorama behind the main menu is its own saved world at `saves/background/background.mcvx`. Choose **Edit Background** on the main menu to build it with the normal controls; the menu resumes your saved vantage point, time of day, and season. A missing or unreadable file falls back to the built-in scenery and never blocks launch.
 *   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. Version 8 saves round-trip the game mode, health/hunger/air, every chest's contents, every live mob's kind, position, facing, and health, and the save-local content names; version 1-7 saves load and gain the newer tails on the next save, and version 1-5 saves also load as Creative with full vitals. Malformed mob or content data is rejected rather than skipped. See the [save and release notes](docs/SAVE-NOTES.md).
 *   **Comprehensive UI System**:
@@ -124,6 +125,20 @@ SMOKE_PROFILE=release bash scripts/ui_smoke.sh
 ```
 
 `--demo-ui` can also be run directly (`target/debug/opencraft --demo-ui`). It prints the same three pinned `ui_demo:` lines and exits before creating a world, loading a save, or opening a window.
+
+`scripts/modding_smoke.sh` is the real-binary proof for the data-only content packs. It checks the `--validate-pack` exit codes for a valid, broken, and missing pack, runs a bounded launch with a broken pack, and repeats the authoring-doc reader-test. The checked-in reference packs `packs/mymod-ruby` (two blocks, two items, a ruby tier, two tools, two recipes, a disabled shortbow recipe, and two worldgen rules) and `packs/ruby-overlay` (a single `stone.png` layer) exercise the same paths a player does:
+
+```bash
+bash scripts/modding_smoke.sh
+```
+
+For the release binary, opt in with `SMOKE_PROFILE`:
+
+```bash
+SMOKE_PROFILE=release bash scripts/modding_smoke.sh
+```
+
+The headless `--demo-presentation`, `--demo-crafting`, `--demo-worldgen`, and `--demo-palette` digests replay the authored content through the production seams. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#reference-packs) for the stack order and what each digest covers.
 
 ## 🎮 Controls
 

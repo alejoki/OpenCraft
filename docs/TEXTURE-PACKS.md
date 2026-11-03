@@ -31,6 +31,8 @@ Packs are folders under `packs/`, relative to the game's working directory — t
 
 Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
 
+The repository ships three example packs you can copy into your own `packs/` folder: `mymod-ruby` (a complete Format v2 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). They are examples and test fixtures, not part of a normal install; a release build may not ship them, and the game never creates `packs/`.
+
 ## pack.toml reference
 
 A pack folder works without `pack.toml` — a missing or broken manifest never blocks launch — but you want one: it carries the pack name, description, and presentation settings.
@@ -47,9 +49,9 @@ Rules that apply to every field:
 - Unknown keys, unknown tables, and unknown files are ignored silently, so future versions can add features without breaking older ones.
 - A missing or unreadable `pack.toml` uses built-in default values and shows a warning that names the pack.
 
-## Format v2 (preview)
+## Format v2
 
-Set `format_version = 2` to add blocks, items, custom tool tiers and tools, shaped recipes and declarative worldgen from the same `pack.toml`. Version 1 packs keep working unchanged: without `format_version = 2`, a content array is ignored with one warning while the pack's textures and sounds still load. A `format_version` newer than 2 is ignored the same way, with one warning.
+Set `format_version = 2` to add blocks, items, custom tool tiers and tools, shaped recipes, per-field patches over built-in content, and declarative worldgen from the same `pack.toml`. Version 1 packs keep working unchanged: without `format_version = 2`, a content array is ignored with one warning while the pack's textures and sounds still load. A `format_version` newer than 2 is ignored the same way, with one warning.
 
 ```toml
 format_version = 2
@@ -59,29 +61,33 @@ version = "1.0.0"
 [[blocks]]
 id = "mymod:ruby_ore"
 name = "Ruby Ore"
-textures = { all = "ruby_ore.png" }
+textures = { all = "textures/ruby_ore.png" }
 hardness = 3.0
 drop = "mymod:ruby"
 tool = "pickaxe"
 stack = 64
 
 [[items]]
-id = "mymod:ruby"
-icon = "ruby.png"
-nutrition = 4
-eat_seconds = 1.2
+id = "mymod:ruby_stew"
+name = "Ruby Stew"
+icon = "textures/ruby_stew.png"
+stack = 16
+nutrition = 7
+eat_seconds = 0.8
 
 [[tiers]]
 id = "mymod:ruby"
+name = "Ruby"
 speed = 9.0
 durability = 900
-damage = 6
+damage = 9
 
 [[tools]]
 id = "mymod:ruby_pickaxe"
+name = "Ruby Pickaxe"
 kind = "pickaxe"
 tier = "mymod:ruby"
-icon = "ruby_pickaxe.png"
+icon = "textures/ruby_pickaxe.png"
 
 [[recipes]]
 id = "mymod:ruby_pickaxe"
@@ -89,18 +95,46 @@ pattern = ["RRR", " S ", " S "]
 key = { R = "mymod:ruby", S = "stick" }
 output = "mymod:ruby_pickaxe"
 count = 1
+
+[[block_patches]]
+id = "stone"
+name = "Hard Stone"
+hardness = 3.5
+stack = 64
+
+[[recipe_patches]]
+id = "shortbow"
+enabled = false
+
+[[worldgen]]
+type = "ore"
+block = "mymod:ruby_ore"
+replace = "stone"
+min_y = 4
+max_y = 40
+vein = 4
+attempts = 8
 ```
 
-A block needs `id`, `textures` (at least one of `all`, `top`, `bottom`, `side`) and a finite `hardness` from 0 to 3600. `drop`, `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) and `stack` (1 to 999, default 999) are optional. An item needs `id` and `icon`; `stack` defaults to 64, and `nutrition` (1 to 20) makes it food with an optional `eat_seconds` (0.1 to 10, default 1.2). A tier needs `speed`, `durability` and `damage`; a tool needs `kind`, `tier` and `icon`. A recipe needs a 1-to-4-row `pattern` of 1-to-4 characters, a `key` mapping each pattern character to an item, an `output` and a `count` from 1 to 999. Worldgen entries use `type = "ore"` (with `vein` 1 to 8 and `attempts` 1 to 32) or `type = "patch"` (with a non-empty `biomes` list of `plains`, `forest`, `mountains` or `ocean`, and a `chance` from 0 to 1). Both kinds need `block`, `replace`, and `min_y`/`max_y` within -64 to 128 with `min_y < max_y`.
+A block needs `id`, a `textures` table that resolves one image for every face, and a finite `hardness` from 0 to 3600. `textures.all` is the fallback for every face; `textures.side` overrides the four side faces, and `textures.top` and `textures.bottom` override those faces individually. `name` is optional and a readable display name is derived from the id when it is absent. `drop` names the item produced on break and defaults to the block itself; `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) marks the block as efficiently broken by that tool kind; `stack` sets the block item's maximum stack from 1 to 999 (default 999).
+
+An item needs `id` and `icon`. `stack` defaults to 64; `nutrition` from 1 to 20 turns the item into food, and an optional `eat_seconds` (0.1 to 10, default 1.2) sets how long the hold-to-eat gesture takes. A tier needs `id`, `speed`, `durability` and `damage`; the tool's durability comes from the tier. A tool needs `kind` (`pickaxe`, `axe`, `shovel`, `hoe` or `sword`), `tier` and `icon`; `bow` is not authorable in this format. `name` is optional on items, tiers and tools.
+
+A recipe needs a 1-to-4-row `pattern` of 1-to-4 characters, a `key` mapping each pattern character to an item, an `output` and a `count` from 1 to 999. A `[[block_patches]]` entry changes one built-in block without redefining it: `id` is the built-in short name (`stone`, `iron_ore`, ...), and the entry must set at least one of `name`, `hardness`, `drop`, `tool` or `stack`. A patch can only set fields; it cannot clear a built-in value, create a block, change a block's identity, or target a pack-defined block. A `[[recipe_patches]]` entry takes a built-in recipe short name in `id` and an `enabled` boolean; `enabled = false` removes that recipe from crafting while the pack is active, and a later patch can turn it back on.
+
+Worldgen entries use `type = "ore"` (with `vein` 1 to 8 and `attempts` 1 to 32) or `type = "patch"` (with a non-empty `biomes` list of `plains`, `forest`, `mountains` or `ocean`, and a `chance` from 0 to 1). Both kinds need `block`, `replace`, and `min_y`/`max_y` within -64 to 128 with `min_y < max_y`. The schema is described here; [Declarative worldgen](#declarative-worldgen) explains what those rules do to a world.
 
 Entry rules:
 
-- New ids are namespaced (`mymod:ruby_ore`) with lowercase letters, digits and `_`; the `opencraft`, `builtin` and `minecraft` namespaces are reserved. Blocks, items and tools share one namespace; tiers and recipes are independent.
+- New ids are namespaced (`mymod:ruby_ore`) with lowercase letters, digits and `_`; the `opencraft`, `builtin` and `minecraft` namespaces are reserved. Blocks, items and tools share one namespace; tiers and recipes are independent. Content ids are limited to 255 bytes.
 - References (`drop`, recipe `key`/`output`, tool `tier`, worldgen `block`/`replace`, patch `drop`) must name a built-in or an entry in the same pack. Cross-pack references are not supported in this format.
-- One bad entry never fails the pack: a missing or wrong field, malformed/duplicate id, unknown reference, or over-limit array rejects only that entry and reports a diagnostic while its valid siblings load. Unknown keys are ignored.
+- One bad entry never fails the pack: a missing or wrong field, malformed or duplicate id, unknown reference, or over-limit array rejects only that entry and reports a diagnostic while its valid siblings load. Unknown keys are ignored.
+- A duplicate id inside one pack keeps the first definition and rejects the later one. The same id authored by a later pack in the stack replaces the earlier definition as a whole and reports a warning; fields are never merged across two definitions.
+- `[[block_patches]]` and `[[recipe_patches]]` apply in stack order, and a present field wins over the same field from an earlier patch. An absent field leaves the earlier or built-in value alone.
+- A later pack's authored file wins for that layer only. Earlier packs keep every other authored layer, logo, tint, description and sound, so stacking a texture-only overlay changes exactly the files it authors.
 - Asset paths are relative to the pack folder. Absolute paths, `.`/`..` components and symlink escapes are rejected, each file is limited to 1 MiB, images must be square and 16 to 256 pixels per side, and a pack may load at most 8 MiB of raw asset bytes.
 
-Pack content ids allocate deterministically: blocks take dense ids from 23 in sorted id order after the 23 built-in blocks, items and tools from 0, tiers after the three built-ins, and recipes after the 22 built-ins. Block face layers append from texture-array layer 48 (at most 160 pack layers) and item/tool icons from layer 32 (at most 192 icons), deduplicated per pack folder and authored path. A registry digest (FNV-1a 64) covers pack identities and every definition field so a validation run and a game load agree, but it deliberately excludes image bytes: recolouring an existing PNG does not change content identity.
+Pack content ids allocate deterministically: blocks take dense ids from 23 in sorted id order after the 23 built-in blocks, items and tools from 0, tiers after the three built-ins, and recipes after the 22 built-ins. Block face layers append from texture-array layer 48 (at most 160 pack layers) and item/tool icons from layer 32 (at most 192 icons), deduplicated per pack folder and authored path; patch entries allocate no ids. A registry digest (FNV-1a 64) covers pack identities and every definition field so a validation run and a game load agree, but it deliberately excludes image bytes: recolouring an existing PNG does not change content identity.
 
 ## Declarative worldgen
 
@@ -141,6 +175,54 @@ chance = 0.02
 **Drift.** Generated content is not saved. Unedited chunks regenerate from the currently selected stack, so removing a pack removes its generated ore and patches, while player edits survive as placeholders. Changing the stack requires a world reload to take effect.
 
 **Observable.** `opencraft --demo-worldgen` prints a deterministic digest of the selected stack (rule counts, authored ore cells and y band, patch cells and biomes, coal/iron stability versus no rules, and empty-rule byte identity), and `scripts/worldgen_smoke.sh` pins that digest plus bounded real-binary launches with the pack present and removed.
+
+## Reference packs
+
+The repository ships two content-oriented examples next to the sound fixture. Copy both folders into the game's `packs/` directory and select them in this order:
+
+1. `mymod-ruby`
+2. `ruby-overlay`
+
+`mymod-ruby` is a complete `format_version = 2` pack. It authors:
+
+- Two blocks: `mymod:ruby_ore` (hardness 3, pickaxe, drops `mymod:ruby`) and `mymod:ruby_block` (hardness 4, pickaxe, drops itself).
+- Two items: `mymod:ruby` and `mymod:ruby_stew` (food, 7 nutrition, 0.8 s to eat, stack 16).
+- One tier `mymod:ruby` (speed 9, durability 900, damage 9) and two tools made from it: `mymod:ruby_pickaxe` and `mymod:ruby_sword`.
+- Two shaped recipes: the ruby pickaxe (`RRR` over `S` over `S`) and ruby stew (`RR` over `WW`, which fits the 2x2 player grid).
+- One recipe patch that disables the built-in shortbow while the pack is selected.
+- Two worldgen rules: a ruby-ore vein rule in stone from y 4 to 40, and a ruby-ore surface patch on plains and forest grass from y 40 to 110.
+
+`ruby-overlay` is a version 1 manifest with no content arrays and a single authored file, `stone.png`. Stacked after `mymod-ruby`, it replaces the stone block layer and leaves every other pack file, definition and field alone.
+
+With that stack selected, these headless commands exercise the same code paths a world does:
+
+```bash
+./target/debug/opencraft --demo-presentation
+./target/debug/opencraft --demo-crafting
+./target/debug/opencraft --demo-worldgen
+./target/debug/opencraft --demo-palette
+./target/debug/opencraft --validate-pack mymod-ruby
+./target/debug/opencraft --validate-pack ruby-overlay
+bash scripts/modding_smoke.sh
+```
+
+`--demo-presentation` prints composed layer/icon counts, the authored block names, a production mesh, a production break, and the placeholder policy. `--demo-crafting` crafts the ruby pickaxe at a table and the stew in the 2x2 grid, breaks ruby ore with ruby and iron pickaxes, eats the stew, exercises the disabled shortbow, and saves/reloads the pickaxe. `--demo-worldgen` prints rule counts and authored ore/patch cells for a pinned seed. `--demo-palette` prints the entry stock, layout, filter, grant, use, placeholder and key-leg results. The four demo digests read the selected stack from `settings.toml`; with `mymod-ruby` missing they fail closed instead of printing a misleading success. `--validate-pack` checks one named folder. `scripts/modding_smoke.sh` is the real-binary proof of the validation exit codes, a bounded launch with a broken pack, and the docs reader-test.
+
+## Content packs and saves
+
+Content definitions are not baked into a world file. A version 8 save stores every block, item and tool reference by name in a sorted, save-local table; built-in names are unqualified and pack content uses its namespaced id. Loading reads those names against the currently selected stack.
+
+When a saved name is well-formed but absent from the selected stack, the load succeeds and keeps the reference as a placeholder:
+
+- An unknown block name becomes a placeholder block. It is solid, unbreakable and drops nothing, uses the checker texture, and stays in the world exactly where it was saved.
+- An unknown generic item name becomes a placeholder item. It uses the checker icon, is movable and stackable in the inventory, and is unusable: it is not food, not a tool, and not placeable.
+- A pack tool whose name disappears degrades to a count-one placeholder item. Restoring the pack returns it as the live tool at its full authored durability: wear is not carried through the placeholder.
+- The saved names survive a second save. Removing a pack never rewrites the world to a different id, and restoring the pack resolves the same names to the real definitions again.
+- A name that is malformed, uses a reserved namespace but does not exist, or refers to a liquid is not a placeholder: the whole load fails closed with a named error.
+
+A changed stack shows one readable, non-blocking notice after the world is open and playable. It names the missing or added packs and reports how many saved content names are unavailable and render as placeholders. The notice never blocks saving or shutdown.
+
+Generated worldgen is not saved. Unedited chunks regenerate from the currently selected stack, so removing a pack removes its generated ore and patches, while player edits survive as placeholders. Restoring the pack brings its generated content back on the next load. A stack change takes effect when the world is loaded again, not while the current session is running.
 
 ## Block textures
 
