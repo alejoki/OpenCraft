@@ -29,6 +29,8 @@ Packs are folders under `packs/`, relative to the game's working directory — t
 - The game only reads packs. It never writes files inside `packs/`.
 - The Default entry always exists and is the built-in procedural texture set.
 
+Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
+
 ## pack.toml reference
 
 A pack folder works without `pack.toml` — a missing or broken manifest never blocks launch — but you want one: it carries the pack name, description, and presentation settings.

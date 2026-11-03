@@ -29,6 +29,85 @@ pub const SOUND_BYTE_CAP: u64 = 1_048_576;
 /// is read.
 pub const SOUND_EXTENSIONS: [&str; 5] = ["wav", "ogg", "flac", "mp3", "m4a"];
 
+/// Authored (unresolved) sound presence for one pack.
+///
+/// Every slot is `None` unless the pack ships that slot's file. Keeping
+/// presence separate from the resolved buffer array is what lets an ordered
+/// stack merge per slot without a later pack's silence erasing an earlier
+/// pack's sound (the MEM509 contract applied to audio).
+#[derive(Clone, Debug)]
+pub struct SoundSpec {
+    pub slots: [Option<SoundBuffer>; SOUND_SLOT_COUNT],
+    pub warnings: Vec<SettingsWarning>,
+}
+
+impl Default for SoundSpec {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Read only the authored sound presence from `dir`.
+///
+/// Missing files are legal and silent: the slot stays `None`. A file that
+/// exists but is unreadable, larger than [`SOUND_BYTE_CAP`], fails to decode,
+/// or decodes to zero samples produces exactly one warning whose `field` is
+/// the bare file name.
+pub fn load_sound_spec(dir: &Path) -> SoundSpec {
+    let mut spec = SoundSpec::default();
+
+    for slot in SoundSlot::ALL {
+        let Some((file, path)) = first_existing_file(dir, slot) else {
+            // Partial packs are legal: keep the slot unauthored silently.
+            continue;
+        };
+
+        match read_and_decode(&path) {
+            Ok(buffer) => spec.slots[slot.index()] = Some(buffer),
+            Err(reason) => spec.warnings.push(SettingsWarning {
+                field: file,
+                reason,
+            }),
+        }
+    }
+
+    spec
+}
+
+/// Resolve every sound slot from an ordered stack of pack specs.
+///
+/// Starts from the synthesized defaults and overlays only `Some` slots in
+/// stack order, so a later pack overrides just the slots it authored and an
+/// earlier pack's sound survives everywhere else. Warnings concatenate in
+/// stack order.
+pub fn resolve_sounds(
+    specs: &[crate::pack::spec::PackSpec],
+) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
+    resolve_sound_specs(specs.iter().map(|spec| &spec.sound))
+}
+
+/// Overlay authored sound presence in order; the shared merge core.
+fn resolve_sound_specs<'a>(
+    specs: impl IntoIterator<Item = &'a SoundSpec>,
+) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
+    let mut buffers = default_buffers();
+    let mut warnings = Vec::new();
+
+    for spec in specs {
+        for (index, authored) in spec.slots.iter().enumerate() {
+            if let Some(buffer) = authored {
+                buffers[index] = buffer.clone();
+            }
+        }
+        warnings.extend(spec.warnings.iter().cloned());
+    }
+
+    (buffers, warnings)
+}
+
 /// Resolve every sound slot from `dir`, falling back per file.
 ///
 /// `dir` is the pack root (the same folder that holds `pack.toml` and the
@@ -37,25 +116,7 @@ pub const SOUND_EXTENSIONS: [&str; 5] = ["wav", "ogg", "flac", "mp3", "m4a"];
 /// [`SOUND_BYTE_CAP`], fails to decode, or decodes to zero samples produces
 /// exactly one warning whose `field` is the bare file name.
 pub fn load_sound_overrides(dir: &Path) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
-    let mut buffers = default_buffers();
-    let mut warnings = Vec::new();
-
-    for slot in SoundSlot::ALL {
-        let Some((file, path)) = first_existing_file(dir, slot) else {
-            // Partial packs are legal: keep the synthesized default silently.
-            continue;
-        };
-
-        match read_and_decode(&path) {
-            Ok(buffer) => buffers[slot.index()] = buffer,
-            Err(reason) => warnings.push(SettingsWarning {
-                field: file,
-                reason,
-            }),
-        }
-    }
-
-    (buffers, warnings)
+    resolve_sound_specs(std::iter::once(&load_sound_spec(dir)))
 }
 
 /// First existing `<slot>.<ext>` candidate, in [`SOUND_EXTENSIONS`] order.
