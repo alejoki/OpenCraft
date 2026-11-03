@@ -333,6 +333,7 @@ pub fn build_registry(
                 eat_seconds: food.eat_seconds,
             }),
             placeholder: false,
+            placeholder_tool: false,
         });
     }
 

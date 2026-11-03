@@ -146,6 +146,14 @@ pub struct ItemDef {
     pub food: Option<FoodDef>,
     /// Whether this definition is placeholder art awaiting pack content.
     pub placeholder: bool,
+    /// Whether this placeholder stands in for a pack tool whose pack is
+    /// missing.
+    ///
+    /// Only `true` for a tool degraded by an absent pack. Persistence uses it
+    /// to re-save the record as a pack-tool tag so that restoring the pack
+    /// resolves the same wire name back to the live tool instead of failing
+    /// on a cross-kind generic-item reference.
+    pub placeholder_tool: bool,
 }
 
 /// A resolved tool tier definition.
@@ -373,7 +381,28 @@ impl ContentRegistry {
             stack_limit: MAX_STACK_COUNT,
             food: None,
             placeholder: true,
+            placeholder_tool: false,
         });
+        index
+    }
+
+    /// Appends a deterministic placeholder for a pack tool whose pack is gone.
+    ///
+    /// Behaves like [`Self::append_placeholder_item`] but records
+    /// `placeholder_tool`, so a re-save keeps the record on the pack-tool wire
+    /// tag and a later load with the restored pack resolves the live tool
+    /// again. Tools never stack, so the placeholder is count-one only.
+    ///
+    /// Persistence policy: wear is not carried through the placeholder — the
+    /// restored tool comes back at its authored maximum durability.
+    pub fn append_placeholder_tool_item(&mut self, name: &str) -> u16 {
+        let index = self.append_placeholder_item(name);
+        let def = self
+            .items
+            .get_mut(usize::from(index))
+            .expect("the placeholder was just appended");
+        def.placeholder_tool = true;
+        def.stack_limit = 1;
         index
     }
 
@@ -1240,6 +1269,7 @@ mod tests {
             stack_limit: 12,
             food: None,
             placeholder: false,
+            placeholder_tool: false,
         });
         registry.tiers.push(TierDef {
             index: 3,

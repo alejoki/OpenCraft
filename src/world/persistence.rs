@@ -1355,10 +1355,25 @@ fn write_v8_item(
                 out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
             }
-            ItemId::Item(_) => {
-                out.push(ITEM_TAG_GENERIC);
-                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
-                out.extend_from_slice(&item.count().to_le_bytes());
+            ItemId::Item(index) => {
+                // A pack tool degraded by a missing pack keeps its pack-tool
+                // wire tag so that restoring the pack resolves the live tool
+                // instead of rejecting the name as a cross-kind generic item.
+                // Tools never stack, so only a count-one placeholder is a
+                // tool stand-in. The durability sentinel means "no wear
+                // carried": reading clamps it to the authored maximum.
+                let degraded_tool = registry.item(index).is_some_and(|def| {
+                    def.placeholder && def.placeholder_tool && item.count() == 1
+                });
+                if degraded_tool {
+                    out.push(ITEM_TAG_MOD_TOOL);
+                    out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                    out.extend_from_slice(&u16::MAX.to_le_bytes());
+                } else {
+                    out.push(ITEM_TAG_GENERIC);
+                    out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                    out.extend_from_slice(&item.count().to_le_bytes());
+                }
             }
             ItemId::ModTool(_) => {
                 out.push(ITEM_TAG_MOD_TOOL);
@@ -2037,6 +2052,10 @@ impl<'a> V8Resolver<'a> {
     /// by an earlier load) degrades to a count-one placeholder item, exactly
     /// like a generic item placeholder. Any other known kind is a forged
     /// cross-kind reference and fails closed.
+    ///
+    /// The degraded definition is marked [`crate::content::ItemDef::placeholder_tool`],
+    /// so a re-save keeps the record on the pack-tool wire tag and restoring
+    /// the pack resolves the live tool again.
     fn mod_tool(&mut self, index: u16) -> Result<ItemId, PersistenceError> {
         let name = self.name(index)?;
         if let Some(def) = self.registry.tool_by_name(name) {
@@ -2056,7 +2075,7 @@ impl<'a> V8Resolver<'a> {
             return Err(PersistenceError::InvalidContentName(name.to_string()));
         }
         if is_placeholder_content_name(name) {
-            let item_index = self.registry.append_placeholder_item(name);
+            let item_index = self.registry.append_placeholder_tool_item(name);
             self.unresolved += 1;
             return Ok(ItemId::Item(item_index));
         }
@@ -5853,6 +5872,65 @@ mod tests {
         let tool = restored.data.player.inventory.slots()[0].expect("tool");
         assert_eq!(tool.id(), ItemId::ModTool(0));
         assert_eq!(tool.durability(), Some(875));
+    }
+
+    #[test]
+    fn v8_re_saved_degraded_pack_tool_restores_as_the_live_tool() {
+        let registry = ruby_tool_registry();
+        let data = sample_data(pack_tool_player(&registry, 875));
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &data, &registry).expect("v8 names a pack tool");
+
+        // First load without the pack: the tool degrades to a marked
+        // placeholder rather than failing the world.
+        let loaded = load_world_from_bytes_with(&bytes, ContentRegistry::builtin())
+            .expect("a missing pack never blocks the world");
+        assert_eq!(loaded.unresolved, 1);
+        let degraded = loaded.data.player.inventory.slots()[0].expect("degraded slot");
+        assert_eq!(degraded.id(), ItemId::Item(0));
+        assert_eq!(degraded.count(), 1);
+        let def = loaded.registry.item(0).expect("placeholder is registered");
+        assert_eq!(def.name, "mymod:ruby_pickaxe");
+        assert!(def.placeholder);
+        assert!(
+            def.placeholder_tool,
+            "the placeholder remembers it is a tool"
+        );
+        assert_eq!(def.stack_limit, 1, "tools never merge");
+
+        // Re-saving the degraded episode must keep the pack-tool wire tag,
+        // otherwise the restored pack rejects the name as a cross-kind
+        // generic item (`InvalidContentName`).
+        let mut resaved = Vec::new();
+        save_world_to_bytes_with(&mut resaved, &loaded.data, &loaded.registry)
+            .expect("a degraded tool re-saves");
+        let slot = v8_first_inventory_slot(&resaved);
+        assert_eq!(resaved[slot], ITEM_TAG_MOD_TOOL);
+        let durability_at = slot + 3;
+        assert_eq!(
+            u16::from_le_bytes([resaved[durability_at], resaved[durability_at + 1]]),
+            u16::MAX,
+            "wear is not carried through the placeholder"
+        );
+
+        // The re-saved bytes still open without the pack (fresh registry per
+        // load: reusing one that already holds placeholders drifts ids).
+        let still_missing = load_world_from_bytes_with(&resaved, ContentRegistry::builtin())
+            .expect("the re-saved degraded world still opens");
+        assert_eq!(still_missing.unresolved, 1);
+        let placeholder = still_missing.data.player.inventory.slots()[0].expect("slot");
+        assert_eq!(placeholder.id(), ItemId::Item(0));
+        assert_eq!(placeholder.count(), 1);
+
+        // And restoring the pack resolves the live tool at full durability.
+        let restored = load_world_from_bytes_with(&resaved, &ruby_tool_registry())
+            .expect("restoring the pack resolves the tool");
+        assert_eq!(restored.unresolved, 0);
+        let tool = restored.data.player.inventory.slots()[0].expect("live tool");
+        assert_eq!(tool.id(), ItemId::ModTool(0));
+        assert_eq!(tool.count(), 1);
+        assert_eq!(tool.durability(), Some(900));
+        assert_eq!(tool.max_durability(), Some(900));
     }
 
     #[test]
