@@ -14,7 +14,7 @@
 //! ([`Inventory::hotbar_stack`], [`Inventory::to_legacy_hotbar`]) so those
 //! consumers can migrate without regaining mutable slot arrays.
 
-use crate::content::ContentRegistry;
+use crate::content::{names, ContentRegistry, RecipeDef};
 use crate::world::block::BlockId;
 use crate::world::loot::LootItem;
 use crate::world::mob_loot::MobDropItem;
@@ -1506,12 +1506,6 @@ pub(crate) struct Recipe {
     pub(crate) output_count: u16,
 }
 
-impl Recipe {
-    fn output_item(&self) -> Item {
-        Item::new(self.output, self.output_count).expect("static recipes are valid")
-    }
-}
-
 /// Shaped recipe table.
 ///
 /// The material chain is grounded in what the world actually yields today:
@@ -1771,7 +1765,7 @@ fn grid_bounds(grid: &CraftingGrid) -> Option<Bounds> {
     })
 }
 
-fn pattern_bounds(pattern: &'static [&'static str]) -> Option<Bounds> {
+fn pattern_bounds(pattern: &[String]) -> Option<Bounds> {
     let mut top = usize::MAX;
     let mut left = usize::MAX;
     let mut bottom = 0;
@@ -1797,8 +1791,19 @@ fn pattern_bounds(pattern: &'static [&'static str]) -> Option<Bounds> {
     })
 }
 
-fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) -> bool {
-    let Some(pattern_bounds) = pattern_bounds(recipe.pattern) else {
+/// Registry-aware shaped match.
+///
+/// Compares the trimmed grid bounds against the trimmed pattern bounds, then
+/// every pattern cell: spaces must be empty, and every key character must
+/// resolve through the registry to the item identity currently in the cell.
+/// An absent character, an unknown index, or placeholder content fails closed.
+fn matches_pattern(
+    grid: &CraftingGrid,
+    grid_bounds: Bounds,
+    registry: &ContentRegistry,
+    recipe: &RecipeDef,
+) -> bool {
+    let Some(pattern_bounds) = pattern_bounds(&recipe.pattern) else {
         return false;
     };
     if pattern_bounds.width != grid_bounds.width || pattern_bounds.height != grid_bounds.height {
@@ -1818,7 +1823,10 @@ fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) ->
                     return false;
                 }
             } else {
-                let Some(expected_id) = pattern_item(expected) else {
+                let Some(reference) = recipe.key.get(&char::from(expected)) else {
+                    return false;
+                };
+                let Some(expected_id) = registry.resolve_item_ref(*reference) else {
                     return false;
                 };
                 if actual.map(|item| item.id()) != Some(expected_id) {
@@ -1830,11 +1838,21 @@ fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) ->
     true
 }
 
-fn recipe_for(grid: &CraftingGrid) -> Option<&'static Recipe> {
+fn recipe_for<'a>(grid: &CraftingGrid, registry: &'a ContentRegistry) -> Option<&'a RecipeDef> {
     let grid_bounds = grid_bounds(grid)?;
-    RECIPES
-        .iter()
-        .find(|recipe| matches_pattern(grid, grid_bounds, recipe))
+    registry
+        .enabled_recipes()
+        .map(|(_, recipe)| recipe)
+        .find(|recipe| {
+            registry.resolve_item_ref(recipe.output).is_some()
+                && matches_pattern(grid, grid_bounds, registry, recipe)
+        })
+}
+
+/// Map a dense registry recipe index back to the frozen public id: the 22
+/// built-ins keep their names, every pack recipe is [`RecipeId::Modded`].
+fn recipe_id_for_index(index: u16) -> RecipeId {
+    names::builtin_recipe_by_index(index).unwrap_or(RecipeId::Modded(index))
 }
 
 /// A bounded crafting grid. Only the active `dim * dim` region is addressable;
@@ -1913,25 +1931,54 @@ impl CraftingGrid {
             .all(Option::is_none)
     }
 
-    /// Evaluates the current grid contents. Never cached: the result is a pure
-    /// function of the cells at call time.
+    /// Evaluates the current grid contents against the built-in registry.
+    /// Never cached: the result is a pure function of the cells at call time.
     pub fn preview(&self) -> Option<RecipePreview> {
-        recipe_for(self).map(|recipe| RecipePreview {
-            recipe: recipe.id,
-            output: recipe.output,
-            output_count: recipe.output_count,
+        self.preview_with(ContentRegistry::builtin())
+    }
+
+    /// Evaluates the current grid contents against `registry`.
+    ///
+    /// Disabled and placeholder recipes are skipped, and every key character
+    /// and the output resolve through the registry. Never caches.
+    pub fn preview_with(&self, registry: &ContentRegistry) -> Option<RecipePreview> {
+        recipe_for(self, registry).and_then(|recipe| {
+            Some(RecipePreview {
+                recipe: recipe_id_for_index(recipe.index),
+                output: registry.resolve_item_ref(recipe.output)?,
+                output_count: recipe.count,
+            })
         })
     }
 
-    /// Crafts one result: revalidate the recipe and destination, insert the
-    /// output, then consume exactly one item from each occupied cell.
+    /// Crafts one result against the built-in registry.
+    ///
+    /// Delegates to [`CraftingGrid::take_result_with`], so built-in recipes
+    /// answer byte-identically to the registry-aware path.
+    pub fn take_result(&mut self, inventory: &mut Inventory) -> Result<Item, CraftError> {
+        self.take_result_with(ContentRegistry::builtin(), inventory)
+    }
+
+    /// Crafts one result against `registry`: revalidate the recipe and
+    /// destination, insert the output, then consume exactly one item from each
+    /// occupied cell.
     ///
     /// Any error (no recipe, full destination) leaves both the grid and the
     /// inventory untouched. The recipe is always re-derived from the current
-    /// cells, so a stale caller-held preview can never take a result.
-    pub fn take_result(&mut self, inventory: &mut Inventory) -> Result<Item, CraftError> {
-        let recipe = recipe_for(self).ok_or(CraftError::NoRecipe)?;
-        let output = recipe.output_item();
+    /// cells, so a stale caller-held preview can never take a result. A pack
+    /// tool output is built through [`Item::new_with`], so it becomes
+    /// [`ItemId::ModTool`] with authored durability.
+    pub fn take_result_with(
+        &mut self,
+        registry: &ContentRegistry,
+        inventory: &mut Inventory,
+    ) -> Result<Item, CraftError> {
+        let recipe = recipe_for(self, registry).ok_or(CraftError::NoRecipe)?;
+        let output_id = registry
+            .resolve_item_ref(recipe.output)
+            .ok_or(CraftError::NoRecipe)?;
+        let output =
+            Item::new_with(registry, output_id, recipe.count).map_err(|_| CraftError::NoRecipe)?;
         if !inventory.can_insert(&output) {
             return Err(CraftError::DestinationFull);
         }
@@ -2034,6 +2081,85 @@ mod tests {
             )],
         );
         assert_eq!(report.errors(), 0, "fixture registry must not error");
+        registry
+    }
+
+    /// A pack registry with one generic item, one tier/tool and two shaped
+    /// recipes: a 2x2 gem recipe (from stone) and a 4x4 ruby pickaxe recipe
+    /// (gems + sticks). Recipe ids sort as `gem_from_stone` then
+    /// `ruby_pickaxe`, allocating dense indices 22 and 23.
+    fn recipe_fixture_registry() -> crate::content::ContentRegistry {
+        use crate::content::build_registry;
+        use crate::content::spec::{
+            ItemEntry, PackAsset, PackContentSpec, RecipeEntry, TierEntry, ToolEntry,
+        };
+        use crate::content::PackIdentity;
+        use std::collections::BTreeMap;
+
+        let mut spec = PackContentSpec {
+            items: vec![ItemEntry {
+                id: "mymod:gem".to_string(),
+                display_name: Some("Ruby Gem".to_string()),
+                icon: "gem.png".to_string(),
+                stack_limit: 12,
+                food: None,
+            }],
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "pickaxe.png".to_string(),
+            }],
+            recipes: vec![
+                RecipeEntry {
+                    id: "mymod:gem_from_stone".to_string(),
+                    pattern: vec!["SS".to_string(), "SS".to_string()],
+                    key: [('S', "stone".to_string())]
+                        .into_iter()
+                        .collect::<BTreeMap<_, _>>(),
+                    output: "mymod:gem".to_string(),
+                    count: 4,
+                },
+                RecipeEntry {
+                    id: "mymod:ruby_pickaxe".to_string(),
+                    pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
+                    key: [('R', "mymod:gem".to_string()), ('S', "stick".to_string())]
+                        .into_iter()
+                        .collect::<BTreeMap<_, _>>(),
+                    output: "mymod:ruby_pickaxe".to_string(),
+                    count: 1,
+                },
+            ],
+            ..PackContentSpec::default()
+        };
+        for icon in ["gem.png", "pickaxe.png"] {
+            spec.assets.insert(
+                icon.to_string(),
+                PackAsset {
+                    rgba: vec![0u8; 16 * 16 * 4],
+                    source_side: 16,
+                },
+            );
+        }
+        let (registry, report) = build_registry(
+            crate::content::ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "recipe fixture must not error");
         registry
     }
 
@@ -4867,6 +4993,169 @@ mod tests {
                 "{:?} must be the only recipe matching its own pattern",
                 recipe.id
             );
+        }
+    }
+
+    // -- Registry-aware shaped matching (S05-T02) ---------------------------
+
+    #[test]
+    fn pack_recipes_preview_and_craft_in_both_grids() {
+        let registry = recipe_fixture_registry();
+
+        // 2x2 player grid: four stone make four authored gems.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..4 {
+            player_grid
+                .set(index, Some(block(BlockId::Stone, 1)))
+                .expect("2x2 cell");
+        }
+        let gem_recipe = registry
+            .recipe_by_name("mymod:gem_from_stone")
+            .expect("gem recipe exists");
+        let preview = player_grid
+            .preview_with(&registry)
+            .expect("the pack gem recipe matches the player grid");
+        assert_eq!(preview.recipe, RecipeId::Modded(gem_recipe.index));
+        assert_eq!(preview.output, ItemId::Item(0));
+        assert_eq!(preview.output_count, 4);
+
+        let mut inventory = Inventory::empty();
+        let crafted = player_grid
+            .take_result_with(&registry, &mut inventory)
+            .expect("pack gem recipe crafts");
+        assert_eq!(crafted.id(), ItemId::Item(0));
+        assert_eq!(crafted.count(), 4);
+        assert_eq!(
+            inventory.slot(0).map(|item| item.id()),
+            Some(ItemId::Item(0))
+        );
+        assert!(player_grid.is_empty());
+        assert!(
+            Item::new_with(&registry, ItemId::Item(0), 13).is_err(),
+            "the authored stack_limit 12 caps the crafted item"
+        );
+
+        // 4x4 table grid: three gems over two sticks make the pack tool.
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for (row, line) in ["RRR", " S ", " S "].iter().enumerate() {
+            for (col, byte) in line.bytes().enumerate() {
+                let cell = match byte {
+                    b'R' => {
+                        Item::new_with(&registry, ItemId::Item(0), 1).expect("authored gem item")
+                    }
+                    b'S' => stick(1),
+                    _ => continue,
+                };
+                table_grid
+                    .set(row * GridKind::Table.dim() + col, Some(cell))
+                    .expect("4x4 cell");
+            }
+        }
+        let pickaxe_recipe = registry
+            .recipe_by_name("mymod:ruby_pickaxe")
+            .expect("pickaxe recipe exists");
+        let preview = table_grid
+            .preview_with(&registry)
+            .expect("the pack pickaxe recipe matches the table grid");
+        assert_eq!(preview.recipe, RecipeId::Modded(pickaxe_recipe.index));
+        assert_eq!(preview.output, ItemId::ModTool(0));
+        assert_eq!(preview.output_count, 1);
+
+        let crafted = table_grid
+            .take_result_with(&registry, &mut Inventory::empty())
+            .expect("pack pickaxe crafts");
+        assert_eq!(crafted.id(), ItemId::ModTool(0));
+        assert_eq!(crafted.count(), 1);
+        assert_eq!(crafted.durability(), Some(900));
+        assert_eq!(crafted.max_durability(), Some(900));
+        assert!(table_grid.is_empty());
+    }
+
+    #[test]
+    fn disabled_builtin_recipe_never_previews_or_crafts() {
+        use crate::content::spec::RecipePatch;
+
+        let mut spec = crate::content::spec::PackContentSpec::default();
+        spec.recipe_patches.push(RecipePatch {
+            id: "shortbow".to_string(),
+            enabled: false,
+        });
+        let (registry, report) = crate::content::build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                crate::content::PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0);
+
+        let grid = grid_from_pattern(GridKind::Table, &[" SE", "S E", " S "]);
+        assert!(
+            grid.preview().is_some(),
+            "the frozen built-in table still knows the shortbow"
+        );
+        assert_eq!(
+            grid.preview_with(&registry),
+            None,
+            "a disabled recipe produces no preview"
+        );
+
+        let mut disabled_grid = grid.clone();
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            disabled_grid.take_result_with(&registry, &mut inventory),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(disabled_grid, grid, "the grid is untouched");
+        assert_eq!(inventory, Inventory::empty(), "nothing was inserted");
+    }
+
+    #[test]
+    fn partially_filled_grid_never_matches_a_pack_recipe() {
+        let registry = recipe_fixture_registry();
+        let mut grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..3 {
+            grid.set(index, Some(block(BlockId::Stone, 1)))
+                .expect("2x2 cell");
+        }
+        assert_eq!(grid.preview_with(&registry), None);
+        let before = grid.clone();
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            grid.take_result_with(&registry, &mut inventory),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(grid, before);
+        assert_eq!(inventory, Inventory::empty());
+    }
+
+    #[test]
+    fn builtin_and_registry_aware_paths_answer_identically_for_every_builtin_recipe() {
+        let registry = ContentRegistry::builtin();
+        for recipe in RECIPES {
+            let grid = grid_from_pattern(GridKind::Table, recipe.pattern);
+            let mut legacy_grid = grid.clone();
+            let mut aware_grid = grid.clone();
+            assert_eq!(
+                legacy_grid.preview(),
+                aware_grid.preview_with(registry),
+                "preview mismatch for {:?}",
+                recipe.id
+            );
+
+            let mut legacy_inventory = Inventory::empty();
+            let mut aware_inventory = Inventory::empty();
+            assert_eq!(
+                legacy_grid.take_result(&mut legacy_inventory),
+                aware_grid.take_result_with(registry, &mut aware_inventory),
+                "craft mismatch for {:?}",
+                recipe.id
+            );
+            assert_eq!(legacy_grid, aware_grid);
+            assert_eq!(legacy_inventory, aware_inventory);
         }
     }
 

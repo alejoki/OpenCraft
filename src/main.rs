@@ -54,9 +54,9 @@ use opencraft::ui::hud::{
     HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
-    hit_test, hovered_item, layout, rects_intersect, screen_labels, screen_quads, tooltip_lines,
-    tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS,
-    TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
+    hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
+    tooltip_lines, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
+    LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
     compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
@@ -1042,6 +1042,30 @@ pub fn apply_inventory_click_button(
     target: InventoryTarget,
     button: InventoryClickButton,
 ) -> Result<InventoryClickOutcome, InventoryCommandError> {
+    apply_inventory_click_button_with(
+        player,
+        ContentRegistry::builtin(),
+        screen,
+        table_open,
+        target,
+        button,
+    )
+}
+
+/// Registry-aware production result-slot seam.
+///
+/// Identical to [`apply_inventory_click_button`] except a result-slot click
+/// crafts against `registry`, so pack recipes match through the real click
+/// path and a crafted pack tool keeps its [`ItemId::ModTool`] identity. Every
+/// other target is registry-independent and answers unchanged.
+pub fn apply_inventory_click_button_with(
+    player: &mut Player,
+    registry: &ContentRegistry,
+    screen: &InventoryScreen,
+    table_open: Option<IVec3>,
+    target: InventoryTarget,
+    button: InventoryClickButton,
+) -> Result<InventoryClickOutcome, InventoryCommandError> {
     let mode = screen.mode(table_open);
     let table_target = matches!(
         target,
@@ -1099,11 +1123,11 @@ pub fn apply_inventory_click_button(
             .click_grid_cell_right(GridKind::Table, index)
             .map(|()| InventoryClickOutcome::Moved),
         (_, InventoryTarget::ResultSlot(GridKind::Player)) => player
-            .take_craft_result(GridKind::Player)
+            .take_craft_result_with(registry, GridKind::Player)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
         (_, InventoryTarget::ResultSlot(GridKind::Table)) => player
-            .take_craft_result(GridKind::Table)
+            .take_craft_result_with(registry, GridKind::Table)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
     }
@@ -10140,11 +10164,13 @@ impl ApplicationHandler for GameApp {
                     if let Some(destination) =
                         drag_release_target(self.inventory_drag.take(), release_target)
                     {
-                        let result = apply_inventory_click(
+                        let result = apply_inventory_click_button_with(
                             &mut self.session.player,
+                            &self.session_registry,
                             &self.inventory,
                             table_open,
                             destination,
+                            InventoryClickButton::Left,
                         );
                         self.inventory_status = Some(inventory_status_text(result));
                     }
@@ -10314,11 +10340,13 @@ impl ApplicationHandler for GameApp {
                                 // from an empty cursor (S04-T03).
                                 let cursor_empty_before =
                                     self.session.player.inventory().cursor().is_none();
-                                let result = apply_inventory_click(
+                                let result = apply_inventory_click_button_with(
                                     &mut self.session.player,
+                                    &self.session_registry,
                                     &self.inventory,
                                     table_open,
                                     target,
+                                    InventoryClickButton::Left,
                                 );
                                 self.inventory_status = Some(inventory_status_text(result));
                                 // Only a pure pick-up begins a drag; a swap,
@@ -10342,8 +10370,9 @@ impl ApplicationHandler for GameApp {
                                 .cursor_pos
                                 .and_then(|cursor| hit_test(mode, &layout, cursor));
                             if let Some(target) = target {
-                                let result = apply_inventory_click_button(
+                                let result = apply_inventory_click_button_with(
                                     &mut self.session.player,
+                                    &self.session_registry,
                                     &self.inventory,
                                     table_open,
                                     target,
@@ -11356,7 +11385,7 @@ impl ApplicationHandler for GameApp {
                 let inventory_layout = if inventory_mode.is_open() {
                     let layout =
                         layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
-                    quads.extend(screen_quads(
+                    quads.extend(screen_quads_with(
                         inventory_mode,
                         &layout,
                         self.session.player.inventory(),
@@ -11364,6 +11393,7 @@ impl ApplicationHandler for GameApp {
                         self.session.player.table_grid(),
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
+                        &self.session_registry,
                     ));
                     Some(layout)
                 } else {
@@ -11395,13 +11425,14 @@ impl ApplicationHandler for GameApp {
                 // model the click handlers use. Closed screens produce nothing.
                 let tooltip_hover = self.cursor_pos.and_then(|cursor| {
                     if let Some(layout) = inventory_layout.as_ref() {
-                        hovered_item(
+                        hovered_item_with(
                             inventory_mode,
                             layout,
                             self.session.player.inventory(),
                             self.session.player.player_grid(),
                             self.session.player.table_grid(),
                             cursor,
+                            &self.session_registry,
                         )
                         .or_else(|| self.session.player.inventory().cursor())
                     } else if let Some(layout) = chest_layout_value.as_ref() {
@@ -11554,13 +11585,14 @@ impl ApplicationHandler for GameApp {
                 // A closed screen produces no labels, so nothing is reshaped
                 // and no inventory text area is pushed.
                 let inventory_panel_labels = match inventory_layout {
-                    Some(layout) => screen_labels(
+                    Some(layout) => screen_labels_with(
                         inventory_mode,
                         &layout,
                         self.session.player.inventory(),
                         self.session.player.player_grid(),
                         self.session.player.table_grid(),
                         self.inventory_status.as_deref(),
+                        &self.session_registry,
                     ),
                     None => Vec::new(),
                 };
@@ -12727,6 +12759,7 @@ mod tests {
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
+    use opencraft::ui::inventory::{screen_labels, screen_quads};
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
@@ -19433,6 +19466,81 @@ stack = 64
     // S03-T03: inventory panel adapter (mode state, cursor ownership, clicks)
     // -----------------------------------------------------------------------
 
+    /// Pack registry with an authored 2x2 gem recipe (four stone make four
+    /// gems) and a 4x4 ruby-pickaxe recipe (gems over sticks), built through
+    /// the public registry builder.
+    fn pack_recipe_registry() -> ContentRegistry {
+        use opencraft::content::build_registry;
+        use opencraft::content::spec::{ItemEntry, PackAsset, RecipeEntry, TierEntry, ToolEntry};
+        use opencraft::content::PackIdentity;
+
+        let mut spec = PackContentSpec {
+            items: vec![ItemEntry {
+                id: "mymod:gem".to_string(),
+                display_name: Some("Ruby Gem".to_string()),
+                icon: "gem.png".to_string(),
+                stack_limit: 12,
+                food: None,
+            }],
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "pickaxe.png".to_string(),
+            }],
+            recipes: vec![
+                RecipeEntry {
+                    id: "mymod:gem_from_stone".to_string(),
+                    pattern: vec!["SS".to_string(), "SS".to_string()],
+                    key: [('S', "stone".to_string())]
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    output: "mymod:gem".to_string(),
+                    count: 4,
+                },
+                RecipeEntry {
+                    id: "mymod:ruby_pickaxe".to_string(),
+                    pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
+                    key: [('R', "mymod:gem".to_string()), ('S', "stick".to_string())]
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    output: "mymod:ruby_pickaxe".to_string(),
+                    count: 1,
+                },
+            ],
+            ..PackContentSpec::default()
+        };
+        for icon in ["gem.png", "pickaxe.png"] {
+            spec.assets.insert(
+                icon.to_string(),
+                PackAsset {
+                    rgba: vec![0u8; 16 * 16 * 4],
+                    source_side: 16,
+                },
+            );
+        }
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "pack recipe fixture must not error");
+        registry
+    }
+
     /// Total item count across all 36 slots, the cursor, and both grids — the
     /// conservation invariant every UI command must preserve.
     fn inventory_units(player: &Player) -> u32 {
@@ -19705,6 +19813,160 @@ stack = 64
             Err(InventoryCommandError::Craft(CraftError::NoRecipe))
         );
         assert_eq!(session.player.inventory(), &before);
+    }
+
+    #[test]
+    fn apply_inventory_click_button_with_crafts_pack_recipes_at_both_grids() {
+        let registry = pack_recipe_registry();
+
+        // 2x2 player grid: four stone are a pack recipe for four gems.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..4 {
+            player_grid
+                .set(
+                    index,
+                    Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone item")),
+                )
+                .expect("2x2 cell");
+        }
+
+        // 4x4 table grid: the pack pickaxe pattern (gems over sticks).
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for (row, line) in ["RRR", " S ", " S "].iter().enumerate() {
+            for (col, byte) in line.bytes().enumerate() {
+                let cell = match byte {
+                    b'R' => {
+                        Item::new_with(&registry, ItemId::Item(0), 1).expect("authored gem item")
+                    }
+                    b'S' => Item::new(ItemId::Material(Material::Stick), 1).expect("stick item"),
+                    _ => continue,
+                };
+                table_grid
+                    .set(row * GridKind::Table.dim() + col, Some(cell))
+                    .expect("4x4 cell");
+            }
+        }
+
+        let mut player =
+            Player::with_inventory(Vec3::ZERO, Inventory::empty(), player_grid, table_grid);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+
+        // The built-in registry cannot see pack recipes; the session registry
+        // can. This is the exact difference the production seam must bridge.
+        assert!(player
+            .craft_preview_with(&registry, GridKind::Player)
+            .is_some());
+        assert_eq!(player.craft_preview(GridKind::Player), None);
+
+        let outcome = apply_inventory_click_button_with(
+            &mut player,
+            &registry,
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+            InventoryClickButton::Left,
+        )
+        .expect("the pack gem recipe crafts through the production seam");
+        match outcome {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::Item(0));
+                assert_eq!(item.count(), 4);
+            }
+            InventoryClickOutcome::Moved => panic!("a result click must report the crafted item"),
+        }
+        assert!(player.player_grid().is_empty());
+        assert!(player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .any(|item| item.id() == ItemId::Item(0) && item.count() == 4));
+
+        // Attach the screen to a live table and verify the UI preview/labels
+        // resolve the pack tool through the session registry.
+        screen.open_table();
+        let table_open = Some(IVec3::new(0, 5, 0));
+        let ui_layout = layout(1280, 720, InventoryMode::Table);
+        let pack_labels = screen_labels_with(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            &registry,
+        );
+        assert!(
+            pack_labels
+                .iter()
+                .any(|label| label.text == "Ruby Pickaxe x1"),
+            "the pack-tool result label renders its authored name"
+        );
+        let builtin_labels = screen_labels(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+        );
+        assert!(
+            !builtin_labels
+                .iter()
+                .any(|label| label.text == "Ruby Pickaxe x1"),
+            "the built-in registry cannot preview pack content"
+        );
+
+        let pack_quads = screen_quads_with(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            None,
+            &registry,
+        );
+        let builtin_quads = screen_quads(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            None,
+        );
+        assert_eq!(
+            pack_quads.len(),
+            builtin_quads.len() + 1,
+            "the pack-tool preview adds exactly one result fill quad"
+        );
+
+        let outcome = apply_inventory_click_button_with(
+            &mut player,
+            &registry,
+            &screen,
+            table_open,
+            InventoryTarget::ResultSlot(GridKind::Table),
+            InventoryClickButton::Left,
+        )
+        .expect("the pack pickaxe crafts through the production seam");
+        match outcome {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::ModTool(0));
+                assert_eq!(item.durability(), Some(900));
+                assert_eq!(item.max_durability(), Some(900));
+            }
+            InventoryClickOutcome::Moved => panic!("a result click must report the crafted item"),
+        }
+        assert!(player.table_grid().is_empty());
+        assert!(player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .any(|item| item.id() == ItemId::ModTool(0)));
     }
 
     #[test]

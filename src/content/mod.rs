@@ -95,6 +95,30 @@ impl ItemRef {
     }
 }
 
+impl ContentRegistry {
+    /// Resolve an authored [`ItemRef`] to an insertable [`ItemId`].
+    ///
+    /// This is the fail-closed bridge used by recipe matching: an item or tool
+    /// index that is absent from the registry, or points at placeholder
+    /// content, resolves to `None` so a malformed recipe can never match. A
+    /// pack block placeholder likewise never matches. Built-in identities are
+    /// always resolvable because the built-in tables are frozen and complete.
+    pub fn resolve_item_ref(&self, reference: ItemRef) -> Option<ItemId> {
+        match reference {
+            ItemRef::Block(block) => self
+                .block(block)
+                .filter(|def| !def.placeholder)
+                .map(|_| ItemId::Block(block)),
+            ItemRef::Builtin(id) => Some(id),
+            ItemRef::Item(index) => self
+                .item(index)
+                .filter(|def| !def.placeholder)
+                .map(|_| ItemId::Item(index)),
+            ItemRef::Tool(index) => self.tool(index).map(|_| ItemId::ModTool(index)),
+        }
+    }
+}
+
 /// Food behaviour authored on a pack item.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct FoodDef {
@@ -518,6 +542,22 @@ impl ContentRegistry {
     /// The recipe whose stable name is exactly `name`.
     pub fn recipe_by_name(&self, name: &str) -> Option<&RecipeDef> {
         self.recipes.iter().find(|def| def.name == name)
+    }
+
+    /// Number of recipe definitions: the 22 frozen built-ins plus every pack
+    /// recipe.
+    pub fn recipe_count(&self) -> u16 {
+        u16::try_from(self.recipes.len()).expect("recipe table fits the u16 id space")
+    }
+
+    /// Enabled, non-placeholder recipes in authored stack order, paired with
+    /// their dense index (`< 22` built-in, `>= 22` pack).
+    pub fn enabled_recipes(&self) -> impl Iterator<Item = (u16, &RecipeDef)> + '_ {
+        self.recipes
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| def.enabled && !def.placeholder)
+            .map(|(index, def)| (index as u16, def))
     }
 
     /// Worldgen rules in authored stack order (later packs last).
@@ -1258,6 +1298,68 @@ mod tests {
         assert_eq!(registry.break_duration(ruby, None), Some(0.5));
         registry.blocks[usize::from(ruby.to_raw())].hardness = None;
         assert_eq!(registry.break_duration(ruby, None), None);
+    }
+
+    #[test]
+    fn placeholder_or_unknown_recipe_key_never_matches() {
+        use crate::player::inventory::{
+            CraftError, CraftingGrid, GridKind, Inventory, Item, ItemId, Material,
+        };
+
+        let mut registry = ContentRegistry::builtin().clone();
+        let placeholder = registry.append_placeholder_item("save:missing_gem");
+
+        let placeholder_index = registry.recipe_count();
+        registry.recipes.push(RecipeDef {
+            index: placeholder_index,
+            name: "save:placeholder_recipe".to_string(),
+            pattern: vec!["Q".to_string()],
+            key: std::collections::BTreeMap::from([('Q', ItemRef::Item(placeholder))]),
+            output: ItemRef::Block(BlockId::Stone),
+            count: 1,
+            enabled: true,
+            placeholder: false,
+        });
+        let unknown_index = registry.recipe_count();
+        registry.recipes.push(RecipeDef {
+            index: unknown_index,
+            name: "save:unknown_recipe".to_string(),
+            pattern: vec!["U".to_string()],
+            key: std::collections::BTreeMap::from([('U', ItemRef::Item(u16::MAX))]),
+            output: ItemRef::Block(BlockId::Stone),
+            count: 1,
+            enabled: true,
+            placeholder: false,
+        });
+
+        // A grid holding the placeholder identity itself must not match the
+        // recipe keyed to that placeholder.
+        let mut grid = CraftingGrid::new(GridKind::Player);
+        grid.set(
+            0,
+            Some(
+                Item::new_with(&registry, ItemId::Item(placeholder), 1)
+                    .expect("placeholder item constructs"),
+            ),
+        )
+        .expect("player cell");
+        assert_eq!(grid.preview_with(&registry), None);
+        let before = grid.clone();
+        assert_eq!(
+            grid.take_result_with(&registry, &mut Inventory::empty()),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(grid, before, "a failed match consumes nothing");
+
+        // A key pointing at an absent registry index also fails closed.
+        let mut unknown_grid = CraftingGrid::new(GridKind::Player);
+        unknown_grid
+            .set(
+                0,
+                Some(Item::new(ItemId::Material(Material::Stick), 1).expect("built-in stick")),
+            )
+            .expect("player cell");
+        assert_eq!(unknown_grid.preview_with(&registry), None);
     }
 
     #[test]

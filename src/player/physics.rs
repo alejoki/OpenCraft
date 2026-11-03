@@ -1,5 +1,7 @@
 use glam::Vec3;
 
+use crate::content::ContentRegistry;
+
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
 use crate::player::eating::food_value;
@@ -704,11 +706,43 @@ impl Player {
         }
     }
 
+    /// Crafts one result against `registry`.
+    ///
+    /// The registry-aware forwarder used by the production inventory click
+    /// seam (D196/MEM512): pack recipes match, disabled built-ins stay absent,
+    /// and the crafted stack is built from registry definitions.
+    pub fn take_craft_result_with(
+        &mut self,
+        registry: &ContentRegistry,
+        kind: GridKind,
+    ) -> Result<Item, CraftError> {
+        match kind {
+            GridKind::Player => self
+                .player_grid
+                .take_result_with(registry, &mut self.inventory),
+            GridKind::Table => self
+                .table_grid
+                .take_result_with(registry, &mut self.inventory),
+        }
+    }
+
     /// Read-only recipe preview for the matching grid. Never mutates.
     pub fn craft_preview(&self, kind: GridKind) -> Option<RecipePreview> {
         match kind {
             GridKind::Player => self.player_grid.preview(),
             GridKind::Table => self.table_grid.preview(),
+        }
+    }
+
+    /// Read-only registry-aware recipe preview for the matching grid.
+    pub fn craft_preview_with(
+        &self,
+        registry: &ContentRegistry,
+        kind: GridKind,
+    ) -> Option<RecipePreview> {
+        match kind {
+            GridKind::Player => self.player_grid.preview_with(registry),
+            GridKind::Table => self.table_grid.preview_with(registry),
         }
     }
 

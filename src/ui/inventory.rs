@@ -15,6 +15,8 @@
 
 use glam::IVec3;
 
+use crate::content::ContentRegistry;
+
 use crate::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
     HOTBAR_SLOTS, INVENTORY_SLOTS, MAIN_SLOTS, MAX_GRID_SLOTS, PLAYER_GRID_DIM, TABLE_GRID_DIM,
@@ -436,6 +438,28 @@ pub fn hovered_item(
     table_grid: &CraftingGrid,
     cursor: (f32, f32),
 ) -> Option<Item> {
+    hovered_item_with(
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+        cursor,
+        ContentRegistry::builtin(),
+    )
+}
+
+/// Registry-aware [`hovered_item`]: result slots resolve their preview output
+/// through the session registry, so a pack tool reports its real identity.
+pub fn hovered_item_with(
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    cursor: (f32, f32),
+    registry: &ContentRegistry,
+) -> Option<Item> {
     let target = hit_test(mode, layout, cursor)?;
     match target {
         InventoryTarget::Slot(index) => inventory.slot(index),
@@ -444,21 +468,20 @@ pub fn hovered_item(
             GridKind::Table if mode == InventoryMode::Table => table_grid.slot(index),
             GridKind::Table => None,
         },
-        InventoryTarget::ResultSlot(GridKind::Player) => preview_item(player_grid),
+        InventoryTarget::ResultSlot(GridKind::Player) => preview_item_with(player_grid, registry),
         InventoryTarget::ResultSlot(GridKind::Table) if mode == InventoryMode::Table => {
-            preview_item(table_grid)
+            preview_item_with(table_grid, registry)
         }
         InventoryTarget::ResultSlot(GridKind::Table) => None,
     }
 }
 
-/// The output stack a grid would craft, or `None` when it matches no recipe.
-///
-/// Static recipes are validated by construction, so the `Item::new` failure
-/// branch is unreachable; `ok()` keeps this helper total instead of panicking.
-fn preview_item(grid: &CraftingGrid) -> Option<Item> {
-    grid.preview()
-        .and_then(|preview| Item::new(preview.output, preview.output_count).ok())
+/// The output stack a grid would craft through `registry`, or `None` when it
+/// matches no recipe. A pack tool preview becomes
+/// [`crate::player::inventory::ItemId::ModTool`] with authored durability.
+fn preview_item_with(grid: &CraftingGrid, registry: &ContentRegistry) -> Option<Item> {
+    grid.preview_with(registry)
+        .and_then(|preview| Item::new_with(registry, preview.output, preview.output_count).ok())
 }
 
 /// Tooltip body lines for an item: name first, then optional detail lines.
@@ -666,8 +689,12 @@ fn cell_fill(rect: Rect) -> Rect {
     inset(rect, rect.2 * FILL_INSET_RATIO)
 }
 
-fn preview_fill(rect: Rect, preview: RecipePreview) -> Option<Quad> {
-    let item = Item::new(preview.output, preview.output_count).ok()?;
+fn preview_fill_with(
+    rect: Rect,
+    preview: RecipePreview,
+    registry: &ContentRegistry,
+) -> Option<Quad> {
+    let item = Item::new_with(registry, preview.output, preview.output_count).ok()?;
     Some(rect_quad(cell_fill(rect), item_color(item)))
 }
 
@@ -684,6 +711,34 @@ pub fn screen_quads(
     table_grid: &CraftingGrid,
     cursor_item: Option<Item>,
     cursor_pos: Option<(f32, f32)>,
+) -> Vec<Quad> {
+    screen_quads_with(
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+        cursor_item,
+        cursor_pos,
+        ContentRegistry::builtin(),
+    )
+}
+
+/// Registry-aware [`screen_quads`]: result previews resolve through `registry`
+/// so a pack-tool preview renders with its authored identity/colour.
+///
+/// Eight arguments is the pure frame plumbing plus the session registry; the
+/// geometry stays a pure function of its inputs (no hidden state).
+#[allow(clippy::too_many_arguments)]
+pub fn screen_quads_with(
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    cursor_item: Option<Item>,
+    cursor_pos: Option<(f32, f32)>,
+    registry: &ContentRegistry,
 ) -> Vec<Quad> {
     if !mode.is_open() {
         return Vec::new();
@@ -710,8 +765,8 @@ pub fn screen_quads(
     }
 
     quads.push(rect_quad(layout.player_result, RESULT_COLOR));
-    if let Some(preview) = player_grid.preview() {
-        quads.extend(preview_fill(layout.player_result, preview));
+    if let Some(preview) = player_grid.preview_with(registry) {
+        quads.extend(preview_fill_with(layout.player_result, preview, registry));
     }
 
     if mode == InventoryMode::Table {
@@ -722,8 +777,8 @@ pub fn screen_quads(
             }
         }
         quads.push(rect_quad(layout.table_result, RESULT_COLOR));
-        if let Some(preview) = table_grid.preview() {
-            quads.extend(preview_fill(layout.table_result, preview));
+        if let Some(preview) = table_grid.preview_with(registry) {
+            quads.extend(preview_fill_with(layout.table_result, preview, registry));
         }
     }
 
@@ -784,10 +839,18 @@ fn push_cell_labels(labels: &mut Vec<InventoryLabel>, rect: Rect, item: Item) {
     }
 }
 
-fn push_result_label(labels: &mut Vec<InventoryLabel>, rect: Rect, preview: RecipePreview) {
+fn push_result_label_with(
+    labels: &mut Vec<InventoryLabel>,
+    rect: Rect,
+    preview: RecipePreview,
+    registry: &ContentRegistry,
+) {
     let (left, top) = count_origin(rect);
+    let name = registry
+        .item_display_name(preview.output)
+        .unwrap_or_else(|| preview.output.name().to_string());
     labels.push(InventoryLabel {
-        text: format!("{} x{}", preview.output.name(), preview.output_count),
+        text: format!("{name} x{}", preview.output_count),
         left,
         top,
     });
@@ -815,6 +878,28 @@ pub fn screen_labels(
     player_grid: &CraftingGrid,
     table_grid: &CraftingGrid,
     status: Option<&str>,
+) -> Vec<InventoryLabel> {
+    screen_labels_with(
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+        status,
+        ContentRegistry::builtin(),
+    )
+}
+
+/// Registry-aware [`screen_labels`]: result labels render the authored display
+/// name for pack items/tools and keep every built-in label unchanged.
+pub fn screen_labels_with(
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    status: Option<&str>,
+    registry: &ContentRegistry,
 ) -> Vec<InventoryLabel> {
     let mut labels = Vec::new();
     if !mode.is_open() {
@@ -851,12 +936,12 @@ pub fn screen_labels(
         }
     }
 
-    if let Some(preview) = player_grid.preview() {
-        push_result_label(&mut labels, layout.player_result, preview);
+    if let Some(preview) = player_grid.preview_with(registry) {
+        push_result_label_with(&mut labels, layout.player_result, preview, registry);
     }
     if mode == InventoryMode::Table {
-        if let Some(preview) = table_grid.preview() {
-            push_result_label(&mut labels, layout.table_result, preview);
+        if let Some(preview) = table_grid.preview_with(registry) {
+            push_result_label_with(&mut labels, layout.table_result, preview, registry);
         }
     }
 
