@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
 use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
 use opencraft::mesh::quad::ChunkMesh;
@@ -13878,6 +13879,291 @@ fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     }
 }
 
+/// Resolve the palette's granted identity by stable name: blocks first, then
+/// generic items, then pack tools.
+fn palette_demo_item_id(registry: &ContentRegistry, name: &str) -> Option<ItemId> {
+    if let Some(def) = registry.block_by_name(name) {
+        return Some(ItemId::Block(def.id));
+    }
+    if let Some(def) = registry.item_by_name(name) {
+        return Some(ItemId::Item(def.index));
+    }
+    registry
+        .tool_by_name(name)
+        .map(|def| ItemId::ModTool(def.index))
+}
+
+/// Format a pixel-space rect as four rounded integers for the digest.
+fn palette_demo_rect((x, y, w, h): (f32, f32, f32, f32)) -> String {
+    format!("{x:.0},{y:.0},{w:.0},{h:.0}")
+}
+
+/// Build the deterministic `--demo-palette` digest.
+///
+/// Every leg runs through a production seam: [`palette::entries`],
+/// [`palette::layout`], [`palette::screen_quads`], [`palette::screen_labels`],
+/// [`palette::filter_entries`], [`Player::grant_palette_item_with`],
+/// [`Player::eat_selected_with`], [`palette::available_in`], and the registry's
+/// placeholder append seam. Each line is machine-independent (names, counts,
+/// booleans), so `scripts/palette_smoke.sh` can pin them whole-line. The caller
+/// exits non-zero when the latch fails.
+fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Fail closed when the checked-in reference pack is not selected: the
+    // pinned literals below only exist with its five authored definitions.
+    if registry.item_by_name("mymod:ruby").is_none() {
+        lines.push("palette: failed reason=pack".to_string());
+        return (lines, false);
+    }
+
+    macro_rules! fail_if {
+        ($cond:expr, $leg:literal) => {
+            if $cond {
+                lines.push(format!("palette: failed reason={}", $leg));
+                return (lines, false);
+            }
+        };
+    }
+
+    // (a) Entry stock: source groups counted from the registry and the frozen
+    // name tables, total from the production palette builder.
+    let builtin_blocks = registry
+        .blocks()
+        .iter()
+        .filter(|def| {
+            !def.placeholder && def.id.is_carryable() && !matches!(def.id, BlockId::Modded(_))
+        })
+        .count();
+    let builtin_items = names::MATERIAL_ID_NAMES.len();
+    let builtin_tools = names::TOOL_ID_NAMES.len();
+    let pack_blocks = registry
+        .blocks()
+        .iter()
+        .filter(|def| matches!(def.id, BlockId::Modded(_)) && !def.placeholder)
+        .count();
+    let pack_items = registry
+        .items()
+        .iter()
+        .filter(|def| !def.placeholder)
+        .count();
+    let pack_tools = registry.tools().len();
+    let entries = palette::entries(registry);
+    let total = entries.len();
+    lines.push(format!(
+        "palette: leg=entries builtin_blocks={builtin_blocks} builtin_items={builtin_items} builtin_tools={builtin_tools} pack_blocks={pack_blocks} pack_items={pack_items} pack_tools={pack_tools} total={total}"
+    ));
+    fail_if!(
+        builtin_blocks != 14
+            || builtin_items != 11
+            || builtin_tools != 16
+            || pack_blocks != 1
+            || pack_items != 2
+            || pack_tools != 2
+            || total != 46,
+        "entries"
+    );
+
+    // (b) Pinned geometry at 1280x720 through the production layout, quad, and
+    // label builders.
+    let mut screen = PaletteScreen::new();
+    screen.open(registry);
+    let layout = palette::layout(1280, 720);
+    let quads = palette::screen_quads(&screen, &layout, None).len();
+    let labels = palette::screen_labels(&screen, &layout).len();
+    lines.push(format!(
+        "palette: leg=layout surface=1280x720 panel={} slot0={} slot53={} quads={quads} labels={labels}",
+        palette_demo_rect(layout.panel),
+        palette_demo_rect(layout.slots[0]),
+        palette_demo_rect(layout.slots[53]),
+    ));
+    fail_if!(
+        layout.panel != (428.0, 158.0, 424.0, 404.0)
+            || layout.slots[0] != (444.0, 242.0, 40.0, 40.0)
+            || layout.slots[53] != (796.0, 462.0, 40.0, 40.0)
+            || quads != 57
+            || labels != 4,
+        "layout"
+    );
+
+    // (c) Filter legs: the `rub` line pins the sorted-display-name order from
+    // the palette model; the namespace legs prove the other match axes.
+    let rub = palette::filter_entries(&entries, "rub");
+    let rub_names = rub
+        .iter()
+        .map(|index| entries[*index].name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    lines.push(format!(
+        "palette: leg=filter query=rub matched={} names={rub_names}",
+        rub.len()
+    ));
+    fail_if!(
+        rub.len() != 5
+            || rub_names
+                != "mymod:ruby,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword",
+        "filter"
+    );
+
+    let namespaced = palette::filter_entries(&entries, "mymod");
+    lines.push(format!(
+        "palette: leg=filter query=mymod matched={}",
+        namespaced.len()
+    ));
+    fail_if!(namespaced.len() != 5, "filter");
+
+    let builtin_matches = palette::filter_entries(&entries, "builtin");
+    lines.push(format!(
+        "palette: leg=filter query=builtin matched={}",
+        builtin_matches.len()
+    ));
+    fail_if!(builtin_matches.len() != 41, "filter");
+
+    // (d) Grant legs: a fresh Creative player, one authored full stack per
+    // identity, granted through the real production path. Every grant writes
+    // the next empty hotbar slot and selects it.
+    let mut player = Player::with_inventory(
+        Vec3::ZERO,
+        Inventory::empty(),
+        CraftingGrid::new(GridKind::Player),
+        CraftingGrid::new(GridKind::Table),
+    );
+    struct GrantSpec {
+        name: &'static str,
+        slot: usize,
+        count: u16,
+        tool: bool,
+        durability: Option<u16>,
+        placeable: bool,
+    }
+    let grant_specs = [
+        GrantSpec {
+            name: "mymod:ruby_ore",
+            slot: 0,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: true,
+        },
+        GrantSpec {
+            name: "mymod:ruby",
+            slot: 1,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_stew",
+            slot: 2,
+            count: 16,
+            tool: false,
+            durability: None,
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_pickaxe",
+            slot: 3,
+            count: 1,
+            tool: true,
+            durability: Some(900),
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_sword",
+            slot: 4,
+            count: 1,
+            tool: true,
+            durability: Some(900),
+            placeable: false,
+        },
+    ];
+    for spec in grant_specs {
+        let name = spec.name;
+        let Some(id) = palette_demo_item_id(registry, name) else {
+            lines.push("palette: failed reason=grant".to_string());
+            return (lines, false);
+        };
+        let Ok((slot, item)) = player.grant_palette_item_with(registry, id) else {
+            lines.push("palette: failed reason=grant".to_string());
+            return (lines, false);
+        };
+        let tool = item.is_tool();
+        let placeable = player.selected_block().is_some();
+        if tool {
+            lines.push(format!(
+                "palette: leg=grant slot={slot} item={name} count={} tool={tool} durability={}",
+                item.count(),
+                item.durability().unwrap_or(0),
+            ));
+            fail_if!(
+                slot != spec.slot
+                    || item.count() != spec.count
+                    || tool != spec.tool
+                    || item.durability() != spec.durability,
+                "grant"
+            );
+        } else {
+            lines.push(format!(
+                "palette: leg=grant slot={slot} item={name} count={} tool={tool} placeable={placeable}",
+                item.count(),
+            ));
+            fail_if!(
+                slot != spec.slot
+                    || item.count() != spec.count
+                    || tool != spec.tool
+                    || placeable != spec.placeable,
+                "grant"
+            );
+        }
+    }
+
+    // (e) Use leg: the granted stew restores its authored seven hunger at the
+    // production eat seam, from a known twelve-hunger baseline.
+    let Some(stew_id) = palette_demo_item_id(registry, "mymod:ruby_stew") else {
+        lines.push("palette: failed reason=use".to_string());
+        return (lines, false);
+    };
+    player.survival = SurvivalState::new(20, 12, FULL_AIR).expect("valid vitals");
+    player.select_slot(2);
+    let restored = player.eat_selected_with(registry, 2, stew_id);
+    let hunger = player.survival.hunger();
+    lines.push(format!(
+        "palette: leg=use item=mymod:ruby_stew restored={} hunger={hunger}",
+        restored.unwrap_or(0),
+    ));
+    fail_if!(restored != Some(7) || hunger != 19, "use");
+
+    // (f) Placeholder leg: save-local placeholder definitions appended after
+    // the pack must never enter the palette stock.
+    let mut with_placeholders = (**registry).clone();
+    with_placeholders.append_placeholder_block("save:ghost_block");
+    with_placeholders.append_placeholder_item("save:ghost_item");
+    let placeholder_entries = palette::entries(&with_placeholders);
+    let ghosts_listed = placeholder_entries
+        .iter()
+        .any(|entry| entry.name == "save:ghost_block" || entry.name == "save:ghost_item");
+    lines.push(format!(
+        "palette: leg=placeholder excluded=2 total={}",
+        placeholder_entries.len()
+    ));
+    fail_if!(
+        placeholder_entries.len() != 46 || ghosts_listed,
+        "placeholder"
+    );
+
+    // (g) Key leg: the palette is Creative-only.
+    let creative = palette::available_in(GameMode::Creative);
+    let survival = palette::available_in(GameMode::Survival);
+    lines.push(format!(
+        "palette: leg=key key=C creative={creative} survival={survival}"
+    ));
+    fail_if!(!creative || survival, "key");
+
+    lines.push("palette: ok".to_string());
+    (lines, true)
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -13989,6 +14275,31 @@ fn main() {
             load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
         let (registry, _report) = build_session_registry(&specs);
         let (lines, ok) = worldgen_demo_lines(&registry);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-palette` is the headless Creative palette digest: it reads the
+    // settings file and the persisted pack stack (read-only), builds the same
+    // frozen registry a launch would, and pins the palette's entry stock,
+    // geometry, filter, grant, use, placeholder and key legs through the
+    // production seams. It runs after the worldgen digest and before
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop,
+    // settings write or save happens here.
+    if cli.demo_palette {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let (lines, ok) = palette_demo_lines(&registry);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -14596,6 +14907,20 @@ mod tests {
     }
 
     #[test]
+    fn demo_palette_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless digest,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let palette = CliConfig::parse_args(["--demo-palette"]);
+        assert!(!cli_has_world_intent(&palette));
+        assert_eq!(cli_has_world_intent(&palette), cli_has_world_intent(&bare));
+        // A real world flag still grants intent; the digest flag is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--demo-palette"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
     fn demo_presentation_is_a_launch_switch_and_never_a_world_intent() {
         // The flag alone must not bypass the menus: it is a headless digest,
         // not a world parameter.
@@ -14610,6 +14935,42 @@ mod tests {
         // persisted or turned into a world parameter.
         let with_new = CliConfig::parse_args(["--new", "--demo-presentation"]);
         assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_palette_short_circuit_precedes_world_startup() {
+        // The palette digest must run after the worldgen digest and before any
+        // world/session startup: no save, settings write, window, GPU, audio
+        // engine or event loop is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_worldgen_at = body
+            .find("cli.demo_worldgen")
+            .expect("fn main must branch on cli.demo_worldgen");
+        let demo_palette_at = body
+            .find("cli.demo_palette")
+            .expect("fn main must branch on cli.demo_palette");
+        let digest_at = body
+            .find("palette_demo_lines(")
+            .expect("fn main must call palette_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_worldgen_at < demo_palette_at,
+            "the palette digest must follow the worldgen branch"
+        );
+        assert!(
+            demo_palette_at < startup_at,
+            "cli.demo_palette must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "palette_demo_lines must precede startup"
+        );
     }
 
     /// A real v2 pack on disk (two blocks, one item, one distinct 16x16 PNG
@@ -14830,6 +15191,58 @@ stack = 64
         assert_eq!(
             lines.last().map(String::as_str),
             Some("crafting: failed reason=table")
+        );
+    }
+
+    #[test]
+    fn palette_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let (lines, ok) = palette_demo_lines(&registry);
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test (D143/MEM368).
+        let expected = vec![
+            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=1 pack_items=2 pack_tools=2 total=46".to_string(),
+            "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4".to_string(),
+            "palette: leg=filter query=rub matched=5 names=mymod:ruby,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
+            "palette: leg=filter query=mymod matched=5".to_string(),
+            "palette: leg=filter query=builtin matched=41".to_string(),
+            "palette: leg=grant slot=0 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
+            "palette: leg=grant slot=1 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=2 item=mymod:ruby_stew count=16 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=3 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
+            "palette: leg=grant slot=4 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
+            "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19".to_string(),
+            "palette: leg=placeholder excluded=2 total=46".to_string(),
+            "palette: leg=key key=C creative=true survival=false".to_string(),
+            "palette: ok".to_string(),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn palette_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = palette_demo_lines(&ContentRegistry::builtin_arc());
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("palette: failed reason=pack")
         );
     }
 

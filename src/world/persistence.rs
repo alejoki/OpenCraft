@@ -236,6 +236,14 @@ pub struct CliConfig {
     /// before `StartupContent::load`, so the digest never opens a window, GPU,
     /// audio engine, event loop or settings write, and never writes a save.
     pub demo_worldgen: bool,
+    /// Whether the headless Creative palette digest (`--demo-palette`,
+    /// M010/S07-T04) is requested. Same bare-switch contract as
+    /// `demo_worldgen`: it takes no value, is deliberately NOT a world intent
+    /// (so it never affects `cli_has_world_intent`), and is never persisted.
+    /// `main` consumes it before `StartupContent::load`, so the digest never
+    /// opens a window, GPU, audio engine, event loop or settings write, and
+    /// never writes a save.
+    pub demo_palette: bool,
     /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
     /// `main` consumes it before `startup_session`, so validation never opens
     /// a window, GPU, world, save or settings file. A switch with no following
@@ -272,6 +280,7 @@ impl CliConfig {
         let mut demo_presentation = false;
         let mut demo_crafting = false;
         let mut demo_worldgen = false;
+        let mut demo_palette = false;
         let mut validate_pack = None;
         let mut mode = GameMode::Creative;
 
@@ -365,6 +374,11 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_worldgen = true;
                 }
+                "--demo-palette" => {
+                    // Same bare-switch rule as `--demo-worldgen`. `main`
+                    // short-circuits on this before `StartupContent::load`.
+                    demo_palette = true;
+                }
                 "--validate-pack" => {
                     // Value switch: consume the next token. A missing value
                     // stores an empty name so the request fails closed in
@@ -402,6 +416,7 @@ impl CliConfig {
             demo_presentation,
             demo_crafting,
             demo_worldgen,
+            demo_palette,
             validate_pack,
             mode,
         }
@@ -5478,6 +5493,45 @@ mod tests {
         // A stray non-flag token after the switch never becomes the seed.
         let stray = CliConfig::parse_args(["--demo-worldgen", "5"]);
         assert!(stray.demo_worldgen);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_palette_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_palette);
+        assert!(!bare.demo_worldgen);
+        assert!(!bare.demo_crafting);
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let palette = CliConfig::parse_args(["--demo-palette"]);
+        assert!(palette.demo_palette);
+        assert!(!palette.demo_worldgen);
+        assert!(!palette.demo_crafting);
+        assert!(!palette.demo_presentation);
+        assert!(!palette.demo_ui);
+        assert!(!palette.force_new_world);
+        assert_eq!(palette.seed_override, None);
+        assert_eq!(
+            palette.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--save fixture.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value.
+        let with_save = CliConfig::parse_args(["--demo-palette", "--save", "fixture.mcvx"]);
+        assert!(with_save.demo_palette);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-palette", "5"]);
+        assert!(stray.demo_palette);
         assert_eq!(stray.seed_override, None);
     }
 
