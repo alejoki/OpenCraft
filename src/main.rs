@@ -26,7 +26,8 @@ use opencraft::player::inventory::{
     ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
 };
 use opencraft::player::melee::{
-    attack_damage, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH, SWORD_DAMAGE_WOOD,
+    attack_damage, attack_damage_with, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH,
+    SWORD_DAMAGE_WOOD,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
@@ -517,9 +518,12 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
         // Drop mapping is authored content (Stone -> Cobblestone, a pack block
         // -> its authored item and stack limit). The item identity and limit
         // both come from the frozen session registry, and the drop is still
-        // collected last so MEM195 ordering is preserved.
+        // collected last so MEM195 ordering is preserved. The registry-aware
+        // collector can construct a non-stackable pack tool drop.
         if let Some((id, limit)) = session.registry.drop_entry(block) {
-            session.player.collect_limited(id, 1, limit);
+            session
+                .player
+                .collect_limited_with(&session.registry, id, 1, limit);
         }
 
         // Breaking the support ends the crop's eligibility even though the
@@ -11001,7 +11005,8 @@ impl ApplicationHandler for GameApp {
                     // i-frame-blocked swing mutate nothing (MEM392).
                     let target_health = self.session.mobs().get(index).map(|mob| mob.health);
                     if let Some(target_health) = target_health {
-                        let damage = attack_damage(
+                        let damage = attack_damage_with(
+                            &self.session.registry,
                             self.session.player.selected_item(),
                             self.session.player.mode(),
                             target_health,
@@ -18351,6 +18356,183 @@ stack = 64
             "an unknown id is never edited"
         );
         assert_eq!(builtin.player.inventory().slots()[0], None);
+    }
+
+    #[test]
+    fn pack_tier_pickaxe_breaks_ruby_ore_faster_than_iron() {
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let ruby_pickaxe = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        let iron_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            },
+            1,
+        )
+        .expect("iron pickaxe");
+
+        // The production duration function resolves the authored 9x tier
+        // against the block's authored hardness/class.
+        let ruby_duration = registry
+            .break_duration(ruby_ore, Some(ruby_pickaxe))
+            .expect("ruby ore is breakable");
+        let iron_duration = registry
+            .break_duration(ruby_ore, Some(iron_pickaxe))
+            .expect("ruby ore is breakable");
+        assert!((ruby_duration - 3.0 / 9.0).abs() < 1e-6);
+        assert!((iron_duration - 3.0 / 6.0).abs() < 1e-6);
+        assert!(
+            ruby_duration < iron_duration,
+            "ruby {ruby_duration}s must beat iron {iron_duration}s"
+        );
+
+        // The production mining target carries the same registry-aware time.
+        let target = MiningTarget::from_block_with(
+            &registry,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+            Some(ruby_pickaxe),
+        )
+        .expect("a registry-aware target");
+        assert!((target.duration() - ruby_duration).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pack_tool_break_wears_exactly_one_point_and_reports_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5151,
+            dir.path().join("pack-wear.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe"));
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty(), "the pack block edit applied");
+        assert_eq!(wear, ToolWearOutcome::Worn { remaining: 899 });
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(899),
+            "exactly one durability point was spent"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.id()),
+            Some(ItemId::ModTool(0)),
+            "the pack tool keeps its identity"
+        );
+    }
+
+    #[test]
+    fn pack_tool_at_last_durability_breaks_and_frees_its_slot_for_the_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5152,
+            dir.path().join("pack-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability_with(&registry, ItemId::ModTool(0), 1)
+                .expect("last durability"),
+        );
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Broke);
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        let ruby_index = registry
+            .item_by_name("mymod:ruby")
+            .expect("ruby item is authored")
+            .index;
+        assert_eq!(
+            session.player.inventory().slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(ruby_index)),
+            "wear ran before collection, so the drop took the freed slot"
+        );
+    }
+
+    #[test]
+    fn authored_pack_tool_drop_is_collected_with_authored_durability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let altar = registry
+            .block_by_name("mymod:tool_altar")
+            .expect("the altar is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5153,
+            dir.path().join("pack-tool-drop.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, altar);
+
+        assert_eq!(
+            registry.drop_entry(altar),
+            Some((ItemId::ModTool(0), 1)),
+            "the authored drop resolves to the pack tool identity"
+        );
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, IVec3::new(0, 10, 0), altar));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Nothing);
+        let slot = session.player.inventory().slots()[0].expect("the tool dropped");
+        assert_eq!(slot.id(), ItemId::ModTool(0));
+        assert_eq!(slot.count(), 1);
+        assert_eq!(slot.durability(), Some(900));
+        assert_eq!(slot.max_durability(), Some(900));
     }
 
     #[test]
@@ -28429,6 +28611,97 @@ stack = 64
             spec,
         )];
         let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        Arc::new(registry)
+    }
+
+    /// Pack registry with an authored ruby tier (speed 9, durability 900,
+    /// damage 9), a ruby pickaxe and sword, ruby ore that drops a ruby item,
+    /// and an altar block whose authored drop is the pack pickaxe itself.
+    fn pack_tool_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{
+            BlockEntry, BlockTextures, ItemEntry, PackAsset, TierEntry, ToolEntry,
+        };
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 3.0,
+            drop: Some("mymod:ruby".to_string()),
+            tool: Some(ToolKind::Pickaxe),
+            stack_limit: 64,
+        });
+        spec.blocks.push(BlockEntry {
+            id: "mymod:tool_altar".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("altar.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: Some("mymod:ruby_pickaxe".to_string()),
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 64,
+            food: None,
+        });
+        spec.tiers.push(TierEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: Some("Ruby".to_string()),
+            speed: 9.0,
+            durability: 900,
+            damage: 9,
+        });
+        spec.tools.push(ToolEntry {
+            id: "mymod:ruby_pickaxe".to_string(),
+            display_name: Some("Ruby Pickaxe".to_string()),
+            kind: ToolKind::Pickaxe,
+            tier: "mymod:ruby".to_string(),
+            icon: "pickaxe.png".to_string(),
+        });
+        spec.tools.push(ToolEntry {
+            id: "mymod:ruby_sword".to_string(),
+            display_name: Some("Ruby Sword".to_string()),
+            kind: ToolKind::Sword,
+            tier: "mymod:ruby".to_string(),
+            icon: "sword.png".to_string(),
+        });
+        for path in [
+            "ore.png",
+            "altar.png",
+            "ruby.png",
+            "pickaxe.png",
+            "sword.png",
+        ] {
+            spec.assets.insert(
+                path.to_string(),
+                PackAsset {
+                    rgba: vec![0x44; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod-tools".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
         assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
         Arc::new(registry)
     }

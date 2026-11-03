@@ -448,30 +448,48 @@ impl ContentRegistry {
     ///
     /// Built-ins answer exactly like [`tools::break_duration`] because
     /// [`BlockDef::from_builtin`] derives both fields from the same accessors.
-    /// Unknown ids and unbreakable definitions return `None`.
+    /// A pack tool resolves its [`ToolDef`] and authored [`TierDef::speed`]; a
+    /// mismatched class keeps the authored hardness and an unknown tool or tier
+    /// index falls back to bare-hand timing. Unknown ids and unbreakable
+    /// definitions return `None`.
     pub fn break_duration(&self, block: BlockId, selected: Option<Item>) -> Option<f32> {
         let def = self.block(block)?;
-        tools::break_duration_for(def.hardness, def.tool_class, selected)
+        if !matches!(selected.map(|item| item.id()), Some(ItemId::ModTool(_))) {
+            return tools::break_duration_for(def.hardness, def.tool_class, selected);
+        }
+        let Some(ItemId::ModTool(index)) = selected.map(|item| item.id()) else {
+            unreachable!("the match above proved a pack tool identity");
+        };
+        let Some((kind, speed)) = self
+            .tool(index)
+            .and_then(|tool| self.tier(tool.tier).map(|tier| (tool.kind, tier.speed)))
+        else {
+            return tools::break_duration_for(def.hardness, def.tool_class, None);
+        };
+        tools::break_duration_for_pack_tier(def.hardness, def.tool_class, kind, speed)
     }
 
     /// The insertable drop for `block` and its authored stack limit.
     ///
     /// Returns `None` when the definition is missing, the block authors no
-    /// drop, or the drop is a pack tool identity that cannot be inserted until
-    /// S05 widens [`ItemId`]. Block drops use the breaking definition's
-    /// authored limit; item drops use the item definition's limit; built-ins
-    /// use [`ItemId::stack_limit`]. The result is always clamped to
+    /// drop, or the drop cannot be resolved to a live identity. Block drops use
+    /// the breaking definition's authored limit; item drops use the item
+    /// definition's limit; pack tool drops use the non-stackable limit of one;
+    /// built-ins use [`ItemId::stack_limit`]. The result is always clamped to
     /// `1..=MAX_STACK_COUNT` so callers can hand it straight to collection.
     pub fn drop_entry(&self, block: BlockId) -> Option<(ItemId, u16)> {
         let def = self.block(block)?;
         let (id, limit) = match def.drop? {
             ItemRef::Block(id) => (ItemId::Block(id), def.stack_limit),
             ItemRef::Item(index) => {
-                let item = self.item(index)?;
+                let item = self.item(index).filter(|def| !def.placeholder)?;
                 (ItemId::Item(index), item.stack_limit)
             }
             ItemRef::Builtin(id) => (id, id.stack_limit()),
-            ItemRef::Tool(_) => return None,
+            ItemRef::Tool(index) => {
+                self.tool(index)?;
+                (ItemId::ModTool(index), 1)
+            }
         };
         Some((id, limit.clamp(1, MAX_STACK_COUNT)))
     }
@@ -1190,6 +1208,22 @@ mod tests {
             food: None,
             placeholder: false,
         });
+        registry.tiers.push(TierDef {
+            index: 3,
+            name: "mymod:ruby".to_string(),
+            display_name: "Ruby".to_string(),
+            speed: 9.0,
+            durability: 900,
+            damage: 9,
+        });
+        registry.tools.push(ToolDef {
+            index: 0,
+            name: "mymod:ruby_pickaxe".to_string(),
+            display_name: "Ruby Pickaxe".to_string(),
+            kind: ToolKind::Pickaxe,
+            tier: 3,
+            icon_layer: PLACEHOLDER_ICON_LAYER,
+        });
 
         let mut push_block = |id: BlockId, drop: ItemRef, stack_limit: u16| {
             registry.blocks.push(BlockDef {
@@ -1233,16 +1267,42 @@ mod tests {
         );
 
         // Item drops use the target item's authored limit; block drops use the
-        // breaking definition's authored limit.
+        // breaking definition's authored limit; tools are non-stackable.
         assert_eq!(registry.drop_entry(item_drop), Some((ItemId::Item(0), 12)));
         assert_eq!(
             registry.drop_entry(block_drop),
             Some((ItemId::Block(item_drop), 7))
         );
+        assert_eq!(
+            registry.drop_entry(tool_drop),
+            Some((ItemId::ModTool(0), 1)),
+            "an authored pack tool drop resolves to the widened identity"
+        );
 
-        // Tools and unresolved item indices cannot be inserted.
-        assert_eq!(registry.drop_entry(tool_drop), None);
+        // Unresolved item and tool indices cannot be inserted.
         assert_eq!(registry.drop_entry(missing_item_drop), None);
+        let mut unknown_tool = ContentRegistry::builtin().clone();
+        let unknown_tool_block = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        unknown_tool.blocks.push(BlockDef {
+            id: unknown_tool_block,
+            name: "test:unknown_tool".to_string(),
+            display_name: "Test Unknown Tool".to_string(),
+            faces: [PLACEHOLDER_BLOCK_LAYER; 6],
+            hardness: Some(1.0),
+            drop: Some(ItemRef::Tool(9)),
+            tool_class: None,
+            stack_limit: 64,
+            placeholder: false,
+        });
+        assert_eq!(unknown_tool.drop_entry(unknown_tool_block), None);
+
+        // A placeholder item identity never becomes a live drop.
+        let mut placeholder = ContentRegistry::builtin().clone();
+        let placeholder_index = placeholder.append_placeholder_item("save:missing_gem");
+        let placeholder_block = placeholder.append_placeholder_block("save:placeholder_source");
+        placeholder.blocks[usize::from(placeholder_block.to_raw())].drop =
+            Some(ItemRef::Item(placeholder_index));
+        assert_eq!(placeholder.drop_entry(placeholder_block), None);
     }
 
     #[test]
@@ -1291,6 +1351,23 @@ mod tests {
                 tools::break_duration(block, None),
                 "bare-hand answer diverged for {block:?}"
             );
+            for item in [
+                Item::new(
+                    ItemId::Tool {
+                        kind: ToolKind::Pickaxe,
+                        tier: ToolTier::Iron,
+                    },
+                    1,
+                )
+                .expect("built-in pickaxe"),
+                Item::new(ItemId::Block(BlockId::OakPlanks), 1).expect("block item"),
+            ] {
+                assert_eq!(
+                    registry.break_duration(block, Some(item)),
+                    tools::break_duration(block, Some(item)),
+                    "built-in selection diverged for {block:?}"
+                );
+            }
         }
 
         let (mut registry, [ruby, ..]) = registry_with_drops();
@@ -1298,6 +1375,50 @@ mod tests {
         assert_eq!(registry.break_duration(ruby, None), Some(0.5));
         registry.blocks[usize::from(ruby.to_raw())].hardness = None;
         assert_eq!(registry.break_duration(ruby, None), None);
+    }
+
+    #[test]
+    fn pack_tier_speed_shortens_a_matched_block_and_unknown_indices_fall_back() {
+        let (mut registry, [ruby, ..]) = registry_with_drops();
+        let ruby_block = usize::from(ruby.to_raw());
+        registry.blocks[ruby_block].hardness = Some(3.0);
+        registry.blocks[ruby_block].tool_class = Some(ToolKind::Pickaxe);
+
+        let ruby_pickaxe = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        let iron_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            },
+            1,
+        )
+        .expect("built-in pickaxe");
+
+        let ruby_duration = registry
+            .break_duration(ruby, Some(ruby_pickaxe))
+            .expect("the pack block is breakable");
+        let iron_duration = registry
+            .break_duration(ruby, Some(iron_pickaxe))
+            .expect("the pack block is breakable");
+        assert!((ruby_duration - 3.0 / 9.0).abs() < 1e-6);
+        assert!((iron_duration - 3.0 / 6.0).abs() < 1e-6);
+        assert!(
+            ruby_duration < iron_duration,
+            "the authored 9x tier must beat the 6x iron tier"
+        );
+
+        // A mismatched pack class keeps the authored hardness.
+        let mut mismatched = registry.clone();
+        mismatched.tools[0].kind = ToolKind::Sword;
+        let sword = Item::new_with(&mismatched, ItemId::ModTool(0), 1).expect("pack sword");
+        assert_eq!(mismatched.break_duration(ruby, Some(sword)), Some(3.0));
+
+        // An item whose tool index does not exist in the resolving registry
+        // falls back to bare-hand timing instead of aliasing another identity.
+        let foreign = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        let mut no_tools = registry.clone();
+        no_tools.tools.clear();
+        assert_eq!(no_tools.break_duration(ruby, Some(foreign)), Some(3.0));
     }
 
     #[test]

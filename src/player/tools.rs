@@ -111,6 +111,30 @@ pub fn break_duration_for(
     Some(base / f32::from(tier_speed_multiplier(tier)))
 }
 
+/// Registry-friendly core for a pack tool tier.
+///
+/// `kind` and `speed` are the authored values from the resolved [`ToolDef`]
+/// and its [`TierDef`], so a pack tier gets the same class gate and hardness
+/// division as the built-in `Tool { kind, tier }` arm. A mismatched tool class
+/// keeps the authored hardness, and a missing/degenerate authored speed fails
+/// closed to bare-hand timing instead of producing a non-finite or
+/// longer-than-base duration.
+///
+/// [`ToolDef`]: crate::content::ToolDef
+/// [`TierDef`]: crate::content::TierDef
+pub fn break_duration_for_pack_tier(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    kind: ToolKind,
+    speed: f32,
+) -> Option<f32> {
+    let base = hardness?;
+    if tool_class != Some(kind) || !speed.is_finite() || speed < 1.0 {
+        return Some(base);
+    }
+    Some(base / speed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +439,42 @@ mod tests {
                 Some(tool(ToolKind::Axe, ToolTier::Iron))
             ),
             Some(0.2)
+        );
+    }
+
+    #[test]
+    fn pack_tier_break_speed_matches_the_authored_multiplier() {
+        approx(
+            break_duration_for_pack_tier(
+                Some(3.0),
+                Some(ToolKind::Pickaxe),
+                ToolKind::Pickaxe,
+                9.0,
+            )
+            .unwrap(),
+            3.0 / 9.0,
+        );
+        // The class gate is exact: a pack sword never accelerates a pickaxe block.
+        assert_eq!(
+            break_duration_for_pack_tier(Some(3.0), Some(ToolKind::Pickaxe), ToolKind::Sword, 9.0),
+            Some(3.0)
+        );
+        // Degenerate authored speeds fail closed to bare-hand timing.
+        for speed in [0.0, -1.0, 0.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                break_duration_for_pack_tier(
+                    Some(3.0),
+                    Some(ToolKind::Pickaxe),
+                    ToolKind::Pickaxe,
+                    speed
+                ),
+                Some(3.0),
+                "speed {speed} must not produce a degenerate duration"
+            );
+        }
+        assert_eq!(
+            break_duration_for_pack_tier(None, Some(ToolKind::Pickaxe), ToolKind::Pickaxe, 9.0),
+            None
         );
     }
 

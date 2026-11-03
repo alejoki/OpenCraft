@@ -396,6 +396,22 @@ impl Player {
         self.inventory.collect_limited(id, amount, limit)
     }
 
+    /// Collects a registry-allocated drop (pack item or pack tool).
+    ///
+    /// Thin forwarder over [`Inventory::collect_limited_with`]: the identity is
+    /// constructed through the session registry, so a non-stackable pack tool
+    /// can land in the freed hotbar slot under its authored identity.
+    pub fn collect_limited_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.inventory
+            .collect_limited_with(registry, id, amount, limit)
+    }
+
     /// Inserts one whole item stack, all-or-nothing.
     ///
     /// Thin forwarder over [`Inventory::insert`]: `true` only when every unit

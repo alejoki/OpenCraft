@@ -1049,6 +1049,33 @@ impl Inventory {
         amount: u16,
         limit: u16,
     ) -> Option<CollectOutcome> {
+        self.collect_limited_impl(None, id, amount, limit)
+    }
+
+    /// Registry-aware [`Inventory::collect_limited`].
+    ///
+    /// Pack identities are constructed through [`Item::new_with`], so an
+    /// authored drop can be a generic item or a non-stackable pack tool even
+    /// though [`Item::new`] deliberately refuses registry identities. The
+    /// merge/fill order, clamping and no-room contract are identical to the
+    /// registry-free path, and built-in ids answer byte-identically.
+    pub fn collect_limited_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.collect_limited_impl(Some(registry), id, amount, limit)
+    }
+
+    fn collect_limited_impl(
+        &mut self,
+        registry: Option<&ContentRegistry>,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
         if amount == 0 {
             return None;
         }
@@ -1079,7 +1106,11 @@ impl Inventory {
             }
             if slot.is_none() {
                 let moved = remaining.min(limit);
-                if let Ok(item) = Item::new(id, moved) {
+                let item = match registry {
+                    Some(registry) => Item::new_with(registry, id, moved),
+                    None => Item::new(id, moved),
+                };
+                if let Ok(item) = item {
                     *slot = Some(item);
                     remaining -= moved;
                     if first_slot.is_none() {
@@ -3335,6 +3366,51 @@ mod tests {
         for slot in 0..3 {
             assert_eq!(inventory.hotbar(slot).map(|item| item.count()), Some(1));
         }
+    }
+
+    #[test]
+    fn collect_limited_with_inserts_a_pack_tool_at_authored_durability() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+        let mut inventory = Inventory::empty();
+
+        let outcome = inventory
+            .collect_limited_with(&registry, id, 1, 1)
+            .expect("an empty slot accepts the tool");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 1);
+        let slot = inventory.slot(0).expect("the pack tool landed");
+        assert_eq!(slot.id(), id);
+        assert_eq!(slot.count(), 1);
+        assert_eq!(slot.durability(), Some(900));
+        assert_eq!(slot.max_durability(), Some(900));
+
+        // Tools are non-stackable: a second unit opens a second slot.
+        let outcome = inventory
+            .collect_limited_with(&registry, id, 1, 1)
+            .expect("a second slot accepts the tool");
+        assert_eq!(outcome.first_slot, 1);
+        assert_eq!(total_of(&inventory, id), 2);
+
+        // The legacy registry-free path refuses to forge a registry identity.
+        assert_eq!(Inventory::empty().collect_limited(id, 1, 1), None);
+    }
+
+    #[test]
+    fn collect_limited_with_matches_the_legacy_path_for_builtin_drops() {
+        let registry = ContentRegistry::builtin();
+        let mut legacy = Inventory::empty();
+        let mut aware = Inventory::empty();
+        let id = ItemId::Block(BlockId::Cobblestone);
+
+        let legacy_outcome = legacy
+            .collect_limited(id, 7, MAX_STACK_COUNT)
+            .expect("blocks fit");
+        let aware_outcome = aware
+            .collect_limited_with(registry, id, 7, MAX_STACK_COUNT)
+            .expect("blocks fit");
+        assert_eq!(legacy_outcome, aware_outcome);
+        assert_eq!(legacy.slots(), aware.slots());
     }
 
     // -- Best-effort batch collection ---------------------------------------
