@@ -450,6 +450,10 @@ impl BlockId {
 mod tests {
     use super::*;
 
+    /// One row of the frozen built-in contract: raw id, display name, six face
+    /// texture layers, hardness, and mined drop.
+    type BuiltinContractRow<'a> = (u16, &'a str, [u8; 6], Option<f32>, BlockId);
+
     #[test]
     fn test_block_solidity_and_texture_layers() {
         assert!(!BlockId::Air.is_solid());
@@ -854,7 +858,7 @@ mod tests {
         // layers, hardness, mined drop) is pinned here so S01's storage and
         // registry refactor cannot silently renumber or re-skin a built-in.
         // The stable snake_case registry name arrives in T04, not here.
-        let contract: [(u16, &str, [u8; 6], Option<f32>, BlockId); 23] = [
+        let contract: [BuiltinContractRow<'_>; 23] = [
             (0, "Air", [0, 0, 0, 0, 0, 0], None, BlockId::Air),
             (1, "Grass", [1, 1, 0, 2, 1, 1], Some(0.5), BlockId::Grass),
             (2, "Dirt", [2; 6], Some(0.45), BlockId::Dirt),

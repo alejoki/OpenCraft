@@ -156,7 +156,9 @@ mod tests {
             assert!(!def.placeholder, "built-ins are not placeholders");
 
             assert_eq!(
-                registry.block_by_name(def.name.as_str()).map(|found| found.id),
+                registry
+                    .block_by_name(def.name.as_str())
+                    .map(|found| found.id),
                 Some(id),
                 "name lookup mismatch for {id:?}"
             );
@@ -166,7 +168,9 @@ mod tests {
     #[test]
     fn registry_rejects_unknown_modded_ids() {
         let registry = ContentRegistry::builtin();
-        assert!(registry.block(BlockId::Modded(BUILTIN_BLOCK_COUNT)).is_none());
+        assert!(registry
+            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
+            .is_none());
         assert!(registry.block(BlockId::Modded(u16::MAX)).is_none());
         assert!(registry.block_by_name("mymod:ruby").is_none());
     }
