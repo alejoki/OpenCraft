@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use glam::{IVec3, Vec3};
 
 use crate::content::faces::BlockFaces;
-use crate::content::ContentRegistry;
+use crate::content::{ContentRegistry, WorldgenRule};
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
 use crate::player::combat::DamageCause;
@@ -256,6 +256,7 @@ impl WorldSession {
         // Build the face table from the registry *before* the registry moves
         // into the session, so mesh workers never hold the registry itself.
         let faces = Arc::new(BlockFaces::from_registry(&registry));
+        let rules: Arc<[WorldgenRule]> = Arc::from(registry.worldgen_rules());
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player,
@@ -283,6 +284,7 @@ impl WorldSession {
             last_damage_cause: None,
         };
         session.world.set_block_faces(faces);
+        session.world.set_worldgen_rules(rules);
         session.sync_camera();
         session
     }
@@ -336,6 +338,7 @@ impl WorldSession {
         // Build the face table from the registry *before* the registry moves
         // into the session, so mesh workers never hold the registry itself.
         let faces = Arc::new(BlockFaces::from_registry(&registry));
+        let rules: Arc<[WorldgenRule]> = Arc::from(registry.worldgen_rules());
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(position),
@@ -367,6 +370,7 @@ impl WorldSession {
             last_damage_cause: None,
         };
         session.world.set_block_faces(faces);
+        session.world.set_worldgen_rules(rules);
         session.sync_camera();
         session
     }
@@ -472,6 +476,7 @@ impl WorldSession {
         // from the already-augmented registry (a known pack block still maps
         // to its authored layer; an unresolved name maps to the checker).
         let faces = Arc::new(BlockFaces::from_registry(&registry));
+        let rules: Arc<[WorldgenRule]> = Arc::from(registry.worldgen_rules());
         let mut session = WorldSession {
             world: WorldManager::with_seed_and_edits(
                 saved.render_distance as i32,
@@ -516,6 +521,7 @@ impl WorldSession {
             last_damage_cause: None,
         };
         session.world.set_block_faces(faces);
+        session.world.set_worldgen_rules(rules);
         session.sync_camera();
         session
     }
@@ -7313,6 +7319,108 @@ mod tests {
         for face in 0u8..6 {
             assert_eq!(at.world.block_faces().layer(modded, face), PACK_LAYER_BASE);
         }
+    }
+
+    /// T02: every registry-aware constructor carries the resolved worldgen
+    /// rules into the manager, so a pack's authored ore reaches generated
+    /// terrain on fresh, editor, save-load and pack-load paths.
+    #[test]
+    fn registry_constructors_install_the_registry_worldgen_rules() {
+        use crate::content::spec::{WorldgenEntry, WorldgenKind};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity};
+        use crate::world::persistence::LoadedWorld;
+
+        let mut spec = PackContentSpec::default();
+        spec.worldgen.push(WorldgenEntry {
+            kind: WorldgenKind::Ore {
+                block: "brick".to_string(),
+                replace: "stone".to_string(),
+                min_y: 4,
+                max_y: 40,
+                vein: 4,
+                attempts: 8,
+            },
+        });
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        let expected = registry.worldgen_rules().to_vec();
+        assert_eq!(expected.len(), 1, "the pack must contribute one rule");
+        let registry = Arc::new(registry);
+
+        let fresh = WorldSession::new_session_with_mode_and_registry(
+            7,
+            PathBuf::from("/tmp/fresh-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        assert_eq!(
+            (*fresh.world.worldgen_rules()).as_ref(),
+            expected.as_slice(),
+            "fresh session must generate with the pack rules"
+        );
+
+        let at = WorldSession::new_at_with_registry(
+            7,
+            PathBuf::from("/tmp/at-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.0, 20.0, 2.0),
+            GameClock::new(),
+            Arc::clone(&registry),
+        );
+        assert_eq!(
+            (*at.world.worldgen_rules()).as_ref(),
+            expected.as_slice(),
+            "editor session must generate with the pack rules"
+        );
+
+        let restored = WorldSession::session_from_save_with_registry(
+            make_save(7),
+            PathBuf::from("/tmp/save-rules.mcvx"),
+            Arc::clone(&registry),
+            None,
+        );
+        assert_eq!(
+            (*restored.world.worldgen_rules()).as_ref(),
+            expected.as_slice(),
+            "save-load session must generate new chunks with the pack rules"
+        );
+
+        let loaded = WorldSession::from_loaded_world(
+            LoadedWorld {
+                data: make_save(7),
+                registry: (*registry).clone(),
+                saved_content: None,
+                unresolved: 0,
+            },
+            PathBuf::from("/tmp/loaded-rules.mcvx"),
+        );
+        assert_eq!(
+            (*loaded.world.worldgen_rules()).as_ref(),
+            expected.as_slice(),
+            "pack-present load must generate new chunks with the pack rules"
+        );
+
+        let empty = WorldSession::new_session_with_mode_and_registry(
+            7,
+            PathBuf::from("/tmp/empty-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            ContentRegistry::builtin_arc(),
+        );
+        assert!(
+            empty.world.worldgen_rules().is_empty(),
+            "a built-in registry must install zero rules"
+        );
     }
 
     /// The save-load constructor builds its table from the placeholder-

@@ -5,6 +5,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::content::faces::BlockFaces;
+use crate::content::WorldgenRule;
 use crate::mesh::greedy::{mesh_chunk_with, PaddedChunk};
 use crate::mesh::quad::ChunkMesh;
 use crate::world::block::BlockId;
@@ -12,7 +13,7 @@ use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPo
 use crate::world::light::{self, LightGrid};
 use crate::world::persistence::ChunkEditMap;
 use crate::world::season::Season;
-use crate::world::terrain::{generate_chunk_seeded, DEFAULT_WORLD_SEED};
+use crate::world::terrain::{generate_chunk_seeded_with, DEFAULT_WORLD_SEED};
 
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
@@ -75,6 +76,12 @@ pub struct WorldManager {
     /// registry. The built-in table is the default; a session with a pack
     /// stack installs the registry-derived table through `set_block_faces`.
     block_faces: Arc<BlockFaces>,
+    /// Resolved pack worldgen rules, in authored stack order. Shared behind
+    /// `Arc` for the same reason as `block_faces`: every generation job clones
+    /// a pointer, never the rule list or the content registry. The default is
+    /// an empty slice, which makes generation byte-identical to the built-in
+    /// `generate_chunk_seeded` path.
+    worldgen_rules: Arc<[WorldgenRule]>,
 }
 
 /// Result of one rayon sky-light job. Produced entirely off the frame thread;
@@ -209,6 +216,7 @@ impl WorldManager {
             season_rollover: VecDeque::new(),
             season_rollover_inflight: FxHashSet::default(),
             block_faces: BlockFaces::builtin(),
+            worldgen_rules: Arc::from([]),
         }
     }
 
@@ -226,6 +234,21 @@ impl WorldManager {
     #[inline]
     pub fn block_faces(&self) -> &Arc<BlockFaces> {
         &self.block_faces
+    }
+
+    /// Replaces the pack worldgen rules used by every subsequent generation.
+    ///
+    /// Installed once at session construction, alongside [`Self::set_block_faces`],
+    /// before any chunk is generated. An empty slice restores the built-in
+    /// generation path exactly.
+    pub fn set_worldgen_rules(&mut self, rules: Arc<[WorldgenRule]>) {
+        self.worldgen_rules = rules;
+    }
+
+    /// The pack worldgen rules this manager generates against.
+    #[inline]
+    pub fn worldgen_rules(&self) -> &Arc<[WorldgenRule]> {
+        &self.worldgen_rules
     }
 
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
@@ -1056,8 +1079,11 @@ impl WorldManager {
             self.pending_gen.insert(pos);
             self.season_rollover_inflight.insert(pos);
             let tx = self.gen_tx.clone();
+            // The seasonal replacement must use the same pack rules as the
+            // first generation, or winter would silently erase authored ore.
+            let rules = Arc::clone(&self.worldgen_rules);
             rayon::spawn(move || {
-                let chunk = generate_chunk_seeded(pos, seed, target);
+                let chunk = generate_chunk_seeded_with(pos, seed, target, &rules);
                 let _ = tx.send((pos, chunk));
             });
             dispatched += 1;
@@ -1286,8 +1312,9 @@ impl WorldManager {
                 if !self.chunks.contains_key(&pos) && !self.pending_gen.contains(&pos) {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
+                    let rules = Arc::clone(&self.worldgen_rules);
                     rayon::spawn(move || {
-                        let chunk = generate_chunk_seeded(pos, seed, gen_season);
+                        let chunk = generate_chunk_seeded_with(pos, seed, gen_season, &rules);
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -1372,6 +1399,7 @@ impl WorldManager {
 mod tests {
     use super::*;
     use crate::world::block::BlockId;
+    use crate::world::terrain::generate_chunk_seeded;
 
     /// Serialises the tests that depend on the shared global rayon pool. The
     /// ocean-crossing acceptance test deliberately saturates that pool (a full
@@ -3560,6 +3588,109 @@ mod tests {
             "max update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: {sorted:?}",
             max.as_secs_f64() * 1000.0,
             MAX_BUDGET.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// T02: the default generation path carries no pack rules, and the
+    /// installed `Arc` is the exact one read back by `worldgen_rules`.
+    #[test]
+    fn default_manager_has_no_worldgen_rules_and_install_round_trips() {
+        let mut mgr = WorldManager::new(4);
+        assert!(mgr.worldgen_rules().is_empty());
+
+        let rules: Arc<[WorldgenRule]> = Arc::from(vec![WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: 4,
+            max_y: 40,
+            vein: 4,
+            attempts: 8,
+        }]);
+        mgr.set_worldgen_rules(Arc::clone(&rules));
+        assert!(Arc::ptr_eq(mgr.worldgen_rules(), &rules));
+        assert_eq!(mgr.worldgen_rules().len(), 1);
+    }
+
+    /// T02 streaming proof: chunks generated through the real rayon dispatch
+    /// carry the installed rules, so an authored ore reaches resident terrain.
+    /// The rules-less baseline is regenerated for the same positions and used
+    /// to separate rule-placed cells from ruin Brick: every cell this rule
+    /// added must be a Stone cell that empty-rule generation left untouched
+    /// and must fall inside the authored Y band.
+    #[test]
+    fn streaming_generation_uses_installed_worldgen_rules() {
+        let _heavy = lock_heavy_streaming();
+        const SEED: u32 = 1337;
+        const MIN_Y: i32 = 4;
+        const MAX_Y: i32 = 40;
+        // Wall-clock bound, not a poll count: sibling light-job tests flood the
+        // shared rayon pool, so a short poll window can starve the two
+        // generation tasks even though the wiring is correct.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let mut mgr = WorldManager::with_seed_and_edits(4, SEED, ChunkEditMap::default());
+        mgr.set_worldgen_rules(Arc::from(vec![WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: MIN_Y,
+            max_y: MAX_Y,
+            vein: 4,
+            attempts: 8,
+        }]));
+
+        let center = ChunkPos::new(0, 0, 0);
+        let surface_layers = [ChunkPos::new(0, 0, 0), ChunkPos::new(0, 1, 0)];
+        // One real streaming frame dispatches the centre column's generation
+        // tasks through the production rayon closure; consume their results
+        // directly so the assertion does not depend on pool scheduling.
+        mgr.update_streaming(center, Season::Summer);
+        let mut received = 0usize;
+        while received < surface_layers.len() {
+            let (pos, chunk) = mgr
+                .gen_rx
+                .recv_timeout(WAIT)
+                .expect("authored-rule generation dispatch never produced a surface layer");
+            mgr.pending_gen.remove(&pos);
+            if surface_layers.contains(&pos) {
+                received += 1;
+            }
+            mgr.insert_chunk_for_test(pos, chunk);
+        }
+
+        let mut placed = 0usize;
+        for pos in surface_layers {
+            let generated = mgr
+                .chunks
+                .get(&pos)
+                .expect("streamed surface layer is resident");
+            let baseline = generate_chunk_seeded(pos, SEED, Season::Summer);
+            for ly in 0..CHUNK_SIZE {
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if generated.get(lx, ly, lz) != BlockId::Brick
+                            || baseline.get(lx, ly, lz) == BlockId::Brick
+                        {
+                            // Not authored by this rule (pre-existing ruin brick).
+                            continue;
+                        }
+                        placed += 1;
+                        let wy = pos.y * CHUNK_SIZE as i32 + ly as i32;
+                        assert!(
+                            (MIN_Y..=MAX_Y).contains(&wy),
+                            "rule brick at wy {wy} escaped the authored band {MIN_Y}..={MAX_Y}"
+                        );
+                        assert_eq!(
+                            baseline.get(lx, ly, lz),
+                            BlockId::Stone,
+                            "rule brick at ({lx}, {ly}, {lz}) in {pos:?} replaced a non-Stone cell"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            placed > 0,
+            "the streamed chunks contain no cell authored by the installed ore rule"
         );
     }
 }
