@@ -13,7 +13,9 @@ pub const fn padded_index(px: usize, py: usize, pz: usize) -> usize {
 
 #[derive(Clone)]
 pub struct PaddedChunk {
-    pub voxels: Box<[BlockId; PADDED_VOLUME]>,
+    /// M010 contract: padded mesh cells are raw `u16` ids so each mesh job's
+    /// copy stays ~78 KB instead of ~157 KB.
+    pub voxels: Box<[u16; PADDED_VOLUME]>,
     /// Per-cell sky light, 0-15. Defaults to all-15 (fully lit) so the T01
     /// placeholder keeps rendering identical until real light is wired in.
     pub light: Box<[u8; PADDED_VOLUME]>,
@@ -27,7 +29,10 @@ pub struct PaddedChunk {
 impl PaddedChunk {
     pub fn new_empty() -> Self {
         Self {
-            voxels: Box::new([BlockId::Air; PADDED_VOLUME]),
+            voxels: vec![0u16; PADDED_VOLUME]
+                .into_boxed_slice()
+                .try_into()
+                .expect("PADDED_VOLUME sized array"),
             light: Box::new([15u8; PADDED_VOLUME]),
             has_any_solid: false,
             has_any_liquid: false,
@@ -42,7 +47,7 @@ impl PaddedChunk {
                 for py in 1..=CHUNK_SIZE {
                     for pz in 1..=CHUNK_SIZE {
                         for px in 1..=CHUNK_SIZE {
-                            padded.voxels[padded_index(px, py, pz)] = b;
+                            padded.voxels[padded_index(px, py, pz)] = b.to_raw();
                         }
                     }
                 }
@@ -55,7 +60,7 @@ impl PaddedChunk {
             for py in 1..=CHUNK_SIZE {
                 for pz in 1..=CHUNK_SIZE {
                     for px in 1..=CHUNK_SIZE {
-                        padded.voxels[padded_index(px, py, pz)] = b;
+                        padded.voxels[padded_index(px, py, pz)] = b.to_raw();
                     }
                 }
             }
@@ -68,10 +73,10 @@ impl PaddedChunk {
                     let b = chunk.get(lx, ly, lz);
                     if b.is_solid() {
                         padded.has_any_solid = true;
-                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b;
+                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b.to_raw();
                     } else if b.is_liquid() {
                         padded.has_any_liquid = true;
-                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b;
+                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b.to_raw();
                     }
                 }
             }
@@ -86,12 +91,12 @@ impl PaddedChunk {
         } else if block.is_liquid() {
             self.has_any_liquid = true;
         }
-        self.voxels[padded_index(px, py, pz)] = block;
+        self.voxels[padded_index(px, py, pz)] = block.to_raw();
     }
 
     #[inline]
     pub fn get(&self, px: usize, py: usize, pz: usize) -> BlockId {
-        self.voxels[padded_index(px, py, pz)]
+        BlockId::from_raw(self.voxels[padded_index(px, py, pz)])
     }
 
     #[inline]
@@ -689,6 +694,23 @@ mod tests {
         // The stone cell is a single voxel against Air on five sides and water
         // on the -X side; water is not solid, so all six faces are opaque.
         assert_eq!(mesh.total_quads(), 6);
+    }
+
+    #[test]
+    fn padded_chunk_stores_raw_u16_and_round_trips() {
+        let mut padded = PaddedChunk::new_empty();
+        assert_eq!(padded.get(1, 1, 1), BlockId::Air);
+        padded.set(1, 1, 1, BlockId::Modded(23));
+        assert_eq!(padded.get(1, 1, 1), BlockId::Modded(23));
+        assert!(padded.has_any_solid, "modded solid id keeps the solid flag");
+        assert!(!padded.has_any_liquid);
+        assert_eq!(std::mem::size_of_val(&*padded.voxels), PADDED_VOLUME * 2);
+
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(3, 4, 5, BlockId::Modded(23));
+        let copied = PaddedChunk::from_center_only(&chunk);
+        assert_eq!(copied.get(4, 5, 6), BlockId::Modded(23));
+        assert!(copied.has_any_solid);
     }
 
     /// FNV-1a 64 over the mesh quad stream in a fixed order: bucket count,

@@ -17,10 +17,14 @@ impl ChunkPos {
     }
 }
 
+/// M010 contract: dense chunk cells are raw `u16` ids, independent of the
+/// in-memory width of [`BlockId`]. A dense chunk is exactly 65,536 bytes.
+const _: () = assert!(std::mem::size_of::<u16>() * CHUNK_VOLUME == 65_536);
+
 #[derive(Clone, Debug)]
 pub enum ChunkStorage {
     Uniform(BlockId),
-    Dense(Box<[BlockId; CHUNK_VOLUME]>),
+    Dense(Box<[u16; CHUNK_VOLUME]>),
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +67,7 @@ impl Chunk {
     pub fn get(&self, x: usize, y: usize, z: usize) -> BlockId {
         match &self.storage {
             ChunkStorage::Uniform(b) => *b,
-            ChunkStorage::Dense(arr) => arr[linear_index(x, y, z)],
+            ChunkStorage::Dense(arr) => BlockId::from_raw(arr[linear_index(x, y, z)]),
         }
     }
 
@@ -81,13 +85,18 @@ impl Chunk {
                 if *u == block {
                     return;
                 }
-                let fill = *u;
-                let mut boxed = Box::new([fill; CHUNK_VOLUME]);
-                boxed[idx] = block;
+                let fill = u.to_raw();
+                // Avoid `Box::new([fill; CHUNK_VOLUME])`: that materializes a
+                // transient 64 KB stack array in every rayon worker.
+                let mut boxed: Box<[u16; CHUNK_VOLUME]> = vec![fill; CHUNK_VOLUME]
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("CHUNK_VOLUME sized array");
+                boxed[idx] = block.to_raw();
                 self.storage = ChunkStorage::Dense(boxed);
             }
             ChunkStorage::Dense(arr) => {
-                arr[idx] = block;
+                arr[idx] = block.to_raw();
             }
         }
     }
@@ -97,8 +106,8 @@ impl Chunk {
             ChunkStorage::Uniform(_) => true,
             ChunkStorage::Dense(arr) => {
                 let first = arr[0];
-                if arr.iter().all(|&b| b == first) {
-                    self.storage = ChunkStorage::Uniform(first);
+                if arr.iter().all(|&raw| raw == first) {
+                    self.storage = ChunkStorage::Uniform(BlockId::from_raw(first));
                     true
                 } else {
                     false
@@ -148,5 +157,65 @@ mod tests {
         chunk.set(3, 4, 5, BlockId::Air);
         assert!(chunk.try_compress());
         assert_eq!(chunk.is_uniform(), Some(BlockId::Air));
+    }
+
+    #[test]
+    fn dense_chunk_storage_is_two_bytes_per_block() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(1, 2, 3, BlockId::Stone);
+        match &chunk.storage {
+            ChunkStorage::Dense(arr) => {
+                assert_eq!(std::mem::size_of_val(&**arr), 65_536);
+                assert_eq!(std::mem::size_of_val(&**arr), CHUNK_VOLUME * 2);
+            }
+            ChunkStorage::Uniform(_) => panic!("one non-uniform cell must promote to dense"),
+        }
+    }
+
+    #[test]
+    fn chunk_round_trips_every_builtin_and_modded_id() {
+        // Identity is total and bijective over the whole u16 space.
+        for raw in 0..=u16::MAX {
+            assert_eq!(BlockId::from_raw(raw).to_raw(), raw);
+        }
+        // Sampled built-in plus modded ids round-trip through dense storage,
+        // and promotion never touches the neighbouring cell.
+        for raw in (0..=22u16).chain([23, 24, 1000, u16::MAX]) {
+            let mut chunk = Chunk::new_uniform(BlockId::Air);
+            chunk.set(1, 2, 3, BlockId::from_raw(raw));
+            assert_eq!(chunk.get(1, 2, 3), BlockId::from_raw(raw));
+            assert_eq!(chunk.get(2, 2, 3), BlockId::Air);
+        }
+        // Exhaustive storage round-trip: a dense chunk holds every raw id.
+        let mut low = Chunk::new_uniform(BlockId::Air);
+        let mut high = Chunk::new_uniform(BlockId::Air);
+        for idx in 0..CHUNK_VOLUME {
+            low.set_by_index(idx as u16, BlockId::from_raw(idx as u16));
+            high.set_by_index(
+                idx as u16,
+                BlockId::from_raw(idx as u16 + CHUNK_VOLUME as u16),
+            );
+        }
+        for idx in 0..CHUNK_VOLUME {
+            let (x, y, z) = local_coords_from_index(idx as u16);
+            assert_eq!(low.get(x, y, z), BlockId::from_raw(idx as u16));
+            assert_eq!(
+                high.get(x, y, z),
+                BlockId::from_raw(idx as u16 + CHUNK_VOLUME as u16)
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_promotion_and_compression_use_raw_ids() {
+        let mut chunk = Chunk::new_uniform(BlockId::Modded(23));
+        assert_eq!(chunk.is_uniform(), Some(BlockId::Modded(23)));
+        chunk.set(4, 5, 6, BlockId::Stone);
+        assert_eq!(chunk.is_uniform(), None);
+        assert_eq!(chunk.get(4, 5, 6), BlockId::Stone);
+        assert_eq!(chunk.get(0, 0, 0), BlockId::Modded(23));
+        chunk.set(4, 5, 6, BlockId::Modded(23));
+        assert!(chunk.try_compress());
+        assert_eq!(chunk.is_uniform(), Some(BlockId::Modded(23)));
     }
 }
