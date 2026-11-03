@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::player::inventory::{
-    self, ItemId, Recipe, ToolKind, ToolTier, MAX_STACK_COUNT, RECIPES,
+    self, Item, ItemId, Recipe, ToolKind, ToolTier, MAX_STACK_COUNT, RECIPES,
 };
 use crate::player::tools;
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
@@ -81,6 +81,17 @@ impl ItemRef {
         match id {
             ItemId::Block(block) => ItemRef::Block(block),
             other => ItemRef::Builtin(other),
+        }
+    }
+
+    /// The insertable [`ItemId`] for this reference, or `None` for a pack tool
+    /// identity that `ItemId` cannot express until S05 widens it.
+    pub const fn item_id(self) -> Option<ItemId> {
+        match self {
+            ItemRef::Block(block) => Some(ItemId::Block(block)),
+            ItemRef::Builtin(id) => Some(id),
+            ItemRef::Item(index) => Some(ItemId::Item(index)),
+            ItemRef::Tool(_) => None,
         }
     }
 }
@@ -231,8 +242,9 @@ impl BlockDef {
         let display_name = id.name().to_string();
         let faces = [0u8, 1, 2, 3, 4, 5].map(|face| id.face_tex_layer(face));
         let hardness = id.break_duration_secs();
-        let drop = if hardness.is_some() && id.is_carryable() {
-            Some(ItemRef::Block(id.mined_drop()))
+        let dropped = id.mined_drop();
+        let drop = if hardness.is_some() && dropped.is_carryable() {
+            Some(ItemRef::Block(dropped))
         } else {
             None
         };
@@ -373,6 +385,39 @@ impl ContentRegistry {
         self.blocks
             .get(usize::from(id.to_raw()))
             .filter(|def| def.id == id)
+    }
+
+    /// Effective seconds to break `block` with `selected`, resolved through the
+    /// registry definition's authored hardness and tool class.
+    ///
+    /// Built-ins answer exactly like [`tools::break_duration`] because
+    /// [`BlockDef::from_builtin`] derives both fields from the same accessors.
+    /// Unknown ids and unbreakable definitions return `None`.
+    pub fn break_duration(&self, block: BlockId, selected: Option<Item>) -> Option<f32> {
+        let def = self.block(block)?;
+        tools::break_duration_for(def.hardness, def.tool_class, selected)
+    }
+
+    /// The insertable drop for `block` and its authored stack limit.
+    ///
+    /// Returns `None` when the definition is missing, the block authors no
+    /// drop, or the drop is a pack tool identity that cannot be inserted until
+    /// S05 widens [`ItemId`]. Block drops use the breaking definition's
+    /// authored limit; item drops use the item definition's limit; built-ins
+    /// use [`ItemId::stack_limit`]. The result is always clamped to
+    /// `1..=MAX_STACK_COUNT` so callers can hand it straight to collection.
+    pub fn drop_entry(&self, block: BlockId) -> Option<(ItemId, u16)> {
+        let def = self.block(block)?;
+        let (id, limit) = match def.drop? {
+            ItemRef::Block(id) => (ItemId::Block(id), def.stack_limit),
+            ItemRef::Item(index) => {
+                let item = self.item(index)?;
+                (ItemId::Item(index), item.stack_limit)
+            }
+            ItemRef::Builtin(id) => (id, id.stack_limit()),
+            ItemRef::Tool(_) => return None,
+        };
+        Some((id, limit.clamp(1, MAX_STACK_COUNT)))
     }
 
     /// The definition whose stable short name is exactly `name`.
@@ -642,11 +687,12 @@ mod tests {
             assert_eq!(def.faces, expected_faces, "faces mismatch for {id:?}");
 
             assert_eq!(def.hardness, id.break_duration_secs());
-            let expected_drop = if id.break_duration_secs().is_some() && id.is_carryable() {
-                Some(ItemRef::Block(id.mined_drop()))
-            } else {
-                None
-            };
+            let expected_drop =
+                if id.break_duration_secs().is_some() && id.mined_drop().is_carryable() {
+                    Some(ItemRef::Block(id.mined_drop()))
+                } else {
+                    None
+                };
             assert_eq!(def.drop, expected_drop, "drop mismatch for {id:?}");
             assert_eq!(def.tool_class, tools::block_tool_class(id));
             let expected_stack = if expected_drop.is_some() {
@@ -957,6 +1003,154 @@ mod tests {
             content_mismatch_note(saved.packs(), saved.digest(), &changed, 0),
             Some("content definitions changed".to_string())
         );
+    }
+
+    #[test]
+    fn item_ref_maps_only_insertable_identities() {
+        use crate::player::inventory::Material;
+
+        assert_eq!(
+            ItemRef::Block(BlockId::Stone).item_id(),
+            Some(ItemId::Block(BlockId::Stone))
+        );
+        assert_eq!(
+            ItemRef::Builtin(ItemId::Material(Material::Stick)).item_id(),
+            Some(ItemId::Material(Material::Stick))
+        );
+        assert_eq!(ItemRef::Item(7).item_id(), Some(ItemId::Item(7)));
+        assert_eq!(
+            ItemRef::Tool(3).item_id(),
+            None,
+            "pack tools are unrepresentable until S05 widens ItemId"
+        );
+    }
+
+    /// Clones the built-in registry and appends definitions whose drops cover
+    /// every [`ItemRef`] arm, so `drop_entry` is exercised without pack IO.
+    fn registry_with_drops() -> (ContentRegistry, [BlockId; 4]) {
+        let mut registry = ContentRegistry::builtin().clone();
+        let item_drop = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let block_drop = BlockId::Modded(BUILTIN_BLOCK_COUNT + 1);
+        let tool_drop = BlockId::Modded(BUILTIN_BLOCK_COUNT + 2);
+        let missing_item_drop = BlockId::Modded(BUILTIN_BLOCK_COUNT + 3);
+
+        registry.items.push(ItemDef {
+            index: 0,
+            name: "mymod:ruby".to_string(),
+            display_name: "Ruby".to_string(),
+            icon_layer: PLACEHOLDER_ICON_LAYER,
+            stack_limit: 12,
+            food: None,
+            placeholder: false,
+        });
+
+        let mut push_block = |id: BlockId, drop: ItemRef, stack_limit: u16| {
+            registry.blocks.push(BlockDef {
+                id,
+                name: format!("test:{id:?}"),
+                display_name: format!("Test {id:?}"),
+                faces: [PLACEHOLDER_BLOCK_LAYER; 6],
+                hardness: Some(1.0),
+                drop: Some(drop),
+                tool_class: None,
+                stack_limit,
+                placeholder: false,
+            });
+        };
+        push_block(item_drop, ItemRef::Item(0), 64);
+        push_block(block_drop, ItemRef::Block(item_drop), 7);
+        push_block(tool_drop, ItemRef::Tool(0), 64);
+        push_block(missing_item_drop, ItemRef::Item(9), 64);
+        (
+            registry,
+            [item_drop, block_drop, tool_drop, missing_item_drop],
+        )
+    }
+
+    #[test]
+    fn drop_entry_resolves_authored_identities_and_limits() {
+        let (registry, [item_drop, block_drop, tool_drop, missing_item_drop]) =
+            registry_with_drops();
+
+        // Built-ins keep the historical drop and full block limit.
+        assert_eq!(
+            registry.drop_entry(BlockId::Stone),
+            Some((ItemId::Block(BlockId::Cobblestone), MAX_STACK_COUNT))
+        );
+        assert_eq!(registry.drop_entry(BlockId::Air), None);
+        assert_eq!(registry.drop_entry(BlockId::Bedrock), None);
+        assert_eq!(
+            registry.drop_entry(BlockId::Modded(BUILTIN_BLOCK_COUNT + 99)),
+            None,
+            "unknown ids have no drop"
+        );
+
+        // Item drops use the target item's authored limit; block drops use the
+        // breaking definition's authored limit.
+        assert_eq!(registry.drop_entry(item_drop), Some((ItemId::Item(0), 12)));
+        assert_eq!(
+            registry.drop_entry(block_drop),
+            Some((ItemId::Block(item_drop), 7))
+        );
+
+        // Tools and unresolved item indices cannot be inserted.
+        assert_eq!(registry.drop_entry(tool_drop), None);
+        assert_eq!(registry.drop_entry(missing_item_drop), None);
+    }
+
+    #[test]
+    fn drop_entry_clamps_authored_limits_into_the_insertable_range() {
+        let (mut registry, [item_drop, block_drop, ..]) = registry_with_drops();
+        let block_index = usize::from(block_drop.to_raw());
+
+        registry.items[0].stack_limit = 0;
+        assert_eq!(
+            registry.drop_entry(item_drop),
+            Some((ItemId::Item(0), 1)),
+            "a zero authored item limit clamps to one"
+        );
+
+        registry.items[0].stack_limit = u16::MAX;
+        assert_eq!(
+            registry.drop_entry(item_drop),
+            Some((ItemId::Item(0), MAX_STACK_COUNT)),
+            "an oversized authored item limit clamps to the block cap"
+        );
+
+        registry.blocks[block_index].stack_limit = 0;
+        assert_eq!(
+            registry.drop_entry(block_drop),
+            Some((ItemId::Block(item_drop), 1)),
+            "a zero authored block limit clamps to one"
+        );
+        registry.blocks[block_index].stack_limit = u16::MAX;
+        assert_eq!(
+            registry.drop_entry(block_drop),
+            Some((ItemId::Block(item_drop), MAX_STACK_COUNT))
+        );
+    }
+
+    #[test]
+    fn break_duration_matches_builtin_and_resolves_pack_hardness() {
+        let registry = ContentRegistry::builtin();
+        for block in [
+            BlockId::Stone,
+            BlockId::OakLog,
+            BlockId::Air,
+            BlockId::Bedrock,
+        ] {
+            assert_eq!(
+                registry.break_duration(block, None),
+                tools::break_duration(block, None),
+                "bare-hand answer diverged for {block:?}"
+            );
+        }
+
+        let (mut registry, [ruby, ..]) = registry_with_drops();
+        registry.blocks[usize::from(ruby.to_raw())].hardness = Some(0.5);
+        assert_eq!(registry.break_duration(ruby, None), Some(0.5));
+        registry.blocks[usize::from(ruby.to_raw())].hardness = None;
+        assert_eq!(registry.break_duration(ruby, None), None);
     }
 
     #[test]

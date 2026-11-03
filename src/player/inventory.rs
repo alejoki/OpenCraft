@@ -920,12 +920,32 @@ impl Inventory {
     /// the remainder. Returns `None` (no mutation) when nothing was accepted
     /// or the block cannot be carried.
     pub fn collect_block(&mut self, block: BlockId, amount: u16) -> Option<CollectOutcome> {
-        if !block.is_carryable() || amount == 0 {
+        if !block.is_carryable() {
+            return None;
+        }
+        self.collect_limited(ItemId::Block(block), amount, MAX_STACK_COUNT)
+    }
+
+    /// Best-effort collection of any [`ItemId`] under an authored stack limit.
+    ///
+    /// This is [`Inventory::collect_block`] with the identity and per-slot cap
+    /// supplied by the caller (the session registry's [`crate::content::drop_entry`]
+    /// for pack-authored drops). Compatible existing stacks merge first, then
+    /// empty slots fill in flat hotbar-then-main order. `limit` is clamped to
+    /// `1..=MAX_STACK_COUNT` and then to the identity's own cap so a slot can
+    /// never hold an invalid stack. Returns `None` with no mutation when the
+    /// amount is zero or nothing fits.
+    pub fn collect_limited(
+        &mut self,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        if amount == 0 {
             return None;
         }
 
-        let id = ItemId::Block(block);
-        let limit = MAX_STACK_COUNT;
+        let limit = limit.clamp(1, MAX_STACK_COUNT).min(id.stack_limit()).max(1);
         let mut remaining = amount;
         let mut first_slot = None;
 
@@ -951,10 +971,12 @@ impl Inventory {
             }
             if slot.is_none() {
                 let moved = remaining.min(limit);
-                *slot = Item::new(id, moved).ok();
-                remaining -= moved;
-                if first_slot.is_none() {
-                    first_slot = Some(index);
+                if let Ok(item) = Item::new(id, moved) {
+                    *slot = Some(item);
+                    remaining -= moved;
+                    if first_slot.is_none() {
+                        first_slot = Some(index);
+                    }
                 }
             }
         }
@@ -2748,6 +2770,81 @@ mod tests {
         assert_eq!(inventory.collect_block(BlockId::Water, 1), None);
         assert_eq!(inventory.collect_block(BlockId::Stone, 0), None);
         assert_eq!(inventory, Inventory::empty());
+    }
+
+    #[test]
+    fn collect_limited_fills_to_the_authored_limit_then_spills_into_a_fresh_slot() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+
+        let outcome = inventory
+            .collect_limited(id, 100, 12)
+            .expect("the inventory has room");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 100);
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(12));
+        assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(12));
+        // 8 full slots of 12 plus a final partial stack of 4.
+        assert_eq!(inventory.hotbar(8).map(|item| item.count()), Some(4));
+        assert_eq!(total_of(&inventory, id), 100);
+        assert!(inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == id)
+            .all(|item| item.count() <= 12));
+    }
+
+    #[test]
+    fn collect_limited_merges_an_existing_stack_before_opening_a_new_one() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+        inventory.slots[0] = Some(item(id, 10));
+
+        let outcome = inventory
+            .collect_limited(id, 5, 12)
+            .expect("the remainder fits");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 5);
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(12));
+        assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(3));
+    }
+
+    #[test]
+    fn collect_limited_is_a_no_op_with_no_room_or_invalid_input() {
+        let id = ItemId::Item(0);
+
+        // Zero amount never mutates.
+        let mut inventory = Inventory::empty();
+        assert_eq!(inventory.collect_limited(id, 0, 12), None);
+        assert_eq!(inventory, Inventory::empty());
+
+        // A non-carryable identity cannot be constructed into a slot.
+        assert_eq!(
+            inventory.collect_limited(ItemId::Block(BlockId::Air), 1, MAX_STACK_COUNT),
+            None
+        );
+        assert_eq!(inventory, Inventory::empty());
+
+        // A full inventory accepts nothing and stays byte-identical.
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        let before = inventory.clone();
+        assert_eq!(inventory.collect_limited(id, 1, 12), None);
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn collect_limited_clamps_degenerate_limits_to_one() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+        let outcome = inventory
+            .collect_limited(id, 3, 0)
+            .expect("three single-item slots fit");
+        assert_eq!(outcome.accepted, 3);
+        for slot in 0..3 {
+            assert_eq!(inventory.hotbar(slot).map(|item| item.count()), Some(1));
+        }
     }
 
     // -- Best-effort batch collection ---------------------------------------

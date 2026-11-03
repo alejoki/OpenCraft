@@ -384,6 +384,16 @@ impl Player {
         self.inventory.collect_block(block, 1)
     }
 
+    /// Collects an authored drop under a registry-supplied stack limit.
+    pub fn collect_limited(
+        &mut self,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.inventory.collect_limited(id, amount, limit)
+    }
+
     /// Inserts one whole item stack, all-or-nothing.
     ///
     /// Thin forwarder over [`Inventory::insert`]: `true` only when every unit

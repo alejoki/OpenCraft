@@ -438,7 +438,13 @@ enum BreakOutcome {
 /// mining can never duplicate items or spend durability through an edit that
 /// never happened.
 fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> BreakOutcome {
-    if block.break_duration_secs().is_none() {
+    // Breakability is authored content: the session registry is the authority,
+    // so a pack block with authored hardness is mineable while a placeholder
+    // (`hardness: None`) or an unknown id stays unbreakable.
+    let Some(def) = session.registry.block(block) else {
+        return BreakOutcome::Rejected(BreakRejection::Unbreakable);
+    };
+    if def.hardness.is_none() {
         return BreakOutcome::Rejected(BreakRejection::Unbreakable);
     }
     // `pos`/`block` come from the mining accumulator, which is not authority:
@@ -508,10 +514,13 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
             .expect("preflight proved capacity");
         session.remove_crop(pos);
     } else {
-        // Drop mapping is block metadata (Stone -> Cobblestone); the item
-        // identity is the only thing that differs, and the drop is still
+        // Drop mapping is authored content (Stone -> Cobblestone, a pack block
+        // -> its authored item and stack limit). The item identity and limit
+        // both come from the frozen session registry, and the drop is still
         // collected last so MEM195 ordering is preserved.
-        session.player.collect_block(block.mined_drop());
+        if let Some((id, limit)) = session.registry.drop_entry(block) {
+            session.player.collect_limited(id, 1, limit);
+        }
 
         // Breaking the support ends the crop's eligibility even though the
         // floating wheat block itself is not edited: the candidate is
@@ -5315,7 +5324,8 @@ fn combat_fight_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool
         mine_hit.block_pos.y,
         mine_hit.block_pos.z,
     );
-    let Some(mining) = MiningTarget::from_block(
+    let Some(mining) = MiningTarget::from_block_with(
+        &session.registry,
         mine_hit.block_pos,
         mine_block,
         session.player.selected_item(),
@@ -10935,7 +10945,8 @@ impl ApplicationHandler for GameApp {
                             h.block_pos.y,
                             h.block_pos.z,
                         );
-                        MiningTarget::from_block(
+                        MiningTarget::from_block_with(
+                            &self.session.registry,
                             h.block_pos,
                             block,
                             self.session.player.selected_item(),
@@ -10993,7 +11004,9 @@ impl ApplicationHandler for GameApp {
                 // mining candidate is untouched.
                 let candidate = mining_after_attack(attack_candidate, mining_candidate);
                 let mut target_block = hit.map(|h| h.block_pos);
-                if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
+                if let MiningTick::Broke { pos, block } =
+                    self.mining.tick_with(&self.session.registry, dt, candidate)
+                {
                     // The only production break site (S02): hardness
                     // gating happens in MiningState and is re-checked by the
                     // helper, so Bedrock (no duration) can never reach an
@@ -17527,6 +17540,54 @@ mod tests {
                 count: 2,
             })
         );
+    }
+
+    #[test]
+    fn pack_block_break_uses_the_session_registry_drop_and_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = main_ruby_registry();
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            4242,
+            dir.path().join("pack-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty(), "the pack block edit applied");
+        assert_eq!(wear, ToolWearOutcome::Nothing, "bare hand wears nothing");
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        let slot = session.player.inventory().slots()[0].expect("ruby was collected");
+        assert_eq!(slot.id(), ItemId::Item(0), "the authored drop is ruby");
+        assert_eq!(slot.count(), 1);
+
+        // The same block under the built-in registry is an unknown id, so the
+        // break is rejected without an edit or a drop.
+        let mut builtin = WorldSession::new_session(
+            4243,
+            dir.path().join("pack-break-builtin.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut builtin, BlockId::Stone);
+        builtin.world.set_block_immediate(0, 10, 0, ruby_ore);
+        assert!(matches!(
+            break_mined_block(&mut builtin, IVec3::new(0, 10, 0), ruby_ore),
+            BreakOutcome::Rejected(BreakRejection::Unbreakable)
+        ));
+        assert_eq!(
+            builtin.world.get_block(0, 10, 0),
+            ruby_ore,
+            "an unknown id is never edited"
+        );
+        assert_eq!(builtin.player.inventory().slots()[0], None);
     }
 
     #[test]
@@ -27347,7 +27408,7 @@ mod tests {
                 ..BlockTextures::default()
             },
             hardness: 1.0,
-            drop: None,
+            drop: Some("mymod:ruby".to_string()),
             tool: None,
             stack_limit: 64,
         });

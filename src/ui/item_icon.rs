@@ -2792,15 +2792,25 @@ mod tests {
         );
 
         let procedural = generate_item_sprite_layers_rgba();
-        for layer in 0..ITEM_SPRITE_LAYERS as usize {
+        for (layer, (actual, expected)) in composed
+            .iter()
+            .take(ITEM_SPRITE_LAYERS as usize)
+            .zip(procedural.iter())
+            .enumerate()
+        {
             assert_eq!(
-                composed[layer], procedural[layer],
+                actual, expected,
                 "built-in layer {layer} must stay byte-identical"
             );
         }
-        for layer in ITEM_SPRITE_LAYERS as usize..ITEM_SPRITE_ARRAY_LAYERS as usize {
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(ITEM_SPRITE_LAYERS as usize)
+        {
             assert!(
-                composed[layer].iter().all(|byte| *byte == 0),
+                actual.iter().all(|byte| *byte == 0),
                 "unused layer {layer} must stay transparent"
             );
         }
@@ -2814,9 +2824,14 @@ mod tests {
 
         assert_eq!(composed[PACK_ICON_BASE as usize], icon0);
         assert_eq!(composed[PACK_ICON_BASE as usize + 1], icon1);
-        for layer in PACK_ICON_BASE as usize + 2..ITEM_SPRITE_ARRAY_LAYERS as usize {
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(PACK_ICON_BASE as usize + 2)
+        {
             assert!(
-                composed[layer].iter().all(|byte| *byte == 0),
+                actual.iter().all(|byte| *byte == 0),
                 "layer {layer} must stay transparent"
             );
         }
@@ -2834,9 +2849,14 @@ mod tests {
         for (index, icon) in icons.iter().take(copyable).enumerate() {
             assert_eq!(composed[PACK_ICON_BASE as usize + index], *icon);
         }
-        for layer in PACK_ICON_CAP as usize..ITEM_SPRITE_ARRAY_LAYERS as usize {
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(PACK_ICON_CAP as usize)
+        {
             assert!(
-                composed[layer].iter().all(|byte| *byte == 0),
+                actual.iter().all(|byte| *byte == 0),
                 "layer {layer} past the icon cap must stay transparent"
             );
         }

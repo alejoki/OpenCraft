@@ -962,9 +962,14 @@ mod tests {
         assert_eq!(composed.len(), BLOCK_ARRAY_LAYERS as usize);
         assert_eq!(&composed[..NUM_TEX_LAYERS as usize], &base[..]);
 
-        for index in NUM_TEX_LAYERS as usize..BLOCK_ARRAY_LAYERS as usize {
+        for (index, layer) in composed
+            .iter()
+            .enumerate()
+            .take(BLOCK_ARRAY_LAYERS as usize)
+            .skip(NUM_TEX_LAYERS as usize)
+        {
             assert_eq!(
-                composed[index],
+                *layer,
                 reserved_checker(index as u32),
                 "unused layer {index} must be the reserved checker"
             );
@@ -981,8 +986,13 @@ mod tests {
 
         assert_eq!(composed[PACK_LAYER_BASE as usize], pack0);
         assert_eq!(composed[PACK_LAYER_BASE as usize + 1], pack1);
-        for index in PACK_LAYER_BASE as usize + 2..BLOCK_ARRAY_LAYERS as usize {
-            assert_eq!(composed[index], reserved_checker(index as u32));
+        for (index, layer) in composed
+            .iter()
+            .enumerate()
+            .take(BLOCK_ARRAY_LAYERS as usize)
+            .skip(PACK_LAYER_BASE as usize + 2)
+        {
+            assert_eq!(*layer, reserved_checker(index as u32));
         }
     }
 
@@ -1009,11 +1019,21 @@ mod tests {
             .collect();
         let composed = compose_block_array_layers(&base, &pack);
 
-        for index in PACK_LAYER_BASE as usize..PACK_LAYER_CAP as usize {
-            assert_eq!(composed[index], pack[index - PACK_LAYER_BASE as usize]);
+        for (index, layer) in composed
+            .iter()
+            .enumerate()
+            .take(PACK_LAYER_CAP as usize)
+            .skip(PACK_LAYER_BASE as usize)
+        {
+            assert_eq!(*layer, pack[index - PACK_LAYER_BASE as usize]);
         }
-        for index in PACK_LAYER_CAP as usize..BLOCK_ARRAY_LAYERS as usize {
-            assert_eq!(composed[index], reserved_checker(index as u32));
+        for (index, layer) in composed
+            .iter()
+            .enumerate()
+            .take(BLOCK_ARRAY_LAYERS as usize)
+            .skip(PACK_LAYER_CAP as usize)
+        {
+            assert_eq!(*layer, reserved_checker(index as u32));
         }
     }
 

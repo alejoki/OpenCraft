@@ -83,11 +83,29 @@ pub const fn tier_speed_multiplier(tier: ToolTier) -> u8 {
 /// multiplier; a mismatched tool, a non-tool, and an empty slot all keep the
 /// base hardness.
 pub fn break_duration(block: BlockId, selected_item: Option<Item>) -> Option<f32> {
-    let base = block.break_duration_secs()?;
+    break_duration_for(
+        block.break_duration_secs(),
+        block_tool_class(block),
+        selected_item,
+    )
+}
+
+/// Registry-friendly core of [`break_duration`].
+///
+/// `hardness` and `tool_class` are the authored values from a [`BlockDef`], so
+/// pack blocks get exactly the same tier math as built-ins. `None` hardness is
+/// structurally unbreakable regardless of the held item; a mismatched,
+/// non-tool, or empty selection keeps the authored hardness.
+pub fn break_duration_for(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    selected_item: Option<Item>,
+) -> Option<f32> {
+    let base = hardness?;
     let Some((kind, tier)) = selected_item.and_then(|item| item.id().tool()) else {
         return Some(base);
     };
-    if block_tool_class(block) != Some(kind) {
+    if tool_class != Some(kind) {
         return Some(base);
     }
     Some(base / f32::from(tier_speed_multiplier(tier)))
@@ -315,6 +333,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn break_duration_for_matches_builtin_answers_exhaustively() {
+        // The registry path must ask the same core rule with the same authored
+        // fields, so every built-in answer is byte-identical.
+        for block in ALL_BLOCKS {
+            let hardness = block.break_duration_secs();
+            let class = block_tool_class(block);
+            assert_eq!(
+                break_duration_for(hardness, class, None),
+                break_duration(block, None),
+                "bare-hand mismatch for {block:?}"
+            );
+            for kind in ALL_KINDS {
+                for &tier in kind.allowed_tiers() {
+                    let item = Some(tool(kind, tier));
+                    assert_eq!(
+                        break_duration_for(hardness, class, item),
+                        break_duration(block, item),
+                        "{block:?} with {kind:?}/{tier:?} diverged"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            break_duration_for(None, Some(ToolKind::Pickaxe), None),
+            None
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use glam::IVec3;
 
+use crate::content::ContentRegistry;
 use crate::player::inventory::Item;
-use crate::player::tools;
 use crate::world::block::BlockId;
 
 /// A validated block-breaking target.
@@ -25,12 +25,26 @@ impl MiningTarget {
     /// Returns `None` when the block is structurally unbreakable or the
     /// duration is not a finite positive number.
     pub fn new(pos: IVec3, block: BlockId, duration: f32) -> Option<Self> {
+        Self::new_with(ContentRegistry::builtin(), pos, block, duration)
+    }
+
+    /// Registry-aware [`MiningTarget::new`].
+    ///
+    /// Breakability is the registry definition's authored hardness, so a pack
+    /// block with authored hardness is valid while a placeholder with
+    /// `hardness: None` stays unbreakable.
+    pub fn new_with(
+        registry: &ContentRegistry,
+        pos: IVec3,
+        block: BlockId,
+        duration: f32,
+    ) -> Option<Self> {
         if !duration.is_finite() || duration <= 0.0 {
             return None;
         }
-        // Internal catalog hardness guard: the block's own hardness is the
-        // authority on breakability, never the caller-supplied duration.
-        block.break_duration_secs()?;
+        // Internal catalog hardness guard: the block's authorized hardness is
+        // the authority on breakability, never the caller-supplied duration.
+        registry.block(block)?.hardness?;
         Some(Self {
             pos,
             block,
@@ -43,7 +57,22 @@ impl MiningTarget {
     /// This is the production entry point: the item's tool class and tier
     /// decide the effective duration via [`tools::break_duration`].
     pub fn from_block(pos: IVec3, block: BlockId, selected_item: Option<Item>) -> Option<Self> {
-        Self::new(pos, block, tools::break_duration(block, selected_item)?)
+        Self::from_block_with(ContentRegistry::builtin(), pos, block, selected_item)
+    }
+
+    /// Registry-aware [`MiningTarget::from_block`] for pack-authored blocks.
+    pub fn from_block_with(
+        registry: &ContentRegistry,
+        pos: IVec3,
+        block: BlockId,
+        selected_item: Option<Item>,
+    ) -> Option<Self> {
+        Self::new_with(
+            registry,
+            pos,
+            block,
+            registry.break_duration(block, selected_item)?,
+        )
     }
 
     pub const fn pos(self) -> IVec3 {
@@ -101,6 +130,20 @@ impl MiningState {
     }
 
     pub fn tick(&mut self, dt: f32, candidate: Option<MiningTarget>) -> MiningTick {
+        self.tick_with(ContentRegistry::builtin(), dt, candidate)
+    }
+
+    /// Registry-aware [`MiningState::tick`].
+    ///
+    /// Breakability is re-read from the registry definition's authored
+    /// hardness, so a pack block with authored hardness keeps accumulating
+    /// instead of being reset by the built-in-only accessor.
+    pub fn tick_with(
+        &mut self,
+        registry: &ContentRegistry,
+        dt: f32,
+        candidate: Option<MiningTarget>,
+    ) -> MiningTick {
         let dt = if !dt.is_finite() || dt <= 0.0 {
             0.0
         } else {
@@ -114,7 +157,10 @@ impl MiningState {
         // Fail closed even though `MiningTarget::new` already validated: the
         // catalog hardness guard stays the authority on breakability, and a
         // degenerate duration must never accumulate progress.
-        if target.block.break_duration_secs().is_none()
+        if registry
+            .block(target.block)
+            .and_then(|def| def.hardness)
+            .is_none()
             || !target.duration.is_finite()
             || target.duration <= 0.0
         {
@@ -197,6 +243,117 @@ mod tests {
             }
         }
         panic!("target never broke");
+    }
+
+    fn hold_until_broke_with(
+        mining: &mut MiningState,
+        registry: &ContentRegistry,
+        target: MiningTarget,
+    ) -> u32 {
+        for tick in 1..=200 {
+            match mining.tick_with(registry, 0.1, Some(target)) {
+                MiningTick::Broke { pos, block } => {
+                    assert_eq!(pos, target.pos());
+                    assert_eq!(block, target.block());
+                    return tick;
+                }
+                MiningTick::Mining { .. } => {}
+                MiningTick::Idle => panic!("a held, breakable target must not go Idle"),
+            }
+        }
+        panic!("target never broke");
+    }
+
+    /// A one-block pack registry with authored hardness and a ruby item drop.
+    fn ruby_registry() -> ContentRegistry {
+        use crate::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby_ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 0.3,
+            drop: Some("mymod:ruby".to_string()),
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 32,
+            food: None,
+        });
+        for path in ["ruby_ore.png", "ruby.png"] {
+            spec.assets.insert(
+                path.to_string(),
+                PackAsset {
+                    rgba: vec![0x22; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+
+        let packs = vec![(
+            PackIdentity {
+                folder: "mymod-ruby".to_string(),
+                version: None,
+            },
+            spec,
+        )];
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        registry
+    }
+
+    #[test]
+    fn registry_modded_block_is_mineable_through_tick_with() {
+        let registry = ruby_registry();
+        let def = registry
+            .blocks()
+            .iter()
+            .find(|def| def.name == "mymod:ruby_ore")
+            .expect("fixture block is registered");
+        let block = def.id;
+
+        let target = MiningTarget::from_block_with(&registry, POS, block, None)
+            .expect("authored hardness makes the pack block a target");
+        assert_eq!(target.duration(), 0.3);
+        assert!(
+            MiningTarget::from_block(POS, block, None).is_none(),
+            "the built-in registry cannot see pack ids"
+        );
+
+        // The built-in accumulator has no definition for the id and resets,
+        // which is exactly the pre-registry bug this task fixes.
+        let mut mining = MiningState::new();
+        assert_eq!(mining.tick(0.1, Some(target)), MiningTick::Idle);
+        assert!(mining.progress().is_none());
+
+        let ticks = hold_until_broke_with(&mut mining, &registry, target);
+        assert!(
+            ticks.abs_diff(3) <= 1,
+            "0.3s at 0.1s per tick broke after {ticks} ticks"
+        );
+    }
+
+    #[test]
+    fn placeholder_block_stays_unbreakable_through_registry_guards() {
+        let mut registry = ruby_registry();
+        let placeholder = registry.append_placeholder_block("mymod:missing");
+
+        assert!(registry.block(placeholder).is_some());
+        assert!(MiningTarget::new_with(&registry, POS, placeholder, 0.5).is_none());
+        assert!(MiningTarget::from_block_with(&registry, POS, placeholder, None).is_none());
+
+        // A forged/unresolved id with no definition is equally unbreakable.
+        let unknown = BlockId::Modded(u16::MAX);
+        assert!(MiningTarget::new_with(&registry, POS, unknown, 0.5).is_none());
     }
 
     #[test]

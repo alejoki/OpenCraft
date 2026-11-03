@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn table_length_is_blocks_times_six_in_raw_id_order() {
         let registry = ContentRegistry::builtin();
-        let faces = BlockFaces::from_registry(&registry);
+        let faces = BlockFaces::from_registry(registry);
         assert_eq!(faces.len(), registry.blocks().len() * 6);
         let mut expected = BTreeMap::new();
         for def in registry.blocks() {
