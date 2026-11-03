@@ -52,6 +52,18 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
     }
 }
 
+/// Sword damage for a tool tier in Survival (4 / 5 / 6).
+///
+/// A pure data source for built-in tier damage: content definitions and the
+/// melee rules both read it instead of duplicating the table.
+pub const fn tier_sword_damage(tier: ToolTier) -> u16 {
+    match tier {
+        ToolTier::Wood => 4,
+        ToolTier::Stone => 5,
+        ToolTier::Iron => 6,
+    }
+}
+
 /// Speed multiplier for a tool tier. Always `>= 1`, so a matched tool can only
 /// ever shorten a break, never lengthen it.
 pub const fn tier_speed_multiplier(tier: ToolTier) -> u8 {

@@ -23,16 +23,17 @@ use glam::Vec3;
 
 use crate::player::inventory::{Item, ItemId, ToolKind, ToolTier};
 use crate::player::survival::GameMode;
+use crate::player::tools::tier_sword_damage;
 use crate::world::mob::Mob;
 
 /// Damage of an empty hand (or of any item that is not a sword).
 pub const FIST_DAMAGE: u16 = 1;
 /// Damage of a wood sword in Survival.
-pub const SWORD_DAMAGE_WOOD: u16 = 4;
+pub const SWORD_DAMAGE_WOOD: u16 = tier_sword_damage(ToolTier::Wood);
 /// Damage of a stone sword in Survival.
-pub const SWORD_DAMAGE_STONE: u16 = 5;
+pub const SWORD_DAMAGE_STONE: u16 = tier_sword_damage(ToolTier::Stone);
 /// Damage of an iron sword in Survival.
-pub const SWORD_DAMAGE_IRON: u16 = 6;
+pub const SWORD_DAMAGE_IRON: u16 = tier_sword_damage(ToolTier::Iron);
 /// Reach of a melee swing in blocks, measured camera-to-mob-AABB.
 pub const MELEE_REACH: f32 = 3.0;
 /// Seconds a swing cooldown takes to elapse.
@@ -64,16 +65,8 @@ pub fn attack_damage(selected: Option<Item>, mode: GameMode, target_health: u16)
     match selected.map(|item| item.id()) {
         Some(ItemId::Tool {
             kind: ToolKind::Sword,
-            tier: ToolTier::Wood,
-        }) => SWORD_DAMAGE_WOOD,
-        Some(ItemId::Tool {
-            kind: ToolKind::Sword,
-            tier: ToolTier::Stone,
-        }) => SWORD_DAMAGE_STONE,
-        Some(ItemId::Tool {
-            kind: ToolKind::Sword,
-            tier: ToolTier::Iron,
-        }) => SWORD_DAMAGE_IRON,
+            tier,
+        }) => tier_sword_damage(tier),
         _ => FIST_DAMAGE,
     }
 }

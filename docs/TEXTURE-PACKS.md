@@ -100,6 +100,8 @@ Entry rules:
 - One bad entry never fails the pack: a missing or wrong field, malformed/duplicate id, unknown reference, or over-limit array rejects only that entry and reports a diagnostic while its valid siblings load. Unknown keys are ignored.
 - Asset paths are relative to the pack folder. Absolute paths, `.`/`..` components and symlink escapes are rejected, each file is limited to 1 MiB, images must be square and 16 to 256 pixels per side, and a pack may load at most 8 MiB of raw asset bytes.
 
+Pack content ids allocate deterministically: blocks take dense ids from 23 in sorted id order after the 23 built-in blocks, items and tools from 0, tiers after the three built-ins, and recipes after the 22 built-ins. Block face layers append from texture-array layer 48 (at most 160 pack layers) and item/tool icons from layer 32 (at most 192 icons), deduplicated per pack folder and authored path. A registry digest (FNV-1a 64) covers pack identities and every definition field so a validation run and a game load agree, but it deliberately excludes image bytes: recolouring an existing PNG does not change content identity.
+
 ## Block textures
 
 Save each block texture directly inside the pack folder, using these exact file names and in this order (the order is the block layer contract; do not reorder them):

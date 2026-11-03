@@ -1355,11 +1355,11 @@ pub enum CraftError {
 /// identity and one consumed grid cell; the pattern may sit anywhere in the
 /// grid as long as its trimmed bounding box matches.
 #[derive(Copy, Clone)]
-struct Recipe {
-    id: RecipeId,
-    pattern: &'static [&'static str],
-    output: ItemId,
-    output_count: u16,
+pub(crate) struct Recipe {
+    pub(crate) id: RecipeId,
+    pub(crate) pattern: &'static [&'static str],
+    pub(crate) output: ItemId,
+    pub(crate) output_count: u16,
 }
 
 impl Recipe {
@@ -1375,7 +1375,7 @@ impl Recipe {
 /// the three tool tiers use planks, cobblestone, and mined iron ore as their
 /// head material. Adding smelting later can swap the iron head identity
 /// without changing the shaped-recipe machinery.
-const RECIPES: &[Recipe] = &[
+pub(crate) const RECIPES: &[Recipe] = &[
     Recipe {
         id: RecipeId::Planks,
         pattern: &["L"],
@@ -1577,7 +1577,7 @@ const RECIPES: &[Recipe] = &[
 /// only coal identity available — the same convention `I` already uses for
 /// iron ore. Smelting can later swap both head materials without touching the
 /// shaped-recipe machinery.
-fn pattern_item(byte: u8) -> Option<ItemId> {
+pub(crate) fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
         b'P' => Some(ItemId::Block(BlockId::OakPlanks)),

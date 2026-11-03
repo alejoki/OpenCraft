@@ -1,29 +1,201 @@
-//! Immutable content registry and built-in block definitions.
+//! Immutable content registry and built-in content definitions.
 //!
 //! [`ContentRegistry::builtin`] is the single authoritative built-in content
-//! table. It is immutable for the session, is `Send + Sync`, and later slices
-//! freeze it behind `Arc<ContentRegistry>` once pack-defined content exists.
+//! table. [`registry::build_registry`] folds an ordered pack stack over it into
+//! one deterministic, immutable [`ContentRegistry`]. Later slices freeze the
+//! result behind `Arc<ContentRegistry>` once modded content is live.
 //!
-//! This module deliberately has no render, audio, settings, or filesystem
+//! This module deliberately has no render, audio, settings, filesystem or pack
 //! dependency: content identity must stay decoupled from presentation and
 //! persistence so the pack parser (S02) can build a registry without touching
-//! the GPU or the save layer.
+//! the GPU or the save layer. It may import *pure* player rules (inventory,
+//! tools) and world enums (block ids, biomes).
 
 pub mod names;
+pub mod registry;
 pub mod spec;
 
+pub use registry::{build_registry, ContentLoadReport, PackIdentity};
 pub use spec::{ContentDiagnostic, PackContentSpec, Severity};
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use crate::player::inventory::{
+    self, ItemId, Recipe, ToolKind, ToolTier, MAX_STACK_COUNT, RECIPES,
+};
+use crate::player::tools;
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
+use crate::world::terrain::Biome;
+
+/// First texture-array layer reserved for pack-authored block faces.
+///
+/// Mirrors [`crate::render::texture::NUM_TEX_LAYERS`] as a literal so `content`
+/// stays render-free; S04 grows the array to [`PACK_LAYER_CAP`].
+pub const PACK_LAYER_BASE: u8 = 48;
+
+/// Exclusive upper bound for pack-authored block face layers (160 pack layers).
+pub const PACK_LAYER_CAP: u8 = 208;
+
+/// First reserved block face layer used when a pack asset is missing or the
+/// layer space overflows: the built-in checker placeholder.
+pub const PLACEHOLDER_BLOCK_LAYER: u8 = 25;
+
+/// First icon layer reserved for pack-authored item/tool icons.
+pub const PACK_ICON_BASE: u8 = 32;
+
+/// Exclusive upper bound for pack-authored icon layers (192 pack icons).
+pub const PACK_ICON_CAP: u8 = 224;
+
+/// Reserved icon layer used when a pack icon is missing or icon space overflows.
+pub const PLACEHOLDER_ICON_LAYER: u8 = 27;
+
+/// Digest of a registry with no packs: the FNV-1a 64 offset basis.
+///
+/// The digest excludes built-in definitions, asset bytes and diagnostics, so
+/// the built-in registry is exactly the empty-stack digest.
+pub const EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// A reference to an item identity before `ItemId`/`RecipeId` widening.
+///
+/// Built-in identities reuse the frozen [`ItemId`] vocabulary; pack identities
+/// stay dense indices into the registry tables so S03+ can widen `ItemId`
+/// without a spec change.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ItemRef {
+    /// A block identity, built-in or registry-allocated.
+    Block(BlockId),
+    /// A built-in non-block item (material or tool).
+    Builtin(ItemId),
+    /// Registry-allocated pack item index.
+    Item(u16),
+    /// Registry-allocated pack tool index.
+    Tool(u16),
+}
+
+impl ItemRef {
+    /// Classify a built-in [`ItemId`]: blocks stay [`ItemRef::Block`], every
+    /// other built-in identity becomes [`ItemRef::Builtin`].
+    pub const fn from_item_id(id: ItemId) -> ItemRef {
+        match id {
+            ItemId::Block(block) => ItemRef::Block(block),
+            other => ItemRef::Builtin(other),
+        }
+    }
+}
+
+/// Food behaviour authored on a pack item.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FoodDef {
+    /// Hunger points restored, 1..=20.
+    pub nutrition: u16,
+    /// Seconds the eat animation takes, 0.1..=10.0.
+    pub eat_seconds: f32,
+}
+
+/// A resolved generic item definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemDef {
+    /// Dense registry index (`ItemRef::Item`).
+    pub index: u16,
+    /// Namespaced stable id (for example `mymod:ruby`).
+    pub name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Reported icon layer; index into [`ContentRegistry::pack_icons`] as
+    /// `icon_layer - PACK_ICON_BASE`.
+    pub icon_layer: u8,
+    /// Maximum stack size.
+    pub stack_limit: u16,
+    /// Food behaviour, when the item is edible.
+    pub food: Option<FoodDef>,
+    /// Whether this definition is placeholder art awaiting pack content.
+    pub placeholder: bool,
+}
+
+/// A resolved tool tier definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TierDef {
+    /// Dense registry index; built-ins occupy `0..=2`.
+    pub index: u16,
+    /// Short stable name (`wood`, `mymod:ruby`).
+    pub name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Speed multiplier applied to a matched block's base hardness.
+    pub speed: f32,
+    /// Maximum durability.
+    pub durability: u16,
+    /// Sword damage at this tier.
+    pub damage: u16,
+}
+
+/// A resolved tool definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolDef {
+    /// Dense registry index (`ItemRef::Tool`).
+    pub index: u16,
+    /// Namespaced stable id (for example `mymod:ruby_pickaxe`).
+    pub name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Tool behaviour class.
+    pub kind: ToolKind,
+    /// Index into [`ContentRegistry::tiers`].
+    pub tier: u16,
+    /// Reported icon layer; index into [`ContentRegistry::pack_icons`] as
+    /// `icon_layer - PACK_ICON_BASE`.
+    pub icon_layer: u8,
+}
+
+/// A resolved shaped recipe definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecipeDef {
+    /// Dense registry index; built-ins occupy `0..22`.
+    pub index: u16,
+    /// Stable name (`planks` for a built-in, a namespaced id for a pack).
+    pub name: String,
+    /// Shaped pattern rows; spaces are empty cells.
+    pub pattern: Vec<String>,
+    /// Pattern character to item reference. Space is never a key.
+    pub key: BTreeMap<char, ItemRef>,
+    /// Crafted item.
+    pub output: ItemRef,
+    /// Crafted count.
+    pub count: u16,
+    /// Whether the recipe is currently craftable (patches may disable it).
+    pub enabled: bool,
+    /// Whether this definition is placeholder content awaiting a pack.
+    pub placeholder: bool,
+}
+
+/// A resolved worldgen rule, in authored stack order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorldgenRule {
+    /// Ore vein replacing a host block below the surface.
+    Ore {
+        block: BlockId,
+        replace: BlockId,
+        min_y: i32,
+        max_y: i32,
+        vein: u8,
+        attempts: u8,
+    },
+    /// Surface patch replacing a host block inside listed biomes.
+    Patch {
+        block: BlockId,
+        replace: BlockId,
+        biomes: Vec<Biome>,
+        min_y: i32,
+        max_y: i32,
+        chance: f32,
+    },
+}
 
 /// A resolved block definition.
 ///
 /// Built-in definitions are derived from the existing [`BlockId`] accessors so
-/// "registry equals built-ins" holds by construction. [`BlockDef::drop`] is the
-/// S02/S05 staging type: it widens to `Option<ItemId>` once non-block drops and
-/// per-field pack patches exist.
+/// "registry equals built-ins" holds by construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDef {
     /// Stable identity this definition describes.
@@ -33,13 +205,17 @@ pub struct BlockDef {
     /// Human-readable display name (for example `Oak Log`).
     pub display_name: String,
     /// Texture-array layer per face direction: +X, -X, +Y, -Y, +Z, -Z.
+    ///
+    /// Pack-authored layers are reported as `PACK_LAYER_BASE + index`.
     pub faces: [u8; 6],
     /// Seconds of held left-click needed to break, or `None` if unbreakable.
     pub hardness: Option<f32>,
-    /// Block item produced on break, or `None` for uncarryable blocks.
-    ///
-    /// This is the S02/S05 staging type that widens to `Option<ItemId>`.
-    pub drop: Option<BlockId>,
+    /// Item produced on break, or `None` for uncarryable blocks.
+    pub drop: Option<ItemRef>,
+    /// Tool class that efficiently breaks this block, if any.
+    pub tool_class: Option<ToolKind>,
+    /// Maximum stack size of the block item (0 when there is no drop).
+    pub stack_limit: u16,
     /// Whether this definition is placeholder art awaiting pack content.
     pub placeholder: bool,
 }
@@ -55,10 +231,11 @@ impl BlockDef {
         let faces = [0u8, 1, 2, 3, 4, 5].map(|face| id.face_tex_layer(face));
         let hardness = id.break_duration_secs();
         let drop = if hardness.is_some() && id.is_carryable() {
-            Some(id.mined_drop())
+            Some(ItemRef::Block(id.mined_drop()))
         } else {
             None
         };
+        let stack_limit = if drop.is_some() { MAX_STACK_COUNT } else { 0 };
         Some(BlockDef {
             id,
             name,
@@ -66,33 +243,48 @@ impl BlockDef {
             faces,
             hardness,
             drop,
+            tool_class: tools::block_tool_class(id),
+            stack_limit,
             placeholder: false,
         })
     }
 }
 
-/// Immutable, session-scoped registry of block definitions.
+/// Immutable, session-scoped registry of content definitions.
 ///
-/// The built-in registry is created once and shared through a `OnceLock`.
-/// It is `Send + Sync`; later slices freeze it behind `Arc<ContentRegistry>`
-/// and layer pack-defined entries on top without mutating the built-in table.
+/// The built-in registry is created once and shared through a `OnceLock`; a
+/// pack stack is folded over it by [`registry::build_registry`]. Allocation is
+/// deterministic (sorted ids, dense indices, append-only layers/icons), so a
+/// `--validate-pack` run and a game load agree on ids, layers and digest.
 #[derive(Debug)]
 pub struct ContentRegistry {
     blocks: Vec<BlockDef>,
+    items: Vec<ItemDef>,
+    tiers: Vec<TierDef>,
+    tools: Vec<ToolDef>,
+    recipes: Vec<RecipeDef>,
+    worldgen_rules: Vec<WorldgenRule>,
+    pack_layers: Vec<Vec<u8>>,
+    pack_icons: Vec<Vec<u8>>,
+    packs: Vec<PackIdentity>,
+    digest: u64,
 }
 
 impl ContentRegistry {
     /// The immutable built-in registry, built once per process.
     pub fn builtin() -> &'static ContentRegistry {
         static REGISTRY: OnceLock<ContentRegistry> = OnceLock::new();
-        REGISTRY.get_or_init(|| {
-            let blocks = (0..BUILTIN_BLOCK_COUNT)
-                .map(|raw| {
-                    BlockDef::from_builtin(BlockId::from_raw(raw))
-                        .expect("every built-in raw id has a definition")
-                })
-                .collect();
-            ContentRegistry { blocks }
+        REGISTRY.get_or_init(|| ContentRegistry {
+            blocks: builtin_blocks(),
+            items: Vec::new(),
+            tiers: builtin_tiers(),
+            tools: Vec::new(),
+            recipes: builtin_recipes(),
+            worldgen_rules: Vec::new(),
+            pack_layers: Vec::new(),
+            pack_icons: Vec::new(),
+            packs: Vec::new(),
+            digest: EMPTY_DIGEST,
         })
     }
 
@@ -101,13 +293,18 @@ impl ContentRegistry {
         &self.blocks
     }
 
-    /// The definition for `id`, or `None` when the id is unknown or modded.
+    /// The definition for `id`, or `None` when the id is unknown.
     ///
     /// Indexing is by raw id and additionally filters on identity, so a forged
-    /// [`BlockId::Modded`] payload can never alias a built-in definition.
+    /// [`BlockId::Modded`] payload can never alias a built-in (or another
+    /// modded) definition.
     pub fn block(&self, id: BlockId) -> Option<&BlockDef> {
-        if !id.is_builtin() {
-            return None;
+        // A forged `Modded` payload below the built-in count is not a
+        // registry index and must never alias a built-in definition.
+        if let BlockId::Modded(raw) = id {
+            if raw < BUILTIN_BLOCK_COUNT {
+                return None;
+            }
         }
         self.blocks
             .get(usize::from(id.to_raw()))
@@ -116,10 +313,170 @@ impl ContentRegistry {
 
     /// The definition whose stable short name is exactly `name`.
     ///
-    /// This is a linear scan over the frozen built-in table and matches the
+    /// This is a linear scan over the frozen table and matches the
     /// unqualified stable name, not the display name.
     pub fn block_by_name(&self, name: &str) -> Option<&BlockDef> {
         self.blocks.iter().find(|def| def.name == name)
+    }
+
+    /// All resolved generic item definitions in index order.
+    pub fn items(&self) -> &[ItemDef] {
+        &self.items
+    }
+
+    /// The generic item at dense `index`.
+    pub fn item(&self, index: u16) -> Option<&ItemDef> {
+        self.items.get(usize::from(index))
+    }
+
+    /// The item whose stable id is exactly `name`.
+    pub fn item_by_name(&self, name: &str) -> Option<&ItemDef> {
+        self.items.iter().find(|def| def.name == name)
+    }
+
+    /// All resolved tool tiers: the three built-ins followed by pack tiers.
+    pub fn tiers(&self) -> &[TierDef] {
+        &self.tiers
+    }
+
+    /// The tier at dense `index`.
+    pub fn tier(&self, index: u16) -> Option<&TierDef> {
+        self.tiers.get(usize::from(index))
+    }
+
+    /// The tier whose stable name is exactly `name`.
+    pub fn tier_by_name(&self, name: &str) -> Option<&TierDef> {
+        self.tiers.iter().find(|def| def.name == name)
+    }
+
+    /// All resolved tool definitions in index order.
+    pub fn tools(&self) -> &[ToolDef] {
+        &self.tools
+    }
+
+    /// The tool at dense `index`.
+    pub fn tool(&self, index: u16) -> Option<&ToolDef> {
+        self.tools.get(usize::from(index))
+    }
+
+    /// The tool whose stable id is exactly `name`.
+    pub fn tool_by_name(&self, name: &str) -> Option<&ToolDef> {
+        self.tools.iter().find(|def| def.name == name)
+    }
+
+    /// All resolved recipes: 22 built-ins followed by pack recipes.
+    pub fn recipes(&self) -> &[RecipeDef] {
+        &self.recipes
+    }
+
+    /// The recipe at dense `index`.
+    pub fn recipe(&self, index: u16) -> Option<&RecipeDef> {
+        self.recipes.get(usize::from(index))
+    }
+
+    /// The recipe whose stable name is exactly `name`.
+    pub fn recipe_by_name(&self, name: &str) -> Option<&RecipeDef> {
+        self.recipes.iter().find(|def| def.name == name)
+    }
+
+    /// Worldgen rules in authored stack order (later packs last).
+    pub fn worldgen_rules(&self) -> &[WorldgenRule] {
+        &self.worldgen_rules
+    }
+
+    /// Pack-authored block face layers, index-aligned with
+    /// `reported layer - PACK_LAYER_BASE`.
+    pub fn pack_layers(&self) -> &[Vec<u8>] {
+        &self.pack_layers
+    }
+
+    /// The pack block layer reported as `layer`, or `None` for built-in and
+    /// placeholder layers.
+    pub fn pack_layer(&self, layer: u8) -> Option<&[u8]> {
+        let index = layer.checked_sub(PACK_LAYER_BASE)?;
+        self.pack_layers.get(usize::from(index)).map(Vec::as_slice)
+    }
+
+    /// Pack-authored icons, index-aligned with `reported layer - PACK_ICON_BASE`.
+    pub fn pack_icons(&self) -> &[Vec<u8>] {
+        &self.pack_icons
+    }
+
+    /// The pack icon reported as `layer`, or `None` for other layers.
+    pub fn pack_icon(&self, layer: u8) -> Option<&[u8]> {
+        let index = layer.checked_sub(PACK_ICON_BASE)?;
+        self.pack_icons.get(usize::from(index)).map(Vec::as_slice)
+    }
+
+    /// Pack identities in the order they were stacked.
+    pub fn packs(&self) -> &[PackIdentity] {
+        &self.packs
+    }
+
+    /// FNV-1a 64 digest of the pack definitions (not built-ins, asset bytes or
+    /// diagnostics). Stable across runs for identical input.
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+}
+
+fn builtin_blocks() -> Vec<BlockDef> {
+    (0..BUILTIN_BLOCK_COUNT)
+        .map(|raw| {
+            BlockDef::from_builtin(BlockId::from_raw(raw))
+                .expect("every built-in raw id has a definition")
+        })
+        .collect()
+}
+
+fn builtin_tiers() -> Vec<TierDef> {
+    [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tier)| TierDef {
+            index: index as u16,
+            name: names::builtin_tier_id_name(tier).to_string(),
+            display_name: tier.name().to_string(),
+            speed: f32::from(tools::tier_speed_multiplier(tier)),
+            durability: tier.max_durability(),
+            damage: tools::tier_sword_damage(tier),
+        })
+        .collect()
+}
+
+fn builtin_recipes() -> Vec<RecipeDef> {
+    RECIPES
+        .iter()
+        .enumerate()
+        .map(|(index, recipe)| builtin_recipe_def(index as u16, recipe))
+        .collect()
+}
+
+fn builtin_recipe_def(index: u16, recipe: &Recipe) -> RecipeDef {
+    let mut key = BTreeMap::new();
+    for row in recipe.pattern {
+        for byte in row.bytes() {
+            if key.contains_key(&char::from(byte)) {
+                continue;
+            }
+            if let Some(item) = inventory::pattern_item(byte) {
+                key.insert(char::from(byte), ItemRef::from_item_id(item));
+            }
+        }
+    }
+    RecipeDef {
+        index,
+        name: names::builtin_recipe_id_name(recipe.id).to_string(),
+        pattern: recipe
+            .pattern
+            .iter()
+            .map(|row| (*row).to_string())
+            .collect(),
+        key,
+        output: ItemRef::from_item_id(recipe.output),
+        count: recipe.output_count,
+        enabled: true,
+        placeholder: false,
     }
 }
 
@@ -151,11 +508,18 @@ mod tests {
 
             assert_eq!(def.hardness, id.break_duration_secs());
             let expected_drop = if id.break_duration_secs().is_some() && id.is_carryable() {
-                Some(id.mined_drop())
+                Some(ItemRef::Block(id.mined_drop()))
             } else {
                 None
             };
             assert_eq!(def.drop, expected_drop, "drop mismatch for {id:?}");
+            assert_eq!(def.tool_class, tools::block_tool_class(id));
+            let expected_stack = if expected_drop.is_some() {
+                MAX_STACK_COUNT
+            } else {
+                0
+            };
+            assert_eq!(def.stack_limit, expected_stack);
             assert!(!def.placeholder, "built-ins are not placeholders");
 
             assert_eq!(
@@ -186,5 +550,69 @@ mod tests {
             ContentRegistry::builtin(),
             ContentRegistry::builtin()
         ));
+    }
+
+    #[test]
+    fn builtin_registry_has_three_tiers_and_22_recipes() {
+        let registry = ContentRegistry::builtin();
+        assert_eq!(registry.tiers().len(), 3);
+        assert_eq!(
+            registry
+                .tiers()
+                .iter()
+                .map(|tier| tier.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wood", "stone", "iron"]
+        );
+        assert_eq!(
+            registry
+                .tiers()
+                .iter()
+                .map(|tier| tier.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Wood", "Stone", "Iron"]
+        );
+        for (index, tier) in registry.tiers().iter().enumerate() {
+            assert_eq!(usize::from(tier.index), index);
+        }
+        assert_eq!(registry.tiers()[0].speed, 2.0);
+        assert_eq!(registry.tiers()[1].speed, 4.0);
+        assert_eq!(registry.tiers()[2].speed, 6.0);
+        assert_eq!(
+            registry.tiers()[0].durability,
+            ToolTier::Wood.max_durability()
+        );
+        assert_eq!(registry.tiers()[0].damage, 4);
+        assert_eq!(registry.tiers()[1].damage, 5);
+        assert_eq!(registry.tiers()[2].damage, 6);
+
+        assert_eq!(registry.recipes().len(), 22);
+        for (index, recipe) in registry.recipes().iter().enumerate() {
+            assert_eq!(usize::from(recipe.index), index);
+            assert!(recipe.enabled);
+            assert!(!recipe.placeholder);
+            assert!(!recipe.pattern.is_empty());
+            assert!(recipe.key.values().all(|reference| match reference {
+                ItemRef::Block(_) | ItemRef::Builtin(_) => true,
+                ItemRef::Item(_) | ItemRef::Tool(_) => false,
+            }));
+        }
+        assert_eq!(
+            registry.recipe(0).map(|recipe| recipe.name.as_str()),
+            Some("planks")
+        );
+        assert_eq!(
+            registry
+                .recipe_by_name("planks")
+                .map(|recipe| recipe.output),
+            Some(ItemRef::Block(BlockId::OakPlanks))
+        );
+        assert!(registry.items().is_empty());
+        assert!(registry.tools().is_empty());
+        assert!(registry.worldgen_rules().is_empty());
+        assert!(registry.pack_layers().is_empty());
+        assert!(registry.pack_icons().is_empty());
+        assert!(registry.packs().is_empty());
+        assert_eq!(registry.digest(), EMPTY_DIGEST);
     }
 }
