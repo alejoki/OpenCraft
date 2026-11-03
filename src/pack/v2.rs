@@ -677,6 +677,17 @@ fn validate_content_id(id: &str, entry: &str, diagnostics: &mut Vec<ContentDiagn
         );
         return false;
     }
+    if id.len() > names::MAX_CONTENT_NAME_LEN {
+        err(
+            diagnostics,
+            entry,
+            format!(
+                "`{id}` exceeds the {}-byte content name limit",
+                names::MAX_CONTENT_NAME_LEN
+            ),
+        );
+        return false;
+    }
     let namespace = id.split(':').next().unwrap_or("");
     if names::is_reserved_namespace(namespace) {
         err(
@@ -2012,6 +2023,28 @@ hardness = 1.0
         assert_eq!(diagnostics.len(), 3);
         assert_has_reason(&diagnostics, "reserved");
         assert_has_reason(&diagnostics, "not a namespaced id");
+    }
+
+    #[test]
+    fn over_long_ids_are_rejected_before_any_save_can_fail() {
+        let long_id = format!("mymod:{}", "a".repeat(names::MAX_CONTENT_NAME_LEN));
+        assert!(long_id.len() > names::MAX_CONTENT_NAME_LEN);
+        let text = format!(
+            r#"
+[[items]]
+id = "{long_id}"
+icon = "a.png"
+
+[[items]]
+id = "mymod:valid"
+icon = "b.png"
+"#
+        );
+        let (spec, _, diagnostics) = parse_v2(&text);
+        assert_eq!(spec.items.len(), 1);
+        assert_eq!(spec.items[0].id, "mymod:valid");
+        assert_has_reason(&diagnostics, "content name limit");
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]
