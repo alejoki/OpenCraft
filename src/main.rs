@@ -20067,6 +20067,19 @@ stack = 64
         (loaded, specs)
     }
 
+    /// The texture-only `ruby-overlay` stack on its own: what remains after a
+    /// player removes the `mymod-ruby` content pack. Every reference name the
+    /// pack authored must degrade to a deterministic placeholder against it.
+    fn removed_reference_pack_specs() -> Vec<PackSpec> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (_, specs, warnings) = pack::load_stack(&root, &["ruby-overlay".to_string()]);
+        assert!(
+            warnings.is_empty(),
+            "leg=derive: the overlay-only stack loads without warnings: {warnings:?}"
+        );
+        specs
+    }
+
     /// Inserts the generated chunk that owns `pos` plus uniform-Air face
     /// neighbours, generating with the session's pack worldgen rules so the
     /// reference pack's ore and patches actually appear.
@@ -20767,6 +20780,338 @@ stack = 64
             resaved, bytes,
             "leg=reload: a loaded v8 save re-saves byte-identically"
         );
+    }
+
+    #[test]
+    fn modding_acceptance_placeholder_removal_resave_and_restore_preserves_every_reference_identity(
+    ) {
+        use opencraft::content::PLACEHOLDER_ICON_LAYER;
+        use opencraft::world::persistence::{load_world_from_bytes_with, save_world_to_bytes_with};
+
+        // (1) Full and removed registries. Every load below rebuilds its own
+        // registry: reusing one that already holds placeholders would drift
+        // the appended ids and the unresolved count.
+        let (_full_pack, specs) = reference_pack_specs();
+        let overlay_specs = removed_reference_pack_specs();
+        let (full, full_report) = build_session_registry(&specs);
+        assert_eq!(
+            full_report.errors(),
+            0,
+            "leg=derive: the full registry is clean: {full_report:?}"
+        );
+
+        // (2) Derive every reference identity from the full registry by name.
+        let mut reference_names: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for def in full.blocks() {
+            if !def.placeholder && matches!(def.id, BlockId::Modded(_)) {
+                reference_names.insert(def.name.as_str());
+            }
+        }
+        for def in full.items() {
+            if !def.placeholder {
+                reference_names.insert(def.name.as_str());
+            }
+        }
+        for def in full.tools() {
+            reference_names.insert(def.name.as_str());
+        }
+        let expected_names: std::collections::BTreeSet<&str> = [
+            "mymod:ruby",
+            "mymod:ruby_block",
+            "mymod:ruby_ore",
+            "mymod:ruby_pickaxe",
+            "mymod:ruby_stew",
+            "mymod:ruby_sword",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            reference_names, expected_names,
+            "leg=derive: the reference stack authors exactly six content names"
+        );
+        assert_eq!(
+            reference_names.len(),
+            6,
+            "leg=derive: the reference set stays honest if the pack grows"
+        );
+
+        let ore = full
+            .block_by_name("mymod:ruby_ore")
+            .expect("leg=derive: mymod:ruby_ore is authored");
+        let ruby_block = full
+            .block_by_name("mymod:ruby_block")
+            .expect("leg=derive: mymod:ruby_block is authored");
+        let ruby = full
+            .item_by_name("mymod:ruby")
+            .expect("leg=derive: mymod:ruby is authored");
+        let stew = full
+            .item_by_name("mymod:ruby_stew")
+            .expect("leg=derive: mymod:ruby_stew is authored");
+        let pickaxe = full
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("leg=derive: mymod:ruby_pickaxe is authored");
+        let sword = full
+            .tool_by_name("mymod:ruby_sword")
+            .expect("leg=derive: mymod:ruby_sword is authored");
+
+        // (3) A save that references every block and item identity: two chunk
+        // edits plus a stack of each generic item and both tools.
+        let mut data = sample_save(9_090);
+        let mut edits = FxHashMap::default();
+        edits.insert(linear_index(0, 0, 0) as u16, ore.id);
+        edits.insert(linear_index(1, 0, 0) as u16, ruby_block.id);
+        data.chunk_edits.insert(ChunkPos::new(0, 0, 0), edits);
+
+        let worn_pickaxe =
+            Item::tool_with_durability_with(full.as_ref(), ItemId::ModTool(pickaxe.index), 875)
+                .expect("leg=derive: the pickaxe keeps a worn durability");
+        assert_eq!(worn_pickaxe.durability(), Some(875));
+        let worn_sword =
+            Item::tool_with_durability_with(full.as_ref(), ItemId::ModTool(sword.index), 900)
+                .expect("leg=derive: the sword is at authored maximum");
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Item(ruby.index), 5).expect("leg=derive: ruby stack"))
+            .expect("leg=derive: five ruby fit");
+        inventory
+            .insert(Item::new(ItemId::Item(stew.index), 3).expect("leg=derive: stew stack"))
+            .expect("leg=derive: three stew fit");
+        inventory
+            .insert(worn_pickaxe)
+            .expect("leg=derive: the pickaxe fits");
+        inventory
+            .insert(worn_sword)
+            .expect("leg=derive: the sword fits");
+        data.player.inventory = inventory;
+
+        let mut saved = Vec::new();
+        save_world_to_bytes_with(&mut saved, &data, full.as_ref())
+            .expect("leg=derive: the six-reference v8 save writes");
+
+        // (4) Removing the content pack keeps the world loadable: every
+        // reference becomes a deterministic placeholder and the notice names
+        // the missing pack and the six stand-ins.
+        let (missing_reg, missing_report) = build_session_registry(&overlay_specs);
+        assert_eq!(
+            missing_report.errors(),
+            0,
+            "leg=missing-reload: the removed stack is clean: {missing_report:?}"
+        );
+        let missing = load_world_from_bytes_with(&saved, missing_reg.as_ref())
+            .expect("leg=missing-reload: the world loads without the content pack");
+        assert_eq!(
+            missing.unresolved, 6,
+            "leg=missing-reload: all six reference names degrade"
+        );
+        let notice = missing
+            .content_notice()
+            .expect("leg=missing-reload: a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod-ruby`"), "{notice}");
+        assert!(
+            notice.contains("6 saved content names are unavailable and render as placeholders"),
+            "{notice}"
+        );
+
+        for name in ["mymod:ruby_ore", "mymod:ruby_block"] {
+            let def = missing
+                .registry
+                .block_by_name(name)
+                .expect("leg=missing-reload: the block placeholder keeps its saved name");
+            assert!(
+                def.placeholder,
+                "leg=missing-reload: {name} is a placeholder block"
+            );
+            assert!(
+                def.id.is_solid(),
+                "leg=missing-reload: {name} still occludes like a solid block"
+            );
+            assert!(
+                missing.registry.break_duration(def.id, None).is_none(),
+                "leg=missing-reload: {name} is unbreakable while missing"
+            );
+            assert!(
+                missing.registry.drop_entry(def.id).is_none(),
+                "leg=missing-reload: {name} yields no drop while missing"
+            );
+        }
+
+        for name in [
+            "mymod:ruby",
+            "mymod:ruby_stew",
+            "mymod:ruby_pickaxe",
+            "mymod:ruby_sword",
+        ] {
+            let def = missing
+                .registry
+                .item_by_name(name)
+                .expect("leg=missing-reload: the item placeholder keeps its saved name");
+            assert!(
+                def.placeholder,
+                "leg=missing-reload: {name} is a placeholder item"
+            );
+            assert_eq!(
+                def.icon_layer, PLACEHOLDER_ICON_LAYER,
+                "leg=missing-reload: {name} uses the checker icon"
+            );
+            assert!(
+                def.food.is_none(),
+                "leg=missing-reload: {name} is not edible while missing"
+            );
+            let mut movable = Inventory::empty();
+            movable
+                .insert(
+                    Item::new(ItemId::Item(def.index), 1)
+                        .expect("leg=missing-reload: placeholder item"),
+                )
+                .expect("leg=missing-reload: the placeholder stays movable");
+        }
+
+        let palette_names: Vec<String> = palette::entries(&missing.registry)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        for name in &reference_names {
+            assert!(
+                !palette_names
+                    .iter()
+                    .any(|palette_name| palette_name == name),
+                "leg=missing-reload: the palette hides unavailable {name}"
+            );
+        }
+
+        // (5) Re-save while still missing: all six authored names survive on
+        // the wire, and a second removed load still opens non-blocking.
+        let mut resaved = Vec::new();
+        save_world_to_bytes_with(&mut resaved, &missing.data, &missing.registry)
+            .expect("leg=resave: the degraded world re-saves");
+        for name in &reference_names {
+            assert!(
+                resaved
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "leg=resave: {name} survives the degraded re-save"
+            );
+        }
+
+        let (missing_again_reg, missing_again_report) = build_session_registry(&overlay_specs);
+        assert_eq!(
+            missing_again_report.errors(),
+            0,
+            "leg=missing-reload: the second removed stack is clean: {missing_again_report:?}"
+        );
+        let missing_again = load_world_from_bytes_with(&resaved, missing_again_reg.as_ref())
+            .expect("leg=missing-reload: the re-saved world still loads while missing");
+        assert_eq!(
+            missing_again.unresolved, 6,
+            "leg=missing-reload: the re-save keeps every name unresolved"
+        );
+        let dir = tempfile::tempdir().expect("leg=missing-reload: tempdir");
+        let mut reopened =
+            WorldSession::from_loaded_world(missing_again, dir.path().join("missing.mcvx"));
+        assert!(
+            reopened.take_content_notice().is_some(),
+            "leg=missing-reload: the world opens non-blocking with a readable notice"
+        );
+
+        // (6) Restoring the content pack resolves every identity again. The
+        // restored tools intentionally come back at their authored maximum:
+        // wear is not carried through a placeholder.
+        let (restored_reg, restored_report) = build_session_registry(&specs);
+        assert_eq!(
+            restored_report.errors(),
+            0,
+            "leg=restore: the restored stack is clean: {restored_report:?}"
+        );
+        let restored = load_world_from_bytes_with(&resaved, restored_reg.as_ref())
+            .expect("leg=restore: the re-save loads once the pack returns");
+        assert_eq!(
+            restored.unresolved, 0,
+            "leg=restore: every saved name resolves against the restored pack"
+        );
+        assert_eq!(
+            restored.data.chunk_edits, data.chunk_edits,
+            "leg=restore: both pack block edits survive the round trip"
+        );
+
+        for name in ["mymod:ruby_ore", "mymod:ruby_block"] {
+            let def = restored
+                .registry
+                .block_by_name(name)
+                .expect("leg=restore: the real block definition returns");
+            assert!(!def.placeholder, "leg=restore: {name} is live again");
+        }
+        for name in ["mymod:ruby", "mymod:ruby_stew"] {
+            let def = restored
+                .registry
+                .item_by_name(name)
+                .expect("leg=restore: the real item definition returns");
+            assert!(!def.placeholder, "leg=restore: {name} is live again");
+        }
+        for name in ["mymod:ruby_pickaxe", "mymod:ruby_sword"] {
+            let def = restored
+                .registry
+                .tool_by_name(name)
+                .expect("leg=restore: the real tool definition returns");
+            assert_eq!(def.name, name, "leg=restore: {name} keeps its identity");
+        }
+
+        let restored_tools: Vec<Item> = restored
+            .data
+            .player
+            .inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| matches!(item.id(), ItemId::ModTool(_)))
+            .copied()
+            .collect();
+        assert_eq!(
+            restored_tools.len(),
+            2,
+            "leg=restore: both tools stay registry-allocated tools"
+        );
+        for item in restored_tools {
+            assert_eq!(
+                item.durability(),
+                Some(900),
+                "leg=restore: wear is intentionally not carried through the placeholder"
+            );
+            assert_eq!(item.max_durability(), Some(900));
+            let ItemId::ModTool(index) = item.id() else {
+                unreachable!("the filter kept only pack tools");
+            };
+            let def = restored
+                .registry
+                .tool(index)
+                .expect("leg=restore: the tool index resolves");
+            assert!(
+                def.name == "mymod:ruby_pickaxe" || def.name == "mymod:ruby_sword",
+                "leg=restore: {0} is a reference tool",
+                def.name
+            );
+        }
+
+        let restore_notice = restored
+            .content_notice()
+            .expect("leg=restore: a restored stack yields a readable notice");
+        assert!(
+            restore_notice.contains("added pack `mymod-ruby`"),
+            "{restore_notice}"
+        );
+
+        // (7) Re-saving the restored world keeps all six names: no data loss.
+        let mut restored_resaved = Vec::new();
+        save_world_to_bytes_with(&mut restored_resaved, &restored.data, &restored.registry)
+            .expect("leg=resave-restored: the restored world re-saves");
+        for name in &reference_names {
+            assert!(
+                restored_resaved
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "leg=resave-restored: {name} is still present"
+            );
+        }
     }
 
     /// The validated inventory items a generated ruin chest's table yields, in
