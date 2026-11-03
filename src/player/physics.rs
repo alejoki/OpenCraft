@@ -4,7 +4,7 @@ use crate::content::ContentRegistry;
 
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
-use crate::player::eating::food_value;
+use crate::player::eating::{food_value, food_value_with};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
     InventoryError, Item, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
@@ -469,10 +469,36 @@ impl Player {
     /// and `SurvivalState::restore_hunger` reports the applied amount after
     /// the cap.
     pub fn eat_selected(&mut self, slot: usize, expected: ItemId) -> Option<u16> {
+        self.eat_selected_resolved(slot, expected, food_value(expected)?)
+    }
+
+    /// Registry-aware completion half of the hold-to-eat flow.
+    ///
+    /// Mirrors [`Player::eat_selected`] exactly — selected-slot guard,
+    /// identity guard, hunger guard, one-unit consume and capped restore — but
+    /// resolves authored nutrition through `registry`, so pack food restores
+    /// its authored value while built-in food stays byte-identical. Every
+    /// guard still runs before any mutation, making a stale completion a
+    /// fail-closed `None`.
+    pub fn eat_selected_with(
+        &mut self,
+        registry: &ContentRegistry,
+        slot: usize,
+        expected: ItemId,
+    ) -> Option<u16> {
+        self.eat_selected_resolved(slot, expected, food_value_with(registry, expected)?)
+    }
+
+    /// Shared guarded consume used by both eating entry points.
+    fn eat_selected_resolved(
+        &mut self,
+        slot: usize,
+        expected: ItemId,
+        restore: u16,
+    ) -> Option<u16> {
         if slot != self.selected_slot || self.survival.hunger() >= MAX_HUNGER {
             return None;
         }
-        let restore = food_value(expected)?;
         if self.selected_item()?.id() != expected {
             return None;
         }
@@ -2842,6 +2868,164 @@ mod tests {
 
     fn bread_item(count: u16) -> Item {
         Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
+    }
+
+    // -----------------------------------------------------------------------
+    // S05-T04: authored pack food through the same completion guards
+    // -----------------------------------------------------------------------
+
+    /// A pack registry with `mymod:ruby_stew` (nutrition 7, 0.8 s) and a
+    /// non-food `mymod:ruby`.
+    fn pack_food_registry() -> ContentRegistry {
+        use crate::content::spec::{FoodSpec, ItemEntry, PackAsset};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec::default();
+        for (id, icon, food) in [
+            (
+                "mymod:ruby_stew",
+                "stew.png",
+                Some(FoodSpec {
+                    nutrition: 7,
+                    eat_seconds: 0.8,
+                }),
+            ),
+            ("mymod:ruby", "ruby.png", None),
+        ] {
+            spec.items.push(ItemEntry {
+                id: id.to_string(),
+                display_name: None,
+                icon: icon.to_string(),
+                stack_limit: 64,
+                food,
+            });
+        }
+        for (name, byte) in [("stew.png", 0x11), ("ruby.png", 0x22)] {
+            spec.assets.insert(
+                name.to_string(),
+                PackAsset {
+                    rgba: vec![byte; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+        let pack = (
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    fn pack_stew_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index
+    }
+
+    fn pack_gem_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby")
+            .expect("registered pack gem")
+            .index
+    }
+
+    fn pack_stew(registry: &ContentRegistry, count: u16) -> Item {
+        Item::new_with(registry, ItemId::Item(pack_stew_index(registry)), count)
+            .expect("registered pack stew")
+    }
+
+    #[test]
+    fn eat_selected_with_consumes_one_stew_and_restores_authored_seven() {
+        let registry = pack_food_registry();
+        let mut player = food_player(pack_stew(&registry, 2), 10);
+
+        let applied =
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry)));
+
+        assert_eq!(applied, Some(7), "authored nutrition drives the restore");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), Some(1));
+        // The second call consumes the last unit and caps at MAX_HUNGER.
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            Some(3),
+            "the last stew restores only the capped remainder"
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn eat_selected_with_refuses_full_hunger_without_mutation() {
+        let registry = pack_food_registry();
+        let mut player = food_player(pack_stew(&registry, 2), MAX_HUNGER);
+
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(2), "nothing was consumed");
+    }
+
+    #[test]
+    fn eat_selected_with_refuses_non_food_and_unknown_indices() {
+        let registry = pack_food_registry();
+        let gem = Item::new_with(&registry, ItemId::Item(pack_gem_index(&registry)), 2)
+            .expect("registered pack gem");
+        let mut player = food_player(gem, 10);
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_gem_index(&registry))),
+            None,
+            "a non-food pack item is never edible"
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(99)),
+            None,
+            "an unknown index is not food"
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(1));
+    }
+
+    #[test]
+    fn eat_selected_with_rejects_stale_completions_fail_closed() {
+        let registry = pack_food_registry();
+
+        // Slot switched after the hold started.
+        let mut player = food_player(pack_stew(&registry, 2), 10);
+        assert!(player.select_slot(1));
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.count()),
+            Some(2)
+        );
+
+        // The held item was picked up before completion.
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+        player
+            .inventory
+            .consume_one(0)
+            .expect("the selected stew exists");
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), None);
     }
 
     /// A Survival player holding `item` in slot 0 at `hunger`.

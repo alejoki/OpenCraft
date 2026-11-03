@@ -20,7 +20,7 @@ use opencraft::pack::spec::PackSpec;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
-use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
+use opencraft::player::eating::{food_value_with, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
     ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
@@ -632,8 +632,9 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
-            if food_value(item.id()).is_some() {
-                return match EatingTarget::new(
+            if food_value_with(session.registry.as_ref(), item.id()).is_some() {
+                return match EatingTarget::new_with(
+                    session.registry.as_ref(),
                     session.player.selected_slot(),
                     item,
                     session.player.survival.hunger(),
@@ -769,7 +770,12 @@ fn eating_candidate(
         return None;
     }
     let item = player.selected_item()?;
-    EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
+    EatingTarget::new_with(
+        session.registry.as_ref(),
+        player.selected_slot(),
+        item,
+        player.survival.hunger(),
+    )
 }
 
 /// The hold-to-draw candidate for this frame, or `None` when the draw must
@@ -10822,7 +10828,13 @@ impl ApplicationHandler for GameApp {
                     );
                     if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
                     {
-                        self.session.player.eat_selected(slot, item);
+                        // Authored nutrition resolves through the frozen
+                        // session registry; built-in food answers unchanged.
+                        self.session.player.eat_selected_with(
+                            self.session.registry.as_ref(),
+                            slot,
+                            item,
+                        );
                     }
                     // Hold-to-draw (M009/S07-T05): raw frame dt, never
                     // `dt * time_scale`, exactly like eating and the melee
@@ -26713,6 +26725,87 @@ stack = 64
 
     fn selected_food_count(session: &WorldSession) -> Option<u16> {
         session.player.selected_item().map(|item| item.count())
+    }
+
+    /// A pack registry with `mymod:ruby_stew` (nutrition 7, 0.8 s).
+    fn pack_stew_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{FoodSpec, ItemEntry, PackAsset};
+
+        let mut spec = PackContentSpec::default();
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby_stew".to_string(),
+            display_name: None,
+            icon: "stew.png".to_string(),
+            stack_limit: 64,
+            food: Some(FoodSpec {
+                nutrition: 7,
+                eat_seconds: 0.8,
+            }),
+        });
+        spec.assets.insert(
+            "stew.png".to_string(),
+            PackAsset {
+                rgba: vec![0x11; 1024],
+                source_side: 16,
+            },
+        );
+        let pack = (
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn authored_pack_food_runs_through_the_real_right_click_and_hold_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_stew_registry();
+        let index = registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered stew")
+            .index;
+        let stew_id = ItemId::Item(index);
+        let stew =
+            Item::new_with(registry.as_ref(), stew_id, 2).expect("registered pack stew stack");
+        let mut session = survival_food_session(dir.path(), 123, "eat-pack-stew.mcvx", stew, 10);
+        session.registry = Arc::clone(&registry);
+
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("pack meal target");
+        assert_eq!(target.item(), stew_id);
+        assert_eq!(target.restore(), 7);
+        assert!((target.duration() - 0.8).abs() < 1e-6);
+
+        let mut state = EatingState::new();
+        for _ in 0..7 {
+            assert!(matches!(
+                state.tick(0.1, Some(target)),
+                EatingTick::Eating { .. }
+            ));
+        }
+        assert!(matches!(
+            state.tick(0.09, Some(target)),
+            EatingTick::Eating { .. }
+        ));
+        let (slot, item) = tick_until_ate(&mut state, target).expect("pack meal completes");
+        assert_eq!((slot, item), (0, stew_id));
+        assert_eq!(
+            session
+                .player
+                .eat_selected_with(session.registry.as_ref(), slot, item),
+            Some(7)
+        );
+        assert_eq!(session.player.survival.hunger(), 17);
+        assert_eq!(selected_food_count(&session), Some(1));
     }
 
     fn tick_until_ate(state: &mut EatingState, target: EatingTarget) -> Option<(usize, ItemId)> {
