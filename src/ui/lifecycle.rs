@@ -15,6 +15,8 @@ pub enum LifecycleScreen {
     Playing,
     Pause,
     Settings(SettingsCaller),
+    /// The ordered pack-stack editor reached from Settings.
+    Packs(SettingsCaller),
     Death,
 }
 
@@ -67,6 +69,14 @@ pub enum PauseIntent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsIntent {
     Back,
+    /// Open the Packs screen, preserving the caller that owns the return path.
+    Packs,
+}
+
+/// Intents accepted by the Packs screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacksIntent {
+    Back,
 }
 
 /// Intents accepted by the death screen.
@@ -85,6 +95,7 @@ pub enum LifecycleIntent {
     LoadGame(LoadGameIntent),
     Pause(PauseIntent),
     Settings(SettingsIntent),
+    Packs(PacksIntent),
     Death(DeathIntent),
 }
 
@@ -205,6 +216,12 @@ pub fn decide(screen: LifecycleScreen, intent: LifecycleIntent) -> LifecycleResu
                 SettingsCaller::MainMenu => LifecycleScreen::MainMenu,
                 SettingsCaller::Pause => LifecycleScreen::Pause,
             })
+        }
+        (LifecycleScreen::Settings(caller), LifecycleIntent::Settings(SettingsIntent::Packs)) => {
+            LifecycleDecision::Navigate(LifecycleScreen::Packs(caller))
+        }
+        (LifecycleScreen::Packs(caller), LifecycleIntent::Packs(PacksIntent::Back)) => {
+            LifecycleDecision::Navigate(LifecycleScreen::Settings(caller))
         }
         (LifecycleScreen::Death, LifecycleIntent::Death(intent)) => match intent {
             DeathIntent::Respawn => LifecycleDecision::Respawn,
@@ -335,6 +352,7 @@ mod tests {
             LifecycleIntent::LoadGame(LoadGameIntent::Back),
             LifecycleIntent::Pause(PauseIntent::Resume),
             LifecycleIntent::Settings(SettingsIntent::Back),
+            LifecycleIntent::Packs(PacksIntent::Back),
         ];
         for intent in non_death_intents {
             assert_eq!(
@@ -358,6 +376,8 @@ mod tests {
             Screen::Pause,
             Screen::Settings(SettingsCaller::MainMenu),
             Screen::Settings(SettingsCaller::Pause),
+            Screen::Packs(SettingsCaller::MainMenu),
+            Screen::Packs(SettingsCaller::Pause),
         ] {
             for intent in death_intents {
                 assert_eq!(
@@ -402,6 +422,65 @@ mod tests {
             ),
             Ok(LifecycleDecision::Navigate(Screen::Pause))
         );
+    }
+
+    #[test]
+    fn settings_packs_opens_the_packs_screen_and_back_returns_to_the_caller() {
+        for caller in [SettingsCaller::MainMenu, SettingsCaller::Pause] {
+            assert_eq!(
+                decide(
+                    Screen::Settings(caller),
+                    LifecycleIntent::Settings(SettingsIntent::Packs)
+                ),
+                Ok(LifecycleDecision::Navigate(Screen::Packs(caller)))
+            );
+            assert_eq!(
+                decide(
+                    Screen::Packs(caller),
+                    LifecycleIntent::Packs(PacksIntent::Back)
+                ),
+                Ok(LifecycleDecision::Navigate(Screen::Settings(caller)))
+            );
+        }
+    }
+
+    #[test]
+    fn packs_intents_are_rejected_on_every_other_screen() {
+        let packs_intent = LifecycleIntent::Packs(PacksIntent::Back);
+        for screen in [
+            Screen::MainMenu,
+            Screen::NewGame,
+            Screen::LoadGame,
+            Screen::Playing,
+            Screen::Pause,
+            Screen::Settings(SettingsCaller::MainMenu),
+            Screen::Settings(SettingsCaller::Pause),
+            Screen::Death,
+        ] {
+            assert_eq!(
+                decide(screen, packs_intent),
+                Err(LifecycleError::IntentNotAllowed {
+                    screen,
+                    intent: packs_intent,
+                }),
+                "{screen:?} must reject the Packs intent"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_intents_are_rejected_on_the_packs_screen() {
+        for intent in [
+            LifecycleIntent::Settings(SettingsIntent::Back),
+            LifecycleIntent::Settings(SettingsIntent::Packs),
+        ] {
+            let screen = Screen::Packs(SettingsCaller::Pause);
+            assert_eq!(
+                decide(screen, intent),
+                Err(LifecycleError::IntentNotAllowed { screen, intent }),
+                "Packs must reject {intent:?}"
+            );
+        }
     }
 
     #[test]
@@ -450,6 +529,8 @@ mod tests {
             Screen::Pause,
             Screen::Settings(SettingsCaller::MainMenu),
             Screen::Settings(SettingsCaller::Pause),
+            Screen::Packs(SettingsCaller::MainMenu),
+            Screen::Packs(SettingsCaller::Pause),
             Screen::Death,
         ] {
             let intent = LifecycleIntent::MainMenu(MainMenuIntent::EditBackground);

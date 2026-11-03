@@ -959,6 +959,8 @@ pub enum ScreenKeyAction {
 /// - **MainMenu**: nothing — the main menu is the root screen, so
 ///   Escape is a documented no-op at the caller.
 /// - **Pause**: Escape → Back (the caller applies it as Resume).
+/// - **Packs**: Escape → Back; every other key has no screen-level
+///   meaning (the row actions are click-only).
 /// - **Playing / Settings**: nothing — gameplay keys and the settings
 ///   menu's own handler own those.
 pub fn screen_key_action(
@@ -998,6 +1000,10 @@ pub fn screen_key_action(
         // The death screen is click-only: the player must choose Respawn or
         // Quit explicitly, so no key (Escape and Enter included) may act.
         LifecycleScreen::Death => ScreenKeyAction::None,
+        LifecycleScreen::Packs(_) => match key {
+            KeyCode::Escape => ScreenKeyAction::Back,
+            _ => ScreenKeyAction::None,
+        },
         LifecycleScreen::MainMenu | LifecycleScreen::Playing | LifecycleScreen::Settings(_) => {
             ScreenKeyAction::None
         }
@@ -2114,6 +2120,33 @@ mod tests {
             screen_key_action(LifecycleScreen::MainMenu, KeyCode::Escape, false),
             ScreenKeyAction::None
         );
+
+        // the Packs screen backs out on Escape only
+        assert_eq!(
+            screen_key_action(
+                LifecycleScreen::Packs(crate::ui::SettingsCaller::MainMenu),
+                KeyCode::Escape,
+                false
+            ),
+            ScreenKeyAction::Back
+        );
+        for key in [
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Tab,
+            KeyCode::Space,
+            KeyCode::ArrowUp,
+        ] {
+            assert_eq!(
+                screen_key_action(
+                    LifecycleScreen::Packs(crate::ui::SettingsCaller::Pause),
+                    key,
+                    false
+                ),
+                ScreenKeyAction::None,
+                "{key:?} must not act on the Packs screen"
+            );
+        }
 
         // gameplay and settings own their own keys
         assert_eq!(

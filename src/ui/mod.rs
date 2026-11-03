@@ -21,7 +21,7 @@ pub use inventory::{
 pub use lifecycle::{
     decide as decide_lifecycle, DeathIntent, LifecycleDecision, LifecycleError, LifecycleIntent,
     LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
-    NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
+    NewGameIntent, PacksIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
 };
 pub use packs::{
     compose_pack_lines, enabled_count, hovered_pack_target, move_pack, pack_back_rect,

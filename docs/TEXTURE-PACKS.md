@@ -213,8 +213,8 @@ Sound rules:
 - A missing sound file is fine and silently keeps the built-in synthesized sound for that slot.
 - A corrupt, oversized, or empty (zero-sample) file also keeps the built-in sound, but the menu shows a warning that names the file.
 - Partial packs always work — add one sound or all nine, with or without textures.
-- Sounds apply live when you cycle the **Texture Pack** row; no restart is needed.
-- Cycling back to **Default** restores all nine built-in sounds.
+- Sounds apply live when you toggle a pack on the **Packs** screen; no restart is needed.
+- Disabling every pack (back to **Default**) restores all nine built-in sounds.
 
 ## A complete sound pack
 
@@ -265,12 +265,12 @@ corrupt.
 
 It is a test fixture, not part of a normal game install. To try it, copy the
 `uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
-creating the `packs/` folder yourself first if it does not exist — then cycle the
-**Texture Pack** row to `uat-sound`. Break and place a block and finish a mining
-sequence to hear the custom sounds; hit a mob and land an arrow to hear the pack's
-`mob_hurt` and `arrow_impact` files; open the settings menu to see the corrupt-file
-warning while the built-in click keeps playing. Cycling back to **Default** restores
-the built-in sounds.
+creating the `packs/` folder yourself first if it does not exist — then open
+**Settings → Packs** and enable `uat-sound`. Break and place a block and finish a
+mining sequence to hear the custom sounds; hit a mob and land an arrow to hear the
+pack's `mob_hurt` and `arrow_impact` files; open the settings menu to see the
+corrupt-file warning while the built-in click keeps playing. Disabling every pack
+(back to **Default**) restores the built-in sounds.
 
 ## Validating a pack
 
@@ -291,18 +291,22 @@ validate-pack: my-first-pack: 2 entries, 0 errors, 1 warnings
 
 The exit code is `0` when there are no errors (warnings still pass) and `1` when an entry was rejected or the pack folder is missing. Validation builds the same registry a normal load builds over the built-in content, so references must name a built-in block/item or an entry in the same pack — cross-pack references are not supported.
 
-## Selecting a pack in game
+## Selecting packs in game
 
-- Open **Settings** and click the **Texture Pack** row. Each click advances through `Default` and every pack folder found under `packs/`, wrapping back to `Default`.
-- The change applies immediately — no restart is needed. The logo, the menu tint, the block textures, and the pack's sounds update live.
-- The selection is saved in `settings.toml` under `[packs]` as an ordered stack, `stack = ["folder-name", ...]`, so it comes back on the next launch. A legacy file with `texture_pack = "folder-name"` is read as a one-entry stack and rewritten in the `stack` form on the next save.
-- The single Cycling **Texture Pack** row is being replaced by a dedicated **Packs** screen that toggles and reorders the stack (T07); until then the row still cycles the first entry.
-- If the selected pack folder is deleted or renamed, the game keeps running with the built-in Default textures and shows an in-menu warning naming the pack. Cycle the row back to `Default` (or to the new folder name) to clear the stale selection.
+- Open **Settings** and click the **Packs** row to open the Packs screen.
+- Click a row to toggle that pack. Enabled packs are listed first in stack order; a later pack wins per authored file and field.
+- Use the `^` and `v` actions at the right edge of an enabled row to move it one step up or down the stack.
+- Presentation applies immediately — no restart is needed. The logo, the menu tint, the block textures, and the pack's sounds update live.
+- The stack is saved in `settings.toml` under `[packs]` as `stack = ["folder-name", ...]`, so it comes back on the next launch. A legacy file with `texture_pack = "folder-name"` is read as a one-entry stack and rewritten in the `stack` form on the next save.
+- Content definitions (blocks, items, tiers, tools, recipes, and worldgen) are loaded once when a world session starts. If a change moves the content digest, the Packs screen shows `content changes apply when the world is loaded again`; presentation still updates immediately and the message never blocks saving or shutdown.
+- If an enabled pack folder is deleted or renamed, the game keeps running with the remaining packs and shows a warning naming the missing pack. The missing row stays in the stack, so restoring the folder makes it apply again.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
 
 ## Packs screen
 
 The dedicated **Packs** screen lists enabled packs first in stack order, then every remaining pack folder alphabetically, greyed out and disabled. Click a row to toggle that pack: disabling removes it from the stack, enabling appends it at the end. Enabled rows carry `^` and `v` actions at the right edge to move one step up or down the stack, so the last enabled pack wins. **Escape** or the **Back** row leaves the screen. A pack folder that no longer exists stays listed and marked `(missing)` while it is in the stack, so restoring the folder makes it apply again without re-adding it.
+
+Toggling and reordering save immediately, so the next launch restores the same order. Texture, logo, tint, and sound changes apply at once; content-definition changes apply when the world is loaded again and the screen says so.
 
 ## Troubleshooting
 
@@ -320,7 +324,7 @@ Warnings appear in the Settings menu as `name: reason` lines, joined together if
 | `stone.png: image is 32x16, layers must be square` | A block texture is not square. | Crop or resize it to equal width and height. |
 | `stone.png: image is 8x8, layers must be between 16 and 256 pixels per side` | A block texture is outside the accepted size range. | Resize it to 16 to 256 pixels per side. |
 | `logo.png: ... larger than the 1024 px logo limit` | The logo is too large. | Resize the logo to 1024 pixels or less per side. |
-| `my-pack: pack folder ... is missing` | `settings.toml` points at a pack folder that no longer exists. | Restore the folder, or cycle the Texture Pack row back to Default. |
+| `my-pack: pack folder ... is missing` | `settings.toml` points at a pack folder that no longer exists. | Restore the folder, or disable that pack on the Packs screen. |
 | `break.wav: failed to decode sound file ...` | The file is not readable audio in a supported format. | Re-export it as WAV, Ogg Vorbis, FLAC, MP3, or M4A. |
 | `break.wav: sound file is ... bytes, the limit is 1048576 bytes` | The sound file is larger than the 1 MiB cap. | Shorten it or export at a lower bitrate. |
 | `break.wav: sound file decoded to zero samples` | The file has a valid header but contains no audio frames. | Export the sound again with actual audio data. |

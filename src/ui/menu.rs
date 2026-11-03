@@ -113,8 +113,8 @@ impl BindAction {
 }
 
 /// One selectable menu line. The full list is 7 keybind rows plus
-/// sensitivity, FOV, render distance, fullscreen, vsync, volume, texture
-/// pack, and a close row.
+/// sensitivity, FOV, render distance, fullscreen, vsync, volume, the Packs
+/// screen entry, and a close row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuRow {
     Bind(BindAction),
@@ -124,7 +124,7 @@ pub enum MenuRow {
     Fullscreen,
     Vsync,
     Volume,
-    TexturePack,
+    Packs,
     Close,
 }
 
@@ -143,7 +143,7 @@ pub const ROWS: [MenuRow; 15] = [
     MenuRow::Fullscreen,
     MenuRow::Vsync,
     MenuRow::Volume,
-    MenuRow::TexturePack,
+    MenuRow::Packs,
     MenuRow::Close,
 ];
 
@@ -168,7 +168,7 @@ impl MenuRow {
             MenuRow::Fullscreen => "Fullscreen",
             MenuRow::Vsync => "VSync",
             MenuRow::Volume => "Volume",
-            MenuRow::TexturePack => "Texture Pack",
+            MenuRow::Packs => "Packs",
             MenuRow::Close => "Close Menu",
         }
     }
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(ROWS[10], MenuRow::Fullscreen);
         assert_eq!(ROWS[11], MenuRow::Vsync);
         assert_eq!(ROWS[12], MenuRow::Volume);
-        assert_eq!(ROWS[13], MenuRow::TexturePack);
+        assert_eq!(ROWS[13], MenuRow::Packs);
         assert_eq!(ROWS[14], MenuRow::Close);
         // every row has a non-empty label
         for r in ROWS {

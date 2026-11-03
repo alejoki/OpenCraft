@@ -12,8 +12,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot, SOUND_SLOT_COUNT};
+use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
+use opencraft::content::{ContentRegistry, PackContentSpec, Severity};
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::spec::PackSpec;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
@@ -58,6 +61,7 @@ use opencraft::ui::inventory::{
 use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
+use opencraft::ui::packs;
 use opencraft::ui::screens::{
     death_cause_line, death_panel_rect, death_row_rect, delete_prompt_line, format_row_line,
     hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
@@ -71,8 +75,8 @@ use opencraft::ui::screens::{
 use opencraft::ui::selection::SelectionLabel;
 use opencraft::ui::{
     DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
-    LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
-    TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
+    LoadGameIntent, MainMenuIntent, NewGameIntent, PacksIntent, PauseIntent, Quad, SettingsIntent,
+    StatsOverlay, TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
@@ -117,38 +121,62 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
 
-/// Load the persisted texture pack at startup, returning it together with its
-/// per-file fallback warnings so the caller can merge them into
-/// `startup_warnings` (the S03 routing contract: warnings are data shown in the
-/// menu, never logs). `None` selection is the built-in Default pack: no data,
-/// no warnings.
-fn load_startup_pack(
+/// Load the persisted ordered pack stack at startup, returning the merged
+/// presentation plus the per-pack specs and their per-file fallback warnings.
+/// The caller merges the warnings into `startup_warnings` (the S03 routing
+/// contract: warnings are data shown in the menu, never logs). An empty stack
+/// is the built-in Default pack: no presentation, no specs, no warnings. A
+/// missing stack entry stays in the stack and only produces a warning, so
+/// restoring the folder restores the pack without re-adding it.
+fn load_startup_stack(
     packs_root: &Path,
-    selected: Option<&str>,
-) -> (Option<LoadedPack>, Vec<SettingsWarning>) {
-    let Some(name) = selected else {
-        return (None, Vec::new());
-    };
-    let loaded = pack::load_pack_by_name(packs_root, name);
-    let warnings = loaded.warnings.clone();
-    (Some(loaded), warnings)
+    stack: &[String],
+) -> (Option<LoadedPack>, Vec<PackSpec>, Vec<SettingsWarning>) {
+    if stack.is_empty() {
+        return (None, Vec::new(), Vec::new());
+    }
+    let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
+    (Some(loaded), specs, warnings)
 }
 
-/// Resolve the startup sound buffers and warnings for the persisted pack.
-///
-/// `None` selection is the built-in Default pack: the synthesized buffers stay
-/// untouched and no warnings are produced. A selected pack is resolved
-/// independently of its texture result (a pack whose layers partially failed
-/// may still ship usable sounds); the loader never fails, so this can never
-/// block launch (D054).
-fn load_startup_sounds(
-    packs_root: &Path,
-    selected: Option<&str>,
-) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
-    let Some(name) = selected else {
-        return (default_buffers(), Vec::new());
-    };
-    pack::sound::load_sound_overrides(&packs_root.join(name))
+/// Build the session's immutable content registry from the ordered pack specs.
+/// The built-in table is the base; later packs win per definition. The caller
+/// freezes the result in an `Arc` and never replaces it mid-session (MEM512).
+fn build_session_registry(specs: &[PackSpec]) -> (Arc<ContentRegistry>, ContentLoadReport) {
+    let packs: Vec<(PackIdentity, PackContentSpec)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                PackIdentity {
+                    folder: spec.folder.clone(),
+                    version: spec.version.clone(),
+                },
+                spec.content.clone(),
+            )
+        })
+        .collect();
+    let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+    (Arc::new(registry), report)
+}
+
+/// Render registry-builder diagnostics as the same field/reason warning shape
+/// every other startup problem uses (MEM009: warnings are data, never logs).
+fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
+    report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| SettingsWarning {
+            field: diagnostic.entry.clone(),
+            reason: format!(
+                "{}: {}",
+                match diagnostic.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                },
+                diagnostic.reason
+            ),
+        })
+        .collect()
 }
 
 /// Build the app's sound engine. Production opens the default output device
@@ -1348,13 +1376,13 @@ fn on_off(value: bool) -> &'static str {
 
 /// Compose the menu's display text: one "label: value" line per row, a
 /// capture hint line while a rebind is pending, and the transient message
-/// line. `pack_label` is the active texture pack's display name ("Default"
-/// for the built-in procedural pack), kept as a parameter so this stays a
+/// line. `pack_summary` is `packs::summary_label`'s rendering of the ordered
+/// stack ("Default" for an empty stack), kept as a parameter so this stays a
 /// pure function of its inputs — unit-testable without GPU or events.
 /// Called per frame while the menu is open, where `StatsOverlay::update`
 /// skips the expensive re-shape unless the composed string actually
 /// changed.
-fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label: &str) -> String {
+fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summary: &str) -> String {
     let mut lines = Vec::with_capacity(menu::ROW_COUNT + 2);
     for row in menu::ROWS {
         let line = match row {
@@ -1379,7 +1407,7 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
             }
             MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
             MenuRow::Volume => format!("{}: {}%", row.label(), settings.volume),
-            MenuRow::TexturePack => format!("{}: {pack_label}", row.label()),
+            MenuRow::Packs => format!("{}: {pack_summary}", row.label()),
             MenuRow::Close => row.label().to_string(),
         };
         lines.push(line);
@@ -1818,7 +1846,12 @@ fn compose_screen_text(
             lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
             lines
         }
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => return String::new(),
+        // The render branch composes the Packs screen from its row model via
+        // `packs::compose_pack_lines` (it already has the rows); Settings
+        // composes through `compose_menu_text`; Playing renders no text.
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
+            return String::new()
+        }
     };
     lines.join("\n")
 }
@@ -1858,7 +1891,10 @@ fn screen_panel_rect(
         LifecycleScreen::NewGame => new_game_panel_rect(surface_w, surface_h),
         LifecycleScreen::LoadGame => load_panel_rect(surface_w, load.row_count()),
         LifecycleScreen::Death => death_panel_rect(surface_w, surface_h),
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
+        // The render branch draws the Packs panel directly from its row
+        // count; Settings keeps its existing path. Both fallbacks here are
+        // unreachable in the render path.
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
             menu::panel_rect(surface_w, surface_h)
         }
     }
@@ -1915,7 +1951,7 @@ fn hovered_target_rect(
             let index = DEATH_ROWS.iter().position(|&r| r == row)?;
             death_row_rect(surface_w, surface_h, index)
         }
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
     }
 }
 
@@ -1930,6 +1966,7 @@ fn screen_title_tag(screen: LifecycleScreen) -> &'static str {
         LifecycleScreen::Pause => " | Paused",
         LifecycleScreen::Death => " | Dead",
         LifecycleScreen::Settings(_) => " | Settings",
+        LifecycleScreen::Packs(_) => " | Packs",
         LifecycleScreen::Playing => "",
     }
 }
@@ -8017,8 +8054,21 @@ struct GameApp {
     available_packs: Vec<String>,
     /// The active pack's loaded layers and presentation data; `None` is
     /// the built-in procedural Default pack (MEM113). Never holds a
-    /// half-loaded pack: `load_pack_by_name` always returns usable layers.
+    /// half-loaded pack: `load_stack` always returns usable layers.
     current_pack: Option<LoadedPack>,
+    /// The session's immutable content registry, built once at startup from
+    /// the then-current pack stack and never replaced while the session runs
+    /// (MEM512). Only presentation applies live; a toggled content change is
+    /// reported as a deferred-until-next-load warning.
+    session_registry: Arc<ContentRegistry>,
+    /// Set whenever the pack stack changes presentation, so the next
+    /// `RedrawRequested` uploads the merged layers and logo once. Startup
+    /// uploads directly in `resumed`, so this starts false.
+    pack_presentation_dirty: bool,
+    /// The Packs screen's transient message (missing-pack/content-change
+    /// warnings), using the same bounded tick-counter pattern as every other
+    /// screen message.
+    packs_message: Option<MenuMessage>,
     /// Clock acceleration from `--time-scale` (S02-T04): an app-level
     /// setting like FOV, NOT session state — the session clock stays
     /// world-swappable through `start_world_session`, and every session
@@ -8122,8 +8172,8 @@ impl GameApp {
         // (D031/MEM121, MEM009: warnings are data, never logs).
         let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
         let available_packs = pack::available_pack_names(&packs_root);
-        let (current_pack, pack_warnings) =
-            load_startup_pack(&packs_root, settings.pack_stack.first().map(String::as_str));
+        let (current_pack, pack_specs, pack_warnings) =
+            load_startup_stack(&packs_root, &settings.pack_stack);
         startup_warnings.extend(pack_warnings);
         // Startup sound overrides (M005/S05): resolved independently of the
         // texture result, so a pack whose layers partially failed still
@@ -8132,10 +8182,14 @@ impl GameApp {
         // message path as every other startup warning (MEM009/D054). The
         // engine is constructed first because `set_buffers` is device-free.
         let mut audio = new_audio_engine();
-        let (startup_sounds, sound_warnings) =
-            load_startup_sounds(&packs_root, settings.pack_stack.first().map(String::as_str));
+        let (startup_sounds, sound_warnings) = pack::sound::resolve_sounds(&pack_specs);
         audio.set_buffers(startup_sounds);
         startup_warnings.extend(sound_warnings);
+        // Session content registry (M010/S02): built once from the ordered
+        // stack over the built-in table, then frozen for the whole session.
+        // Registry diagnostics join the same one-time warning path.
+        let (session_registry, registry_report) = build_session_registry(&pack_specs);
+        startup_warnings.extend(registry_warnings(&registry_report));
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8310,6 +8364,9 @@ impl GameApp {
             packs_root,
             available_packs,
             current_pack,
+            session_registry,
+            pack_presentation_dirty: false,
+            packs_message: None,
             time_scale: cli.time_scale,
             demo_cycle: None,
             demo_finished: false,
@@ -8429,11 +8486,14 @@ impl GameApp {
                     self.audio.play(SoundSlot::UiClick, self.settings.volume);
                 }
             }
-            MenuRow::TexturePack => {
-                // Cycling is not an adjust row: any button advances one step.
-                // The GPU re-upload needs the RenderContext, so it happens in
-                // the caller right after this call (same P005 split as vsync).
-                self.apply_texture_pack_cycle();
+            MenuRow::Packs => {
+                // Open the ordered-stack editor, preserving the caller that
+                // owns the return path. Presentation upload and persistence
+                // happen on the Packs screen's own actions, not here.
+                self.dispatch_screen_intent(
+                    event_loop,
+                    LifecycleIntent::Settings(SettingsIntent::Packs),
+                );
             }
             MenuRow::Close => {
                 // Close now dispatches Back through the lifecycle state
@@ -8469,44 +8529,55 @@ impl GameApp {
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
-    /// Apply one Texture Pack row click: advance through the discovered
-    /// packs (Default -> first -> ... -> Default), load the new pack, surface
-    /// any load warnings in the menu message slot (MEM009), and persist the
-    /// choice. Extracted from `menu_click` so the headless tests can drive
-    /// the exact click semantics without a live event loop; the live GPU
-    /// re-upload stays in the caller (P005 borrow split).
-    fn apply_texture_pack_cycle(&mut self) {
-        let next = menu::cycle_texture_pack(
-            self.settings.pack_stack.first().map(String::as_str),
-            &self.available_packs,
-        );
-        // Until the Packs screen lands (T07), the cycle row maps the single
-        // legacy selection onto a one-entry stack (empty = Default).
-        self.settings.pack_stack = next.clone().map(|name| vec![name]).unwrap_or_default();
-        match next {
-            None => {
-                // Cycling back to Default restores the synthesized sounds
-                // (mirrors MEM135's procedural texture re-upload).
-                self.current_pack = None;
-                self.audio.set_buffers(default_buffers());
+    /// Reload the ordered stack and apply every live surface: merged layers,
+    /// logo, tunes, and the Packs screen's warning message. The session's
+    /// content registry is deliberately NOT replaced (MEM512); a changed
+    /// definition digest only warns that content applies on the next load.
+    fn apply_pack_stack(&mut self) {
+        let (loaded, specs, mut warnings) =
+            load_startup_stack(&self.packs_root, &self.settings.pack_stack);
+        // Sound resolution is independent of the texture result and applies
+        // live: the never-fail resolver starts from the synthesized set and
+        // overlays only authored slots in stack order.
+        let (sounds, sound_warnings) = pack::sound::resolve_sounds(&specs);
+        self.audio.set_buffers(sounds);
+        warnings.extend(sound_warnings);
+        let (candidate, report) = build_session_registry(&specs);
+        warnings.extend(registry_warnings(&report));
+        let changed = candidate.digest() != self.session_registry.digest();
+
+        self.current_pack = loaded;
+        self.pack_presentation_dirty = true;
+
+        if warnings.is_empty() && !changed {
+            self.packs_message = None;
+        } else {
+            let mut lines = menu::format_warnings(&warnings);
+            if changed {
+                lines.push("content changes apply when the world is loaded again".to_string());
             }
-            Some(name) => {
-                let loaded = pack::load_pack_by_name(&self.packs_root, &name);
-                // Sounds load independently of texture success and apply live
-                // on the same click (the helper holds no GPU borrow).
-                let (buffers, sound_warnings) =
-                    pack::sound::load_sound_overrides(&self.packs_root.join(&name));
-                self.audio.set_buffers(buffers);
-                let mut warnings = loaded.warnings.clone();
-                warnings.extend(sound_warnings);
-                if !warnings.is_empty() {
-                    let lines = menu::format_warnings(&warnings).join(" | ");
-                    self.menu.set_message(lines);
-                }
-                self.current_pack = Some(loaded);
-            }
+            self.packs_message = Some(MenuMessage {
+                text: lines.join(" | "),
+                ticks_left: menu::MESSAGE_TICKS,
+            });
         }
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+    }
+
+    /// Toggle one Packs row: append an absent name, remove a present one, then
+    /// apply the new stack live. Extracted from `screen_click` so headless
+    /// tests drive the exact click semantics without an event loop.
+    fn toggle_pack_row(&mut self, name: &str) {
+        packs::toggle_pack(&mut self.settings.pack_stack, name);
+        self.apply_pack_stack();
+    }
+
+    /// Move one enabled Packs row one step up/down the stack. An edge move is
+    /// a no-op (no reload, no save), matching `packs::move_pack`.
+    fn move_pack_row(&mut self, name: &str, direction: packs::MoveDirection) {
+        if packs::move_pack(&mut self.settings.pack_stack, name, direction) {
+            self.apply_pack_stack();
+        }
     }
 
     /// Enter a lifecycle screen — the one transition entry point every
@@ -8574,6 +8645,13 @@ impl GameApp {
         // identity — `set_rows` cancels it).
         if screen == LifecycleScreen::LoadGame {
             self.refresh_load_rows();
+        }
+        // Entering the Packs screen re-reads the pack folders (a pack authored
+        // while the game runs appears on the next visit, with no polling) and
+        // starts with a clean transient message.
+        if matches!(screen, LifecycleScreen::Packs(_)) {
+            self.available_packs = pack::available_pack_names(&self.packs_root);
+            self.packs_message = None;
         }
         self.lifecycle = LifecycleState::from_screen(screen);
     }
@@ -9069,6 +9147,7 @@ impl GameApp {
             LifecycleScreen::NewGame => LifecycleIntent::NewGame(NewGameIntent::Back),
             LifecycleScreen::LoadGame => LifecycleIntent::LoadGame(LoadGameIntent::Back),
             LifecycleScreen::Pause => LifecycleIntent::Pause(PauseIntent::Resume),
+            LifecycleScreen::Packs(_) => LifecycleIntent::Packs(PacksIntent::Back),
             _ => return,
         };
         self.dispatch_screen_intent(event_loop, intent);
@@ -9343,6 +9422,45 @@ impl GameApp {
                             self.load.cancel_delete();
                             self.audio.play(SoundSlot::UiClick, self.settings.volume);
                         }
+                    }
+                }
+            }
+            LifecycleScreen::Packs(_) => {
+                let rows = packs::packs_rows(&self.available_packs, &self.settings.pack_stack);
+                let Some(target) = packs::hovered_pack_target(cursor, surface_w, surface_h, &rows)
+                else {
+                    return;
+                };
+                match target {
+                    // Row body toggles the pack. A click always changes the
+                    // stack, so one click sound follows.
+                    packs::PackTarget::Row(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.toggle_pack_row(&name);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    // Up/Down are live only for enabled rows with a legal
+                    // move (the hover helper guarantees both), so each click
+                    // reorders and is audible.
+                    packs::PackTarget::Up(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.move_pack_row(&name, packs::MoveDirection::Up);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    packs::PackTarget::Down(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.move_pack_row(&name, packs::MoveDirection::Down);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    packs::PackTarget::Back => {
+                        self.dispatch_screen_intent(
+                            event_loop,
+                            LifecycleIntent::Packs(PacksIntent::Back),
+                        );
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
                     }
                 }
             }
@@ -9972,33 +10090,6 @@ impl ApplicationHandler for GameApp {
                                 apply_vsync(&mut gpu.ctx, self.settings.vsync);
                             }
                         }
-                        if clicked == Some(MenuRow::TexturePack) {
-                            // Live apply (MEM111): rewrite the EXISTING block
-                            // texture array's contents — same texture, view,
-                            // and bind group, so nothing needs recreation.
-                            // Clone/copy the layer bytes BEFORE the `as_mut`
-                            // borrow split (P005); Default re-uploads the
-                            // procedural layers so wrapping back restores
-                            // the built-in textures.
-                            let layers = match &self.current_pack {
-                                Some(pack) => pack.layers.clone(),
-                                None => generate_all_texture_layers_rgba(),
-                            };
-                            // The logo is cloned too, for the same reason:
-                            // both reads of `self.current_pack` happen before
-                            // the `self.gpu.as_mut()` borrow (P005). Cycling
-                            // back to Default passes None and clears the logo
-                            // so the text title returns.
-                            let logo = match &self.current_pack {
-                                Some(pack) => pack.logo.clone(),
-                                None => None,
-                            };
-                            if let Some(gpu) = self.gpu.as_mut() {
-                                gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
-                                gpu.ui
-                                    .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
-                            }
-                        }
                     } else {
                         // Other lifecycle screens own the click (T01 hit
                         // tests); gpu is not touched after this call on
@@ -10260,6 +10351,28 @@ impl ApplicationHandler for GameApp {
                 let dt = frame_dt.as_secs_f32();
                 self.last_frame = now;
 
+                // Live pack presentation (M010/S02-T07): a Packs toggle or
+                // reorder sets the dirty flag and the next frame rewrites the
+                // existing block texture array and logo once. Clone every
+                // pack read BEFORE touching `gpu` (P005); Default re-uploads
+                // the procedural layers and clears the logo so the text title
+                // returns. Content definitions stay frozen in
+                // `session_registry` (MEM512).
+                if self.pack_presentation_dirty {
+                    let layers = match &self.current_pack {
+                        Some(pack) => pack.layers.clone(),
+                        None => generate_all_texture_layers_rgba(),
+                    };
+                    let logo = self
+                        .current_pack
+                        .as_ref()
+                        .and_then(|pack| pack.logo.clone());
+                    gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
+                    gpu.ui
+                        .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                    self.pack_presentation_dirty = false;
+                }
+
                 // Message expiry at a bounded ~60 ticks/s (see
                 // `MENU_TICK_INTERVAL`): the pure tick counters decrement
                 // only here, so warnings never stick forever and never flash
@@ -10274,6 +10387,7 @@ impl ApplicationHandler for GameApp {
                         || self.main_menu_message.is_some()
                         || self.pause_message.is_some()
                         || self.game_message.is_some()
+                        || self.packs_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
@@ -10281,6 +10395,7 @@ impl ApplicationHandler for GameApp {
                         tick_transient_message(&mut self.main_menu_message);
                         tick_transient_message(&mut self.pause_message);
                         tick_transient_message(&mut self.game_message);
+                        tick_transient_message(&mut self.packs_message);
                     }
                 }
 
@@ -10844,7 +10959,16 @@ impl ApplicationHandler for GameApp {
                 if active_screen != LifecycleScreen::Playing {
                     let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                     let settings_open = self.menu.is_open();
-                    let (panel_x, panel_y, panel_w, panel_h) = if settings_open {
+                    // The Packs screen owns a row model rather than the
+                    // fixed settings geometry: rows reflow with the stack,
+                    // so the panel, highlight, and text all derive from
+                    // `packs_rows` for this frame.
+                    let pack_rows = matches!(active_screen, LifecycleScreen::Packs(_)).then(|| {
+                        packs::packs_rows(&self.available_packs, &self.settings.pack_stack)
+                    });
+                    let (panel_x, panel_y, panel_w, panel_h) = if let Some(rows) = &pack_rows {
+                        packs::pack_panel_rect(surface_w, rows.len())
+                    } else if settings_open {
                         menu::panel_rect(surface_w, surface_h)
                     } else {
                         screen_panel_rect(active_screen, &self.load, surface_w, surface_h)
@@ -10856,7 +10980,26 @@ impl ApplicationHandler for GameApp {
                         h: panel_h,
                         color: [0.0, 0.0, 0.0, 0.7],
                     });
-                    let hovered = if settings_open {
+                    let hovered = if let Some(rows) = &pack_rows {
+                        self.cursor_pos
+                            .and_then(|cursor| {
+                                packs::hovered_pack_target(cursor, surface_w, surface_h, rows)
+                            })
+                            .and_then(|target| match target {
+                                packs::PackTarget::Row(index) => {
+                                    packs::pack_row_rect(surface_w, index, rows.len())
+                                }
+                                packs::PackTarget::Up(index) => {
+                                    Some(packs::pack_up_rect(surface_w, index))
+                                }
+                                packs::PackTarget::Down(index) => {
+                                    Some(packs::pack_down_rect(surface_w, index))
+                                }
+                                packs::PackTarget::Back => {
+                                    Some(packs::pack_back_rect(surface_w, rows.len()))
+                                }
+                            })
+                    } else if settings_open {
                         self.cursor_pos
                             .and_then(|cursor| menu::hovered_row(cursor, surface_w, surface_h))
                             .and_then(|hover| {
@@ -10884,12 +11027,17 @@ impl ApplicationHandler for GameApp {
                             color: [0.35, 0.55, 0.9, 0.3],
                         });
                     }
-                    let text = if settings_open {
-                        let pack_label = self
-                            .current_pack
-                            .as_ref()
-                            .map_or("Default", |pack| pack.display_name.as_str());
-                        compose_menu_text(&self.settings, &self.menu, pack_label)
+                    let text = if let Some(rows) = &pack_rows {
+                        packs::compose_pack_lines(
+                            rows,
+                            self.packs_message.as_ref().map(|m| m.text.as_str()),
+                        )
+                    } else if settings_open {
+                        compose_menu_text(
+                            &self.settings,
+                            &self.menu,
+                            &packs::summary_label(&self.settings.pack_stack),
+                        )
                     } else {
                         compose_screen_text(
                             active_screen,
@@ -11824,6 +11972,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencraft::audio::default_buffers;
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
@@ -11863,7 +12012,7 @@ mod tests {
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
         assert!(text.contains("Volume: 100%"));
-        assert!(text.contains("Texture Pack: Default"));
+        assert!(text.contains("Packs: Default"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
         assert!(
@@ -11892,7 +12041,7 @@ mod tests {
         assert!(text.contains("Render Distance: 24"));
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
-        assert!(text.contains("Texture Pack: Default"));
+        assert!(text.contains("Packs: Default"));
     }
 
     #[test]
@@ -16441,11 +16590,11 @@ mod tests {
         assert_eq!(app.background.world.render_distance(), 36);
     }
 
-    // --- texture pack wiring (M004/S03) ---
+    // --- ordered pack stack wiring (M010/S02-T07) ---
 
     /// A headless GameApp whose pack root and settings save path live inside
-    /// `dir` (the same injection pattern as `settings_path`). Defaults to no
-    /// pack selected so each test drives the cycle from a known state.
+    /// `dir` (the same injection pattern as `settings_path`). Defaults to an
+    /// empty stack so each test drives the Packs screen from a known state.
     fn app_with_packs(dir: &Path) -> GameApp {
         let mut app = app_at_screen(dir, LifecycleScreen::Settings(SettingsCaller::MainMenu));
         app.settings_path = dir.join("settings.toml");
@@ -16479,12 +16628,27 @@ mod tests {
     }
 
     #[test]
-    fn menu_text_shows_the_active_texture_pack_label() {
-        let settings = Settings::default();
+    fn menu_text_shows_the_packs_summary() {
         let menu = menu::SettingsMenu::new();
-        let text = compose_menu_text(&settings, &menu, "Alpha Pack");
-        assert!(text.contains("Texture Pack: Alpha Pack"));
+        let settings = Settings::default();
+        let text = compose_menu_text(
+            &settings,
+            &menu,
+            &packs::summary_label(&settings.pack_stack),
+        );
+        assert!(text.contains("Packs: Default"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
+
+        let settings = Settings {
+            pack_stack: vec!["alpha".to_string(), "beta".to_string()],
+            ..Settings::default()
+        };
+        let text = compose_menu_text(
+            &settings,
+            &menu,
+            &packs::summary_label(&settings.pack_stack),
+        );
+        assert!(text.contains("Packs: 2 enabled"));
     }
 
     /// Canonical 44-byte-header RIFF/WAVE PCM16 fixture, matching the shape
@@ -16518,200 +16682,237 @@ mod tests {
     }
 
     #[test]
-    fn texture_pack_cycle_advances_to_the_first_pack_and_persists_it() {
+    fn packs_screen_toggles_two_packs_and_persists_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
         write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
-        // A real override layer proves the loaded pack's layers reach
-        // GameApp (not just its manifest).
+        // Real authored files prove the loaded stack reaches GameApp, not just
+        // the manifests: a layer from the earlier pack and a sound that the
+        // later pack does not provide.
         write_solid_png(
             &packs_root.join("alpha").join("grass_top.png"),
             [200, 10, 20, 255],
         );
+        write_wav_fixture(&packs_root.join("alpha").join("break.wav"), 1, 22_050);
         app.available_packs = pack::available_pack_names(&packs_root);
         assert_eq!(app.available_packs, vec!["alpha", "beta"]);
 
-        app.apply_texture_pack_cycle();
+        app.toggle_pack_row("alpha");
+        app.toggle_pack_row("beta");
 
-        assert_eq!(app.settings.pack_stack, vec!["alpha"]);
-        let loaded = app.current_pack.as_ref().expect("pack loaded");
-        assert_eq!(loaded.display_name, "Alpha Pack");
+        assert_eq!(app.settings.pack_stack, vec!["alpha", "beta"]);
+        assert!(app.pack_presentation_dirty, "a toggle schedules an upload");
+        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        assert_eq!(
+            loaded.display_name, "Beta Pack",
+            "the later pack's name wins"
+        );
         assert_eq!(loaded.layers.len(), NUM_TEX_LAYERS as usize);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
-            "the pack's authored layer replaces the procedural one"
+            "alpha's authored layer survives"
         );
-        assert!(loaded.warnings.is_empty(), "clean pack has no warnings");
-
-        // The choice is durable at the injected path.
-        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
-        assert!(warnings.is_empty());
-        assert_eq!(reloaded.pack_stack, vec!["alpha"]);
-    }
-
-    #[test]
-    fn texture_pack_cycle_wraps_the_last_pack_back_to_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        app.available_packs = pack::available_pack_names(&packs_root);
-        app.settings.pack_stack = vec!["alpha".to_string()];
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
-
-        app.apply_texture_pack_cycle();
-
-        assert!(app.settings.pack_stack.is_empty(), "wraps to Default");
-        assert!(app.current_pack.is_none(), "Default holds no pack data");
-        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
-        assert!(warnings.is_empty());
-        assert!(reloaded.pack_stack.is_empty());
-    }
-
-    #[test]
-    fn texture_pack_cycle_from_a_deleted_pack_lands_on_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        app.available_packs = pack::available_pack_names(&packs_root);
-        // The persisted choice names a pack that is no longer on disk.
-        app.settings.pack_stack = vec!["deleted".to_string()];
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "deleted"));
-
-        app.apply_texture_pack_cycle();
-
-        assert!(app.settings.pack_stack.is_empty());
-        assert!(app.current_pack.is_none());
-    }
-
-    #[test]
-    fn texture_pack_cycle_surfaces_load_warnings_in_the_menu_message() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        let broken = packs_root.join("broken");
-        write_pack_fixture(&broken, "Broken Pack");
-        std::fs::write(broken.join("grass_top.png"), b"not a png").expect("corrupt layer");
-        app.available_packs = pack::available_pack_names(&packs_root);
-
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.pack_stack, vec!["broken"]);
-        let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(
-            loaded.layers.len(),
-            NUM_TEX_LAYERS as usize,
-            "fallback still fully usable"
-        );
-        let message = app.menu.message.as_ref().expect("warning in the menu");
-        assert!(
-            message.text.contains("grass_top.png"),
-            "warning names the failing layer: {}",
-            message.text
-        );
-    }
-
-    #[test]
-    fn texture_pack_cycle_swaps_in_valid_pack_sounds() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("soundy"), "Soundy Pack");
-        write_wav_fixture(&packs_root.join("soundy").join("break.wav"), 1, 22_050);
-        app.available_packs = pack::available_pack_names(&packs_root);
-        assert_eq!(
+        assert_ne!(
             *app.audio.buffer(SoundSlot::Break),
             default_buffers()[SoundSlot::Break.index()],
-            "baseline is the synthesized default"
+            "alpha's sound survives a later pack that authors none"
         );
 
-        app.apply_texture_pack_cycle();
+        // The ordering is durable at the injected path.
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["alpha", "beta"]);
 
-        assert_eq!(app.settings.pack_stack, vec!["soundy"]);
-        let swapped = app.audio.buffer(SoundSlot::Break);
-        assert_eq!(swapped.channels(), 1, "mono WAV keeps its channel count");
-        assert_eq!(swapped.sample_rate(), 22_050, "rate passes through");
-        assert_ne!(
-            *swapped,
-            default_buffers()[SoundSlot::Break.index()],
-            "the pack file replaces the synthesized buffer"
-        );
-        // Slots the pack does not provide stay on the synthesized default.
-        assert_eq!(
-            *app.audio.buffer(SoundSlot::Place),
-            default_buffers()[SoundSlot::Place.index()]
-        );
+        // Toggling an enabled pack off removes it and persists the new stack.
+        app.toggle_pack_row("alpha");
+        assert_eq!(app.settings.pack_stack, vec!["beta"]);
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["beta"]);
+    }
+
+    #[test]
+    fn packs_screen_move_reorders_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
+        app.apply_pack_stack();
+
+        app.move_pack_row("beta", packs::MoveDirection::Up);
+
+        assert_eq!(app.settings.pack_stack, vec!["beta", "alpha"]);
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["beta", "alpha"]);
+
+        // An edge move changes nothing and schedules no reload.
+        app.pack_presentation_dirty = false;
+        app.move_pack_row("beta", packs::MoveDirection::Up);
+        assert_eq!(app.settings.pack_stack, vec!["beta", "alpha"]);
         assert!(
-            app.menu.message.is_none(),
-            "a clean sound pack emits no warning, got: {:?}",
-            app.menu.message.as_ref().map(|m| &m.text)
+            !app.pack_presentation_dirty,
+            "an edge move must not trigger a presentation reload"
         );
     }
 
     #[test]
-    fn texture_pack_cycle_surfaces_corrupt_sound_warning_naming_the_bare_file() {
+    fn packs_screen_missing_pack_row_survives_and_warns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        let broken = packs_root.join("broken-sound");
-        write_pack_fixture(&broken, "Broken Sound Pack");
-        std::fs::write(broken.join("place.wav"), b"not a wav at all").expect("corrupt sound");
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.pack_stack = vec!["ghost".to_string()];
+        app.apply_pack_stack();
 
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.pack_stack, vec!["broken-sound"]);
-        let message = app
-            .menu
-            .message
-            .as_ref()
-            .expect("sound warning in the menu");
+        let rows = packs::packs_rows(&app.available_packs, &app.settings.pack_stack);
+        assert_eq!(rows[0].name, "ghost");
+        assert!(rows[0].enabled);
         assert!(
-            message.text.contains("place.wav"),
-            "warning names the bare sound file: {}",
+            rows[0].missing,
+            "the missing folder is marked in the row model"
+        );
+
+        // Toggling a real pack leaves the missing entry in the stack so
+        // restoring the folder makes it apply again.
+        app.toggle_pack_row("alpha");
+        assert_eq!(
+            app.settings.pack_stack,
+            vec!["ghost".to_string(), "alpha".to_string()]
+        );
+        let message = app.packs_message.as_ref().expect("missing-pack warning");
+        assert!(
+            message.text.contains("ghost") && message.text.contains("missing"),
+            "warning names the missing folder: {}",
             message.text
         );
         assert_eq!(
-            *app.audio.buffer(SoundSlot::Place),
-            default_buffers()[SoundSlot::Place.index()],
-            "the corrupt slot falls back to the synthesized default"
+            app.settings
+                .pack_stack
+                .iter()
+                .filter(|name| name.as_str() == "ghost")
+                .count(),
+            1,
+            "the missing entry is never removed by another pack's toggle"
         );
     }
 
     #[test]
-    fn texture_pack_cycle_back_to_default_restores_synthesized_sounds() {
+    fn packs_screen_keeps_earlier_layers_when_later_pack_authors_one_png() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        write_wav_fixture(&packs_root.join("alpha").join("break.wav"), 1, 22_050);
+        let alpha = packs_root.join("alpha");
+        std::fs::create_dir_all(&alpha).expect("create alpha");
+        std::fs::write(
+            alpha.join("pack.toml"),
+            "name = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
+        )
+        .expect("write alpha manifest");
+        write_solid_png(&alpha.join("grass_top.png"), [200, 10, 20, 255]);
+        write_solid_png(&alpha.join("dirt.png"), [10, 20, 200, 255]);
+        write_solid_png(&alpha.join("logo.png"), [240, 20, 30, 255]);
+
+        let beta = packs_root.join("beta");
+        std::fs::create_dir_all(&beta).expect("create beta");
+        std::fs::write(
+            beta.join("pack.toml"),
+            "description = \"a nameless partial pack\"\n",
+        )
+        .expect("write beta manifest");
+        write_solid_png(&beta.join("dirt.png"), [30, 220, 40, 255]);
+
         app.available_packs = pack::available_pack_names(&packs_root);
-        // Start on the pack with its sounds already applied, as a real run
-        // would after cycling onto it.
-        app.settings.pack_stack = vec!["alpha".to_string()];
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
-        let (pack_buffers, _) = pack::sound::load_sound_overrides(&packs_root.join("alpha"));
-        app.audio.set_buffers(pack_buffers);
-        assert_ne!(
-            *app.audio.buffer(SoundSlot::Break),
-            default_buffers()[SoundSlot::Break.index()]
+        app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
+        app.apply_pack_stack();
+
+        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let procedural = generate_all_texture_layers_rgba();
+        assert_eq!(
+            &loaded.layers[0][..4],
+            &[200, 10, 20, 255],
+            "alpha's grass_top survives"
         );
-
-        app.apply_texture_pack_cycle();
-
-        assert!(app.settings.pack_stack.is_empty(), "wraps to Default");
-        for slot in SoundSlot::ALL {
-            assert_eq!(
-                *app.audio.buffer(slot),
-                default_buffers()[slot.index()],
-                "Default must restore the synthesized {} sound",
-                slot.name()
-            );
+        assert_eq!(
+            &loaded.layers[2][..4],
+            &[30, 220, 40, 255],
+            "beta's single PNG overrides only dirt"
+        );
+        assert_eq!(
+            loaded.display_name, "Alpha Pack",
+            "beta authors no name, so alpha's survives"
+        );
+        assert!(
+            loaded.logo.is_some(),
+            "beta authors no logo, so alpha's survives"
+        );
+        for (index, layer) in loaded.layers.iter().enumerate() {
+            if index != 0 && index != 2 {
+                assert_eq!(
+                    layer, &procedural[index],
+                    "layer {index} must stay procedural"
+                );
+            }
         }
+        assert!(
+            loaded.warnings.is_empty(),
+            "a clean two-pack stack emits no presentation warnings: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn apply_pack_stack_warns_on_content_digest_change_without_replacing_the_session_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        let v2 = packs_root.join("mod");
+        std::fs::create_dir_all(&v2).expect("create v2 pack");
+        std::fs::write(
+            v2.join("pack.toml"),
+            "format_version = 2\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&v2.join("ruby.png"), [200, 10, 20, 255]);
+
+        let spec = pack::spec::load_spec_from_dir(&v2);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        assert_ne!(
+            registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the fixture changes content identity"
+        );
+        app.session_registry = registry;
+        let session_digest = app.session_registry.digest();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+
+        // Toggling every content pack off changes the candidate digest, but
+        // the frozen session registry must survive untouched (MEM512).
+        app.settings.pack_stack.clear();
+        app.apply_pack_stack();
+
+        let message = app.packs_message.as_ref().expect("digest change message");
+        assert!(
+            message
+                .text
+                .contains("content changes apply when the world is loaded again"),
+            "deferred content warning: {}",
+            message.text
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "the Arc is never replaced mid-session"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
     }
 
     #[test]
@@ -16725,8 +16926,9 @@ mod tests {
 
         // Mirrors GameApp::new: pack warnings and sound warnings feed the same
         // startup Vec shown once through the Settings-entry path (MEM009).
-        let (_, mut startup_warnings) = load_startup_pack(&packs_root, Some("soundy"));
-        let (buffers, sound_warnings) = load_startup_sounds(&packs_root, Some("soundy"));
+        let (_, specs, mut startup_warnings) =
+            load_startup_stack(&packs_root, &["soundy".to_string()]);
+        let (buffers, sound_warnings) = pack::sound::resolve_sounds(&specs);
         startup_warnings.extend(sound_warnings);
 
         assert!(
@@ -16744,10 +16946,15 @@ mod tests {
             "the corrupt slot falls back"
         );
 
-        // Default selection keeps the synthesized set and adds nothing.
-        let (default_sounds, default_warnings) = load_startup_sounds(&packs_root, None);
-        assert_eq!(default_sounds, default_buffers());
+        // An empty stack is the built-in Default: no presentation, no specs,
+        // the synthesized set, and no warnings.
+        let (default_pack, default_specs, default_warnings) = load_startup_stack(&packs_root, &[]);
+        assert!(default_pack.is_none(), "Default is the procedural pack");
+        assert!(default_specs.is_empty());
         assert!(default_warnings.is_empty());
+        let (default_sounds, sound_warnings) = pack::sound::resolve_sounds(&default_specs);
+        assert_eq!(default_sounds, default_buffers());
+        assert!(sound_warnings.is_empty());
     }
 
     #[test]
@@ -16763,7 +16970,7 @@ mod tests {
         .expect("write pack.toml");
         std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
 
-        let (pack, warnings) = load_startup_pack(&packs_root, Some("broken"));
+        let (pack, _specs, warnings) = load_startup_stack(&packs_root, &["broken".to_string()]);
 
         let pack = pack.expect("a usable pack is still returned");
         assert!(
@@ -16794,7 +17001,7 @@ mod tests {
         .expect("write pack.toml");
         write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
 
-        let (pack, warnings) = load_startup_pack(&packs_root, Some("branded"));
+        let (pack, _specs, warnings) = load_startup_stack(&packs_root, &["branded".to_string()]);
 
         let pack = pack.expect("pack loads");
         let pack_logo = pack.logo.expect("valid logo decodes");
@@ -16808,13 +17015,14 @@ mod tests {
     }
 
     #[test]
-    fn load_startup_pack_default_selection_is_none_without_warnings() {
+    fn load_startup_stack_default_selection_is_none_without_warnings_or_specs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let packs_root = dir.path().join("packs");
 
-        let (pack, warnings) = load_startup_pack(&packs_root, None);
+        let (pack, specs, warnings) = load_startup_stack(&packs_root, &[]);
 
         assert!(pack.is_none(), "Default is the built-in procedural pack");
+        assert!(specs.is_empty(), "Default contributes no pack specs");
         assert!(warnings.is_empty(), "Default emits no warnings");
     }
 
