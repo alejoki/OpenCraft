@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod logo;
 pub mod menu;
 pub mod packs;
+pub mod palette;
 pub mod quad;
 pub mod screens;
 pub mod selection;
@@ -28,6 +29,7 @@ pub use packs::{
     pack_down_rect, pack_panel_rect, pack_row_rect, pack_up_rect, packs_rows, summary_label,
     toggle_pack, MoveDirection, PackRow, PackTarget, PACK_ACTION_WIDTH, PACK_SCREEN_WIDTH,
 };
+pub use palette::{PaletteEntry, PaletteLayout, PaletteScreen, MAX_PALETTE_LABELS};
 pub use screens::{
     death_panel_rect, death_row_rect, delete_prompt_line, format_modified_secs, format_row_line,
     hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
