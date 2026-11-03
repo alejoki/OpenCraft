@@ -32,12 +32,10 @@ pub const SAVE_VERSION: u32 = 8;
 /// `u16` name indices for every persisted content reference, and the
 /// pack-identity + digest tail.
 pub const CONTENT_TABLE_VERSION: u32 = 8;
-/// Version the staged legacy writer still emits in this task.
-///
-/// The public `save_world_to_bytes`/`save_world_to_path` wrappers keep the
-/// pre-v8 u8 vocabulary for one task so the existing persistence suite stays
-/// green while the v8 codec is proven. T03 flips the public writer to v8.
+/// Version the frozen test-only legacy encoder emits.
+#[cfg(test)]
 const LEGACY_WRITE_VERSION: u32 = 7;
+
 /// Upper bound on saved content names. A forged count must never drive an
 /// unbounded decode pass; the value leaves room for the built-in vocabulary
 /// plus the 208 block-layer / 224 icon caps and then some.
@@ -632,6 +630,7 @@ impl std::error::Error for PersistenceError {}
 /// built-in ids `0..=22`, so a [`BlockId::Modded`] id would silently truncate
 /// into a different built-in id. This scan runs before the first output byte
 /// so such a save is rejected with an empty buffer instead.
+#[cfg(test)]
 fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> {
     fn check_block(block: BlockId) -> Result<(), PersistenceError> {
         if !block.is_builtin() {
@@ -693,10 +692,10 @@ fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> 
 
 /// Writes the frozen v1-v7 wire format.
 ///
-/// Kept as the staged legacy writer for this task: the public
-/// [`save_world_to_bytes`] wrapper still emits v7 so the pre-existing
-/// persistence suite stays green. T03 flips the public writer to
-/// [`write_v8_world`].
+/// Test-only since v8 became the public format: the migration suite uses this
+/// encoder to build byte-valid v4-v7 fixtures instead of truncating the live
+/// v8 writer's output (which has a wider item vocabulary and a content table).
+#[cfg(test)]
 fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), PersistenceError> {
     // The v1-v7 wire vocabulary is built-in only (a block id is one `u8` and
     // the decoder accepts 0..=22). Reject every unrepresentable block before
@@ -878,16 +877,16 @@ fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), Per
     Ok(())
 }
 
-/// Writes a save in the frozen v1-v7 format.
+/// Writes a v8 save using the built-in content registry.
 ///
-/// Staged public wrapper: the existing suite and every current call site keep
-/// the u8 vocabulary for this task. Production v8 writes go through
-/// [`save_world_to_bytes_with`].
+/// Callers that loaded a world with a pack stack should use
+/// [`save_world_to_bytes_with`] so modded names round-trip instead of being
+/// rejected as unnameable.
 pub fn save_world_to_bytes(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
 ) -> Result<(), PersistenceError> {
-    write_legacy_world(out, data)
+    save_world_to_bytes_with(out, data, ContentRegistry::builtin())
 }
 
 /// Bounds-checks the persisted mob count before any bytes are emitted.
@@ -921,6 +920,7 @@ fn grid_kind_from_tag(tag: u8) -> Option<GridKind> {
     }
 }
 
+#[cfg(test)]
 fn material_tag(material: Material) -> u8 {
     match material {
         Material::Stick => MATERIAL_STICK,
@@ -954,6 +954,7 @@ fn material_from_tag(tag: u8) -> Option<Material> {
     }
 }
 
+#[cfg(test)]
 fn tool_kind_tag(kind: ToolKind) -> u8 {
     match kind {
         ToolKind::Pickaxe => TOOL_KIND_PICKAXE,
@@ -977,6 +978,7 @@ fn tool_kind_from_tag(tag: u8) -> Option<ToolKind> {
     }
 }
 
+#[cfg(test)]
 fn tool_tier_tag(tier: ToolTier) -> u8 {
     match tier {
         ToolTier::Wood => TOOL_TIER_WOOD,
@@ -1001,6 +1003,7 @@ fn tool_tier_from_tag(tag: u8) -> Option<ToolTier> {
 /// pre-write [`validate_legacy_blocks`] scan makes that branch unreachable for
 /// a save that reached the writer, but the writer keeps the check explicit so
 /// no unchecked cast can be reintroduced.
+#[cfg(test)]
 fn write_item(out: &mut Vec<u8>, item: Option<Item>) -> Result<(), PersistenceError> {
     match item {
         None => out.push(ITEM_TAG_EMPTY),
@@ -1031,6 +1034,7 @@ fn write_item(out: &mut Vec<u8>, item: Option<Item>) -> Result<(), PersistenceEr
     Ok(())
 }
 
+#[cfg(test)]
 fn write_grid(out: &mut Vec<u8>, grid: &CraftingGrid) -> Result<(), PersistenceError> {
     out.push(grid_kind_tag(grid.kind()));
     for index in 0..grid.kind().slot_count() {
@@ -1039,6 +1043,7 @@ fn write_grid(out: &mut Vec<u8>, grid: &CraftingGrid) -> Result<(), PersistenceE
     Ok(())
 }
 
+#[cfg(test)]
 fn write_inventory_extension(
     out: &mut Vec<u8>,
     inventory: &Inventory,
@@ -1579,7 +1584,9 @@ fn decode_legacy(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
     }
 
     let version = read_u32(&mut cur)?;
-    if !(1..=LEGACY_WRITE_VERSION).contains(&version) {
+    // v1..=v7 is every version before the content table. v8 never reaches
+    // this reader; it is dispatched to [`decode_v8`] by version.
+    if !(1..=MOB_VERSION).contains(&version) {
         return Err(PersistenceError::UnsupportedVersion(version));
     }
 
@@ -2531,10 +2538,9 @@ fn write_save_file(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
     Ok(())
 }
 
+/// Writes a v8 save using the built-in content registry, atomically.
 pub fn save_world_to_path(path: &Path, data: &WorldSaveData) -> Result<(), PersistenceError> {
-    let mut bytes = Vec::with_capacity(1024);
-    save_world_to_bytes(&mut bytes, data)?;
-    write_save_file(path, &bytes)
+    save_world_to_path_with(path, data, ContentRegistry::builtin())
 }
 
 /// Writes a v8 save using `registry`, atomically.
@@ -2723,7 +2729,6 @@ mod tests {
             Err(PersistenceError::InvalidMagic | PersistenceError::Io(_))
         ));
 
-        let mut valid = Vec::new();
         let mut edits = ChunkEditMap::default();
         let mut c0 = rustc_hash::FxHashMap::default();
         c0.insert(10, BlockId::Stone);
@@ -2750,7 +2755,9 @@ mod tests {
             mobs: Vec::new(),
             chunk_edits: edits,
         };
-        save_world_to_bytes(&mut valid, &data).unwrap();
+        // A v7 fixture keeps the legacy byte offsets: v8 inserts the content
+        // table at 36 and stores the block as a name index instead of a byte.
+        let mut valid = legacy_world_bytes(&data, 7);
 
         // One chunk, one edit: the block byte sits after chunk_count (71),
         // the 12-byte chunk position, edit_count, and the u16 local index.
@@ -2785,8 +2792,7 @@ mod tests {
         let mut data = sample_data(sample_player());
         data.chunk_edits = edits;
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("stone edit must be saveable");
+        let mut bytes = legacy_world_bytes(&data, 7);
         // One chunk, one edit: the block byte follows chunk_count, the 12-byte
         // chunk position, edit_count, and the u16 local index.
         const FIRST_EDIT_BLOCK_OFFSET: usize = 89;
@@ -2936,8 +2942,7 @@ mod tests {
         let mut player = sample_player();
         player.inventory = Inventory::from_legacy_hotbar(&hotbar);
         let data = sample_data(player);
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+        let legacy = legacy_world_bytes(&data, 7);
 
         // Header layout: 36 bytes through render_distance, then 9 * 3
         // hotbar bytes, then the v3 time u32, then chunk_count (4 bytes),
@@ -2945,7 +2950,7 @@ mod tests {
         // slots, each expanding its 1-byte empty record to a 4-byte block
         // record (+3 bytes each).
         assert_eq!(
-            bytes.len(),
+            legacy.len(),
             V4_EXTENSION_OFFSET
                 + V4_EXTENSION_LEN
                 + V5_SEASON_LEN
@@ -2953,9 +2958,9 @@ mod tests {
                 + 4 * 3
                 + V7_MOB_COUNT_LEN
         );
-        assert_eq!(&bytes[4..8], &LEGACY_WRITE_VERSION.to_le_bytes());
+        assert_eq!(&legacy[4..8], &LEGACY_WRITE_VERSION.to_le_bytes());
 
-        let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
+        let loaded = load_world_from_bytes(&legacy).expect("legacy load should succeed");
         assert_eq!(loaded.player, data.player);
         assert_eq!(loaded.player.selected_slot, 4);
         for slot in 0..HOTBAR_SLOTS {
@@ -2963,6 +2968,21 @@ mod tests {
                 loaded.player.legacy_hotbar().stack(slot),
                 hotbar.stack(slot),
                 "slot {slot} must round-trip"
+            );
+        }
+
+        // The v8 writer keeps the same block-only projection but streams it
+        // after the (here empty) content table.
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &data).expect("v8 save should succeed");
+        assert_eq!(&v8[4..8], &SAVE_VERSION.to_le_bytes());
+        let loaded_v8 = load_world_from_bytes(&v8).expect("v8 load should succeed");
+        assert_eq!(loaded_v8.player, data.player);
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(
+                loaded_v8.player.legacy_hotbar().stack(slot),
+                hotbar.stack(slot),
+                "v8 slot {slot} must round-trip"
             );
         }
     }
@@ -2988,9 +3008,8 @@ mod tests {
         assert!(bytes.is_empty(), "a rejected save must not emit bytes");
     }
 
-    #[test]
-    fn test_v1_save_migrates_to_empty_hotbar() {
-        // Hand-build the old v1 layout (no 27-byte hotbar block).
+    /// Hand-build the old v1 layout (no 27-byte hotbar block).
+    fn hand_built_v1_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SAVE_MAGIC);
         bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -3016,6 +3035,14 @@ mod tests {
         let iron_index = linear_index(4, 5, 6) as u16;
         bytes.extend_from_slice(&iron_index.to_le_bytes());
         bytes.push(BlockId::IronOre.to_raw() as u8);
+        bytes
+    }
+
+    #[test]
+    fn test_v1_save_migrates_to_empty_hotbar() {
+        let bytes = hand_built_v1_bytes();
+        let coal_index = linear_index(1, 2, 3) as u16;
+        let iron_index = linear_index(4, 5, 6) as u16;
 
         let loaded = load_world_from_bytes(&bytes).expect("v1 must migrate, not fail");
 
@@ -3085,6 +3112,58 @@ mod tests {
     /// First v7 mob record (153 for an edit-free save); each record is
     /// [`SAVED_MOB_LEN`] bytes.
     const V7_FIRST_MOB_OFFSET: usize = V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN;
+
+    // v8 empty-table layout. The content table starts where the legacy
+    // hotbar used to: immediately after `render_distance` (36). An edit-free
+    // save with no content references writes only the `u32` name count, so
+    // every older offset shifts by exactly four bytes.
+    /// Empty content table: just the `u32` name count (36..40).
+    const V8_CONTENT_TABLE_LEN: usize = 4;
+    /// v8 tail after the mob section: `u32` pack count + `u64` FNV-1a digest.
+    const V8_TAIL_LEN: usize = 12;
+    const V8_HOTBAR_OFFSET: usize = V2_HOTBAR_OFFSET + V8_CONTENT_TABLE_LEN;
+    const V8_TIME_OFFSET: usize = V8_HOTBAR_OFFSET + HOTBAR_SLOTS * 3;
+    const V8_CHUNK_COUNT_OFFSET: usize = V8_TIME_OFFSET + 4;
+    const V8_EXTENSION_OFFSET: usize = V8_CHUNK_COUNT_OFFSET + 4;
+    const V8_SEASON_OFFSET: usize = V8_EXTENSION_OFFSET + V4_EXTENSION_LEN;
+    const V8_MODE_OFFSET: usize = V8_SEASON_OFFSET + V5_SEASON_LEN;
+    const V8_HEALTH_OFFSET: usize = V8_MODE_OFFSET + 1;
+    const V8_HUNGER_OFFSET: usize = V8_HEALTH_OFFSET + 2;
+    const V8_AIR_OFFSET: usize = V8_HUNGER_OFFSET + 2;
+    const V8_CHEST_COUNT_OFFSET: usize = V8_AIR_OFFSET + 2;
+    /// First chest record with no edits; also the v8 mob count for an
+    /// empty-table, chest-free save (153).
+    const V8_MOB_COUNT_OFFSET: usize = V8_CHEST_COUNT_OFFSET + 4;
+    const V8_TAIL_OFFSET: usize = V8_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN;
+    /// Measured length of an edit-free, chest-free, mob-free v8 save with an
+    /// empty content table (36 header + 4 table + everything older + tail).
+    const V8_EMPTY_SAVE_LEN: usize = V8_TAIL_OFFSET + V8_TAIL_LEN;
+
+    /// Builds a byte-valid v4-v7 fixture with the frozen legacy encoder.
+    ///
+    /// The live writer emits v8, whose wider item vocabulary and header
+    /// content table make "truncate the current payload" invalid. This helper
+    /// always encodes the full v7 layout first, then drops the newer tails and
+    /// patches the version word.
+    fn legacy_world_bytes(data: &WorldSaveData, version: u32) -> Vec<u8> {
+        assert!((4..=7).contains(&version), "legacy fixtures cover v4..=v7");
+        let mut bytes = Vec::new();
+        write_legacy_world(&mut bytes, data).expect("legacy fixture encoding");
+
+        let mob_tail = V7_MOB_COUNT_LEN + SAVED_MOB_LEN * data.mobs.len();
+        if version <= 6 {
+            bytes.truncate(bytes.len() - mob_tail);
+        }
+        if version <= 5 {
+            assert!(data.chests.is_empty(), "v{version} has no chest section");
+            bytes.truncate(bytes.len() - V6_HEADER_LEN);
+        }
+        if version <= 4 {
+            bytes.truncate(bytes.len() - V5_SEASON_LEN);
+        }
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        bytes
+    }
 
     fn set_v2_slot(bytes: &mut [u8], slot: usize, block: u8, count: u16) {
         let off = V2_HOTBAR_OFFSET + slot * 3;
@@ -3207,14 +3286,22 @@ mod tests {
     fn test_v3_time_of_day_roundtrips_exactly() {
         let mut data = sample_data(sample_player());
         data.time_of_day = 12_345;
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
+        // The legacy layout assertion reads a v7 fixture; v8 inserts the
+        // content table before the hotbar.
+        let legacy = legacy_world_bytes(&data, 7);
         assert_eq!(
-            &bytes[V3_TIME_OFFSET..V3_TIME_OFFSET + 4],
+            &legacy[V3_TIME_OFFSET..V3_TIME_OFFSET + 4],
             &12_345u32.to_le_bytes(),
             "time-of-day must sit immediately after the hotbar block"
         );
 
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v8 save should succeed");
+        assert_eq!(
+            &bytes[V8_TIME_OFFSET..V8_TIME_OFFSET + 4],
+            &12_345u32.to_le_bytes(),
+            "v8 time-of-day follows the empty content table and hotbar"
+        );
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
         assert_eq!(loaded.time_of_day, 12_345);
         assert_eq!(loaded.time_of_day, data.time_of_day);
@@ -3404,11 +3491,14 @@ mod tests {
         );
 
         // The legacy block-only header cannot express the tool: it stays the
-        // empty sentinel while the v4 extension is authoritative.
+        // empty sentinel while the v4 extension is authoritative. Read the
+        // legacy fixture because v8 shifts the hotbar behind a non-empty
+        // content table (this player holds coal, planks and tools).
+        let legacy = legacy_world_bytes(&data, 7);
         let header_slot = V2_HOTBAR_OFFSET + 3;
-        assert_eq!(bytes[header_slot], BlockId::Air.to_raw() as u8);
+        assert_eq!(legacy[header_slot], BlockId::Air.to_raw() as u8);
         assert_eq!(
-            &bytes[header_slot + 1..header_slot + 3],
+            &legacy[header_slot + 1..header_slot + 3],
             &0u16.to_le_bytes()
         );
 
@@ -3421,8 +3511,7 @@ mod tests {
     #[test]
     fn test_v4_truncated_extension_is_typed_io_error() {
         let data = sample_data(rich_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let bytes = legacy_world_bytes(&data, 4);
 
         // Cut inside the slot records.
         let truncated = &bytes[..V4_EXTENSION_OFFSET + 5];
@@ -3439,45 +3528,19 @@ mod tests {
         ));
     }
 
-    /// Build a byte-valid v4 save: the current writer's payload with the
-    /// version field patched back to 4 and the v5+v6+v7 tails removed.
-    fn v4_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
-        assert!(data.chests.is_empty(), "v4 has no chest section");
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(
-            bytes.len()
-                - V6_HEADER_LEN
-                - V5_SEASON_LEN
-                - V7_MOB_COUNT_LEN
-                - SAVED_MOB_LEN * data.mobs.len(),
-        );
-        bytes[4..8].copy_from_slice(&INVENTORY_EXTENSION_VERSION.to_le_bytes());
-        bytes
+    /// Build a byte-valid v4 save with the frozen legacy encoder.
+    fn v4_bytes(data: &WorldSaveData) -> Vec<u8> {
+        legacy_world_bytes(data, 4)
     }
 
-    /// Build a byte-valid v5 save: the current writer's payload with the
-    /// version field patched back to 5 and the v6+v7 tails removed.
-    fn v5_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
-        assert!(data.chests.is_empty(), "v5 has no chest section");
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(
-            bytes.len() - V6_HEADER_LEN - V7_MOB_COUNT_LEN - SAVED_MOB_LEN * data.mobs.len(),
-        );
-        bytes[4..8].copy_from_slice(&SEASON_VERSION.to_le_bytes());
-        bytes
+    /// Build a byte-valid v5 save with the frozen legacy encoder.
+    fn v5_bytes(data: &WorldSaveData) -> Vec<u8> {
+        legacy_world_bytes(data, 5)
     }
 
-    /// Build a byte-valid v6 save: the current writer's payload with the
-    /// version field patched back to 6 and the v7 mob tail removed.
-    fn v6_bytes_from_current(data: &WorldSaveData) -> Vec<u8> {
-        assert!(data.chests.is_empty(), "v6 helper has no chest section");
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, data).unwrap();
-        bytes.truncate(bytes.len() - V7_MOB_COUNT_LEN - SAVED_MOB_LEN * data.mobs.len());
-        bytes[4..8].copy_from_slice(&SURVIVAL_VERSION.to_le_bytes());
-        bytes
+    /// Build a byte-valid v6 save with the frozen legacy encoder.
+    fn v6_bytes(data: &WorldSaveData) -> Vec<u8> {
+        legacy_world_bytes(data, 6)
     }
 
     #[test]
@@ -3490,20 +3553,24 @@ mod tests {
         let mut data = sample_data(sample_player());
         data.day_index = 17;
         data.season_length_days = 4;
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("save should succeed");
 
+        // The absolute legacy layout is pinned on a v5 fixture; v8 inserts the
+        // content table before the hotbar and appends its own tail.
+        let legacy = legacy_world_bytes(&data, 5);
         assert_eq!(
-            &bytes[V5_SEASON_OFFSET..V5_SEASON_OFFSET + 4],
+            &legacy[V5_SEASON_OFFSET..V5_SEASON_OFFSET + 4],
             &17u32.to_le_bytes(),
             "day_index sits immediately after the v4 extension"
         );
         assert_eq!(
-            &bytes[V5_SEASON_OFFSET + 4..V5_SEASON_OFFSET + V5_SEASON_LEN],
+            &legacy[V5_SEASON_OFFSET + 4..V5_SEASON_OFFSET + V5_SEASON_LEN],
             &4u32.to_le_bytes(),
             "season_length_days follows day_index"
         );
 
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v8 save should succeed");
+        assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
         let loaded = load_world_from_bytes(&bytes).expect("load should succeed");
         assert_eq!(loaded.day_index, 17);
         assert_eq!(loaded.season_length_days, 4);
@@ -3523,7 +3590,7 @@ mod tests {
         let mut data = sample_data(sample_player());
         data.day_index = 99;
         data.season_length_days = 8;
-        let bytes = v4_bytes_from_current(&data);
+        let bytes = v4_bytes(&data);
 
         let loaded = load_world_from_bytes(&bytes).expect("v4 must migrate, not fail");
         assert_eq!(
@@ -3539,7 +3606,7 @@ mod tests {
 
     #[test]
     fn test_v4_rejects_trailing_bytes() {
-        let mut bytes = v4_bytes_from_current(&sample_data(sample_player()));
+        let mut bytes = v4_bytes(&sample_data(sample_player()));
         bytes.push(0);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -3550,8 +3617,7 @@ mod tests {
     #[test]
     fn test_v5_rejects_trailing_bytes() {
         let data = sample_data(sample_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let mut bytes = legacy_world_bytes(&data, 5);
         bytes.push(0);
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -3562,8 +3628,7 @@ mod tests {
     #[test]
     fn test_v5_truncated_calendar_tail_is_typed_io_error() {
         let data = sample_data(sample_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let bytes = legacy_world_bytes(&data, 5);
 
         // Drop the final season-length byte entirely.
         let truncated = &bytes[..bytes.len() - 1];
@@ -3584,8 +3649,7 @@ mod tests {
     fn test_v5_out_of_range_season_length_clamps_to_default() {
         for garbage in [0u32, MAX_SEASON_LENGTH_DAYS + 1, u32::MAX] {
             let data = sample_data(sample_player());
-            let mut bytes = Vec::new();
-            save_world_to_bytes(&mut bytes, &data).unwrap();
+            let mut bytes = legacy_world_bytes(&data, 5);
             bytes[V5_SEASON_OFFSET + 4..V5_SEASON_OFFSET + V5_SEASON_LEN]
                 .copy_from_slice(&garbage.to_le_bytes());
             let loaded = load_world_from_bytes(&bytes).expect("clamp, not error");
@@ -3595,7 +3659,8 @@ mod tests {
             );
         }
 
-        // The writer normalises the same way, keeping round-trips byte-stable.
+        // The v8 writer normalises the same way, keeping round-trips
+        // byte-stable.
         let mut data = sample_data(sample_player());
         data.season_length_days = 0;
         let mut bytes = Vec::new();
@@ -3604,14 +3669,16 @@ mod tests {
         assert_eq!(loaded.season_length_days, DEFAULT_SEASON_LENGTH_DAYS);
     }
 
-    fn v4_bytes_with_slot0(item: Item) -> Vec<u8> {
+    fn data_with_slot0(item: Item) -> WorldSaveData {
         let mut slots = [None; INVENTORY_SLOTS];
         slots[0] = Some(item);
         let mut player = sample_player();
         player.inventory = Inventory::from_parts(slots, None);
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &sample_data(player)).unwrap();
-        bytes
+        sample_data(player)
+    }
+
+    fn v4_bytes_with_slot0(item: Item) -> Vec<u8> {
+        legacy_world_bytes(&data_with_slot0(item), 4)
     }
 
     // ------------------------------------------------------------------
@@ -3638,17 +3705,15 @@ mod tests {
         let mut chests = ChestMap::default();
         chests.insert(IVec3::new(1, 2, 3), chest);
         let data = v6_data_with_chests(chests);
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
-        bytes
+        legacy_world_bytes(&data, 6)
     }
 
     fn v6_bytes_with_one_empty_chest() -> Vec<u8> {
         let bytes = v6_bytes_with_chest(Container::empty());
         assert_eq!(
             bytes.len(),
-            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS + V7_MOB_COUNT_LEN,
-            "one all-empty chest writes a fixed 12 + 27 byte record, plus the v7 count"
+            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS,
+            "v6 writes one all-empty chest as a fixed 12 + 27 byte record"
         );
         bytes
     }
@@ -3669,8 +3734,7 @@ mod tests {
         chests.insert(IVec3::new(-1, 0, 3), Container::empty());
         let data = v6_data_with_chests(chests);
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let bytes = legacy_world_bytes(&data, 6);
 
         assert_eq!(bytes[V6_MODE_OFFSET], GAME_MODE_SURVIVAL);
         assert_eq!(
@@ -3752,20 +3816,31 @@ mod tests {
         );
         assert_eq!(loaded.chests[&IVec3::new(-1, 0, 3)], Container::empty());
 
-        // Re-saving a loaded world reproduces the exact bytes, and insertion
-        // order is irrelevant because records are sorted before writing.
-        let mut again = Vec::new();
-        save_world_to_bytes(&mut again, &loaded).unwrap();
-        assert_eq!(again, bytes);
+        // A v8 re-save is deterministic and round-trips the same domain
+        // values, while insertion order stays irrelevant.
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &loaded).unwrap();
+        assert_eq!(&v8[4..8], &SAVE_VERSION.to_le_bytes());
+        let reloaded = load_world_from_bytes(&v8).unwrap();
+        assert_eq!(reloaded, loaded);
+        let mut v8_again = Vec::new();
+        save_world_to_bytes(&mut v8_again, &reloaded).unwrap();
+        assert_eq!(v8_again, v8, "v8 writes are byte-stable");
 
         let mut reversed = ChestMap::default();
         reversed.insert(IVec3::new(-1, 0, 3), Container::empty());
         reversed.insert(IVec3::new(4, -2, 7), survival_chest());
-        let mut reversed_bytes = Vec::new();
-        save_world_to_bytes(&mut reversed_bytes, &v6_data_with_chests(reversed)).unwrap();
+        let reversed_data = v6_data_with_chests(reversed);
         assert_eq!(
-            reversed_bytes, bytes,
+            legacy_world_bytes(&reversed_data, 6),
+            bytes,
             "sorted chest records make the wire independent of insertion order"
+        );
+        let mut reversed_v8 = Vec::new();
+        save_world_to_bytes(&mut reversed_v8, &reversed_data).unwrap();
+        assert_eq!(
+            reversed_v8, v8,
+            "v8 writes are independent of chest insertion order"
         );
     }
 
@@ -3777,8 +3852,7 @@ mod tests {
         chests.insert(IVec3::new(-1, 0, 3), Container::empty());
         let data = v6_data_with_chests(chests);
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let bytes = legacy_world_bytes(&data, 6);
         let loaded = load_world_from_bytes(&bytes).expect("v6 must load");
 
         assert_eq!(loaded.chests.len(), 1, "an empty chest is not dropped");
@@ -3790,15 +3864,12 @@ mod tests {
             !loaded.chests.contains_key(&IVec3::new(0, 0, 0)),
             "a position without a record stays missing"
         );
-        // The present-empty record still occupies its full 12 + 27 bytes and
-        // re-saves byte-identically; the v7 mob count follows it.
-        assert_eq!(
-            bytes.len(),
-            V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS + V7_MOB_COUNT_LEN
-        );
-        let mut again = Vec::new();
-        save_world_to_bytes(&mut again, &loaded).unwrap();
-        assert_eq!(again, bytes);
+        // The present-empty record still occupies its full 12 + 27 bytes.
+        assert_eq!(bytes.len(), V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS);
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &loaded).unwrap();
+        let reloaded = load_world_from_bytes(&v8).expect("v8 must load");
+        assert_eq!(reloaded.chests, loaded.chests);
     }
 
     // ------------------------------------------------------------------
@@ -3843,9 +3914,7 @@ mod tests {
     }
 
     fn v7_bytes_with_pinned_mobs() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &v7_data_with_mobs(pinned_mobs())).unwrap();
-        bytes
+        legacy_world_bytes(&v7_data_with_mobs(pinned_mobs()), 7)
     }
 
     #[test]
@@ -3857,8 +3926,7 @@ mod tests {
         assert_eq!(SAVED_MOB_LEN, 19);
 
         let data = v7_data_with_mobs(pinned_mobs());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v7 mob save must succeed");
+        let bytes = legacy_world_bytes(&data, 7);
 
         assert_eq!(bytes.len(), V7_FIRST_MOB_OFFSET + 4 * SAVED_MOB_LEN);
         assert_eq!(bytes.len(), 229);
@@ -3882,9 +3950,22 @@ mod tests {
         assert_eq!(loaded, data);
         assert_eq!(loaded.mobs, pinned_mobs());
 
+        // v8 keeps the same record vocabulary behind an empty content table
+        // (this world references no content names) and adds the 12-byte tail.
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &data).expect("v8 mob save must succeed");
+        assert_eq!(&v8[4..8], &SAVE_VERSION.to_le_bytes());
+        assert_eq!(v8.len(), V8_TAIL_OFFSET + 4 * SAVED_MOB_LEN + V8_TAIL_LEN);
+        assert_eq!(
+            &v8[V8_MOB_COUNT_OFFSET..V8_TAIL_OFFSET],
+            &4u32.to_le_bytes()
+        );
+        let loaded_v8 = load_world_from_bytes(&v8).expect("v8 must load");
+        assert_eq!(loaded_v8, data);
+
         let mut again = Vec::new();
-        save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
-        assert_eq!(again, bytes, "a loaded v7 save re-saves byte-identically");
+        save_world_to_bytes(&mut again, &loaded_v8).expect("v8 re-save must succeed");
+        assert_eq!(again, v8, "a loaded v8 mob save re-saves byte-identically");
     }
 
     #[test]
@@ -4039,15 +4120,20 @@ mod tests {
         let mut mobs = pinned_mobs();
         mobs[0].health = 0;
         let data = v7_data_with_mobs(mobs);
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let legacy = legacy_world_bytes(&data, 7);
         assert_eq!(
-            &bytes[V7_FIRST_MOB_OFFSET + 17..V7_FIRST_MOB_OFFSET + 19],
+            &legacy[V7_FIRST_MOB_OFFSET + 17..V7_FIRST_MOB_OFFSET + 19],
             &0u16.to_le_bytes()
         );
-        let loaded = load_world_from_bytes(&bytes).unwrap();
+        let loaded = load_world_from_bytes(&legacy).unwrap();
         assert_eq!(loaded.mobs[0].health, 0);
         assert_eq!(loaded, data);
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let loaded_v8 = load_world_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded_v8.mobs[0].health, 0);
+        assert_eq!(loaded_v8, data);
     }
 
     // ------------------------------------------------------------------
@@ -4066,21 +4152,6 @@ mod tests {
 
     fn v7_melee_item(material: Material, count: u16) -> Item {
         Item::new(ItemId::Material(material), count).expect("material count is in range")
-    }
-
-    /// Rebuilds a byte-valid v6 payload from an edit-free, chest-free v7
-    /// payload: patch the version back and drop the four-byte mob count.
-    fn v6_bytes_from_v7(bytes: &[u8]) -> Vec<u8> {
-        let mob_count_at = bytes.len() - V7_MOB_COUNT_LEN;
-        assert_eq!(
-            &bytes[mob_count_at..],
-            &0u32.to_le_bytes(),
-            "helper only rewrites a chest-free v7 save with no mobs"
-        );
-        let mut bytes = bytes.to_vec();
-        bytes.truncate(mob_count_at);
-        bytes[4..8].copy_from_slice(&SURVIVAL_VERSION.to_le_bytes());
-        bytes
     }
 
     #[test]
@@ -4105,44 +4176,52 @@ mod tests {
         data.player.inventory = Inventory::from_parts(slots, None);
         data.chests = chests;
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v7 item vocabulary must save");
-        assert_eq!(&bytes[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
+        // The record-layout pins belong to the frozen v7 vocabulary; read a
+        // legacy fixture for them, then prove the same domain values through
+        // the public v8 writer.
+        let legacy = legacy_world_bytes(&data, ITEM_VOCAB_VERSION);
+        assert_eq!(&legacy[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
 
-        let loaded = load_world_from_bytes(&bytes).expect("v7 item vocabulary must load");
-        assert_eq!(loaded, data);
+        let loaded_legacy = load_world_from_bytes(&legacy).expect("v7 item vocabulary must load");
+        assert_eq!(loaded_legacy, data);
 
         for (index, (material, tag)) in V7_MELEE_MATERIALS.iter().enumerate() {
             // Slot-0 layout for a material record: tag, material tag, count.
-            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4], ITEM_TAG_MATERIAL);
-            assert_eq!(bytes[V4_EXTENSION_OFFSET + index * 4 + 1], *tag);
+            assert_eq!(legacy[V4_EXTENSION_OFFSET + index * 4], ITEM_TAG_MATERIAL);
+            assert_eq!(legacy[V4_EXTENSION_OFFSET + index * 4 + 1], *tag);
             assert_eq!(
-                loaded.player.inventory.slot(index),
+                loaded_legacy.player.inventory.slot(index),
                 Some(v7_melee_item(*material, 2 + index as u16))
             );
             assert_eq!(
-                loaded.chests[&IVec3::new(7, 65, -3)].slot(index),
+                loaded_legacy.chests[&IVec3::new(7, 65, -3)].slot(index),
                 Some(v7_melee_item(*material, 5))
             );
         }
 
         // Slot-6/7 layout for a tool record: tag, kind, tier, durability u16.
         let sword = V4_EXTENSION_OFFSET + 6 * 4;
-        assert_eq!(bytes[sword], ITEM_TAG_TOOL);
-        assert_eq!(bytes[sword + 1], TOOL_KIND_SWORD);
-        assert_eq!(bytes[sword + 2], TOOL_TIER_WOOD);
-        assert_eq!(&bytes[sword + 3..sword + 5], &17u16.to_le_bytes());
+        assert_eq!(legacy[sword], ITEM_TAG_TOOL);
+        assert_eq!(legacy[sword + 1], TOOL_KIND_SWORD);
+        assert_eq!(legacy[sword + 2], TOOL_TIER_WOOD);
+        assert_eq!(&legacy[sword + 3..sword + 5], &17u16.to_le_bytes());
         let bow = sword + 5;
-        assert_eq!(bytes[bow], ITEM_TAG_TOOL);
-        assert_eq!(bytes[bow + 1], TOOL_KIND_BOW);
-        assert_eq!(bytes[bow + 2], TOOL_TIER_WOOD);
-        assert_eq!(&bytes[bow + 3..bow + 5], &3u16.to_le_bytes());
+        assert_eq!(legacy[bow], ITEM_TAG_TOOL);
+        assert_eq!(legacy[bow + 1], TOOL_KIND_BOW);
+        assert_eq!(legacy[bow + 2], TOOL_TIER_WOOD);
+        assert_eq!(&legacy[bow + 3..bow + 5], &3u16.to_le_bytes());
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("v8 item vocabulary must save");
+        assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
+        let loaded = load_world_from_bytes(&bytes).expect("v8 item vocabulary must load");
+        assert_eq!(loaded, data);
 
         let mut again = Vec::new();
         save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
         assert_eq!(
             again, bytes,
-            "a loaded v7 item save re-saves byte-identically"
+            "a loaded v8 item save re-saves byte-identically"
         );
     }
 
@@ -4150,21 +4229,21 @@ mod tests {
     fn test_v6_rejects_v7_only_material_and_combat_tool_records() {
         // Material tag 9 (Bone) was appended in v7: a pre-v7 payload that
         // claims it fails closed, while the identical v7 payload loads.
-        let bone = v4_bytes_with_slot0(v7_melee_item(Material::Bone, 1));
-        assert!(load_world_from_bytes(&bone).is_ok());
+        let bone_data = data_with_slot0(v7_melee_item(Material::Bone, 1));
+        assert!(load_world_from_bytes(&legacy_world_bytes(&bone_data, 7)).is_ok());
         assert!(matches!(
-            load_world_from_bytes(&v6_bytes_from_v7(&bone)),
+            load_world_from_bytes(&legacy_world_bytes(&bone_data, 6)),
             Err(PersistenceError::InvalidMaterial(9))
         ));
 
         // Tool kind 4 (Sword) is likewise v7-only, and its v6 rejection is
         // independent of the v6-only Hoe gate.
-        let sword = v4_bytes_with_slot0(
+        let sword_data = data_with_slot0(
             Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
         );
-        assert!(load_world_from_bytes(&sword).is_ok());
+        assert!(load_world_from_bytes(&legacy_world_bytes(&sword_data, 7)).is_ok());
         assert!(matches!(
-            load_world_from_bytes(&v6_bytes_from_v7(&sword)),
+            load_world_from_bytes(&legacy_world_bytes(&sword_data, 6)),
             Err(PersistenceError::InvalidToolKind(4))
         ));
     }
@@ -4174,10 +4253,10 @@ mod tests {
         // `(Bow, Stone)` is not a constructible tool identity; persistence
         // decode must funnel through the checked constructor and report the
         // tier gate instead of accepting the forged pair.
-        let sword = v4_bytes_with_slot0(
+        let sword_data = data_with_slot0(
             Item::tool_with_durability(ToolKind::Sword, ToolTier::Wood, 17).unwrap(),
         );
-        let mut bytes = sword;
+        let mut bytes = legacy_world_bytes(&sword_data, 7);
         bytes[V4_EXTENSION_OFFSET + 1] = TOOL_KIND_BOW;
         bytes[V4_EXTENSION_OFFSET + 2] = TOOL_TIER_STONE;
         assert!(matches!(
@@ -4187,12 +4266,11 @@ mod tests {
     }
 
     #[test]
-    fn test_v7_edit_free_item_vocabulary_save_keeps_the_153_byte_baseline() {
+    fn test_v7_legacy_encoder_keeps_the_153_byte_edit_free_baseline() {
         assert_eq!(ITEM_VOCAB_VERSION, MOB_VERSION);
 
         let data = sample_data(sample_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("edit-free v7 save must succeed");
+        let bytes = legacy_world_bytes(&data, ITEM_VOCAB_VERSION);
 
         assert_eq!(bytes.len(), V7_FIRST_MOB_OFFSET);
         assert_eq!(bytes.len(), 153);
@@ -4207,19 +4285,52 @@ mod tests {
     }
 
     #[test]
+    fn v8_empty_table_save_has_the_measured_169_byte_layout() {
+        let data = sample_data(sample_player());
+        assert!(data.mobs.is_empty());
+        assert!(data.chests.is_empty());
+        assert!(data.chunk_edits.is_empty());
+        assert_eq!(data.player.inventory, Inventory::empty());
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).expect("edit-free v8 save must succeed");
+
+        assert_eq!(bytes.len(), V8_EMPTY_SAVE_LEN);
+        assert_eq!(bytes.len(), 169);
+        assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
+        assert_eq!(
+            &bytes[V2_HOTBAR_OFFSET..V2_HOTBAR_OFFSET + 4],
+            &0u32.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[V8_MOB_COUNT_OFFSET..V8_TAIL_OFFSET],
+            &0u32.to_le_bytes(),
+            "the v8 mob count sits at offset 153 for an empty table"
+        );
+        assert_eq!(
+            &bytes[V8_TAIL_OFFSET..V8_TAIL_OFFSET + 4],
+            &0u32.to_le_bytes(),
+            "no packs in the built-in stack"
+        );
+
+        let loaded = load_world_from_bytes(&bytes).expect("baseline must load");
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
     fn test_v6_save_loads_with_zero_mobs() {
         let data = v7_data_with_mobs(pinned_mobs());
-        let bytes = v6_bytes_from_current(&data);
+        let bytes = v6_bytes(&data);
         let loaded = load_world_from_bytes(&bytes).expect("v6 must migrate, not fail");
         assert!(loaded.mobs.is_empty());
         assert_eq!(loaded.chests, data.chests);
 
-        // Re-saving migrates the payload to v7 with an explicit zero count.
+        // Re-saving migrates the payload to v8 with an explicit zero mob count.
         let mut resaved = Vec::new();
         save_world_to_bytes(&mut resaved, &loaded).unwrap();
-        assert_eq!(&resaved[4..8], &MOB_VERSION.to_le_bytes());
+        assert_eq!(&resaved[4..8], &SAVE_VERSION.to_le_bytes());
         assert_eq!(
-            &resaved[V7_MOB_COUNT_OFFSET..V7_FIRST_MOB_OFFSET],
+            &resaved[V8_MOB_COUNT_OFFSET..V8_TAIL_OFFSET],
             &0u32.to_le_bytes()
         );
     }
@@ -4254,21 +4365,28 @@ mod tests {
         data.player.fly_mode = false;
         data.player.survival = SurvivalState::new(0, 0, 0).unwrap();
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        // Vital offsets are shared by v6-v7; v8 shifts them behind the content
+        // table, so the layout pin reads a legacy fixture.
+        let legacy = legacy_world_bytes(&data, 7);
         assert_eq!(
-            &bytes[V6_HEALTH_OFFSET..V6_HEALTH_OFFSET + 2],
+            &legacy[V6_HEALTH_OFFSET..V6_HEALTH_OFFSET + 2],
             &0u16.to_le_bytes()
         );
         assert_eq!(
-            &bytes[V6_HUNGER_OFFSET..V6_HUNGER_OFFSET + 2],
+            &legacy[V6_HUNGER_OFFSET..V6_HUNGER_OFFSET + 2],
             &0u16.to_le_bytes()
         );
         assert_eq!(
-            &bytes[V6_AIR_OFFSET..V6_AIR_OFFSET + 2],
+            &legacy[V6_AIR_OFFSET..V6_AIR_OFFSET + 2],
             &0u16.to_le_bytes()
         );
 
+        let mut bytes = Vec::new();
+        save_world_to_bytes(&mut bytes, &data).unwrap();
+        assert_eq!(
+            &bytes[V8_HEALTH_OFFSET..V8_HEALTH_OFFSET + 2],
+            &0u16.to_le_bytes()
+        );
         let loaded = load_world_from_bytes(&bytes).expect("a dead save must be loadable");
         assert_eq!(loaded.player.survival, SurvivalState::new(0, 0, 0).unwrap());
         assert_eq!(loaded, data);
@@ -4306,7 +4424,7 @@ mod tests {
         let mut data = sample_data(sample_player());
         data.mode = GameMode::Survival;
         data.player.survival = SurvivalState::new(1, 2, 3).unwrap();
-        let bytes = v5_bytes_from_current(&data);
+        let bytes = v5_bytes(&data);
 
         let loaded = load_world_from_bytes(&bytes).expect("v5 must migrate, not fail");
         assert_v6_migration_defaults(&loaded);
@@ -4366,14 +4484,13 @@ mod tests {
             Err(PersistenceError::InvalidChestState)
         ));
 
-        // Duplicate positions are ambiguous state, not a merge. Insert the
-        // copied record before the v7 mob count so the two chest records stay
-        // contiguous.
+        // Duplicate positions are ambiguous state, not a merge. Append the
+        // copied record at the end of the v6 chest section (v6 has no mob
+        // tail) so the two chest records stay contiguous.
         let mut bytes = v6_bytes_with_one_empty_chest();
         let record =
             bytes[V6_FIRST_CHEST_OFFSET..V6_FIRST_CHEST_OFFSET + 12 + CHEST_SLOTS].to_vec();
-        let mob_count_offset = bytes.len() - V7_MOB_COUNT_LEN;
-        bytes.splice(mob_count_offset..mob_count_offset, record);
+        bytes.extend_from_slice(&record);
         bytes[V6_CHEST_COUNT_OFFSET..V6_CHEST_COUNT_OFFSET + 4]
             .copy_from_slice(&2u32.to_le_bytes());
         assert!(matches!(
@@ -4508,9 +4625,8 @@ mod tests {
         let mut data = sample_data(player);
         data.chunk_edits = edits;
 
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v6 survival palette must save");
-        assert_eq!(&bytes[4..8], &LEGACY_WRITE_VERSION.to_le_bytes());
+        let bytes = legacy_world_bytes(&data, 6);
+        assert_eq!(&bytes[4..8], &SURVIVAL_VERSION.to_le_bytes());
         let loaded = load_world_from_bytes(&bytes).expect("v6 survival palette must load");
 
         let loaded_chunk = loaded
@@ -4537,7 +4653,7 @@ mod tests {
         // Chunk-edit funnel: every v6-only id is a typed error on a v5
         // payload, not a silently accepted block.
         for block in SURVIVAL_ONLY_BLOCKS {
-            let bytes = v5_bytes_from_current(&v6_data_with_block_edit(block));
+            let bytes = v5_bytes(&v6_data_with_block_edit(block));
             assert!(
                 matches!(
                     load_world_from_bytes(&bytes),
@@ -4549,7 +4665,7 @@ mod tests {
 
         // Legacy-hotbar funnel: forge block id 16 into slot 0 of a byte-valid
         // v5 save (36-byte header, then 9 * 3 hotbar bytes).
-        let mut bytes = v5_bytes_from_current(&sample_data(sample_player()));
+        let mut bytes = v5_bytes(&sample_data(sample_player()));
         bytes[V2_HOTBAR_OFFSET] = BlockId::Farmland.to_raw() as u8;
         bytes[V2_HOTBAR_OFFSET + 1..V2_HOTBAR_OFFSET + 3].copy_from_slice(&1u16.to_le_bytes());
         assert!(matches!(
@@ -4565,12 +4681,11 @@ mod tests {
         player.inventory = Inventory::from_parts(slots, None);
         let data = sample_data(player);
 
-        let mut v6_bytes = Vec::new();
-        save_world_to_bytes(&mut v6_bytes, &data).expect("v6 Chest item must save");
+        let v6_bytes = legacy_world_bytes(&data, 6);
         let loaded = load_world_from_bytes(&v6_bytes).expect("v6 Chest item must load");
         assert_eq!(loaded.player.inventory, data.player.inventory);
 
-        let v5_bytes = v5_bytes_from_current(&data);
+        let v5_bytes = v5_bytes(&data);
         assert!(matches!(
             load_world_from_bytes(&v5_bytes),
             Err(PersistenceError::InvalidBlockId(21))
@@ -4590,7 +4705,7 @@ mod tests {
             slots[0] = Some(item);
             let mut player = sample_player();
             player.inventory = Inventory::from_parts(slots, None);
-            let bytes = v5_bytes_from_current(&sample_data(player));
+            let bytes = v5_bytes(&sample_data(player));
             assert!(
                 matches!(
                     load_world_from_bytes(&bytes),
@@ -4604,7 +4719,7 @@ mod tests {
         slots[0] = Some(Item::tool_with_durability(ToolKind::Hoe, ToolTier::Wood, 10).unwrap());
         let mut player = sample_player();
         player.inventory = Inventory::from_parts(slots, None);
-        let bytes = v5_bytes_from_current(&sample_data(player));
+        let bytes = v5_bytes(&sample_data(player));
         assert!(matches!(
             load_world_from_bytes(&bytes),
             Err(PersistenceError::InvalidToolKind(TOOL_KIND_HOE))
@@ -4614,8 +4729,7 @@ mod tests {
     #[test]
     fn test_v4_rejects_unknown_item_tag() {
         let data = sample_data(sample_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let mut bytes = legacy_world_bytes(&data, 4);
         bytes[V4_EXTENSION_OFFSET] = 200;
         assert!(matches!(
             load_world_from_bytes(&bytes),
@@ -4790,8 +4904,7 @@ mod tests {
     #[test]
     fn test_v4_rejects_bad_grid_records() {
         let data = sample_data(sample_player());
-        let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).unwrap();
+        let bytes = legacy_world_bytes(&data, 4);
 
         const PLAYER_GRID_KIND_OFFSET: usize = V4_EXTENSION_OFFSET + INVENTORY_SLOTS + 1;
         const TABLE_GRID_KIND_OFFSET: usize = PLAYER_GRID_KIND_OFFSET + 1 + 4;
@@ -5580,5 +5693,139 @@ mod tests {
             load_world_from_bytes_with(&trailing, ContentRegistry::builtin()),
             Err(PersistenceError::InvalidContentMeta)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // v1-v7 migration into the public v8 format
+    // ------------------------------------------------------------------
+
+    /// Representative migrated world for the legacy encoder: chunk edit,
+    /// inventory and crafting grids, plus the chest/mob tails when the target
+    /// version can carry them.
+    fn migration_data(version: u32) -> WorldSaveData {
+        let mut data = sample_data(rich_player());
+        data.time_of_day = 4_321;
+        data.day_index = 9;
+        data.season_length_days = 3;
+        data.mode = GameMode::Survival;
+        data.player.fly_mode = false;
+        data.player.survival = SurvivalState::new(7, 3, 12).unwrap();
+
+        let mut chunk = rustc_hash::FxHashMap::default();
+        chunk.insert(10, BlockId::Stone);
+        data.chunk_edits.insert(ChunkPos::new(2, -1, 3), chunk);
+
+        if version >= SURVIVAL_VERSION {
+            let mut chests = ChestMap::default();
+            chests.insert(IVec3::new(1, 2, 3), survival_chest());
+            data.chests = chests;
+        }
+        if version >= MOB_VERSION {
+            data.mobs = pinned_mobs();
+        }
+        data
+    }
+
+    /// Loads the fixture for one legacy version, then proves the public v8
+    /// path is deterministic: v -> load -> v8 -> load -> v8 is byte-stable and
+    /// never changes the decoded domain values.
+    fn assert_migrates_to_v8(fixture: &[u8], version: u32) {
+        let loaded =
+            load_world_from_bytes(fixture).expect("legacy fixture must load before migration");
+
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &loaded)
+            .unwrap_or_else(|error| panic!("v{version} -> v8 save failed: {error:?}"));
+        assert_eq!(
+            &v8[4..8],
+            &SAVE_VERSION.to_le_bytes(),
+            "v{version} must re-save as v8"
+        );
+
+        let reloaded = load_world_from_bytes(&v8)
+            .unwrap_or_else(|error| panic!("v{version} v8 reload failed: {error:?}"));
+        assert_eq!(
+            reloaded, loaded,
+            "v{version} -> v8 -> v8 must preserve every domain value"
+        );
+
+        let mut again = Vec::new();
+        save_world_to_bytes(&mut again, &reloaded).expect("v8 re-save must succeed");
+        assert_eq!(again, v8, "v{version} migration must be byte-stable");
+    }
+
+    #[test]
+    fn v1_to_v7_fixtures_migrate_to_v8_and_resave_byte_stably() {
+        assert_migrates_to_v8(&hand_built_v1_bytes(), 1);
+        assert_migrates_to_v8(&valid_v2_bytes(), 2);
+        assert_migrates_to_v8(&hand_built_v3_bytes(&hotbar_sample()), 3);
+        for version in 4..=7 {
+            let fixture = legacy_world_bytes(&migration_data(version), version);
+            assert_migrates_to_v8(&fixture, version);
+        }
+    }
+
+    #[test]
+    fn v7_migration_writes_a_sorted_unique_builtin_content_table() {
+        let fixture = legacy_world_bytes(&migration_data(7), 7);
+        let loaded = load_world_from_bytes(&fixture).expect("v7 fixture must load");
+        let mut v8 = Vec::new();
+        save_world_to_bytes(&mut v8, &loaded).expect("v7 -> v8 save must succeed");
+
+        let names = v8_content_names(&v8);
+        assert_eq!(
+            names,
+            vec![
+                "apple",
+                "bread",
+                "coal_ore",
+                "iron_pickaxe",
+                "oak_log",
+                "oak_planks",
+                "stick",
+                "stone",
+                "stone_axe",
+            ],
+            "the table contains exactly the referenced built-in names, sorted"
+        );
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "table must be duplicate-free");
+        assert!(
+            names.windows(2).all(|pair| pair[0] < pair[1]),
+            "table must be sorted by UTF-8 bytes: {names:?}"
+        );
+
+        // Every reference resolves without placeholders against the built-in
+        // registry, and the saved tail carries no packs plus the builtin digest.
+        let reloaded = load_world_from_bytes_with(&v8, ContentRegistry::builtin()).unwrap();
+        assert_eq!(reloaded.unresolved, 0);
+        let meta = reloaded.saved_content.expect("v8 metadata survives");
+        assert!(meta.packs.is_empty());
+        assert_eq!(meta.digest, crate::content::EMPTY_DIGEST);
+        assert_eq!(reloaded.data, loaded);
+    }
+
+    #[test]
+    fn v5_v6_v7_tails_still_decode_after_retargeting() {
+        // v5: the calendar tail arrives; every later tail defaults.
+        let v5_data = migration_data(5);
+        let v5 = load_world_from_bytes(&legacy_world_bytes(&v5_data, 5)).unwrap();
+        assert_eq!(v5.day_index, 9);
+        assert_eq!(v5.season_length_days, 3);
+        assert_v6_migration_defaults(&v5);
+
+        // v6: vitals and the sorted chest records arrive; mobs stay empty.
+        let v6_data = migration_data(6);
+        let v6 = load_world_from_bytes(&legacy_world_bytes(&v6_data, 6)).unwrap();
+        assert_eq!(v6.mode, GameMode::Survival);
+        assert_eq!(v6.player.survival, SurvivalState::new(7, 3, 12).unwrap());
+        assert_eq!(v6.chests, v6_data.chests);
+        assert!(v6.mobs.is_empty());
+
+        // v7: the mob tail arrives too.
+        let v7_data = migration_data(7);
+        let v7 = load_world_from_bytes(&legacy_world_bytes(&v7_data, 7)).unwrap();
+        assert_eq!(v7.mobs, pinned_mobs());
+        assert_eq!(v7.chests, v7_data.chests);
     }
 }

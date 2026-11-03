@@ -5618,7 +5618,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_mob_save_keeps_the_153_byte_edit_free_length() {
+    fn empty_mob_save_keeps_the_169_byte_edit_free_length() {
         use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
 
         let data = make_save(9183u32);
@@ -5626,11 +5626,14 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("empty mob save encodes");
 
-        assert_eq!(bytes.len(), 153);
+        // Measured v8 shape: the empty content table adds four bytes before
+        // the hotbar, so the mob count moves from 149 to 153 and the pack +
+        // digest tail adds eight more bytes than the v7 mob-only tail.
+        assert_eq!(bytes.len(), 169);
         assert_eq!(
-            &bytes[149..153],
+            &bytes[153..157],
             &0u32.to_le_bytes(),
-            "the v7 mob count sits at offset 149"
+            "the v8 mob count sits at offset 153"
         );
         let loaded = load_world_from_bytes(&bytes).expect("empty mob save decodes");
         assert!(loaded.mobs.is_empty());
@@ -6795,12 +6798,12 @@ mod tests {
             "respawn forgets the projectile cause too"
         );
 
-        // Arrows have no wire representation: the v7 save stays the same
-        // 153-byte edit-free layout and a reload starts in flight-free air.
+        // Arrows have no wire representation: the v8 save stays the same
+        // 169-byte edit-free layout and a reload starts in flight-free air.
         let data = make_save(62);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save encodes");
-        assert_eq!(bytes.len(), 153, "arrows add no save bytes");
+        assert_eq!(bytes.len(), 169, "arrows add no save bytes");
         let restored = WorldSession::session_from_save(
             load_world_from_bytes(&bytes).expect("save decodes"),
             PathBuf::from("/tmp/arrow-reload.mcvx"),
