@@ -1492,7 +1492,7 @@ mod tests {
                 kind: WorldgenKind::Ore {
                     block: "mymod:ore".to_string(),
                     replace: "stone".to_string(),
-                    min_y: index as i32,
+                    min_y: index,
                     max_y: 128,
                     vein: 4,
                     attempts: 8,

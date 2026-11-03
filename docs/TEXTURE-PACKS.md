@@ -300,6 +300,10 @@ The exit code is `0` when there are no errors (warnings still pass) and `1` when
 - If the selected pack folder is deleted or renamed, the game keeps running with the built-in Default textures and shows an in-menu warning naming the pack. Cycle the row back to `Default` (or to the new folder name) to clear the stale selection.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
 
+## Packs screen
+
+The dedicated **Packs** screen lists enabled packs first in stack order, then every remaining pack folder alphabetically, greyed out and disabled. Click a row to toggle that pack: disabling removes it from the stack, enabling appends it at the end. Enabled rows carry `^` and `v` actions at the right edge to move one step up or down the stack, so the last enabled pack wins. **Escape** or the **Back** row leaves the screen. A pack folder that no longer exists stays listed and marked `(missing)` while it is in the stack, so restoring the folder makes it apply again without re-adding it.
+
 ## Troubleshooting
 
 Warnings appear in the Settings menu as `name: reason` lines, joined together if there are several. Each one is a fallback, not a crash.

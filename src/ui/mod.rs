@@ -6,6 +6,7 @@ pub mod item_icon;
 pub mod lifecycle;
 pub mod logo;
 pub mod menu;
+pub mod packs;
 pub mod quad;
 pub mod screens;
 pub mod selection;
@@ -21,6 +22,11 @@ pub use lifecycle::{
     decide as decide_lifecycle, DeathIntent, LifecycleDecision, LifecycleError, LifecycleIntent,
     LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
     NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
+};
+pub use packs::{
+    compose_pack_lines, enabled_count, hovered_pack_target, move_pack, pack_back_rect,
+    pack_down_rect, pack_panel_rect, pack_row_rect, pack_up_rect, packs_rows, summary_label,
+    toggle_pack, MoveDirection, PackRow, PackTarget, PACK_ACTION_WIDTH, PACK_SCREEN_WIDTH,
 };
 pub use screens::{
     death_panel_rect, death_row_rect, delete_prompt_line, format_modified_secs, format_row_line,
