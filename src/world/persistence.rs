@@ -482,6 +482,8 @@ pub enum PersistenceError {
     /// position or facing, health above the kind maximum, or duplicate
     /// `(kind, position)` record).
     InvalidMobState,
+    /// A registry-allocated pack item has no encoding in a legacy save.
+    UnsupportedItem,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -543,6 +545,12 @@ impl fmt::Display for PersistenceError {
                 write!(f, "unknown mob kind {tag} in save")
             }
             PersistenceError::InvalidMobState => write!(f, "invalid mob state in save"),
+            PersistenceError::UnsupportedItem => {
+                write!(
+                    f,
+                    "a registry-allocated item cannot be written to a legacy save"
+                )
+            }
         }
     }
 }
@@ -933,6 +941,7 @@ fn write_item(out: &mut Vec<u8>, item: Option<Item>) -> Result<(), PersistenceEr
                 out.push(tool_tier_tag(tier));
                 out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
             }
+            ItemId::Item(_) => return Err(PersistenceError::UnsupportedItem),
         },
     }
     Ok(())

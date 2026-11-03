@@ -12,6 +12,13 @@
 use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolTier};
 use crate::world::block::BlockId;
 
+/// Longest content name accepted anywhere a name is persisted or namespaced.
+///
+/// This is the shared cap for the v8 save content string table and pack ids,
+/// so a name accepted by the pack parser can always be written to a save and
+/// vice versa. Bytes, not chars: the save table stores UTF-8 length.
+pub const MAX_CONTENT_NAME_LEN: usize = 255;
+
 /// Built-in block id names, index-aligned to raw ids `0..=22`.
 pub const BLOCK_ID_NAMES: [&str; 23] = [
     "air",

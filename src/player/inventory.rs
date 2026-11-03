@@ -294,7 +294,13 @@ impl ToolTier {
 pub enum ItemId {
     Block(BlockId),
     Material(Material),
-    Tool { kind: ToolKind, tier: ToolTier },
+    Tool {
+        kind: ToolKind,
+        tier: ToolTier,
+    },
+    /// A registry-allocated pack generic item: a dense index into
+    /// [`crate::content::ContentRegistry::items`].
+    Item(u16),
 }
 
 impl ItemId {
@@ -304,6 +310,7 @@ impl ItemId {
             ItemId::Block(_) => MAX_STACK_COUNT,
             ItemId::Material(_) => MATERIAL_STACK_LIMIT,
             ItemId::Tool { .. } => 1,
+            ItemId::Item(_) => MAX_STACK_COUNT,
         }
     }
 
@@ -326,6 +333,9 @@ impl ItemId {
         match self {
             ItemId::Block(block) => block.name(),
             ItemId::Material(material) => material.name(),
+            // A registry-allocated pack item has no static label; callers that
+            // have the registry read the real display name from its `ItemDef`.
+            ItemId::Item(_) => "Modded Item",
             ItemId::Tool { kind, tier } => match kind {
                 ToolKind::Pickaxe => match tier {
                     ToolTier::Wood => "Wood Pickaxe",
@@ -461,6 +471,7 @@ impl Item {
         match id {
             ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
+            ItemId::Item(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
             ItemId::Tool { kind, tier } => {
                 check_tool_tier(kind, tier)?;
@@ -2295,6 +2306,35 @@ mod tests {
             Some(ToolTier::Wood.max_durability()),
             "a dropped bow must enter at full wood-bow durability"
         );
+    }
+
+    #[test]
+    fn widened_pack_item_identity_is_stackable_and_inert() {
+        let id = ItemId::Item(0);
+        assert_eq!(id.stack_limit(), MAX_STACK_COUNT);
+        assert!(!id.is_tool());
+        assert_eq!(id.tool(), None);
+        assert_eq!(id.name(), "Modded Item");
+
+        for count in [1, 2, MAX_STACK_COUNT] {
+            let built = Item::new(id, count).expect("pack items stack like blocks");
+            assert_eq!(built.id(), id);
+            assert_eq!(built.count(), count);
+            assert_eq!(built.durability(), None);
+            assert!(!built.is_tool());
+            assert!(built.is_stackable());
+            assert_eq!(built.block_stack(), None);
+            assert_eq!(built.max_durability(), None);
+        }
+        assert_eq!(Item::new(id, 0), Err(ItemError::EmptyStack));
+        assert_eq!(
+            Item::new(id, MAX_STACK_COUNT + 1),
+            Err(ItemError::StackOverflow)
+        );
+
+        let stack = Item::new(id, 2).expect("valid pack stack");
+        assert!(stack.mergeable_with(&stack));
+        assert_ne!(stack.id(), ItemId::Item(1));
     }
 
     #[test]

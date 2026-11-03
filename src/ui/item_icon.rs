@@ -265,6 +265,9 @@ const ITEM_SPRITE_TABLE: [(ItemId, u32); 27] = [
 /// unconstructible tool pair (for example a stone bow) also returns `None`, so
 /// a forged identity can never select a sprite that does not exist.
 pub fn item_sprite_layer(id: ItemId) -> Option<u32> {
+    if let ItemId::Item(_) = id {
+        return Some(u32::from(crate::content::PLACEHOLDER_ICON_LAYER));
+    }
     if let ItemId::Tool { kind, tier } = id {
         if !kind.allowed_tiers().contains(&tier) {
             return None;
@@ -290,6 +293,9 @@ pub fn icon_source(id: ItemId) -> Option<IconSource> {
             .is_carryable()
             .then(|| IconSource::Block(block_icon_layers(block))),
         ItemId::Material(_) | ItemId::Tool { .. } => item_sprite_layer(id).map(IconSource::Sprite),
+        ItemId::Item(_) => Some(IconSource::Sprite(u32::from(
+            crate::content::PLACEHOLDER_ICON_LAYER,
+        ))),
     }
 }
 
@@ -643,6 +649,9 @@ fn draw_material(material: Material, canvas: &mut SpriteCanvas) {
 fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
     match id {
         ItemId::Block(_) => {}
+        // Layer 27 is the reserved transparent checker slot: a placeholder
+        // pack item draws no art until a pack supplies an icon.
+        ItemId::Item(_) => {}
         ItemId::Material(material) => draw_material(material, canvas),
         ItemId::Tool { kind, tier } => {
             if !kind.allowed_tiers().contains(&tier) {
@@ -2324,6 +2333,31 @@ mod tests {
             }),
             Some(26),
             "the bow is pinned to the final used layer"
+        );
+    }
+
+    #[test]
+    fn placeholder_pack_items_use_the_reserved_transparent_layer() {
+        let id = ItemId::Item(0);
+        assert_eq!(
+            item_sprite_layer(id),
+            Some(u32::from(crate::content::PLACEHOLDER_ICON_LAYER))
+        );
+        assert_eq!(
+            icon_source(id),
+            Some(IconSource::Sprite(u32::from(
+                crate::content::PLACEHOLDER_ICON_LAYER
+            )))
+        );
+
+        // Layer 27 stays transparent: a placeholder item has no art until a
+        // pack supplies one, and must not alias another material or tool.
+        let layers = generate_item_sprite_layers_rgba();
+        assert!(
+            layers[usize::from(crate::content::PLACEHOLDER_ICON_LAYER)]
+                .iter()
+                .all(|byte| *byte == 0),
+            "the reserved placeholder layer must stay fully transparent"
         );
     }
 

@@ -301,6 +301,7 @@ mod tests {
                 kind: ToolKind::Pickaxe,
                 tier: ToolTier::Iron,
             },
+            ItemId::Item(0),
         ];
         for id in non_food {
             assert_eq!(food_value(id), None, "{id:?} must not be food");

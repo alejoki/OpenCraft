@@ -19,7 +19,7 @@ pub use registry::{build_registry, ContentLoadReport, PackIdentity};
 pub use spec::{ContentDiagnostic, PackContentSpec, Severity};
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::player::inventory::{
     self, ItemId, Recipe, ToolKind, ToolTier, MAX_STACK_COUNT, RECIPES,
@@ -256,7 +256,7 @@ impl BlockDef {
 /// pack stack is folded over it by [`registry::build_registry`]. Allocation is
 /// deterministic (sorted ids, dense indices, append-only layers/icons), so a
 /// `--validate-pack` run and a game load agree on ids, layers and digest.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ContentRegistry {
     blocks: Vec<BlockDef>,
     items: Vec<ItemDef>,
@@ -286,6 +286,69 @@ impl ContentRegistry {
             packs: Vec::new(),
             digest: EMPTY_DIGEST,
         })
+    }
+
+    /// The built-in registry behind a shared `Arc`, built once per process.
+    ///
+    /// Callers that need an owned, mutable episode registry clone this value
+    /// instead of rebuilding the built-in tables.
+    pub fn builtin_arc() -> Arc<ContentRegistry> {
+        static REGISTRY: OnceLock<Arc<ContentRegistry>> = OnceLock::new();
+        Arc::clone(REGISTRY.get_or_init(|| Arc::new(ContentRegistry::builtin().clone())))
+    }
+
+    /// Appends a deterministic placeholder block for a save-local name.
+    ///
+    /// The new definition's raw id is the current table length, which is
+    /// always at least [`BUILTIN_BLOCK_COUNT`], so it can never alias a
+    /// built-in id. The placeholder uses the reserved checker face layer and
+    /// has no drop. Returns the allocated id.
+    pub fn append_placeholder_block(&mut self, name: &str) -> BlockId {
+        let raw = u16::try_from(self.blocks.len())
+            .expect("content registry block count exceeds the u16 id space");
+        let id = BlockId::Modded(raw);
+        self.blocks.push(BlockDef {
+            id,
+            name: name.to_string(),
+            display_name: name.to_string(),
+            faces: [PLACEHOLDER_BLOCK_LAYER; 6],
+            hardness: None,
+            drop: None,
+            tool_class: None,
+            stack_limit: MAX_STACK_COUNT,
+            placeholder: true,
+        });
+        id
+    }
+
+    /// Appends a deterministic placeholder item for a save-local name.
+    ///
+    /// The new definition's dense index is the current table length. The
+    /// placeholder uses the reserved transparent icon layer and is not food.
+    /// Returns the allocated index.
+    pub fn append_placeholder_item(&mut self, name: &str) -> u16 {
+        let index = u16::try_from(self.items.len())
+            .expect("content registry item count exceeds the u16 item space");
+        self.items.push(ItemDef {
+            index,
+            name: name.to_string(),
+            display_name: name.to_string(),
+            icon_layer: PLACEHOLDER_ICON_LAYER,
+            stack_limit: MAX_STACK_COUNT,
+            food: None,
+            placeholder: true,
+        });
+        index
+    }
+
+    /// The saved name of `id`, or `None` when the id is unknown.
+    pub fn block_name(&self, id: BlockId) -> Option<&str> {
+        self.block(id).map(|def| def.name.as_str())
+    }
+
+    /// The saved name of the generic item at dense `index`.
+    pub fn item_def_name(&self, index: u16) -> Option<&str> {
+        self.item(index).map(|def| def.name.as_str())
     }
 
     /// All registered block definitions in raw id order.
@@ -614,5 +677,91 @@ mod tests {
         assert!(registry.pack_icons().is_empty());
         assert!(registry.packs().is_empty());
         assert_eq!(registry.digest(), EMPTY_DIGEST);
+    }
+
+    #[test]
+    fn placeholder_appends_are_deterministic_and_leave_the_builtin_registry_alone() {
+        let builtin_blocks = ContentRegistry::builtin().blocks().len();
+        let builtin_digest = ContentRegistry::builtin().digest();
+        let mut registry = ContentRegistry::builtin().clone();
+
+        let ruby_ore = registry.append_placeholder_block("mymod:ruby_ore");
+        let other_ore = registry.append_placeholder_block("mymod:other_ore");
+        let expected_first = BlockId::Modded(
+            u16::try_from(builtin_blocks).expect("test table fits the u16 id space"),
+        );
+        assert_eq!(ruby_ore, expected_first);
+        assert_eq!(
+            other_ore,
+            BlockId::Modded(u16::try_from(builtin_blocks + 1).expect("fits")),
+        );
+
+        let def = registry
+            .block(ruby_ore)
+            .expect("appended definition resolves");
+        assert!(def.placeholder);
+        assert_eq!(def.name, "mymod:ruby_ore");
+        assert_eq!(def.display_name, "mymod:ruby_ore");
+        assert_eq!(def.faces, [PLACEHOLDER_BLOCK_LAYER; 6]);
+        assert_eq!(def.hardness, None);
+        assert_eq!(def.drop, None);
+        assert_eq!(def.tool_class, None);
+        assert_eq!(def.stack_limit, MAX_STACK_COUNT);
+        assert_eq!(registry.block_name(ruby_ore), Some("mymod:ruby_ore"));
+        assert_eq!(registry.block_name(other_ore), Some("mymod:other_ore"));
+
+        // Placeholder appends are not pack definitions: identity and pack
+        // stack must stay exactly as they were.
+        assert_eq!(registry.digest(), builtin_digest);
+        assert!(registry.packs().is_empty());
+
+        // The shared built-in table was cloned, not mutated.
+        assert_eq!(ContentRegistry::builtin().blocks().len(), builtin_blocks);
+        assert!(ContentRegistry::builtin().block(ruby_ore).is_none());
+        assert_eq!(ContentRegistry::builtin().digest(), builtin_digest);
+    }
+
+    #[test]
+    fn placeholder_items_are_deterministic_and_nameable() {
+        let mut registry = ContentRegistry::builtin().clone();
+        assert!(registry.items().is_empty());
+
+        let ruby = registry.append_placeholder_item("mymod:ruby");
+        let shard = registry.append_placeholder_item("mymod:ruby_shard");
+        assert_eq!(ruby, 0);
+        assert_eq!(shard, 1);
+
+        let def = registry.item(ruby).expect("appended item resolves");
+        assert!(def.placeholder);
+        assert_eq!(def.index, ruby);
+        assert_eq!(def.name, "mymod:ruby");
+        assert_eq!(def.display_name, "mymod:ruby");
+        assert_eq!(def.icon_layer, PLACEHOLDER_ICON_LAYER);
+        assert_eq!(def.stack_limit, MAX_STACK_COUNT);
+        assert_eq!(def.food, None);
+        assert_eq!(registry.item_def_name(ruby), Some("mymod:ruby"));
+        assert_eq!(registry.item_def_name(shard), Some("mymod:ruby_shard"));
+        assert_eq!(registry.item_def_name(2), None);
+        assert!(registry.item_by_name("mymod:ruby").is_some());
+
+        assert!(ContentRegistry::builtin().items().is_empty());
+        assert_eq!(registry.digest(), ContentRegistry::builtin().digest());
+        assert!(registry.packs().is_empty());
+    }
+
+    #[test]
+    fn builtin_arc_is_shared_and_matches_builtin() {
+        let first = ContentRegistry::builtin_arc();
+        let second = ContentRegistry::builtin_arc();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            first.blocks().len(),
+            ContentRegistry::builtin().blocks().len()
+        );
+        assert_eq!(first.digest(), ContentRegistry::builtin().digest());
+        assert_eq!(
+            first.packs().len(),
+            ContentRegistry::builtin().packs().len()
+        );
     }
 }

@@ -556,6 +556,8 @@ pub fn item_color(item: Item) -> [f32; 4] {
         ItemId::Block(block) => block_color(block),
         ItemId::Material(material) => material_color(material),
         ItemId::Tool { kind, tier } => tool_color(kind, tier),
+        // Placeholder pack item: neutral checker grey until a pack icon lands.
+        ItemId::Item(_) => [0.35, 0.35, 0.35, 1.0],
     }
 }
 
@@ -1574,6 +1576,14 @@ mod tests {
         assert_eq!(empty_labels.len(), 2, "title plus hint only");
         assert_eq!(empty_labels[0].text, "Player Inventory");
         assert!(!empty_labels.iter().any(|label| label.text == "0"));
+    }
+
+    #[test]
+    fn placeholder_pack_item_uses_checker_grey() {
+        let placeholder = item(ItemId::Item(0), 1);
+        assert_eq!(item_color(placeholder), [0.35, 0.35, 0.35, 1.0]);
+        let stack = item(ItemId::Item(0), 64);
+        assert_eq!(item_color(stack), [0.35, 0.35, 0.35, 1.0]);
     }
 
     #[test]

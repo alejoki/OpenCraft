@@ -895,6 +895,13 @@ impl Digest {
                 self.u8(tool_kind_tag(kind));
                 self.u8(tool_tier_tag(tier));
             }
+            // A widened pack identity hashes by its dense item index. It
+            // cannot appear in a built-in recipe output, so existing digests
+            // are unchanged.
+            ItemId::Item(index) => {
+                self.u8(3);
+                self.u16(index);
+            }
         }
     }
 
