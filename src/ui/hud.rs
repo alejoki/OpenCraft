@@ -171,11 +171,13 @@ pub fn hotbar_count_label(stack: Option<ItemStack>) -> String {
 /// Count label for a hotbar slot, read straight off the durable inventory.
 ///
 /// Takes a shared borrow so the HUD can observe counts but can never mutate
-/// slot state; non-block hotbar items (tools) show their count of one.
+/// slot state. Only real stacks (count > 1) get a label: tools and single
+/// items would otherwise reserve space for a redundant `1` and shrink the
+/// icon for no information gain.
 pub fn hotbar_count_label_for(inventory: &Inventory, slot: usize) -> String {
     match inventory.hotbar(slot) {
-        Some(item) => item.count().to_string(),
-        None => String::new(),
+        Some(item) if item.count() > 1 => item.count().to_string(),
+        _ => String::new(),
     }
 }
 
@@ -198,16 +200,16 @@ pub fn hotbar_count_text_origin(rect: (f32, f32, f32, f32)) -> (f32, f32) {
     (x + 4.0, y + h - HOTBAR_COUNT_LINE_HEIGHT - 2.0)
 }
 
-/// Icon area for one hotbar slot: the slot minus the count-label strip.
+/// Icon area for one hotbar slot.
 ///
-/// Count labels start at [`hotbar_count_text_origin`] and grow downward, so an
-/// icon that stays above that top edge can never cover a number. Degenerate
-/// slots collapse to a zero-height rect instead of inverting.
+/// The icon owns the whole slot so cubes and sprites use the full height;
+/// [`icon_rect`](super::item_icon::icon_rect) still applies its deterministic
+/// 15% inset. Stack counts are drawn *over* the icon at the bottom-left with a
+/// shadow, so they stay legible without shrinking the art. Returning the slot
+/// unchanged also keeps the mapping trivially inside the slot for degenerate
+/// surfaces.
 pub fn hotbar_icon_rect(rect: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
-    let (x, y, w, h) = rect;
-    let label_top = hotbar_count_text_origin(rect).1;
-    let icon_h = (label_top - y).clamp(0.0, h.max(0.0));
-    (x, y, w, icon_h)
+    rect
 }
 
 /// Fill color of the eating progress bar, distinct from the mining amber.
@@ -704,27 +706,22 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_icon_rect_stays_inside_the_slot_and_above_the_count_label() {
+    fn hotbar_icon_rect_uses_the_full_slot_so_counts_can_overlay() {
         for (w, h) in [(1280, 720), (0, 0), (80, 60)] {
             for (slot, rect) in hotbar_slot_rects(w, h).iter().enumerate() {
                 let icon = hotbar_icon_rect(*rect);
                 let label_top = hotbar_count_text_origin(*rect).1;
+                assert_eq!(icon, *rect, "slot {slot} icon owns the full slot");
                 for (name, value) in [("x", icon.0), ("y", icon.1), ("w", icon.2), ("h", icon.3)] {
                     assert!(value.is_finite(), "slot {slot} icon {name} finite");
                 }
                 assert!(icon.2 >= 0.0 && icon.3 >= 0.0, "never inverted");
-                assert!(icon.0 >= rect.0 && icon.0 + icon.2 <= rect.0 + rect.2 + 1e-3);
-                assert!(icon.1 >= rect.1);
-                // On very small surfaces the label strip is taller than the
-                // slot itself and starts above it; there is no positive icon
-                // area to keep clear, so only assert the real invariant when
-                // the label actually begins inside the slot.
-                if label_top >= rect.1 {
-                    assert!(
-                        icon.1 + icon.3 <= label_top + 1e-3,
-                        "slot {slot} icon bottom clears the count label top"
-                    );
-                }
+                // The icon now intentionally reaches past the old label top;
+                // the label is drawn afterward as an overlay with a shadow.
+                assert!(
+                    icon.1 + icon.3 >= label_top,
+                    "slot {slot} icon uses the full height above the count origin"
+                );
             }
         }
     }
@@ -803,6 +800,14 @@ mod tests {
         for slot in 1..HOTBAR_SLOTS {
             assert!(hotbar_count_label_for(&inventory, slot).is_empty());
         }
+
+        // Count one is not a stack label: tools and single items keep the
+        // full slot for the icon instead of reserving space for a redundant
+        // `1`.
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Material(Material::Apple), 1).expect("apple"));
+        let singles = Inventory::from_parts(slots, None);
+        assert!(hotbar_count_label_for(&singles, 0).is_empty());
 
         // Main-storage and out-of-range indices never surface as hotbar labels.
         let mut slots = [None; INVENTORY_SLOTS];

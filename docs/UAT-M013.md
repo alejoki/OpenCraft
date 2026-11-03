@@ -1,6 +1,6 @@
 # M013 human UAT runbook — 720p/1080p UI polish
 
-**Status: NEEDS-HUMAN — prepared by an autonomous agent; no human PASS is claimed.**
+**Status: PASS — owner verdict recorded 2026-11-03 after the hotbar-icon and tooltip-layer remediation.**
 
 M013 criterion 8 is human-sensory: icon recognizability, visual separation, table art,
 tooltip legibility, a visible fade, and vitals spacing. An autonomous agent can prepare
@@ -188,19 +188,19 @@ per-item verdicts are filled, the M013 criterion-8 verdict remains **NEEDS-HUMAN
 
 | Field | Value |
 | --- | --- |
-| Date | |
-| Operator | |
-| Build SHA-256 (debug) | |
-| Build SHA-256 (release) | |
-| Display / output / window size | |
-| Item 1 — inventory icons 1280x720 | |
-| Item 2 — inventory icons 1920x1080 | |
-| Item 3 — separated hotbar row | |
-| Item 4 — crafting-table art | |
-| Item 5 — occupied-slot tooltip | |
-| Item 6 — corner/edge and result tooltips | |
-| Item 7 — selected-name strip | |
-| Item 8 — fade and restart | |
-| Item 9 — vitals 1280x720 | |
-| Item 10 — vitals 1920x1080 | |
-| Verbatim notes / surprises | |
+| Date | 2026-11-03 (local) |
+| Operator | owner (interactive UAT) |
+| Build SHA-256 (debug) | `dfdf8fac59435700925508d66613611e6fc8a6fb70fe620ed9327fa1b1c9732d` |
+| Build SHA-256 (release) | `8d0d899c8914154ac8025e746a9b6c78826e3e88e64a155fd4605c8d7e3625f7` |
+| Display / output / window size | KDE Plasma (KWin) on Wayland/XWayland; default 1280x720 logical window and a 1920x1080 pass |
+| Item 1 — inventory icons 1280x720 | PASS (inventory icons correct; hotbar portion initially FAILED on icon size, re-checked PASS after remediation) |
+| Item 2 — inventory icons 1920x1080 | PASS after remediation (initial FAIL: hotbar icons clipped to the top of the slot) |
+| Item 3 — separated hotbar row | PASS |
+| Item 4 — crafting-table art | PASS |
+| Item 5 — occupied-slot tooltip | PASS after remediation (initial FAIL: stack counts/labels bled through the tooltip) |
+| Item 6 — corner/edge and result tooltips | PASS |
+| Item 7 — selected-name strip | PASS |
+| Item 8 — fade and restart | PASS |
+| Item 9 — vitals 1280x720 | PASS |
+| Item 10 — vitals 1920x1080 | PASS |
+| Verbatim notes / surprises | Initial pass found two presentation defects. (1) Hotbar icons were undersized because every occupied slot reserved the full count-label strip and tools showed a redundant `1`. (2) The tooltip background was drawn before icons/counts, so stack labels showed through it. Remediation: hotbar icons now own the full slot, counts draw only for stacks > 1 and overlay with a 1 px shadow; the tooltip uses a dedicated overlay drawn after icons and culls labels under the box. Both items were re-checked on the rebuilt binary and passed. All other checklist items passed unchanged. |

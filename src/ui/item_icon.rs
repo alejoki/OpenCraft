@@ -958,10 +958,10 @@ pub fn inventory_icon_vertices(
 
 /// Item icons for the nine gameplay hotbar slots.
 ///
-/// Each icon is inset inside its [`hotbar_slot_rects`] slot and clipped to
-/// stay above the count label's top edge ([`hotbar_count_text_origin`]), so a
-/// stack count can never be hidden behind a cube face or a sprite. Empty slots
-/// and non-carryable identities produce no vertices.
+/// Each icon is inset inside its [`hotbar_slot_rects`] slot and owns the full
+/// slot height. Stack counts are drawn afterward as a bottom-left overlay with
+/// a dark shadow, so the icon no longer shrinks to reserve a count strip.
+/// Empty slots and non-carryable identities produce no vertices.
 pub fn hotbar_icon_vertices(inventory: &Inventory, surface_w: u32, surface_h: u32) -> IconDrawList {
     let mut out = IconDrawList::new();
     for (slot, rect) in hotbar_slot_rects(surface_w, surface_h).iter().enumerate() {
@@ -1868,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_icons_fill_the_nine_slots_and_stay_above_count_labels() {
+    fn hotbar_icons_fill_the_nine_slots_and_counts_overlay_them() {
         let inventory = block_inventory(INVENTORY_SLOTS);
         let verts = hotbar_icon_vertices(&inventory, 1280, 720);
         assert_eq!(verts.block.len(), HOTBAR_SLOTS * 18);
@@ -1878,6 +1878,7 @@ mod tests {
         for (slot, chunk) in verts.block.chunks(18).enumerate() {
             let (x, y, w, h) = rects[slot];
             let label_top = super::super::hud::hotbar_count_text_origin(rects[slot]).1;
+            let mut max_py = f32::NEG_INFINITY;
             for v in chunk {
                 let (px, py) = px_vertex(v, 1280, 720);
                 assert!(
@@ -1888,11 +1889,12 @@ mod tests {
                     py >= y - 1e-3 && py <= y + h + 1e-3,
                     "slot {slot} y in rect"
                 );
-                assert!(
-                    py <= label_top + 1e-3,
-                    "slot {slot} icon must not cover the count label (py {py} > {label_top})"
-                );
+                max_py = max_py.max(py);
             }
+            assert!(
+                max_py > label_top,
+                "slot {slot} icon must use the full slot height, not stop at the count strip"
+            );
         }
     }
 
@@ -2415,14 +2417,15 @@ mod tests {
     }
 
     #[test]
-    fn every_sprite_quad_stays_inside_its_slot_and_above_the_count_origin() {
+    fn every_sprite_quad_stays_inside_its_slot_and_may_overlay_the_count_origin() {
         let inventory = sprite_inventory();
         let icons = hotbar_icon_vertices(&inventory, 1280, 720);
         assert_eq!(icons.sprite.len(), HOTBAR_SLOTS * 6);
         let rects = hotbar_slot_rects(1280, 720);
         for (slot, chunk) in icons.sprite.chunks(6).enumerate() {
             let (x, y, w, h) = rects[slot];
-            let (count_x, count_y) = super::super::hud::hotbar_count_text_origin(rects[slot]);
+            let label_top = super::super::hud::hotbar_count_text_origin(rects[slot]).1;
+            let mut max_py = f32::NEG_INFINITY;
             for v in chunk {
                 let (px, py) = px_vertex(v, 1280, 720);
                 assert!(
@@ -2435,16 +2438,12 @@ mod tests {
                     "slot {slot} sprite y {py} outside [{y}, {}]",
                     y + h
                 );
-                assert!(
-                    py <= count_y + 1e-3,
-                    "slot {slot} sprite must stay above the count origin ({py} > {count_y})"
-                );
-                // The bottom-left count origin itself must never be covered.
-                assert!(
-                    !(px <= count_x && py >= count_y),
-                    "slot {slot} sprite covers the count origin"
-                );
+                max_py = max_py.max(py);
             }
+            assert!(
+                max_py > label_top,
+                "slot {slot} sprite must use the full slot height, with the count drawn over it"
+            );
         }
     }
 

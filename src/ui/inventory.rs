@@ -526,6 +526,21 @@ pub fn tooltip_rect(
     )
 }
 
+/// Whether two pixel-space rects overlap by a positive area.
+///
+/// Used by the frame loop to cull hotbar counts and panel labels that would
+/// otherwise draw over the tooltip box. Touching edges do not count, and a
+/// non-finite rect never claims an overlap.
+pub fn rects_intersect(a: Rect, b: Rect) -> bool {
+    if ![a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return false;
+    }
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
 // ---------------------------------------------------------------------------
 // Item palette
 // ---------------------------------------------------------------------------
@@ -1957,6 +1972,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rects_intersect_detects_positive_overlap_and_ignores_touching_edges() {
+        let box_rect = (10.0, 10.0, 40.0, 20.0);
+        assert!(rects_intersect(box_rect, (10.0, 10.0, 1.0, 1.0)));
+        assert!(rects_intersect(box_rect, (30.0, 20.0, 30.0, 20.0)));
+        assert!(!rects_intersect(box_rect, (50.0, 10.0, 5.0, 5.0)));
+        assert!(!rects_intersect(box_rect, (10.0, 30.0, 5.0, 5.0)));
+        assert!(!rects_intersect(box_rect, (0.0, 0.0, 10.0, 10.0)));
+        assert!(!rects_intersect(box_rect, (f32::NAN, 0.0, 10.0, 10.0)));
     }
 
     #[test]

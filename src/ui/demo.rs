@@ -13,12 +13,13 @@
 
 use crate::pack::AUTHORABLE_TEX_LAYERS;
 use crate::player::inventory::{
-    CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier, INVENTORY_SLOTS,
+    CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier, HOTBAR_SLOTS,
+    INVENTORY_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState};
 use crate::render::texture::generate_all_texture_layers_rgba;
 use crate::ui::hud::{
-    hotbar_count_text_origin, hotbar_icon_rect, hotbar_slot_rects, vitals_metrics, vitals_quads,
+    hotbar_count_label_for, hotbar_icon_rect, hotbar_slot_rects, vitals_metrics, vitals_quads,
     AIR_FILL_COLOR, HEART_FILL_COLOR, HUNGER_FILL_COLOR,
 };
 use crate::ui::inventory::{layout, screen_quads, tooltip_lines, tooltip_rect, InventoryMode};
@@ -328,10 +329,16 @@ fn digest_line(
     let air_line = air.len() == 10 && air_bottom < hunger_top;
 
     let rects = hotbar_slot_rects(surface_w, surface_h);
-    let count_clear = rects.iter().all(|rect| {
-        let icon = hotbar_icon_rect(*rect);
-        icon.1 + icon.3 <= hotbar_count_text_origin(*rect).1 + 1e-3
-    });
+    // Counts are now an overlay: the icon owns the whole slot, and a count of
+    // one draws no label at all. The render-side shadow/order is pinned by the
+    // main-binary source test; this digest proves the pure geometry contract.
+    let count_clear = rects.iter().all(|rect| hotbar_icon_rect(*rect) == *rect)
+        && (0..HOTBAR_SLOTS).all(|slot| match fixture.inventory.hotbar(slot) {
+            Some(item) if item.count() <= 1 => {
+                hotbar_count_label_for(&fixture.inventory, slot).is_empty()
+            }
+            _ => true,
+        });
 
     let mut failures = Vec::new();
     push_check(

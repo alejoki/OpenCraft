@@ -51,8 +51,9 @@ use opencraft::ui::hud::{
     HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
-    hit_test, hovered_item, layout, screen_labels, screen_quads, tooltip_lines, tooltip_rect,
-    InventoryMode, InventoryScreen, InventoryTarget, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
+    hit_test, hovered_item, layout, rects_intersect, screen_labels, screen_quads, tooltip_lines,
+    tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS,
+    TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
 use opencraft::ui::logo;
@@ -11089,6 +11090,12 @@ impl ApplicationHandler for GameApp {
                     }
                 });
                 let mut tooltip_text_area = None;
+                // The tooltip background is drawn by its own small overlay
+                // renderer after icons (so slot art cannot cover it). Labels
+                // under the box are culled below; the tooltip text is pushed
+                // last, which makes the tooltip the top layer.
+                let mut tooltip_quad = None;
+                let mut tooltip_bounds = None;
                 if let (Some(item), Some(cursor)) = (tooltip_hover, self.cursor_pos) {
                     let (text, line_count) = tooltip_text(item);
                     debug_assert!(
@@ -11105,13 +11112,14 @@ impl ApplicationHandler for GameApp {
                     let measured = gpu.tooltip_text.measured_width();
                     let (x, y, w, h) =
                         tooltip_rect(cursor, measured, line_count, surface_w, surface_h);
-                    quads.push(Quad {
+                    tooltip_quad = Some(Quad {
                         x,
                         y,
                         w,
                         h,
                         color: [0.05, 0.05, 0.08, 0.95],
                     });
+                    tooltip_bounds = Some((x, y, w, h));
                     tooltip_text_area = Some((x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y));
                 }
                 // Transient selected-item name (S05-T02): a dark one-line
@@ -11178,6 +11186,12 @@ impl ApplicationHandler for GameApp {
                     &gpu.ctx.device,
                     &icons.block,
                     &icons.sprite,
+                    gpu.ctx.config.width,
+                    gpu.ctx.config.height,
+                );
+                gpu.ui.set_tooltip_quad(
+                    &gpu.ctx.device,
+                    tooltip_quad,
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
@@ -11274,29 +11288,60 @@ impl ApplicationHandler for GameApp {
                 }
                 // Hotbar count labels ride the same UI pass, after the
                 // screen text areas. Empty slots push nothing, so the
-                // renderer only sees non-empty labels.
+                // renderer only sees non-empty labels. Counts are drawn twice:
+                // a one-pixel black shadow, then the white glyphs, so a stack
+                // count stays legible over a full-height icon.
                 for (slot, counts) in gpu.hotbar_counts.iter().enumerate() {
                     let label = hotbar_count_label_for(self.session.player.inventory(), slot);
                     if !label.is_empty() {
                         let (x, y) = hotbar_count_text_origin(hotbar_rects[slot]);
+                        let label_rect = (x, y, counts.measured_width(), HOTBAR_COUNT_LINE_HEIGHT);
+                        if tooltip_bounds.is_some_and(|bounds| rects_intersect(label_rect, bounds))
+                        {
+                            continue;
+                        }
+                        areas.push(counts.text_area_with_color(
+                            x + 1.0,
+                            y + 1.0,
+                            glyphon::Color::rgba(0, 0, 0, 255),
+                        ));
                         areas.push(counts.text_area(x, y));
                     }
                 }
                 // Inventory panel labels ride the same UI pass, above the
                 // HUD labels. The label count is bounded by the pure
                 // `MAX_LABELS` and by the buffer pool length, so the zip
-                // never drops a label silently.
+                // never drops a label silently. Labels under the tooltip are
+                // culled: the tooltip owns that area and is drawn last.
                 debug_assert!(inventory_panel_labels.len() <= MAX_LABELS);
                 for (buffer, label) in gpu
                     .inventory_labels
                     .iter()
                     .zip(inventory_panel_labels.iter())
                 {
+                    let label_rect = (
+                        label.left,
+                        label.top,
+                        buffer.measured_width(),
+                        LABEL_LINE_HEIGHT,
+                    );
+                    if tooltip_bounds.is_some_and(|bounds| rects_intersect(label_rect, bounds)) {
+                        continue;
+                    }
                     areas.push(buffer.text_area(label.left, label.top));
                 }
                 // Chest panel labels ride the same UI pass above the HUD.
                 debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
                 for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
+                    let label_rect = (
+                        label.left,
+                        label.top,
+                        buffer.measured_width(),
+                        LABEL_LINE_HEIGHT,
+                    );
+                    if tooltip_bounds.is_some_and(|bounds| rects_intersect(label_rect, bounds)) {
+                        continue;
+                    }
                     areas.push(buffer.text_area(label.left, label.top));
                 }
                 // Tooltip text rides the same UI pass, after the panel labels.
@@ -23729,6 +23774,32 @@ mod tests {
         assert!(
             src.contains(".text_area_with_color(left, top, selected_name_color(alpha))"),
             "the selected-name label must use the faded colored text area"
+        );
+    }
+
+    #[test]
+    fn tooltip_background_draws_after_icons_and_labels_under_it_are_culled() {
+        let src = include_str!("main.rs");
+        let icons = src
+            .find("gpu.ui.set_icons(")
+            .expect("icon upload is present");
+        let tooltip_quad = src
+            .find("gpu.ui.set_tooltip_quad(")
+            .expect("tooltip quad upload is present");
+        let prepare = src
+            .find("&mut gpu.ui.swash_cache")
+            .expect("the single UI prepare call is present");
+        assert!(
+            icons < tooltip_quad && tooltip_quad < prepare,
+            "the tooltip background must upload after icons and render in the UI pass"
+        );
+        assert!(
+            src.matches("rects_intersect(label_rect, bounds)").count() >= 3,
+            "hotbar, inventory, and chest labels must all be culled under the tooltip"
+        );
+        assert!(
+            src.matches("counts.text_area_with_color(").count() >= 1,
+            "the hotbar count shadow must use the colored text area"
         );
     }
 

@@ -58,6 +58,10 @@ pub struct UiRenderer {
     quad_renderer: QuadRenderer,
     logo_renderer: logo::LogoRenderer,
     icon_renderer: IconRenderer,
+    /// Single-quad overlay drawn after icons and before text. The hover
+    /// tooltip needs to sit above slot art and below its own text, so it uses
+    /// its own tiny buffer instead of joining the main panel quad batch.
+    tooltip_quad_renderer: QuadRenderer,
 }
 
 impl UiRenderer {
@@ -90,6 +94,7 @@ impl UiRenderer {
             quad_renderer: QuadRenderer::new(ctx),
             logo_renderer: logo::LogoRenderer::new(ctx),
             icon_renderer: IconRenderer::new(ctx, block_texture_view, block_texture_sampler),
+            tooltip_quad_renderer: QuadRenderer::new(ctx),
         }
     }
 
@@ -134,6 +139,29 @@ impl UiRenderer {
             .set_icons(device, block_icons, sprite_icons, surface_w, surface_h);
     }
 
+    /// Set the one hover-tooltip background quad for this frame.
+    ///
+    /// `None` clears the buffer. The quad is drawn after icons so it covers
+    /// slot art, and before text so the tooltip's own text (plus any label
+    /// that survives culling) renders on top.
+    pub fn set_tooltip_quad(
+        &mut self,
+        device: &wgpu::Device,
+        quad: Option<Quad>,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        match quad {
+            Some(quad) => {
+                self.tooltip_quad_renderer
+                    .set_quads(device, &[quad], surface_w, surface_h)
+            }
+            None => self
+                .tooltip_quad_renderer
+                .set_quads(device, &[], surface_w, surface_h),
+        }
+    }
+
     /// Rebuild the per-frame logo quad. `None` clears it, which also keeps a
     /// logo from drawing on non-vista screens.
     pub fn set_logo_frame(
@@ -155,6 +183,9 @@ impl UiPass for UiRenderer {
         self.quad_renderer.draw(pass);
         self.logo_renderer.draw(pass);
         self.icon_renderer.draw(pass);
+        // Tooltip background sits above icons/panels but below the text pass;
+        // the frame loop culls labels under it and pushes the tooltip text last.
+        self.tooltip_quad_renderer.draw(pass);
         let _ = self.text_renderer.render(&self.atlas, pass);
     }
 }
