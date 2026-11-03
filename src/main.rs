@@ -20052,6 +20052,723 @@ stack = 64
         chunk_pos
     }
 
+    /// Loads the two checked-in reference packs (`mymod-ruby` content plus the
+    /// texture-only `ruby-overlay`) exactly as a launch would.
+    fn reference_pack_specs() -> (LoadedPack, Vec<PackSpec>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (loaded, specs, warnings) = pack::load_stack(
+            &root,
+            &["mymod-ruby".to_string(), "ruby-overlay".to_string()],
+        );
+        assert!(
+            warnings.is_empty(),
+            "leg=generate: the reference pack stack loads without warnings: {warnings:?}"
+        );
+        (loaded, specs)
+    }
+
+    /// Inserts the generated chunk that owns `pos` plus uniform-Air face
+    /// neighbours, generating with the session's pack worldgen rules so the
+    /// reference pack's ore and patches actually appear.
+    fn insert_pack_generated_chunk_with_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let chunk = generate_chunk_seeded_with(
+            chunk_pos,
+            session.world.seed(),
+            Season::Summer,
+            session.world.worldgen_rules().as_ref(),
+        );
+        session.world.insert_chunk_for_test(chunk_pos, chunk);
+        for neighbour in [
+            ChunkPos::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1),
+        ] {
+            if neighbour != chunk_pos {
+                session
+                    .world
+                    .insert_chunk_for_test(neighbour, Chunk::new_uniform(BlockId::Air));
+            }
+        }
+        chunk_pos
+    }
+
+    /// Finds the first generated chunk in a bounded window that holds at least
+    /// five `ore` cells, returning the chunk, its cells, and one extra cell for
+    /// the tool leg (from the same chunk when possible, otherwise from another
+    /// generated chunk in the same window).
+    fn scan_reference_ore_cells(
+        session: &WorldSession,
+        ore: BlockId,
+    ) -> (ChunkPos, Vec<IVec3>, Option<(ChunkPos, IVec3)>) {
+        let seed = session.world.seed();
+        let rules: Vec<WorldgenRule> = session.world.worldgen_rules().as_ref().to_vec();
+        let mut chosen: Option<(ChunkPos, Vec<IVec3>)> = None;
+        let mut extra: Option<(ChunkPos, IVec3)> = None;
+        'window: for radius in [2i32, 4] {
+            for cz in -radius..=radius {
+                for cx in -radius..=radius {
+                    for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                        let chunk_pos = ChunkPos::new(cx, cy, cz);
+                        let chunk =
+                            generate_chunk_seeded_with(chunk_pos, seed, Season::Summer, &rules);
+                        let mut cells = Vec::new();
+                        for ly in 0..CHUNK_SIZE {
+                            for lz in 0..CHUNK_SIZE {
+                                for lx in 0..CHUNK_SIZE {
+                                    if chunk.get(lx, ly, lz) == ore {
+                                        cells.push(IVec3::new(
+                                            cx * CHUNK_SIZE as i32 + lx as i32,
+                                            cy * CHUNK_SIZE as i32 + ly as i32,
+                                            cz * CHUNK_SIZE as i32 + lz as i32,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if chosen.is_none() {
+                            if cells.len() >= 5 {
+                                if let Some(pos) = cells.get(5).copied() {
+                                    extra = Some((chunk_pos, pos));
+                                }
+                                chosen = Some((chunk_pos, cells));
+                            }
+                        } else if extra.is_none() {
+                            if let Some(pos) = cells.first().copied() {
+                                extra = Some((chunk_pos, pos));
+                            }
+                        }
+                        if chosen.is_some() && extra.is_some() {
+                            break 'window;
+                        }
+                    }
+                }
+            }
+        }
+        let (chosen_pos, cells) =
+            chosen.expect("leg=generate: the scan window holds a reference-pack ore chunk");
+        let extra = cells.get(5).map(|pos| (chosen_pos, *pos)).or(extra);
+        (chosen_pos, cells, extra)
+    }
+
+    /// Mines one cell through the production accumulator and break path,
+    /// returning the wear outcome.
+    fn mine_generated_cell(
+        registry: &ContentRegistry,
+        session: &mut WorldSession,
+        pos: IVec3,
+        block: BlockId,
+        tool: Option<Item>,
+    ) -> ToolWearOutcome {
+        let mut mining = MiningState::new();
+        let target = MiningTarget::from_block_with(registry, pos, block, tool)
+            .expect("a generated reference-pack ore cell is breakable");
+        let mut broke = false;
+        for _ in 0..2_000 {
+            if let MiningTick::Broke {
+                pos: broke_pos,
+                block: broke_block,
+            } = mining.tick_with(registry, 0.05, Some(target))
+            {
+                assert_eq!(
+                    (broke_pos, broke_block),
+                    (pos, block),
+                    "leg=mine: the accumulator broke the requested cell"
+                );
+                broke = true;
+                break;
+            }
+        }
+        assert!(
+            broke,
+            "leg=mine: the accumulator reaches Broke for {block:?} at {pos:?}"
+        );
+        let (remeshed, wear) = applied_break(break_mined_block(session, pos, block));
+        assert!(
+            !remeshed.is_empty(),
+            "leg=mine: the break at {pos:?} remeshed its chunk"
+        );
+        wear
+    }
+
+    #[test]
+    fn modding_acceptance_fresh_world_with_reference_packs_end_to_end() {
+        use opencraft::pack::manifest::PackFormat;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (full_pack, specs) = reference_pack_specs();
+        let (content_only_pack, content_only_specs, content_only_warnings) =
+            pack::load_stack(&root, &["mymod-ruby".to_string()]);
+        assert!(
+            content_only_warnings.is_empty(),
+            "leg=generate: the content pack alone loads without warnings: {content_only_warnings:?}"
+        );
+        let (_, overlay_only_specs, overlay_only_warnings) =
+            pack::load_stack(&root, &["ruby-overlay".to_string()]);
+        assert!(
+            overlay_only_warnings.is_empty(),
+            "leg=generate: the overlay alone loads without warnings: {overlay_only_warnings:?}"
+        );
+
+        // (2) The checked-in overlay is a texture-only v1 pack: no
+        // format_version, no content, exactly LAYER_FILES[3], no menu art.
+        let overlay = overlay_only_specs
+            .first()
+            .expect("leg=generate: the overlay pack loaded");
+        assert_eq!(
+            overlay.format_version,
+            PackFormat::V1,
+            "leg=generate: the overlay is a v1 pack"
+        );
+        assert_eq!(
+            overlay.manifest.format_version,
+            PackFormat::V1,
+            "leg=generate: the overlay manifest defaults to v1"
+        );
+        let overlay_manifest = std::fs::read_to_string(root.join("ruby-overlay").join("pack.toml"))
+            .expect("leg=generate: the overlay manifest is readable");
+        assert!(
+            !overlay_manifest.contains("format_version"),
+            "leg=generate: the checked-in overlay authors no format_version"
+        );
+        assert_eq!(
+            overlay.content,
+            PackContentSpec::default(),
+            "leg=generate: the overlay authors no content"
+        );
+        let authored_layers: Vec<usize> = overlay
+            .block_layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| layer.is_some().then_some(index))
+            .collect();
+        assert_eq!(
+            authored_layers,
+            vec![3],
+            "leg=generate: the overlay authors exactly one block layer"
+        );
+        assert_eq!(pack::LAYER_FILES[3], "stone.png");
+        assert!(
+            overlay.manifest.logo.is_none(),
+            "leg=generate: the overlay authors no menu logo"
+        );
+        assert!(
+            overlay.manifest.overlay_tint.is_none(),
+            "leg=generate: the overlay authors no menu tint"
+        );
+
+        // (3) Later-pack-wins is per authored file: only stone.png changes.
+        assert_eq!(full_pack.layers.len(), NUM_TEX_LAYERS as usize);
+        let overlay_stone = overlay.block_layers[3]
+            .clone()
+            .expect("leg=generate: the overlay authors stone.png");
+        for index in 0..full_pack.layers.len() {
+            if index == 3 {
+                assert_ne!(
+                    full_pack.layers[index], content_only_pack.layers[index],
+                    "leg=generate: the overlay replaces the content pack's stone layer"
+                );
+                assert_eq!(
+                    full_pack.layers[index], overlay_stone,
+                    "leg=generate: the merged stone layer is the overlay's authored art"
+                );
+            } else {
+                assert_eq!(
+                    full_pack.layers[index], content_only_pack.layers[index],
+                    "leg=generate: layer {index} keeps the content pack's art"
+                );
+            }
+        }
+        assert_eq!(full_pack.description, content_only_pack.description);
+        assert_eq!(full_pack.logo, content_only_pack.logo);
+        assert_eq!(full_pack.overlay_tint, content_only_pack.overlay_tint);
+        assert!(
+            full_pack.warnings.is_empty(),
+            "leg=generate: the full stack is warning-free"
+        );
+
+        // (4) The overlay adds no content; the full and content-only stacks
+        // resolve the same definitions and worldgen rules.
+        let (full_reg, full_report) = build_session_registry(&specs);
+        assert_eq!(
+            full_report.errors(),
+            0,
+            "leg=generate: the full registry is clean: {full_report:?}"
+        );
+        let (content_reg, content_report) = build_session_registry(&content_only_specs);
+        assert_eq!(
+            content_report.errors(),
+            0,
+            "leg=generate: the content-only registry is clean: {content_report:?}"
+        );
+        let (overlay_reg, overlay_report) = build_session_registry(&overlay_only_specs);
+        assert_eq!(
+            overlay_report.errors(),
+            0,
+            "leg=generate: the overlay-only registry is clean: {overlay_report:?}"
+        );
+
+        let builtin = ContentRegistry::builtin();
+        assert_eq!(
+            overlay_reg.blocks(),
+            builtin.blocks(),
+            "leg=generate: the overlay adds no block definitions"
+        );
+        assert_eq!(
+            overlay_reg.items(),
+            builtin.items(),
+            "leg=generate: the overlay adds no item definitions"
+        );
+        assert_eq!(
+            overlay_reg.tiers(),
+            builtin.tiers(),
+            "leg=generate: the overlay adds no tiers"
+        );
+        assert_eq!(
+            overlay_reg.tools(),
+            builtin.tools(),
+            "leg=generate: the overlay adds no tools"
+        );
+        assert_eq!(
+            overlay_reg.recipes(),
+            builtin.recipes(),
+            "leg=generate: the overlay adds no recipes"
+        );
+        assert_eq!(
+            overlay_reg.worldgen_rules(),
+            builtin.worldgen_rules(),
+            "leg=generate: the overlay adds no worldgen rules"
+        );
+
+        assert_eq!(
+            full_reg.blocks(),
+            content_reg.blocks(),
+            "leg=generate: the overlay leaves block definitions unchanged"
+        );
+        assert_eq!(full_reg.items(), content_reg.items());
+        assert_eq!(full_reg.tiers(), content_reg.tiers());
+        assert_eq!(full_reg.tools(), content_reg.tools());
+        assert_eq!(full_reg.recipes(), content_reg.recipes());
+        assert_eq!(
+            full_reg.worldgen_rules(),
+            content_reg.worldgen_rules(),
+            "leg=generate: the overlay leaves worldgen rules unchanged"
+        );
+
+        assert_eq!(
+            full_reg.packs().len(),
+            2,
+            "leg=generate: two packs are stacked"
+        );
+        assert_eq!(content_reg.packs().len(), 1);
+        assert_eq!(overlay_reg.packs().len(), 1);
+        assert_eq!(full_reg.packs()[0].folder, "mymod-ruby");
+        assert_eq!(full_reg.packs()[1].folder, "ruby-overlay");
+
+        // (5) A fresh Creative world freezes the full stack.
+        let dir = tempfile::tempdir().expect("leg=generate: tempdir");
+        let save_path = dir.path().join("modding-acceptance.mcvx");
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            424_242,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&full_reg),
+        );
+
+        // (6) Resolve every reference identity by its authored name.
+        let ore = full_reg
+            .block_by_name("mymod:ruby_ore")
+            .expect("leg=generate: mymod:ruby_ore is authored")
+            .id;
+        let ruby_block = full_reg
+            .block_by_name("mymod:ruby_block")
+            .expect("leg=generate: mymod:ruby_block is authored")
+            .id;
+        let ruby_item = full_reg
+            .item_by_name("mymod:ruby")
+            .expect("leg=generate: mymod:ruby is authored")
+            .index;
+        let stew_item = full_reg
+            .item_by_name("mymod:ruby_stew")
+            .expect("leg=generate: mymod:ruby_stew is authored")
+            .index;
+        let pickaxe_index = full_reg
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("leg=generate: mymod:ruby_pickaxe is authored")
+            .index;
+        assert_eq!(
+            full_reg
+                .tool_by_name("mymod:ruby_sword")
+                .expect("leg=generate: mymod:ruby_sword is authored")
+                .kind,
+            ToolKind::Sword,
+            "leg=generate: the second reference tool is the sword"
+        );
+
+        let (ore_chunk, ore_cells, extra_cell) = scan_reference_ore_cells(&session, ore);
+        assert!(
+            ore_cells.len() >= 5,
+            "leg=generate: the chosen chunk holds at least five ore cells, found {}",
+            ore_cells.len()
+        );
+        let first_five: Vec<IVec3> = ore_cells.iter().copied().take(5).collect();
+        insert_pack_generated_chunk_with_face_neighbors(&mut session, first_five[0]);
+        for cell in &first_five {
+            assert_eq!(
+                session.world.get_block(cell.x, cell.y, cell.z),
+                ore,
+                "leg=generate: the loaded chunk reads back {cell:?} as ruby ore"
+            );
+        }
+
+        // (7) Mine five ore cells bare-hand: no wear, five ruby collected.
+        for cell in &first_five {
+            let wear = mine_generated_cell(full_reg.as_ref(), &mut session, *cell, ore, None);
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Nothing,
+                "leg=mine: a bare hand wears nothing"
+            );
+        }
+        let mined_ruby: u32 = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Item(ruby_item))
+            .map(|item| u32::from(item.count()))
+            .sum();
+        assert_eq!(
+            mined_ruby, 5,
+            "leg=mine: five bare-hand ore breaks yield five ruby"
+        );
+
+        // (8) Craft both authored recipes through the production result-slot
+        // seam, preserving the mined inventory and vitals across the rebuild.
+        let position = session.player.position;
+        let inventory = session.player.inventory().clone();
+        let vitals = session.player.survival;
+        let selected_slot = session.player.selected_slot();
+        let table_grid = crafting_demo_grid(
+            full_reg.as_ref(),
+            GridKind::Table,
+            &["RRR", " S ", " S "],
+            &[
+                ('R', ItemId::Item(ruby_item)),
+                ('S', ItemId::Material(Material::Stick)),
+            ],
+        );
+        let player_grid = crafting_demo_grid(
+            full_reg.as_ref(),
+            GridKind::Player,
+            &["RR", "WW"],
+            &[
+                ('R', ItemId::Item(ruby_item)),
+                ('W', ItemId::Material(Material::Wheat)),
+            ],
+        );
+        let mut rebuilt = Player::with_inventory(position, inventory, player_grid, table_grid);
+        rebuilt.survival = vitals;
+        rebuilt.restore_selected_slot(selected_slot);
+        session.player = rebuilt;
+
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        let crafted_pickaxe = apply_inventory_click_button_with(
+            &mut session.player,
+            full_reg.as_ref(),
+            &screen,
+            Some(IVec3::new(0, 5, 0)),
+            InventoryTarget::ResultSlot(GridKind::Table),
+            InventoryClickButton::Left,
+        )
+        .expect("leg=craft: the ruby pickaxe crafts through the result-slot seam");
+        match crafted_pickaxe {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(
+                    item.id(),
+                    ItemId::ModTool(pickaxe_index),
+                    "leg=craft: the table yields the pack pickaxe"
+                );
+                assert_eq!(item.count(), 1, "leg=craft: one pickaxe per craft");
+                assert_eq!(
+                    item.durability(),
+                    Some(900),
+                    "leg=craft: the pickaxe starts at authored durability"
+                );
+                assert_eq!(
+                    item.max_durability(),
+                    Some(900),
+                    "leg=craft: the pickaxe keeps the authored max durability"
+                );
+            }
+            InventoryClickOutcome::Moved => {
+                panic!("leg=craft: a result click must report the crafted item")
+            }
+        }
+        assert!(
+            session.player.table_grid().is_empty(),
+            "leg=craft: the pickaxe pattern is consumed"
+        );
+
+        screen.open_player();
+        let crafted_stew = apply_inventory_click_button_with(
+            &mut session.player,
+            full_reg.as_ref(),
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+            InventoryClickButton::Left,
+        )
+        .expect("leg=craft: the ruby stew crafts through the result-slot seam");
+        match crafted_stew {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(
+                    item.id(),
+                    ItemId::Item(stew_item),
+                    "leg=craft: the player grid yields ruby stew"
+                );
+                assert_eq!(item.count(), 1, "leg=craft: one stew per craft");
+            }
+            InventoryClickOutcome::Moved => {
+                panic!("leg=craft: a result click must report the crafted item")
+            }
+        }
+        assert_eq!(
+            full_reg.item(stew_item).map(|def| def.stack_limit),
+            Some(16),
+            "leg=craft: the stew keeps its authored stack limit"
+        );
+        assert!(
+            session.player.player_grid().is_empty(),
+            "leg=craft: the stew pattern is consumed"
+        );
+
+        // (9) Eat the stew at hunger 5: authored nutrition 7 restores to 12.
+        let stew_slot = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .position(|slot| slot.as_ref().map(|item| item.id()) == Some(ItemId::Item(stew_item)))
+            .expect("leg=eat: the crafted stew is in the inventory");
+        assert!(
+            stew_slot < HOTBAR_SLOTS,
+            "leg=eat: the crafted stew sits in the hotbar"
+        );
+        let vitals = session.player.survival;
+        session.player.survival = SurvivalState::new(vitals.health(), 5, vitals.air())
+            .expect("leg=eat: hunger 5 is a valid vital");
+        assert!(session.player.select_slot(stew_slot));
+        let stew = session
+            .player
+            .inventory()
+            .slot(stew_slot)
+            .expect("leg=eat: the stew slot is occupied");
+        let target = EatingTarget::new_with(full_reg.as_ref(), stew_slot, stew, 5)
+            .expect("leg=eat: the authored stew is edible at hunger 5");
+        let mut eating = EatingState::new();
+        let mut ate = false;
+        for _ in 0..2_000 {
+            if let EatingTick::Ate {
+                slot,
+                item,
+                restore,
+            } = eating.tick(0.05, Some(target))
+            {
+                assert_eq!(
+                    (slot, item, restore),
+                    (stew_slot, ItemId::Item(stew_item), 7),
+                    "leg=eat: the accumulator completes the authored meal"
+                );
+                ate = true;
+                break;
+            }
+        }
+        assert!(ate, "leg=eat: the accumulator reaches Ate");
+        let restored = session
+            .player
+            .eat_selected_with(full_reg.as_ref(), stew_slot, ItemId::Item(stew_item))
+            .expect("leg=eat: the completion consumes the stew");
+        assert_eq!(restored, 7, "leg=eat: the authored stew restores seven");
+        assert_eq!(
+            session.player.survival.hunger(),
+            12,
+            "leg=eat: hunger 5 + 7 = 12"
+        );
+
+        // (10) The crafted pickaxe mines one more generated ore cell: one point
+        // of wear and a faster break than iron.
+        let (extra_chunk, extra_pos) =
+            extra_cell.expect("leg=tool: the scan window holds a sixth ore cell");
+        if extra_chunk != ore_chunk {
+            insert_pack_generated_chunk_with_face_neighbors(&mut session, extra_pos);
+        }
+        let pickaxe_slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                session.player.inventory().slot(slot).map(|item| item.id())
+                    == Some(ItemId::ModTool(pickaxe_index))
+            })
+            .expect("leg=tool: the crafted pickaxe sits in the hotbar");
+        assert!(session.player.select_slot(pickaxe_slot));
+        let held_pickaxe = session
+            .player
+            .selected_item()
+            .expect("leg=tool: the pickaxe is selected");
+        assert_eq!(
+            held_pickaxe.durability(),
+            Some(900),
+            "leg=tool: the crafted pickaxe is unworn before the break"
+        );
+        let wear = mine_generated_cell(
+            full_reg.as_ref(),
+            &mut session,
+            extra_pos,
+            ore,
+            Some(held_pickaxe),
+        );
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 899 },
+            "leg=tool: the pack pickaxe wears exactly one point"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(899),
+            "leg=tool: the pickaxe keeps its identity and worn durability"
+        );
+        let iron_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            },
+            1,
+        )
+        .expect("leg=tool: an iron pickaxe constructs");
+        let ruby_duration = full_reg
+            .break_duration(ore, Some(held_pickaxe))
+            .expect("leg=tool: ruby ore is breakable with the pack pickaxe");
+        let iron_duration = full_reg
+            .break_duration(ore, Some(iron_pickaxe))
+            .expect("leg=tool: ruby ore is breakable with iron");
+        assert!(
+            ruby_duration < iron_duration,
+            "leg=tool: ruby {ruby_duration}s beats iron {iron_duration}s"
+        );
+
+        // (11) Place the authored block through the production right-click
+        // path, consuming exactly one of the granted 64.
+        let (block_slot, granted) = session
+            .player
+            .grant_palette_item_with(full_reg.as_ref(), ItemId::Block(ruby_block))
+            .expect("leg=place: the palette grants the ruby block");
+        assert_eq!(
+            granted.count(),
+            64,
+            "leg=place: the authored block stack limit is 64"
+        );
+        assert_eq!(
+            session.player.selected_slot(),
+            block_slot,
+            "leg=place: the granted stack is selected"
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        assert!(
+            !session
+                .world
+                .set_block_immediate(0, 5, 0, BlockId::Stone)
+                .is_empty(),
+            "leg=place: the support block edit applies"
+        );
+        session.player.position = Vec3::new(0.5, 10.0, 0.5);
+        aim_placement_camera(&mut session);
+        let remeshed =
+            try_place_selected_block(&mut session).expect("leg=place: the ruby block places");
+        assert!(!remeshed.is_empty(), "leg=place: the placement remeshes");
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            ruby_block,
+            "leg=place: (0,6,0) is the authored ruby block"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(63),
+            "leg=place: one ruby block is consumed"
+        );
+
+        // (12) Save v8, reload against the same stack, and prove the writer is
+        // deterministic.
+        save_current_world(&mut session).expect("leg=save: the session save writes");
+        let bytes = std::fs::read(&save_path).expect("leg=save: the save file is readable");
+        assert!(
+            bytes.starts_with(b"MCVX"),
+            "leg=save: the file starts with the save magic"
+        );
+        let version = u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("leg=save: the version word is present"),
+        );
+        assert_eq!(version, 8, "leg=save: the file is v8");
+        let loaded = load_world_from_path_with(&save_path, full_reg.as_ref())
+            .expect("leg=reload: the save loads");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "leg=reload: every saved name resolves against the same pack stack"
+        );
+        assert!(
+            loaded.content_notice().is_none(),
+            "leg=reload: the same pack stack is silent"
+        );
+        let placed = loaded
+            .data
+            .chunk_edits
+            .get(&ChunkPos::new(0, 0, 0))
+            .and_then(|edits| edits.get(&(linear_index(0, 6, 0) as u16)))
+            .copied();
+        assert_eq!(
+            placed,
+            Some(ruby_block),
+            "leg=reload: the placed ruby block survives"
+        );
+        let reloaded_pickaxe = loaded
+            .data
+            .player
+            .inventory
+            .slots()
+            .iter()
+            .flatten()
+            .find(|item| item.id() == ItemId::ModTool(pickaxe_index))
+            .expect("leg=reload: the crafted pickaxe survives");
+        assert_eq!(
+            reloaded_pickaxe.durability(),
+            Some(899),
+            "leg=reload: the worn durability survives"
+        );
+        let mut resaved = Vec::new();
+        opencraft::world::persistence::save_world_to_bytes_with(
+            &mut resaved,
+            &loaded.data,
+            full_reg.as_ref(),
+        )
+        .expect("leg=reload: the loaded world re-saves");
+        assert_eq!(
+            resaved, bytes,
+            "leg=reload: a loaded v8 save re-saves byte-identically"
+        );
+    }
+
     /// The validated inventory items a generated ruin chest's table yields, in
     /// slot order.
     fn generated_loot_stacks(pos: IVec3, seed: u32) -> Vec<Item> {
