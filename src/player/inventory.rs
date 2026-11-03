@@ -992,6 +992,30 @@ impl Inventory {
         Ok(())
     }
 
+    /// Grants one item into exactly one hotbar slot for Creative palette use.
+    ///
+    /// This is deliberately **not** a conservation path: the item is placed
+    /// wholesale, never merged, and its count is never changed. The write
+    /// priority is the first empty hotbar slot, then an existing hotbar stack
+    /// of the same identity (replaced wholesale), then `preferred` clamped
+    /// into the hotbar when all nine slots are occupied. Main storage
+    /// (`HOTBAR_SLOTS..INVENTORY_SLOTS`), the cursor, and both crafting grids
+    /// are never touched. Returns the slot that now holds `item`.
+    pub fn grant_hotbar(&mut self, item: Item, preferred: usize) -> usize {
+        let hotbar = &mut self.slots[..HOTBAR_SLOTS];
+        let slot = hotbar
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                hotbar
+                    .iter()
+                    .position(|existing| matches!(existing, Some(stack) if stack.id() == item.id()))
+            })
+            .unwrap_or_else(|| preferred.min(HOTBAR_SLOTS - 1));
+        hotbar[slot] = Some(item);
+        slot
+    }
+
     /// Whether every item in `items` fits, in order, without touching the
     /// cursor or either crafting grid.
     ///
@@ -5241,5 +5265,124 @@ mod tests {
         assert_eq!(grid.kind(), GridKind::Player);
         assert!(grid.is_empty());
         assert_eq!(grid.preview(), None);
+    }
+
+    // -- Creative palette grants (S07-T02) --------------------------------
+
+    #[test]
+    fn palette_grant_hotbar_fills_empty_then_replaces_the_same_identity() {
+        let mut inventory = Inventory::empty();
+
+        assert_eq!(inventory.grant_hotbar(stick(7), 4), 0);
+        assert_eq!(inventory.slot(0).map(|item| (item.id(), item.count())), Some((ItemId::Material(Material::Stick), 7)));
+
+        assert_eq!(inventory.grant_hotbar(wheat(3), 4), 1);
+        assert_eq!(
+            inventory.slot(1).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Wheat), 3))
+        );
+
+        // Fill the remaining seven slots so the next grant must take the
+        // same-identity branch rather than an empty slot.
+        for (offset, material) in [
+            Material::Apple,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                inventory.grant_hotbar(item(ItemId::Material(material), 1), 8),
+                2 + offset
+            );
+        }
+
+        // A same-identity grant replaces the existing hotbar stack wholesale
+        // (count 64 is the whole replacement, not a merge into 7).
+        assert_eq!(inventory.grant_hotbar(stick(64), 8), 0);
+        assert_eq!(
+            inventory.slot(0).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Stick), 64))
+        );
+        assert_eq!(
+            inventory.slot(1).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Wheat), 3)),
+            "another identity's stack is untouched"
+        );
+    }
+
+    #[test]
+    fn palette_grant_hotbar_replaces_preferred_when_the_hotbar_is_full() {
+        let mut inventory = Inventory::empty();
+        for (slot, material) in [
+            Material::Stick,
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(inventory.grant_hotbar(item(ItemId::Material(material), 1), 0), slot);
+        }
+        assert!(inventory.slots()[..HOTBAR_SLOTS].iter().all(Option::is_some));
+
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Stone, 999), 6), 6);
+        assert_eq!(
+            inventory.slot(6).map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 999))
+        );
+
+        // Out-of-range preferred values clamp to the last hotbar slot.
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Dirt, 999), 99), 8);
+        assert_eq!(inventory.slot(8).map(|item| item.id()), Some(ItemId::Block(BlockId::Dirt)));
+    }
+
+    #[test]
+    fn palette_grant_hotbar_never_touches_main_cursor_or_grid() {
+        let mut slots: [Option<Item>; INVENTORY_SLOTS] = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(HOTBAR_SLOTS) {
+            *slot = Some(item(ItemId::Material(Material::Apple), 1));
+        }
+        for slot in slots.iter_mut().skip(HOTBAR_SLOTS) {
+            *slot = Some(item(ItemId::Material(Material::Wheat), 2));
+        }
+        let cursor = item(ItemId::Material(Material::Bread), 3);
+        let mut inventory = Inventory::from_parts(slots, Some(cursor));
+
+        let mut grid = CraftingGrid::new(GridKind::Player);
+        grid.set(0, Some(item(ItemId::Material(Material::Stick), 1)))
+            .expect("player grid cell");
+
+        let main_before: Vec<Option<Item>> = inventory.slots()[HOTBAR_SLOTS..].to_vec();
+        let hotbar_before: Vec<Option<Item>> = inventory.slots()[..HOTBAR_SLOTS].to_vec();
+        let cursor_before = inventory.cursor();
+        let grid_before = grid.clone();
+
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Stone, 999), 3), 3);
+
+        assert_eq!(
+            inventory.slot(3).map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 999))
+        );
+        for (slot, before) in hotbar_before.iter().enumerate() {
+            if slot == 3 {
+                continue;
+            }
+            assert_eq!(inventory.slot(slot), *before);
+        }
+        assert_eq!(inventory.slots()[HOTBAR_SLOTS..].to_vec(), main_before);
+        assert_eq!(inventory.cursor(), cursor_before);
+        assert_eq!(grid, grid_before, "the crafting grid is never touched");
     }
 }

@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::player::inventory::{
-    self, Item, ItemId, Recipe, ToolKind, ToolTier, MAX_STACK_COUNT, RECIPES,
+    self, Item, ItemId, Recipe, ToolKind, ToolTier, MATERIAL_STACK_LIMIT, MAX_STACK_COUNT, RECIPES,
 };
 use crate::player::tools;
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
@@ -418,6 +418,39 @@ impl ContentRegistry {
             ItemId::ModTool(index) => self.tool(index).map(|def| def.kind),
             _ => None,
         }
+    }
+
+    /// The authored maximum stack size for an insertable `id`, or `None` when
+    /// the identity cannot be granted.
+    ///
+    /// Unknown registry indices, placeholder definitions, and blocks with no
+    /// carryable drop row (`stack_limit == 0`) all return `None`. The result is
+    /// clamped to `1..=MAX_STACK_COUNT`, so callers can hand it straight to
+    /// [`crate::player::inventory::Item::new_with`]. Built-in carryable blocks
+    /// answer `MAX_STACK_COUNT` because [`BlockDef::from_builtin`] uses that
+    /// row; pack blocks and pack items answer their authored limits; materials
+    /// answer [`MATERIAL_STACK_LIMIT`]; every tool answers one.
+    pub fn stack_limit(&self, id: ItemId) -> Option<u16> {
+        let limit = match id {
+            ItemId::Block(block) => self
+                .block(block)
+                .filter(|def| !def.placeholder)
+                .map(|def| def.stack_limit)?,
+            ItemId::Item(index) => self
+                .item(index)
+                .filter(|def| !def.placeholder)
+                .map(|def| def.stack_limit)?,
+            ItemId::Material(_) => MATERIAL_STACK_LIMIT,
+            ItemId::Tool { .. } => 1,
+            ItemId::ModTool(index) => {
+                self.tool(index)?;
+                1
+            }
+        };
+        if limit == 0 {
+            return None;
+        }
+        Some(limit.clamp(1, MAX_STACK_COUNT))
     }
 
     /// All registered block definitions in raw id order.
@@ -1492,6 +1525,103 @@ mod tests {
         assert_eq!(
             content_mismatch_note(&[], EMPTY_DIGEST, ContentRegistry::builtin(), 3),
             Some("3 saved content names are unavailable and render as placeholders".to_string())
+        );
+    }
+
+    // -- Palette stack limits (S07-T02) ------------------------------------
+
+    /// The checked-in reference pack through the same production mapping as
+    /// `main.rs::build_session_registry`.
+    fn reference_registry() -> ContentRegistry {
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let pack = (
+            PackIdentity {
+                folder: spec.folder.clone(),
+                version: spec.version.clone(),
+            },
+            spec.content.clone(),
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    #[test]
+    fn palette_stack_limit_matches_builtin_and_pack_authored_limits() {
+        use crate::player::inventory::Material;
+
+        let registry = reference_registry();
+
+        assert_eq!(
+            registry.stack_limit(ItemId::Block(BlockId::Stone)),
+            Some(MAX_STACK_COUNT),
+            "built-in carryable blocks answer the authored 999 row"
+        );
+        assert_eq!(
+            registry.stack_limit(ItemId::Material(Material::Stick)),
+            Some(MATERIAL_STACK_LIMIT)
+        );
+        assert_eq!(
+            registry.stack_limit(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            }),
+            Some(1)
+        );
+
+        let stew = registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index;
+        assert_eq!(registry.stack_limit(ItemId::Item(stew)), Some(16));
+        let ruby = registry
+            .item_by_name("mymod:ruby")
+            .expect("registered pack gem")
+            .index;
+        assert_eq!(registry.stack_limit(ItemId::Item(ruby)), Some(64));
+
+        let ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("registered pack ore")
+            .id;
+        assert_eq!(registry.stack_limit(ItemId::Block(ore)), Some(64));
+
+        let pickaxe = registry
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("registered pack pickaxe")
+            .index;
+        assert_eq!(registry.stack_limit(ItemId::ModTool(pickaxe)), Some(1));
+    }
+
+    #[test]
+    fn palette_stack_limit_rejects_placeholders_and_unknown_indices() {
+        use crate::player::inventory::Material;
+
+        let mut registry = reference_registry();
+        let placeholder_block = registry.append_placeholder_block("save:missing_block");
+        let placeholder_item = registry.append_placeholder_item("save:missing_item");
+
+        assert_eq!(
+            registry.stack_limit(ItemId::Block(placeholder_block)),
+            None,
+            "placeholder art is never grantable"
+        );
+        assert_eq!(
+            registry.stack_limit(ItemId::Item(placeholder_item)),
+            None,
+            "placeholder art is never grantable"
+        );
+        assert_eq!(registry.stack_limit(ItemId::Item(u16::MAX)), None);
+        assert_eq!(registry.stack_limit(ItemId::ModTool(u16::MAX)), None);
+        assert_eq!(
+            registry.stack_limit(ItemId::Block(BlockId::Bedrock)),
+            None,
+            "a block with no carryable drop row cannot be granted"
+        );
+        assert_eq!(
+            registry.stack_limit(ItemId::Material(Material::Stick)),
+            Some(MATERIAL_STACK_LIMIT),
+            "unknown registry indices must not affect static identities"
         );
     }
 }

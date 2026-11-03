@@ -7,7 +7,7 @@ use crate::player::container::Container;
 use crate::player::eating::{food_value, food_value_with};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
-    InventoryError, Item, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
+    InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
@@ -379,6 +379,28 @@ impl Player {
     /// The selected hotbar item's block identity, for placement.
     pub fn selected_block(&self) -> Option<BlockId> {
         self.selected_item()?.block_stack().map(|stack| stack.block)
+    }
+
+    /// Grants a Creative palette stack into the hotbar from the session
+    /// registry (MEM190/MEM193).
+    ///
+    /// The authored stack limit comes from [`ContentRegistry::stack_limit`],
+    /// the item is built through [`Item::new_with`] (so pack tools start at
+    /// full authored durability and pack items respect their authored cap),
+    /// and exactly one hotbar slot is written. The granted slot is selected so
+    /// the content is immediately placeable or usable. Unknown and
+    /// placeholder identities fail with [`ItemError::UnknownContent`] without
+    /// mutating the inventory.
+    pub fn grant_palette_item_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+    ) -> Result<(usize, Item), ItemError> {
+        let limit = registry.stack_limit(id).ok_or(ItemError::UnknownContent)?;
+        let item = Item::new_with(registry, id, limit)?;
+        let slot = self.inventory.grant_hotbar(item, self.selected_slot);
+        self.select_slot(slot);
+        Ok((slot, item))
     }
 
     /// Collects one broken block into the inventory (hotbar first, then main).
@@ -3206,6 +3228,112 @@ mod tests {
             assert!(input.is_moving(), "key index {index} must count as moving");
             input.reset();
             assert!(!input.is_moving(), "reset clears every movement key");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T02: Creative palette hotbar grants
+    // -----------------------------------------------------------------------
+
+    /// The checked-in reference pack through the same production mapping as
+    /// `main.rs::build_session_registry`.
+    fn reference_registry() -> ContentRegistry {
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let pack = (
+            crate::content::PackIdentity {
+                folder: spec.folder.clone(),
+                version: spec.version.clone(),
+            },
+            spec.content.clone(),
+        );
+        let (registry, report) = crate::content::build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    fn creative_player() -> Player {
+        Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Creative)
+    }
+
+    #[test]
+    fn palette_grant_builds_authored_stacks_and_selects_the_slot() {
+        let registry = reference_registry();
+        let mut player = creative_player();
+
+        let ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("registered pack ore")
+            .id;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Block(ore))
+            .expect("pack ore is grantable");
+        assert_eq!(slot, 0);
+        assert_eq!(player.selected_slot(), 0, "the granted slot becomes live");
+        assert_eq!(item.count(), 64, "the authored block stack is 64");
+        assert_eq!(player.selected_block(), Some(ore));
+
+        let stew = registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Item(stew))
+            .expect("pack stew is grantable");
+        assert_eq!(slot, 1);
+        assert_eq!(item.count(), 16, "16 is the authored stew limit, not 64 or 999");
+        assert_eq!(player.selected_slot(), 1);
+
+        let pickaxe = registry
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("registered pack pickaxe")
+            .index;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::ModTool(pickaxe))
+            .expect("pack pickaxe is grantable");
+        assert_eq!(slot, 2);
+        assert_eq!(item.count(), 1);
+        assert_eq!(item.durability(), Some(900));
+        assert_eq!(item.max_durability(), Some(900));
+        assert!(item.is_tool());
+
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Block(BlockId::Stone))
+            .expect("built-in stone is grantable");
+        assert_eq!(slot, 3);
+        assert_eq!(item.count(), 999);
+        assert_eq!(player.selected_block(), Some(BlockId::Stone));
+
+        for empty in 4..HOTBAR_SLOTS {
+            assert_eq!(
+                player.inventory().hotbar(empty),
+                None,
+                "grant writes exactly one slot"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_grant_rejects_unknown_and_placeholder_without_mutation() {
+        let mut registry = reference_registry();
+        let placeholder_block = registry.append_placeholder_block("save:missing_block");
+        let placeholder_item = registry.append_placeholder_item("save:missing_item");
+        let mut player = creative_player();
+        let before = player.inventory().clone();
+
+        for id in [
+            ItemId::Item(u16::MAX),
+            ItemId::ModTool(u16::MAX),
+            ItemId::Block(placeholder_block),
+            ItemId::Item(placeholder_item),
+            ItemId::Block(BlockId::Modded(0)),
+        ] {
+            assert_eq!(
+                player.grant_palette_item_with(&registry, id),
+                Err(ItemError::UnknownContent),
+                "{id:?} must fail closed"
+            );
+            assert_eq!(player.inventory(), &before, "{id:?} mutated the inventory");
+            assert_eq!(player.selected_slot(), 0, "{id:?} changed the selection");
         }
     }
 }
