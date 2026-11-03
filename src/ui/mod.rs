@@ -75,6 +75,7 @@ impl UiRenderer {
         ctx: &RenderContext,
         block_texture_view: &wgpu::TextureView,
         block_texture_sampler: &wgpu::Sampler,
+        sprite_layers: &[Vec<u8>],
     ) -> Self {
         // ColorMode::Accurate: proper sRGB texture, matching our sRGB surface format.
         // (glyphon 0.5.0 has no `Color` variant; Accurate/Web are the only modes.)
@@ -99,7 +100,12 @@ impl UiRenderer {
             text_renderer,
             quad_renderer: QuadRenderer::new(ctx),
             logo_renderer: logo::LogoRenderer::new(ctx),
-            icon_renderer: IconRenderer::new(ctx, block_texture_view, block_texture_sampler),
+            icon_renderer: IconRenderer::new_with_sprite_layers(
+                ctx,
+                block_texture_view,
+                block_texture_sampler,
+                sprite_layers,
+            ),
             tooltip_quad_renderer: QuadRenderer::new(ctx),
         }
     }

@@ -58,7 +58,10 @@ use opencraft::ui::inventory::{
     tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS,
     TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
-use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
+use opencraft::ui::item_icon::{
+    compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
+    IconDrawList,
+};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
 use opencraft::ui::packs;
@@ -9666,6 +9669,7 @@ impl ApplicationHandler for GameApp {
             &ctx,
             &renderer.block_texture_view,
             &renderer.block_texture_sampler,
+            &compose_item_sprite_layers(self.session_registry.pack_icons()),
         );
         // Startup logo upload (M004/S04): the texture is created exactly once
         // per pack selection, never on the render hot path. Default (`None`)
@@ -11480,13 +11484,15 @@ impl ApplicationHandler for GameApp {
                 // same pixel-space rects the quads use and classify each item
                 // through `icon_source`; the icon pass draws after every quad
                 // and below text, so counts and labels always win.
-                let mut icons: IconDrawList = hotbar_icon_vertices(
+                let mut icons: IconDrawList = hotbar_icon_vertices_with(
+                    Some(&self.session_registry),
                     self.session.player.inventory(),
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
                 if let Some(layout) = inventory_layout.as_ref() {
-                    icons.append(inventory_icon_vertices(
+                    icons.append(inventory_icon_vertices_with(
+                        Some(&self.session_registry),
                         inventory_mode,
                         layout,
                         self.session.player.inventory(),
