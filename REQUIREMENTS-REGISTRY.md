@@ -619,6 +619,96 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M013/S01, M013/S02, M013/S03, M013/S04, M013/S05, M013/S06
 - Validation: bash scripts/ui_smoke.sh; SMOKE_PROFILE=release bash scripts/ui_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
 
+### R062 — Frozen built-in identity and dense u16 block storage
+- Class: constraint
+- Status: active
+- Description: Built-in block discriminants 0..=22, material vocabulary 0..=10, tiers, the 22 built-in recipe ids, texture layers 0..=47 and icon layers 0..=31 stay frozen, and chunks store blocks densely in two bytes so `BlockId::to_raw`/`from_raw` round-trips built-ins plus modded indices.
+- Why it matters: Every pack, save and pinned surface depends on stable discriminants and two-byte block storage; moving either silently corrupts saved worlds and golden digests.
+- Source: M010 / S01 identity and storage spine
+- Primary owning slice: M010/S01
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::chunk; cargo test --locked --lib -- world::block; cargo test --locked --lib -- world::terrain; cargo test --locked --lib -- mesh::greedy; bash scripts/presentation_smoke.sh
+
+### R063 — Pack format v2, ordered stack merge and --validate-pack
+- Class: core-capability
+- Status: active
+- Description: A v1 texture-only pack still loads unchanged while a format v2 pack declares blocks, items, tiers, tools, recipes, block/recipe patches and worldgen; entries fall back individually with warnings, the ordered stack merges per authored file and field with later packs winning, ids are deterministic namespaced names, and `--validate-pack` prints per-entry results and exits 0 for a clean pack and nonzero for broken or missing packs without opening a window, GPU or save.
+- Why it matters: Content packs are only authorable and stackable if parsing, merge precedence and a strict offline validator agree on the same rules.
+- Source: M010 / S02 pack format and validation
+- Primary owning slice: M010/S02
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- pack::v2; cargo test --locked --lib -- pack::spec; cargo test --locked --lib -- pack::validate; bash scripts/validate_pack_smoke.sh; bash scripts/pack_smoke.sh
+
+### R064 — Save v8 content table, v1-v7 migration, placeholders and changed-stack notice
+- Class: continuity
+- Status: active
+- Description: v8 writes a sorted content-name table and round-trips byte-stably, v1-v7 saves migrate, writes fail closed before the first output byte, unknown but well-formed names degrade to solid unbreakable drop-nothing blocks and checker-iconed movable unusable items that survive re-save (a degraded pack tool re-saves its tool kind), and restoring the pack resolves the same names while a changed stack shows a non-blocking digest notice.
+- Why it matters: Pack content must never be lost or silently remapped when the stack changes between sessions.
+- Source: M010 / S03 save v8 and placeholders
+- Primary owning slice: M010/S03
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::persistence; cargo test --locked --lib -- world::session; cargo test --locked --bin opencraft -- modding_acceptance_placeholder
+
+### R065 — Registry-backed modded blocks, items and patchable built-ins
+- Class: core-capability
+- Status: active
+- Description: Authored block faces, generic item and tool icons, authored hardness, drop and stack limits flow through production mining, placement and rendering; built-in block fields are patchable by id without moving discriminants and built-in layers 0..=47 stay byte-identical.
+- Why it matters: New content is only real if the gameplay and render paths read it through the same registry the save and palette do.
+- Source: M010 / S04 blocks and items in the world
+- Primary owning slice: M010/S04
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- content::faces; cargo test --locked --lib -- content::registry; cargo test --locked --lib -- render::texture; bash scripts/pack_smoke.sh; bash scripts/ui_smoke.sh
+
+### R066 — Registry-shaped recipes, custom tool tiers and authored food
+- Class: core-capability
+- Status: active
+- Description: Shaped recipes work at 2x2 and 4x4, disabled built-ins vanish from previews and results, recipes with missing or placeholder ingredients never match, authored tiers change break duration, durability and melee damage through the existing paths, and authored food restores its nutrition through hold-to-eat.
+- Why it matters: Recipes, tools and food are the progression surfaces a content pack must be able to change without new code.
+- Source: M010 / S05 recipes, tools and food
+- Primary owning slice: M010/S05
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- content::registry; cargo test --locked --lib -- player::tools; cargo test --locked --lib -- player::eating; bash scripts/crafting_smoke.sh
+
+### R067 — Declarative ore and surface-patch worldgen
+- Class: core-capability
+- Status: active
+- Description: Pack ore veins and surface patches generate deterministically from `(seed, pos, rule)` with independent streams in authored y ranges and biomes, an empty rule set produces byte-identical chunks to pre-M010, and coal/iron distribution is unchanged.
+- Why it matters: Generated content is the only way a pack changes terrain, and it must not perturb built-in terrain for existing seeds.
+- Source: M010 / S06 worldgen
+- Primary owning slice: M010/S06
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- world::terrain; cargo test --locked --lib -- world::chunk; bash scripts/worldgen_smoke.sh
+
+### R068 — Searchable Creative palette with authored grants and placeholder exclusion
+- Class: primary-user-loop
+- Status: active
+- Description: A fresh Creative world opens a searchable palette listing every non-placeholder built-in and pack block and item, filters case-insensitively by id, display name and namespace, places authored stacks into the hotbar, and never lists placeholders while the closed-state digests stay pinned.
+- Why it matters: Pack content that cannot be found in-game is not discoverable, and placeholders in the palette would offer unusable stacks.
+- Source: M010 / S07 Creative palette
+- Primary owning slice: M010/S07
+- Supporting slices: None
+- Validation: cargo test --locked --lib -- ui::palette; cargo test --locked --bin opencraft -- palette; bash scripts/palette_smoke.sh
+
+### R069 — Reference packs, end-to-end acceptance and modding smoke
+- Class: integration
+- Status: active
+- Description: The checked-in `packs/mymod-ruby` content pack plus texture-only `packs/ruby-overlay` drive one headless acceptance test through generate, mine, craft, eat, place/use, save and reload, a placeholder removal/re-save/restore test preserves every reference block and item, and `scripts/modding_smoke.sh` proves validate-pack exit codes, the docs reader-test and bounded launches in debug and release.
+- Why it matters: The pack surface must be proven on the shipped example content, not only on synthetic fixtures.
+- Source: M010 / S08 reference packs and acceptance
+- Primary owning slice: M010/S08
+- Supporting slices: None
+- Validation: cargo test --locked --bin opencraft -- modding_acceptance; bash scripts/modding_smoke.sh; SMOKE_PROFILE=release bash scripts/modding_smoke.sh
+
+### R070 — M010 closure surface
+- Class: admin/support
+- Status: active
+- Description: M010 closes with completed pack-author, README and save docs plus a prepared human UAT runbook, every smoke green in debug and release, fmt/clippy/lib/bin/streaming gates passing, and the registry plus checker/selftest carrying R062-R069 and the 11-row M010 criterion trace.
+- Why it matters: Closure must be reproducible on the assembled tree, and the sensory outcomes need recorded human judgment rather than inferred claims.
+- Source: M010 / S08 closure
+- Primary owning slice: M010/S08
+- Supporting slices: M010/S01, M010/S02, M010/S03, M010/S04, M010/S05, M010/S06, M010/S07
+- Validation: bash scripts/modding_smoke.sh; SMOKE_PROFILE=release bash scripts/modding_smoke.sh; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings; cargo test --locked; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -705,3 +795,19 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 6 | R060 | S06 | cargo test --locked --lib -- ui::hud::tests::vitals && cargo test --locked --bin opencraft -- playing_hud_quads && bash scripts/ui_smoke.sh |
 | 7 | R061 | S01, S02, S03, S04, S05, S06, S07 | cargo test --locked && cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && bash scripts/ui_smoke.sh && SMOKE_PROFILE=release bash scripts/ui_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |
 | 8 | R061 | S01, S02, S03, S04, S05, S06, S07 | recorded human UAT with 1280x720 and 1920x1080 screenshots |
+
+## M010 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R062, R063 | S01, S02 | cargo test --locked --lib -- pack::v2 && cargo test --locked --lib -- content::registry && bash scripts/validate_pack_smoke.sh |
+| 2 | R065 | S04 | cargo test --locked --lib -- content::faces && cargo test --locked --lib -- content::registry && bash scripts/pack_smoke.sh && bash scripts/ui_smoke.sh |
+| 3 | R066 | S05 | cargo test --locked --lib -- player::tools && cargo test --locked --lib -- player::eating && bash scripts/crafting_smoke.sh |
+| 4 | R067 | S06 | cargo test --locked --lib -- world::terrain && bash scripts/worldgen_smoke.sh |
+| 5 | R066 | S05 | cargo test --locked --lib -- content::registry && bash scripts/crafting_smoke.sh |
+| 6 | R068 | S07 | cargo test --locked --lib -- ui::palette && bash scripts/palette_smoke.sh |
+| 7 | R064 | S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- world::session |
+| 8 | R064, R068 | S03, S07 | cargo test --locked --lib -- world::persistence && cargo test --locked --lib -- ui::palette |
+| 9 | R064 | S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --bin opencraft -- modding_acceptance_placeholder |
+| 10 | R063, R069 | S02, S08 | bash scripts/validate_pack_smoke.sh && bash scripts/modding_smoke.sh |
+| 11 | R062, R063, R064, R065, R066, R067, R068, R069 | S01, S02, S03, S04, S05, S06, S07, S08 | cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && bash scripts/modding_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |

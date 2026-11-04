@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Negative-path selftest for scripts/requirements_check.sh (M003/S05-T03,
 # extended M004/S05-T02, M005/S06-T02, M007/S01-T06, M007/S08-T04,
-# M008/S09-T02, M009/S10-T02, and M013/S07-T01).
+# M008/S09-T02, M009/S10-T02, M013/S07-T01, and M010/S08-T07).
 #
 # Proves the registry checker is not a happy-path-only gate: a pristine copy
 # must be accepted, and each of the following defects must be rejected:
@@ -27,8 +27,8 @@
 #  20. missing M007 criterion trace row
 #  21. wrong M007 criterion -> requirement mapping
 #  22. lost M007 slice mapping
-#  23. record-count mismatch with 62 records
-#  24. record-count mismatch with 60 records
+#  23. record-count mismatch with 71 records
+#  24. record-count mismatch with 69 records
 #  25. malformed M007 row with an empty Validation field
 #  26. M007 row ownership reverted to another milestone
 #  27. out-of-range criterion row in the M007 trace table
@@ -55,17 +55,25 @@
 #  48. M013 row ownership reverted to another milestone
 #  49. missing M013 criterion trace row
 #  50. M013 row with an empty Validation field
+#  51. duplicate M010 requirement ID
+#  52. lost M010 slice mapping
+#  53. wrong M010 criterion -> requirement mapping
+#  54. out-of-range criterion row in the M010 trace table
+#  55. M010 row ownership reverted to another milestone
+#  56. missing M010 criterion trace row
+#  57. M010 row with an empty Validation field
 #
 # Cases 8-11 exercise the M004 checker surface added with R016-R020, cases
 # 12-15 exercise the M005 surface added with R021-R026, cases 16-18 exercise
 # the deliberate-supersession surface added to R005 (and, in cases 32-33, the
 # R033 M008/S06 supersession), cases 19-27 exercise the M007 surface added
 # with R027-R034, cases 28-36 exercise the M008 surface added with R035-R044,
-# cases 37-43 exercise the M009 surface added with R045-R054, and cases 44-50
-# exercise the M013 surface added with R055-R061. All seven criterion tables
-# restart their row numbers at 1, so these cases plus the positive control prove
-# the checker parses each table section-scoped rather than counting colliding
-# criterion 1 rows across tables.
+# cases 37-43 exercise the M009 surface added with R045-R054, cases 44-50
+# exercise the M013 surface added with R055-R061, and cases 51-57 exercise the
+# M010 surface added with R062-R070. All eight criterion tables restart their
+# row numbers at 1, so these cases plus the positive control prove the checker
+# parses each table section-scoped rather than counting colliding criterion 1
+# rows across tables.
 #
 # Every mutation is applied to a throwaway copy under mktemp -d; the canonical
 # REQUIREMENTS-REGISTRY.md is never written. The selftest asserts the on-disk
@@ -157,17 +165,18 @@ assert_mutated "duplicate ID" "$case1" "$case2"
 expect_fail "duplicate requirement ID" "$case2"
 
 # --- Case 3: missing ID --------------------------------------------------
-# Retargeted to the new last record: renumbering R061 to R062 removes R061
-# from the R001-R061 range. Retarget chain: R015->R016 was pre-M004,
+# Retargeted to the new last record: renumbering R070 to R071 removes R070
+# from the R001-R070 range. Retarget chain: R015->R016 was pre-M004,
 # R020->R021 was pre-M005, R026->R027 was pre-S08, R034->R035 was pre-M008,
-# R044->R045 was pre-M009, R054->R055 was pre-M013, and now R061->R062 is the
-# current last record. (Renumbering R026 to R027 today would create a duplicate
-# instead of a missing record, which is why the old mutation moved.)
+# R044->R045 was pre-M009, R054->R055 was pre-M013, R061->R062 was pre-M010,
+# and now R070->R071 is the current last record. (Renumbering R026 to R027
+# today would create a duplicate instead of a missing record, which is why the
+# old mutation moved.)
 case3="$(new_case "$SCRATCH/case3.md")"
-sed -i 's/^### R061 /### R062 /' "$case3"
+sed -i 's/^### R070 /### R071 /' "$case3"
 assert_mutated "missing ID" "$case1" "$case3"
-expect_fail "missing requirement ID R061" "$case3"
-grep -q 'missing requirement record: R061' "$CHECK_LOG" \
+expect_fail "missing requirement ID R070" "$case3"
+grep -q 'missing requirement record: R070' "$CHECK_LOG" \
     || { echo "FAIL: missing ID was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 
 # --- Case 4: removed M003 slice mapping ----------------------------------
@@ -408,19 +417,19 @@ grep -q 'no requirement maps to M007/S07' "$CHECK_LOG" \
     || { echo "FAIL: removed M007 slice mapping was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 echo "PASS: removed M007/S07 slice mapping rejected"
 
-# --- Case 23: record-count mismatch with 62 records ---------------------
-# A structurally valid R062 record must still be rejected because the
-# contract is exactly R001-R061.
+# --- Case 23: record-count mismatch with 71 records ---------------------
+# A structurally valid R071 record must still be rejected because the
+# contract is exactly R001-R070.
 case23="$SCRATCH/case23.md"
 awk '
 /^## M003 Criterion Trace/ && !done {
-    print "### R062 — Extra M013 closure record"
+    print "### R071 — Extra M010 closure record"
     print "- Class: admin/support"
     print "- Status: active"
     print "- Description: Extra record used only by the negative-path selftest."
-    print "- Why it matters: The registry contract is exactly R001-R061."
-    print "- Source: M013 / S07 selftest"
-    print "- Primary owning slice: M013/S07"
+    print "- Why it matters: The registry contract is exactly R001-R070."
+    print "- Source: M010 / S08 selftest"
+    print "- Primary owning slice: M010/S08"
     print "- Supporting slices: None"
     print "- Validation: bash scripts/requirements_check.sh"
     print ""
@@ -428,37 +437,37 @@ awk '
 }
 { print }
 ' "$REGISTRY" > "$case23"
-assert_mutated "62-record count" "$case1" "$case23"
+assert_mutated "71-record count" "$case1" "$case23"
 rc=0
 run_checker "$case23" || rc=$?
 if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: 62-record registry should have been rejected but the checker exited 0" >&2
+    echo "FAIL: 71-record registry should have been rejected but the checker exited 0" >&2
     exit 1
 fi
-grep -q 'expected 61 requirement records, found 62' "$CHECK_LOG" \
-    || { echo "FAIL: 62-record registry was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
-echo "PASS: 62-record registry rejected"
+grep -q 'expected 70 requirement records, found 71' "$CHECK_LOG" \
+    || { echo "FAIL: 71-record registry was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: 71-record registry rejected"
 
-# --- Case 24: record-count mismatch with 60 records ---------------------
-# Dropping the whole R061 block (heading, bullets and trailing blank) leaves
-# 60 records, so the count check fires before the missing-ID sweep.
+# --- Case 24: record-count mismatch with 69 records ---------------------
+# Dropping the whole R070 block (heading, bullets and trailing blank) leaves
+# 69 records, so the count check fires before the missing-ID sweep.
 case24="$SCRATCH/case24.md"
 awk '
-/^### R061 / { skip = 1; next }
+/^### R070 / { skip = 1; next }
 skip && /^$/ { skip = 0; next }
 skip { next }
 { print }
 ' "$REGISTRY" > "$case24"
-assert_mutated "60-record count" "$case1" "$case24"
+assert_mutated "69-record count" "$case1" "$case24"
 rc=0
 run_checker "$case24" || rc=$?
 if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: 60-record registry should have been rejected but the checker exited 0" >&2
+    echo "FAIL: 69-record registry should have been rejected but the checker exited 0" >&2
     exit 1
 fi
-grep -q 'expected 61 requirement records, found 60' "$CHECK_LOG" \
-    || { echo "FAIL: 60-record registry was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
-echo "PASS: 60-record registry rejected"
+grep -q 'expected 70 requirement records, found 69' "$CHECK_LOG" \
+    || { echo "FAIL: 69-record registry was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: 69-record registry rejected"
 
 # --- Case 25: malformed M007 row with empty Validation -------------------
 # R029 must carry a concrete evidence command; deleting the bullet must fail
@@ -901,6 +910,121 @@ fi
 grep -q 'R060 has an empty Validation field' "$CHECK_LOG" \
     || { echo "FAIL: malformed M013 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 echo "PASS: malformed M013 row rejected"
+
+# --- Case 51: duplicate M010 ID ------------------------------------------
+# R063 renamed to R062 collides with the existing R062, so the duplicate gate
+# must fire before any M010 trace check.
+case51="$(new_case "$SCRATCH/case51.md")"
+sed -i 's/^### R063 /### R062 /' "$case51"
+assert_mutated "duplicate M010 ID" "$case1" "$case51"
+rc=0
+run_checker "$case51" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: duplicate M010 requirement ID should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'duplicate requirement ID: R062' "$CHECK_LOG" \
+    || { echo "FAIL: duplicate M010 ID was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: duplicate M010 requirement ID rejected"
+
+# --- Case 52: lost M010 slice mapping ------------------------------------
+# R064 is the only record that maps M010/S03; pointing its owner at an
+# unknown M010 slice must be rejected by the M010 slice-coverage sweep.
+case52="$(new_case "$SCRATCH/case52.md")"
+sed -i 's#^- Primary owning slice: M010/S03$#- Primary owning slice: M010/S99#' "$case52"
+assert_mutated "M010 slice mapping" "$case1" "$case52"
+rc=0
+run_checker "$case52" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: removed M010/S03 slice mapping should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'no requirement maps to M010/S03' "$CHECK_LOG" \
+    || { echo "FAIL: removed M010 slice mapping was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: removed M010/S03 slice mapping rejected"
+
+# --- Case 53: wrong M010 criterion mapping -------------------------------
+# Row 4 of the M010 table is uniquely identified by R067; swapping in R066
+# must fail the M010 criterion-4 requirement assertion.
+case53="$(new_case "$SCRATCH/case53.md")"
+sed -i 's/^| 4 | R067 | S06 |/| 4 | R066 | S06 |/' "$case53"
+assert_mutated "M010 criterion mapping" "$case1" "$case53"
+rc=0
+run_checker "$case53" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: wrong M010 criterion mapping should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'M010 criterion 4 requirements' "$CHECK_LOG" \
+    || { echo "FAIL: wrong M010 criterion mapping was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: wrong M010 criterion mapping rejected"
+
+# --- Case 54: out-of-range row in the M010 trace table -------------------
+# Appending criterion 12 after the M010 table's row 11 must be rejected by the
+# M010 range check (1-11), proving the eighth section branch is range-scoped.
+case54="$(new_case "$SCRATCH/case54.md")"
+sed -i '/^| 11 | R062, R063, R064, R065, R066, R067, R068, R069 |/a\| 12 | R069 | S08 | cargo test --locked |' "$case54"
+assert_mutated "M010 out-of-range row" "$case1" "$case54"
+rc=0
+run_checker "$case54" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: out-of-range M010 trace row should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'M010 table' "$CHECK_LOG" \
+    || { echo "FAIL: out-of-range M010 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: out-of-range M010 trace row rejected"
+
+# --- Case 55: M010 row ownership reverted to another milestone -----------
+# R066 belongs to M010/S05; pointing it at M009 must be rejected by the M010
+# ownership sweep.
+case55="$(new_case "$SCRATCH/case55.md")"
+sed -i 's#^- Primary owning slice: M010/S05$#- Primary owning slice: M009/S05#' "$case55"
+assert_mutated "reverted M010 ownership" "$case1" "$case55"
+rc=0
+run_checker "$case55" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: reverted M010 ownership should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'R066 is not owned by M010' "$CHECK_LOG" \
+    || { echo "FAIL: reverted M010 ownership was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: reverted M010 ownership rejected"
+
+# --- Case 56: missing M010 criterion trace row ---------------------------
+# Deleting row 10 leaves criteria 1-9 and 11 intact but drops criterion 10.
+case56="$(new_case "$SCRATCH/case56.md")"
+sed -i '/^| 10 | R063, R069 | S02, S08 |/d' "$case56"
+assert_mutated "missing M010 trace row" "$case1" "$case56"
+rc=0
+run_checker "$case56" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: missing M010 trace row should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'M010 criterion 10 must have exactly one trace row, found 0' "$CHECK_LOG" \
+    || { echo "FAIL: missing M010 trace row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: missing M010 criterion trace row rejected"
+
+# --- Case 57: M010 row with an empty Validation field -------------------
+# R065 must carry a concrete evidence command; deleting the bullet must fail
+# closed at the non-empty-field gate.
+case57="$SCRATCH/case57.md"
+awk '
+/^### R065 / { in_r065 = 1 }
+in_r065 && !deleted && /^- Validation: / { deleted = 1; next }
+{ print }
+' "$REGISTRY" > "$case57"
+assert_mutated "malformed M010 row" "$case1" "$case57"
+rc=0
+run_checker "$case57" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: malformed M010 row should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'R065 has an empty Validation field' "$CHECK_LOG" \
+    || { echo "FAIL: malformed M010 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: malformed M010 row rejected"
 
 # --- Canonical registry must be untouched --------------------------------
 cmp -s "$PRISTINE" "$REGISTRY" \
