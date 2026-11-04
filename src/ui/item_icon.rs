@@ -16,11 +16,15 @@
 //! with the codebase-wide convention (`x_ndc = 2x/sw - 1`,
 //! `y_ndc = 1 - 2y/sh`, surface dimensions guarded with `.max(1)`).
 
+use std::sync::Arc;
+
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
 use super::inventory::{InventoryLayout, InventoryMode, Rect};
+use super::palette::{self, PaletteLayout, PaletteScreen};
+use crate::content::{ContentRegistry, PACK_ICON_BASE, PACK_ICON_CAP};
 use crate::player::inventory::{
     CraftingGrid, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
 };
@@ -110,7 +114,25 @@ pub const fn block_icon_layers(block: BlockId) -> BlockIconLayers {
 // ---------------------------------------------------------------------------
 
 /// Number of layers in the UI-only procedural item sprite texture array.
+///
+/// This is the authored/procedural contract (layers `0..32`); it never grows.
+/// The GPU array itself is [`ITEM_SPRITE_ARRAY_LAYERS`], with pack icons laid
+/// out above this base so pre-M010 icon bytes stay byte-identical.
 pub const ITEM_SPRITE_LAYERS: u32 = 32;
+
+/// GPU depth of the UI item sprite texture array.
+///
+/// `0..32` are the procedural layers, `32..=223` are registry pack icons (see
+/// [`crate::content::PACK_ICON_BASE`] / [`crate::content::PACK_ICON_CAP`]), and
+/// `224..256` stay transparent padding. The shader, pipeline and vertex layout
+/// are unchanged: only the array depth and the per-vertex layer numbers grow.
+pub const ITEM_SPRITE_ARRAY_LAYERS: u32 = 256;
+
+// The atlas layout is a fixed contract: procedural layers fill `0..32`, pack
+// icons start exactly at `PACK_ICON_BASE` and must fit inside the GPU depth.
+const _: () = assert!(PACK_ICON_BASE as u32 == ITEM_SPRITE_LAYERS);
+const _: () = assert!(ITEM_SPRITE_LAYERS <= ITEM_SPRITE_ARRAY_LAYERS);
+const _: () = assert!(PACK_ICON_CAP as u32 <= ITEM_SPRITE_ARRAY_LAYERS);
 
 /// Edge length, in texels, of every procedural item sprite layer.
 pub const ITEM_SPRITE_SIZE: u32 = 16;
@@ -265,6 +287,9 @@ const ITEM_SPRITE_TABLE: [(ItemId, u32); 27] = [
 /// unconstructible tool pair (for example a stone bow) also returns `None`, so
 /// a forged identity can never select a sprite that does not exist.
 pub fn item_sprite_layer(id: ItemId) -> Option<u32> {
+    if let ItemId::Item(_) = id {
+        return Some(u32::from(crate::content::PLACEHOLDER_ICON_LAYER));
+    }
     if let ItemId::Tool { kind, tier } = id {
         if !kind.allowed_tiers().contains(&tier) {
             return None;
@@ -290,6 +315,52 @@ pub fn icon_source(id: ItemId) -> Option<IconSource> {
             .is_carryable()
             .then(|| IconSource::Block(block_icon_layers(block))),
         ItemId::Material(_) | ItemId::Tool { .. } => item_sprite_layer(id).map(IconSource::Sprite),
+        ItemId::Item(_) => Some(IconSource::Sprite(u32::from(
+            crate::content::PLACEHOLDER_ICON_LAYER,
+        ))),
+        // A pack tool has no procedural art yet; the reserved placeholder
+        // sprite keeps the slot visible until a registry icon path resolves.
+        ItemId::ModTool(_) => Some(IconSource::Sprite(u32::from(
+            crate::content::PLACEHOLDER_ICON_LAYER,
+        ))),
+    }
+}
+
+/// Registry-aware icon-source mapping.
+///
+/// Same contract as [`icon_source`], but pack-authored identities resolve
+/// their frozen session definitions:
+///
+/// * carryable blocks use `BlockDef.faces` with top = `faces[2]`, left =
+///   `faces[4]`, right = `faces[0]` — the same directions
+///   [`block_icon_layers`] uses, so built-in blocks stay byte-identical.
+/// * registry items use `ItemDef.icon_layer`, which the registry already
+///   points at [`crate::content::PLACEHOLDER_ICON_LAYER`] for placeholder art.
+///
+/// A missing definition (forged or unknown id) falls back to the registry-free
+/// mapping instead of panicking, so unknown content renders the reserved
+/// checker/placeholder policy. Everything else delegates to [`icon_source`].
+pub fn icon_source_with(registry: &ContentRegistry, id: ItemId) -> Option<IconSource> {
+    match id {
+        ItemId::Block(block) => match registry.block(block) {
+            Some(def) if block.is_carryable() => Some(IconSource::Block(BlockIconLayers {
+                top: def.faces[2],
+                left: def.faces[4],
+                right: def.faces[0],
+            })),
+            _ => icon_source(id),
+        },
+        ItemId::Item(index) => Some(IconSource::Sprite(u32::from(
+            registry
+                .item(index)
+                .map_or(crate::content::PLACEHOLDER_ICON_LAYER, |def| def.icon_layer),
+        ))),
+        ItemId::ModTool(index) => Some(IconSource::Sprite(u32::from(
+            registry
+                .tool(index)
+                .map_or(crate::content::PLACEHOLDER_ICON_LAYER, |def| def.icon_layer),
+        ))),
+        ItemId::Material(_) | ItemId::Tool { .. } => icon_source(id),
     }
 }
 
@@ -643,6 +714,11 @@ fn draw_material(material: Material, canvas: &mut SpriteCanvas) {
 fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
     match id {
         ItemId::Block(_) => {}
+        // Layer 27 is the reserved transparent checker slot: a placeholder
+        // pack item draws no art until a pack supplies an icon.
+        ItemId::Item(_) => {}
+        // Pack tool art is registry-authored; there is no procedural fallback.
+        ItemId::ModTool(_) => {}
         ItemId::Material(material) => draw_material(material, canvas),
         ItemId::Tool { kind, tier } => {
             if !kind.allowed_tiers().contains(&tier) {
@@ -672,6 +748,33 @@ pub fn generate_item_sprite_layers_rgba() -> Vec<Vec<u8>> {
         let mut canvas = SpriteCanvas::new();
         draw_item(id, &mut canvas);
         layers[layer as usize] = canvas.into_rgba();
+    }
+    layers
+}
+
+/// Compose the full [`ITEM_SPRITE_ARRAY_LAYERS`] GPU sprite atlas once per
+/// renderer from the frozen session registry's pack icons.
+///
+/// Layers `0..32` are exactly [`generate_item_sprite_layers_rgba`], so every
+/// built-in icon stays byte-identical. Pack icons are copied to
+/// `32 + index` in registry order, capped at [`crate::content::PACK_ICON_CAP`]
+/// (layer 224). A malformed entry (not exactly [`ITEM_SPRITE_BYTES`]) becomes a
+/// transparent slot rather than a short GPU upload; unused slots `224..256`
+/// are transparent `[0, 0, 0, 0]` padding. The result is always exactly 256
+/// layers, because a `texture_2d_array` needs a fixed depth.
+pub fn compose_item_sprite_layers(pack_icons: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut layers = generate_item_sprite_layers_rgba();
+    layers.resize(
+        ITEM_SPRITE_ARRAY_LAYERS as usize,
+        vec![0u8; ITEM_SPRITE_BYTES],
+    );
+
+    let copyable = (PACK_ICON_CAP - PACK_ICON_BASE) as usize;
+    for (index, icon) in pack_icons.iter().take(copyable).enumerate() {
+        let layer = usize::from(PACK_ICON_BASE) + index;
+        if icon.len() == ITEM_SPRITE_BYTES {
+            layers[layer] = icon.clone();
+        }
     }
     layers
 }
@@ -824,11 +927,27 @@ pub fn sprite_icon_vertices(
 pub struct IconDrawList {
     pub block: Vec<IconVertex>,
     pub sprite: Vec<IconVertex>,
+    /// Frozen session registry used to resolve pack identities. `None` keeps
+    /// the registry-free built-in mapping, so every pre-M010 caller and test
+    /// stays byte-identical.
+    registry: Option<Arc<ContentRegistry>>,
 }
 
 impl IconDrawList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A batch that resolves pack block faces and item icons through `registry`.
+    ///
+    /// The `Arc` is cloned once per batch, never per item: the registry is the
+    /// frozen session registry (MEM512), not a per-frame rebuild.
+    pub fn with_registry(registry: Arc<ContentRegistry>) -> Self {
+        Self {
+            block: Vec::new(),
+            sprite: Vec::new(),
+            registry: Some(registry),
+        }
     }
 
     /// Total vertices across both batches.
@@ -855,7 +974,10 @@ impl IconDrawList {
         if item.count() == 0 {
             return;
         }
-        let Some(source) = icon_source(item.id()) else {
+        let Some(source) = self.registry.as_deref().map_or_else(
+            || icon_source(item.id()),
+            |registry| icon_source_with(registry, item.id()),
+        ) else {
             return;
         };
         match source {
@@ -911,7 +1033,42 @@ pub fn inventory_icon_vertices(
     surface_w: u32,
     surface_h: u32,
 ) -> IconDrawList {
-    let mut out = IconDrawList::new();
+    inventory_icon_vertices_with(
+        None,
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+        cursor_item,
+        cursor_pos,
+        surface_w,
+        surface_h,
+    )
+}
+
+/// [`inventory_icon_vertices`] with pack identities resolved through the frozen
+/// session registry.
+///
+/// `None` is exactly the registry-free behavior; `Some` clones the `Arc` once
+/// into the batch so each slot lookup is a plain table read.
+#[allow(clippy::too_many_arguments)]
+pub fn inventory_icon_vertices_with(
+    registry: Option<&Arc<ContentRegistry>>,
+    mode: InventoryMode,
+    layout: &InventoryLayout,
+    inventory: &Inventory,
+    player_grid: &CraftingGrid,
+    table_grid: &CraftingGrid,
+    cursor_item: Option<Item>,
+    cursor_pos: Option<(f32, f32)>,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    let mut out = match registry {
+        Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
+        None => IconDrawList::new(),
+    };
     if !mode.is_open() {
         return out;
     }
@@ -963,11 +1120,72 @@ pub fn inventory_icon_vertices(
 /// a dark shadow, so the icon no longer shrinks to reserve a count strip.
 /// Empty slots and non-carryable identities produce no vertices.
 pub fn hotbar_icon_vertices(inventory: &Inventory, surface_w: u32, surface_h: u32) -> IconDrawList {
-    let mut out = IconDrawList::new();
+    hotbar_icon_vertices_with(None, inventory, surface_w, surface_h)
+}
+
+/// [`hotbar_icon_vertices`] with pack identities resolved through the frozen
+/// session registry. `None` is exactly the registry-free behavior.
+pub fn hotbar_icon_vertices_with(
+    registry: Option<&Arc<ContentRegistry>>,
+    inventory: &Inventory,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    let mut out = match registry {
+        Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
+        None => IconDrawList::new(),
+    };
     for (slot, rect) in hotbar_slot_rects(surface_w, surface_h).iter().enumerate() {
         let icon_slot = hotbar_icon_rect(*rect);
         out.push_item(inventory.hotbar(slot), icon_slot, surface_w, surface_h);
     }
+    out
+}
+
+/// Item icons for the visible Creative palette grid.
+///
+/// `None` is exactly the registry-free behavior; `Some` clones the frozen
+/// session registry once into the batch so pack blocks/items resolve through
+/// their authored icons. A closed screen returns an empty batch, so the
+/// palette can never change any pre-M010 pinned UI digest while it is closed.
+/// Construction failures (a malformed identity) are ignored rather than
+/// drawing a ghost icon.
+pub fn palette_icon_vertices_with(
+    registry: Option<&Arc<ContentRegistry>>,
+    screen: &PaletteScreen,
+    layout: &PaletteLayout,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    let mut out = match registry {
+        Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
+        None => IconDrawList::new(),
+    };
+    if !screen.is_open() {
+        return out;
+    }
+
+    for (visible, entry_index) in screen
+        .filtered()
+        .iter()
+        .copied()
+        .skip(screen.scroll())
+        .take(palette::PALETTE_VISIBLE)
+        .enumerate()
+    {
+        // `filtered()` stores indices into `entries`, not into `filtered`.
+        // Resolve the entry directly; calling `filtered_entry` here would
+        // double-index and drop or misdraw every icon after a search.
+        let Some(entry) = screen.entries().get(entry_index) else {
+            continue;
+        };
+        let item = match registry {
+            Some(registry) => Item::new_with(registry, entry.id, 1).ok(),
+            None => Item::new(entry.id, 1).ok(),
+        };
+        out.push_item(item, layout.slots[visible], surface_w, surface_h);
+    }
+
     out
 }
 
@@ -1027,23 +1245,27 @@ fn fs_main(in: IconOutput) -> @location(0) vec4<f32> {
 /// the same shader and produce identically gamma-correct icons.
 const ITEM_SPRITE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// Create the 32-layer procedural sprite texture array and its sampler.
+/// Create the [`ITEM_SPRITE_ARRAY_LAYERS`]-layer item sprite texture array
+/// and its sampler.
 ///
-/// The atlas is generated from [`generate_item_sprite_layers_rgba`] and uploaded
-/// exactly once at renderer construction: unlike the block array it is never
-/// replaced by a pack, so there is no reload churn. `mip_level_count` is 1
-/// because 16x16 pixel art is sampled nearest and mips would only blur it.
+/// `layers` is the final composed atlas (see [`compose_item_sprite_layers`]),
+/// uploaded exactly once at renderer construction: the array is never replaced
+/// by a live pack change (MEM483/485/MEM512). `mip_level_count` is 1 because
+/// 16x16 pixel art is sampled nearest and mips would only blur it. Entries that
+/// are not exactly [`ITEM_SPRITE_BYTES`] are skipped rather than uploaded, so a
+/// malformed caller cannot trip wgpu validation.
 ///
 /// Returns only the view and sampler; a wgpu `TextureView` keeps its source
 /// texture alive internally.
 fn create_item_sprite_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    layers: &[Vec<u8>],
 ) -> (wgpu::TextureView, wgpu::Sampler) {
     let size = wgpu::Extent3d {
         width: ITEM_SPRITE_SIZE,
         height: ITEM_SPRITE_SIZE,
-        depth_or_array_layers: ITEM_SPRITE_LAYERS,
+        depth_or_array_layers: ITEM_SPRITE_ARRAY_LAYERS,
     };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ui_item_sprite_array"),
@@ -1056,7 +1278,14 @@ fn create_item_sprite_array(
         view_formats: &[],
     });
 
-    for (layer_index, layer) in generate_item_sprite_layers_rgba().iter().enumerate() {
+    for (layer_index, layer) in layers
+        .iter()
+        .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+        .enumerate()
+    {
+        if layer.len() != ITEM_SPRITE_BYTES {
+            continue;
+        }
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -1085,7 +1314,7 @@ fn create_item_sprite_array(
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("ui_item_sprite_array_view"),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
-        array_layer_count: Some(ITEM_SPRITE_LAYERS),
+        array_layer_count: Some(ITEM_SPRITE_ARRAY_LAYERS),
         ..Default::default()
     });
 
@@ -1135,6 +1364,26 @@ impl IconRenderer {
         ctx: &RenderContext,
         block_texture_view: &wgpu::TextureView,
         block_texture_sampler: &wgpu::Sampler,
+    ) -> Self {
+        Self::new_with_sprite_layers(
+            ctx,
+            block_texture_view,
+            block_texture_sampler,
+            &compose_item_sprite_layers(&[]),
+        )
+    }
+
+    /// Construct the icon renderer with an explicit composed sprite atlas.
+    ///
+    /// `sprite_layers` is the final [`ITEM_SPRITE_ARRAY_LAYERS`]-layer atlas,
+    /// normally [`compose_item_sprite_layers`] over the frozen session
+    /// registry's pack icons. The upload happens exactly once here; a changed
+    /// pack stack applies on the next load/restart like other content.
+    pub fn new_with_sprite_layers(
+        ctx: &RenderContext,
+        block_texture_view: &wgpu::TextureView,
+        block_texture_sampler: &wgpu::Sampler,
+        sprite_layers: &[Vec<u8>],
     ) -> Self {
         let shader = ctx
             .device
@@ -1240,7 +1489,8 @@ impl IconRenderer {
             ],
         });
 
-        let (sprite_view, sprite_sampler) = create_item_sprite_array(&ctx.device, &ctx.queue);
+        let (sprite_view, sprite_sampler) =
+            create_item_sprite_array(&ctx.device, &ctx.queue, sprite_layers);
         let sprite_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui_item_icon_sprite_bind_group"),
             layout: &bind_group_layout,
@@ -1347,6 +1597,7 @@ mod tests {
         CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
         HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
+    use crate::ui::text_input::TextInputAction;
 
     const SLOT: Rect = (10.0, 20.0, 40.0, 40.0);
 
@@ -1926,12 +2177,16 @@ mod tests {
             "main must upload icons after quads and before the render pass"
         );
         assert!(
-            src.contains("hotbar_icon_vertices("),
-            "main must draw the hotbar icons"
+            src.contains("hotbar_icon_vertices_with("),
+            "main must draw the hotbar icons through the registry-aware builder"
         );
         assert!(
-            src.contains("inventory_icon_vertices("),
-            "main must draw the inventory panel icons"
+            src.contains("inventory_icon_vertices_with("),
+            "main must draw the inventory panel icons through the registry-aware builder"
+        );
+        assert!(
+            src.contains("Some(&self.session_registry)"),
+            "icons must resolve pack content through the frozen session registry"
         );
         assert!(
             src.contains("IconDrawList"),
@@ -2327,6 +2582,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn placeholder_pack_items_use_the_reserved_transparent_layer() {
+        let id = ItemId::Item(0);
+        assert_eq!(
+            item_sprite_layer(id),
+            Some(u32::from(crate::content::PLACEHOLDER_ICON_LAYER))
+        );
+        assert_eq!(
+            icon_source(id),
+            Some(IconSource::Sprite(u32::from(
+                crate::content::PLACEHOLDER_ICON_LAYER
+            )))
+        );
+
+        // Layer 27 stays transparent: a placeholder item has no art until a
+        // pack supplies one, and must not alias another material or tool.
+        let layers = generate_item_sprite_layers_rgba();
+        assert!(
+            layers[usize::from(crate::content::PLACEHOLDER_ICON_LAYER)]
+                .iter()
+                .all(|byte| *byte == 0),
+            "the reserved placeholder layer must stay fully transparent"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Sprite batches alongside block cubes (S02-T02)
     // -----------------------------------------------------------------------
@@ -2493,5 +2773,438 @@ mod tests {
         // Both block cubes precede the sprite quad in their own batches, which
         // is what the two-draw renderer relies on.
         assert_eq!(a.len(), 2 * 18 + 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-aware icons and the 256-layer sprite atlas (M010/S04-T03)
+    // -----------------------------------------------------------------------
+
+    use crate::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+    use crate::content::{
+        build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE, PLACEHOLDER_BLOCK_LAYER,
+        PLACEHOLDER_ICON_LAYER,
+    };
+    use crate::world::block::BUILTIN_BLOCK_COUNT;
+
+    fn pack_asset(seed: u8) -> PackAsset {
+        PackAsset {
+            rgba: vec![seed; ITEM_SPRITE_BYTES],
+            source_side: 16,
+        }
+    }
+
+    /// One pack block (`mymod:ruby_ore`, distinct top/side art) and one pack
+    /// item (`mymod:ruby`, its own icon), both resolved with zero errors.
+    fn pack_registry() -> ContentRegistry {
+        let mut spec = PackContentSpec::default();
+        spec.assets
+            .insert("ore_top.png".to_string(), pack_asset(0x11));
+        spec.assets
+            .insert("ore_side.png".to_string(), pack_asset(0x22));
+        spec.assets
+            .insert("ore_bottom.png".to_string(), pack_asset(0x44));
+        spec.assets.insert("ruby.png".to_string(), pack_asset(0x33));
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                top: Some("ore_top.png".to_string()),
+                bottom: Some("ore_bottom.png".to_string()),
+                side: Some("ore_side.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 3.0,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 64,
+            food: None,
+        });
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    #[test]
+    fn composed_sprite_atlas_is_256_layers_and_keeps_the_procedural_base() {
+        let composed = compose_item_sprite_layers(&[]);
+        assert_eq!(composed.len(), ITEM_SPRITE_ARRAY_LAYERS as usize);
+        assert_eq!(composed.len(), 256);
+        assert!(
+            composed
+                .iter()
+                .all(|layer| layer.len() == ITEM_SPRITE_BYTES),
+            "every layer must be 16x16 RGBA"
+        );
+
+        let procedural = generate_item_sprite_layers_rgba();
+        for (layer, (actual, expected)) in composed
+            .iter()
+            .take(ITEM_SPRITE_LAYERS as usize)
+            .zip(procedural.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                actual, expected,
+                "built-in layer {layer} must stay byte-identical"
+            );
+        }
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(ITEM_SPRITE_LAYERS as usize)
+        {
+            assert!(
+                actual.iter().all(|byte| *byte == 0),
+                "unused layer {layer} must stay transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_icons_land_on_layer_32_and_the_rest_stay_transparent() {
+        let icon0 = vec![0x5Au8; ITEM_SPRITE_BYTES];
+        let icon1 = vec![0xA5u8; ITEM_SPRITE_BYTES];
+        let composed = compose_item_sprite_layers(&[icon0.clone(), icon1.clone()]);
+
+        assert_eq!(composed[PACK_ICON_BASE as usize], icon0);
+        assert_eq!(composed[PACK_ICON_BASE as usize + 1], icon1);
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(PACK_ICON_BASE as usize + 2)
+        {
+            assert!(
+                actual.iter().all(|byte| *byte == 0),
+                "layer {layer} must stay transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_pack_icon_list_caps_at_the_reserved_icon_cap() {
+        let icons: Vec<Vec<u8>> = (0..200u16)
+            .map(|index| vec![(index % 251) as u8; ITEM_SPRITE_BYTES])
+            .collect();
+        let composed = compose_item_sprite_layers(&icons);
+        assert_eq!(composed.len(), ITEM_SPRITE_ARRAY_LAYERS as usize);
+
+        let copyable = PACK_ICON_CAP as usize - PACK_ICON_BASE as usize;
+        for (index, icon) in icons.iter().take(copyable).enumerate() {
+            assert_eq!(composed[PACK_ICON_BASE as usize + index], *icon);
+        }
+        for (layer, actual) in composed
+            .iter()
+            .enumerate()
+            .take(ITEM_SPRITE_ARRAY_LAYERS as usize)
+            .skip(PACK_ICON_CAP as usize)
+        {
+            assert!(
+                actual.iter().all(|byte| *byte == 0),
+                "layer {layer} past the icon cap must stay transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_pack_icon_becomes_a_transparent_layer() {
+        let composed = compose_item_sprite_layers(&[vec![0xFF; 100]]);
+        assert_eq!(composed.len(), ITEM_SPRITE_ARRAY_LAYERS as usize);
+        assert!(
+            composed[PACK_ICON_BASE as usize]
+                .iter()
+                .all(|byte| *byte == 0),
+            "a non-1024-byte icon must not reach the GPU atlas"
+        );
+    }
+
+    #[test]
+    fn icon_source_with_matches_icon_source_for_every_carryable_builtin() {
+        let mut carryable = Vec::new();
+        for block in ALL_BLOCKS {
+            if block.is_carryable() {
+                carryable.push(ItemId::Block(block));
+            }
+        }
+        carryable.extend(
+            ALL_MATERIALS
+                .iter()
+                .map(|material| ItemId::Material(*material)),
+        );
+        carryable.extend(all_tools());
+
+        let registry = ContentRegistry::builtin();
+        for id in carryable {
+            assert_eq!(
+                icon_source_with(registry, id),
+                icon_source(id),
+                "built-in icon mapping changed for {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn icon_source_with_resolves_pack_faces_and_item_icon_layer() {
+        let registry = pack_registry();
+        let block = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let def = registry.block(block).expect("pack block resolves");
+
+        match icon_source_with(&registry, ItemId::Block(block)) {
+            Some(IconSource::Block(layers)) => {
+                assert_eq!(layers.top, def.faces[2], "top is +Y");
+                assert_eq!(layers.left, def.faces[4], "left is +Z");
+                assert_eq!(layers.right, def.faces[0], "right is +X");
+                assert_ne!(
+                    layers.top, layers.left,
+                    "distinct top/side art proves the direction mapping"
+                );
+            }
+            other => panic!("pack block icon source was {other:?}"),
+        }
+
+        let item = ItemId::Item(0);
+        let icon_layer = registry.item(0).expect("pack item resolves").icon_layer;
+        assert_eq!(icon_layer, PACK_ICON_BASE);
+        assert_eq!(
+            icon_source_with(&registry, item),
+            Some(IconSource::Sprite(u32::from(icon_layer)))
+        );
+
+        // The composed atlas carries the authored icon bytes at that layer.
+        let composed = compose_item_sprite_layers(registry.pack_icons());
+        assert_eq!(
+            composed[usize::from(icon_layer)],
+            vec![0x33u8; ITEM_SPRITE_BYTES]
+        );
+    }
+
+    #[test]
+    fn icon_source_with_falls_back_to_reserved_placeholder_layers() {
+        let mut registry = ContentRegistry::builtin().clone();
+        let block = registry.append_placeholder_block("mymod:missing");
+        let item = registry.append_placeholder_item("mymod:missing");
+
+        let expected = BlockIconLayers {
+            top: PLACEHOLDER_BLOCK_LAYER,
+            left: PLACEHOLDER_BLOCK_LAYER,
+            right: PLACEHOLDER_BLOCK_LAYER,
+        };
+        assert_eq!(
+            icon_source_with(&registry, ItemId::Block(block)),
+            Some(IconSource::Block(expected))
+        );
+        assert_eq!(
+            icon_source_with(&registry, ItemId::Item(item)),
+            Some(IconSource::Sprite(u32::from(PLACEHOLDER_ICON_LAYER)))
+        );
+
+        // Forged/unknown ids never panic and never alias real pack art.
+        let unknown_block = ItemId::Block(BlockId::Modded(u16::MAX));
+        assert_eq!(
+            icon_source_with(&registry, unknown_block),
+            icon_source(unknown_block)
+        );
+        assert_eq!(
+            icon_source_with(&registry, ItemId::Item(u16::MAX)),
+            Some(IconSource::Sprite(u32::from(PLACEHOLDER_ICON_LAYER)))
+        );
+    }
+
+    #[test]
+    fn draw_list_with_registry_emits_pack_layers_while_new_stays_builtin() {
+        let registry = Arc::new(pack_registry());
+        let block = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let def = registry.block(block).expect("pack block resolves");
+
+        let mut with_block = IconDrawList::with_registry(Arc::clone(&registry));
+        with_block.push_item(Some(item(ItemId::Block(block))), SLOT, 800, 600);
+        assert_eq!(with_block.block.len(), 18);
+        assert_eq!(with_block.block[0].layer, u32::from(def.faces[2]));
+        assert_eq!(with_block.block[6].layer, u32::from(def.faces[4]));
+        assert_eq!(with_block.block[12].layer, u32::from(def.faces[0]));
+        assert_eq!(
+            with_block.block[12].layer,
+            u32::from(PACK_LAYER_BASE),
+            "the first allocated pack face is PACK_LAYER_BASE"
+        );
+
+        // Without a registry the same pack item renders the reserved layer.
+        let mut plain_item = IconDrawList::new();
+        plain_item.push_item(Some(item(ItemId::Item(0))), SLOT, 800, 600);
+        assert_eq!(plain_item.sprite.len(), 6);
+        assert_eq!(
+            plain_item.sprite[0].layer,
+            u32::from(PLACEHOLDER_ICON_LAYER)
+        );
+
+        let mut with_item = IconDrawList::with_registry(registry);
+        with_item.push_item(Some(item(ItemId::Item(0))), SLOT, 800, 600);
+        assert_eq!(with_item.sprite.len(), 6);
+        assert_eq!(with_item.sprite[0].layer, u32::from(PACK_ICON_BASE));
+    }
+
+    #[test]
+    fn draw_list_registry_keeps_builtin_cube_layers_identical() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let layers = |list: &IconDrawList| {
+            list.block
+                .iter()
+                .map(|vertex| vertex.layer)
+                .collect::<Vec<_>>()
+        };
+
+        let mut plain = IconDrawList::new();
+        plain.push_item(Some(item(ItemId::Block(BlockId::OakLog))), SLOT, 800, 600);
+        let mut with_registry = IconDrawList::with_registry(registry);
+        with_registry.push_item(Some(item(ItemId::Block(BlockId::OakLog))), SLOT, 800, 600);
+        assert_eq!(layers(&plain), layers(&with_registry));
+    }
+
+    // -----------------------------------------------------------------------
+    // Creative palette icons (M010/S07-T03)
+    // -----------------------------------------------------------------------
+
+    /// The checked-in reference pack through the same production mapping as
+    /// `main.rs::build_session_registry`.
+    fn reference_registry() -> ContentRegistry {
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let pack = (
+            PackIdentity {
+                folder: spec.folder.clone(),
+                version: spec.version.clone(),
+            },
+            spec.content.clone(),
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    #[test]
+    fn palette_icons_are_empty_while_the_screen_is_closed() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let screen = PaletteScreen::new();
+        let layout = palette::layout(1280, 720);
+
+        assert!(
+            palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720).is_empty()
+        );
+        assert!(palette_icon_vertices_with(None, &screen, &layout, 1280, 720).is_empty());
+    }
+
+    #[test]
+    fn open_builtin_palette_emits_block_and_sprite_icons() {
+        let registry = Arc::new(ContentRegistry::builtin().clone());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            !icons.block.is_empty(),
+            "built-in carryable blocks must draw cube icons"
+        );
+        assert!(
+            !icons.sprite.is_empty(),
+            "built-in materials/tools must draw sprite icons"
+        );
+        for vertex in icons.block.iter().chain(icons.sprite.iter()) {
+            assert!(vertex.clip_pos.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn filtered_palette_icons_draw_exactly_the_matching_entries() {
+        let registry = Arc::new(reference_registry());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        // One authored block match: exactly one 18-vertex cube, no sprites.
+        // Before the fix this resolved `filtered_entry(entry_index)` against
+        // the one-element filtered list and silently drew nothing.
+        screen.apply(TextInputAction::InsertText("mymod:ruby_ore".into()));
+        assert_eq!(screen.filtered().len(), 1);
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert_eq!(
+            icons.block.len(),
+            18,
+            "one filtered block must draw one cube icon"
+        );
+        assert!(
+            icons.sprite.is_empty(),
+            "a filtered block must not draw sprite icons"
+        );
+
+        // One authored item match: exactly one 6-vertex sprite, no cubes.
+        screen.apply(TextInputAction::Clear);
+        screen.apply(TextInputAction::InsertText("mymod:ruby_pickaxe".into()));
+        assert_eq!(screen.filtered().len(), 1);
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            icons.block.is_empty(),
+            "a filtered item must not draw block cubes"
+        );
+        assert_eq!(
+            icons.sprite.len(),
+            6,
+            "one filtered item must draw one sprite icon"
+        );
+    }
+
+    #[test]
+    fn palette_icons_resolve_pack_blocks_and_items_through_the_registry() {
+        let registry = Arc::new(reference_registry());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        assert!(
+            screen
+                .entries()
+                .iter()
+                .any(|entry| entry.name == "mymod:ruby_ore"),
+            "the pack block must be listed"
+        );
+        assert!(
+            screen
+                .entries()
+                .iter()
+                .any(|entry| entry.name == "mymod:ruby"),
+            "the pack item must be listed"
+        );
+
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            icons
+                .block
+                .iter()
+                .any(|vertex| vertex.layer >= u32::from(PACK_LAYER_BASE)),
+            "the pack block icon must sample a registry-authored layer"
+        );
+        assert!(
+            icons
+                .sprite
+                .iter()
+                .any(|vertex| vertex.layer >= u32::from(PACK_ICON_BASE)),
+            "the pack item/tool icons must sample registry-authored layers"
+        );
     }
 }

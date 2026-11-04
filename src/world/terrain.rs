@@ -1,3 +1,4 @@
+use crate::content::WorldgenRule;
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
 use crate::world::loot::LootEntry;
@@ -354,6 +355,11 @@ const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
 const COAL_DEPTH_BAND: (i32, i32) = (4, 36);
 const IRON_DEPTH_BAND: (i32, i32) = (12, 90);
 
+/// Built-in ore-stream salt. Pack rules must never reuse this value: a pack
+/// stream seeded with it would consume the same sequence as coal/iron and
+/// could no longer be proven byte-identical to an empty-rule generation.
+const BUILTIN_ORE_SALT: u32 = 0x000F_E51D;
+
 #[inline]
 fn ore_depth_band(ore: BlockId) -> Option<(i32, i32)> {
     match ore {
@@ -379,6 +385,93 @@ fn can_place_ore(block: BlockId, wy: i32, surface: i32, ore: BlockId) -> bool {
         }
         None => false,
     }
+}
+
+/// One FNV-1a step over a little-endian `u32`.
+#[inline]
+fn fnv1a_u32(mut hash: u32, value: u32) -> u32 {
+    for byte in value.to_le_bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Stable discriminant for the biome list inside a patch rule.
+#[inline]
+fn biome_discriminant(biome: Biome) -> u32 {
+    match biome {
+        Biome::Plains => 0,
+        Biome::Forest => 1,
+        Biome::Mountains => 2,
+        Biome::Ocean => 3,
+    }
+}
+
+/// Deterministic per-rule stream salt.
+///
+/// Hand-rolled FNV-1a over the rule's discriminant, authored block ids and
+/// every numeric/biome field. Never `DefaultHasher`, never a clock, and never
+/// the built-in ore salt: that independence is what lets the built-in coal and
+/// iron streams stay byte-identical no matter which pack rules are installed.
+fn pack_rule_salt(index: usize, rule: &WorldgenRule) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    hash = fnv1a_u32(hash, index as u32);
+    match rule {
+        WorldgenRule::Ore {
+            block,
+            replace,
+            min_y,
+            max_y,
+            vein,
+            attempts,
+        } => {
+            hash = fnv1a_u32(hash, 0x0E1A_0001);
+            hash = fnv1a_u32(hash, block.to_raw() as u32);
+            hash = fnv1a_u32(hash, replace.to_raw() as u32);
+            hash = fnv1a_u32(hash, *min_y as u32);
+            hash = fnv1a_u32(hash, *max_y as u32);
+            hash = fnv1a_u32(hash, *vein as u32);
+            hash = fnv1a_u32(hash, *attempts as u32);
+        }
+        WorldgenRule::Patch {
+            block,
+            replace,
+            biomes,
+            min_y,
+            max_y,
+            chance,
+        } => {
+            hash = fnv1a_u32(hash, 0x0A7C_0002);
+            hash = fnv1a_u32(hash, block.to_raw() as u32);
+            hash = fnv1a_u32(hash, replace.to_raw() as u32);
+            hash = fnv1a_u32(hash, *min_y as u32);
+            hash = fnv1a_u32(hash, *max_y as u32);
+            hash = fnv1a_u32(hash, chance.to_bits());
+            for biome in biomes {
+                hash = fnv1a_u32(hash, biome_discriminant(*biome));
+            }
+        }
+    }
+    if hash == BUILTIN_ORE_SALT {
+        hash ^= 1;
+    }
+    hash
+}
+
+/// Pack ore guards: authored host, inside the stone band, and inside the
+/// authored world-Y band. Checked for the selected start and re-checked for
+/// every grown cell, exactly like [`can_place_ore`].
+#[inline]
+fn can_place_pack_ore(
+    block: BlockId,
+    wy: i32,
+    surface: i32,
+    replace: BlockId,
+    min_y: i32,
+    max_y: i32,
+) -> bool {
+    block == replace && is_inside_stone_band(wy, surface) && (min_y..=max_y).contains(&wy)
 }
 
 /// Stone cells with at least one in-chunk Air neighbor that is itself below
@@ -441,7 +534,7 @@ fn place_ore_veins(
     seed: u32,
 ) {
     let base_wy = pos.y * CHUNK_SIZE as i32;
-    let mut rng = Xorshift32::new(hash3d(pos.x, pos.y, pos.z, seed ^ 0x000F_E51D));
+    let mut rng = Xorshift32::new(hash3d(pos.x, pos.y, pos.z, seed ^ BUILTIN_ORE_SALT));
     let exposed = exposed_stone_cells(chunk, heights, pos);
     let max_local = CHUNK_SIZE as i32 - 1;
 
@@ -470,6 +563,107 @@ fn place_ore_veins(
                     chunk.set(lx, ly, lz, ore);
                 }
                 if step + 1 == steps {
+                    break;
+                }
+                let (dx, dy, dz) = NEIGHBOR_OFFSETS[(rng.next() % 6) as usize];
+                lx = (lx as i32 + dx).clamp(0, max_local) as usize;
+                ly = (ly as i32 + dy).clamp(0, max_local) as usize;
+                lz = (lz as i32 + dz).clamp(0, max_local) as usize;
+            }
+        }
+    }
+}
+
+/// Place authored pack ore veins.
+///
+/// Runs after the built-in coal/iron pass on a fresh, independent xorshift
+/// stream per rule, so the built-in ore cells stay byte-identical to an
+/// empty-rule generation. Candidate starts come from one linear scan that
+/// honours the authored host block (`rule.replace`) and Y band; this avoids
+/// `exposed_stone_cells`' hardcoded Stone assumption and gives a non-Stone
+/// host a chance to spawn. Growth mirrors [`place_ore_veins`]: chunk-local
+/// neighbour steps with `clamp(0, 31)`, re-checking every guard per cell.
+fn place_pack_ore_veins(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+    seed: u32,
+    rules: &[WorldgenRule],
+) {
+    if rules.is_empty() {
+        return;
+    }
+
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+    let max_local = CHUNK_SIZE as i32 - 1;
+
+    for (rule_index, rule) in rules.iter().enumerate() {
+        let (block, replace, min_y, max_y, vein, attempts) = match rule {
+            WorldgenRule::Ore {
+                block,
+                replace,
+                min_y,
+                max_y,
+                vein,
+                attempts,
+            } => (*block, *replace, *min_y, *max_y, *vein, *attempts),
+            WorldgenRule::Patch { .. } => continue,
+        };
+
+        // One scan per rule: every cell that currently satisfies the authored
+        // host, stone-band and Y-band guards. Built earlier rules may already
+        // have rewritten some cells, which those rules' own bands decide.
+        let mut candidates: Vec<u16> = Vec::new();
+        for (lz, row) in heights.iter().enumerate() {
+            for ly in 0..CHUNK_SIZE {
+                let wy = base_wy + ly as i32;
+                for (lx, &surface) in row.iter().enumerate() {
+                    if can_place_pack_ore(chunk.get(lx, ly, lz), wy, surface, replace, min_y, max_y)
+                    {
+                        candidates.push(linear_index(lx, ly, lz) as u16);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let mut rng = Xorshift32::new(hash3d(
+            pos.x,
+            pos.y,
+            pos.z,
+            seed ^ pack_rule_salt(rule_index, rule),
+        ));
+
+        for _ in 0..attempts {
+            let start = candidates[(rng.next() as usize) % candidates.len()];
+            let (mut lx, mut ly, mut lz) = local_coords_from_index(start);
+            let start_wy = base_wy + ly as i32;
+            if !can_place_pack_ore(
+                chunk.get(lx, ly, lz),
+                start_wy,
+                heights[lz][lx],
+                replace,
+                min_y,
+                max_y,
+            ) {
+                continue;
+            }
+
+            for step in 0..vein as usize {
+                let wy = base_wy + ly as i32;
+                if can_place_pack_ore(
+                    chunk.get(lx, ly, lz),
+                    wy,
+                    heights[lz][lx],
+                    replace,
+                    min_y,
+                    max_y,
+                ) {
+                    chunk.set(lx, ly, lz, block);
+                }
+                if step + 1 == vein as usize {
                     break;
                 }
                 let (dx, dy, dz) = NEIGHBOR_OFFSETS[(rng.next() % 6) as usize];
@@ -584,6 +778,78 @@ fn place_surface_ruins(
                 continue;
             }
             place_ruin_at(chunk, heights, base_wy, spec);
+        }
+    }
+}
+
+/// Place authored pack surface patches.
+///
+/// Runs last, after built-in ruins, and only ever rewrites the column's own
+/// surface cell (`wy == h`). It never writes above the surface, so trees,
+/// leaves, ruin shells and loot chests are structurally untouchable no matter
+/// what a pack authors. Each rule has its own xorshift stream and rolls at most
+/// once per eligible column in `(lz, lx)` order.
+fn place_pack_surface_patches(
+    chunk: &mut Chunk,
+    heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+    biomes: &[[Biome; CHUNK_SIZE]; CHUNK_SIZE],
+    pos: ChunkPos,
+    seed: u32,
+    rules: &[WorldgenRule],
+) {
+    if rules.is_empty() {
+        return;
+    }
+
+    let base_wy = pos.y * CHUNK_SIZE as i32;
+
+    for (rule_index, rule) in rules.iter().enumerate() {
+        let (block, replace, rule_biomes, min_y, max_y, chance) = match rule {
+            WorldgenRule::Patch {
+                block,
+                replace,
+                biomes,
+                min_y,
+                max_y,
+                chance,
+            } => (*block, *replace, biomes, *min_y, *max_y, *chance),
+            WorldgenRule::Ore { .. } => continue,
+        };
+        if chance <= 0.0 {
+            continue;
+        }
+
+        let mut rng = Xorshift32::new(hash3d(
+            pos.x,
+            pos.y,
+            pos.z,
+            seed ^ pack_rule_salt(rule_index, rule),
+        ));
+
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let h = heights[lz][lx];
+                let surface_ly = h - base_wy;
+                if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                    continue;
+                }
+                if !rule_biomes.contains(&biomes[lz][lx]) {
+                    continue;
+                }
+                if !(min_y..=max_y).contains(&h) {
+                    continue;
+                }
+                let surface_ly = surface_ly as usize;
+                if chunk.get(lx, surface_ly, lz) != replace {
+                    continue;
+                }
+                // Uniform [0, 1): the denominator is one past u32::MAX, so a
+                // chance of 1.0 always passes instead of flaking on u32::MAX.
+                let roll = rng.next() as f64 / 4_294_967_296.0;
+                if roll < chance as f64 {
+                    chunk.set(lx, surface_ly, lz, block);
+                }
+            }
         }
     }
 }
@@ -1355,6 +1621,32 @@ fn seasonal_land_surface(season: Season) -> BlockId {
 /// season-blind Mountain altitude snow cap are untouched, so a seasonal
 /// blanket can never be confused with the altitude cap.
 pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk {
+    generate_chunk_seeded_with(pos, seed, season, &[])
+}
+
+/// Generates `pos` for `seed` under `calendar season` and the given pack
+/// worldgen `rules`.
+///
+/// This is the single generation body; [`generate_chunk_seeded`] is the
+/// empty-rule wrapper, so a world with no pack rules reproduces the pre-M010
+/// generator byte-for-byte by construction. Rules run in authored order after
+/// the built-in passes:
+///
+/// 1. built-in terrain, caves and trees
+/// 2. built-in coal/iron veins (own stream, always byte-identical)
+/// 3. pack ore veins (one independent stream per rule)
+/// 4. built-in surface ruins
+/// 5. pack surface patches (one independent stream per rule)
+///
+/// Both early returns (high sky and all-above-terrain uniform Air) and
+/// `try_compress` stay exactly as they were, so an empty rule slice is not
+/// merely equivalent but work-free.
+pub fn generate_chunk_seeded_with(
+    pos: ChunkPos,
+    seed: u32,
+    season: Season,
+    rules: &[WorldgenRule],
+) -> Chunk {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
@@ -1544,10 +1836,16 @@ pub fn generate_chunk_seeded(pos: ChunkPos, seed: u32, season: Season) -> Chunk 
     }
 
     place_ore_veins(&mut chunk, &heights, pos, seed);
+    // Pack ore runs after built-in coal/iron and before ruins, each rule on
+    // its own stream; the built-in ore cells are therefore untouched.
+    place_pack_ore_veins(&mut chunk, &heights, pos, seed, rules);
     // Third structure pass (S07): after ores, so a ruin can never be carved by
     // the ore pass, and after trees, so the tree-overlap policy can see the
     // actual OakLog cells it refuses to overwrite.
     place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed);
+    // Pack patches run last and only touch `wy == h`, so no structure or
+    // canopy cell can ever be rewritten.
+    place_pack_surface_patches(&mut chunk, &heights, &biomes, pos, seed, rules);
     chunk.try_compress();
     chunk
 }
@@ -1954,7 +2252,15 @@ mod tests {
                                 for lx in 0..CHUNK_SIZE {
                                     let block = chunk.get(lx, ly, lz);
                                     if matches!(block, BlockId::CoalOre | BlockId::IronOre) {
-                                        layout.push((pos.x, pos.y, pos.z, lx, ly, lz, block as u8));
+                                        layout.push((
+                                            pos.x,
+                                            pos.y,
+                                            pos.z,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            block.to_raw() as u8,
+                                        ));
                                     }
                                 }
                             }
@@ -3266,7 +3572,7 @@ mod tests {
                                         cx * CHUNK_SIZE as i32 + lx as i32,
                                         cy * CHUNK_SIZE as i32 + ly as i32,
                                         cz * CHUNK_SIZE as i32 + lz as i32,
-                                        block as u8,
+                                        block.to_raw() as u8,
                                     ));
                                 }
                             }
@@ -3464,7 +3770,7 @@ mod tests {
         );
         let brick_cells = blocks
             .iter()
-            .filter(|b| b.3 == BlockId::Brick as u8)
+            .filter(|b| b.3 == BlockId::Brick.to_raw() as u8)
             .count();
         assert!(
             brick_cells >= 4,
@@ -3506,7 +3812,8 @@ mod tests {
             let on_shell = covering.iter().any(|spec| {
                 let dx = wx - spec.anchor_x;
                 let dz = wz - spec.anchor_z;
-                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF && ruin_wall_block(dx, dz) as u8 == id
+                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF
+                    && ruin_wall_block(dx, dz).to_raw() as u8 == id
             });
             assert!(
                 on_shell,
@@ -5061,6 +5368,432 @@ mod tests {
             generated_block_at(wx, top, wz, seed, Season::Summer),
             BlockId::OakLeaves,
             "shoreline tree at ({wx}, {wz}) lost its canopy top at ({wx}, {top}, {wz})"
+        );
+    }
+
+    /// FNV-1a 64 over every cell in `linear_index` order (x fastest, then z,
+    /// then y), hashing each block id as a little-endian `u16`.
+    ///
+    /// Deliberately local to this test module: the identity refactor swapped
+    /// the `block as u8` expression for `to_raw()` without moving the pinned
+    /// literals.
+    fn fnv1a64_chunk_baseline(chunk: &Chunk) -> (Option<BlockId>, usize, u64) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut non_air = 0usize;
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    debug_assert_eq!(linear_index(x, y, z), y * 1024 + z * 32 + x);
+                    let block = chunk.get(x, y, z);
+                    if block != BlockId::Air {
+                        non_air += 1;
+                    }
+                    for byte in block.to_raw().to_le_bytes() {
+                        hash ^= byte as u64;
+                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+            }
+        }
+        (chunk.is_uniform(), non_air, hash)
+    }
+
+    #[test]
+    fn pinned_terrain_generation_matches_pre_m010_baseline() {
+        let cases = [
+            (ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer),
+            (ChunkPos::new(0, 1, 0), 1337, Season::Winter),
+            (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
+        ];
+        // (uniform, non_air_cells, FNV-1a 64 digest) captured from the
+        // unmodified pre-M010 generator. These are the behavior-preservation
+        // gate for S01: any terrain drift must fail here, not merely differ
+        // from a second run of the same code.
+        let expected: [(Option<BlockId>, usize, u64); 3] = [
+            (None, 26_913, 5_429_992_561_724_371_152),
+            (None, 20_878, 8_773_073_591_056_755_479),
+            (Some(BlockId::Air), 0, 16_934_947_671_703_429_925),
+        ];
+
+        for ((pos, seed, season), expected) in cases.into_iter().zip(expected) {
+            let chunk = generate_chunk_seeded(pos, seed, season);
+            let actual = fnv1a64_chunk_baseline(&chunk);
+            assert_eq!(
+                actual, expected,
+                "pre-M010 terrain baseline drifted for pos {pos:?}, seed {seed}, {season:?}"
+            );
+        }
+    }
+
+    fn assert_chunks_equal(actual: &Chunk, expected: &Chunk, context: &str) {
+        assert_eq!(
+            actual.is_uniform(),
+            expected.is_uniform(),
+            "{context}: uniform-ness differs"
+        );
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        actual.get(lx, ly, lz),
+                        expected.get(lx, ly, lz),
+                        "{context}: cell ({lx}, {ly}, {lz}) differs"
+                    );
+                }
+            }
+        }
+    }
+
+    fn cells_of(chunk: &Chunk, block: BlockId) -> Vec<(usize, usize, usize)> {
+        let mut cells = Vec::new();
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if chunk.get(lx, ly, lz) == block {
+                        cells.push((lx, ly, lz));
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    fn changed_cells(actual: &Chunk, legacy: &Chunk) -> Vec<(usize, usize, usize)> {
+        let mut cells = Vec::new();
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if actual.get(lx, ly, lz) != legacy.get(lx, ly, lz) {
+                        cells.push((lx, ly, lz));
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn empty_rule_set_matches_the_legacy_generator() {
+        let cases = [
+            (ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer),
+            (ChunkPos::new(0, 1, 0), 1337, Season::Winter),
+            (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
+        ];
+        for (pos, seed, season) in cases {
+            let legacy = generate_chunk_seeded(pos, seed, season);
+            let with_empty = generate_chunk_seeded_with(pos, seed, season, &[]);
+            assert_chunks_equal(
+                &with_empty,
+                &legacy,
+                &format!("empty rules for pos {pos:?}, seed {seed}, {season:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn pack_ore_rule_places_authored_block_inside_its_band() {
+        let pos = ChunkPos::new(2, 0, -2);
+        let seed = 424_242;
+        let season = Season::Summer;
+        let rules = [WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: 4,
+            max_y: 20,
+            vein: 6,
+            attempts: 12,
+        }];
+        let legacy = generate_chunk_seeded(pos, seed, season);
+        let generated = generate_chunk_seeded_with(pos, seed, season, &rules);
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+
+        // Diff against the legacy chunk so pre-existing ruin Brick cells (which
+        // stand above the surface) are not mistaken for authored ore.
+        let mut placed = Vec::new();
+        for (lx, ly, lz) in changed_cells(&generated, &legacy) {
+            if generated.get(lx, ly, lz) == BlockId::Brick {
+                let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+                let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+                let wy = base_wy + ly as i32;
+                let surface = terrain_height_at_seeded(wx, wz, seed);
+                assert!(
+                    (4..=20).contains(&wy),
+                    "authored ore escaped its Y band at ({wx}, {wy}, {wz})"
+                );
+                assert!(
+                    wy > -32,
+                    "authored ore reached the bedrock floor at ({wx}, {wy}, {wz})"
+                );
+                assert!(
+                    wy < surface - 3,
+                    "authored ore punched the surface skin at ({wx}, {wy}, {wz}): surface {surface}"
+                );
+                placed.push((wx, wy, wz));
+            }
+        }
+        assert!(
+            !placed.is_empty(),
+            "the first-proof ore rule must place at least one Brick cell"
+        );
+    }
+
+    #[test]
+    fn pack_ore_rule_does_not_alter_coal_or_iron() {
+        let cases = [
+            (ChunkPos::new(0, -1, 0), DEFAULT_WORLD_SEED, Season::Summer),
+            (ChunkPos::new(0, 1, 0), 1337, Season::Winter),
+            (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
+        ];
+        // Broad authored band so the rule actually runs in every non-uniform
+        // pinned case; the comparison is still exact cell-set equality.
+        let rules = [WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: -64,
+            max_y: 128,
+            vein: 8,
+            attempts: 32,
+        }];
+        for (pos, seed, season) in cases {
+            let legacy = generate_chunk_seeded(pos, seed, season);
+            let generated = generate_chunk_seeded_with(pos, seed, season, &rules);
+            assert_eq!(
+                cells_of(&generated, BlockId::CoalOre),
+                cells_of(&legacy, BlockId::CoalOre),
+                "pack ore moved coal cells for pos {pos:?}, seed {seed}, {season:?}"
+            );
+            assert_eq!(
+                cells_of(&generated, BlockId::IronOre),
+                cells_of(&legacy, BlockId::IronOre),
+                "pack ore moved iron cells for pos {pos:?}, seed {seed}, {season:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_ore_rules_are_independent() {
+        let pos = ChunkPos::new(2, 0, -2);
+        let seed = 424_242;
+        let season = Season::Summer;
+        // Different host blocks: neither rule's candidate scan can consume a
+        // cell the other rule writes, so their placements are independent even
+        // though both bands cover the whole chunk.
+        let rule_a = WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: -64,
+            max_y: 128,
+            vein: 6,
+            attempts: 16,
+        };
+        let rule_b = WorldgenRule::Ore {
+            block: BlockId::CraftingTable,
+            replace: BlockId::CoalOre,
+            min_y: -64,
+            max_y: 128,
+            vein: 4,
+            attempts: 16,
+        };
+        let legacy = generate_chunk_seeded(pos, seed, season);
+        let only_a = generate_chunk_seeded_with(pos, seed, season, std::slice::from_ref(&rule_a));
+        // The per-rule salt includes the authored slice index, so hold rule B
+        // at index 1 with a no-op placeholder that neither pass acts on.
+        let noop = WorldgenRule::Patch {
+            block: BlockId::Brick,
+            replace: BlockId::Grass,
+            biomes: vec![Biome::Plains],
+            min_y: 0,
+            max_y: 0,
+            chance: 0.0,
+        };
+        let only_b = generate_chunk_seeded_with(pos, seed, season, &[noop, rule_b.clone()]);
+        let both = generate_chunk_seeded_with(pos, seed, season, &[rule_a.clone(), rule_b.clone()]);
+        let both_again =
+            generate_chunk_seeded_with(pos, seed, season, &[rule_a.clone(), rule_b.clone()]);
+
+        assert!(
+            !changed_cells(&only_a, &legacy).is_empty(),
+            "the first independent rule must place cells"
+        );
+        assert!(
+            !changed_cells(&only_b, &legacy).is_empty(),
+            "the second independent rule must place cells"
+        );
+        assert_eq!(
+            cells_of(&only_a, BlockId::Brick),
+            cells_of(&both, BlockId::Brick),
+            "rule A's cells changed when rule B was also installed"
+        );
+        assert_eq!(
+            cells_of(&only_b, BlockId::CraftingTable),
+            cells_of(&both, BlockId::CraftingTable),
+            "rule B's cells changed when rule A was also installed"
+        );
+        assert_chunks_equal(&both, &both_again, "two rule runs must be identical");
+    }
+
+    #[test]
+    fn pack_patch_rule_replaces_only_the_matching_surface_cell() {
+        let pos = ChunkPos::new(2, 0, -2);
+        let seed = 424_242;
+        let season = Season::Summer;
+        let legacy = generate_chunk_seeded(pos, seed, season);
+        let rules = [WorldgenRule::Patch {
+            block: BlockId::Brick,
+            replace: BlockId::Grass,
+            biomes: vec![Biome::Plains, Biome::Forest],
+            min_y: -64,
+            max_y: 128,
+            chance: 1.0,
+        }];
+        let generated = generate_chunk_seeded_with(pos, seed, season, &rules);
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+
+        // The pinned chunk must contain a structure so the surface-only proof
+        // is not vacuous.
+        assert!(
+            !cells_of(&legacy, BlockId::OakLog).is_empty()
+                || !cells_of(&legacy, BlockId::LootChest).is_empty(),
+            "pinned chunk must contain a tree or ruin"
+        );
+
+        let mut changed_surfaces = 0usize;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+                let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+                let h = terrain_height_at_seeded(wx, wz, seed);
+                let biome = biome_for_height(h, forest_noise(wx, wz, seed));
+                let surface_ly = h - base_wy;
+                if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
+                    continue;
+                }
+                let surface_ly = surface_ly as usize;
+                let expected = if legacy.get(lx, surface_ly, lz) == BlockId::Grass
+                    && matches!(biome, Biome::Plains | Biome::Forest)
+                {
+                    changed_surfaces += 1;
+                    BlockId::Brick
+                } else {
+                    legacy.get(lx, surface_ly, lz)
+                };
+                assert_eq!(
+                    generated.get(lx, surface_ly, lz),
+                    expected,
+                    "surface cell ({lx}, {surface_ly}, {lz}) did not follow the patch rule"
+                );
+                for ly in 0..CHUNK_SIZE {
+                    if ly == surface_ly {
+                        continue;
+                    }
+                    assert_eq!(
+                        generated.get(lx, ly, lz),
+                        legacy.get(lx, ly, lz),
+                        "patch touched a non-surface cell at ({lx}, {ly}, {lz})"
+                    );
+                }
+            }
+        }
+        assert!(
+            changed_surfaces > 0,
+            "the chance-1.0 patch must replace at least one Grass surface"
+        );
+    }
+
+    #[test]
+    fn pack_patch_rule_respects_biome_and_y_bounds() {
+        let pos = ChunkPos::new(2, 0, 2);
+        let seed = 424_242;
+        let season = Season::Summer;
+        let legacy = generate_chunk_seeded(pos, seed, season);
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+
+        let forest_only = [WorldgenRule::Patch {
+            block: BlockId::Brick,
+            replace: BlockId::Grass,
+            biomes: vec![Biome::Forest],
+            min_y: -64,
+            max_y: 128,
+            chance: 1.0,
+        }];
+        let generated = generate_chunk_seeded_with(pos, seed, season, &forest_only);
+        let mut forest_surfaces = 0usize;
+        for (lx, ly, lz) in changed_cells(&generated, &legacy) {
+            let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+            let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+            let h = terrain_height_at_seeded(wx, wz, seed);
+            let biome = biome_for_height(h, forest_noise(wx, wz, seed));
+            assert_eq!(biome, Biome::Forest, "patch left its authored biome list");
+            assert_eq!(base_wy + ly as i32, h, "patch wrote off the surface cell");
+            assert_eq!(legacy.get(lx, ly, lz), BlockId::Grass);
+            forest_surfaces += 1;
+        }
+        assert!(
+            forest_surfaces > 0,
+            "the pinned chunk must contain at least one Forest Grass surface"
+        );
+
+        // A rule whose authored Y band excludes every surface in the chunk
+        // must be a full no-op.
+        let out_of_band = [WorldgenRule::Patch {
+            block: BlockId::Brick,
+            replace: BlockId::Grass,
+            biomes: vec![Biome::Plains, Biome::Forest],
+            min_y: 200,
+            max_y: 300,
+            chance: 1.0,
+        }];
+        let excluded = generate_chunk_seeded_with(pos, seed, season, &out_of_band);
+        assert_chunks_equal(&excluded, &legacy, "out-of-band patch must be a no-op");
+    }
+
+    #[test]
+    fn pack_rules_allow_air_as_an_authored_block() {
+        let pos = ChunkPos::new(2, 0, -2);
+        let seed = 424_242;
+        let season = Season::Summer;
+        let legacy = generate_chunk_seeded(pos, seed, season);
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+
+        // Air replaced by Air is a documented no-op, not a panic or a
+        // validation error.
+        let air_to_air = [WorldgenRule::Ore {
+            block: BlockId::Air,
+            replace: BlockId::Air,
+            min_y: -64,
+            max_y: 128,
+            vein: 6,
+            attempts: 12,
+        }];
+        let unchanged = generate_chunk_seeded_with(pos, seed, season, &air_to_air);
+        assert_chunks_equal(&unchanged, &legacy, "Air -> Air ore must be a no-op");
+
+        // Air authored as the replacement output clears only cells that pass
+        // the same host/stone-band/Y-band guards as any other ore rule.
+        let air_clears_stone = [WorldgenRule::Ore {
+            block: BlockId::Air,
+            replace: BlockId::Stone,
+            min_y: -64,
+            max_y: 128,
+            vein: 6,
+            attempts: 12,
+        }];
+        let cleared = generate_chunk_seeded_with(pos, seed, season, &air_clears_stone);
+        let mut cleared_cells = 0usize;
+        for (lx, ly, lz) in changed_cells(&cleared, &legacy) {
+            let wx = pos.x * CHUNK_SIZE as i32 + lx as i32;
+            let wz = pos.z * CHUNK_SIZE as i32 + lz as i32;
+            let wy = base_wy + ly as i32;
+            let surface = terrain_height_at_seeded(wx, wz, seed);
+            assert_eq!(legacy.get(lx, ly, lz), BlockId::Stone);
+            assert_eq!(cleared.get(lx, ly, lz), BlockId::Air);
+            assert!(wy > -32, "Air rule reached the bedrock floor");
+            assert!(wy < surface - 3, "Air rule punched the surface skin");
+            cleared_cells += 1;
+        }
+        assert!(
+            cleared_cells > 0,
+            "Air-as-output ore rule must clear at least one Stone cell"
         );
     }
 }

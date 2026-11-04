@@ -9,7 +9,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
 *   **Dynamic Chunk Streaming**: Chunks are loaded, unloaded, and meshed in the background as the player moves through the world.
 *   **World Persistence**: Save and load game worlds, including player state, chunk edits, and world seed. A filesystem-based world catalog allows for managing multiple saved games.
 *   **Survival and Creative Modes**: New worlds default to Survival. Survival has 20 health, 20 hunger, and 300 air, shown as a hearts/hunger/air HUD; fall, drowning, and starvation damage; a Death screen with Respawn and Quit (respawn at the deterministic spawn with your inventory kept); hold-to-eat apples and bread; hoe-based wheat farming that pauses in Winter; 27-slot chests; and deterministic ruin loot. Creative keeps flying and building, is invulnerable, never hungry, never loses air, is never targeted or damaged by mobs, and one-shots any mob with its drops intact. The mode is chosen at creation and locked; the mob rule follows the *effective* mode, so Edit Background inherits Creative's immunity and one-shot swings while the background world keeps its stored mode.
-*   **Mobs and Combat**: Four mobs share the world — Pig and Cow are passive, Zombie and Skeleton are hostile. Passives spawn on lit grass by day and flee when hit; hostiles spawn at night or in caves, with zombies chasing and meleeing while skeletons keep their distance and shoot arrows. Fight with your fists, a sword, or a shortbow, and kills drop straight into your inventory. Spawns respect a 24-block safe radius, a 32-mob global cap, and at most 4 mobs per 32-block region. The Death screen names the cause (Zombie or Skeleton arrow, alongside Fall, Drowning, and Starvation). Live mobs persist in version 7 saves with kind, position, facing, and health. Creative players are never targeted or damaged and one-shot any mob with drops intact. Mob art and audio are pack-overridable.
+*   **Mobs and Combat**: Four mobs share the world — Pig and Cow are passive, Zombie and Skeleton are hostile. Passives spawn on lit grass by day and flee when hit; hostiles spawn at night or in caves, with zombies chasing and meleeing while skeletons keep their distance and shoot arrows. Fight with your fists, a sword, or a shortbow, and kills drop straight into your inventory. Spawns respect a 24-block safe radius, a 32-mob global cap, and at most 4 mobs per 32-block region. The Death screen names the cause (Zombie or Skeleton arrow, alongside Fall, Drowning, and Starvation). Live mobs persist in version 8 saves with kind, position, facing, and health. Creative players are never targeted or damaged and one-shot any mob with drops intact. Mob art and audio are pack-overridable.
 *   **Mob and Combat Audio**: Nine built-in generated sounds — block break, block place, mine-complete, UI click, mob idle, mob hurt, mob death, bow release, and arrow impact. A texture pack can override any of them per file; a missing file silently keeps the built-in sound and a corrupt one falls back with a menu warning. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md#sounds).
 *   **Player Physics and Controls**:
     *   Walk mode with collision detection, gravity, jumping, and sprinting.
@@ -20,11 +20,13 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Adjustable mouse sensitivity, field of view (FOV), render distance, VSync, and fullscreen settings.
     *   Settings are saved to and loaded from a `settings.toml` file.
 *   **Texture Packs**: Swap block and mob textures plus menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. The texture array has 48 layers: 23 authorable block textures (the original 16 plus Farmland, four Wheat stages, Chest, and LootChest) and 13 authorable mob part textures, each with optional per-layer overrides; a pack that supplies only the original 16 block layers falls back per layer to the built-in procedural art. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
+*   **Data-Only Content Packs**: A `format_version = 2` pack adds blocks, items, food, custom tool tiers and tools, shaped recipes, per-field block patches, recipe toggles, and declarative ore or surface worldgen without writing code. Save format 8 stores content by name, so a removed pack's blocks and items survive as readable placeholders and resolve again when the pack returns; a changed stack reports a non-blocking notice, and `--validate-pack` checks a pack headlessly. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#format-v2).
 *   **Customizable Menu Background**: The panorama behind the main menu is its own saved world at `saves/background/background.mcvx`. Choose **Edit Background** on the main menu to build it with the normal controls; the menu resumes your saved vantage point, time of day, and season. A missing or unreadable file falls back to the built-in scenery and never blocks launch.
-*   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. Version 7 saves round-trip the game mode, health/hunger/air, every chest's contents, and every live mob's kind, position, facing, and health; version 1-6 saves load with no mobs, and version 1-5 saves also load as Creative with full vitals. Malformed mob data is rejected rather than skipped. See the [save and release notes](docs/SAVE-NOTES.md).
+*   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. Version 8 saves round-trip the game mode, health/hunger/air, every chest's contents, every live mob's kind, position, facing, and health, and the save-local content names; version 1-7 saves load and gain the newer tails on the next save, and version 1-5 saves also load as Creative with full vitals. Malformed mob or content data is rejected rather than skipped. See the [save and release notes](docs/SAVE-NOTES.md).
 *   **Comprehensive UI System**:
     *   Main Menu (including Edit Background), New Game, Load Game, and Pause screens.
     *   Chest screen (27 chest slots plus the 36-slot player inventory) and Death screen (Respawn and Quit).
+    *   Searchable Creative palette (Creative mode, key **C**): lists every non-placeholder built-in and pack block, item, and tool; filters by name, display name, or namespace; and grants the full authored stack/durability into the hotbar. Placeholders never appear. Pack changes apply on the next world load because the session registry is frozen.
     *   In-game settings menu for live adjustments.
     *   UI logic is decoupled from rendering, built with `glyphon` for text rendering.
 
@@ -96,7 +98,7 @@ cargo run --release -- --new --seed 4242 --save "saves/new_world.mcvx"
 
 ### Demo and smoke scripts
 
-The repository's real-binary checks live under `scripts/`. `scripts/combat_smoke.sh` builds the game and runs the full `--demo-combat` capstone in an isolated temporary directory, then asserts the pinned digest lines, the 218-byte version 7 save witness, and the frame p95 budget. Debug is the default:
+The repository's real-binary checks live under `scripts/`. `scripts/combat_smoke.sh` builds the game and runs the full `--demo-combat` capstone in an isolated temporary directory, then asserts the pinned digest lines, the 307-byte version 8 save witness, and the frame p95 budget. Debug is the default:
 
 ```bash
 bash scripts/combat_smoke.sh
@@ -124,6 +126,20 @@ SMOKE_PROFILE=release bash scripts/ui_smoke.sh
 
 `--demo-ui` can also be run directly (`target/debug/opencraft --demo-ui`). It prints the same three pinned `ui_demo:` lines and exits before creating a world, loading a save, or opening a window.
 
+`scripts/modding_smoke.sh` is the real-binary proof for the data-only content packs. It checks the `--validate-pack` exit codes for a valid, broken, and missing pack, runs a bounded launch with a broken pack, and repeats the authoring-doc reader-test. The checked-in reference packs `packs/mymod-ruby` (two blocks, two items, a ruby tier, two tools, two recipes, a disabled shortbow recipe, and two worldgen rules) and `packs/ruby-overlay` (a single `stone.png` layer) exercise the same paths a player does:
+
+```bash
+bash scripts/modding_smoke.sh
+```
+
+For the release binary, opt in with `SMOKE_PROFILE`:
+
+```bash
+SMOKE_PROFILE=release bash scripts/modding_smoke.sh
+```
+
+The headless `--demo-presentation`, `--demo-crafting`, `--demo-worldgen`, and `--demo-palette` digests replay the authored content through the production seams. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#reference-packs) for the stack order and what each digest covers.
+
 ## 🎮 Controls
 
 ### General
@@ -149,6 +165,7 @@ SMOKE_PROFILE=release bash scripts/ui_smoke.sh
 | **Right Click** | Use the targeted block (open a chest or crafting table, till with a hoe, plant seeds), else place a block; hold to eat food or draw a selected bow. |
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
+| **C** (Creative) | Open the searchable Creative palette. Type to filter by name, id or namespace; click an entry to put a full authored stack in the hotbar. Escape closes. |
 | **Escape** | Open the pause menu (settings are available from there). |
 
 ### Survival

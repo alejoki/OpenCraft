@@ -46,6 +46,21 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
         | BlockId::WheatStage1
         | BlockId::WheatStage2
         | BlockId::WheatStage3 => None,
+        // No acceleration until the registry resolves a tool class in S04:
+        // fail closed rather than guessing a built-in material.
+        BlockId::Modded(_) => None,
+    }
+}
+
+/// Sword damage for a tool tier in Survival (4 / 5 / 6).
+///
+/// A pure data source for built-in tier damage: content definitions and the
+/// melee rules both read it instead of duplicating the table.
+pub const fn tier_sword_damage(tier: ToolTier) -> u16 {
+    match tier {
+        ToolTier::Wood => 4,
+        ToolTier::Stone => 5,
+        ToolTier::Iron => 6,
     }
 }
 
@@ -68,14 +83,56 @@ pub const fn tier_speed_multiplier(tier: ToolTier) -> u8 {
 /// multiplier; a mismatched tool, a non-tool, and an empty slot all keep the
 /// base hardness.
 pub fn break_duration(block: BlockId, selected_item: Option<Item>) -> Option<f32> {
-    let base = block.break_duration_secs()?;
+    break_duration_for(
+        block.break_duration_secs(),
+        block_tool_class(block),
+        selected_item,
+    )
+}
+
+/// Registry-friendly core of [`break_duration`].
+///
+/// `hardness` and `tool_class` are the authored values from a [`BlockDef`], so
+/// pack blocks get exactly the same tier math as built-ins. `None` hardness is
+/// structurally unbreakable regardless of the held item; a mismatched,
+/// non-tool, or empty selection keeps the authored hardness.
+pub fn break_duration_for(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    selected_item: Option<Item>,
+) -> Option<f32> {
+    let base = hardness?;
     let Some((kind, tier)) = selected_item.and_then(|item| item.id().tool()) else {
         return Some(base);
     };
-    if block_tool_class(block) != Some(kind) {
+    if tool_class != Some(kind) {
         return Some(base);
     }
     Some(base / f32::from(tier_speed_multiplier(tier)))
+}
+
+/// Registry-friendly core for a pack tool tier.
+///
+/// `kind` and `speed` are the authored values from the resolved [`ToolDef`]
+/// and its [`TierDef`], so a pack tier gets the same class gate and hardness
+/// division as the built-in `Tool { kind, tier }` arm. A mismatched tool class
+/// keeps the authored hardness, and a missing/degenerate authored speed fails
+/// closed to bare-hand timing instead of producing a non-finite or
+/// longer-than-base duration.
+///
+/// [`ToolDef`]: crate::content::ToolDef
+/// [`TierDef`]: crate::content::TierDef
+pub fn break_duration_for_pack_tier(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    kind: ToolKind,
+    speed: f32,
+) -> Option<f32> {
+    let base = hardness?;
+    if tool_class != Some(kind) || !speed.is_finite() || speed < 1.0 {
+        return Some(base);
+    }
+    Some(base / speed)
 }
 
 #[cfg(test)]
@@ -303,6 +360,35 @@ mod tests {
     }
 
     #[test]
+    fn break_duration_for_matches_builtin_answers_exhaustively() {
+        // The registry path must ask the same core rule with the same authored
+        // fields, so every built-in answer is byte-identical.
+        for block in ALL_BLOCKS {
+            let hardness = block.break_duration_secs();
+            let class = block_tool_class(block);
+            assert_eq!(
+                break_duration_for(hardness, class, None),
+                break_duration(block, None),
+                "bare-hand mismatch for {block:?}"
+            );
+            for kind in ALL_KINDS {
+                for &tier in kind.allowed_tiers() {
+                    let item = Some(tool(kind, tier));
+                    assert_eq!(
+                        break_duration_for(hardness, class, item),
+                        break_duration(block, item),
+                        "{block:?} with {kind:?}/{tier:?} diverged"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            break_duration_for(None, Some(ToolKind::Pickaxe), None),
+            None
+        );
+    }
+
+    #[test]
     fn sword_and_bow_never_accelerate_any_block() {
         // Swords and bows are combat trades: no block in the catalogue may
         // ever get a shorter break from holding one, at any tier.
@@ -353,6 +439,42 @@ mod tests {
                 Some(tool(ToolKind::Axe, ToolTier::Iron))
             ),
             Some(0.2)
+        );
+    }
+
+    #[test]
+    fn pack_tier_break_speed_matches_the_authored_multiplier() {
+        approx(
+            break_duration_for_pack_tier(
+                Some(3.0),
+                Some(ToolKind::Pickaxe),
+                ToolKind::Pickaxe,
+                9.0,
+            )
+            .unwrap(),
+            3.0 / 9.0,
+        );
+        // The class gate is exact: a pack sword never accelerates a pickaxe block.
+        assert_eq!(
+            break_duration_for_pack_tier(Some(3.0), Some(ToolKind::Pickaxe), ToolKind::Sword, 9.0),
+            Some(3.0)
+        );
+        // Degenerate authored speeds fail closed to bare-hand timing.
+        for speed in [0.0, -1.0, 0.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                break_duration_for_pack_tier(
+                    Some(3.0),
+                    Some(ToolKind::Pickaxe),
+                    ToolKind::Pickaxe,
+                    speed
+                ),
+                Some(3.0),
+                "speed {speed} must not produce a degenerate duration"
+            );
+        }
+        assert_eq!(
+            break_duration_for_pack_tier(None, Some(ToolKind::Pickaxe), ToolKind::Pickaxe, 9.0),
+            None
         );
     }
 

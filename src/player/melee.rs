@@ -21,18 +21,20 @@
 
 use glam::Vec3;
 
+use crate::content::ContentRegistry;
 use crate::player::inventory::{Item, ItemId, ToolKind, ToolTier};
 use crate::player::survival::GameMode;
+use crate::player::tools::tier_sword_damage;
 use crate::world::mob::Mob;
 
 /// Damage of an empty hand (or of any item that is not a sword).
 pub const FIST_DAMAGE: u16 = 1;
 /// Damage of a wood sword in Survival.
-pub const SWORD_DAMAGE_WOOD: u16 = 4;
+pub const SWORD_DAMAGE_WOOD: u16 = tier_sword_damage(ToolTier::Wood);
 /// Damage of a stone sword in Survival.
-pub const SWORD_DAMAGE_STONE: u16 = 5;
+pub const SWORD_DAMAGE_STONE: u16 = tier_sword_damage(ToolTier::Stone);
 /// Damage of an iron sword in Survival.
-pub const SWORD_DAMAGE_IRON: u16 = 6;
+pub const SWORD_DAMAGE_IRON: u16 = tier_sword_damage(ToolTier::Iron);
 /// Reach of a melee swing in blocks, measured camera-to-mob-AABB.
 pub const MELEE_REACH: f32 = 3.0;
 /// Seconds a swing cooldown takes to elapse.
@@ -64,16 +66,42 @@ pub fn attack_damage(selected: Option<Item>, mode: GameMode, target_health: u16)
     match selected.map(|item| item.id()) {
         Some(ItemId::Tool {
             kind: ToolKind::Sword,
-            tier: ToolTier::Wood,
-        }) => SWORD_DAMAGE_WOOD,
+            tier,
+        }) => tier_sword_damage(tier),
+        _ => FIST_DAMAGE,
+    }
+}
+
+/// Registry-aware counterpart of [`attack_damage`].
+///
+/// Built-in sword identities keep the frozen tier table, while a pack sword
+/// (`ItemId::ModTool`) resolves its [`ToolDef`] and authored [`TierDef::damage`].
+/// A pack tool that is not a sword, an unknown tool/tier index, and every
+/// non-tool keep [`FIST_DAMAGE`], and Creative still one-shots regardless of
+/// the selected identity. Built-in answers are byte-identical to
+/// [`attack_damage`].
+///
+/// [`ToolDef`]: crate::content::ToolDef
+/// [`TierDef`]: crate::content::TierDef
+pub fn attack_damage_with(
+    registry: &ContentRegistry,
+    selected: Option<Item>,
+    mode: GameMode,
+    target_health: u16,
+) -> u16 {
+    if matches!(mode, GameMode::Creative) {
+        return target_health;
+    }
+    match selected.map(|item| item.id()) {
         Some(ItemId::Tool {
             kind: ToolKind::Sword,
-            tier: ToolTier::Stone,
-        }) => SWORD_DAMAGE_STONE,
-        Some(ItemId::Tool {
-            kind: ToolKind::Sword,
-            tier: ToolTier::Iron,
-        }) => SWORD_DAMAGE_IRON,
+            tier,
+        }) => tier_sword_damage(tier),
+        Some(ItemId::ModTool(index)) => registry
+            .tool(index)
+            .filter(|tool| tool.kind == ToolKind::Sword)
+            .and_then(|tool| registry.tier(tool.tier))
+            .map_or(FIST_DAMAGE, |tier| tier.damage),
         _ => FIST_DAMAGE,
     }
 }
@@ -292,6 +320,10 @@ mod tests {
         }))
     }
 
+    fn item_with(registry: &ContentRegistry, id: ItemId) -> Item {
+        Item::new_with(registry, id, 1).expect("fixture identity is constructible")
+    }
+
     fn target(index: usize) -> Option<MeleeTarget> {
         MeleeTarget::new(index, 10)
     }
@@ -474,6 +506,124 @@ mod tests {
     }
 
     // ---- attack_damage -------------------------------------------------
+
+    /// One authored ruby tier (speed 9, damage 9) with a pickaxe and a sword.
+    fn pack_tier_registry() -> ContentRegistry {
+        use crate::content::spec::{PackAsset, TierEntry, ToolEntry};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec {
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![
+                ToolEntry {
+                    id: "mymod:ruby_pickaxe".to_string(),
+                    display_name: Some("Ruby Pickaxe".to_string()),
+                    kind: ToolKind::Pickaxe,
+                    tier: "mymod:ruby".to_string(),
+                    icon: "pickaxe.png".to_string(),
+                },
+                ToolEntry {
+                    id: "mymod:ruby_sword".to_string(),
+                    display_name: Some("Ruby Sword".to_string()),
+                    kind: ToolKind::Sword,
+                    tier: "mymod:ruby".to_string(),
+                    icon: "sword.png".to_string(),
+                },
+            ],
+            ..PackContentSpec::default()
+        };
+        for icon in ["pickaxe.png", "sword.png"] {
+            spec.assets.insert(
+                icon.to_string(),
+                PackAsset {
+                    rgba: vec![0u8; 16 * 16 * 4],
+                    source_side: 16,
+                },
+            );
+        }
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{report:?}");
+        registry
+    }
+
+    #[test]
+    fn pack_sword_uses_the_authored_tier_damage() {
+        let registry = pack_tier_registry();
+        let ruby_pickaxe = item_with(&registry, ItemId::ModTool(0));
+        let ruby_sword = item_with(&registry, ItemId::ModTool(1));
+
+        assert_eq!(
+            attack_damage_with(&registry, Some(ruby_sword), GameMode::Survival, 10),
+            9,
+            "the authored ruby tier damage is the sword's survival damage"
+        );
+        assert_eq!(
+            attack_damage_with(&registry, Some(ruby_pickaxe), GameMode::Survival, 10),
+            FIST_DAMAGE,
+            "a pack tool that is not a sword keeps fist damage"
+        );
+        assert_eq!(
+            attack_damage_with(&registry, Some(ruby_sword), GameMode::Creative, 10),
+            10,
+            "Creative still one-shots with a pack sword"
+        );
+
+        // A pack tool index the resolving registry does not know is a fist.
+        assert_eq!(
+            attack_damage_with(
+                ContentRegistry::builtin(),
+                Some(ruby_sword),
+                GameMode::Survival,
+                10
+            ),
+            FIST_DAMAGE
+        );
+    }
+
+    #[test]
+    fn attack_damage_with_matches_every_builtin_answer() {
+        let registry = ContentRegistry::builtin();
+        let mut selections = vec![None];
+        selections.push(Some(item(ItemId::Material(Material::Stick))));
+        for kind in [
+            ToolKind::Pickaxe,
+            ToolKind::Axe,
+            ToolKind::Shovel,
+            ToolKind::Hoe,
+            ToolKind::Sword,
+            ToolKind::Bow,
+        ] {
+            for &tier in kind.allowed_tiers() {
+                selections.push(Some(item(ItemId::Tool { kind, tier })));
+            }
+        }
+        for selected in selections {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                for health in [1, 10, 20] {
+                    assert_eq!(
+                        attack_damage_with(registry, selected, mode, health),
+                        attack_damage(selected, mode, health),
+                        "built-in answer diverged for {selected:?}/{mode:?}/{health}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn attack_damage_follows_the_weapon_table() {

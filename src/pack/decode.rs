@@ -5,7 +5,7 @@
 //! plus a structured warning so a bad pack can never block loading.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 /// Largest accepted logo side length, in pixels.
@@ -77,25 +77,44 @@ pub fn to_rgba(bytes: &[u8], color_type: png::ColorType, pixels: usize) -> Vec<u
 /// The image may have any dimensions; the caller validates squareness and the
 /// 16..=256 range. No resampling happens here.
 pub fn decode_png_rgba(path: &Path) -> Result<DecodedPng, String> {
-    decode(path, None)
+    let bytes = read_file_bytes(path)?;
+    decode_bytes(&bytes, &path.display().to_string(), None)
+}
+
+/// Decode a PNG from memory for use as a pack asset.
+///
+/// `label` names the authored path in error messages. This is the bytes-based
+/// half of [`decode_png_rgba`]: v2 assets are read through the confinement
+/// layer first and then decoded here, so loading never re-opens a path that
+/// was not already validated.
+pub fn decode_png_rgba_bytes(bytes: &[u8], label: &str) -> Result<DecodedPng, String> {
+    decode_bytes(bytes, label, None)
 }
 
 /// Decode a PNG for use as a pack logo, preserving its native size.
 ///
 /// Rejects zero-sized and larger-than-1024-per-side images.
 pub fn decode_png_native(path: &Path) -> Result<DecodedPng, String> {
-    decode(path, Some(MAX_LOGO_SIDE))
+    let bytes = read_file_bytes(path)?;
+    decode_bytes(&bytes, &path.display().to_string(), Some(MAX_LOGO_SIDE))
 }
 
-fn decode(path: &Path, max_side: Option<u32>) -> Result<DecodedPng, String> {
-    let file =
+fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file =
         File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut decoder = png::Decoder::new(BufReader::new(file));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok(bytes)
+}
+
+fn decode_bytes(bytes: &[u8], label: &str, max_side: Option<u32>) -> Result<DecodedPng, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
 
     let mut reader = decoder
         .read_info()
-        .map_err(|err| format!("failed to read PNG header {}: {err}", path.display()))?;
+        .map_err(|err| format!("failed to read PNG header {label}: {err}"))?;
 
     let (width, height) = {
         let info = reader.info();
@@ -105,14 +124,12 @@ fn decode(path: &Path, max_side: Option<u32>) -> Result<DecodedPng, String> {
     if let Some(limit) = max_side {
         if width == 0 || height == 0 {
             return Err(format!(
-                "{} has an empty image size ({width}x{height})",
-                path.display()
+                "{label} has an empty image size ({width}x{height})"
             ));
         }
         if width > limit || height > limit {
             return Err(format!(
-                "{} is {width}x{height}, larger than the {limit} px logo limit",
-                path.display()
+                "{label} is {width}x{height}, larger than the {limit} px logo limit"
             ));
         }
     }
@@ -120,12 +137,11 @@ fn decode(path: &Path, max_side: Option<u32>) -> Result<DecodedPng, String> {
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let output = reader
         .next_frame(&mut buf)
-        .map_err(|err| format!("failed to decode PNG {}: {err}", path.display()))?;
+        .map_err(|err| format!("failed to decode PNG {label}: {err}"))?;
 
     if output.color_type == png::ColorType::Indexed {
         return Err(format!(
-            "{} still uses an indexed color type after normalization",
-            path.display()
+            "{label} still uses an indexed color type after normalization"
         ));
     }
 

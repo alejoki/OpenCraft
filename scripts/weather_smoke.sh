@@ -15,23 +15,26 @@
 #         a `timeout` kill surfaces as 124 and is an explicit failure here).
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 7 — the SAVE_VERSION that appends the v6 survival header and the
-#         v7 mob count after the calendar tail.
-#     (d) day_index (u32 LE at byte offset 130) is exactly 4 — four dawn
+#         is 8 — the SAVE_VERSION that inserts the content table in the header
+#         and appends the v6 survival header, the v7 mob count, and the v8
+#         pack-identity + digest tail after the calendar tail.
+#     (d) day_index (u32 LE at byte offset 134) is exactly 4 — four dawn
 #         crossings, one per demo day.
-#     (e) season_length_days (u32 LE at byte offset 134) is the default 1.
+#     (e) season_length_days (u32 LE at byte offset 138) is the default 1.
 #
 # Why the offsets are fixed: a fresh `--new` run is edit-free by construction
 # (no mining, no placement), so the variable-length chunk section writes a
-# zero edit count and the layout is the header (36 + 27) + time_of_day (4) +
-# chunk count (4) + v4 inventory extension (59) = 130 bytes before the v5
-# calendar tail. The v6 survival header (mode u8, health/hunger/air u16 each,
-# chest count u32 = 11 bytes) and the v7 mob count (u32 = 4 bytes) are
-# appended after that tail, so the calendar offsets 130/134 stay pinned. Those
-# offsets are pinned by
-# `V5_SEASON_OFFSET`/`V5_SEASON_LEN` in src/world/persistence.rs, so this
-# script and the unit tests cannot drift apart silently; the size check also
-# requires the v6 survival header and v7 mob count to be present. Any header
+# zero edit count and the layout is the header (36) + v8 content table (4
+# bytes: just the zero name count) + hotbar (27) + time_of_day (4) + chunk
+# count (4) + v4 inventory extension (59) = 134 bytes before the v5 calendar
+# tail. The v6 survival header (mode u8, health/hunger/air u16 each, chest
+# count u32 = 11 bytes), the v7 mob count (u32 = 4 bytes), and the v8
+# pack-identity + FNV-1a digest tail (u32 pack count + u64 digest = 12 bytes)
+# are appended after that tail, so the calendar offsets 134/138 stay pinned.
+# Those offsets are pinned by the `V8_*` constants in
+# src/world/persistence.rs, so this script and the unit tests cannot drift
+# apart silently; the size check also requires the v6 survival header, v7 mob
+# count, and v8 tail to be present. Any header
 # change before the chunk section invalidates those offsets: update the
 # persistence test consts first, then copy them here.
 #
@@ -78,7 +81,11 @@ cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
 # Calendar wire layout (see the header comment and persistence.rs).
-V5_SEASON_OFFSET=130
+# Legacy offset 130 plus the 4-byte empty v8 content table (36..40).
+LEGACY_V5_SEASON_OFFSET=130
+V8_CONTENT_TABLE_OFFSET=36
+V8_CONTENT_TABLE_LEN=4
+V5_SEASON_OFFSET=$((LEGACY_V5_SEASON_OFFSET + V8_CONTENT_TABLE_LEN))
 V5_SEASON_LEN=8
 V5_DAY_INDEX_OFFSET=$V5_SEASON_OFFSET
 V5_SEASON_LENGTH_OFFSET=$((V5_SEASON_OFFSET + 4))
@@ -86,9 +93,12 @@ V5_SEASON_LENGTH_OFFSET=$((V5_SEASON_OFFSET + 4))
 # hunger u16 + air u16 + chest count u32.
 V6_HEADER_LEN=11
 # v7 mob tail: a u32 count. These runs are edit-free with an empty inventory,
-# so the count sits at 149 and a fresh world writes 0.
+# so the count sits at 153 and a fresh world writes 0.
 V7_MOB_COUNT_LEN=4
 V7_MOB_COUNT_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN))
+# v8 tail: a u32 pack count (zero in a built-in world) plus the u64 digest.
+V8_TAIL_LEN=12
+V8_SAVE_LEN=$((V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN + V8_TAIL_LEN))
 
 SEED=1
 DEMO_DAYS=4
@@ -135,8 +145,8 @@ if [[ ! -f "$SAVE" ]]; then
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN)) ]]; then
-    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header and v7 mob count after the v5 calendar tail"
+if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN + V8_TAIL_LEN)) ]]; then
+    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header, v7 mob count, and v8 digest tail after the v5 calendar tail"
     exit 1
 fi
 
@@ -147,14 +157,26 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 7 ]]; then
-    echo "WEATHER SMOKE FAIL: save version is $VERSION (expected 7)"
+if [[ "$VERSION" -ne 8 ]]; then
+    echo "WEATHER SMOKE FAIL: save version is $VERSION (expected 8)"
+    exit 1
+fi
+
+CONTENT_NAME_COUNT=$(read_u32_le "$SAVE" "$V8_CONTENT_TABLE_OFFSET")
+if [[ "$CONTENT_NAME_COUNT" -ne 0 ]]; then
+    echo "WEATHER SMOKE FAIL: v8 content table holds $CONTENT_NAME_COUNT names (expected 0 for an edit-free fresh world with an empty inventory)"
     exit 1
 fi
 
 MOB_COUNT=$(read_u32_le "$SAVE" "$V7_MOB_COUNT_OFFSET")
 if [[ "$MOB_COUNT" -ne 0 ]]; then
-    echo "WEATHER SMOKE FAIL: v7 mob count is $MOB_COUNT (expected 0 in an edit-free fresh world)"
+    echo "WEATHER SMOKE FAIL: v8 mob count is $MOB_COUNT (expected 0 in an edit-free fresh world)"
+    exit 1
+fi
+
+SAVE_SIZE=$(wc -c <"$SAVE")
+if [[ "$SAVE_SIZE" -ne "$V8_SAVE_LEN" ]]; then
+    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $V8_SAVE_LEN for an edit-free v8 save with no content names)"
     exit 1
 fi
 

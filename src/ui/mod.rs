@@ -6,6 +6,8 @@ pub mod item_icon;
 pub mod lifecycle;
 pub mod logo;
 pub mod menu;
+pub mod packs;
+pub mod palette;
 pub mod quad;
 pub mod screens;
 pub mod selection;
@@ -20,8 +22,14 @@ pub use inventory::{
 pub use lifecycle::{
     decide as decide_lifecycle, DeathIntent, LifecycleDecision, LifecycleError, LifecycleIntent,
     LifecycleResult, LifecycleScreen, LifecycleState, LoadGameIntent, MainMenuIntent,
-    NewGameIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
+    NewGameIntent, PacksIntent, PauseIntent, Screen, SettingsCaller, SettingsIntent,
 };
+pub use packs::{
+    compose_pack_lines, enabled_count, hovered_pack_target, move_pack, pack_back_rect,
+    pack_down_rect, pack_panel_rect, pack_row_rect, pack_up_rect, packs_rows, summary_label,
+    toggle_pack, MoveDirection, PackRow, PackTarget, PACK_ACTION_WIDTH, PACK_SCREEN_WIDTH,
+};
+pub use palette::{PaletteEntry, PaletteLayout, PaletteScreen, MAX_PALETTE_LABELS};
 pub use screens::{
     death_panel_rect, death_row_rect, delete_prompt_line, format_modified_secs, format_row_line,
     hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
@@ -69,6 +77,7 @@ impl UiRenderer {
         ctx: &RenderContext,
         block_texture_view: &wgpu::TextureView,
         block_texture_sampler: &wgpu::Sampler,
+        sprite_layers: &[Vec<u8>],
     ) -> Self {
         // ColorMode::Accurate: proper sRGB texture, matching our sRGB surface format.
         // (glyphon 0.5.0 has no `Color` variant; Accurate/Web are the only modes.)
@@ -93,7 +102,12 @@ impl UiRenderer {
             text_renderer,
             quad_renderer: QuadRenderer::new(ctx),
             logo_renderer: logo::LogoRenderer::new(ctx),
-            icon_renderer: IconRenderer::new(ctx, block_texture_view, block_texture_sampler),
+            icon_renderer: IconRenderer::new_with_sprite_layers(
+                ctx,
+                block_texture_view,
+                block_texture_sampler,
+                sprite_layers,
+            ),
             tooltip_quad_renderer: QuadRenderer::new(ctx),
         }
     }

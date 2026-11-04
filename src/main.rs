@@ -12,18 +12,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencraft::audio::{default_buffers, AudioEngine, SoundBuffer, SoundSlot, SOUND_SLOT_COUNT};
+use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::content::names;
+use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
+use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::spec::PackSpec;
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
-use opencraft::player::eating::{food_value, EatingState, EatingTarget, EatingTick};
+use opencraft::player::eating::{food_value_with, EatingState, EatingTarget, EatingTick};
 use opencraft::player::inventory::{
     CraftingGrid, GridKind, Inventory, Item, ItemId, Material, RecipeId, ToolKind, ToolTier,
     ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
 };
 use opencraft::player::melee::{
-    attack_damage, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH, SWORD_DAMAGE_WOOD,
+    attack_damage, attack_damage_with, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH,
+    SWORD_DAMAGE_WOOD,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
@@ -34,7 +39,7 @@ use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
 use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
-use opencraft::render::texture::generate_all_texture_layers_rgba;
+use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
@@ -46,18 +51,23 @@ use opencraft::ui::chest::{
 };
 use opencraft::ui::hud::{
     bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
-    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
+    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label_with,
     selected_name_rect, vitals_quads, vitals_stack_top, HOTBAR_COUNT_FONT_SIZE,
     HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
-    hit_test, hovered_item, layout, rects_intersect, screen_labels, screen_quads, tooltip_lines,
-    tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS,
-    TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
+    hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
+    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
+    LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
-use opencraft::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices, IconDrawList};
+use opencraft::ui::item_icon::{
+    compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
+    palette_icon_vertices_with, IconDrawList,
+};
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
+use opencraft::ui::packs;
+use opencraft::ui::palette::{self, PaletteScreen, MAX_PALETTE_LABELS};
 use opencraft::ui::screens::{
     death_cause_line, death_panel_rect, death_row_rect, delete_prompt_line, format_row_line,
     hovered_death_row, hovered_load_target, hovered_main_menu_row, hovered_new_game_target,
@@ -71,26 +81,30 @@ use opencraft::ui::screens::{
 use opencraft::ui::selection::SelectionLabel;
 use opencraft::ui::{
     DeathIntent, LifecycleDecision, LifecycleIntent, LifecycleScreen, LifecycleState,
-    LoadGameIntent, MainMenuIntent, NewGameIntent, PauseIntent, Quad, SettingsIntent, StatsOverlay,
-    TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
+    LoadGameIntent, MainMenuIntent, NewGameIntent, PacksIntent, PauseIntent, Quad, SettingsIntent,
+    StatsOverlay, TextInputAction, UiRenderer, FONT_SIZE, LINE_HEIGHT,
 };
 use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
-use opencraft::world::chunk::{linear_index, world_to_chunk_and_local, ChunkPos, CHUNK_SIZE};
+use opencraft::world::chunk::{
+    linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE,
+};
 use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
 use opencraft::world::loot;
-use opencraft::world::manager::WorldManager;
+use opencraft::world::manager::{WorldManager, MAX_CHUNK_Y, MIN_CHUNK_Y};
 use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind, MobShot};
 use opencraft::world::mob_ai::MobAttack;
 use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
+#[cfg(test)]
+use opencraft::world::persistence::save_world_to_path;
 use opencraft::world::persistence::{
-    load_world_from_path, save_world_to_path, CliConfig, PersistenceError, SavedMob,
-    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
-    DEFAULT_TIME_SCALE,
+    load_world_from_path, load_world_from_path_with, save_world_to_path_with, ChunkEditMap,
+    CliConfig, PersistenceError, SavedMob, SavedPlayerState, WorldSaveData,
+    DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -100,8 +114,8 @@ use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
 };
 use opencraft::world::terrain::{
-    biome_at_seeded, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded, Biome,
-    DEFAULT_WORLD_SEED, SEA_LEVEL,
+    biome_at_seeded, generate_chunk_seeded, generate_chunk_seeded_with, ruin_at_seeded,
+    ruin_loot_chest_at, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -117,38 +131,62 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
 
-/// Load the persisted texture pack at startup, returning it together with its
-/// per-file fallback warnings so the caller can merge them into
-/// `startup_warnings` (the S03 routing contract: warnings are data shown in the
-/// menu, never logs). `None` selection is the built-in Default pack: no data,
-/// no warnings.
-fn load_startup_pack(
+/// Load the persisted ordered pack stack at startup, returning the merged
+/// presentation plus the per-pack specs and their per-file fallback warnings.
+/// The caller merges the warnings into `startup_warnings` (the S03 routing
+/// contract: warnings are data shown in the menu, never logs). An empty stack
+/// is the built-in Default pack: no presentation, no specs, no warnings. A
+/// missing stack entry stays in the stack and only produces a warning, so
+/// restoring the folder restores the pack without re-adding it.
+fn load_startup_stack(
     packs_root: &Path,
-    selected: Option<&str>,
-) -> (Option<LoadedPack>, Vec<SettingsWarning>) {
-    let Some(name) = selected else {
-        return (None, Vec::new());
-    };
-    let loaded = pack::load_pack_by_name(packs_root, name);
-    let warnings = loaded.warnings.clone();
-    (Some(loaded), warnings)
+    stack: &[String],
+) -> (Option<LoadedPack>, Vec<PackSpec>, Vec<SettingsWarning>) {
+    if stack.is_empty() {
+        return (None, Vec::new(), Vec::new());
+    }
+    let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
+    (Some(loaded), specs, warnings)
 }
 
-/// Resolve the startup sound buffers and warnings for the persisted pack.
-///
-/// `None` selection is the built-in Default pack: the synthesized buffers stay
-/// untouched and no warnings are produced. A selected pack is resolved
-/// independently of its texture result (a pack whose layers partially failed
-/// may still ship usable sounds); the loader never fails, so this can never
-/// block launch (D054).
-fn load_startup_sounds(
-    packs_root: &Path,
-    selected: Option<&str>,
-) -> ([SoundBuffer; SOUND_SLOT_COUNT], Vec<SettingsWarning>) {
-    let Some(name) = selected else {
-        return (default_buffers(), Vec::new());
-    };
-    pack::sound::load_sound_overrides(&packs_root.join(name))
+/// Build the session's immutable content registry from the ordered pack specs.
+/// The built-in table is the base; later packs win per definition. The caller
+/// freezes the result in an `Arc` and never replaces it mid-session (MEM512).
+fn build_session_registry(specs: &[PackSpec]) -> (Arc<ContentRegistry>, ContentLoadReport) {
+    let packs: Vec<(PackIdentity, PackContentSpec)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                PackIdentity {
+                    folder: spec.folder.clone(),
+                    version: spec.version.clone(),
+                },
+                spec.content.clone(),
+            )
+        })
+        .collect();
+    let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+    (Arc::new(registry), report)
+}
+
+/// Render registry-builder diagnostics as the same field/reason warning shape
+/// every other startup problem uses (MEM009: warnings are data, never logs).
+fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
+    report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| SettingsWarning {
+            field: diagnostic.entry.clone(),
+            reason: format!(
+                "{}: {}",
+                match diagnostic.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                },
+                diagnostic.reason
+            ),
+        })
+        .collect()
 }
 
 /// Build the app's sound engine. Production opens the default output device
@@ -253,7 +291,7 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
-    let result = save_world_to_path(&session.save_path, &data);
+    let result = save_world_to_path_with(&session.save_path, &data, session.registry.as_ref());
     if result.is_ok() {
         session.world.mark_saved();
     }
@@ -405,7 +443,13 @@ enum BreakOutcome {
 /// mining can never duplicate items or spend durability through an edit that
 /// never happened.
 fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> BreakOutcome {
-    if block.break_duration_secs().is_none() {
+    // Breakability is authored content: the session registry is the authority,
+    // so a pack block with authored hardness is mineable while a placeholder
+    // (`hardness: None`) or an unknown id stays unbreakable.
+    let Some(def) = session.registry.block(block) else {
+        return BreakOutcome::Rejected(BreakRejection::Unbreakable);
+    };
+    if def.hardness.is_none() {
         return BreakOutcome::Rejected(BreakRejection::Unbreakable);
     }
     // `pos`/`block` come from the mining accumulator, which is not authority:
@@ -475,10 +519,16 @@ fn break_mined_block(session: &mut WorldSession, pos: IVec3, block: BlockId) -> 
             .expect("preflight proved capacity");
         session.remove_crop(pos);
     } else {
-        // Drop mapping is block metadata (Stone -> Cobblestone); the item
-        // identity is the only thing that differs, and the drop is still
-        // collected last so MEM195 ordering is preserved.
-        session.player.collect_block(block.mined_drop());
+        // Drop mapping is authored content (Stone -> Cobblestone, a pack block
+        // -> its authored item and stack limit). The item identity and limit
+        // both come from the frozen session registry, and the drop is still
+        // collected last so MEM195 ordering is preserved. The registry-aware
+        // collector can construct a non-stackable pack tool drop.
+        if let Some((id, limit)) = session.registry.drop_entry(block) {
+            session
+                .player
+                .collect_limited_with(&session.registry, id, 1, limit);
+        }
 
         // Breaking the support ends the crop's eligibility even though the
         // floating wheat block itself is not edited: the candidate is
@@ -586,8 +636,9 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     }
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
-            if food_value(item.id()).is_some() {
-                return match EatingTarget::new(
+            if food_value_with(session.registry.as_ref(), item.id()).is_some() {
+                return match EatingTarget::new_with(
+                    session.registry.as_ref(),
                     session.player.selected_slot(),
                     item,
                     session.player.survival.hunger(),
@@ -723,7 +774,12 @@ fn eating_candidate(
         return None;
     }
     let item = player.selected_item()?;
-    EatingTarget::new(player.selected_slot(), item, player.survival.hunger())
+    EatingTarget::new_with(
+        session.registry.as_ref(),
+        player.selected_slot(),
+        item,
+        player.survival.hunger(),
+    )
 }
 
 /// The hold-to-draw candidate for this frame, or `None` when the draw must
@@ -952,6 +1008,101 @@ fn close_inventory(
     set_cursor_grab(window, true);
 }
 
+/// Opens the searchable Creative palette and releases the pointer to it.
+///
+/// Mirrors [`open_inventory`]: the session registry is frozen (MEM512), so the
+/// entry stock is cached once here rather than rebuilt per frame. Every
+/// gameplay hold is dropped so a held mouse button cannot mine behind the
+/// screen. A free function for the same disjoint-borrow reason (P005).
+#[allow(clippy::too_many_arguments)]
+fn open_palette(
+    screen: &mut PaletteScreen,
+    registry: &Arc<ContentRegistry>,
+    status: &mut Option<String>,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    bow: &mut BowState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.open(registry);
+    *status = None;
+    input.reset();
+    reset_panel_holds(mining, eating, bow);
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *cursor_grabbed = false;
+    set_cursor_grab(window, false);
+}
+
+/// Closes the Creative palette and restores gameplay input ownership.
+///
+/// Escape is the only close path while the palette is open; it re-grabs the
+/// cursor exactly like [`close_inventory`] and clears every hold so no stale
+/// press survives the screen boundary.
+#[allow(clippy::too_many_arguments)]
+fn close_palette(
+    screen: &mut PaletteScreen,
+    status: &mut Option<String>,
+    input: &mut InputState,
+    left_mouse_held: &mut bool,
+    right_mouse_held: &mut bool,
+    mining: &mut MiningState,
+    eating: &mut EatingState,
+    bow: &mut BowState,
+    cursor_grabbed: &mut bool,
+    window: &Window,
+) {
+    screen.close();
+    *status = None;
+    input.reset();
+    reset_panel_holds(mining, eating, bow);
+    *left_mouse_held = false;
+    *right_mouse_held = false;
+    *cursor_grabbed = true;
+    set_cursor_grab(window, true);
+}
+
+/// Grants the palette entry under `cursor` into the hotbar.
+///
+/// Pure apart from the player inventory mutation: the hit test and filtered
+/// entry resolution come from `ui::palette`, and the grant path is the T02
+/// `Player::grant_palette_item_with` (authored stack limit, exactly one hotbar
+/// slot, granted slot selected). Returns `None` for a closed screen, empty
+/// space, or an entry the registry refuses, so the caller reports one status
+/// line and never mutates on a miss.
+fn apply_palette_click(
+    player: &mut Player,
+    registry: &ContentRegistry,
+    screen: &PaletteScreen,
+    layout: &palette::PaletteLayout,
+    cursor: Option<(f32, f32)>,
+) -> Option<(usize, Item)> {
+    let index = palette::hit_test(screen, layout, cursor?)?;
+    let entry = screen.filtered_entry(index)?;
+    player.grant_palette_item_with(registry, entry.id).ok()
+}
+
+/// Resolves the palette entry under `cursor` into a tooltip item.
+///
+/// Uses the same filtered-entry model as the click and icon paths, so the
+/// tooltip describes exactly the row the user is pointing at. Returns `None`
+/// for a closed screen, empty space, or an identity the registry cannot
+/// construct (the palette excludes placeholders, so this is a defensive arm).
+fn palette_hovered_item(
+    registry: &ContentRegistry,
+    screen: &PaletteScreen,
+    layout: &palette::PaletteLayout,
+    cursor: Option<(f32, f32)>,
+) -> Option<Item> {
+    let index = palette::hit_test(screen, layout, cursor?)?;
+    let entry = screen.filtered_entry(index)?;
+    Item::new_with(registry, entry.id, 1).ok()
+}
+
 /// Which mouse button issued an inventory command.
 ///
 /// Left is whole-stack movement; right is the split-half / place-one
@@ -995,6 +1146,30 @@ pub fn apply_inventory_click(
 /// unchanged, which keeps the conservation guarantees in one place.
 pub fn apply_inventory_click_button(
     player: &mut Player,
+    screen: &InventoryScreen,
+    table_open: Option<IVec3>,
+    target: InventoryTarget,
+    button: InventoryClickButton,
+) -> Result<InventoryClickOutcome, InventoryCommandError> {
+    apply_inventory_click_button_with(
+        player,
+        ContentRegistry::builtin(),
+        screen,
+        table_open,
+        target,
+        button,
+    )
+}
+
+/// Registry-aware production result-slot seam.
+///
+/// Identical to [`apply_inventory_click_button`] except a result-slot click
+/// crafts against `registry`, so pack recipes match through the real click
+/// path and a crafted pack tool keeps its [`ItemId::ModTool`] identity. Every
+/// other target is registry-independent and answers unchanged.
+pub fn apply_inventory_click_button_with(
+    player: &mut Player,
+    registry: &ContentRegistry,
     screen: &InventoryScreen,
     table_open: Option<IVec3>,
     target: InventoryTarget,
@@ -1057,11 +1232,11 @@ pub fn apply_inventory_click_button(
             .click_grid_cell_right(GridKind::Table, index)
             .map(|()| InventoryClickOutcome::Moved),
         (_, InventoryTarget::ResultSlot(GridKind::Player)) => player
-            .take_craft_result(GridKind::Player)
+            .take_craft_result_with(registry, GridKind::Player)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
         (_, InventoryTarget::ResultSlot(GridKind::Table)) => player
-            .take_craft_result(GridKind::Table)
+            .take_craft_result_with(registry, GridKind::Table)
             .map(InventoryClickOutcome::Crafted)
             .map_err(InventoryCommandError::Craft),
     }
@@ -1219,8 +1394,13 @@ fn chest_should_close(screen: &ChestScreen, open_chest: Option<IVec3>) -> bool {
 /// gameplay panel open. One helper keeps the redraw `gameplay` gate and every
 /// input guard in agreement, so a panel can never leak a key, wheel, or click
 /// into the world while still freezing movement.
-fn gameplay_surface(playing: bool, inventory_open: bool, chest_open: bool) -> bool {
-    playing && !inventory_open && !chest_open
+fn gameplay_surface(
+    playing: bool,
+    inventory_open: bool,
+    chest_open: bool,
+    palette_open: bool,
+) -> bool {
+    playing && !inventory_open && !chest_open && !palette_open
 }
 
 /// Backing-panel rect for the transient gameplay notice, in physical pixels.
@@ -1271,8 +1451,10 @@ fn gameplay_notice_rect_above(
 /// Kept pure so the frame loop and the tests agree on the exact buffer text
 /// (`tooltip_lines` joined by newlines) and the line count fed to
 /// [`tooltip_rect`].
-fn tooltip_text(item: Item) -> (String, usize) {
-    let lines = tooltip_lines(item);
+/// Registry-aware [`tooltip_text`]: pack items and tools show their authored
+/// display name instead of the static `Modded Item` fallback.
+fn tooltip_text_with(item: Item, registry: Option<&ContentRegistry>) -> (String, usize) {
+    let lines = tooltip_lines_with(item, registry);
     let line_count = lines.len();
     (lines.join("\n"), line_count)
 }
@@ -1285,9 +1467,10 @@ fn selected_name_should_draw(
     playing: bool,
     inventory_open: bool,
     chest_open: bool,
+    palette_open: bool,
     label: &SelectionLabel,
 ) -> bool {
-    playing && !inventory_open && !chest_open && label.is_visible()
+    playing && !inventory_open && !chest_open && !palette_open && label.is_visible()
 }
 
 /// glyphon default color for the selected-name label at `alpha`.
@@ -1348,13 +1531,13 @@ fn on_off(value: bool) -> &'static str {
 
 /// Compose the menu's display text: one "label: value" line per row, a
 /// capture hint line while a rebind is pending, and the transient message
-/// line. `pack_label` is the active texture pack's display name ("Default"
-/// for the built-in procedural pack), kept as a parameter so this stays a
+/// line. `pack_summary` is `packs::summary_label`'s rendering of the ordered
+/// stack ("Default" for an empty stack), kept as a parameter so this stays a
 /// pure function of its inputs — unit-testable without GPU or events.
 /// Called per frame while the menu is open, where `StatsOverlay::update`
 /// skips the expensive re-shape unless the composed string actually
 /// changed.
-fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label: &str) -> String {
+fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summary: &str) -> String {
     let mut lines = Vec::with_capacity(menu::ROW_COUNT + 2);
     for row in menu::ROWS {
         let line = match row {
@@ -1379,7 +1562,7 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_label:
             }
             MenuRow::Vsync => format!("{}: {}", row.label(), on_off(settings.vsync)),
             MenuRow::Volume => format!("{}: {}%", row.label(), settings.volume),
-            MenuRow::TexturePack => format!("{}: {pack_label}", row.label()),
+            MenuRow::Packs => format!("{}: {pack_summary}", row.label()),
             MenuRow::Close => row.label().to_string(),
         };
         lines.push(line);
@@ -1573,7 +1756,7 @@ fn scripted_demo_requested(cli: &CliConfig) -> bool {
 /// for every production launch.
 ///
 /// Those runs pin exact save layouts — several real-binary scripts assert a
-/// zero v7 mob count on an "edit-free fresh world" — so the ambient population
+/// zero v8 mob count on an "edit-free fresh world" — so the ambient population
 /// layer stays closed for their whole life. That is the same ephemeral demo
 /// switch `--demo-combat` uses around its own pinned stages (M009/S05-T03):
 /// creation and daylight burning are off, the distance cull still runs.
@@ -1592,10 +1775,24 @@ fn demo_owns_world_witness(cli: &CliConfig) -> bool {
 /// fresh `WorldSession::new_session` at
 /// `cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED)` with the same save
 /// path.
+///
+/// Test-only built-in wrapper: production builds [`StartupContent`] first and
+/// calls [`startup_session_with`] with its base registry.
+#[cfg(test)]
 fn startup_session(cli: &CliConfig) -> WorldSession {
+    startup_session_with(cli, &ContentRegistry::builtin_arc())
+}
+
+/// The startup world session resolved against `registry`.
+///
+/// The load branch keeps the placeholder-augmented registry and the one-shot
+/// changed-stack notice; the fresh branch freezes the supplied registry on the
+/// new session. [`startup_session`] is the built-in wrapper every existing
+/// test and demo launch uses.
+fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> WorldSession {
     if !cli.force_new_world && cli.save_path.exists() {
-        if let Ok(save) = load_world_from_path(&cli.save_path) {
-            let mut session = WorldSession::session_from_save(save, cli.save_path.clone());
+        if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
+            let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
             // A bounded accelerated watch that reloads a save must keep the
             // same pinned witness as its fresh leg: no ambient records may
             // appear in the next saved tail. The scripted demos are
@@ -1633,13 +1830,18 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     // over a launch flag. The mode follows the same rule: `--creative` /
     // `--survival` pick the fresh world's persisted mode, while a loaded save
     // restores its own stored mode and ignores the flag.
-    let mut session =
-        WorldSession::new_session_with_mode(seed, cli.save_path.clone(), cli.season_length, mode);
+    let mut session = WorldSession::new_session_with_mode_and_registry(
+        seed,
+        cli.save_path.clone(),
+        cli.season_length,
+        mode,
+        Arc::clone(registry),
+    );
     if cli.demo_combat {
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
     // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v7 save tail must describe only what that
+    // digest and every bounded demo's v8 save tail must describe only what that
     // demo placed, so ambient spawning and daylight burning stay off for the
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {
@@ -1818,7 +2020,12 @@ fn compose_screen_text(
             lines.extend(DEATH_ROWS.iter().map(|row| row.label().to_string()));
             lines
         }
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => return String::new(),
+        // The render branch composes the Packs screen from its row model via
+        // `packs::compose_pack_lines` (it already has the rows); Settings
+        // composes through `compose_menu_text`; Playing renders no text.
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
+            return String::new()
+        }
     };
     lines.join("\n")
 }
@@ -1858,7 +2065,10 @@ fn screen_panel_rect(
         LifecycleScreen::NewGame => new_game_panel_rect(surface_w, surface_h),
         LifecycleScreen::LoadGame => load_panel_rect(surface_w, load.row_count()),
         LifecycleScreen::Death => death_panel_rect(surface_w, surface_h),
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
+        // The render branch draws the Packs panel directly from its row
+        // count; Settings keeps its existing path. Both fallbacks here are
+        // unreachable in the render path.
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {
             menu::panel_rect(surface_w, surface_h)
         }
     }
@@ -1915,7 +2125,7 @@ fn hovered_target_rect(
             let index = DEATH_ROWS.iter().position(|&r| r == row)?;
             death_row_rect(surface_w, surface_h, index)
         }
-        LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
+        LifecycleScreen::Packs(_) | LifecycleScreen::Settings(_) | LifecycleScreen::Playing => None,
     }
 }
 
@@ -1930,6 +2140,7 @@ fn screen_title_tag(screen: LifecycleScreen) -> &'static str {
         LifecycleScreen::Pause => " | Paused",
         LifecycleScreen::Death => " | Dead",
         LifecycleScreen::Settings(_) => " | Settings",
+        LifecycleScreen::Packs(_) => " | Packs",
         LifecycleScreen::Playing => "",
     }
 }
@@ -2043,6 +2254,9 @@ struct Ready {
     /// Chest panel labels (S03-T05): same change-gated pattern, sized once to
     /// the pure `MAX_CHEST_LABELS` bound so no frame allocates a text buffer.
     chest_labels: Vec<StatsOverlay>,
+    /// Creative palette labels (S07-T03): same change-gated pattern, sized once
+    /// to the pure `MAX_PALETTE_LABELS` bound. A closed palette draws none.
+    palette_labels: Vec<StatsOverlay>,
 }
 
 /// Bounded accelerated-demo watch (S02-T04, generalized to N cycles in
@@ -4177,17 +4391,21 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// stage earns the wood bow and its arrows, and the Save stage writes the two
 /// surviving hostile records.
 ///
-/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v7_save`)
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v8_save`)
 /// and reading the file back, never computed by hand: every earned stack changes
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 218;
-/// Measured offset of the v7 mob-count word in that save: the 19-byte Zombie
-/// record starts 4 bytes later and the Skeleton record follows it, so the tail
-/// ends at [`COMBAT_SAVE_BYTES`].
+const COMBAT_SAVE_BYTES: usize = 307;
+/// Bytes of the v8 pack-identity + digest tail after the mob records: a `u32`
+/// pack count (zero here) plus the `u64` FNV-1a digest.
 #[cfg(test)]
-const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
+const COMBAT_SAVE_TAIL_BYTES: usize = 12;
+/// Measured offset of the v8 mob-count word in that save: the 19-byte Zombie
+/// record starts 4 bytes later and the Skeleton record follows it, so the tail
+/// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
+#[cfg(test)]
+const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
@@ -4233,8 +4451,8 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 176;
 /// to Creative rules — no target selection, no melee, no arrows, no damage —
 /// and then that one melee swing and one charge-0 arrow each one-shot a
 /// full-health Zombie with the pinned drop table intact. It consumes exactly
-/// the two rotten-flesh units its kills earned, so the 218-byte v7 witness and
-/// every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
+/// the two rotten-flesh units its kills earned, so the measured 307-byte v8
+/// witness and every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
 /// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
 /// Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5250,7 +5468,8 @@ fn combat_fight_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool
         mine_hit.block_pos.y,
         mine_hit.block_pos.z,
     );
-    let Some(mining) = MiningTarget::from_block(
+    let Some(mining) = MiningTarget::from_block_with(
+        &session.registry,
         mine_hit.block_pos,
         mine_block,
         session.player.selected_item(),
@@ -5919,7 +6138,7 @@ fn combat_spot_feet_y(y: f32) -> f32 {
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
 /// * the player pose is restored afterwards, so the Shot stage and the Save
-///   witness start from the same pinned pose (the v7 layout itself is measured
+///   witness start from the same pinned pose (the v8 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
 ///
 /// The Skeleton is left where Drops left it: it is hostile and will chase, but
@@ -7053,7 +7272,7 @@ fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
 ///    the real projectile sweep, granting exactly one more rotten flesh.
 /// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
 ///    again and the inventory total must return to its pre-stage value, which
-///    is what keeps the 218-byte v7 save byte-identical.
+///    is what keeps the measured 307-byte v8 save byte-identical.
 ///
 /// Documented demo pins, not gameplay rules: the two survivors are parked 20
 /// blocks behind the camera (position *and* leash anchor, so the synthetic
@@ -7376,8 +7595,8 @@ fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
         .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
 
     // 4. Conserve the save witness: both earned units are consumed again, so
-    //    the inventory section (and therefore the 218-byte v7 layout) is
-    //    byte-identical.
+    //    the inventory section (and therefore the measured 307-byte v8 layout)
+    //    is byte-identical.
     if session.player.consume_item(flesh_id).is_none()
         || session.player.consume_item(flesh_id).is_none()
     {
@@ -7845,6 +8064,75 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
+/// Everything the pack-aware startup path builds before `GameApp` exists.
+///
+/// Production loads this ONCE in `main` and hands the same instance to both
+/// the startup `WorldSession` and `GameApp`, so the pack registry that names a
+/// fresh world's content is the same registry the app adopts as its base. A
+/// test-only `GameApp::new_with_paths` builds one internally from the same
+/// settings/packs conventions the pre-M010 constructor used.
+struct StartupContent {
+    settings: Settings,
+    startup_warnings: Vec<SettingsWarning>,
+    current_pack: Option<LoadedPack>,
+    available_packs: Vec<String>,
+    audio: AudioEngine,
+    /// The settings file this startup content was loaded from. `GameApp` keeps
+    /// it as the save target for every settings mutation; injecting it through
+    /// this bundle keeps one source of truth for production and tests.
+    settings_path: PathBuf,
+    packs_root: PathBuf,
+    /// The launch pack-stack registry: the immutable base every loaded session
+    /// and every newly created world is resolved against. It is replaced only
+    /// by a pack-stack change, and then only for the NEXT load (MEM512).
+    base_registry: Arc<ContentRegistry>,
+}
+
+impl StartupContent {
+    /// Load settings, the persisted pack stack, sound overrides and the
+    /// session content registry in the historical warning order.
+    fn load(settings_path: &Path, packs_root: PathBuf) -> StartupContent {
+        // Startup settings load: never blocks launch — a missing or corrupt
+        // settings.toml yields defaults plus structured warnings, surfaced
+        // as menu text on the first open.
+        let (settings, mut startup_warnings) = load_with_warnings(settings_path);
+        // Pack discovery and startup apply (M004/S03): the persisted choice
+        // is re-applied on every launch. A missing/deleted pack folder still
+        // yields a fully usable procedural pack plus one warning naming it,
+        // surfaced through the existing first-Settings-open message path
+        // (D031/MEM121, MEM009: warnings are data, never logs).
+        let available_packs = pack::available_pack_names(&packs_root);
+        let (current_pack, pack_specs, pack_warnings) =
+            load_startup_stack(&packs_root, &settings.pack_stack);
+        startup_warnings.extend(pack_warnings);
+        // Startup sound overrides (M005/S05): resolved independently of the
+        // texture result, so a pack whose layers partially failed still
+        // supplies its sounds. The never-fail loader returns a complete
+        // buffer set; its warnings merge into the same one-time Settings-entry
+        // message path as every other startup warning (MEM009/D054). The
+        // engine is constructed first because `set_buffers` is device-free.
+        let mut audio = new_audio_engine();
+        let (startup_sounds, sound_warnings) = pack::sound::resolve_sounds(&pack_specs);
+        audio.set_buffers(startup_sounds);
+        startup_warnings.extend(sound_warnings);
+        // Session content registry (M010/S02): built once from the ordered
+        // stack over the built-in table, then frozen for the whole session.
+        // Registry diagnostics join the same one-time warning path.
+        let (base_registry, registry_report) = build_session_registry(&pack_specs);
+        startup_warnings.extend(registry_warnings(&registry_report));
+        StartupContent {
+            settings,
+            startup_warnings,
+            current_pack,
+            available_packs,
+            audio,
+            settings_path: settings_path.to_path_buf(),
+            packs_root,
+            base_registry,
+        }
+    }
+}
+
 struct GameApp {
     window: Option<Arc<Window>>,
     gpu: Option<Ready>,
@@ -7924,6 +8212,14 @@ struct GameApp {
     /// Last chest-click status line, read by the T04 renderer as the footer
     /// message; `None` until the first click of a session.
     chest_status: Option<String>,
+    /// Searchable Creative palette (S07-T03): the T01 pure screen. Open only
+    /// while the lifecycle screen is Playing, and only in Creative mode. The
+    /// entry stock is cached from the frozen session registry at open time.
+    palette: PaletteScreen,
+    /// Last palette grant status line. Mirrors `inventory_status`, but the
+    /// pure `screen_labels` footer reads the screen's own status slot, so the
+    /// render pass syncs this field into it before building labels.
+    palette_status: Option<String>,
     /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
     /// under the player is reported here while still Playing. Same tick-counter
     /// pattern as the screen messages, but it renders above the hotbar instead
@@ -8017,8 +8313,26 @@ struct GameApp {
     available_packs: Vec<String>,
     /// The active pack's loaded layers and presentation data; `None` is
     /// the built-in procedural Default pack (MEM113). Never holds a
-    /// half-loaded pack: `load_pack_by_name` always returns usable layers.
+    /// half-loaded pack: `load_stack` always returns usable layers.
     current_pack: Option<LoadedPack>,
+    /// The launch pack-stack registry: the base every new/loaded world is
+    /// resolved against and the reference for a live pack-change digest
+    /// comparison. A Packs toggle replaces this (for the NEXT load) but never
+    /// `session_registry` (MEM512/D181).
+    base_registry: Arc<ContentRegistry>,
+    /// The CURRENT session's immutable content registry. A loaded v8 world
+    /// carries the placeholder-augmented registry it was decoded with; a fresh
+    /// world carries a clone of `base_registry`. Re-adopted by
+    /// `on_session_installed`, never replaced while a session runs.
+    session_registry: Arc<ContentRegistry>,
+    /// Set whenever the pack stack changes presentation, so the next
+    /// `RedrawRequested` uploads the merged layers and logo once. Startup
+    /// uploads directly in `resumed`, so this starts false.
+    pack_presentation_dirty: bool,
+    /// The Packs screen's transient message (missing-pack/content-change
+    /// warnings), using the same bounded tick-counter pattern as every other
+    /// screen message.
+    packs_message: Option<MenuMessage>,
     /// Clock acceleration from `--time-scale` (S02-T04): an app-level
     /// setting like FOV, NOT session state — the session clock stays
     /// world-swappable through `start_world_session`, and every session
@@ -8091,6 +8405,7 @@ impl GameApp {
         event_loop.exit();
     }
 
+    #[cfg(test)]
     fn new(cli: CliConfig, session: WorldSession) -> Self {
         Self::new_with_paths(
             cli,
@@ -8100,42 +8415,45 @@ impl GameApp {
         )
     }
 
-    /// Constructor with injectable settings and background paths.
+    /// Test-only constructor with injectable settings and background paths.
     ///
-    /// Production goes through [`GameApp::new`]; headless tests point both
-    /// paths at a tempdir so a developer's real settings.toml or background
-    /// save can never change a test outcome.
+    /// Production goes through [`GameApp::new_with_content`] after building
+    /// [`StartupContent`] once in `main`; headless tests point both paths at a
+    /// tempdir so a developer's real settings.toml or background save can
+    /// never change a test outcome.
+    #[cfg(test)]
     fn new_with_paths(
         cli: CliConfig,
-        mut session: WorldSession,
+        session: WorldSession,
         settings_path: PathBuf,
         background_path: PathBuf,
     ) -> Self {
-        // Startup settings load: never blocks launch — a missing or corrupt
-        // settings.toml yields defaults plus structured warnings, surfaced
-        // as menu text on the first open.
-        let (settings, mut startup_warnings) = load_with_warnings(&settings_path);
-        // Pack discovery and startup apply (M004/S03): the persisted choice
-        // is re-applied on every launch. A missing/deleted pack folder still
-        // yields a fully usable procedural pack plus one warning naming it,
-        // surfaced through the existing first-Settings-open message path
-        // (D031/MEM121, MEM009: warnings are data, never logs).
-        let packs_root = Path::new(pack::PACKS_DIR).to_path_buf();
-        let available_packs = pack::available_pack_names(&packs_root);
-        let (current_pack, pack_warnings) =
-            load_startup_pack(&packs_root, settings.texture_pack.as_deref());
-        startup_warnings.extend(pack_warnings);
-        // Startup sound overrides (M005/S05): resolved independently of the
-        // texture result, so a pack whose layers partially failed still
-        // supplies its sounds. The never-fail loader returns a complete
-        // buffer set; its warnings merge into the same one-time Settings-entry
-        // message path as every other startup warning (MEM009/D054). The
-        // engine is constructed first because `set_buffers` is device-free.
-        let mut audio = new_audio_engine();
-        let (startup_sounds, sound_warnings) =
-            load_startup_sounds(&packs_root, settings.texture_pack.as_deref());
-        audio.set_buffers(startup_sounds);
-        startup_warnings.extend(sound_warnings);
+        let content =
+            StartupContent::load(&settings_path, Path::new(pack::PACKS_DIR).to_path_buf());
+        Self::new_with_content(cli, session, content, background_path)
+    }
+
+    /// Constructor from already-loaded startup content.
+    ///
+    /// Production builds [`StartupContent`] once in `main` and shares the same
+    /// base registry with the startup session; this body only assembles the app
+    /// (no settings/pack/sound/registry I/O).
+    fn new_with_content(
+        cli: CliConfig,
+        mut session: WorldSession,
+        content: StartupContent,
+        background_path: PathBuf,
+    ) -> Self {
+        let StartupContent {
+            settings,
+            startup_warnings,
+            current_pack,
+            available_packs,
+            audio,
+            settings_path,
+            packs_root,
+            base_registry,
+        } = content;
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8245,21 +8563,37 @@ impl GameApp {
         // file is the deterministic demo; a corrupt file falls back to the
         // same demo and the reason becomes menu data (D006/MEM009). Loading is
         // read-only: this path never creates, repairs, or rewrites the file.
-        let (background, background_warning) =
-            match BackgroundScene::load(&background_path, settings.render_distance) {
-                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => (scene, None),
-                BackgroundLoad::Invalid { scene, error } => (
-                    scene,
-                    Some(format!(
-                        "could not load menu background: {error}; showing the default scenery (editing will replace it)"
-                    )),
-                ),
-            };
+        let (background, background_warning) = match BackgroundScene::load_with(
+            &background_path,
+            settings.render_distance,
+            base_registry.as_ref(),
+        ) {
+            BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => (scene, None),
+            BackgroundLoad::Invalid { scene, error } => (
+                scene,
+                Some(format!(
+                    "could not load menu background: {error}; showing the default scenery (editing will replace it)"
+                )),
+            ),
+        };
         let main_menu_message = if startup_screen == LifecycleScreen::MainMenu {
             background_warning.map(|text| MenuMessage {
                 text,
                 ticks_left: menu::MESSAGE_TICKS,
             })
+        } else {
+            None
+        };
+        // The session registry is the load-time registry: a loaded v8 world
+        // keeps its placeholder-augmented registry, a fresh world the launch
+        // base. Only `on_session_installed` re-adopts it on a swap (MEM512).
+        let session_registry = Arc::clone(&session.registry);
+        // Seed the changed-stack notice once, and only for a launch that
+        // starts in gameplay (D193). Menu-first launches keep it queued on the
+        // session; the usual `on_session_installed` path surfaces it when a
+        // world is actually opened.
+        let startup_content_notice = if startup_screen == LifecycleScreen::Playing {
+            session.take_content_notice()
         } else {
             None
         };
@@ -8285,7 +8619,12 @@ impl GameApp {
             inventory_drag: None,
             chest: ChestScreen::new(),
             chest_status: None,
-            game_message: None,
+            palette: PaletteScreen::new(),
+            palette_status: None,
+            game_message: startup_content_notice.map(|text| MenuMessage {
+                text,
+                ticks_left: menu::MESSAGE_TICKS,
+            }),
             selection_label: SelectionLabel::new(),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
@@ -8310,6 +8649,10 @@ impl GameApp {
             packs_root,
             available_packs,
             current_pack,
+            session_registry,
+            base_registry,
+            pack_presentation_dirty: false,
+            packs_message: None,
             time_scale: cli.time_scale,
             demo_cycle: None,
             demo_finished: false,
@@ -8429,11 +8772,14 @@ impl GameApp {
                     self.audio.play(SoundSlot::UiClick, self.settings.volume);
                 }
             }
-            MenuRow::TexturePack => {
-                // Cycling is not an adjust row: any button advances one step.
-                // The GPU re-upload needs the RenderContext, so it happens in
-                // the caller right after this call (same P005 split as vsync).
-                self.apply_texture_pack_cycle();
+            MenuRow::Packs => {
+                // Open the ordered-stack editor, preserving the caller that
+                // owns the return path. Presentation upload and persistence
+                // happen on the Packs screen's own actions, not here.
+                self.dispatch_screen_intent(
+                    event_loop,
+                    LifecycleIntent::Settings(SettingsIntent::Packs),
+                );
             }
             MenuRow::Close => {
                 // Close now dispatches Back through the lifecycle state
@@ -8469,40 +8815,59 @@ impl GameApp {
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
-    /// Apply one Texture Pack row click: advance through the discovered
-    /// packs (Default -> first -> ... -> Default), load the new pack, surface
-    /// any load warnings in the menu message slot (MEM009), and persist the
-    /// choice. Extracted from `menu_click` so the headless tests can drive
-    /// the exact click semantics without a live event loop; the live GPU
-    /// re-upload stays in the caller (P005 borrow split).
-    fn apply_texture_pack_cycle(&mut self) {
-        let next =
-            menu::cycle_texture_pack(self.settings.texture_pack.as_deref(), &self.available_packs);
-        self.settings.texture_pack = next.clone();
-        match next {
-            None => {
-                // Cycling back to Default restores the synthesized sounds
-                // (mirrors MEM135's procedural texture re-upload).
-                self.current_pack = None;
-                self.audio.set_buffers(default_buffers());
+    /// Reload the ordered stack and apply every live surface: merged layers,
+    /// logo, tunes, and the Packs screen's warning message. The session's
+    /// content registry is deliberately NOT replaced (MEM512); the candidate
+    /// becomes the new `base_registry` for the NEXT load, and a changed
+    /// definition digest only warns that content applies on the next load.
+    fn apply_pack_stack(&mut self) {
+        let (loaded, specs, mut warnings) =
+            load_startup_stack(&self.packs_root, &self.settings.pack_stack);
+        // Sound resolution is independent of the texture result and applies
+        // live: the never-fail resolver starts from the synthesized set and
+        // overlays only authored slots in stack order.
+        let (sounds, sound_warnings) = pack::sound::resolve_sounds(&specs);
+        self.audio.set_buffers(sounds);
+        warnings.extend(sound_warnings);
+        let (candidate, report) = build_session_registry(&specs);
+        warnings.extend(registry_warnings(&report));
+        let changed = candidate.digest() != self.base_registry.digest();
+
+        self.current_pack = loaded;
+        self.pack_presentation_dirty = true;
+        // The candidate becomes the base for the NEXT load. The live session
+        // keeps its frozen registry untouched (MEM512/D181).
+        self.base_registry = candidate;
+
+        if warnings.is_empty() && !changed {
+            self.packs_message = None;
+        } else {
+            let mut lines = menu::format_warnings(&warnings);
+            if changed {
+                lines.push("content changes apply when the world is loaded again".to_string());
             }
-            Some(name) => {
-                let loaded = pack::load_pack_by_name(&self.packs_root, &name);
-                // Sounds load independently of texture success and apply live
-                // on the same click (the helper holds no GPU borrow).
-                let (buffers, sound_warnings) =
-                    pack::sound::load_sound_overrides(&self.packs_root.join(&name));
-                self.audio.set_buffers(buffers);
-                let mut warnings = loaded.warnings.clone();
-                warnings.extend(sound_warnings);
-                if !warnings.is_empty() {
-                    let lines = menu::format_warnings(&warnings).join(" | ");
-                    self.menu.set_message(lines);
-                }
-                self.current_pack = Some(loaded);
-            }
+            self.packs_message = Some(MenuMessage {
+                text: lines.join(" | "),
+                ticks_left: menu::MESSAGE_TICKS,
+            });
         }
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
+    }
+
+    /// Toggle one Packs row: append an absent name, remove a present one, then
+    /// apply the new stack live. Extracted from `screen_click` so headless
+    /// tests drive the exact click semantics without an event loop.
+    fn toggle_pack_row(&mut self, name: &str) {
+        packs::toggle_pack(&mut self.settings.pack_stack, name);
+        self.apply_pack_stack();
+    }
+
+    /// Move one enabled Packs row one step up/down the stack. An edge move is
+    /// a no-op (no reload, no save), matching `packs::move_pack`.
+    fn move_pack_row(&mut self, name: &str, direction: packs::MoveDirection) {
+        if packs::move_pack(&mut self.settings.pack_stack, name, direction) {
+            self.apply_pack_stack();
+        }
     }
 
     /// Enter a lifecycle screen — the one transition entry point every
@@ -8545,6 +8910,8 @@ impl GameApp {
         self.inventory_drag = None;
         self.chest.close();
         self.chest_status = None;
+        self.palette.close();
+        self.palette_status = None;
         self.game_message = None;
         self.session.close_chest();
         self.cursor_grabbed = false;
@@ -8571,6 +8938,13 @@ impl GameApp {
         if screen == LifecycleScreen::LoadGame {
             self.refresh_load_rows();
         }
+        // Entering the Packs screen re-reads the pack folders (a pack authored
+        // while the game runs appears on the next visit, with no polling) and
+        // starts with a clean transient message.
+        if matches!(screen, LifecycleScreen::Packs(_)) {
+            self.available_packs = pack::available_pack_names(&self.packs_root);
+            self.packs_message = None;
+        }
         self.lifecycle = LifecycleState::from_screen(screen);
     }
 
@@ -8586,6 +8960,8 @@ impl GameApp {
         self.bow.reset();
         self.melee.reset();
         self.pause_message = None;
+        self.palette.close();
+        self.palette_status = None;
         self.cursor_grabbed = true;
         if let Some(window) = self.window.as_ref() {
             set_cursor_grab(window, true);
@@ -8743,7 +9119,20 @@ impl GameApp {
         self.inventory_drag = None;
         self.chest.close();
         self.chest_status = None;
+        self.palette.close();
+        self.palette_status = None;
         self.game_message = None;
+        // The installed session owns the registry every save names content
+        // through: a loaded world keeps its placeholder-augmented registry, a
+        // fresh world the base it was built from (MEM512/D181). Its one-shot
+        // changed-stack notice becomes the existing transient notice.
+        self.session_registry = Arc::clone(&self.session.registry);
+        if let Some(text) = self.session.take_content_notice() {
+            self.game_message = Some(MenuMessage {
+                text,
+                ticks_left: menu::MESSAGE_TICKS,
+            });
+        }
         self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
@@ -8800,17 +9189,26 @@ impl GameApp {
     /// menu anchor, with the scene's clock; saving it creates the file.
     fn build_background_edit_session(&self) -> Result<WorldSession, String> {
         let mut session = if self.background.persisted {
-            let data = load_world_from_path(&self.background_path)
-                .map_err(|error| format!("could not open menu background for editing: {error}"))?;
-            WorldSession::session_from_save(data, self.background_path.clone())
+            let loaded =
+                load_world_from_path_with(&self.background_path, self.base_registry.as_ref())
+                    .map_err(|error| {
+                        format!("could not open menu background for editing: {error}")
+                    })?;
+            let mut session = WorldSession::from_loaded_world(loaded, self.background_path.clone());
+            // D179: the menu background owns no content-notice channel, so the
+            // edit session must not surface the changed-stack note either. The
+            // placeholders still render, keeping the scene readable.
+            session.take_content_notice();
+            session
         } else {
             let position = self.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
-            WorldSession::new_at(
+            WorldSession::new_at_with_registry(
                 self.background.world.seed(),
                 self.background_path.clone(),
                 self.background.season_length_days,
                 position,
                 self.background.clock,
+                Arc::clone(&self.base_registry),
             )
         };
         // Edit Background always runs Creative movement rules over the live
@@ -8836,25 +9234,32 @@ impl GameApp {
     /// an empty store and a blank panorama. Restores the suspended session, so
     /// the menu returns to the pre-edit session rather than keeping the editor.
     fn finish_background_edit(&mut self) {
-        let reloaded =
-            match BackgroundScene::load(&self.background_path, self.settings.render_distance) {
-                BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => scene,
-                BackgroundLoad::Invalid { scene, error } => {
-                    self.main_menu_message = Some(MenuMessage {
-                        text: format!(
-                            "could not reload menu background: {error}; showing the default scenery"
-                        ),
-                        ticks_left: menu::MESSAGE_TICKS,
-                    });
-                    scene
-                }
-            };
+        let reloaded = match BackgroundScene::load_with(
+            &self.background_path,
+            self.settings.render_distance,
+            self.base_registry.as_ref(),
+        ) {
+            BackgroundLoad::Missing(scene) | BackgroundLoad::Loaded(scene) => scene,
+            BackgroundLoad::Invalid { scene, error } => {
+                self.main_menu_message = Some(MenuMessage {
+                    text: format!(
+                        "could not reload menu background: {error}; showing the default scenery"
+                    ),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                scene
+            }
+        };
         self.background = reloaded;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.vista_store.clear();
         }
         if let Some(previous) = self.suspended_session.take() {
             self.session = previous;
+            // The restored session's frozen registry is the current session
+            // registry again; the edit session's registry (and any one-shot
+            // notice) does not leak into menus or the next save.
+            self.session_registry = Arc::clone(&self.session.registry);
         }
     }
 
@@ -9065,6 +9470,7 @@ impl GameApp {
             LifecycleScreen::NewGame => LifecycleIntent::NewGame(NewGameIntent::Back),
             LifecycleScreen::LoadGame => LifecycleIntent::LoadGame(LoadGameIntent::Back),
             LifecycleScreen::Pause => LifecycleIntent::Pause(PauseIntent::Resume),
+            LifecycleScreen::Packs(_) => LifecycleIntent::Packs(PacksIntent::Back),
             _ => return,
         };
         self.dispatch_screen_intent(event_loop, intent);
@@ -9114,11 +9520,12 @@ impl GameApp {
         // The New Game row owns the season length (S02-T04) and the game mode
         // (S08-T01 T05): the screen's cycler values, defaulting to one game
         // day per season and Survival.
-        let session = WorldSession::new_session_with_mode(
+        let session = WorldSession::new_session_with_mode_and_registry(
             seed,
             save_path,
             self.new_game.season_length_days(),
             self.new_game.mode(),
+            Arc::clone(&self.base_registry),
         );
         // Unreachable: attempt_create only runs while the new-game screen is
         // open, and that screen accepts Create.
@@ -9157,8 +9564,11 @@ impl GameApp {
     /// degraded or vanished rows are displayed, never swallowed — the
     /// crate stays log-free). A loadable row starts the real world session:
     /// the persisted `WorldSaveData` (seed, player state, chunk edits)
-    /// rebuilds the session via `session::session_from_save` at the row's
-    /// own file path (`<saves_dir>/<file_name>`), and the S01 decision
+    /// rebuilds the session via `WorldSession::from_loaded_world` at the row's
+    /// own file path (`<saves_dir>/<file_name>`), resolved against the app's
+    /// `base_registry` so pack content keeps its real definitions and a
+    /// changed stack produces deterministic placeholders plus the one-shot
+    /// notice. The S01 decision
     /// `LoadWorld` (from dispatching `LoadGameIntent::Load`) drives the
     /// swap through the one `start_world_session` boundary and enters
     /// Playing semantics (cursor grab via `enter_playing`; the lifecycle
@@ -9170,8 +9580,11 @@ impl GameApp {
         let Some(row) = self.load.rows().get(index).cloned() else {
             return;
         };
-        let save = match self.catalog.load_row(&row) {
-            Ok(save) => save,
+        let loaded = match self
+            .catalog
+            .load_row_loaded(&row, self.base_registry.as_ref())
+        {
+            Ok(loaded) => loaded,
             Err(err) => {
                 self.load_message = Some(MenuMessage {
                     text: err.to_string(),
@@ -9181,7 +9594,7 @@ impl GameApp {
             }
         };
         let session =
-            WorldSession::session_from_save(save, self.catalog.saves_dir().join(&row.file_name));
+            WorldSession::from_loaded_world(loaded, self.catalog.saves_dir().join(&row.file_name));
         // Unreachable: play_row only runs while the load screen is
         // open, and that screen accepts Load.
         if let Ok(LifecycleDecision::LoadWorld) = self
@@ -9342,6 +9755,45 @@ impl GameApp {
                     }
                 }
             }
+            LifecycleScreen::Packs(_) => {
+                let rows = packs::packs_rows(&self.available_packs, &self.settings.pack_stack);
+                let Some(target) = packs::hovered_pack_target(cursor, surface_w, surface_h, &rows)
+                else {
+                    return;
+                };
+                match target {
+                    // Row body toggles the pack. A click always changes the
+                    // stack, so one click sound follows.
+                    packs::PackTarget::Row(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.toggle_pack_row(&name);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    // Up/Down are live only for enabled rows with a legal
+                    // move (the hover helper guarantees both), so each click
+                    // reorders and is audible.
+                    packs::PackTarget::Up(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.move_pack_row(&name, packs::MoveDirection::Up);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    packs::PackTarget::Down(index) => {
+                        let Some(row) = rows.get(index) else { return };
+                        let name = row.name.clone();
+                        self.move_pack_row(&name, packs::MoveDirection::Down);
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                    packs::PackTarget::Back => {
+                        self.dispatch_screen_intent(
+                            event_loop,
+                            LifecycleIntent::Packs(PacksIntent::Back),
+                        );
+                        self.audio.play(SoundSlot::UiClick, self.settings.volume);
+                    }
+                }
+            }
             // Settings clicks route through menu_click (its own path);
             // gameplay clicks never reach this method.
             LifecycleScreen::Settings(_) | LifecycleScreen::Playing => {}
@@ -9372,16 +9824,22 @@ impl ApplicationHandler for GameApp {
         // Re-apply the persisted texture pack to the freshly created GPU
         // texture (M004/S03): the renderer is still a local here, so the
         // initial upload reuses the same live-apply path as cycling. A
-        // missing pack still carries usable procedural layers.
-        if let Some(pack) = &self.current_pack {
-            renderer.write_block_layers(&ctx.queue, &pack.layers);
-        }
+        // missing pack still carries usable procedural layers. The 256-layer
+        // GPU array is always composed from the 48-layer base plus the
+        // frozen session registry's pack faces; unused slots are checker.
+        let base = match &self.current_pack {
+            Some(pack) => pack.layers.clone(),
+            None => generate_all_texture_layers_rgba(),
+        };
+        let pack_layers = self.base_registry.pack_layers().to_vec();
+        renderer.write_block_layers(&ctx.queue, &compose_block_array_layers(&base, &pack_layers));
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(
             &ctx,
             &renderer.block_texture_view,
             &renderer.block_texture_sampler,
+            &compose_item_sprite_layers(self.session_registry.pack_icons()),
         );
         // Startup logo upload (M004/S04): the texture is created exactly once
         // per pack selection, never on the render hot path. Default (`None`)
@@ -9445,6 +9903,17 @@ impl ApplicationHandler for GameApp {
                 )
             })
             .collect();
+        // Creative palette labels (S07-T03): same overlay type and metrics,
+        // sized once to the pure palette label bound.
+        let palette_labels = (0..MAX_PALETTE_LABELS)
+            .map(|_| {
+                StatsOverlay::with_metrics(
+                    &mut ui.font_system,
+                    HOTBAR_COUNT_FONT_SIZE,
+                    HOTBAR_COUNT_LINE_HEIGHT,
+                )
+            })
+            .collect();
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
@@ -9482,6 +9951,7 @@ impl ApplicationHandler for GameApp {
             hotbar_counts,
             inventory_labels,
             chest_labels,
+            palette_labels,
         });
     }
 
@@ -9677,6 +10147,94 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Palette owns the keyboard while open (S07-T03):
+                    // every press and release is consumed, so E/C can only
+                    // type, no digit/movement/F5 binding can fire through the
+                    // screen, and Escape is the only close path. This block
+                    // sits after the inventory/chest early returns and before
+                    // the gameplay match, including its Escape arm.
+                    if self.palette.is_open() {
+                        if !pressed {
+                            return;
+                        }
+                        if event.repeat {
+                            return;
+                        }
+                        match code {
+                            KeyCode::Escape => {
+                                close_palette(
+                                    &mut self.palette,
+                                    &mut self.palette_status,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
+                                    &mut self.mining,
+                                    &mut self.eating,
+                                    &mut self.bow,
+                                    &mut self.cursor_grabbed,
+                                    window,
+                                );
+                            }
+                            KeyCode::Enter => {
+                                if let Some(entry) = self.palette.selected_entry().cloned() {
+                                    match self
+                                        .session
+                                        .player
+                                        .grant_palette_item_with(&self.session_registry, entry.id)
+                                    {
+                                        Ok((slot, _)) => {
+                                            self.palette_status = Some(format!(
+                                                "Added {} to slot {}",
+                                                entry.display_name,
+                                                slot + 1
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            self.palette_status = Some(format!(
+                                                "Cannot add {}: {error:?}",
+                                                entry.display_name
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::ArrowUp => self.palette.move_selection(-1),
+                            KeyCode::ArrowDown => self.palette.move_selection(1),
+                            KeyCode::PageUp => self.palette.scroll_by(-9),
+                            KeyCode::PageDown => self.palette.scroll_by(9),
+                            KeyCode::Backspace => {
+                                self.palette.apply(TextInputAction::Backspace);
+                            }
+                            KeyCode::Delete => {
+                                self.palette.apply(TextInputAction::Delete);
+                            }
+                            KeyCode::ArrowLeft => {
+                                self.palette.apply(TextInputAction::MoveLeft);
+                            }
+                            KeyCode::ArrowRight => {
+                                self.palette.apply(TextInputAction::MoveRight);
+                            }
+                            KeyCode::Home => {
+                                self.palette.apply(TextInputAction::Home);
+                            }
+                            KeyCode::End => {
+                                self.palette.apply(TextInputAction::End);
+                            }
+                            _ => {
+                                if let Some(text) = event.text.as_deref() {
+                                    let printable: String = text
+                                        .chars()
+                                        .filter(|character| !character.is_control())
+                                        .collect();
+                                    if !printable.is_empty() {
+                                        self.palette.apply(TextInputAction::InsertText(printable));
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+
                     match code {
                         // E opens the 9+27 inventory with the 2x2 player grid
                         // (S03-T03). When a table station is already open the
@@ -9747,6 +10305,27 @@ impl ApplicationHandler for GameApp {
                         KeyCode::Digit9 if pressed => {
                             self.session.player.select_slot(8);
                         }
+                        // Creative palette (S07-T03): a documented,
+                        // non-rebindable utility key beside F/F5/digits.
+                        // Survival stays silent — no message, no empty panel
+                        // — because the palette is a Creative capability.
+                        KeyCode::KeyC if pressed && !event.repeat => {
+                            if palette::available_in(self.session.player.mode()) {
+                                open_palette(
+                                    &mut self.palette,
+                                    &self.session_registry,
+                                    &mut self.palette_status,
+                                    &mut self.input,
+                                    &mut self.left_mouse_held,
+                                    &mut self.right_mouse_held,
+                                    &mut self.mining,
+                                    &mut self.eating,
+                                    &mut self.bow,
+                                    &mut self.cursor_grabbed,
+                                    window,
+                                );
+                            }
+                        }
                         // Rebindable gameplay keys (S04-T03): press sets the
                         // InputState flag, release clears it — both
                         // transitions route through the loaded keybind map
@@ -9773,7 +10352,8 @@ impl ApplicationHandler for GameApp {
                 // consumed — the hotbar is gameplay state and no screen has
                 // a scroll action in this slice. Both gameplay panels consume
                 // it for the same reason (S03-T03/T05): no hotbar selection may
-                // change from inside a panel.
+                // change from inside a panel. The Creative palette consumes
+                // the wheel into its own scroll window instead of the hotbar.
                 if self.lifecycle.screen() != LifecycleScreen::Playing
                     || self.inventory.is_open()
                     || self.chest.is_open()
@@ -9801,7 +10381,11 @@ impl ApplicationHandler for GameApp {
                     }
                 };
                 if step != 0 {
-                    self.session.player.select_relative(step);
+                    if self.palette.is_open() {
+                        self.palette.scroll_by(step);
+                    } else {
+                        self.session.player.select_relative(step);
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -9809,6 +10393,18 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Palette release (S07-T03): the screen never transfers a
+                // stack on release, but clearing every hold keeps a press
+                // that started outside from surviving the close.
+                if self.palette.is_open() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    return;
+                }
                 // Inventory panel (S03-T03): a release resolves the drop for a
                 // press-drag-release gesture and always ends the gesture, so it
                 // can never reach gameplay. A same-cell or off-panel release
@@ -9842,11 +10438,13 @@ impl ApplicationHandler for GameApp {
                     if let Some(destination) =
                         drag_release_target(self.inventory_drag.take(), release_target)
                     {
-                        let result = apply_inventory_click(
+                        let result = apply_inventory_click_button_with(
                             &mut self.session.player,
+                            &self.session_registry,
                             &self.inventory,
                             table_open,
                             destination,
+                            InventoryClickButton::Left,
                         );
                         self.inventory_status = Some(inventory_status_text(result));
                     }
@@ -9903,6 +10501,16 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Right,
                 ..
             } => {
+                // Palette release (S07-T03): consume before `release_bow`, so
+                // a right press that never armed a draw cannot fire an arrow
+                // out of the palette.
+                if self.palette.is_open() {
+                    self.right_mouse_held = false;
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    return;
+                }
                 // A release can arrive while a menu owns the input, so this
                 // arm deliberately bypasses the screen routing (exactly like
                 // the Left release arm): clearing the right hold and any
@@ -9968,38 +10576,43 @@ impl ApplicationHandler for GameApp {
                                 apply_vsync(&mut gpu.ctx, self.settings.vsync);
                             }
                         }
-                        if clicked == Some(MenuRow::TexturePack) {
-                            // Live apply (MEM111): rewrite the EXISTING block
-                            // texture array's contents — same texture, view,
-                            // and bind group, so nothing needs recreation.
-                            // Clone/copy the layer bytes BEFORE the `as_mut`
-                            // borrow split (P005); Default re-uploads the
-                            // procedural layers so wrapping back restores
-                            // the built-in textures.
-                            let layers = match &self.current_pack {
-                                Some(pack) => pack.layers.clone(),
-                                None => generate_all_texture_layers_rgba(),
-                            };
-                            // The logo is cloned too, for the same reason:
-                            // both reads of `self.current_pack` happen before
-                            // the `self.gpu.as_mut()` borrow (P005). Cycling
-                            // back to Default passes None and clears the logo
-                            // so the text title returns.
-                            let logo = match &self.current_pack {
-                                Some(pack) => pack.logo.clone(),
-                                None => None,
-                            };
-                            if let Some(gpu) = self.gpu.as_mut() {
-                                gpu.renderer.write_block_layers(&gpu.ctx.queue, &layers);
-                                gpu.ui
-                                    .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
-                            }
-                        }
                     } else {
                         // Other lifecycle screens own the click (T01 hit
                         // tests); gpu is not touched after this call on
                         // this path.
                         self.screen_click(event_loop, button, surface_w, surface_h);
+                    }
+                    return;
+                }
+
+                // Palette press routing (S07-T03): before the click-to-re-grab branch.
+                // While open it owns every press: a left press grants exactly
+                // one authored stack (or reports empty space), a right press is
+                // inert but still consumed. No click can reach placement,
+                // mining arming, or the cursor re-grab below.
+                if self.palette.is_open() {
+                    if button == MouseButton::Left {
+                        let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        let layout = palette::layout(surface_w, surface_h);
+                        let clicked_name = self
+                            .cursor_pos
+                            .and_then(|cursor| palette::hit_test(&self.palette, &layout, cursor))
+                            .and_then(|index| self.palette.filtered_entry(index))
+                            .map(|entry| entry.display_name.clone());
+                        self.palette_status = match apply_palette_click(
+                            &mut self.session.player,
+                            &self.session_registry,
+                            &self.palette,
+                            &layout,
+                            self.cursor_pos,
+                        ) {
+                            Some((slot, _)) => Some(format!(
+                                "Added {} to slot {}",
+                                clicked_name.unwrap_or_else(|| "item".to_string()),
+                                slot + 1
+                            )),
+                            None => Some("No item under the cursor".to_string()),
+                        };
                     }
                     return;
                 }
@@ -10043,11 +10656,13 @@ impl ApplicationHandler for GameApp {
                                 // from an empty cursor (S04-T03).
                                 let cursor_empty_before =
                                     self.session.player.inventory().cursor().is_none();
-                                let result = apply_inventory_click(
+                                let result = apply_inventory_click_button_with(
                                     &mut self.session.player,
+                                    &self.session_registry,
                                     &self.inventory,
                                     table_open,
                                     target,
+                                    InventoryClickButton::Left,
                                 );
                                 self.inventory_status = Some(inventory_status_text(result));
                                 // Only a pure pick-up begins a drag; a swap,
@@ -10071,8 +10686,9 @@ impl ApplicationHandler for GameApp {
                                 .cursor_pos
                                 .and_then(|cursor| hit_test(mode, &layout, cursor));
                             if let Some(target) = target {
-                                let result = apply_inventory_click_button(
+                                let result = apply_inventory_click_button_with(
                                     &mut self.session.player,
+                                    &self.session_registry,
                                     &self.inventory,
                                     table_open,
                                     target,
@@ -10256,6 +10872,30 @@ impl ApplicationHandler for GameApp {
                 let dt = frame_dt.as_secs_f32();
                 self.last_frame = now;
 
+                // Live pack presentation (M010/S02-T07): a Packs toggle or
+                // reorder sets the dirty flag and the next frame rewrites the
+                // existing block texture array and logo once. Clone every
+                // pack read BEFORE touching `gpu` (P005); Default re-uploads
+                // the procedural layers and clears the logo so the text title
+                // returns. Content definitions stay frozen in
+                // `session_registry` (MEM512).
+                if self.pack_presentation_dirty {
+                    let base = match &self.current_pack {
+                        Some(pack) => pack.layers.clone(),
+                        None => generate_all_texture_layers_rgba(),
+                    };
+                    let pack_layers = self.base_registry.pack_layers().to_vec();
+                    let logo = self
+                        .current_pack
+                        .as_ref()
+                        .and_then(|pack| pack.logo.clone());
+                    let composed = compose_block_array_layers(&base, &pack_layers);
+                    gpu.renderer.write_block_layers(&gpu.ctx.queue, &composed);
+                    gpu.ui
+                        .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                    self.pack_presentation_dirty = false;
+                }
+
                 // Message expiry at a bounded ~60 ticks/s (see
                 // `MENU_TICK_INTERVAL`): the pure tick counters decrement
                 // only here, so warnings never stick forever and never flash
@@ -10270,6 +10910,7 @@ impl ApplicationHandler for GameApp {
                         || self.main_menu_message.is_some()
                         || self.pause_message.is_some()
                         || self.game_message.is_some()
+                        || self.packs_message.is_some()
                     {
                         self.menu.tick();
                         self.new_game.tick();
@@ -10277,6 +10918,7 @@ impl ApplicationHandler for GameApp {
                         tick_transient_message(&mut self.main_menu_message);
                         tick_transient_message(&mut self.pause_message);
                         tick_transient_message(&mut self.game_message);
+                        tick_transient_message(&mut self.packs_message);
                     }
                 }
 
@@ -10295,8 +10937,12 @@ impl ApplicationHandler for GameApp {
                 // raycast, and hold-to-mine, but NOT the world: time, station
                 // revalidation, streaming, and saves keep running so a panel
                 // opened next to a station cannot freeze the chunk pipeline.
-                let gameplay =
-                    gameplay_surface(playing, self.inventory.is_open(), self.chest.is_open());
+                let gameplay = gameplay_surface(
+                    playing,
+                    self.inventory.is_open(),
+                    self.chest.is_open(),
+                    self.palette.is_open(),
+                );
                 // Game time (S02-T04): advance only on Playing frames, before
                 // the player update, with the app-owned acceleration scale.
                 // The same two lines as `GameApp::tick_clock` (which the
@@ -10492,7 +11138,13 @@ impl ApplicationHandler for GameApp {
                     );
                     if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
                     {
-                        self.session.player.eat_selected(slot, item);
+                        // Authored nutrition resolves through the frozen
+                        // session registry; built-in food answers unchanged.
+                        self.session.player.eat_selected_with(
+                            self.session.registry.as_ref(),
+                            slot,
+                            item,
+                        );
                     }
                     // Hold-to-draw (M009/S07-T05): raw frame dt, never
                     // `dt * time_scale`, exactly like eating and the melee
@@ -10648,7 +11300,8 @@ impl ApplicationHandler for GameApp {
                             h.block_pos.y,
                             h.block_pos.z,
                         );
-                        MiningTarget::from_block(
+                        MiningTarget::from_block_with(
+                            &self.session.registry,
                             h.block_pos,
                             block,
                             self.session.player.selected_item(),
@@ -10674,7 +11327,8 @@ impl ApplicationHandler for GameApp {
                     // i-frame-blocked swing mutate nothing (MEM392).
                     let target_health = self.session.mobs().get(index).map(|mob| mob.health);
                     if let Some(target_health) = target_health {
-                        let damage = attack_damage(
+                        let damage = attack_damage_with(
+                            &self.session.registry,
                             self.session.player.selected_item(),
                             self.session.player.mode(),
                             target_health,
@@ -10706,7 +11360,9 @@ impl ApplicationHandler for GameApp {
                 // mining candidate is untouched.
                 let candidate = mining_after_attack(attack_candidate, mining_candidate);
                 let mut target_block = hit.map(|h| h.block_pos);
-                if let MiningTick::Broke { pos, block } = self.mining.tick(dt, candidate) {
+                if let MiningTick::Broke { pos, block } =
+                    self.mining.tick_with(&self.session.registry, dt, candidate)
+                {
                     // The only production break site (S02): hardness
                     // gating happens in MiningState and is re-checked by the
                     // helper, so Bedrock (no duration) can never reach an
@@ -10840,7 +11496,16 @@ impl ApplicationHandler for GameApp {
                 if active_screen != LifecycleScreen::Playing {
                     let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                     let settings_open = self.menu.is_open();
-                    let (panel_x, panel_y, panel_w, panel_h) = if settings_open {
+                    // The Packs screen owns a row model rather than the
+                    // fixed settings geometry: rows reflow with the stack,
+                    // so the panel, highlight, and text all derive from
+                    // `packs_rows` for this frame.
+                    let pack_rows = matches!(active_screen, LifecycleScreen::Packs(_)).then(|| {
+                        packs::packs_rows(&self.available_packs, &self.settings.pack_stack)
+                    });
+                    let (panel_x, panel_y, panel_w, panel_h) = if let Some(rows) = &pack_rows {
+                        packs::pack_panel_rect(surface_w, rows.len())
+                    } else if settings_open {
                         menu::panel_rect(surface_w, surface_h)
                     } else {
                         screen_panel_rect(active_screen, &self.load, surface_w, surface_h)
@@ -10852,7 +11517,26 @@ impl ApplicationHandler for GameApp {
                         h: panel_h,
                         color: [0.0, 0.0, 0.0, 0.7],
                     });
-                    let hovered = if settings_open {
+                    let hovered = if let Some(rows) = &pack_rows {
+                        self.cursor_pos
+                            .and_then(|cursor| {
+                                packs::hovered_pack_target(cursor, surface_w, surface_h, rows)
+                            })
+                            .and_then(|target| match target {
+                                packs::PackTarget::Row(index) => {
+                                    packs::pack_row_rect(surface_w, index, rows.len())
+                                }
+                                packs::PackTarget::Up(index) => {
+                                    Some(packs::pack_up_rect(surface_w, index))
+                                }
+                                packs::PackTarget::Down(index) => {
+                                    Some(packs::pack_down_rect(surface_w, index))
+                                }
+                                packs::PackTarget::Back => {
+                                    Some(packs::pack_back_rect(surface_w, rows.len()))
+                                }
+                            })
+                    } else if settings_open {
                         self.cursor_pos
                             .and_then(|cursor| menu::hovered_row(cursor, surface_w, surface_h))
                             .and_then(|hover| {
@@ -10880,12 +11564,17 @@ impl ApplicationHandler for GameApp {
                             color: [0.35, 0.55, 0.9, 0.3],
                         });
                     }
-                    let text = if settings_open {
-                        let pack_label = self
-                            .current_pack
-                            .as_ref()
-                            .map_or("Default", |pack| pack.display_name.as_str());
-                        compose_menu_text(&self.settings, &self.menu, pack_label)
+                    let text = if let Some(rows) = &pack_rows {
+                        packs::compose_pack_lines(
+                            rows,
+                            self.packs_message.as_ref().map(|m| m.text.as_str()),
+                        )
+                    } else if settings_open {
+                        compose_menu_text(
+                            &self.settings,
+                            &self.menu,
+                            &packs::summary_label(&self.settings.pack_stack),
+                        )
                     } else {
                         compose_screen_text(
                             active_screen,
@@ -10949,6 +11638,7 @@ impl ApplicationHandler for GameApp {
                     playing,
                     self.inventory.is_open(),
                     self.chest.is_open(),
+                    self.palette.is_open(),
                     &self.selection_label,
                 );
                 // Gameplay transient notice (S03-T05): a station that vanished
@@ -11023,7 +11713,7 @@ impl ApplicationHandler for GameApp {
                 let inventory_layout = if inventory_mode.is_open() {
                     let layout =
                         layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
-                    quads.extend(screen_quads(
+                    quads.extend(screen_quads_with(
                         inventory_mode,
                         &layout,
                         self.session.player.inventory(),
@@ -11031,6 +11721,7 @@ impl ApplicationHandler for GameApp {
                         self.session.player.table_grid(),
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
+                        &self.session_registry,
                     ));
                     Some(layout)
                 } else {
@@ -11056,19 +11747,34 @@ impl ApplicationHandler for GameApp {
                 } else {
                     None
                 };
+                // Palette quads/icons/text ride the single UI pass (S07-T03).
+                // A closed palette extends nothing, so every pre-M010 pinned
+                // digest stays byte-identical.
+                let palette_layout_value = if self.palette.is_open() {
+                    let layout = palette::layout(gpu.ctx.config.width, gpu.ctx.config.height);
+                    quads.extend(palette::screen_quads(
+                        &self.palette,
+                        &layout,
+                        self.cursor_pos,
+                    ));
+                    Some(layout)
+                } else {
+                    None
+                };
                 // Hover tooltips (S05-T02): a held stack is described when the
                 // pointer is not over an occupied target; otherwise the target
                 // itself is described through the same `hit_test`/`ChestTarget`
                 // model the click handlers use. Closed screens produce nothing.
                 let tooltip_hover = self.cursor_pos.and_then(|cursor| {
                     if let Some(layout) = inventory_layout.as_ref() {
-                        hovered_item(
+                        hovered_item_with(
                             inventory_mode,
                             layout,
                             self.session.player.inventory(),
                             self.session.player.player_grid(),
                             self.session.player.table_grid(),
                             cursor,
+                            &self.session_registry,
                         )
                         .or_else(|| self.session.player.inventory().cursor())
                     } else if let Some(layout) = chest_layout_value.as_ref() {
@@ -11085,6 +11791,13 @@ impl ApplicationHandler for GameApp {
                                 }
                             });
                         chest_item.or_else(|| self.session.player.inventory().cursor())
+                    } else if let Some(layout) = palette_layout_value.as_ref() {
+                        palette_hovered_item(
+                            self.session_registry.as_ref(),
+                            &self.palette,
+                            layout,
+                            Some(cursor),
+                        )
                     } else {
                         None
                     }
@@ -11097,7 +11810,8 @@ impl ApplicationHandler for GameApp {
                 let mut tooltip_quad = None;
                 let mut tooltip_bounds = None;
                 if let (Some(item), Some(cursor)) = (tooltip_hover, self.cursor_pos) {
-                    let (text, line_count) = tooltip_text(item);
+                    let (text, line_count) =
+                        tooltip_text_with(item, Some(self.session_registry.as_ref()));
                     debug_assert!(
                         line_count <= 3,
                         "tooltip_lines is capped at name + count + durability"
@@ -11128,7 +11842,10 @@ impl ApplicationHandler for GameApp {
                 // (no new pipeline), and panels hide it entirely.
                 let mut selected_name_text_area = None;
                 if selected_name_visible {
-                    if let Some(label) = self.selection_label.label() {
+                    if let Some(label) = self
+                        .selection_label
+                        .label_with(Some(self.session_registry.as_ref()))
+                    {
                         let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                         gpu.selected_name_text.update(
                             &mut gpu.ui.font_system,
@@ -11164,13 +11881,15 @@ impl ApplicationHandler for GameApp {
                 // same pixel-space rects the quads use and classify each item
                 // through `icon_source`; the icon pass draws after every quad
                 // and below text, so counts and labels always win.
-                let mut icons: IconDrawList = hotbar_icon_vertices(
+                let mut icons: IconDrawList = hotbar_icon_vertices_with(
+                    Some(&self.session_registry),
                     self.session.player.inventory(),
                     gpu.ctx.config.width,
                     gpu.ctx.config.height,
                 );
                 if let Some(layout) = inventory_layout.as_ref() {
-                    icons.append(inventory_icon_vertices(
+                    icons.append(inventory_icon_vertices_with(
+                        Some(&self.session_registry),
                         inventory_mode,
                         layout,
                         self.session.player.inventory(),
@@ -11178,6 +11897,15 @@ impl ApplicationHandler for GameApp {
                         self.session.player.table_grid(),
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ));
+                }
+                if let Some(layout) = palette_layout_value.as_ref() {
+                    icons.append(palette_icon_vertices_with(
+                        Some(&self.session_registry),
+                        &self.palette,
+                        layout,
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
                     ));
@@ -11219,13 +11947,14 @@ impl ApplicationHandler for GameApp {
                 // A closed screen produces no labels, so nothing is reshaped
                 // and no inventory text area is pushed.
                 let inventory_panel_labels = match inventory_layout {
-                    Some(layout) => screen_labels(
+                    Some(layout) => screen_labels_with(
                         inventory_mode,
                         &layout,
                         self.session.player.inventory(),
                         self.session.player.player_grid(),
                         self.session.player.table_grid(),
                         self.inventory_status.as_deref(),
+                        &self.session_registry,
                     ),
                     None => Vec::new(),
                 };
@@ -11255,6 +11984,31 @@ impl ApplicationHandler for GameApp {
                     None => Vec::new(),
                 };
                 for (buffer, label) in gpu.chest_labels.iter_mut().zip(chest_panel_labels.iter()) {
+                    buffer.update(
+                        &mut gpu.ui.font_system,
+                        gpu.ctx.config.width as f32,
+                        gpu.ctx.config.height as f32,
+                        &label.text,
+                    );
+                }
+
+                // Palette panel labels (S07-T03): same two-pass borrow
+                // pattern. The pure screen footer reads `PaletteScreen::status`,
+                // so the grant status cached on the app is synced into the
+                // screen before labels are built. Closed -> no labels, no
+                // re-shape, no text area.
+                let palette_panel_labels = match palette_layout_value {
+                    Some(layout) => {
+                        self.palette.set_status(self.palette_status.clone());
+                        palette::screen_labels(&self.palette, &layout)
+                    }
+                    None => Vec::new(),
+                };
+                for (buffer, label) in gpu
+                    .palette_labels
+                    .iter_mut()
+                    .zip(palette_panel_labels.iter())
+                {
                     buffer.update(
                         &mut gpu.ui.font_system,
                         gpu.ctx.config.width as f32,
@@ -11333,6 +12087,20 @@ impl ApplicationHandler for GameApp {
                 // Chest panel labels ride the same UI pass above the HUD.
                 debug_assert!(chest_panel_labels.len() <= MAX_CHEST_LABELS);
                 for (buffer, label) in gpu.chest_labels.iter().zip(chest_panel_labels.iter()) {
+                    let label_rect = (
+                        label.left,
+                        label.top,
+                        buffer.measured_width(),
+                        LABEL_LINE_HEIGHT,
+                    );
+                    if tooltip_bounds.is_some_and(|bounds| rects_intersect(label_rect, bounds)) {
+                        continue;
+                    }
+                    areas.push(buffer.text_area(label.left, label.top));
+                }
+                // Palette labels ride the same UI pass above the HUD (S07-T03).
+                debug_assert!(palette_panel_labels.len() <= MAX_PALETTE_LABELS);
+                for (buffer, label) in gpu.palette_labels.iter().zip(palette_panel_labels.iter()) {
                     let label_rect = (
                         label.left,
                         label.top,
@@ -11482,8 +12250,10 @@ impl ApplicationHandler for GameApp {
                             } else {
                                 "Walk"
                             };
-                            let block_name =
-                                selected_item_label(self.session.player.selected_item());
+                            let block_name = selected_item_label_with(
+                                self.session.player.selected_item(),
+                                Some(self.session_registry.as_ref()),
+                            );
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -11675,7 +12445,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 218-byte v7 witness keep their exact bytes.
+            // measured 307-byte v8 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -11685,7 +12455,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Shot stage's digest follows the Hostile line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` /
-            // `combat_hostile:` lines and the v7 witness keep their exact
+            // `combat_hostile:` lines and the v8 witness keep their exact
             // bytes.
             if let Some(line) = self
                 .combat_demo
@@ -11704,7 +12474,7 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             // The Creative stage's digest follows the Skeleton line for the
-            // same reason: every earlier line and the 218-byte v7 witness keep
+            // same reason: every earlier line and the 307-byte v8 witness keep
             // their exact bytes.
             if let Some(line) = self
                 .combat_demo
@@ -11764,8 +12534,1699 @@ impl ApplicationHandler for GameApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Headless presentation digest (`--demo-presentation`, M010/S04-T05)
+// ---------------------------------------------------------------------------
+
+/// Fixed seed of the presentation digest's fixture world: the authored blocks
+/// sit relative to this seed's deterministic terrain height, so two machines
+/// render the same world. Never a clock, a random source, or a path.
+const PRESENTATION_DEMO_SEED: u32 = 0x0BEE_F5ED;
+
+/// The fixture world's authored block positions: two floating cells above the
+/// deterministic surface at column `(4, 4)`, far enough apart that greedy
+/// meshing cannot merge one block's faces into the other's.
+fn presentation_demo_block_positions() -> (IVec3, IVec3) {
+    let surface = terrain_height_at_seeded(4, 4, PRESENTATION_DEMO_SEED);
+    (IVec3::new(4, surface + 2, 4), IVec3::new(6, surface + 2, 6))
+}
+
+/// The stable label of an [`ItemId`] for the digest. Registry identities are
+/// named through the same frozen registry the rest of the digest reports, so
+/// the printed drop name is the authored name, never a display label.
+fn presentation_item_label(registry: &ContentRegistry, id: ItemId) -> String {
+    match id {
+        ItemId::Block(block) => registry
+            .block_name(block)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("block:{}", block.to_raw())),
+        ItemId::Item(index) => registry
+            .item_def_name(index)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("item:{index}")),
+        ItemId::ModTool(index) => registry
+            .tool_def_name(index)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("tool:{index}")),
+        ItemId::Material(material) => material.name().to_string(),
+        ItemId::Tool { kind, tier } => format!("{}_{}", tier.name(), kind.name()),
+    }
+}
+
+/// The v8 fixture save the digest writes and reloads: a frozen seed, two
+/// authored block edits in the chunk at the origin column, one authored item
+/// stack in the hotbar, and a Creative player standing just above them.
+///
+/// Everything is derived from the frozen seed, so the file bytes are stable
+/// across machines for one registry (the v8 content table names the ids, and
+/// the edit map is sorted by the encoder).
+fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16) -> WorldSaveData {
+    let (ore_pos, block_pos) = presentation_demo_block_positions();
+    let mut chunk_edits = ChunkEditMap::default();
+    for (pos, id) in [(ore_pos, ore), (block_pos, block)] {
+        let (chunk_pos, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        chunk_edits
+            .entry(chunk_pos)
+            .or_default()
+            .insert(linear_index(lx, ly, lz) as u16, id);
+    }
+    let mut inventory = Inventory::empty();
+    inventory
+        .insert(Item::new(ItemId::Item(item_index), 5).expect("fixture item stack"))
+        .expect("the empty fixture inventory accepts the stack");
+    let eye_y = (ore_pos.y + 4) as f32;
+    WorldSaveData {
+        seed: PRESENTATION_DEMO_SEED,
+        time_of_day: DEFAULT_TIME_OF_DAY,
+        day_index: 0,
+        season_length_days: opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        mode: GameMode::Creative,
+        player: SavedPlayerState {
+            position: [4.5, eye_y, 4.5],
+            yaw: 0.0,
+            pitch: -0.4,
+            fly_mode: true,
+            selected_slot: 0,
+            render_distance: 16,
+            inventory,
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
+            survival: SurvivalState::full(),
+        },
+        chests: Default::default(),
+        mobs: Vec::new(),
+        chunk_edits,
+    }
+}
+
+/// Build the deterministic `--demo-presentation` digest.
+///
+/// Every line is a structural fact (counts, resolved names, authored layers,
+/// booleans) rather than a timing, an absolute path or an asset hash, so the
+/// pinned line set is machine-independent. All content comes through the
+/// production seams: the frozen session registry, the CPU composers the real
+/// renderer uploads, `mesh_chunk_with`, `MiningTarget::from_block_with` +
+/// `MiningState::tick_with`, `break_mined_block`, and the v8 save/load codec.
+///
+/// Returns `(lines, ok)`. `ok` is false exactly when a leg recorded a
+/// `failed=<name>` token; the caller exits non-zero on that flag.
+fn presentation_demo_lines(
+    registry: &Arc<ContentRegistry>,
+    fixture: Option<&Path>,
+) -> (Vec<String>, bool) {
+    use opencraft::content::faces::BlockFaces;
+    use opencraft::content::{
+        PACK_ICON_BASE, PACK_LAYER_BASE, PLACEHOLDER_BLOCK_LAYER, PLACEHOLDER_ICON_LAYER,
+    };
+    use opencraft::render::texture::{BLOCK_ARRAY_LAYERS, NUM_TEX_LAYERS};
+    use opencraft::ui::item_icon::{
+        generate_item_sprite_layers_rgba, ITEM_SPRITE_ARRAY_LAYERS, ITEM_SPRITE_BYTES,
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // (a) Frozen registry counts and the two composed GPU arrays.
+    lines.push(format!(
+        "presentation_demo: leg=registry blocks={} items={} pack_layers={} pack_icons={}",
+        registry.blocks().len(),
+        registry.items().len(),
+        registry.pack_layers().len(),
+        registry.pack_icons().len(),
+    ));
+
+    let base_layers = generate_all_texture_layers_rgba();
+    let block_array = compose_block_array_layers(&base_layers, registry.pack_layers());
+    let empty_block_array = compose_block_array_layers(&base_layers, &[]);
+    let builtin_layers_match = block_array.len() == BLOCK_ARRAY_LAYERS as usize
+        && block_array
+            .iter()
+            .take(NUM_TEX_LAYERS as usize)
+            .eq(base_layers.iter().take(NUM_TEX_LAYERS as usize));
+    let pack_layer_match = match registry.pack_layer(PACK_LAYER_BASE) {
+        Some(layer) => block_array.get(PACK_LAYER_BASE as usize).map(Vec::as_slice) == Some(layer),
+        None => {
+            block_array.get(PACK_LAYER_BASE as usize)
+                == empty_block_array.get(PACK_LAYER_BASE as usize)
+        }
+    };
+    lines.push(format!(
+        "presentation_demo: leg=block_array layers={} builtin_match={} pack_match={}",
+        block_array.len(),
+        builtin_layers_match,
+        pack_layer_match,
+    ));
+    if !builtin_layers_match {
+        failed.get_or_insert("block_array_builtin");
+    }
+    if !pack_layer_match {
+        failed.get_or_insert("block_array_pack");
+    }
+
+    let base_icons = generate_item_sprite_layers_rgba();
+    let item_atlas = compose_item_sprite_layers(registry.pack_icons());
+    let builtin_icons_match = item_atlas.len() == ITEM_SPRITE_ARRAY_LAYERS as usize
+        && item_atlas
+            .iter()
+            .take(base_icons.len())
+            .eq(base_icons.iter());
+    let padding_icon = vec![0u8; ITEM_SPRITE_BYTES];
+    let pack_icon_match = match registry.pack_icon(PACK_ICON_BASE) {
+        Some(icon) => item_atlas.get(PACK_ICON_BASE as usize).map(Vec::as_slice) == Some(icon),
+        None => item_atlas.get(PACK_ICON_BASE as usize) == Some(&padding_icon),
+    };
+    lines.push(format!(
+        "presentation_demo: leg=item_atlas layers={} builtin_match={} pack_match={}",
+        item_atlas.len(),
+        builtin_icons_match,
+        pack_icon_match,
+    ));
+    if !builtin_icons_match {
+        failed.get_or_insert("item_atlas_builtin");
+    }
+    if !pack_icon_match {
+        failed.get_or_insert("item_atlas_pack");
+    }
+
+    // (b) Authored content lookups. A stack with no packs at all is the
+    // built-in launch: nothing authored is expected, so only the absence is
+    // reported. A non-empty stack that cannot resolve the pinned names is a
+    // broken pack and fails closed.
+    let authored_ore = registry.block_by_name("mymod:ruby_ore");
+    let authored_block = registry.block_by_name("mymod:ruby_block");
+    let authored_item = registry.item_by_name("mymod:ruby");
+    let has_packs = !registry.packs().is_empty();
+
+    if !has_packs {
+        lines.push(
+            "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
+                .to_string(),
+        );
+    } else if authored_ore.is_none() || authored_block.is_none() || authored_item.is_none() {
+        if authored_ore.is_none() {
+            failed.get_or_insert("ruby_ore");
+        }
+        if authored_block.is_none() {
+            failed.get_or_insert("ruby_block");
+        }
+        if authored_item.is_none() {
+            failed.get_or_insert("ruby_item");
+        }
+        lines.push(format!(
+            "presentation_demo: leg=authored ruby_ore={} ruby_block={} ruby={}",
+            if authored_ore.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            if authored_block.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            if authored_item.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+        ));
+    } else {
+        let ore = authored_ore.expect("checked present above");
+        let block = authored_block.expect("checked present above");
+        let item = authored_item.expect("checked present above");
+
+        for def in [ore, block] {
+            let faces = def
+                .faces
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let drop = match def.drop.and_then(ItemRef::item_id) {
+                Some(id) => presentation_item_label(registry, id),
+                None => "none".to_string(),
+            };
+            let hardness = match def.hardness {
+                Some(value) => format!("{value:.3}"),
+                None => "none".to_string(),
+            };
+            lines.push(format!(
+                "presentation_demo: leg=block name={} id={} faces={} hardness={} drop={} stack={}",
+                def.name,
+                def.id.to_raw(),
+                faces,
+                hardness,
+                drop,
+                def.stack_limit,
+            ));
+        }
+        lines.push(format!(
+            "presentation_demo: leg=item name={} id={} icon={} stack={}",
+            item.name, item.index, item.icon_layer, item.stack_limit,
+        ));
+
+        // (c) Mesh the authored blocks through the production face table.
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            PRESENTATION_DEMO_SEED,
+            fixture
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("presentation-demo.mcvx")),
+            opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(registry),
+        );
+        let chunk_pos = ChunkPos::new(0, 0, 0);
+        session.world.insert_chunk_for_test(
+            chunk_pos,
+            opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+        );
+        for neighbor in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            session.world.insert_chunk_for_test(
+                neighbor,
+                opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+            );
+        }
+        let ore_pos = IVec3::new(0, 10, 0);
+        let block_pos = IVec3::new(2, 10, 0);
+        session
+            .world
+            .set_block_immediate(ore_pos.x, ore_pos.y, ore_pos.z, ore.id);
+        session
+            .world
+            .set_block_immediate(block_pos.x, block_pos.y, block_pos.z, block.id);
+
+        let mut mesh_ok = false;
+        if let Some(padded) = session.world.build_padded_chunk(chunk_pos) {
+            let mesh =
+                opencraft::mesh::greedy::mesh_chunk_with(&padded, session.world.block_faces());
+            let mut layers: Vec<u8> = mesh
+                .buckets
+                .iter()
+                .flat_map(|bucket| bucket.iter())
+                .map(|quad| quad.unpack().6)
+                .collect();
+            layers.sort_unstable();
+            layers.dedup();
+            let mut expected: Vec<u8> = ore
+                .faces
+                .iter()
+                .chain(block.faces.iter())
+                .copied()
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+            let layer_text = layers
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!(
+                "presentation_demo: leg=mesh blocks=2 quads={} layers={}",
+                mesh.total_quads(),
+                layer_text,
+            ));
+            // Two isolated blocks with six exposed faces each: exactly 12
+            // greedy quads, and every one samples an authored layer.
+            mesh_ok = mesh.total_quads() == 12 && layers == expected;
+        }
+        if !mesh_ok {
+            failed.get_or_insert("mesh");
+        }
+
+        // (d) Mine the authored block through the production break path.
+        let target = MiningTarget::from_block_with(&session.registry, ore_pos, ore.id, None);
+        let mut ticks = 0usize;
+        let mut broke = false;
+        if let Some(target) = target {
+            let mut mining = MiningState::new();
+            while ticks < 10_000 {
+                ticks += 1;
+                match mining.tick_with(&session.registry, 0.05, Some(target)) {
+                    MiningTick::Broke { .. } => {
+                        broke = true;
+                        break;
+                    }
+                    MiningTick::Mining { .. } => {}
+                    MiningTick::Idle => break,
+                }
+            }
+        }
+        let outcome = break_mined_block(&mut session, ore_pos, ore.id);
+        let applied = matches!(outcome, BreakOutcome::Applied { .. });
+        let drop_entry = registry.drop_entry(ore.id);
+        let collected = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .enumerate()
+            .find_map(|(slot, item)| item.map(|item| (slot, item)));
+        let (drop_name, count, slot, limit) = match (drop_entry, collected) {
+            (Some((id, limit)), Some((slot, item))) => (
+                presentation_item_label(registry, id),
+                item.count(),
+                slot,
+                limit,
+            ),
+            _ => ("none".to_string(), 0, 0, 0),
+        };
+        lines.push(format!(
+            "presentation_demo: leg=mine target={} ticks={} broken={} applied={} drop={} count={} slot={} limit={}",
+            ore.name, ticks, broke, applied, drop_name, count, slot, limit,
+        ));
+        let authored_drop = drop_entry
+            .map(|(id, _)| id == ItemId::Item(item.index))
+            .unwrap_or(false);
+        let mine_ok = target.is_some()
+            && broke
+            && applied
+            && authored_drop
+            && count == 1
+            && limit == item.stack_limit;
+        if !mine_ok {
+            failed.get_or_insert("mine");
+        }
+
+        // (e) Write the v8 fixture, reload it against the same registry, then
+        // reload the same bytes against the built-in registry to prove the
+        // reserved placeholder policy.
+        let (fixture_path, remove_fixture) = match fixture {
+            Some(path) => (path.to_path_buf(), false),
+            None => (
+                std::env::temp_dir().join(format!(
+                    "opencraft-presentation-demo-{}.mcvx",
+                    std::process::id()
+                )),
+                true,
+            ),
+        };
+        let save_data = presentation_demo_save_data(ore.id, block.id, item.index);
+        let saved = save_world_to_path_with(&fixture_path, &save_data, registry.as_ref());
+        if saved.is_err() {
+            failed.get_or_insert("save_write");
+        } else {
+            match load_world_from_path_with(&fixture_path, registry.as_ref()) {
+                Ok(loaded) => {
+                    let ore_resolved = loaded
+                        .registry
+                        .block_by_name("mymod:ruby_ore")
+                        .map(|def| !def.placeholder)
+                        .unwrap_or(false);
+                    let block_resolved = loaded
+                        .registry
+                        .block_by_name("mymod:ruby_block")
+                        .map(|def| !def.placeholder)
+                        .unwrap_or(false);
+                    let item_resolved = loaded
+                        .registry
+                        .item_by_name("mymod:ruby")
+                        .map(|def| !def.placeholder)
+                        .unwrap_or(false);
+                    lines.push(format!(
+                        "presentation_demo: leg=save unresolved={} ruby_ore={} ruby_block={} ruby_item={}",
+                        loaded.unresolved, ore_resolved, block_resolved, item_resolved,
+                    ));
+                    if loaded.unresolved != 0 || !ore_resolved || !block_resolved || !item_resolved
+                    {
+                        failed.get_or_insert("save_reload");
+                    }
+                }
+                Err(_) => {
+                    failed.get_or_insert("save_reload");
+                    lines.push("presentation_demo: leg=save unresolved=- ruby_ore=false ruby_block=false ruby_item=false".to_string());
+                }
+            }
+
+            // Placeholder policy: the same bytes against built-in content.
+            match load_world_from_path_with(&fixture_path, ContentRegistry::builtin()) {
+                Ok(loaded) => {
+                    let unresolved_placeholders = loaded.unresolved;
+                    let placeholder = loaded.registry.block_by_name("mymod:ruby_ore");
+                    let placeholder_item = loaded.registry.item_by_name("mymod:ruby");
+                    let faces = BlockFaces::from_registry(&loaded.registry);
+                    let mesh_layer = placeholder
+                        .map(|def| faces.layer(def.id, 0))
+                        .unwrap_or(u8::MAX);
+                    let face = placeholder.map(|def| def.faces[0]).unwrap_or(u8::MAX);
+                    let icon = placeholder_item
+                        .map(|def| def.icon_layer)
+                        .unwrap_or(u8::MAX);
+                    let breakable = placeholder
+                        .map(|def| def.hardness.is_none())
+                        .unwrap_or(false);
+                    lines.push(format!(
+                        "presentation_demo: leg=placeholder unresolved={} face={} icon={} break={} mesh={}",
+                        unresolved_placeholders,
+                        face,
+                        icon,
+                        if breakable { "none" } else { "some" },
+                        mesh_layer,
+                    ));
+                    let placeholder_ok = unresolved_placeholders == 3
+                        && face == PLACEHOLDER_BLOCK_LAYER
+                        && icon == PLACEHOLDER_ICON_LAYER
+                        && breakable
+                        && mesh_layer == PLACEHOLDER_BLOCK_LAYER;
+                    if !placeholder_ok {
+                        failed.get_or_insert("placeholder");
+                    }
+                }
+                Err(_) => {
+                    failed.get_or_insert("placeholder_reload");
+                    lines.push("presentation_demo: leg=placeholder unresolved=- face=- icon=- break=some mesh=-".to_string());
+                }
+            }
+        }
+        if remove_fixture {
+            let _ = std::fs::remove_file(&fixture_path);
+            let _ = std::fs::remove_file(fixture_path.with_extension("mcvx.tmp"));
+        }
+    }
+
+    // The empty-stack (built-in) launch still proves the reserved policy on a
+    // deterministic probe, so the placeholder contract is checked even when
+    // no pack content exists to save.
+    if !has_packs {
+        let mut probe = registry.as_ref().clone();
+        let probe_block = probe.append_placeholder_block("mymod:probe_block");
+        let probe_item = probe.append_placeholder_item("mymod:probe_item");
+        let probe_faces = BlockFaces::from_registry(&probe);
+        let placeholder = probe
+            .block(probe_block)
+            .expect("appended placeholder block");
+        let placeholder_item = probe.item(probe_item).expect("appended placeholder item");
+        let mesh_layer = probe_faces.layer(probe_block, 0);
+        let placeholder_ok = placeholder.placeholder
+            && placeholder_item.placeholder
+            && placeholder.faces == [PLACEHOLDER_BLOCK_LAYER; 6]
+            && placeholder_item.icon_layer == PLACEHOLDER_ICON_LAYER
+            && placeholder.hardness.is_none()
+            && mesh_layer == PLACEHOLDER_BLOCK_LAYER;
+        lines.push(format!(
+            "presentation_demo: leg=placeholder unresolved=0 face={} icon={} break={} mesh={}",
+            placeholder.faces[0],
+            placeholder_item.icon_layer,
+            if placeholder.hardness.is_none() {
+                "none"
+            } else {
+                "some"
+            },
+            mesh_layer,
+        ));
+        if !placeholder_ok {
+            failed.get_or_insert("placeholder");
+        }
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("presentation_demo: ok=false failed={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("presentation_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headless crafting digest (`--demo-crafting`, M010/S05-T06)
+// ---------------------------------------------------------------------------
+
+/// Build a shaped grid from authored `rows` and a `char -> ItemId` key.
+///
+/// Every cell is constructed through [`Item::new_with`] so pack ingredients
+/// carry their authored stack limits, exactly like a real pick-up.
+fn crafting_demo_grid(
+    registry: &ContentRegistry,
+    kind: GridKind,
+    rows: &[&str],
+    key: &[(char, ItemId)],
+) -> CraftingGrid {
+    let mut grid = CraftingGrid::new(kind);
+    let dim = kind.dim();
+    for (row, line) in rows.iter().enumerate() {
+        for (col, character) in line.chars().enumerate() {
+            if character == ' ' {
+                continue;
+            }
+            let id = key
+                .iter()
+                .find(|(key, _)| *key == character)
+                .map(|(_, id)| *id)
+                .expect("fixture pattern characters have a key");
+            let item = Item::new_with(registry, id, 1).expect("fixture ingredient constructs");
+            grid.set(row * dim + col, Some(item))
+                .expect("fixture cell is inside the grid");
+        }
+    }
+    grid
+}
+
+/// The stable authored name of an [`ItemId`], or `None` for an unknown index.
+///
+/// The digest prints the same names the registry resolved, never a display
+/// label and never an opaque index.
+fn crafting_demo_item_name(registry: &ContentRegistry, id: ItemId) -> Option<String> {
+    match id {
+        ItemId::Block(block) => registry.block_name(block).map(str::to_string),
+        ItemId::ModTool(index) => registry.tool_def_name(index).map(str::to_string),
+        ItemId::Item(index) => registry.item_def_name(index).map(str::to_string),
+        other => Some(other.name().to_string()),
+    }
+}
+
+/// Total item units across the 36 slots, the cursor, and both grids — the
+/// conservation invariant a failed craft must preserve.
+fn crafting_demo_units(player: &Player) -> u32 {
+    let mut total = 0u32;
+    for item in player.inventory().slots().iter().flatten() {
+        total += u32::from(item.count());
+    }
+    if let Some(cursor) = player.inventory().cursor() {
+        total += u32::from(cursor.count());
+    }
+    for grid in [player.player_grid(), player.table_grid()] {
+        for index in 0..grid.kind().slot_count() {
+            if let Some(item) = grid.slot(index) {
+                total += u32::from(item.count());
+            }
+        }
+    }
+    total
+}
+
+/// Mine one authored block with `tool` through the production break path and
+/// report `(ticks, remaining_durability)`.
+///
+/// The accumulator and the world edit are the same pair the frame loop uses:
+/// [`MiningTarget::from_block_with`] + [`MiningState::tick_with`] for the
+/// timing, then [`break_mined_block`] for the edit, wear and drop. A fresh
+/// synthetic air chunk keeps the measurement independent of terrain.
+fn crafting_demo_break(
+    registry: &Arc<ContentRegistry>,
+    block: BlockId,
+    tool: Item,
+) -> Option<(usize, u16)> {
+    let mut session = WorldSession::new_session_with_mode_and_registry(
+        0x00C0_FFEE,
+        PathBuf::from("crafting-demo-break.mcvx"),
+        opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        GameMode::Creative,
+        Arc::clone(registry),
+    );
+    let chunk_pos = ChunkPos::new(0, 0, 0);
+    session.world.insert_chunk_for_test(
+        chunk_pos,
+        opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+    );
+    for neighbor in [
+        ChunkPos::new(1, 0, 0),
+        ChunkPos::new(-1, 0, 0),
+        ChunkPos::new(0, 1, 0),
+        ChunkPos::new(0, -1, 0),
+        ChunkPos::new(0, 0, 1),
+        ChunkPos::new(0, 0, -1),
+    ] {
+        session.world.insert_chunk_for_test(
+            neighbor,
+            opencraft::world::chunk::Chunk::new_uniform(BlockId::Air),
+        );
+    }
+    let ore_pos = IVec3::new(0, 10, 0);
+    session
+        .world
+        .set_block_immediate(ore_pos.x, ore_pos.y, ore_pos.z, block);
+    session.player.collect_item(tool);
+    if !session.player.select_slot(0) {
+        return None;
+    }
+
+    let target = MiningTarget::from_block_with(registry, ore_pos, block, Some(tool))?;
+    let mut mining = MiningState::new();
+    let mut ticks = 0usize;
+    let mut broke = false;
+    while ticks < 10_000 {
+        ticks += 1;
+        match mining.tick_with(registry, 0.05, Some(target)) {
+            MiningTick::Broke { .. } => {
+                broke = true;
+                break;
+            }
+            MiningTick::Mining { .. } => {}
+            MiningTick::Idle => return None,
+        }
+    }
+    if !broke {
+        return None;
+    }
+
+    match break_mined_block(&mut session, ore_pos, block) {
+        BreakOutcome::Applied { wear, .. } => match wear {
+            ToolWearOutcome::Worn { remaining } => Some((ticks, remaining)),
+            ToolWearOutcome::Broke => Some((ticks, 0)),
+            ToolWearOutcome::Nothing => None,
+        },
+        BreakOutcome::Rejected(_) => None,
+    }
+}
+
+/// Build the deterministic `--demo-crafting` digest.
+///
+/// Every leg runs through a production function: the frozen registry resolved
+/// from the launch stack, [`apply_inventory_click_button_with`], the mining
+/// accumulator + [`break_mined_block`], [`EatingTarget::new_with`] +
+/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the v8 save/load
+/// codec. Each structural line is machine-independent (names, counts,
+/// booleans) and the caller exits non-zero when the latch is `crafting:
+/// failed`.
+fn crafting_demo_lines(
+    registry: &Arc<ContentRegistry>,
+    fixture: Option<&Path>,
+) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // Resolve the authored identities once; every leg uses the same frozen
+    // registry the launch would freeze.
+    let ruby_index = registry.item_by_name("mymod:ruby").map(|def| def.index);
+    let stew_index = registry
+        .item_by_name("mymod:ruby_stew")
+        .map(|def| def.index);
+    let pickaxe_index = registry
+        .tool_by_name("mymod:ruby_pickaxe")
+        .map(|def| def.index);
+    let ore = registry.block_by_name("mymod:ruby_ore").map(|def| def.id);
+
+    // (a) Craft the ruby pickaxe at the 4x4 table through the production
+    // result-slot seam.
+    let table_craft = match (ruby_index, pickaxe_index) {
+        (Some(ruby), Some(_pickaxe)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let stick =
+                Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Table,
+                &["RRR", " S ", " S "],
+                &[('R', ruby_item.id()), ('S', stick.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                CraftingGrid::new(GridKind::Player),
+                grid,
+            );
+            let mut screen = InventoryScreen::new();
+            screen.open_table();
+            let outcome = apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                Some(IVec3::new(0, 5, 0)),
+                InventoryTarget::ResultSlot(GridKind::Table),
+                InventoryClickButton::Left,
+            );
+            match outcome {
+                Ok(InventoryClickOutcome::Crafted(item)) => {
+                    let name = crafting_demo_item_name(registry, item.id())
+                        .unwrap_or_else(|| "unresolved".to_string());
+                    (
+                        name,
+                        item.count(),
+                        item.durability().unwrap_or(0),
+                        item.max_durability().unwrap_or(0),
+                    )
+                }
+                _ => ("none".to_string(), 0, 0, 0),
+            }
+        }
+        _ => ("none".to_string(), 0, 0, 0),
+    };
+    lines.push(format!(
+        "crafting: leg=table item={} count={} durability={} max={}",
+        table_craft.0, table_craft.1, table_craft.2, table_craft.3,
+    ));
+    if table_craft.0 != "mymod:ruby_pickaxe"
+        || table_craft.1 != 1
+        || table_craft.2 != 900
+        || table_craft.3 != 900
+    {
+        failed.get_or_insert("table");
+    }
+
+    // (b) Craft the ruby stew at the 2x2 player grid.
+    let stew_stack_limit = stew_index
+        .and_then(|index| registry.item(index))
+        .map(|def| def.stack_limit)
+        .unwrap_or(0);
+    let player_craft = match (ruby_index, stew_index) {
+        (Some(ruby), Some(_stew)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let wheat =
+                Item::new(ItemId::Material(Material::Wheat), 1).expect("wheat is carryable");
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Player,
+                &["RR", "WW"],
+                &[('R', ruby_item.id()), ('W', wheat.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                grid,
+                CraftingGrid::new(GridKind::Table),
+            );
+            let mut screen = InventoryScreen::new();
+            screen.open_player();
+            let outcome = apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                None,
+                InventoryTarget::ResultSlot(GridKind::Player),
+                InventoryClickButton::Left,
+            );
+            match outcome {
+                Ok(InventoryClickOutcome::Crafted(item)) => (
+                    crafting_demo_item_name(registry, item.id())
+                        .unwrap_or_else(|| "unresolved".to_string()),
+                    item.count(),
+                ),
+                _ => ("none".to_string(), 0),
+            }
+        }
+        _ => ("none".to_string(), 0),
+    };
+    lines.push(format!(
+        "crafting: leg=player item={} count={} stack={}",
+        player_craft.0, player_craft.1, stew_stack_limit,
+    ));
+    if player_craft.0 != "mymod:ruby_stew" || player_craft.1 != 1 || stew_stack_limit != 16 {
+        failed.get_or_insert("player");
+    }
+
+    // (c) Break the ruby ore with ruby and iron; both durations and both worn
+    // durabilities come from the production mining path.
+    let mine = match (ore, pickaxe_index) {
+        (Some(ore), Some(pickaxe)) => {
+            let ruby_tool = Item::new_with(registry, ItemId::ModTool(pickaxe), 1)
+                .expect("the authored pickaxe constructs");
+            let iron_tool = Item::new(
+                ItemId::Tool {
+                    kind: ToolKind::Pickaxe,
+                    tier: ToolTier::Iron,
+                },
+                1,
+            )
+            .expect("an iron pickaxe constructs");
+            match (
+                crafting_demo_break(registry, ore, ruby_tool),
+                crafting_demo_break(registry, ore, iron_tool),
+            ) {
+                (Some((ruby_ticks, ruby_wear)), Some((iron_ticks, iron_wear))) => {
+                    Some((ruby_ticks, iron_ticks, ruby_wear, iron_wear))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (ruby_ticks, iron_ticks, ruby_wear, iron_wear) = mine.unwrap_or((0, 0, 0, 0));
+    lines.push(format!(
+        "crafting: leg=mine block=mymod:ruby_ore ruby_ticks={} iron_ticks={} ruby_wear={} iron_wear={}",
+        ruby_ticks, iron_ticks, ruby_wear, iron_wear,
+    ));
+    if !(ruby_ticks > 0 && ruby_ticks < iron_ticks && ruby_wear == 899 && iron_wear == 249) {
+        failed.get_or_insert("mine");
+    }
+
+    // (d) Eat the stew through the real hold-to-eat flow.
+    let eat = match stew_index {
+        Some(stew) => {
+            let stew_item = Item::new_with(registry, ItemId::Item(stew), 1)
+                .expect("the authored stew constructs");
+            let mut inventory = Inventory::empty();
+            inventory
+                .insert(stew_item)
+                .expect("an empty inventory holds one stew");
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                inventory,
+                CraftingGrid::new(GridKind::Player),
+                CraftingGrid::new(GridKind::Table),
+            );
+            player.survival =
+                SurvivalState::new(20, 5, FULL_AIR).expect("5 hunger is a valid vitals value");
+            player.select_slot(0);
+            let mut eating = EatingState::new();
+            let mut completed = None;
+            for _ in 0..1_000 {
+                let target =
+                    EatingTarget::new_with(registry, 0, stew_item, player.survival.hunger());
+                match eating.tick(0.05, target) {
+                    EatingTick::Ate {
+                        slot,
+                        item,
+                        restore,
+                    } => {
+                        completed = player
+                            .eat_selected_with(registry, slot, item)
+                            .map(|applied| (applied, restore));
+                        break;
+                    }
+                    EatingTick::Eating { .. } => {}
+                    EatingTick::Idle => break,
+                }
+            }
+            completed.map(|(applied, _)| (applied, player.survival.hunger()))
+        }
+        None => None,
+    };
+    let (restored, hunger_after) = eat.unwrap_or((0, 0));
+    lines.push(format!(
+        "crafting: leg=eat item=mymod:ruby_stew restored={} hunger={}",
+        restored, hunger_after,
+    ));
+    if restored != 7 || hunger_after != 12 {
+        failed.get_or_insert("eat");
+    }
+
+    // (e) The disabled built-in shortbow has no preview and cannot craft.
+    let shortbow = if registry
+        .recipe_by_name("shortbow")
+        .map(|recipe| !recipe.enabled)
+        .unwrap_or(false)
+    {
+        let stick = Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+        let leather =
+            Item::new(ItemId::Material(Material::Leather), 1).expect("leather is carryable");
+        let grid = crafting_demo_grid(
+            registry,
+            GridKind::Table,
+            &[" SE", "S E", " S "],
+            &[('S', stick.id()), ('E', leather.id())],
+        );
+        let mut player = Player::with_inventory(
+            Vec3::ZERO,
+            Inventory::empty(),
+            CraftingGrid::new(GridKind::Player),
+            grid,
+        );
+        let preview = player
+            .craft_preview_with(registry, GridKind::Table)
+            .is_some();
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        let crafted = matches!(
+            apply_inventory_click_button_with(
+                &mut player,
+                registry,
+                &screen,
+                Some(IVec3::new(0, 5, 0)),
+                InventoryTarget::ResultSlot(GridKind::Table),
+                InventoryClickButton::Left,
+            ),
+            Ok(InventoryClickOutcome::Crafted(_))
+        );
+        (preview, crafted)
+    } else {
+        (true, true)
+    };
+    lines.push(format!(
+        "crafting: leg=shortbow preview={} craft={}",
+        shortbow.0, shortbow.1,
+    ));
+    if shortbow.0 || shortbow.1 {
+        failed.get_or_insert("shortbow");
+    }
+
+    // (f) A grid missing one ingredient never matches and consumes nothing.
+    let missing = match (ruby_index, pickaxe_index) {
+        (Some(ruby), Some(_)) => {
+            let ruby_item = Item::new_with(registry, ItemId::Item(ruby), 1)
+                .expect("the authored ruby item constructs");
+            let stick =
+                Item::new(ItemId::Material(Material::Stick), 1).expect("a stick is carryable");
+            // The pickaxe pattern with the middle stick omitted.
+            let grid = crafting_demo_grid(
+                registry,
+                GridKind::Table,
+                &["RRR", "   ", " S "],
+                &[('R', ruby_item.id()), ('S', stick.id())],
+            );
+            let mut player = Player::with_inventory(
+                Vec3::ZERO,
+                Inventory::empty(),
+                CraftingGrid::new(GridKind::Player),
+                grid,
+            );
+            let before = crafting_demo_units(&player);
+            let preview = player
+                .craft_preview_with(registry, GridKind::Table)
+                .is_some();
+            let mut screen = InventoryScreen::new();
+            screen.open_table();
+            let crafted = matches!(
+                apply_inventory_click_button_with(
+                    &mut player,
+                    registry,
+                    &screen,
+                    Some(IVec3::new(0, 5, 0)),
+                    InventoryTarget::ResultSlot(GridKind::Table),
+                    InventoryClickButton::Left,
+                ),
+                Ok(InventoryClickOutcome::Crafted(_))
+            );
+            let consumed = before.saturating_sub(crafting_demo_units(&player));
+            (preview, crafted, consumed)
+        }
+        _ => (true, true, 1),
+    };
+    lines.push(format!(
+        "crafting: leg=missing preview={} craft={} consumed={}",
+        missing.0, missing.1, missing.2,
+    ));
+    if missing.0 || missing.1 || missing.2 != 0 {
+        failed.get_or_insert("missing");
+    }
+
+    // (g)/(h) Save and reload the ruby pickaxe, then reload the same bytes
+    // with no pack at all.
+    let (fixture_path, remove_fixture) = match fixture {
+        Some(path) => (path.to_path_buf(), false),
+        None => (
+            std::env::temp_dir().join(format!(
+                "opencraft-crafting-demo-{}.mcvx",
+                std::process::id()
+            )),
+            true,
+        ),
+    };
+    let mut reloaded = (0u16, usize::MAX, false);
+    let mut placeholder = (0usize, 0u16, false);
+    if let Some(pickaxe) = pickaxe_index {
+        match Item::tool_with_durability_with(registry, ItemId::ModTool(pickaxe), 850) {
+            Ok(tool) => {
+                let mut session = WorldSession::new_session_with_mode_and_registry(
+                    0x00C0_FFEE,
+                    fixture_path.clone(),
+                    opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+                    GameMode::Creative,
+                    Arc::clone(registry),
+                );
+                session.player.collect_item(tool);
+                session.player.select_slot(0);
+                if save_current_world(&mut session).is_err() {
+                    failed.get_or_insert("save_write");
+                } else {
+                    match load_world_from_path_with(&fixture_path, registry.as_ref()) {
+                        Ok(loaded) => {
+                            let resolved = loaded
+                                .data
+                                .player
+                                .inventory
+                                .slot(0)
+                                .map(|item| (item.durability().unwrap_or(0), item.id()));
+                            let name_ok = resolved
+                                .and_then(|(_, id)| crafting_demo_item_name(registry, id))
+                                .map(|name| name == "mymod:ruby_pickaxe")
+                                .unwrap_or(false);
+                            reloaded = (
+                                resolved.map(|(durability, _)| durability).unwrap_or(0),
+                                loaded.unresolved,
+                                name_ok,
+                            );
+                        }
+                        Err(_) => {
+                            failed.get_or_insert("save_reload");
+                        }
+                    }
+
+                    match load_world_from_path_with(&fixture_path, ContentRegistry::builtin()) {
+                        Ok(loaded) => {
+                            let item = loaded.data.player.inventory.slot(0);
+                            let is_placeholder = item
+                                .and_then(|item| match item.id() {
+                                    ItemId::Item(index) => {
+                                        loaded.registry.item(index).map(|def| def.placeholder)
+                                    }
+                                    _ => Some(false),
+                                })
+                                .unwrap_or(false);
+                            placeholder = (
+                                loaded.unresolved,
+                                item.map(|item| item.count()).unwrap_or(0),
+                                is_placeholder,
+                            );
+                        }
+                        Err(_) => {
+                            failed.get_or_insert("placeholder_reload");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                failed.get_or_insert("save_construct");
+            }
+        }
+    } else {
+        failed.get_or_insert("save_construct");
+    }
+    lines.push(format!(
+        "crafting: leg=save durability={} unresolved={} resolved={}",
+        reloaded.0, reloaded.1, reloaded.2,
+    ));
+    if reloaded.0 != 850 || reloaded.1 != 0 || !reloaded.2 {
+        failed.get_or_insert("save");
+    }
+    lines.push(format!(
+        "crafting: leg=placeholder name=mymod:ruby_pickaxe unresolved={} count={} placeholder={}",
+        placeholder.0, placeholder.1, placeholder.2,
+    ));
+    if placeholder.0 != 1 || placeholder.1 != 1 || !placeholder.2 {
+        failed.get_or_insert("placeholder");
+    }
+    if remove_fixture {
+        let _ = std::fs::remove_file(&fixture_path);
+        let _ = std::fs::remove_file(fixture_path.with_extension("mcvx.tmp"));
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("crafting: failed reason={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("crafting: ok".to_string());
+            (lines, true)
+        }
+    }
+}
+
+/// Seed pinned for the `--demo-worldgen` digest.
+///
+/// A plain constant (never a clock or `random_seed`) so the digest is a pure
+/// function of the checked-in pack plus this seed.
+const WORLDGEN_DEMO_SEED: u32 = 424_242;
+
+/// The 8x8 chunk-column window the digest scans: `x in -1..=6`,
+/// `z in -1..=6`, across every world chunk layer (`MIN_CHUNK_Y..=MAX_CHUNK_Y`,
+/// six layers) — 384 chunk generations per leg. Wide enough to hold authored
+/// ore and patch cells at the pinned seed (the 4x4 window had no patch hit)
+/// while staying bounded and deterministic.
+const WORLDGEN_DEMO_MIN_CX: i32 = -1;
+const WORLDGEN_DEMO_MAX_CX: i32 = 6;
+const WORLDGEN_DEMO_MIN_CZ: i32 = -1;
+const WORLDGEN_DEMO_MAX_CZ: i32 = 6;
+
+/// Generate the pinned digest window with `rules` through the production seam.
+fn worldgen_demo_window(rules: &[WorldgenRule]) -> Vec<(ChunkPos, Chunk)> {
+    let mut chunks = Vec::new();
+    for cz in WORLDGEN_DEMO_MIN_CZ..=WORLDGEN_DEMO_MAX_CZ {
+        for cx in WORLDGEN_DEMO_MIN_CX..=WORLDGEN_DEMO_MAX_CX {
+            for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                let pos = ChunkPos::new(cx, cy, cz);
+                chunks.push((
+                    pos,
+                    generate_chunk_seeded_with(pos, WORLDGEN_DEMO_SEED, Season::Summer, rules),
+                ));
+            }
+        }
+    }
+    chunks
+}
+
+/// Every world cell in `chunks` holding `block` for which `keep` is true.
+fn worldgen_demo_cells(
+    chunks: &[(ChunkPos, Chunk)],
+    block: BlockId,
+    keep: impl Fn(i32, i32, i32) -> bool,
+) -> Vec<(i32, i32, i32)> {
+    let mut cells = Vec::new();
+    for (pos, chunk) in chunks {
+        let base_x = pos.x * CHUNK_SIZE as i32;
+        let base_y = pos.y * CHUNK_SIZE as i32;
+        let base_z = pos.z * CHUNK_SIZE as i32;
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if chunk.get(lx, ly, lz) != block {
+                        continue;
+                    }
+                    let wx = base_x + lx as i32;
+                    let wy = base_y + ly as i32;
+                    let wz = base_z + lz as i32;
+                    if keep(wx, wy, wz) {
+                        cells.push((wx, wy, wz));
+                    }
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Whether two chunks hold the same block in every cell.
+fn worldgen_demo_chunks_equal(a: &Chunk, b: &Chunk) -> bool {
+    (0..CHUNK_SIZE)
+        .all(|y| (0..CHUNK_SIZE).all(|z| (0..CHUNK_SIZE).all(|x| a.get(x, y, z) == b.get(x, y, z))))
+}
+
+/// Stable lowercase name for an authored patch biome.
+fn worldgen_demo_biome_name(biome: Biome) -> &'static str {
+    match biome {
+        Biome::Plains => "plains",
+        Biome::Forest => "forest",
+        Biome::Mountains => "mountains",
+        Biome::Ocean => "ocean",
+    }
+}
+
+/// Build the deterministic `--demo-worldgen` digest.
+///
+/// Every leg runs through a production seam: [`ContentRegistry::worldgen_rules`],
+/// [`WorldSession::new_session_with_mode_and_registry`],
+/// [`generate_chunk_seeded_with`] and [`generate_chunk_seeded`]. Each line is
+/// machine-independent (names, counts, booleans), so `scripts/worldgen_smoke.sh`
+/// can pin them whole-line. The caller exits non-zero when the latch fails.
+fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    let rules = registry.worldgen_rules();
+    let ore_rules = rules
+        .iter()
+        .filter(|rule| matches!(rule, WorldgenRule::Ore { .. }))
+        .count();
+    let patch_rules = rules
+        .iter()
+        .filter(|rule| matches!(rule, WorldgenRule::Patch { .. }))
+        .count();
+    lines.push(format!(
+        "worldgen_demo: leg=registry rules={} ore={} patch={}",
+        rules.len(),
+        ore_rules,
+        patch_rules,
+    ));
+    if rules.len() != 2 || ore_rules != 1 || patch_rules != 1 {
+        failed.get_or_insert("registry");
+    }
+
+    // Authored bands and biomes, read from the same frozen rules the generator
+    // consumes. A missing or malformed pair fails the corresponding leg below.
+    let mut ore_band = None;
+    let mut patch_band = None;
+    let mut patch_biomes: Vec<Biome> = Vec::new();
+    for rule in rules {
+        match rule {
+            WorldgenRule::Ore { min_y, max_y, .. } => ore_band = Some((*min_y, *max_y)),
+            WorldgenRule::Patch {
+                biomes,
+                min_y,
+                max_y,
+                ..
+            } => {
+                patch_band = Some((*min_y, *max_y));
+                patch_biomes = biomes.clone();
+            }
+        }
+    }
+
+    // (a) The session seam: a registry-built session must expose exactly the
+    // frozen registry's rules on its WorldManager (proves T02 wiring without
+    // touching the async streaming loop).
+    let session_path = std::env::temp_dir().join(format!(
+        "opencraft-worldgen-demo-{}.mcvx",
+        std::process::id()
+    ));
+    let session = WorldSession::new_session_with_mode_and_registry(
+        WORLDGEN_DEMO_SEED,
+        session_path,
+        opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        GameMode::Creative,
+        Arc::clone(registry),
+    );
+    let session_rules = session.world.worldgen_rules();
+    let session_matches = session_rules.as_ref() == rules;
+    lines.push(format!(
+        "worldgen_demo: leg=session rules={} matches={}",
+        session_rules.len(),
+        session_matches,
+    ));
+    if !session_matches {
+        failed.get_or_insert("session");
+    }
+
+    let rule_chunks = worldgen_demo_window(rules);
+    let authored_block = registry.block_by_name("mymod:ruby_ore").map(|def| def.id);
+
+    // (b) Ore leg: authored ore below the surface must exist only inside the
+    // authored y band and strictly inside the stone band (above bedrock, at
+    // least four blocks below the column surface). Surface cells are excluded
+    // here — the patch leg owns those.
+    let mut ore_cells: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(block) = authored_block {
+        ore_cells = worldgen_demo_cells(&rule_chunks, block, |wx, wy, wz| {
+            wy < terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED)
+        });
+    }
+    let ore_observed_min = ore_cells.iter().map(|cell| cell.1).min();
+    let ore_observed_max = ore_cells.iter().map(|cell| cell.1).max();
+    let ore_in_band = match (ore_band, ore_observed_min, ore_observed_max) {
+        (Some((min_y, max_y)), Some(observed_min), Some(observed_max)) => {
+            !ore_cells.is_empty()
+                && min_y <= observed_min
+                && observed_max <= max_y
+                && ore_cells.iter().all(|&(wx, wy, wz)| {
+                    wy > -32 && wy < terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED) - 3
+                })
+        }
+        _ => false,
+    };
+    lines.push(format!(
+        "worldgen_demo: leg=ore block=mymod:ruby_ore cells={} min_y={} max_y={} in_band={}",
+        ore_cells.len(),
+        ore_observed_min.unwrap_or(0),
+        ore_observed_max.unwrap_or(0),
+        ore_in_band,
+    ));
+    if !ore_in_band {
+        failed.get_or_insert("ore");
+    }
+
+    // (c) Patch leg: the authored block at `wy == h` is unambiguously a patch
+    // cell (ore never reaches the surface), so every such cell must sit in an
+    // authored biome and inside the authored band.
+    let mut patch_cells: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(block) = authored_block {
+        patch_cells = worldgen_demo_cells(&rule_chunks, block, |wx, wy, wz| {
+            wy == terrain_height_at_seeded(wx, wz, WORLDGEN_DEMO_SEED)
+        });
+    }
+    let patch_biomes_ok = !patch_cells.is_empty()
+        && !patch_biomes.is_empty()
+        && patch_cells.iter().all(|&(wx, _, wz)| {
+            patch_biomes.contains(&biome_at_seeded(wx, wz, WORLDGEN_DEMO_SEED))
+        })
+        && patch_cells.iter().all(|&(_, wy, _)| {
+            patch_band
+                .map(|(min_y, max_y)| (min_y..=max_y).contains(&wy))
+                .unwrap_or(false)
+        });
+    let patch_biome_list = patch_biomes
+        .iter()
+        .map(|biome| worldgen_demo_biome_name(*biome))
+        .collect::<Vec<_>>()
+        .join(",");
+    lines.push(format!(
+        "worldgen_demo: leg=patch block=mymod:ruby_ore cells={} biomes={} biomes_ok={}",
+        patch_cells.len(),
+        patch_biome_list,
+        patch_biomes_ok,
+    ));
+    if !patch_biomes_ok {
+        failed.get_or_insert("patch");
+    }
+
+    // (d) Coal/iron equality: pack rules must never move a built-in ore cell.
+    let empty_chunks = worldgen_demo_window(&[]);
+    let coal = worldgen_demo_cells(&rule_chunks, BlockId::CoalOre, |_, _, _| true);
+    let iron = worldgen_demo_cells(&rule_chunks, BlockId::IronOre, |_, _, _| true);
+    let mut coal_sorted = coal.clone();
+    coal_sorted.sort_unstable();
+    let mut iron_sorted = iron.clone();
+    iron_sorted.sort_unstable();
+    let mut empty_coal = worldgen_demo_cells(&empty_chunks, BlockId::CoalOre, |_, _, _| true);
+    empty_coal.sort_unstable();
+    let mut empty_iron = worldgen_demo_cells(&empty_chunks, BlockId::IronOre, |_, _, _| true);
+    empty_iron.sort_unstable();
+    let unchanged = coal_sorted == empty_coal && iron_sorted == empty_iron;
+    lines.push(format!(
+        "worldgen_demo: leg=coal_iron coal={} iron={} unchanged={}",
+        coal.len(),
+        iron.len(),
+        unchanged,
+    ));
+    if !unchanged {
+        failed.get_or_insert("coal_iron");
+    }
+
+    // (e) Empty-rule identity: the wrapper must reproduce the pre-M010 chunks.
+    let mut identical = true;
+    for (pos, chunk) in &empty_chunks {
+        let legacy = generate_chunk_seeded(*pos, WORLDGEN_DEMO_SEED, Season::Summer);
+        if !worldgen_demo_chunks_equal(chunk, &legacy) {
+            identical = false;
+            break;
+        }
+    }
+    lines.push(format!(
+        "worldgen_demo: leg=empty_rules identical={}",
+        identical,
+    ));
+    if !identical {
+        failed.get_or_insert("empty_rules");
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("worldgen_demo: ok=false failed={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("worldgen_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
+/// Resolve the palette's granted identity by stable name: blocks first, then
+/// generic items, then pack tools.
+fn palette_demo_item_id(registry: &ContentRegistry, name: &str) -> Option<ItemId> {
+    if let Some(def) = registry.block_by_name(name) {
+        return Some(ItemId::Block(def.id));
+    }
+    if let Some(def) = registry.item_by_name(name) {
+        return Some(ItemId::Item(def.index));
+    }
+    registry
+        .tool_by_name(name)
+        .map(|def| ItemId::ModTool(def.index))
+}
+
+/// Format a pixel-space rect as four rounded integers for the digest.
+fn palette_demo_rect((x, y, w, h): (f32, f32, f32, f32)) -> String {
+    format!("{x:.0},{y:.0},{w:.0},{h:.0}")
+}
+
+/// Build the deterministic `--demo-palette` digest.
+///
+/// Every leg runs through a production seam: [`palette::entries`],
+/// [`palette::layout`], [`palette::screen_quads`], [`palette::screen_labels`],
+/// [`palette::filter_entries`], [`Player::grant_palette_item_with`],
+/// [`Player::eat_selected_with`], [`palette::available_in`], and the registry's
+/// placeholder append seam. Each line is machine-independent (names, counts,
+/// booleans), so `scripts/palette_smoke.sh` can pin them whole-line. The caller
+/// exits non-zero when the latch fails.
+fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Fail closed when the checked-in reference pack is not selected: the
+    // pinned literals below only exist with its five authored definitions.
+    if registry.item_by_name("mymod:ruby").is_none() {
+        lines.push("palette: failed reason=pack".to_string());
+        return (lines, false);
+    }
+
+    macro_rules! fail_if {
+        ($cond:expr, $leg:literal) => {
+            if $cond {
+                lines.push(format!("palette: failed reason={}", $leg));
+                return (lines, false);
+            }
+        };
+    }
+
+    // (a) Entry stock: source groups counted from the registry and the frozen
+    // name tables, total from the production palette builder.
+    let builtin_blocks = registry
+        .blocks()
+        .iter()
+        .filter(|def| {
+            !def.placeholder && def.id.is_carryable() && !matches!(def.id, BlockId::Modded(_))
+        })
+        .count();
+    let builtin_items = names::MATERIAL_ID_NAMES.len();
+    let builtin_tools = names::TOOL_ID_NAMES.len();
+    let pack_blocks = registry
+        .blocks()
+        .iter()
+        .filter(|def| matches!(def.id, BlockId::Modded(_)) && !def.placeholder)
+        .count();
+    let pack_items = registry
+        .items()
+        .iter()
+        .filter(|def| !def.placeholder)
+        .count();
+    let pack_tools = registry.tools().len();
+    let entries = palette::entries(registry);
+    let total = entries.len();
+    lines.push(format!(
+        "palette: leg=entries builtin_blocks={builtin_blocks} builtin_items={builtin_items} builtin_tools={builtin_tools} pack_blocks={pack_blocks} pack_items={pack_items} pack_tools={pack_tools} total={total}"
+    ));
+    fail_if!(
+        builtin_blocks != 14
+            || builtin_items != 11
+            || builtin_tools != 16
+            || pack_blocks != 2
+            || pack_items != 2
+            || pack_tools != 2
+            || total != 47,
+        "entries"
+    );
+
+    // (b) Pinned geometry at 1280x720 through the production layout, quad, and
+    // label builders.
+    let mut screen = PaletteScreen::new();
+    screen.open(registry);
+    let layout = palette::layout(1280, 720);
+    let quads = palette::screen_quads(&screen, &layout, None).len();
+    let labels = palette::screen_labels(&screen, &layout).len();
+    lines.push(format!(
+        "palette: leg=layout surface=1280x720 panel={} slot0={} slot53={} quads={quads} labels={labels}",
+        palette_demo_rect(layout.panel),
+        palette_demo_rect(layout.slots[0]),
+        palette_demo_rect(layout.slots[53]),
+    ));
+    fail_if!(
+        layout.panel != (428.0, 158.0, 424.0, 404.0)
+            || layout.slots[0] != (444.0, 242.0, 40.0, 40.0)
+            || layout.slots[53] != (796.0, 462.0, 40.0, 40.0)
+            || quads != 57
+            || labels != 4,
+        "layout"
+    );
+
+    // (c) Filter legs: the `rub` line pins the sorted-display-name order from
+    // the palette model; the namespace legs prove the other match axes.
+    let rub = palette::filter_entries(&entries, "rub");
+    let rub_names = rub
+        .iter()
+        .map(|index| entries[*index].name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    lines.push(format!(
+        "palette: leg=filter query=rub matched={} names={rub_names}",
+        rub.len()
+    ));
+    fail_if!(
+        rub.len() != 6
+            || rub_names
+                != "mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword",
+        "filter"
+    );
+
+    let namespaced = palette::filter_entries(&entries, "mymod");
+    lines.push(format!(
+        "palette: leg=filter query=mymod matched={}",
+        namespaced.len()
+    ));
+    fail_if!(namespaced.len() != 6, "filter");
+
+    let builtin_matches = palette::filter_entries(&entries, "builtin");
+    lines.push(format!(
+        "palette: leg=filter query=builtin matched={}",
+        builtin_matches.len()
+    ));
+    fail_if!(builtin_matches.len() != 41, "filter");
+
+    // (d) Grant legs: a fresh Creative player, one authored full stack per
+    // identity, granted through the real production path. Every grant writes
+    // the next empty hotbar slot and selects it.
+    let mut player = Player::with_inventory(
+        Vec3::ZERO,
+        Inventory::empty(),
+        CraftingGrid::new(GridKind::Player),
+        CraftingGrid::new(GridKind::Table),
+    );
+    struct GrantSpec {
+        name: &'static str,
+        slot: usize,
+        count: u16,
+        tool: bool,
+        durability: Option<u16>,
+        placeable: bool,
+    }
+    let grant_specs = [
+        GrantSpec {
+            name: "mymod:ruby_block",
+            slot: 0,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: true,
+        },
+        GrantSpec {
+            name: "mymod:ruby_ore",
+            slot: 1,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: true,
+        },
+        GrantSpec {
+            name: "mymod:ruby",
+            slot: 2,
+            count: 64,
+            tool: false,
+            durability: None,
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_stew",
+            slot: 3,
+            count: 16,
+            tool: false,
+            durability: None,
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_pickaxe",
+            slot: 4,
+            count: 1,
+            tool: true,
+            durability: Some(900),
+            placeable: false,
+        },
+        GrantSpec {
+            name: "mymod:ruby_sword",
+            slot: 5,
+            count: 1,
+            tool: true,
+            durability: Some(900),
+            placeable: false,
+        },
+    ];
+    for spec in grant_specs {
+        let name = spec.name;
+        let Some(id) = palette_demo_item_id(registry, name) else {
+            lines.push("palette: failed reason=grant".to_string());
+            return (lines, false);
+        };
+        let Ok((slot, item)) = player.grant_palette_item_with(registry, id) else {
+            lines.push("palette: failed reason=grant".to_string());
+            return (lines, false);
+        };
+        let tool = item.is_tool();
+        let placeable = player.selected_block().is_some();
+        if tool {
+            lines.push(format!(
+                "palette: leg=grant slot={slot} item={name} count={} tool={tool} durability={}",
+                item.count(),
+                item.durability().unwrap_or(0),
+            ));
+            fail_if!(
+                slot != spec.slot
+                    || item.count() != spec.count
+                    || tool != spec.tool
+                    || item.durability() != spec.durability,
+                "grant"
+            );
+        } else {
+            lines.push(format!(
+                "palette: leg=grant slot={slot} item={name} count={} tool={tool} placeable={placeable}",
+                item.count(),
+            ));
+            fail_if!(
+                slot != spec.slot
+                    || item.count() != spec.count
+                    || tool != spec.tool
+                    || placeable != spec.placeable,
+                "grant"
+            );
+        }
+    }
+
+    // (e) Use leg: the granted stew restores its authored seven hunger at the
+    // production eat seam, from a known twelve-hunger baseline.
+    let Some(stew_id) = palette_demo_item_id(registry, "mymod:ruby_stew") else {
+        lines.push("palette: failed reason=use".to_string());
+        return (lines, false);
+    };
+    player.survival = SurvivalState::new(20, 12, FULL_AIR).expect("valid vitals");
+    player.select_slot(3);
+    let restored = player.eat_selected_with(registry, 3, stew_id);
+    let hunger = player.survival.hunger();
+    lines.push(format!(
+        "palette: leg=use item=mymod:ruby_stew restored={} hunger={hunger}",
+        restored.unwrap_or(0),
+    ));
+    fail_if!(restored != Some(7) || hunger != 19, "use");
+
+    // (f) Placeholder leg: save-local placeholder definitions appended after
+    // the pack must never enter the palette stock.
+    let mut with_placeholders = (**registry).clone();
+    with_placeholders.append_placeholder_block("save:ghost_block");
+    with_placeholders.append_placeholder_item("save:ghost_item");
+    let placeholder_entries = palette::entries(&with_placeholders);
+    let ghosts_listed = placeholder_entries
+        .iter()
+        .any(|entry| entry.name == "save:ghost_block" || entry.name == "save:ghost_item");
+    lines.push(format!(
+        "palette: leg=placeholder excluded=2 total={}",
+        placeholder_entries.len()
+    ));
+    fail_if!(
+        placeholder_entries.len() != 47 || ghosts_listed,
+        "placeholder"
+    );
+
+    // (g) Key leg: the palette is Creative-only.
+    let creative = palette::available_in(GameMode::Creative);
+    let survival = palette::available_in(GameMode::Survival);
+    lines.push(format!(
+        "palette: leg=key key=C creative={creative} survival={survival}"
+    ));
+    fail_if!(!creative || survival, "key");
+
+    lines.push("palette: ok".to_string());
+    (lines, true)
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
+
+    // `--validate-pack` is a headless, pre-startup short-circuit: it prints
+    // stable per-entry lines and exits 0/1 without a session, event loop,
+    // window, GPU, save, settings file or world. The empty-name case (a
+    // `--validate-pack` typo with no value) fails closed here.
+    if let Some(name) = cli.validate_pack.as_deref() {
+        let (lines, ok) = opencraft::pack::validate::validate_pack_lines(
+            std::path::Path::new(pack::PACKS_DIR),
+            name,
+        );
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if cli.demo_ui {
         let (lines, ok) = opencraft::ui::demo::ui_demo_digest_lines();
@@ -11781,12 +14242,135 @@ fn main() {
         return;
     }
 
-    let session = startup_session(&cli);
+    // `--demo-presentation` is the headless presentation digest: it reads the
+    // settings file and the persisted pack stack (read-only), builds the same
+    // frozen registry a launch would, and prints structural facts about the
+    // composed arrays, the authored content, the production mesh, the
+    // production break path, and the v8 save/load placeholder policy. It runs
+    // before `StartupContent::load`, so no window, GPU, audio engine, event
+    // loop, or settings write happens here. The only write is the fixture save
+    // (at the demo's `--save` path when given, otherwise a temp file).
+    if cli.demo_presentation {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let fixture = if cli.save_path != Path::new(DEFAULT_SAVE_PATH) {
+            Some(cli.save_path.as_path())
+        } else {
+            None
+        };
+        let (lines, ok) = presentation_demo_lines(&registry, fixture);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-crafting` is the headless crafting digest: it reads the settings
+    // file and the persisted pack stack (read-only), builds the same frozen
+    // registry a launch would, and exercises crafting, mining, eating and the
+    // v8 save/load placeholder policy through production seams. It runs before
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop, or
+    // settings write happens here. The only write is the fixture save (at the
+    // demo's `--save` path when given, otherwise a temp file).
+    if cli.demo_crafting {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let fixture = if cli.save_path != Path::new(DEFAULT_SAVE_PATH) {
+            Some(cli.save_path.as_path())
+        } else {
+            None
+        };
+        let (lines, ok) = crafting_demo_lines(&registry, fixture);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-worldgen` is the headless worldgen digest: it reads the settings
+    // file and the persisted pack stack (read-only), builds the same frozen
+    // registry a launch would, and generates the pinned chunk window through
+    // the production terrain seam. It runs before `StartupContent::load`, so no
+    // window, GPU, audio engine, event loop, settings write or save happens
+    // here.
+    if cli.demo_worldgen {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let (lines, ok) = worldgen_demo_lines(&registry);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-palette` is the headless Creative palette digest: it reads the
+    // settings file and the persisted pack stack (read-only), builds the same
+    // frozen registry a launch would, and pins the palette's entry stock,
+    // geometry, filter, grant, use, placeholder and key legs through the
+    // production seams. It runs after the worldgen digest and before
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop,
+    // settings write or save happens here.
+    if cli.demo_palette {
+        let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+        let (_loaded, specs, _pack_warnings) =
+            load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+        let (registry, _report) = build_session_registry(&specs);
+        let (lines, ok) = palette_demo_lines(&registry);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Build the pack-aware startup content ONCE: the same base registry names
+    // the fresh/loaded startup session and becomes the app's base registry.
+    // `--validate-pack` and `--demo-ui` returned above, so no window, GPU,
+    // settings file or save is touched for those short-circuits.
+    let content = StartupContent::load(
+        Path::new(DEFAULT_SETTINGS_PATH),
+        Path::new(pack::PACKS_DIR).to_path_buf(),
+    );
+    let session = startup_session_with(&cli, &content.base_registry);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = GameApp::new(cli, session);
+    let mut app = GameApp::new_with_content(
+        cli,
+        session,
+        content,
+        Path::new(DEFAULT_BACKGROUND_SAVE_PATH).to_path_buf(),
+    );
     event_loop.run_app(&mut app).expect("Event loop error");
     // A failed scripted demo seam (a self-describing swim abort) exits non-zero
     // so a bounded smoke can distinguish "ran to a verdict and failed" from
@@ -11799,10 +14383,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencraft::audio::default_buffers;
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
+    use opencraft::ui::inventory::{screen_labels, screen_quads};
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
@@ -11838,7 +14424,7 @@ mod tests {
         assert!(text.contains("Fullscreen: Off"));
         assert!(text.contains("VSync: Off"));
         assert!(text.contains("Volume: 100%"));
-        assert!(text.contains("Texture Pack: Default"));
+        assert!(text.contains("Packs: Default"));
         assert!(text.contains("Close Menu"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
         assert!(
@@ -11856,7 +14442,7 @@ mod tests {
             render_distance: 24,
             fullscreen: true,
             vsync: true,
-            texture_pack: None,
+            pack_stack: Vec::new(),
             volume: 100,
         };
         let menu = menu::SettingsMenu::new();
@@ -11867,7 +14453,7 @@ mod tests {
         assert!(text.contains("Render Distance: 24"));
         assert!(text.contains("Fullscreen: On"));
         assert!(text.contains("VSync: On"));
-        assert!(text.contains("Texture Pack: Default"));
+        assert!(text.contains("Packs: Default"));
     }
 
     #[test]
@@ -12202,6 +14788,56 @@ mod tests {
     }
 
     #[test]
+    fn validate_pack_is_a_launch_switch_and_never_a_world_intent() {
+        // Validation is a headless one-shot: naming a pack must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let validate = CliConfig::parse_args(["--validate-pack", "mymod-ruby"]);
+        assert!(!cli_has_world_intent(&validate));
+        assert_eq!(cli_has_world_intent(&validate), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the validation switch is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
+        assert!(cli_has_world_intent(&with_new));
+        assert_eq!(with_new.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn main_validate_pack_short_circuit_precedes_world_startup() {
+        // Validation must run before any world/session startup: no save,
+        // settings file, window, or GPU work is allowed on this launch. Pin
+        // the ordering in the real binary source so a later refactor cannot
+        // silently move the seam behind `startup_session`.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let lines_at = body
+            .find("validate_pack_lines")
+            .expect("fn main must call validate_pack_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_at < startup_at,
+            "cli.validate_pack must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "validate_pack_lines must precede startup"
+        );
+        assert!(
+            validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
+            "validate-pack must precede the demo-ui branch"
+        );
+    }
+
+    #[test]
     fn main_demo_ui_short_circuit_precedes_world_startup() {
         // The headless UI digest must run before any world/session startup:
         // no save, settings file, window, or GPU work is allowed on this
@@ -12219,12 +14855,435 @@ mod tests {
             .find("ui_demo_digest_lines")
             .expect("fn main must call ui_demo_digest_lines");
         let startup_at = body
-            .find("startup_session(&cli)")
-            .expect("fn main must call startup_session(&cli)");
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
         assert!(demo_ui_at < startup_at, "cli.demo_ui must precede startup");
         assert!(
             digest_at < startup_at,
             "ui_demo_digest_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn main_demo_presentation_short_circuit_precedes_world_startup() {
+        // The presentation digest must run after the UI digest and before any
+        // world/session startup: no save, settings write, window, GPU, audio
+        // engine or event loop is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_ui_at = body
+            .find("cli.demo_ui")
+            .expect("fn main must branch on cli.demo_ui");
+        let demo_presentation_at = body
+            .find("cli.demo_presentation")
+            .expect("fn main must branch on cli.demo_presentation");
+        let digest_at = body
+            .find("presentation_demo_lines(")
+            .expect("fn main must call presentation_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_ui_at < demo_presentation_at,
+            "the presentation digest must follow the demo-ui branch"
+        );
+        assert!(
+            demo_presentation_at < startup_at,
+            "cli.demo_presentation must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "presentation_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn main_demo_crafting_short_circuit_precedes_world_startup() {
+        // The crafting digest must run after the presentation digest and before
+        // any world/session startup: no save (other than its fixture), settings
+        // write, window, GPU, audio engine or event loop is allowed here.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_presentation_at = body
+            .find("cli.demo_presentation")
+            .expect("fn main must branch on cli.demo_presentation");
+        let demo_crafting_at = body
+            .find("cli.demo_crafting")
+            .expect("fn main must branch on cli.demo_crafting");
+        let digest_at = body
+            .find("crafting_demo_lines(")
+            .expect("fn main must call crafting_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_presentation_at < demo_crafting_at,
+            "the crafting digest must follow the presentation branch"
+        );
+        assert!(
+            demo_crafting_at < startup_at,
+            "cli.demo_crafting must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "crafting_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_crafting_is_a_launch_switch_and_never_a_world_intent() {
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let crafting = CliConfig::parse_args(["--demo-crafting"]);
+        assert!(!cli_has_world_intent(&crafting));
+        assert_eq!(cli_has_world_intent(&crafting), cli_has_world_intent(&bare));
+        let with_new = CliConfig::parse_args(["--new", "--demo-crafting"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn demo_palette_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless digest,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let palette = CliConfig::parse_args(["--demo-palette"]);
+        assert!(!cli_has_world_intent(&palette));
+        assert_eq!(cli_has_world_intent(&palette), cli_has_world_intent(&bare));
+        // A real world flag still grants intent; the digest flag is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--demo-palette"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn demo_presentation_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless digest,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let presentation = CliConfig::parse_args(["--demo-presentation"]);
+        assert!(!cli_has_world_intent(&presentation));
+        assert_eq!(
+            cli_has_world_intent(&presentation),
+            cli_has_world_intent(&bare)
+        );
+        // A real world flag still grants intent; the digest flag is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--demo-presentation"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_palette_short_circuit_precedes_world_startup() {
+        // The palette digest must run after the worldgen digest and before any
+        // world/session startup: no save, settings write, window, GPU, audio
+        // engine or event loop is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_worldgen_at = body
+            .find("cli.demo_worldgen")
+            .expect("fn main must branch on cli.demo_worldgen");
+        let demo_palette_at = body
+            .find("cli.demo_palette")
+            .expect("fn main must branch on cli.demo_palette");
+        let digest_at = body
+            .find("palette_demo_lines(")
+            .expect("fn main must call palette_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_worldgen_at < demo_palette_at,
+            "the palette digest must follow the worldgen branch"
+        );
+        assert!(
+            demo_palette_at < startup_at,
+            "cli.demo_palette must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "palette_demo_lines must precede startup"
+        );
+    }
+
+    /// A real v2 pack on disk (two blocks, one item, one distinct 16x16 PNG
+    /// per entry) loaded through the production spec+registry path.
+    fn presentation_demo_registry(root: &Path) -> Arc<ContentRegistry> {
+        let dir = root.join("mymod-ruby");
+        std::fs::create_dir_all(&dir).expect("create fixture pack");
+        std::fs::write(
+            dir.join("pack.toml"),
+            r#"format_version = 2
+name = "Ruby Mod"
+version = "1.0.0"
+
+[[blocks]]
+id = "mymod:ruby_ore"
+name = "Ruby Ore"
+textures = { all = "ruby_ore.png" }
+hardness = 3.0
+drop = "mymod:ruby"
+tool = "pickaxe"
+stack = 64
+
+[[blocks]]
+id = "mymod:ruby_block"
+name = "Ruby Block"
+textures = { all = "ruby_block.png" }
+hardness = 4.0
+stack = 64
+
+[[items]]
+id = "mymod:ruby"
+icon = "ruby.png"
+stack = 64
+"#,
+        )
+        .expect("write fixture pack.toml");
+        write_solid_png(&dir.join("ruby_ore.png"), [200, 10, 20, 255]);
+        write_solid_png(&dir.join("ruby_block.png"), [20, 200, 30, 255]);
+        write_solid_png(&dir.join("ruby.png"), [30, 40, 220, 255]);
+
+        let spec = pack::spec::load_spec_from_dir(&dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        registry
+    }
+
+    #[test]
+    fn presentation_demo_pins_the_authored_line_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = presentation_demo_registry(dir.path());
+        let fixture = dir.path().join("fixture.mcvx");
+        let (lines, ok) = presentation_demo_lines(&registry, Some(&fixture));
+        assert!(ok, "a clean authored pack must pass: {lines:#?}");
+
+        // Literals measured from a real run, never derived from the fixture.
+        let expected = vec![
+            "presentation_demo: leg=registry blocks=25 items=1 pack_layers=2 pack_icons=1"
+                .to_string(),
+            "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
+                .to_string(),
+            "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
+                .to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_ore id=24 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_block id=23 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
+            "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64".to_string(),
+            "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49".to_string(),
+            "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
+            "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
+            "presentation_demo: leg=placeholder unresolved=3 face=25 icon=27 break=none mesh=25".to_string(),
+            "presentation_demo: ok=true".to_string(),
+        ];
+        assert_eq!(lines, expected);
+
+        // The fixture is left in place only when the caller supplied a path.
+        assert!(fixture.is_file(), "the --save fixture must be written");
+    }
+
+    #[test]
+    fn presentation_demo_empty_stack_reports_absent_authored_content() {
+        let (registry, report) = build_session_registry(&[]);
+        assert_eq!(report.errors(), 0);
+        let (lines, ok) = presentation_demo_lines(&registry, None);
+        assert!(
+            ok,
+            "the built-in launch is a valid presentation: {lines:#?}"
+        );
+        let expected = vec![
+            "presentation_demo: leg=registry blocks=23 items=0 pack_layers=0 pack_icons=0"
+                .to_string(),
+            "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
+                .to_string(),
+            "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
+                .to_string(),
+            "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
+                .to_string(),
+            "presentation_demo: leg=placeholder unresolved=0 face=25 icon=27 break=none mesh=25"
+                .to_string(),
+            "presentation_demo: ok=true".to_string(),
+        ];
+        assert_eq!(lines, expected);
+        assert!(registry.block_by_name("mymod:ruby_ore").is_none());
+        assert!(registry.item_by_name("mymod:ruby").is_none());
+    }
+
+    #[test]
+    fn presentation_demo_broken_pack_fails_closed_naming_the_leg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("broken");
+        std::fs::create_dir_all(&pack_dir).expect("create broken pack");
+        std::fs::write(
+            pack_dir.join("pack.toml"),
+            "this is not a valid toml manifest [[\n",
+        )
+        .expect("write junk manifest");
+        let spec = pack::spec::load_spec_from_dir(&pack_dir);
+        let (registry, _report) = build_session_registry(&[spec]);
+        assert!(!registry.packs().is_empty(), "the folder is still stacked");
+        assert!(registry.block_by_name("mymod:ruby_ore").is_none());
+
+        let (lines, ok) = presentation_demo_lines(&registry, None);
+        assert!(!ok, "a broken pack must fail closed: {lines:#?}");
+        let last = lines.last().expect("the digest always prints a verdict");
+        assert_eq!(last, "presentation_demo: ok=false failed=ruby_ore");
+    }
+
+    #[test]
+    fn crafting_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = dir.path().join("fixture.mcvx");
+        let (lines, ok) = crafting_demo_lines(&registry, Some(&fixture));
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test.
+        let expected = vec![
+            "crafting: leg=table item=mymod:ruby_pickaxe count=1 durability=900 max=900"
+                .to_string(),
+            "crafting: leg=player item=mymod:ruby_stew count=1 stack=16".to_string(),
+            "crafting: leg=mine block=mymod:ruby_ore ruby_ticks=7 iron_ticks=10 ruby_wear=899 iron_wear=249".to_string(),
+            "crafting: leg=eat item=mymod:ruby_stew restored=7 hunger=12".to_string(),
+            "crafting: leg=shortbow preview=false craft=false".to_string(),
+            "crafting: leg=missing preview=false craft=false consumed=0".to_string(),
+            "crafting: leg=save durability=850 unresolved=0 resolved=true".to_string(),
+            "crafting: leg=placeholder name=mymod:ruby_pickaxe unresolved=1 count=1 placeholder=true".to_string(),
+            "crafting: ok".to_string(),
+        ];
+        assert_eq!(lines, expected);
+        assert!(fixture.is_file(), "the --save fixture must be written");
+    }
+
+    #[test]
+    fn worldgen_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let (lines, ok) = worldgen_demo_lines(&registry);
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test (D143/MEM368).
+        let expected = vec![
+            "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
+            "worldgen_demo: leg=session rules=2 matches=true".to_string(),
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2476 min_y=4 max_y=40 in_band=true"
+                .to_string(),
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=334 biomes=plains,forest biomes_ok=true"
+                .to_string(),
+            "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
+            "worldgen_demo: leg=empty_rules identical=true".to_string(),
+            "worldgen_demo: ok=true".to_string(),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn worldgen_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = worldgen_demo_lines(&ContentRegistry::builtin_arc());
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("worldgen_demo: ok=false failed=registry")
+        );
+    }
+
+    #[test]
+    fn crafting_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = crafting_demo_lines(&ContentRegistry::builtin_arc(), None);
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("crafting: failed reason=table")
+        );
+    }
+
+    #[test]
+    fn palette_demo_pins_the_checked_in_reference_pack_line_set() {
+        let pack_dir = Path::new("packs/mymod-ruby");
+        assert!(
+            pack_dir.join("pack.toml").is_file(),
+            "the reference pack must be checked in at packs/mymod-ruby"
+        );
+        let spec = pack::spec::load_spec_from_dir(pack_dir);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(
+            report.errors(),
+            0,
+            "the reference pack is clean: {report:?}"
+        );
+
+        let (lines, ok) = palette_demo_lines(&registry);
+        assert!(ok, "the reference pack passes every leg: {lines:#?}");
+
+        // Literals measured from a real run of the checked-in pack, never
+        // derived from the registry under test (D143/MEM368).
+        let expected = vec![
+            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=47".to_string(),
+            "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4".to_string(),
+            "palette: leg=filter query=rub matched=6 names=mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
+            "palette: leg=filter query=mymod matched=6".to_string(),
+            "palette: leg=filter query=builtin matched=41".to_string(),
+            "palette: leg=grant slot=0 item=mymod:ruby_block count=64 tool=false placeable=true".to_string(),
+            "palette: leg=grant slot=1 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
+            "palette: leg=grant slot=2 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=3 item=mymod:ruby_stew count=16 tool=false placeable=false".to_string(),
+            "palette: leg=grant slot=4 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
+            "palette: leg=grant slot=5 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
+            "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19".to_string(),
+            "palette: leg=placeholder excluded=2 total=47".to_string(),
+            "palette: leg=key key=C creative=true survival=false".to_string(),
+            "palette: ok".to_string(),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn palette_demo_fails_closed_without_the_reference_pack() {
+        let (lines, ok) = palette_demo_lines(&ContentRegistry::builtin_arc());
+        assert!(
+            !ok,
+            "the built-in stack cannot satisfy the digest: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("palette: failed reason=pack")
         );
     }
 
@@ -13666,7 +16725,7 @@ mod tests {
         assert!(!session.player.can_fly());
         assert!(
             !session.ambient_spawning(),
-            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v7 save tail"
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v8 save tail"
         );
         assert!(
             session.spawn_settle_pending(),
@@ -14963,13 +18022,13 @@ mod tests {
         (session, demo)
     }
 
-    /// The fresh leg writes the v7 save through the production save site, and
+    /// The fresh leg writes the v8 save through the production save site, and
     /// the file itself carries the two surviving hostile records plus the earned
     /// inventory. The file length and the mob-count offset are MEASURED by
     /// running the fresh leg, never computed by hand: they depend on the exact
     /// serialized size of the inventory stacks the demo earns.
     #[test]
-    fn combat_demo_fresh_leg_writes_and_verifies_a_v7_save() {
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v8_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = 12345;
         let save_path = dir.path().join("combat-fresh-leg.mcvx");
@@ -15015,16 +18074,16 @@ mod tests {
             COMBAT_SAVE_MOB_COUNT_OFFSET,
             "pinned mob-count offset"
         );
-        assert_eq!(&bytes[4..8], &7u32.to_le_bytes(), "v7 version word");
+        assert_eq!(&bytes[4..8], &8u32.to_le_bytes(), "v8 version word");
         assert_eq!(
             &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
             &2u32.to_le_bytes(),
             "mob count at the measured offset"
         );
         assert_eq!(
-            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len(),
+            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len() + COMBAT_SAVE_TAIL_BYTES,
             bytes.len(),
-            "the mob tail is the last section"
+            "the mob tail is followed only by the pack+digest tail"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
@@ -16366,17 +19425,17 @@ mod tests {
         assert_eq!(app.background.world.render_distance(), 36);
     }
 
-    // --- texture pack wiring (M004/S03) ---
+    // --- ordered pack stack wiring (M010/S02-T07) ---
 
     /// A headless GameApp whose pack root and settings save path live inside
-    /// `dir` (the same injection pattern as `settings_path`). Defaults to no
-    /// pack selected so each test drives the cycle from a known state.
+    /// `dir` (the same injection pattern as `settings_path`). Defaults to an
+    /// empty stack so each test drives the Packs screen from a known state.
     fn app_with_packs(dir: &Path) -> GameApp {
         let mut app = app_at_screen(dir, LifecycleScreen::Settings(SettingsCaller::MainMenu));
         app.settings_path = dir.join("settings.toml");
         app.packs_root = dir.join("packs");
         app.available_packs = pack::available_pack_names(&app.packs_root);
-        app.settings.texture_pack = None;
+        app.settings.pack_stack.clear();
         app.current_pack = None;
         app
     }
@@ -16404,12 +19463,27 @@ mod tests {
     }
 
     #[test]
-    fn menu_text_shows_the_active_texture_pack_label() {
-        let settings = Settings::default();
+    fn menu_text_shows_the_packs_summary() {
         let menu = menu::SettingsMenu::new();
-        let text = compose_menu_text(&settings, &menu, "Alpha Pack");
-        assert!(text.contains("Texture Pack: Alpha Pack"));
+        let settings = Settings::default();
+        let text = compose_menu_text(
+            &settings,
+            &menu,
+            &packs::summary_label(&settings.pack_stack),
+        );
+        assert!(text.contains("Packs: Default"));
         assert_eq!(text.lines().count(), menu::ROW_COUNT);
+
+        let settings = Settings {
+            pack_stack: vec!["alpha".to_string(), "beta".to_string()],
+            ..Settings::default()
+        };
+        let text = compose_menu_text(
+            &settings,
+            &menu,
+            &packs::summary_label(&settings.pack_stack),
+        );
+        assert!(text.contains("Packs: 2 enabled"));
     }
 
     /// Canonical 44-byte-header RIFF/WAVE PCM16 fixture, matching the shape
@@ -16443,200 +19517,385 @@ mod tests {
     }
 
     #[test]
-    fn texture_pack_cycle_advances_to_the_first_pack_and_persists_it() {
+    fn packs_screen_toggles_two_packs_and_persists_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
         write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
-        // A real override layer proves the loaded pack's layers reach
-        // GameApp (not just its manifest).
+        // Real authored files prove the loaded stack reaches GameApp, not just
+        // the manifests: a layer from the earlier pack and a sound that the
+        // later pack does not provide.
         write_solid_png(
             &packs_root.join("alpha").join("grass_top.png"),
             [200, 10, 20, 255],
         );
+        write_wav_fixture(&packs_root.join("alpha").join("break.wav"), 1, 22_050);
         app.available_packs = pack::available_pack_names(&packs_root);
         assert_eq!(app.available_packs, vec!["alpha", "beta"]);
 
-        app.apply_texture_pack_cycle();
+        app.toggle_pack_row("alpha");
+        app.toggle_pack_row("beta");
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("alpha"));
-        let loaded = app.current_pack.as_ref().expect("pack loaded");
-        assert_eq!(loaded.display_name, "Alpha Pack");
+        assert_eq!(app.settings.pack_stack, vec!["alpha", "beta"]);
+        assert!(app.pack_presentation_dirty, "a toggle schedules an upload");
+        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        assert_eq!(
+            loaded.display_name, "Beta Pack",
+            "the later pack's name wins"
+        );
         assert_eq!(loaded.layers.len(), NUM_TEX_LAYERS as usize);
         assert_ne!(
             loaded.layers[0],
             generate_all_texture_layers_rgba()[0],
-            "the pack's authored layer replaces the procedural one"
+            "alpha's authored layer survives"
         );
-        assert!(loaded.warnings.is_empty(), "clean pack has no warnings");
-
-        // The choice is durable at the injected path.
-        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
-        assert!(warnings.is_empty());
-        assert_eq!(reloaded.texture_pack.as_deref(), Some("alpha"));
-    }
-
-    #[test]
-    fn texture_pack_cycle_wraps_the_last_pack_back_to_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        app.available_packs = pack::available_pack_names(&packs_root);
-        app.settings.texture_pack = Some("alpha".to_string());
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
-
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
-        assert!(app.current_pack.is_none(), "Default holds no pack data");
-        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
-        assert!(warnings.is_empty());
-        assert_eq!(reloaded.texture_pack, None);
-    }
-
-    #[test]
-    fn texture_pack_cycle_from_a_deleted_pack_lands_on_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        app.available_packs = pack::available_pack_names(&packs_root);
-        // The persisted choice names a pack that is no longer on disk.
-        app.settings.texture_pack = Some("deleted".to_string());
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "deleted"));
-
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.texture_pack, None);
-        assert!(app.current_pack.is_none());
-    }
-
-    #[test]
-    fn texture_pack_cycle_surfaces_load_warnings_in_the_menu_message() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        let broken = packs_root.join("broken");
-        write_pack_fixture(&broken, "Broken Pack");
-        std::fs::write(broken.join("grass_top.png"), b"not a png").expect("corrupt layer");
-        app.available_packs = pack::available_pack_names(&packs_root);
-
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken"));
-        let loaded = app.current_pack.as_ref().expect("fallback pack loaded");
-        assert_eq!(
-            loaded.layers.len(),
-            NUM_TEX_LAYERS as usize,
-            "fallback still fully usable"
-        );
-        let message = app.menu.message.as_ref().expect("warning in the menu");
-        assert!(
-            message.text.contains("grass_top.png"),
-            "warning names the failing layer: {}",
-            message.text
-        );
-    }
-
-    #[test]
-    fn texture_pack_cycle_swaps_in_valid_pack_sounds() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_packs(dir.path());
-        let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("soundy"), "Soundy Pack");
-        write_wav_fixture(&packs_root.join("soundy").join("break.wav"), 1, 22_050);
-        app.available_packs = pack::available_pack_names(&packs_root);
-        assert_eq!(
+        assert_ne!(
             *app.audio.buffer(SoundSlot::Break),
             default_buffers()[SoundSlot::Break.index()],
-            "baseline is the synthesized default"
+            "alpha's sound survives a later pack that authors none"
         );
 
-        app.apply_texture_pack_cycle();
+        // The ordering is durable at the injected path.
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["alpha", "beta"]);
 
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("soundy"));
-        let swapped = app.audio.buffer(SoundSlot::Break);
-        assert_eq!(swapped.channels(), 1, "mono WAV keeps its channel count");
-        assert_eq!(swapped.sample_rate(), 22_050, "rate passes through");
-        assert_ne!(
-            *swapped,
-            default_buffers()[SoundSlot::Break.index()],
-            "the pack file replaces the synthesized buffer"
-        );
-        // Slots the pack does not provide stay on the synthesized default.
-        assert_eq!(
-            *app.audio.buffer(SoundSlot::Place),
-            default_buffers()[SoundSlot::Place.index()]
-        );
+        // Toggling an enabled pack off removes it and persists the new stack.
+        app.toggle_pack_row("alpha");
+        assert_eq!(app.settings.pack_stack, vec!["beta"]);
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["beta"]);
+    }
+
+    #[test]
+    fn packs_screen_move_reorders_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+        write_pack_fixture(&packs_root.join("beta"), "Beta Pack");
+        app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
+        app.apply_pack_stack();
+
+        app.move_pack_row("beta", packs::MoveDirection::Up);
+
+        assert_eq!(app.settings.pack_stack, vec!["beta", "alpha"]);
+        let (reloaded, warnings) = load_with_warnings(&app.settings_path);
+        assert!(warnings.is_empty());
+        assert_eq!(reloaded.pack_stack, vec!["beta", "alpha"]);
+
+        // An edge move changes nothing and schedules no reload.
+        app.pack_presentation_dirty = false;
+        app.move_pack_row("beta", packs::MoveDirection::Up);
+        assert_eq!(app.settings.pack_stack, vec!["beta", "alpha"]);
         assert!(
-            app.menu.message.is_none(),
-            "a clean sound pack emits no warning, got: {:?}",
-            app.menu.message.as_ref().map(|m| &m.text)
+            !app.pack_presentation_dirty,
+            "an edge move must not trigger a presentation reload"
         );
     }
 
     #[test]
-    fn texture_pack_cycle_surfaces_corrupt_sound_warning_naming_the_bare_file() {
+    fn packs_screen_missing_pack_row_survives_and_warns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        let broken = packs_root.join("broken-sound");
-        write_pack_fixture(&broken, "Broken Sound Pack");
-        std::fs::write(broken.join("place.wav"), b"not a wav at all").expect("corrupt sound");
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
         app.available_packs = pack::available_pack_names(&packs_root);
+        app.settings.pack_stack = vec!["ghost".to_string()];
+        app.apply_pack_stack();
 
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.texture_pack.as_deref(), Some("broken-sound"));
-        let message = app
-            .menu
-            .message
-            .as_ref()
-            .expect("sound warning in the menu");
+        let rows = packs::packs_rows(&app.available_packs, &app.settings.pack_stack);
+        assert_eq!(rows[0].name, "ghost");
+        assert!(rows[0].enabled);
         assert!(
-            message.text.contains("place.wav"),
-            "warning names the bare sound file: {}",
+            rows[0].missing,
+            "the missing folder is marked in the row model"
+        );
+
+        // Toggling a real pack leaves the missing entry in the stack so
+        // restoring the folder makes it apply again.
+        app.toggle_pack_row("alpha");
+        assert_eq!(
+            app.settings.pack_stack,
+            vec!["ghost".to_string(), "alpha".to_string()]
+        );
+        let message = app.packs_message.as_ref().expect("missing-pack warning");
+        assert!(
+            message.text.contains("ghost") && message.text.contains("missing"),
+            "warning names the missing folder: {}",
             message.text
         );
         assert_eq!(
-            *app.audio.buffer(SoundSlot::Place),
-            default_buffers()[SoundSlot::Place.index()],
-            "the corrupt slot falls back to the synthesized default"
+            app.settings
+                .pack_stack
+                .iter()
+                .filter(|name| name.as_str() == "ghost")
+                .count(),
+            1,
+            "the missing entry is never removed by another pack's toggle"
         );
     }
 
     #[test]
-    fn texture_pack_cycle_back_to_default_restores_synthesized_sounds() {
+    fn packs_screen_keeps_earlier_layers_when_later_pack_authors_one_png() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
-        write_wav_fixture(&packs_root.join("alpha").join("break.wav"), 1, 22_050);
+        let alpha = packs_root.join("alpha");
+        std::fs::create_dir_all(&alpha).expect("create alpha");
+        std::fs::write(
+            alpha.join("pack.toml"),
+            "name = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
+        )
+        .expect("write alpha manifest");
+        write_solid_png(&alpha.join("grass_top.png"), [200, 10, 20, 255]);
+        write_solid_png(&alpha.join("dirt.png"), [10, 20, 200, 255]);
+        write_solid_png(&alpha.join("logo.png"), [240, 20, 30, 255]);
+
+        let beta = packs_root.join("beta");
+        std::fs::create_dir_all(&beta).expect("create beta");
+        std::fs::write(
+            beta.join("pack.toml"),
+            "description = \"a nameless partial pack\"\n",
+        )
+        .expect("write beta manifest");
+        write_solid_png(&beta.join("dirt.png"), [30, 220, 40, 255]);
+
         app.available_packs = pack::available_pack_names(&packs_root);
-        // Start on the pack with its sounds already applied, as a real run
-        // would after cycling onto it.
-        app.settings.texture_pack = Some("alpha".to_string());
-        app.current_pack = Some(pack::load_pack_by_name(&packs_root, "alpha"));
-        let (pack_buffers, _) = pack::sound::load_sound_overrides(&packs_root.join("alpha"));
-        app.audio.set_buffers(pack_buffers);
-        assert_ne!(
-            *app.audio.buffer(SoundSlot::Break),
-            default_buffers()[SoundSlot::Break.index()]
+        app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
+        app.apply_pack_stack();
+
+        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let procedural = generate_all_texture_layers_rgba();
+        assert_eq!(
+            &loaded.layers[0][..4],
+            &[200, 10, 20, 255],
+            "alpha's grass_top survives"
         );
-
-        app.apply_texture_pack_cycle();
-
-        assert_eq!(app.settings.texture_pack, None, "wraps to Default");
-        for slot in SoundSlot::ALL {
-            assert_eq!(
-                *app.audio.buffer(slot),
-                default_buffers()[slot.index()],
-                "Default must restore the synthesized {} sound",
-                slot.name()
-            );
+        assert_eq!(
+            &loaded.layers[2][..4],
+            &[30, 220, 40, 255],
+            "beta's single PNG overrides only dirt"
+        );
+        assert_eq!(
+            loaded.display_name, "Alpha Pack",
+            "beta authors no name, so alpha's survives"
+        );
+        assert!(
+            loaded.logo.is_some(),
+            "beta authors no logo, so alpha's survives"
+        );
+        for (index, layer) in loaded.layers.iter().enumerate() {
+            if index != 0 && index != 2 {
+                assert_eq!(
+                    layer, &procedural[index],
+                    "layer {index} must stay procedural"
+                );
+            }
         }
+        assert!(
+            loaded.warnings.is_empty(),
+            "a clean two-pack stack emits no presentation warnings: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn apply_pack_stack_warns_on_content_digest_change_without_replacing_the_session_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_packs(dir.path());
+        let packs_root = app.packs_root.clone();
+        let v2 = packs_root.join("mod");
+        std::fs::create_dir_all(&v2).expect("create v2 pack");
+        std::fs::write(
+            v2.join("pack.toml"),
+            "format_version = 2\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&v2.join("ruby.png"), [200, 10, 20, 255]);
+
+        let spec = pack::spec::load_spec_from_dir(&v2);
+        let (registry, report) = build_session_registry(&[spec]);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        assert_ne!(
+            registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the fixture changes content identity"
+        );
+        app.base_registry = Arc::clone(&registry);
+        app.session_registry = registry;
+        let session_digest = app.session_registry.digest();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+
+        // Toggling every content pack off changes the candidate digest, but
+        // the frozen session registry must survive untouched (MEM512) while
+        // the base adopts the new stack for the next load.
+        app.settings.pack_stack.clear();
+        app.apply_pack_stack();
+
+        let message = app.packs_message.as_ref().expect("digest change message");
+        assert!(
+            message
+                .text
+                .contains("content changes apply when the world is loaded again"),
+            "deferred content warning: {}",
+            message.text
+        );
+        assert_eq!(
+            app.base_registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the base registry adopts the cleared stack for the next load"
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "the Arc is never replaced mid-session"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+    }
+
+    #[test]
+    fn play_row_surfaces_a_changed_stack_warning_and_opens_with_placeholders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let saves = dir.path().join("saves");
+        std::fs::create_dir_all(&saves).expect("create saves dir");
+        let registry = main_ruby_registry();
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        let save_path = saves.join("Modded.mcvx");
+        save_world_to_path_with(&save_path, &modded_sample_save(31), registry.as_ref())
+            .expect("write v8 save with pack content");
+
+        // A temp settings path means an empty pack stack, so the launch base
+        // is the built-in registry even if the developer's real packs exist.
+        let mut app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            dir.path().join("settings.toml"),
+            dir.path().join("background/background.mcvx"),
+        );
+        assert_eq!(
+            app.base_registry.digest(),
+            ContentRegistry::builtin().digest(),
+            "the launch base is the built-in registry"
+        );
+        app.catalog = WorldCatalogFs::new(&saves);
+        app.enter_screen(LifecycleScreen::LoadGame);
+        app.play_row(0);
+
+        // The world opens (never blocked) with deterministic placeholders and
+        // the readable one-shot changed-stack notice above the hotbar.
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            app.session
+                .world
+                .chunk_edits()
+                .get(&ChunkPos::new(1, 2, 3))
+                .and_then(|chunk| chunk.get(&10)),
+            Some(&ruby_ore),
+            "the saved modded block kept its raw id as a placeholder"
+        );
+        assert_eq!(
+            app.session.registry.block_name(ruby_ore),
+            Some("mymod:ruby_ore")
+        );
+        assert!(
+            app.session
+                .registry
+                .block(ruby_ore)
+                .expect("placeholder block registered")
+                .placeholder,
+            "a missing pack renders as a placeholder, not a failure"
+        );
+        let message = app.game_message.as_ref().expect("changed-stack notice");
+        assert!(
+            message.text.contains("missing pack"),
+            "notice names the missing pack: {}",
+            message.text
+        );
+        assert!(
+            message.text.contains("placeholder"),
+            "notice counts the placeholders: {}",
+            message.text
+        );
+        assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+
+        // The same save loaded under the matching pack registry resolves real
+        // definitions and produces NO notice (no modal, no warning state).
+        let matched_dir = tempfile::tempdir().expect("tempdir");
+        let matched_saves = matched_dir.path().join("saves");
+        std::fs::create_dir_all(&matched_saves).expect("create saves dir");
+        let matched_path = matched_saves.join("Modded.mcvx");
+        save_world_to_path_with(&matched_path, &modded_sample_save(32), registry.as_ref())
+            .expect("write v8 save with matching content");
+        let mut matched = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            matched_dir.path().join("settings.toml"),
+            matched_dir.path().join("background/background.mcvx"),
+        );
+        matched.base_registry = Arc::clone(&registry);
+        matched.catalog = WorldCatalogFs::new(&matched_saves);
+        matched.enter_screen(LifecycleScreen::LoadGame);
+        matched.play_row(0);
+
+        assert_eq!(matched.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(
+            matched.session.registry.block_name(ruby_ore),
+            Some("mymod:ruby_ore")
+        );
+        assert!(
+            !matched
+                .session
+                .registry
+                .block(ruby_ore)
+                .expect("real ruby ore registered")
+                .placeholder,
+            "the matching pack keeps the real definition"
+        );
+        assert!(
+            matched.game_message.is_none(),
+            "a matching stack is quiet: {:?}",
+            matched.game_message.as_ref().map(|message| &message.text)
+        );
+
+        // A v8 MENU BACKGROUND with unknown content loads as a scene and never
+        // surfaces a content notice (D179): no menu message, no game message.
+        let background_dir = tempfile::tempdir().expect("tempdir");
+        let background_path = background_dir.path().join("background/background.mcvx");
+        std::fs::create_dir_all(background_path.parent().expect("parent"))
+            .expect("create background dir");
+        save_world_to_path_with(&background_path, &modded_sample_save(33), registry.as_ref())
+            .expect("write v8 menu background with pack content");
+        let background_app = GameApp::new_with_paths(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(
+                1,
+                PathBuf::from("/nonexistent/initial.mcvx"),
+                DEFAULT_SEASON_LENGTH_DAYS,
+            ),
+            background_dir.path().join("settings.toml"),
+            background_path,
+        );
+        assert!(
+            background_app.background.persisted,
+            "the v8 background with unknown content loads as a scene"
+        );
+        assert!(
+            background_app.main_menu_message.is_none(),
+            "the menu background suppresses the content notice"
+        );
+        assert!(background_app.game_message.is_none());
     }
 
     #[test]
@@ -16650,8 +19909,9 @@ mod tests {
 
         // Mirrors GameApp::new: pack warnings and sound warnings feed the same
         // startup Vec shown once through the Settings-entry path (MEM009).
-        let (_, mut startup_warnings) = load_startup_pack(&packs_root, Some("soundy"));
-        let (buffers, sound_warnings) = load_startup_sounds(&packs_root, Some("soundy"));
+        let (_, specs, mut startup_warnings) =
+            load_startup_stack(&packs_root, &["soundy".to_string()]);
+        let (buffers, sound_warnings) = pack::sound::resolve_sounds(&specs);
         startup_warnings.extend(sound_warnings);
 
         assert!(
@@ -16669,10 +19929,15 @@ mod tests {
             "the corrupt slot falls back"
         );
 
-        // Default selection keeps the synthesized set and adds nothing.
-        let (default_sounds, default_warnings) = load_startup_sounds(&packs_root, None);
-        assert_eq!(default_sounds, default_buffers());
+        // An empty stack is the built-in Default: no presentation, no specs,
+        // the synthesized set, and no warnings.
+        let (default_pack, default_specs, default_warnings) = load_startup_stack(&packs_root, &[]);
+        assert!(default_pack.is_none(), "Default is the procedural pack");
+        assert!(default_specs.is_empty());
         assert!(default_warnings.is_empty());
+        let (default_sounds, sound_warnings) = pack::sound::resolve_sounds(&default_specs);
+        assert_eq!(default_sounds, default_buffers());
+        assert!(sound_warnings.is_empty());
     }
 
     #[test]
@@ -16688,7 +19953,7 @@ mod tests {
         .expect("write pack.toml");
         std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
 
-        let (pack, warnings) = load_startup_pack(&packs_root, Some("broken"));
+        let (pack, _specs, warnings) = load_startup_stack(&packs_root, &["broken".to_string()]);
 
         let pack = pack.expect("a usable pack is still returned");
         assert!(
@@ -16719,7 +19984,7 @@ mod tests {
         .expect("write pack.toml");
         write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
 
-        let (pack, warnings) = load_startup_pack(&packs_root, Some("branded"));
+        let (pack, _specs, warnings) = load_startup_stack(&packs_root, &["branded".to_string()]);
 
         let pack = pack.expect("pack loads");
         let pack_logo = pack.logo.expect("valid logo decodes");
@@ -16733,13 +19998,14 @@ mod tests {
     }
 
     #[test]
-    fn load_startup_pack_default_selection_is_none_without_warnings() {
+    fn load_startup_stack_default_selection_is_none_without_warnings_or_specs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let packs_root = dir.path().join("packs");
 
-        let (pack, warnings) = load_startup_pack(&packs_root, None);
+        let (pack, specs, warnings) = load_startup_stack(&packs_root, &[]);
 
         assert!(pack.is_none(), "Default is the built-in procedural pack");
+        assert!(specs.is_empty(), "Default contributes no pack specs");
         assert!(warnings.is_empty(), "Default emits no warnings");
     }
 
@@ -16816,6 +20082,1068 @@ mod tests {
             }
         }
         chunk_pos
+    }
+
+    /// Loads the two checked-in reference packs (`mymod-ruby` content plus the
+    /// texture-only `ruby-overlay`) exactly as a launch would.
+    fn reference_pack_specs() -> (LoadedPack, Vec<PackSpec>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (loaded, specs, warnings) = pack::load_stack(
+            &root,
+            &["mymod-ruby".to_string(), "ruby-overlay".to_string()],
+        );
+        assert!(
+            warnings.is_empty(),
+            "leg=generate: the reference pack stack loads without warnings: {warnings:?}"
+        );
+        (loaded, specs)
+    }
+
+    /// The texture-only `ruby-overlay` stack on its own: what remains after a
+    /// player removes the `mymod-ruby` content pack. Every reference name the
+    /// pack authored must degrade to a deterministic placeholder against it.
+    fn removed_reference_pack_specs() -> Vec<PackSpec> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (_, specs, warnings) = pack::load_stack(&root, &["ruby-overlay".to_string()]);
+        assert!(
+            warnings.is_empty(),
+            "leg=derive: the overlay-only stack loads without warnings: {warnings:?}"
+        );
+        specs
+    }
+
+    /// Inserts the generated chunk that owns `pos` plus uniform-Air face
+    /// neighbours, generating with the session's pack worldgen rules so the
+    /// reference pack's ore and patches actually appear.
+    fn insert_pack_generated_chunk_with_face_neighbors(
+        session: &mut WorldSession,
+        pos: IVec3,
+    ) -> ChunkPos {
+        let (chunk_pos, _) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        let chunk = generate_chunk_seeded_with(
+            chunk_pos,
+            session.world.seed(),
+            Season::Summer,
+            session.world.worldgen_rules().as_ref(),
+        );
+        session.world.insert_chunk_for_test(chunk_pos, chunk);
+        for neighbour in [
+            ChunkPos::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1),
+            ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1),
+        ] {
+            if neighbour != chunk_pos {
+                session
+                    .world
+                    .insert_chunk_for_test(neighbour, Chunk::new_uniform(BlockId::Air));
+            }
+        }
+        chunk_pos
+    }
+
+    /// Finds the first generated chunk in a bounded window that holds at least
+    /// five `ore` cells, returning the chunk, its cells, and one extra cell for
+    /// the tool leg (from the same chunk when possible, otherwise from another
+    /// generated chunk in the same window).
+    fn scan_reference_ore_cells(
+        session: &WorldSession,
+        ore: BlockId,
+    ) -> (ChunkPos, Vec<IVec3>, Option<(ChunkPos, IVec3)>) {
+        let seed = session.world.seed();
+        let rules: Vec<WorldgenRule> = session.world.worldgen_rules().as_ref().to_vec();
+        let mut chosen: Option<(ChunkPos, Vec<IVec3>)> = None;
+        let mut extra: Option<(ChunkPos, IVec3)> = None;
+        'window: for radius in [2i32, 4] {
+            for cz in -radius..=radius {
+                for cx in -radius..=radius {
+                    for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                        let chunk_pos = ChunkPos::new(cx, cy, cz);
+                        let chunk =
+                            generate_chunk_seeded_with(chunk_pos, seed, Season::Summer, &rules);
+                        let mut cells = Vec::new();
+                        for ly in 0..CHUNK_SIZE {
+                            for lz in 0..CHUNK_SIZE {
+                                for lx in 0..CHUNK_SIZE {
+                                    if chunk.get(lx, ly, lz) == ore {
+                                        cells.push(IVec3::new(
+                                            cx * CHUNK_SIZE as i32 + lx as i32,
+                                            cy * CHUNK_SIZE as i32 + ly as i32,
+                                            cz * CHUNK_SIZE as i32 + lz as i32,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if chosen.is_none() {
+                            if cells.len() >= 5 {
+                                if let Some(pos) = cells.get(5).copied() {
+                                    extra = Some((chunk_pos, pos));
+                                }
+                                chosen = Some((chunk_pos, cells));
+                            }
+                        } else if extra.is_none() {
+                            if let Some(pos) = cells.first().copied() {
+                                extra = Some((chunk_pos, pos));
+                            }
+                        }
+                        if chosen.is_some() && extra.is_some() {
+                            break 'window;
+                        }
+                    }
+                }
+            }
+        }
+        let (chosen_pos, cells) =
+            chosen.expect("leg=generate: the scan window holds a reference-pack ore chunk");
+        let extra = cells.get(5).map(|pos| (chosen_pos, *pos)).or(extra);
+        (chosen_pos, cells, extra)
+    }
+
+    /// Mines one cell through the production accumulator and break path,
+    /// returning the wear outcome.
+    fn mine_generated_cell(
+        registry: &ContentRegistry,
+        session: &mut WorldSession,
+        pos: IVec3,
+        block: BlockId,
+        tool: Option<Item>,
+    ) -> ToolWearOutcome {
+        let mut mining = MiningState::new();
+        let target = MiningTarget::from_block_with(registry, pos, block, tool)
+            .expect("a generated reference-pack ore cell is breakable");
+        let mut broke = false;
+        for _ in 0..2_000 {
+            if let MiningTick::Broke {
+                pos: broke_pos,
+                block: broke_block,
+            } = mining.tick_with(registry, 0.05, Some(target))
+            {
+                assert_eq!(
+                    (broke_pos, broke_block),
+                    (pos, block),
+                    "leg=mine: the accumulator broke the requested cell"
+                );
+                broke = true;
+                break;
+            }
+        }
+        assert!(
+            broke,
+            "leg=mine: the accumulator reaches Broke for {block:?} at {pos:?}"
+        );
+        let (remeshed, wear) = applied_break(break_mined_block(session, pos, block));
+        assert!(
+            !remeshed.is_empty(),
+            "leg=mine: the break at {pos:?} remeshed its chunk"
+        );
+        wear
+    }
+
+    #[test]
+    fn modding_acceptance_fresh_world_with_reference_packs_end_to_end() {
+        use opencraft::pack::manifest::PackFormat;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let (full_pack, specs) = reference_pack_specs();
+        let (content_only_pack, content_only_specs, content_only_warnings) =
+            pack::load_stack(&root, &["mymod-ruby".to_string()]);
+        assert!(
+            content_only_warnings.is_empty(),
+            "leg=generate: the content pack alone loads without warnings: {content_only_warnings:?}"
+        );
+        let (_, overlay_only_specs, overlay_only_warnings) =
+            pack::load_stack(&root, &["ruby-overlay".to_string()]);
+        assert!(
+            overlay_only_warnings.is_empty(),
+            "leg=generate: the overlay alone loads without warnings: {overlay_only_warnings:?}"
+        );
+
+        // (2) The checked-in overlay is a texture-only v1 pack: no
+        // format_version, no content, exactly LAYER_FILES[3], no menu art.
+        let overlay = overlay_only_specs
+            .first()
+            .expect("leg=generate: the overlay pack loaded");
+        assert_eq!(
+            overlay.format_version,
+            PackFormat::V1,
+            "leg=generate: the overlay is a v1 pack"
+        );
+        assert_eq!(
+            overlay.manifest.format_version,
+            PackFormat::V1,
+            "leg=generate: the overlay manifest defaults to v1"
+        );
+        let overlay_manifest = std::fs::read_to_string(root.join("ruby-overlay").join("pack.toml"))
+            .expect("leg=generate: the overlay manifest is readable");
+        assert!(
+            !overlay_manifest.contains("format_version"),
+            "leg=generate: the checked-in overlay authors no format_version"
+        );
+        assert_eq!(
+            overlay.content,
+            PackContentSpec::default(),
+            "leg=generate: the overlay authors no content"
+        );
+        let authored_layers: Vec<usize> = overlay
+            .block_layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| layer.is_some().then_some(index))
+            .collect();
+        assert_eq!(
+            authored_layers,
+            vec![3],
+            "leg=generate: the overlay authors exactly one block layer"
+        );
+        assert_eq!(pack::LAYER_FILES[3], "stone.png");
+        assert!(
+            overlay.manifest.logo.is_none(),
+            "leg=generate: the overlay authors no menu logo"
+        );
+        assert!(
+            overlay.manifest.overlay_tint.is_none(),
+            "leg=generate: the overlay authors no menu tint"
+        );
+
+        // (3) Later-pack-wins is per authored file: only stone.png changes.
+        assert_eq!(full_pack.layers.len(), NUM_TEX_LAYERS as usize);
+        let overlay_stone = overlay.block_layers[3]
+            .clone()
+            .expect("leg=generate: the overlay authors stone.png");
+        for index in 0..full_pack.layers.len() {
+            if index == 3 {
+                assert_ne!(
+                    full_pack.layers[index], content_only_pack.layers[index],
+                    "leg=generate: the overlay replaces the content pack's stone layer"
+                );
+                assert_eq!(
+                    full_pack.layers[index], overlay_stone,
+                    "leg=generate: the merged stone layer is the overlay's authored art"
+                );
+            } else {
+                assert_eq!(
+                    full_pack.layers[index], content_only_pack.layers[index],
+                    "leg=generate: layer {index} keeps the content pack's art"
+                );
+            }
+        }
+        assert_eq!(full_pack.description, content_only_pack.description);
+        assert_eq!(full_pack.logo, content_only_pack.logo);
+        assert_eq!(full_pack.overlay_tint, content_only_pack.overlay_tint);
+        assert!(
+            full_pack.warnings.is_empty(),
+            "leg=generate: the full stack is warning-free"
+        );
+
+        // (4) The overlay adds no content; the full and content-only stacks
+        // resolve the same definitions and worldgen rules.
+        let (full_reg, full_report) = build_session_registry(&specs);
+        assert_eq!(
+            full_report.errors(),
+            0,
+            "leg=generate: the full registry is clean: {full_report:?}"
+        );
+        let (content_reg, content_report) = build_session_registry(&content_only_specs);
+        assert_eq!(
+            content_report.errors(),
+            0,
+            "leg=generate: the content-only registry is clean: {content_report:?}"
+        );
+        let (overlay_reg, overlay_report) = build_session_registry(&overlay_only_specs);
+        assert_eq!(
+            overlay_report.errors(),
+            0,
+            "leg=generate: the overlay-only registry is clean: {overlay_report:?}"
+        );
+
+        let builtin = ContentRegistry::builtin();
+        assert_eq!(
+            overlay_reg.blocks(),
+            builtin.blocks(),
+            "leg=generate: the overlay adds no block definitions"
+        );
+        assert_eq!(
+            overlay_reg.items(),
+            builtin.items(),
+            "leg=generate: the overlay adds no item definitions"
+        );
+        assert_eq!(
+            overlay_reg.tiers(),
+            builtin.tiers(),
+            "leg=generate: the overlay adds no tiers"
+        );
+        assert_eq!(
+            overlay_reg.tools(),
+            builtin.tools(),
+            "leg=generate: the overlay adds no tools"
+        );
+        assert_eq!(
+            overlay_reg.recipes(),
+            builtin.recipes(),
+            "leg=generate: the overlay adds no recipes"
+        );
+        assert_eq!(
+            overlay_reg.worldgen_rules(),
+            builtin.worldgen_rules(),
+            "leg=generate: the overlay adds no worldgen rules"
+        );
+
+        assert_eq!(
+            full_reg.blocks(),
+            content_reg.blocks(),
+            "leg=generate: the overlay leaves block definitions unchanged"
+        );
+        assert_eq!(full_reg.items(), content_reg.items());
+        assert_eq!(full_reg.tiers(), content_reg.tiers());
+        assert_eq!(full_reg.tools(), content_reg.tools());
+        assert_eq!(full_reg.recipes(), content_reg.recipes());
+        assert_eq!(
+            full_reg.worldgen_rules(),
+            content_reg.worldgen_rules(),
+            "leg=generate: the overlay leaves worldgen rules unchanged"
+        );
+
+        assert_eq!(
+            full_reg.packs().len(),
+            2,
+            "leg=generate: two packs are stacked"
+        );
+        assert_eq!(content_reg.packs().len(), 1);
+        assert_eq!(overlay_reg.packs().len(), 1);
+        assert_eq!(full_reg.packs()[0].folder, "mymod-ruby");
+        assert_eq!(full_reg.packs()[1].folder, "ruby-overlay");
+
+        // (5) A fresh Creative world freezes the full stack.
+        let dir = tempfile::tempdir().expect("leg=generate: tempdir");
+        let save_path = dir.path().join("modding-acceptance.mcvx");
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            424_242,
+            save_path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&full_reg),
+        );
+
+        // (6) Resolve every reference identity by its authored name.
+        let ore = full_reg
+            .block_by_name("mymod:ruby_ore")
+            .expect("leg=generate: mymod:ruby_ore is authored")
+            .id;
+        let ruby_block = full_reg
+            .block_by_name("mymod:ruby_block")
+            .expect("leg=generate: mymod:ruby_block is authored")
+            .id;
+        let ruby_item = full_reg
+            .item_by_name("mymod:ruby")
+            .expect("leg=generate: mymod:ruby is authored")
+            .index;
+        let stew_item = full_reg
+            .item_by_name("mymod:ruby_stew")
+            .expect("leg=generate: mymod:ruby_stew is authored")
+            .index;
+        let pickaxe_index = full_reg
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("leg=generate: mymod:ruby_pickaxe is authored")
+            .index;
+        assert_eq!(
+            full_reg
+                .tool_by_name("mymod:ruby_sword")
+                .expect("leg=generate: mymod:ruby_sword is authored")
+                .kind,
+            ToolKind::Sword,
+            "leg=generate: the second reference tool is the sword"
+        );
+
+        let (ore_chunk, ore_cells, extra_cell) = scan_reference_ore_cells(&session, ore);
+        assert!(
+            ore_cells.len() >= 5,
+            "leg=generate: the chosen chunk holds at least five ore cells, found {}",
+            ore_cells.len()
+        );
+        let first_five: Vec<IVec3> = ore_cells.iter().copied().take(5).collect();
+        insert_pack_generated_chunk_with_face_neighbors(&mut session, first_five[0]);
+        for cell in &first_five {
+            assert_eq!(
+                session.world.get_block(cell.x, cell.y, cell.z),
+                ore,
+                "leg=generate: the loaded chunk reads back {cell:?} as ruby ore"
+            );
+        }
+
+        // (7) Mine five ore cells bare-hand: no wear, five ruby collected.
+        for cell in &first_five {
+            let wear = mine_generated_cell(full_reg.as_ref(), &mut session, *cell, ore, None);
+            assert_eq!(
+                wear,
+                ToolWearOutcome::Nothing,
+                "leg=mine: a bare hand wears nothing"
+            );
+        }
+        let mined_ruby: u32 = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == ItemId::Item(ruby_item))
+            .map(|item| u32::from(item.count()))
+            .sum();
+        assert_eq!(
+            mined_ruby, 5,
+            "leg=mine: five bare-hand ore breaks yield five ruby"
+        );
+
+        // (8) Craft both authored recipes through the production result-slot
+        // seam, preserving the mined inventory and vitals across the rebuild.
+        let position = session.player.position;
+        let inventory = session.player.inventory().clone();
+        let vitals = session.player.survival;
+        let selected_slot = session.player.selected_slot();
+        let table_grid = crafting_demo_grid(
+            full_reg.as_ref(),
+            GridKind::Table,
+            &["RRR", " S ", " S "],
+            &[
+                ('R', ItemId::Item(ruby_item)),
+                ('S', ItemId::Material(Material::Stick)),
+            ],
+        );
+        let player_grid = crafting_demo_grid(
+            full_reg.as_ref(),
+            GridKind::Player,
+            &["RR", "WW"],
+            &[
+                ('R', ItemId::Item(ruby_item)),
+                ('W', ItemId::Material(Material::Wheat)),
+            ],
+        );
+        let mut rebuilt = Player::with_inventory(position, inventory, player_grid, table_grid);
+        rebuilt.survival = vitals;
+        rebuilt.restore_selected_slot(selected_slot);
+        session.player = rebuilt;
+
+        let mut screen = InventoryScreen::new();
+        screen.open_table();
+        let crafted_pickaxe = apply_inventory_click_button_with(
+            &mut session.player,
+            full_reg.as_ref(),
+            &screen,
+            Some(IVec3::new(0, 5, 0)),
+            InventoryTarget::ResultSlot(GridKind::Table),
+            InventoryClickButton::Left,
+        )
+        .expect("leg=craft: the ruby pickaxe crafts through the result-slot seam");
+        match crafted_pickaxe {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(
+                    item.id(),
+                    ItemId::ModTool(pickaxe_index),
+                    "leg=craft: the table yields the pack pickaxe"
+                );
+                assert_eq!(item.count(), 1, "leg=craft: one pickaxe per craft");
+                assert_eq!(
+                    item.durability(),
+                    Some(900),
+                    "leg=craft: the pickaxe starts at authored durability"
+                );
+                assert_eq!(
+                    item.max_durability(),
+                    Some(900),
+                    "leg=craft: the pickaxe keeps the authored max durability"
+                );
+            }
+            InventoryClickOutcome::Moved => {
+                panic!("leg=craft: a result click must report the crafted item")
+            }
+        }
+        assert!(
+            session.player.table_grid().is_empty(),
+            "leg=craft: the pickaxe pattern is consumed"
+        );
+
+        screen.open_player();
+        let crafted_stew = apply_inventory_click_button_with(
+            &mut session.player,
+            full_reg.as_ref(),
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+            InventoryClickButton::Left,
+        )
+        .expect("leg=craft: the ruby stew crafts through the result-slot seam");
+        match crafted_stew {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(
+                    item.id(),
+                    ItemId::Item(stew_item),
+                    "leg=craft: the player grid yields ruby stew"
+                );
+                assert_eq!(item.count(), 1, "leg=craft: one stew per craft");
+            }
+            InventoryClickOutcome::Moved => {
+                panic!("leg=craft: a result click must report the crafted item")
+            }
+        }
+        assert_eq!(
+            full_reg.item(stew_item).map(|def| def.stack_limit),
+            Some(16),
+            "leg=craft: the stew keeps its authored stack limit"
+        );
+        assert!(
+            session.player.player_grid().is_empty(),
+            "leg=craft: the stew pattern is consumed"
+        );
+
+        // (9) Eat the stew at hunger 5: authored nutrition 7 restores to 12.
+        let stew_slot = session
+            .player
+            .inventory()
+            .slots()
+            .iter()
+            .position(|slot| slot.as_ref().map(|item| item.id()) == Some(ItemId::Item(stew_item)))
+            .expect("leg=eat: the crafted stew is in the inventory");
+        assert!(
+            stew_slot < HOTBAR_SLOTS,
+            "leg=eat: the crafted stew sits in the hotbar"
+        );
+        let vitals = session.player.survival;
+        session.player.survival = SurvivalState::new(vitals.health(), 5, vitals.air())
+            .expect("leg=eat: hunger 5 is a valid vital");
+        assert!(session.player.select_slot(stew_slot));
+        let stew = session
+            .player
+            .inventory()
+            .slot(stew_slot)
+            .expect("leg=eat: the stew slot is occupied");
+        let target = EatingTarget::new_with(full_reg.as_ref(), stew_slot, stew, 5)
+            .expect("leg=eat: the authored stew is edible at hunger 5");
+        let mut eating = EatingState::new();
+        let mut ate = false;
+        for _ in 0..2_000 {
+            if let EatingTick::Ate {
+                slot,
+                item,
+                restore,
+            } = eating.tick(0.05, Some(target))
+            {
+                assert_eq!(
+                    (slot, item, restore),
+                    (stew_slot, ItemId::Item(stew_item), 7),
+                    "leg=eat: the accumulator completes the authored meal"
+                );
+                ate = true;
+                break;
+            }
+        }
+        assert!(ate, "leg=eat: the accumulator reaches Ate");
+        let restored = session
+            .player
+            .eat_selected_with(full_reg.as_ref(), stew_slot, ItemId::Item(stew_item))
+            .expect("leg=eat: the completion consumes the stew");
+        assert_eq!(restored, 7, "leg=eat: the authored stew restores seven");
+        assert_eq!(
+            session.player.survival.hunger(),
+            12,
+            "leg=eat: hunger 5 + 7 = 12"
+        );
+
+        // (10) The crafted pickaxe mines one more generated ore cell: one point
+        // of wear and a faster break than iron.
+        let (extra_chunk, extra_pos) =
+            extra_cell.expect("leg=tool: the scan window holds a sixth ore cell");
+        if extra_chunk != ore_chunk {
+            insert_pack_generated_chunk_with_face_neighbors(&mut session, extra_pos);
+        }
+        let pickaxe_slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                session.player.inventory().slot(slot).map(|item| item.id())
+                    == Some(ItemId::ModTool(pickaxe_index))
+            })
+            .expect("leg=tool: the crafted pickaxe sits in the hotbar");
+        assert!(session.player.select_slot(pickaxe_slot));
+        let held_pickaxe = session
+            .player
+            .selected_item()
+            .expect("leg=tool: the pickaxe is selected");
+        assert_eq!(
+            held_pickaxe.durability(),
+            Some(900),
+            "leg=tool: the crafted pickaxe is unworn before the break"
+        );
+        let wear = mine_generated_cell(
+            full_reg.as_ref(),
+            &mut session,
+            extra_pos,
+            ore,
+            Some(held_pickaxe),
+        );
+        assert_eq!(
+            wear,
+            ToolWearOutcome::Worn { remaining: 899 },
+            "leg=tool: the pack pickaxe wears exactly one point"
+        );
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(899),
+            "leg=tool: the pickaxe keeps its identity and worn durability"
+        );
+        let iron_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            },
+            1,
+        )
+        .expect("leg=tool: an iron pickaxe constructs");
+        let ruby_duration = full_reg
+            .break_duration(ore, Some(held_pickaxe))
+            .expect("leg=tool: ruby ore is breakable with the pack pickaxe");
+        let iron_duration = full_reg
+            .break_duration(ore, Some(iron_pickaxe))
+            .expect("leg=tool: ruby ore is breakable with iron");
+        assert!(
+            ruby_duration < iron_duration,
+            "leg=tool: ruby {ruby_duration}s beats iron {iron_duration}s"
+        );
+
+        // (11) Place the authored block through the production right-click
+        // path, consuming exactly one of the granted 64.
+        let (block_slot, granted) = session
+            .player
+            .grant_palette_item_with(full_reg.as_ref(), ItemId::Block(ruby_block))
+            .expect("leg=place: the palette grants the ruby block");
+        assert_eq!(
+            granted.count(),
+            64,
+            "leg=place: the authored block stack limit is 64"
+        );
+        assert_eq!(
+            session.player.selected_slot(),
+            block_slot,
+            "leg=place: the granted stack is selected"
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        assert!(
+            !session
+                .world
+                .set_block_immediate(0, 5, 0, BlockId::Stone)
+                .is_empty(),
+            "leg=place: the support block edit applies"
+        );
+        session.player.position = Vec3::new(0.5, 10.0, 0.5);
+        aim_placement_camera(&mut session);
+        let remeshed =
+            try_place_selected_block(&mut session).expect("leg=place: the ruby block places");
+        assert!(!remeshed.is_empty(), "leg=place: the placement remeshes");
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            ruby_block,
+            "leg=place: (0,6,0) is the authored ruby block"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.count()),
+            Some(63),
+            "leg=place: one ruby block is consumed"
+        );
+
+        // (12) Save v8, reload against the same stack, and prove the writer is
+        // deterministic.
+        save_current_world(&mut session).expect("leg=save: the session save writes");
+        let bytes = std::fs::read(&save_path).expect("leg=save: the save file is readable");
+        assert!(
+            bytes.starts_with(b"MCVX"),
+            "leg=save: the file starts with the save magic"
+        );
+        let version = u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("leg=save: the version word is present"),
+        );
+        assert_eq!(version, 8, "leg=save: the file is v8");
+        let loaded = load_world_from_path_with(&save_path, full_reg.as_ref())
+            .expect("leg=reload: the save loads");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "leg=reload: every saved name resolves against the same pack stack"
+        );
+        assert!(
+            loaded.content_notice().is_none(),
+            "leg=reload: the same pack stack is silent"
+        );
+        let placed = loaded
+            .data
+            .chunk_edits
+            .get(&ChunkPos::new(0, 0, 0))
+            .and_then(|edits| edits.get(&(linear_index(0, 6, 0) as u16)))
+            .copied();
+        assert_eq!(
+            placed,
+            Some(ruby_block),
+            "leg=reload: the placed ruby block survives"
+        );
+        let reloaded_pickaxe = loaded
+            .data
+            .player
+            .inventory
+            .slots()
+            .iter()
+            .flatten()
+            .find(|item| item.id() == ItemId::ModTool(pickaxe_index))
+            .expect("leg=reload: the crafted pickaxe survives");
+        assert_eq!(
+            reloaded_pickaxe.durability(),
+            Some(899),
+            "leg=reload: the worn durability survives"
+        );
+        let mut resaved = Vec::new();
+        opencraft::world::persistence::save_world_to_bytes_with(
+            &mut resaved,
+            &loaded.data,
+            full_reg.as_ref(),
+        )
+        .expect("leg=reload: the loaded world re-saves");
+        assert_eq!(
+            resaved, bytes,
+            "leg=reload: a loaded v8 save re-saves byte-identically"
+        );
+    }
+
+    #[test]
+    fn modding_acceptance_placeholder_removal_resave_and_restore_preserves_every_reference_identity(
+    ) {
+        use opencraft::content::PLACEHOLDER_ICON_LAYER;
+        use opencraft::world::persistence::{load_world_from_bytes_with, save_world_to_bytes_with};
+
+        // (1) Full and removed registries. Every load below rebuilds its own
+        // registry: reusing one that already holds placeholders would drift
+        // the appended ids and the unresolved count.
+        let (_full_pack, specs) = reference_pack_specs();
+        let overlay_specs = removed_reference_pack_specs();
+        let (full, full_report) = build_session_registry(&specs);
+        assert_eq!(
+            full_report.errors(),
+            0,
+            "leg=derive: the full registry is clean: {full_report:?}"
+        );
+
+        // (2) Derive every reference identity from the full registry by name.
+        let mut reference_names: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for def in full.blocks() {
+            if !def.placeholder && matches!(def.id, BlockId::Modded(_)) {
+                reference_names.insert(def.name.as_str());
+            }
+        }
+        for def in full.items() {
+            if !def.placeholder {
+                reference_names.insert(def.name.as_str());
+            }
+        }
+        for def in full.tools() {
+            reference_names.insert(def.name.as_str());
+        }
+        let expected_names: std::collections::BTreeSet<&str> = [
+            "mymod:ruby",
+            "mymod:ruby_block",
+            "mymod:ruby_ore",
+            "mymod:ruby_pickaxe",
+            "mymod:ruby_stew",
+            "mymod:ruby_sword",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            reference_names, expected_names,
+            "leg=derive: the reference stack authors exactly six content names"
+        );
+        assert_eq!(
+            reference_names.len(),
+            6,
+            "leg=derive: the reference set stays honest if the pack grows"
+        );
+
+        let ore = full
+            .block_by_name("mymod:ruby_ore")
+            .expect("leg=derive: mymod:ruby_ore is authored");
+        let ruby_block = full
+            .block_by_name("mymod:ruby_block")
+            .expect("leg=derive: mymod:ruby_block is authored");
+        let ruby = full
+            .item_by_name("mymod:ruby")
+            .expect("leg=derive: mymod:ruby is authored");
+        let stew = full
+            .item_by_name("mymod:ruby_stew")
+            .expect("leg=derive: mymod:ruby_stew is authored");
+        let pickaxe = full
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("leg=derive: mymod:ruby_pickaxe is authored");
+        let sword = full
+            .tool_by_name("mymod:ruby_sword")
+            .expect("leg=derive: mymod:ruby_sword is authored");
+
+        // (3) A save that references every block and item identity: two chunk
+        // edits plus a stack of each generic item and both tools.
+        let mut data = sample_save(9_090);
+        let mut edits = FxHashMap::default();
+        edits.insert(linear_index(0, 0, 0) as u16, ore.id);
+        edits.insert(linear_index(1, 0, 0) as u16, ruby_block.id);
+        data.chunk_edits.insert(ChunkPos::new(0, 0, 0), edits);
+
+        let worn_pickaxe =
+            Item::tool_with_durability_with(full.as_ref(), ItemId::ModTool(pickaxe.index), 875)
+                .expect("leg=derive: the pickaxe keeps a worn durability");
+        assert_eq!(worn_pickaxe.durability(), Some(875));
+        let worn_sword =
+            Item::tool_with_durability_with(full.as_ref(), ItemId::ModTool(sword.index), 900)
+                .expect("leg=derive: the sword is at authored maximum");
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Item(ruby.index), 5).expect("leg=derive: ruby stack"))
+            .expect("leg=derive: five ruby fit");
+        inventory
+            .insert(Item::new(ItemId::Item(stew.index), 3).expect("leg=derive: stew stack"))
+            .expect("leg=derive: three stew fit");
+        inventory
+            .insert(worn_pickaxe)
+            .expect("leg=derive: the pickaxe fits");
+        inventory
+            .insert(worn_sword)
+            .expect("leg=derive: the sword fits");
+        data.player.inventory = inventory;
+
+        let mut saved = Vec::new();
+        save_world_to_bytes_with(&mut saved, &data, full.as_ref())
+            .expect("leg=derive: the six-reference v8 save writes");
+
+        // (4) Removing the content pack keeps the world loadable: every
+        // reference becomes a deterministic placeholder and the notice names
+        // the missing pack and the six stand-ins.
+        let (missing_reg, missing_report) = build_session_registry(&overlay_specs);
+        assert_eq!(
+            missing_report.errors(),
+            0,
+            "leg=missing-reload: the removed stack is clean: {missing_report:?}"
+        );
+        let missing = load_world_from_bytes_with(&saved, missing_reg.as_ref())
+            .expect("leg=missing-reload: the world loads without the content pack");
+        assert_eq!(
+            missing.unresolved, 6,
+            "leg=missing-reload: all six reference names degrade"
+        );
+        let notice = missing
+            .content_notice()
+            .expect("leg=missing-reload: a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod-ruby`"), "{notice}");
+        assert!(
+            notice.contains("6 saved content names are unavailable and render as placeholders"),
+            "{notice}"
+        );
+
+        for name in ["mymod:ruby_ore", "mymod:ruby_block"] {
+            let def = missing
+                .registry
+                .block_by_name(name)
+                .expect("leg=missing-reload: the block placeholder keeps its saved name");
+            assert!(
+                def.placeholder,
+                "leg=missing-reload: {name} is a placeholder block"
+            );
+            assert!(
+                def.id.is_solid(),
+                "leg=missing-reload: {name} still occludes like a solid block"
+            );
+            assert!(
+                missing.registry.break_duration(def.id, None).is_none(),
+                "leg=missing-reload: {name} is unbreakable while missing"
+            );
+            assert!(
+                missing.registry.drop_entry(def.id).is_none(),
+                "leg=missing-reload: {name} yields no drop while missing"
+            );
+        }
+
+        for name in [
+            "mymod:ruby",
+            "mymod:ruby_stew",
+            "mymod:ruby_pickaxe",
+            "mymod:ruby_sword",
+        ] {
+            let def = missing
+                .registry
+                .item_by_name(name)
+                .expect("leg=missing-reload: the item placeholder keeps its saved name");
+            assert!(
+                def.placeholder,
+                "leg=missing-reload: {name} is a placeholder item"
+            );
+            assert_eq!(
+                def.icon_layer, PLACEHOLDER_ICON_LAYER,
+                "leg=missing-reload: {name} uses the checker icon"
+            );
+            assert!(
+                def.food.is_none(),
+                "leg=missing-reload: {name} is not edible while missing"
+            );
+            let mut movable = Inventory::empty();
+            movable
+                .insert(
+                    Item::new(ItemId::Item(def.index), 1)
+                        .expect("leg=missing-reload: placeholder item"),
+                )
+                .expect("leg=missing-reload: the placeholder stays movable");
+        }
+
+        let palette_names: Vec<String> = palette::entries(&missing.registry)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        for name in &reference_names {
+            assert!(
+                !palette_names
+                    .iter()
+                    .any(|palette_name| palette_name == name),
+                "leg=missing-reload: the palette hides unavailable {name}"
+            );
+        }
+
+        // (5) Re-save while still missing: all six authored names survive on
+        // the wire, and a second removed load still opens non-blocking.
+        let mut resaved = Vec::new();
+        save_world_to_bytes_with(&mut resaved, &missing.data, &missing.registry)
+            .expect("leg=resave: the degraded world re-saves");
+        for name in &reference_names {
+            assert!(
+                resaved
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "leg=resave: {name} survives the degraded re-save"
+            );
+        }
+
+        let (missing_again_reg, missing_again_report) = build_session_registry(&overlay_specs);
+        assert_eq!(
+            missing_again_report.errors(),
+            0,
+            "leg=missing-reload: the second removed stack is clean: {missing_again_report:?}"
+        );
+        let missing_again = load_world_from_bytes_with(&resaved, missing_again_reg.as_ref())
+            .expect("leg=missing-reload: the re-saved world still loads while missing");
+        assert_eq!(
+            missing_again.unresolved, 6,
+            "leg=missing-reload: the re-save keeps every name unresolved"
+        );
+        let dir = tempfile::tempdir().expect("leg=missing-reload: tempdir");
+        let mut reopened =
+            WorldSession::from_loaded_world(missing_again, dir.path().join("missing.mcvx"));
+        assert!(
+            reopened.take_content_notice().is_some(),
+            "leg=missing-reload: the world opens non-blocking with a readable notice"
+        );
+
+        // (6) Restoring the content pack resolves every identity again. The
+        // restored tools intentionally come back at their authored maximum:
+        // wear is not carried through a placeholder.
+        let (restored_reg, restored_report) = build_session_registry(&specs);
+        assert_eq!(
+            restored_report.errors(),
+            0,
+            "leg=restore: the restored stack is clean: {restored_report:?}"
+        );
+        let restored = load_world_from_bytes_with(&resaved, restored_reg.as_ref())
+            .expect("leg=restore: the re-save loads once the pack returns");
+        assert_eq!(
+            restored.unresolved, 0,
+            "leg=restore: every saved name resolves against the restored pack"
+        );
+        assert_eq!(
+            restored.data.chunk_edits, data.chunk_edits,
+            "leg=restore: both pack block edits survive the round trip"
+        );
+
+        for name in ["mymod:ruby_ore", "mymod:ruby_block"] {
+            let def = restored
+                .registry
+                .block_by_name(name)
+                .expect("leg=restore: the real block definition returns");
+            assert!(!def.placeholder, "leg=restore: {name} is live again");
+        }
+        for name in ["mymod:ruby", "mymod:ruby_stew"] {
+            let def = restored
+                .registry
+                .item_by_name(name)
+                .expect("leg=restore: the real item definition returns");
+            assert!(!def.placeholder, "leg=restore: {name} is live again");
+        }
+        for name in ["mymod:ruby_pickaxe", "mymod:ruby_sword"] {
+            let def = restored
+                .registry
+                .tool_by_name(name)
+                .expect("leg=restore: the real tool definition returns");
+            assert_eq!(def.name, name, "leg=restore: {name} keeps its identity");
+        }
+
+        let restored_tools: Vec<Item> = restored
+            .data
+            .player
+            .inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| matches!(item.id(), ItemId::ModTool(_)))
+            .copied()
+            .collect();
+        assert_eq!(
+            restored_tools.len(),
+            2,
+            "leg=restore: both tools stay registry-allocated tools"
+        );
+        for item in restored_tools {
+            assert_eq!(
+                item.durability(),
+                Some(900),
+                "leg=restore: wear is intentionally not carried through the placeholder"
+            );
+            assert_eq!(item.max_durability(), Some(900));
+            let ItemId::ModTool(index) = item.id() else {
+                unreachable!("the filter kept only pack tools");
+            };
+            let def = restored
+                .registry
+                .tool(index)
+                .expect("leg=restore: the tool index resolves");
+            assert!(
+                def.name == "mymod:ruby_pickaxe" || def.name == "mymod:ruby_sword",
+                "leg=restore: {0} is a reference tool",
+                def.name
+            );
+        }
+
+        let restore_notice = restored
+            .content_notice()
+            .expect("leg=restore: a restored stack yields a readable notice");
+        assert!(
+            restore_notice.contains("added pack `mymod-ruby`"),
+            "{restore_notice}"
+        );
+
+        // (7) Re-saving the restored world keeps all six names: no data loss.
+        let mut restored_resaved = Vec::new();
+        save_world_to_bytes_with(&mut restored_resaved, &restored.data, &restored.registry)
+            .expect("leg=resave-restored: the restored world re-saves");
+        for name in &reference_names {
+            assert!(
+                restored_resaved
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "leg=resave-restored: {name} is still present"
+            );
+        }
     }
 
     /// The validated inventory items a generated ruin chest's table yields, in
@@ -16913,6 +21241,231 @@ mod tests {
                 count: 2,
             })
         );
+    }
+
+    #[test]
+    fn pack_block_break_uses_the_session_registry_drop_and_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = main_ruby_registry();
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            4242,
+            dir.path().join("pack-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty(), "the pack block edit applied");
+        assert_eq!(wear, ToolWearOutcome::Nothing, "bare hand wears nothing");
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        let slot = session.player.inventory().slots()[0].expect("ruby was collected");
+        assert_eq!(slot.id(), ItemId::Item(0), "the authored drop is ruby");
+        assert_eq!(slot.count(), 1);
+
+        // The same block under the built-in registry is an unknown id, so the
+        // break is rejected without an edit or a drop.
+        let mut builtin = WorldSession::new_session(
+            4243,
+            dir.path().join("pack-break-builtin.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut builtin, BlockId::Stone);
+        builtin.world.set_block_immediate(0, 10, 0, ruby_ore);
+        assert!(matches!(
+            break_mined_block(&mut builtin, IVec3::new(0, 10, 0), ruby_ore),
+            BreakOutcome::Rejected(BreakRejection::Unbreakable)
+        ));
+        assert_eq!(
+            builtin.world.get_block(0, 10, 0),
+            ruby_ore,
+            "an unknown id is never edited"
+        );
+        assert_eq!(builtin.player.inventory().slots()[0], None);
+    }
+
+    #[test]
+    fn pack_tier_pickaxe_breaks_ruby_ore_faster_than_iron() {
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let ruby_pickaxe = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        let iron_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Iron,
+            },
+            1,
+        )
+        .expect("iron pickaxe");
+
+        // The production duration function resolves the authored 9x tier
+        // against the block's authored hardness/class.
+        let ruby_duration = registry
+            .break_duration(ruby_ore, Some(ruby_pickaxe))
+            .expect("ruby ore is breakable");
+        let iron_duration = registry
+            .break_duration(ruby_ore, Some(iron_pickaxe))
+            .expect("ruby ore is breakable");
+        assert!((ruby_duration - 3.0 / 9.0).abs() < 1e-6);
+        assert!((iron_duration - 3.0 / 6.0).abs() < 1e-6);
+        assert!(
+            ruby_duration < iron_duration,
+            "ruby {ruby_duration}s must beat iron {iron_duration}s"
+        );
+
+        // The production mining target carries the same registry-aware time.
+        let target = MiningTarget::from_block_with(
+            &registry,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+            Some(ruby_pickaxe),
+        )
+        .expect("a registry-aware target");
+        assert!((target.duration() - ruby_duration).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pack_tool_break_wears_exactly_one_point_and_reports_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5151,
+            dir.path().join("pack-wear.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe"));
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty(), "the pack block edit applied");
+        assert_eq!(wear, ToolWearOutcome::Worn { remaining: 899 });
+        assert_eq!(
+            session
+                .player
+                .selected_item()
+                .and_then(|item| item.durability()),
+            Some(899),
+            "exactly one durability point was spent"
+        );
+        assert_eq!(
+            session.player.selected_item().map(|item| item.id()),
+            Some(ItemId::ModTool(0)),
+            "the pack tool keeps its identity"
+        );
+    }
+
+    #[test]
+    fn pack_tool_at_last_durability_breaks_and_frees_its_slot_for_the_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let ruby_ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("ruby ore is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5152,
+            dir.path().join("pack-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(
+            Item::tool_with_durability_with(&registry, ItemId::ModTool(0), 1)
+                .expect("last durability"),
+        );
+        session.player = Player::with_inventory(
+            session.player.position,
+            Inventory::from_parts(slots, None),
+            CraftingGrid::new(GridKind::Player),
+            CraftingGrid::new(GridKind::Table),
+        );
+        assert!(session.player.select_slot(0));
+
+        let (remeshed, wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            ruby_ore,
+        ));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Broke);
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        let ruby_index = registry
+            .item_by_name("mymod:ruby")
+            .expect("ruby item is authored")
+            .index;
+        assert_eq!(
+            session.player.inventory().slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(ruby_index)),
+            "wear ran before collection, so the drop took the freed slot"
+        );
+    }
+
+    #[test]
+    fn authored_pack_tool_drop_is_collected_with_authored_durability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_tool_registry();
+        let altar = registry
+            .block_by_name("mymod:tool_altar")
+            .expect("the altar is authored")
+            .id;
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            5153,
+            dir.path().join("pack-tool-drop.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+            Arc::clone(&registry),
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, altar);
+
+        assert_eq!(
+            registry.drop_entry(altar),
+            Some((ItemId::ModTool(0), 1)),
+            "the authored drop resolves to the pack tool identity"
+        );
+        let (remeshed, wear) =
+            applied_break(break_mined_block(&mut session, IVec3::new(0, 10, 0), altar));
+        assert!(!remeshed.is_empty());
+        assert_eq!(wear, ToolWearOutcome::Nothing);
+        let slot = session.player.inventory().slots()[0].expect("the tool dropped");
+        assert_eq!(slot.id(), ItemId::ModTool(0));
+        assert_eq!(slot.count(), 1);
+        assert_eq!(slot.durability(), Some(900));
+        assert_eq!(slot.max_durability(), Some(900));
     }
 
     #[test]
@@ -18028,6 +22581,81 @@ mod tests {
     // S03-T03: inventory panel adapter (mode state, cursor ownership, clicks)
     // -----------------------------------------------------------------------
 
+    /// Pack registry with an authored 2x2 gem recipe (four stone make four
+    /// gems) and a 4x4 ruby-pickaxe recipe (gems over sticks), built through
+    /// the public registry builder.
+    fn pack_recipe_registry() -> ContentRegistry {
+        use opencraft::content::build_registry;
+        use opencraft::content::spec::{ItemEntry, PackAsset, RecipeEntry, TierEntry, ToolEntry};
+        use opencraft::content::PackIdentity;
+
+        let mut spec = PackContentSpec {
+            items: vec![ItemEntry {
+                id: "mymod:gem".to_string(),
+                display_name: Some("Ruby Gem".to_string()),
+                icon: "gem.png".to_string(),
+                stack_limit: 12,
+                food: None,
+            }],
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "pickaxe.png".to_string(),
+            }],
+            recipes: vec![
+                RecipeEntry {
+                    id: "mymod:gem_from_stone".to_string(),
+                    pattern: vec!["SS".to_string(), "SS".to_string()],
+                    key: [('S', "stone".to_string())]
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    output: "mymod:gem".to_string(),
+                    count: 4,
+                },
+                RecipeEntry {
+                    id: "mymod:ruby_pickaxe".to_string(),
+                    pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
+                    key: [('R', "mymod:gem".to_string()), ('S', "stick".to_string())]
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    output: "mymod:ruby_pickaxe".to_string(),
+                    count: 1,
+                },
+            ],
+            ..PackContentSpec::default()
+        };
+        for icon in ["gem.png", "pickaxe.png"] {
+            spec.assets.insert(
+                icon.to_string(),
+                PackAsset {
+                    rgba: vec![0u8; 16 * 16 * 4],
+                    source_side: 16,
+                },
+            );
+        }
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "pack recipe fixture must not error");
+        registry
+    }
+
     /// Total item count across all 36 slots, the cursor, and both grids — the
     /// conservation invariant every UI command must preserve.
     fn inventory_units(player: &Player) -> u32 {
@@ -18300,6 +22928,160 @@ mod tests {
             Err(InventoryCommandError::Craft(CraftError::NoRecipe))
         );
         assert_eq!(session.player.inventory(), &before);
+    }
+
+    #[test]
+    fn apply_inventory_click_button_with_crafts_pack_recipes_at_both_grids() {
+        let registry = pack_recipe_registry();
+
+        // 2x2 player grid: four stone are a pack recipe for four gems.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..4 {
+            player_grid
+                .set(
+                    index,
+                    Some(Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone item")),
+                )
+                .expect("2x2 cell");
+        }
+
+        // 4x4 table grid: the pack pickaxe pattern (gems over sticks).
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for (row, line) in ["RRR", " S ", " S "].iter().enumerate() {
+            for (col, byte) in line.bytes().enumerate() {
+                let cell = match byte {
+                    b'R' => {
+                        Item::new_with(&registry, ItemId::Item(0), 1).expect("authored gem item")
+                    }
+                    b'S' => Item::new(ItemId::Material(Material::Stick), 1).expect("stick item"),
+                    _ => continue,
+                };
+                table_grid
+                    .set(row * GridKind::Table.dim() + col, Some(cell))
+                    .expect("4x4 cell");
+            }
+        }
+
+        let mut player =
+            Player::with_inventory(Vec3::ZERO, Inventory::empty(), player_grid, table_grid);
+        let mut screen = InventoryScreen::new();
+        screen.open_player();
+
+        // The built-in registry cannot see pack recipes; the session registry
+        // can. This is the exact difference the production seam must bridge.
+        assert!(player
+            .craft_preview_with(&registry, GridKind::Player)
+            .is_some());
+        assert_eq!(player.craft_preview(GridKind::Player), None);
+
+        let outcome = apply_inventory_click_button_with(
+            &mut player,
+            &registry,
+            &screen,
+            None,
+            InventoryTarget::ResultSlot(GridKind::Player),
+            InventoryClickButton::Left,
+        )
+        .expect("the pack gem recipe crafts through the production seam");
+        match outcome {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::Item(0));
+                assert_eq!(item.count(), 4);
+            }
+            InventoryClickOutcome::Moved => panic!("a result click must report the crafted item"),
+        }
+        assert!(player.player_grid().is_empty());
+        assert!(player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .any(|item| item.id() == ItemId::Item(0) && item.count() == 4));
+
+        // Attach the screen to a live table and verify the UI preview/labels
+        // resolve the pack tool through the session registry.
+        screen.open_table();
+        let table_open = Some(IVec3::new(0, 5, 0));
+        let ui_layout = layout(1280, 720, InventoryMode::Table);
+        let pack_labels = screen_labels_with(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            &registry,
+        );
+        assert!(
+            pack_labels
+                .iter()
+                .any(|label| label.text == "Ruby Pickaxe x1"),
+            "the pack-tool result label renders its authored name"
+        );
+        let builtin_labels = screen_labels(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+        );
+        assert!(
+            !builtin_labels
+                .iter()
+                .any(|label| label.text == "Ruby Pickaxe x1"),
+            "the built-in registry cannot preview pack content"
+        );
+
+        let pack_quads = screen_quads_with(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            None,
+            &registry,
+        );
+        let builtin_quads = screen_quads(
+            InventoryMode::Table,
+            &ui_layout,
+            player.inventory(),
+            player.player_grid(),
+            player.table_grid(),
+            None,
+            None,
+        );
+        assert_eq!(
+            pack_quads.len(),
+            builtin_quads.len() + 1,
+            "the pack-tool preview adds exactly one result fill quad"
+        );
+
+        let outcome = apply_inventory_click_button_with(
+            &mut player,
+            &registry,
+            &screen,
+            table_open,
+            InventoryTarget::ResultSlot(GridKind::Table),
+            InventoryClickButton::Left,
+        )
+        .expect("the pack pickaxe crafts through the production seam");
+        match outcome {
+            InventoryClickOutcome::Crafted(item) => {
+                assert_eq!(item.id(), ItemId::ModTool(0));
+                assert_eq!(item.durability(), Some(900));
+                assert_eq!(item.max_durability(), Some(900));
+            }
+            InventoryClickOutcome::Moved => panic!("a result click must report the crafted item"),
+        }
+        assert!(player.table_grid().is_empty());
+        assert!(player
+            .inventory()
+            .slots()
+            .iter()
+            .flatten()
+            .any(|item| item.id() == ItemId::ModTool(0)));
     }
 
     #[test]
@@ -23586,13 +28368,15 @@ mod tests {
     }
 
     #[test]
-    fn gameplay_surface_excludes_inventory_and_chest_panels() {
-        assert!(gameplay_surface(true, false, false));
-        assert!(!gameplay_surface(true, true, false));
-        assert!(!gameplay_surface(true, false, true));
-        assert!(!gameplay_surface(true, true, true));
-        assert!(!gameplay_surface(false, false, false));
-        assert!(!gameplay_surface(false, true, true));
+    fn gameplay_surface_excludes_inventory_chest_and_palette_panels() {
+        assert!(gameplay_surface(true, false, false, false));
+        assert!(!gameplay_surface(true, true, false, false));
+        assert!(!gameplay_surface(true, false, true, false));
+        assert!(!gameplay_surface(true, false, false, true));
+        assert!(!gameplay_surface(true, true, true, true));
+        assert!(!gameplay_surface(false, false, false, false));
+        assert!(!gameplay_surface(false, true, true, false));
+        assert!(!gameplay_surface(false, false, false, true));
     }
 
     #[test]
@@ -23628,13 +28412,13 @@ mod tests {
     #[test]
     fn tooltip_text_and_placement_stay_inside_at_every_corner_and_tiny_surfaces() {
         let stack = Item::new(ItemId::Block(BlockId::Stone), 64).expect("stack");
-        let (text, line_count) = tooltip_text(stack);
+        let (text, line_count) = tooltip_text_with(stack, None);
         assert_eq!(text, "Stone\nx64");
         assert_eq!(line_count, 2);
 
         let pickaxe =
             Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("pickaxe");
-        let (text, line_count) = tooltip_text(pickaxe);
+        let (text, line_count) = tooltip_text_with(pickaxe, None);
         assert_eq!(text, "Iron Pickaxe\nDurability 137/250");
         assert_eq!(line_count, 2);
 
@@ -23663,23 +28447,27 @@ mod tests {
 
         let mut label = SelectionLabel::new();
         assert!(
-            !selected_name_should_draw(true, false, false, &label),
+            !selected_name_should_draw(true, false, false, false, &label),
             "a fresh label is hidden until a selection is observed"
         );
 
         label.observe(3, Some(stone(1)));
-        assert!(selected_name_should_draw(true, false, false, &label));
+        assert!(selected_name_should_draw(true, false, false, false, &label));
         assert!(
-            !selected_name_should_draw(true, true, false, &label),
+            !selected_name_should_draw(true, true, false, false, &label),
             "the inventory panel owns the pointer"
         );
         assert!(
-            !selected_name_should_draw(true, false, true, &label),
+            !selected_name_should_draw(true, false, true, false, &label),
             "the chest panel owns the pointer"
+        );
+        assert!(
+            !selected_name_should_draw(true, false, false, true, &label),
+            "the Creative palette owns the pointer"
         );
         for screen in ["main menu", "pause", "death"] {
             assert!(
-                !selected_name_should_draw(false, false, false, &label),
+                !selected_name_should_draw(false, false, false, false, &label),
                 "{screen} frames must not draw the selected-name strip"
             );
         }
@@ -23692,7 +28480,160 @@ mod tests {
         assert!(label.is_visible() && label.alpha() > 0.0);
         label.tick(0.02);
         assert!(!label.is_visible());
-        assert!(!selected_name_should_draw(true, false, false, &label));
+        assert!(!selected_name_should_draw(
+            true, false, false, false, &label
+        ));
+    }
+
+    #[test]
+    fn palette_click_grants_the_authored_stack_and_selects_its_slot() {
+        let registry = ContentRegistry::builtin();
+        let mut screen = PaletteScreen::new();
+        screen.open(registry);
+        let layout = palette::layout(1280, 720);
+
+        // Entries are display-name sorted, so locate Stone by stable name
+        // instead of assuming slot 0.
+        let visible = (0..screen.filtered().len())
+            .find(|index| {
+                screen
+                    .filtered_entry(*index)
+                    .is_some_and(|entry| entry.name == "stone")
+            })
+            .expect("the built-in stone block is listed");
+        assert!(visible < palette::PALETTE_VISIBLE);
+        let slot_rect = layout.slots[visible];
+        let cursor = (
+            slot_rect.0 + slot_rect.2 * 0.5,
+            slot_rect.1 + slot_rect.3 * 0.5,
+        );
+
+        let mut player = Player::new(Vec3::ZERO);
+        let (slot, item) =
+            apply_palette_click(&mut player, registry, &screen, &layout, Some(cursor))
+                .expect("clicking the stone slot grants a stack");
+        assert_eq!(item.id(), ItemId::Block(BlockId::Stone));
+        assert_eq!(
+            item.count(),
+            opencraft::player::inventory::MAX_STACK_COUNT,
+            "built-in block stack limits are the authored maximum"
+        );
+        assert_eq!(player.selected_slot(), slot);
+        assert_eq!(player.inventory().hotbar(slot), Some(item));
+
+        // A closed screen and empty panel space never grant anything.
+        let closed = PaletteScreen::new();
+        assert!(
+            apply_palette_click(&mut player, registry, &closed, &layout, Some(cursor),).is_none()
+        );
+        assert!(
+            apply_palette_click(&mut player, registry, &screen, &layout, Some((0.0, 0.0)),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn palette_hover_tooltip_resolves_the_filtered_entry_under_the_cursor() {
+        let registry = ContentRegistry::builtin();
+        let mut screen = PaletteScreen::new();
+        screen.open(registry);
+        let layout = palette::layout(1280, 720);
+        let slot = layout.slots[0];
+        let cursor = (slot.0 + slot.2 * 0.5, slot.1 + slot.3 * 0.5);
+
+        let item = palette_hovered_item(registry, &screen, &layout, Some(cursor))
+            .expect("the first slot has a tooltip item");
+        assert_eq!(
+            Some(item.id()),
+            screen.filtered_entry(0).map(|entry| entry.id),
+            "the tooltip must describe the row under the cursor"
+        );
+
+        // Filtering changes the visible row, and the tooltip follows it.
+        screen.apply(TextInputAction::InsertText("stone".into()));
+        let filtered = palette_hovered_item(registry, &screen, &layout, Some(cursor))
+            .expect("the filtered first slot has a tooltip item");
+        assert_eq!(
+            Some(filtered.id()),
+            screen.filtered_entry(0).map(|entry| entry.id),
+            "the tooltip must follow the filtered list, not the unfiltered stock"
+        );
+
+        assert!(palette_hovered_item(registry, &screen, &layout, Some((0.0, 0.0))).is_none());
+        let closed = PaletteScreen::new();
+        assert!(palette_hovered_item(registry, &closed, &layout, Some(cursor)).is_none());
+    }
+
+    #[test]
+    fn closed_palette_draws_no_quads_labels_or_icons() {
+        let closed = PaletteScreen::new();
+        let layout = palette::layout(1280, 720);
+        let registry = ContentRegistry::builtin_arc();
+
+        assert!(palette::screen_quads(&closed, &layout, Some((10.0, 10.0))).is_empty());
+        assert!(palette::screen_labels(&closed, &layout).is_empty());
+        assert!(
+            palette_icon_vertices_with(Some(&registry), &closed, &layout, 1280, 720).is_empty()
+        );
+    }
+
+    #[test]
+    fn palette_routing_markers_pin_keyboard_mouse_and_label_order() {
+        let src = include_str!("main.rs");
+        let keyboard = src
+            .find("// Palette owns the keyboard while open")
+            .expect("palette keyboard routing marker is present");
+        let escape = src
+            .find("KeyCode::Escape if pressed && !event.repeat =>")
+            .expect("the gameplay Escape arm is present");
+        assert!(
+            keyboard < escape,
+            "palette keyboard handling must precede the gameplay Escape arm"
+        );
+
+        let press = src
+            .find("// Palette press routing (S07-T03): before the click-to-re-grab branch.")
+            .expect("palette press marker is present");
+        let regrab = src
+            .find("if !self.cursor_grabbed {")
+            .expect("the click-to-re-grab branch is present");
+        assert!(
+            press < regrab,
+            "palette press routing must precede the click-to-re-grab branch"
+        );
+
+        let keyc = src
+            .find("KeyCode::KeyC if pressed && !event.repeat =>")
+            .expect("the KeyC arm is present");
+        let guard = src
+            .find("palette::available_in(self.session.player.mode())")
+            .expect("the KeyC arm must be Creative-gated");
+        let rebindable = src
+            .find("// Rebindable gameplay keys (S04-T03)")
+            .expect("the rebindable gameplay arm is present");
+        assert!(
+            keyc < guard && guard < rebindable,
+            "KeyC must be a non-rebindable utility key guarded by available_in"
+        );
+
+        let chest_update = src
+            .find("// Chest panel labels (S03-T05): same two-pass borrow pattern")
+            .expect("chest label update is present");
+        let palette_update = src
+            .find("// Palette panel labels (S07-T03): same two-pass borrow")
+            .expect("palette label update is present");
+        let palette_push = src
+            .find("// Palette labels ride the same UI pass above the HUD (S07-T03).")
+            .expect("palette label push is present");
+        let tooltip_push = src
+            .find("// Tooltip text rides the same UI pass")
+            .expect("tooltip text push is present");
+        assert!(
+            chest_update < palette_update
+                && palette_update < palette_push
+                && palette_push < tooltip_push,
+            "palette labels must update after chest and push before the tooltip"
+        );
     }
 
     #[test]
@@ -24864,6 +29805,87 @@ mod tests {
 
     fn selected_food_count(session: &WorldSession) -> Option<u16> {
         session.player.selected_item().map(|item| item.count())
+    }
+
+    /// A pack registry with `mymod:ruby_stew` (nutrition 7, 0.8 s).
+    fn pack_stew_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{FoodSpec, ItemEntry, PackAsset};
+
+        let mut spec = PackContentSpec::default();
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby_stew".to_string(),
+            display_name: None,
+            icon: "stew.png".to_string(),
+            stack_limit: 64,
+            food: Some(FoodSpec {
+                nutrition: 7,
+                eat_seconds: 0.8,
+            }),
+        });
+        spec.assets.insert(
+            "stew.png".to_string(),
+            PackAsset {
+                rgba: vec![0x11; 1024],
+                source_side: 16,
+            },
+        );
+        let pack = (
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn authored_pack_food_runs_through_the_real_right_click_and_hold_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = pack_stew_registry();
+        let index = registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered stew")
+            .index;
+        let stew_id = ItemId::Item(index);
+        let stew =
+            Item::new_with(registry.as_ref(), stew_id, 2).expect("registered pack stew stack");
+        let mut session = survival_food_session(dir.path(), 123, "eat-pack-stew.mcvx", stew, 10);
+        session.registry = Arc::clone(&registry);
+
+        assert!(matches!(
+            right_click_interaction(&mut session),
+            RightClickOutcome::EatingStarted
+        ));
+        let idle = InputState::default();
+        let target = eating_candidate(&session, &idle, true, true, true).expect("pack meal target");
+        assert_eq!(target.item(), stew_id);
+        assert_eq!(target.restore(), 7);
+        assert!((target.duration() - 0.8).abs() < 1e-6);
+
+        let mut state = EatingState::new();
+        for _ in 0..7 {
+            assert!(matches!(
+                state.tick(0.1, Some(target)),
+                EatingTick::Eating { .. }
+            ));
+        }
+        assert!(matches!(
+            state.tick(0.09, Some(target)),
+            EatingTick::Eating { .. }
+        ));
+        let (slot, item) = tick_until_ate(&mut state, target).expect("pack meal completes");
+        assert_eq!((slot, item), (0, stew_id));
+        assert_eq!(
+            session
+                .player
+                .eat_selected_with(session.registry.as_ref(), slot, item),
+            Some(7)
+        );
+        assert_eq!(session.player.survival.hunger(), 17);
+        assert_eq!(selected_food_count(&session), Some(1));
     }
 
     fn tick_until_ate(state: &mut EatingState, target: EatingTarget) -> Option<(usize, ItemId)> {
@@ -26717,5 +31739,268 @@ mod tests {
         assert_ne!(bow[1].color, mining[1].color);
 
         assert!(frame_progress_bar(None, None, None, 1280, 720).is_none());
+    }
+
+    /// A two-entry pack registry (one block, one item) with real, non-placeholder
+    /// definitions, built from an inline spec rather than the crate's `packs/`.
+    fn main_ruby_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby_ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: Some("mymod:ruby".to_string()),
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 64,
+            food: None,
+        });
+        for path in ["ruby_ore.png", "ruby.png"] {
+            spec.assets.insert(
+                path.to_string(),
+                PackAsset {
+                    rgba: vec![0x33; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+
+        let packs = vec![(
+            PackIdentity {
+                folder: "mymod-ruby".to_string(),
+                version: Some("1.0".to_string()),
+            },
+            spec,
+        )];
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        Arc::new(registry)
+    }
+
+    /// Pack registry with an authored ruby tier (speed 9, durability 900,
+    /// damage 9), a ruby pickaxe and sword, ruby ore that drops a ruby item,
+    /// and an altar block whose authored drop is the pack pickaxe itself.
+    fn pack_tool_registry() -> Arc<ContentRegistry> {
+        use opencraft::content::spec::{
+            BlockEntry, BlockTextures, ItemEntry, PackAsset, TierEntry, ToolEntry,
+        };
+
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 3.0,
+            drop: Some("mymod:ruby".to_string()),
+            tool: Some(ToolKind::Pickaxe),
+            stack_limit: 64,
+        });
+        spec.blocks.push(BlockEntry {
+            id: "mymod:tool_altar".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("altar.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: Some("mymod:ruby_pickaxe".to_string()),
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.items.push(ItemEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: None,
+            icon: "ruby.png".to_string(),
+            stack_limit: 64,
+            food: None,
+        });
+        spec.tiers.push(TierEntry {
+            id: "mymod:ruby".to_string(),
+            display_name: Some("Ruby".to_string()),
+            speed: 9.0,
+            durability: 900,
+            damage: 9,
+        });
+        spec.tools.push(ToolEntry {
+            id: "mymod:ruby_pickaxe".to_string(),
+            display_name: Some("Ruby Pickaxe".to_string()),
+            kind: ToolKind::Pickaxe,
+            tier: "mymod:ruby".to_string(),
+            icon: "pickaxe.png".to_string(),
+        });
+        spec.tools.push(ToolEntry {
+            id: "mymod:ruby_sword".to_string(),
+            display_name: Some("Ruby Sword".to_string()),
+            kind: ToolKind::Sword,
+            tier: "mymod:ruby".to_string(),
+            icon: "sword.png".to_string(),
+        });
+        for path in [
+            "ore.png",
+            "altar.png",
+            "ruby.png",
+            "pickaxe.png",
+            "sword.png",
+        ] {
+            spec.assets.insert(
+                path.to_string(),
+                PackAsset {
+                    rgba: vec![0x44; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod-tools".to_string(),
+                    version: Some("1.0".to_string()),
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
+        Arc::new(registry)
+    }
+
+    fn modded_sample_save(seed: u32) -> WorldSaveData {
+        let mut data = sample_save(seed);
+        let mut chunk = FxHashMap::default();
+        chunk.insert(
+            10,
+            BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT),
+        );
+        data.chunk_edits.insert(ChunkPos::new(1, 2, 3), chunk);
+        let mut inventory = Inventory::empty();
+        inventory
+            .insert(Item::new(ItemId::Item(0), 5).expect("ruby stack"))
+            .expect("the empty inventory accepts the stack");
+        data.player.inventory = inventory;
+        data
+    }
+
+    #[test]
+    fn save_current_world_names_modded_content_through_the_session_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-session.mcvx");
+        let registry = main_ruby_registry();
+        let mut session = WorldSession::new_session_with_mode_and_registry(
+            4242,
+            path.clone(),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Stone);
+        session.world.set_block_immediate(0, 10, 0, ruby_ore);
+        session
+            .player
+            .collect_item(Item::new(ItemId::Item(0), 5).expect("ruby stack"));
+
+        save_current_world(&mut session).expect("the session save writes");
+
+        let loaded =
+            opencraft::world::persistence::load_world_from_path_with(&path, registry.as_ref())
+                .expect("the save loads with the pack registry");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "no placeholders against the same pack"
+        );
+        let block = loaded.registry.block(ruby_ore).expect("ruby ore resolves");
+        assert_eq!(block.name, "mymod:ruby_ore");
+        assert!(
+            !block.placeholder,
+            "the real definition was written by name"
+        );
+        let item = loaded.registry.item(0).expect("ruby resolves");
+        assert_eq!(item.name, "mymod:ruby");
+        assert!(!item.placeholder);
+        assert_eq!(
+            loaded.data.player.inventory.slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(0))
+        );
+        assert_eq!(
+            loaded
+                .data
+                .chunk_edits
+                .get(&ChunkPos::new(0, 0, 0))
+                .and_then(|chunk| chunk.get(&(linear_index(0, 10, 0) as u16)))
+                .copied(),
+            Some(ruby_ore)
+        );
+    }
+
+    #[test]
+    fn startup_session_with_loads_v8_content_through_the_pack_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-startup.mcvx");
+        let path_str = path.to_str().expect("utf8 path");
+        let registry = main_ruby_registry();
+        save_world_to_path_with(&path, &modded_sample_save(33), registry.as_ref())
+            .expect("write modded save");
+        let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
+
+        let cli = CliConfig::parse_args(["--save", path_str]);
+        let mut loaded = startup_session_with(&cli, &registry);
+        assert_eq!(
+            loaded
+                .registry
+                .block(ruby_ore)
+                .map(|block| block.name.as_str()),
+            Some("mymod:ruby_ore")
+        );
+        assert!(!loaded.registry.block(ruby_ore).unwrap().placeholder);
+        assert_eq!(loaded.registry.item_def_name(0), Some("mymod:ruby"));
+        assert_eq!(loaded.take_content_notice(), None, "same stack is silent");
+        assert_eq!(
+            loaded.player.inventory().slots()[0].map(|item| item.id()),
+            Some(ItemId::Item(0)),
+            "the saved item id survives the registry-aware load"
+        );
+
+        // The same save under the built-in registry still opens, with the saved
+        // names as placeholders and a readable non-blocking notice.
+        let mut builtin = startup_session_with(&cli, &ContentRegistry::builtin_arc());
+        assert_eq!(
+            builtin
+                .registry
+                .block(ruby_ore)
+                .map(|block| block.name.as_str()),
+            Some("mymod:ruby_ore"),
+            "the placeholder keeps the saved name"
+        );
+        assert!(builtin.registry.block(ruby_ore).unwrap().placeholder);
+        let notice = builtin
+            .take_content_notice()
+            .expect("a changed stack yields a readable notice");
+        assert!(notice.contains("missing pack `mymod-ruby`"), "{notice}");
+        assert!(
+            notice.contains("2 saved content names are unavailable and render as placeholders"),
+            "{notice}"
+        );
+
+        // A fresh branch freezes exactly the supplied registry.
+        let fresh = startup_session_with(
+            &CliConfig::parse_args(["--new", "--seed", "9", "--save", path_str]),
+            &registry,
+        );
+        assert!(Arc::ptr_eq(&fresh.registry, &registry));
     }
 }

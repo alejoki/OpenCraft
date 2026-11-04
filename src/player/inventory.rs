@@ -14,6 +14,7 @@
 //! ([`Inventory::hotbar_stack`], [`Inventory::to_legacy_hotbar`]) so those
 //! consumers can migrate without regaining mutable slot arrays.
 
+use crate::content::{names, ContentRegistry, RecipeDef};
 use crate::world::block::BlockId;
 use crate::world::loot::LootItem;
 use crate::world::mob_loot::MobDropItem;
@@ -294,7 +295,16 @@ impl ToolTier {
 pub enum ItemId {
     Block(BlockId),
     Material(Material),
-    Tool { kind: ToolKind, tier: ToolTier },
+    Tool {
+        kind: ToolKind,
+        tier: ToolTier,
+    },
+    /// A registry-allocated pack generic item: a dense index into
+    /// [`crate::content::ContentRegistry::items`].
+    Item(u16),
+    /// A registry-allocated pack tool: a dense index into
+    /// [`crate::content::ContentRegistry::tools`].
+    ModTool(u16),
 }
 
 impl ItemId {
@@ -304,11 +314,13 @@ impl ItemId {
             ItemId::Block(_) => MAX_STACK_COUNT,
             ItemId::Material(_) => MATERIAL_STACK_LIMIT,
             ItemId::Tool { .. } => 1,
+            ItemId::Item(_) => MAX_STACK_COUNT,
+            ItemId::ModTool(_) => 1,
         }
     }
 
     pub const fn is_tool(self) -> bool {
-        matches!(self, ItemId::Tool { .. })
+        matches!(self, ItemId::Tool { .. } | ItemId::ModTool(_))
     }
 
     pub const fn tool(self) -> Option<(ToolKind, ToolTier)> {
@@ -326,6 +338,12 @@ impl ItemId {
         match self {
             ItemId::Block(block) => block.name(),
             ItemId::Material(material) => material.name(),
+            // A registry-allocated pack item has no static label; callers that
+            // have the registry read the real display name from its `ItemDef`.
+            ItemId::Item(_) => "Modded Item",
+            // A pack tool index is not a `(kind, tier)` pair, so it has no
+            // static kind-first label either; the registry names it.
+            ItemId::ModTool(_) => "Modded Tool",
             ItemId::Tool { kind, tier } => match kind {
                 ToolKind::Pickaxe => match tier {
                     ToolTier::Wood => "Wood Pickaxe",
@@ -423,6 +441,11 @@ pub enum ItemError {
     /// The `(kind, tier)` pair is not a constructible tool identity, e.g. a
     /// stone or iron bow.
     TierNotAllowed,
+    /// A registry identity was built without a registry. Pack items and pack
+    /// tools must go through the `_with` constructors.
+    RegistryRequired,
+    /// A registry lookup failed: the index is not present in the registry.
+    UnknownContent,
 }
 
 /// Shared tier gate for every tool constructor.
@@ -449,6 +472,10 @@ pub struct Item {
     id: ItemId,
     count: u16,
     durability: Option<u16>,
+    /// Maximum durability captured at construction. Built-in tiers derive it
+    /// from `ToolTier`; pack tools store the authored `TierDef::durability`,
+    /// so HUD and inventory labels stay registry-free.
+    max_durability: Option<u16>,
 }
 
 impl Item {
@@ -461,16 +488,74 @@ impl Item {
         match id {
             ItemId::Block(block) if !block.is_carryable() => Err(ItemError::UncarryableBlock),
             ItemId::Block(_) => Self::stackable(id, count, MAX_STACK_COUNT),
+            ItemId::Item(_) => Self::stackable(id, count, MAX_STACK_COUNT),
             ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
             ItemId::Tool { kind, tier } => {
                 check_tool_tier(kind, tier)?;
                 if count != 1 {
                     return Err(ItemError::StackableTool);
                 }
+                let max_durability = tier.max_durability();
                 Ok(Self {
                     id,
                     count: 1,
-                    durability: Some(tier.max_durability()),
+                    durability: Some(max_durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            ItemId::ModTool(_) => Err(ItemError::RegistryRequired),
+        }
+    }
+
+    /// Builds a fully-repaired instance of `id` against `registry`.
+    ///
+    /// Pack generic items use their authored stack limit and pack tools start
+    /// at full authored durability. Built-in ids answer byte-identically to
+    /// [`Item::new`] because the registry built-ins are derived from the same
+    /// frozen tables.
+    pub fn new_with(registry: &ContentRegistry, id: ItemId, count: u16) -> Result<Self, ItemError> {
+        match id {
+            ItemId::Block(block) => {
+                if !block.is_carryable() {
+                    return Err(ItemError::UncarryableBlock);
+                }
+                let limit = registry
+                    .block(block)
+                    .map_or(MAX_STACK_COUNT, |def| def.stack_limit)
+                    .clamp(1, MAX_STACK_COUNT);
+                Self::stackable(id, count, limit)
+            }
+            ItemId::Item(index) => {
+                let def = registry.item(index).ok_or(ItemError::UnknownContent)?;
+                let limit = def.stack_limit.clamp(1, MAX_STACK_COUNT);
+                Self::stackable(id, count, limit)
+            }
+            ItemId::Material(_) => Self::stackable(id, count, MATERIAL_STACK_LIMIT),
+            ItemId::Tool { kind, tier } => {
+                check_tool_tier(kind, tier)?;
+                if count != 1 {
+                    return Err(ItemError::StackableTool);
+                }
+                let max_durability = tier.max_durability();
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(max_durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            ItemId::ModTool(index) => {
+                let def = registry.tool(index).ok_or(ItemError::UnknownContent)?;
+                let tier = registry.tier(def.tier).ok_or(ItemError::UnknownContent)?;
+                if count != 1 {
+                    return Err(ItemError::StackableTool);
+                }
+                let durability = tier.durability.max(1);
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(durability),
+                    max_durability: Some(durability),
                 })
             }
         }
@@ -487,6 +572,7 @@ impl Item {
             id,
             count,
             durability: None,
+            max_durability: None,
         })
     }
 
@@ -507,7 +593,40 @@ impl Item {
             id: ItemId::Tool { kind, tier },
             count: 1,
             durability: Some(durability),
+            max_durability: Some(tier.max_durability()),
         })
+    }
+
+    /// Builds a tool identity with explicit remaining durability against
+    /// `registry`.
+    ///
+    /// Accepts a built-in `(kind, tier)` pair (same strict rule as
+    /// [`Item::tool_with_durability`]) or a pack tool index, whose durability
+    /// must be `1..=authored maximum`. Clamping is a persistence policy and is
+    /// deliberately not performed here.
+    pub fn tool_with_durability_with(
+        registry: &ContentRegistry,
+        id: ItemId,
+        durability: u16,
+    ) -> Result<Self, ItemError> {
+        match id {
+            ItemId::Tool { kind, tier } => Self::tool_with_durability(kind, tier, durability),
+            ItemId::ModTool(index) => {
+                let def = registry.tool(index).ok_or(ItemError::UnknownContent)?;
+                let tier = registry.tier(def.tier).ok_or(ItemError::UnknownContent)?;
+                let max_durability = tier.durability.max(1);
+                if durability == 0 || durability > max_durability {
+                    return Err(ItemError::InvalidDurability);
+                }
+                Ok(Self {
+                    id,
+                    count: 1,
+                    durability: Some(durability),
+                    max_durability: Some(max_durability),
+                })
+            }
+            _ => Err(ItemError::NotATool),
+        }
     }
 
     /// Converts a legacy block stack, reusing the same validation rules.
@@ -530,7 +649,7 @@ impl Item {
 
     /// Maximum durability of this tool, or `None` for non-tools.
     pub fn max_durability(&self) -> Option<u16> {
-        self.id.tool().map(|(_, tier)| tier.max_durability())
+        self.max_durability
     }
 
     pub const fn is_tool(&self) -> bool {
@@ -873,6 +992,30 @@ impl Inventory {
         Ok(())
     }
 
+    /// Grants one item into exactly one hotbar slot for Creative palette use.
+    ///
+    /// This is deliberately **not** a conservation path: the item is placed
+    /// wholesale, never merged, and its count is never changed. The write
+    /// priority is the first empty hotbar slot, then an existing hotbar stack
+    /// of the same identity (replaced wholesale), then `preferred` clamped
+    /// into the hotbar when all nine slots are occupied. Main storage
+    /// (`HOTBAR_SLOTS..INVENTORY_SLOTS`), the cursor, and both crafting grids
+    /// are never touched. Returns the slot that now holds `item`.
+    pub fn grant_hotbar(&mut self, item: Item, preferred: usize) -> usize {
+        let hotbar = &mut self.slots[..HOTBAR_SLOTS];
+        let slot = hotbar
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                hotbar
+                    .iter()
+                    .position(|existing| matches!(existing, Some(stack) if stack.id() == item.id()))
+            })
+            .unwrap_or_else(|| preferred.min(HOTBAR_SLOTS - 1));
+        hotbar[slot] = Some(item);
+        slot
+    }
+
     /// Whether every item in `items` fits, in order, without touching the
     /// cursor or either crafting grid.
     ///
@@ -909,12 +1052,59 @@ impl Inventory {
     /// the remainder. Returns `None` (no mutation) when nothing was accepted
     /// or the block cannot be carried.
     pub fn collect_block(&mut self, block: BlockId, amount: u16) -> Option<CollectOutcome> {
-        if !block.is_carryable() || amount == 0 {
+        if !block.is_carryable() {
+            return None;
+        }
+        self.collect_limited(ItemId::Block(block), amount, MAX_STACK_COUNT)
+    }
+
+    /// Best-effort collection of any [`ItemId`] under an authored stack limit.
+    ///
+    /// This is [`Inventory::collect_block`] with the identity and per-slot cap
+    /// supplied by the caller (the session registry's [`crate::content::drop_entry`]
+    /// for pack-authored drops). Compatible existing stacks merge first, then
+    /// empty slots fill in flat hotbar-then-main order. `limit` is clamped to
+    /// `1..=MAX_STACK_COUNT` and then to the identity's own cap so a slot can
+    /// never hold an invalid stack. Returns `None` with no mutation when the
+    /// amount is zero or nothing fits.
+    pub fn collect_limited(
+        &mut self,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.collect_limited_impl(None, id, amount, limit)
+    }
+
+    /// Registry-aware [`Inventory::collect_limited`].
+    ///
+    /// Pack identities are constructed through [`Item::new_with`], so an
+    /// authored drop can be a generic item or a non-stackable pack tool even
+    /// though [`Item::new`] deliberately refuses registry identities. The
+    /// merge/fill order, clamping and no-room contract are identical to the
+    /// registry-free path, and built-in ids answer byte-identically.
+    pub fn collect_limited_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.collect_limited_impl(Some(registry), id, amount, limit)
+    }
+
+    fn collect_limited_impl(
+        &mut self,
+        registry: Option<&ContentRegistry>,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        if amount == 0 {
             return None;
         }
 
-        let id = ItemId::Block(block);
-        let limit = MAX_STACK_COUNT;
+        let limit = limit.clamp(1, MAX_STACK_COUNT).min(id.stack_limit()).max(1);
         let mut remaining = amount;
         let mut first_slot = None;
 
@@ -940,10 +1130,16 @@ impl Inventory {
             }
             if slot.is_none() {
                 let moved = remaining.min(limit);
-                *slot = Item::new(id, moved).ok();
-                remaining -= moved;
-                if first_slot.is_none() {
-                    first_slot = Some(index);
+                let item = match registry {
+                    Some(registry) => Item::new_with(registry, id, moved),
+                    None => Item::new(id, moved),
+                };
+                if let Ok(item) = item {
+                    *slot = Some(item);
+                    remaining -= moved;
+                    if first_slot.is_none() {
+                        first_slot = Some(index);
+                    }
                 }
             }
         }
@@ -1322,6 +1518,9 @@ pub enum RecipeId {
     IronSword,
     Shortbow,
     Arrows,
+    /// A registry-allocated pack recipe: a dense index into
+    /// [`crate::content::ContentRegistry::recipes`] (`>= 22`).
+    Modded(u16),
 }
 
 /// Read-only recipe evaluation result.
@@ -1355,17 +1554,11 @@ pub enum CraftError {
 /// identity and one consumed grid cell; the pattern may sit anywhere in the
 /// grid as long as its trimmed bounding box matches.
 #[derive(Copy, Clone)]
-struct Recipe {
-    id: RecipeId,
-    pattern: &'static [&'static str],
-    output: ItemId,
-    output_count: u16,
-}
-
-impl Recipe {
-    fn output_item(&self) -> Item {
-        Item::new(self.output, self.output_count).expect("static recipes are valid")
-    }
+pub(crate) struct Recipe {
+    pub(crate) id: RecipeId,
+    pub(crate) pattern: &'static [&'static str],
+    pub(crate) output: ItemId,
+    pub(crate) output_count: u16,
 }
 
 /// Shaped recipe table.
@@ -1375,7 +1568,7 @@ impl Recipe {
 /// the three tool tiers use planks, cobblestone, and mined iron ore as their
 /// head material. Adding smelting later can swap the iron head identity
 /// without changing the shaped-recipe machinery.
-const RECIPES: &[Recipe] = &[
+pub(crate) const RECIPES: &[Recipe] = &[
     Recipe {
         id: RecipeId::Planks,
         pattern: &["L"],
@@ -1577,7 +1770,7 @@ const RECIPES: &[Recipe] = &[
 /// only coal identity available — the same convention `I` already uses for
 /// iron ore. Smelting can later swap both head materials without touching the
 /// shaped-recipe machinery.
-fn pattern_item(byte: u8) -> Option<ItemId> {
+pub(crate) fn pattern_item(byte: u8) -> Option<ItemId> {
     match byte {
         b'L' => Some(ItemId::Block(BlockId::OakLog)),
         b'P' => Some(ItemId::Block(BlockId::OakPlanks)),
@@ -1627,7 +1820,7 @@ fn grid_bounds(grid: &CraftingGrid) -> Option<Bounds> {
     })
 }
 
-fn pattern_bounds(pattern: &'static [&'static str]) -> Option<Bounds> {
+fn pattern_bounds(pattern: &[String]) -> Option<Bounds> {
     let mut top = usize::MAX;
     let mut left = usize::MAX;
     let mut bottom = 0;
@@ -1653,8 +1846,19 @@ fn pattern_bounds(pattern: &'static [&'static str]) -> Option<Bounds> {
     })
 }
 
-fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) -> bool {
-    let Some(pattern_bounds) = pattern_bounds(recipe.pattern) else {
+/// Registry-aware shaped match.
+///
+/// Compares the trimmed grid bounds against the trimmed pattern bounds, then
+/// every pattern cell: spaces must be empty, and every key character must
+/// resolve through the registry to the item identity currently in the cell.
+/// An absent character, an unknown index, or placeholder content fails closed.
+fn matches_pattern(
+    grid: &CraftingGrid,
+    grid_bounds: Bounds,
+    registry: &ContentRegistry,
+    recipe: &RecipeDef,
+) -> bool {
+    let Some(pattern_bounds) = pattern_bounds(&recipe.pattern) else {
         return false;
     };
     if pattern_bounds.width != grid_bounds.width || pattern_bounds.height != grid_bounds.height {
@@ -1674,7 +1878,10 @@ fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) ->
                     return false;
                 }
             } else {
-                let Some(expected_id) = pattern_item(expected) else {
+                let Some(reference) = recipe.key.get(&char::from(expected)) else {
+                    return false;
+                };
+                let Some(expected_id) = registry.resolve_item_ref(*reference) else {
                     return false;
                 };
                 if actual.map(|item| item.id()) != Some(expected_id) {
@@ -1686,11 +1893,21 @@ fn matches_pattern(grid: &CraftingGrid, grid_bounds: Bounds, recipe: &Recipe) ->
     true
 }
 
-fn recipe_for(grid: &CraftingGrid) -> Option<&'static Recipe> {
+fn recipe_for<'a>(grid: &CraftingGrid, registry: &'a ContentRegistry) -> Option<&'a RecipeDef> {
     let grid_bounds = grid_bounds(grid)?;
-    RECIPES
-        .iter()
-        .find(|recipe| matches_pattern(grid, grid_bounds, recipe))
+    registry
+        .enabled_recipes()
+        .map(|(_, recipe)| recipe)
+        .find(|recipe| {
+            registry.resolve_item_ref(recipe.output).is_some()
+                && matches_pattern(grid, grid_bounds, registry, recipe)
+        })
+}
+
+/// Map a dense registry recipe index back to the frozen public id: the 22
+/// built-ins keep their names, every pack recipe is [`RecipeId::Modded`].
+fn recipe_id_for_index(index: u16) -> RecipeId {
+    names::builtin_recipe_by_index(index).unwrap_or(RecipeId::Modded(index))
 }
 
 /// A bounded crafting grid. Only the active `dim * dim` region is addressable;
@@ -1769,25 +1986,54 @@ impl CraftingGrid {
             .all(Option::is_none)
     }
 
-    /// Evaluates the current grid contents. Never cached: the result is a pure
-    /// function of the cells at call time.
+    /// Evaluates the current grid contents against the built-in registry.
+    /// Never cached: the result is a pure function of the cells at call time.
     pub fn preview(&self) -> Option<RecipePreview> {
-        recipe_for(self).map(|recipe| RecipePreview {
-            recipe: recipe.id,
-            output: recipe.output,
-            output_count: recipe.output_count,
+        self.preview_with(ContentRegistry::builtin())
+    }
+
+    /// Evaluates the current grid contents against `registry`.
+    ///
+    /// Disabled and placeholder recipes are skipped, and every key character
+    /// and the output resolve through the registry. Never caches.
+    pub fn preview_with(&self, registry: &ContentRegistry) -> Option<RecipePreview> {
+        recipe_for(self, registry).and_then(|recipe| {
+            Some(RecipePreview {
+                recipe: recipe_id_for_index(recipe.index),
+                output: registry.resolve_item_ref(recipe.output)?,
+                output_count: recipe.count,
+            })
         })
     }
 
-    /// Crafts one result: revalidate the recipe and destination, insert the
-    /// output, then consume exactly one item from each occupied cell.
+    /// Crafts one result against the built-in registry.
+    ///
+    /// Delegates to [`CraftingGrid::take_result_with`], so built-in recipes
+    /// answer byte-identically to the registry-aware path.
+    pub fn take_result(&mut self, inventory: &mut Inventory) -> Result<Item, CraftError> {
+        self.take_result_with(ContentRegistry::builtin(), inventory)
+    }
+
+    /// Crafts one result against `registry`: revalidate the recipe and
+    /// destination, insert the output, then consume exactly one item from each
+    /// occupied cell.
     ///
     /// Any error (no recipe, full destination) leaves both the grid and the
     /// inventory untouched. The recipe is always re-derived from the current
-    /// cells, so a stale caller-held preview can never take a result.
-    pub fn take_result(&mut self, inventory: &mut Inventory) -> Result<Item, CraftError> {
-        let recipe = recipe_for(self).ok_or(CraftError::NoRecipe)?;
-        let output = recipe.output_item();
+    /// cells, so a stale caller-held preview can never take a result. A pack
+    /// tool output is built through [`Item::new_with`], so it becomes
+    /// [`ItemId::ModTool`] with authored durability.
+    pub fn take_result_with(
+        &mut self,
+        registry: &ContentRegistry,
+        inventory: &mut Inventory,
+    ) -> Result<Item, CraftError> {
+        let recipe = recipe_for(self, registry).ok_or(CraftError::NoRecipe)?;
+        let output_id = registry
+            .resolve_item_ref(recipe.output)
+            .ok_or(CraftError::NoRecipe)?;
+        let output =
+            Item::new_with(registry, output_id, recipe.count).map_err(|_| CraftError::NoRecipe)?;
         if !inventory.can_insert(&output) {
             return Err(CraftError::DestinationFull);
         }
@@ -1845,6 +2091,171 @@ mod tests {
 
     fn tool(kind: ToolKind, tier: ToolTier) -> Item {
         item(ItemId::Tool { kind, tier }, 1)
+    }
+
+    /// A deterministic pack registry with one tier (durability 900) and one
+    /// tool pointing at it, built through the public registry builder so the
+    /// test exercises the same allocation path as a real pack.
+    fn fixture_registry() -> crate::content::ContentRegistry {
+        use crate::content::build_registry;
+        use crate::content::spec::{PackAsset, PackContentSpec, TierEntry, ToolEntry};
+        use crate::content::PackIdentity;
+
+        let mut spec = PackContentSpec {
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "ruby_pickaxe.png".to_string(),
+            }],
+            ..PackContentSpec::default()
+        };
+        spec.assets.insert(
+            "ruby_pickaxe.png".to_string(),
+            PackAsset {
+                rgba: vec![0u8; 16 * 16 * 4],
+                source_side: 16,
+            },
+        );
+        let (registry, report) = build_registry(
+            crate::content::ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "fixture registry must not error");
+        registry
+    }
+
+    /// A pack registry with one generic item, one tier/tool and two shaped
+    /// recipes: a 2x2 gem recipe (from stone) and a 4x4 ruby pickaxe recipe
+    /// (gems + sticks). Recipe ids sort as `gem_from_stone` then
+    /// `ruby_pickaxe`, allocating dense indices 22 and 23.
+    fn recipe_fixture_registry() -> crate::content::ContentRegistry {
+        use crate::content::build_registry;
+        use crate::content::spec::{
+            ItemEntry, PackAsset, PackContentSpec, RecipeEntry, TierEntry, ToolEntry,
+        };
+        use crate::content::PackIdentity;
+        use std::collections::BTreeMap;
+
+        let mut spec = PackContentSpec {
+            items: vec![ItemEntry {
+                id: "mymod:gem".to_string(),
+                display_name: Some("Ruby Gem".to_string()),
+                icon: "gem.png".to_string(),
+                stack_limit: 12,
+                food: None,
+            }],
+            tiers: vec![TierEntry {
+                id: "mymod:ruby".to_string(),
+                display_name: Some("Ruby".to_string()),
+                speed: 9.0,
+                durability: 900,
+                damage: 9,
+            }],
+            tools: vec![ToolEntry {
+                id: "mymod:ruby_pickaxe".to_string(),
+                display_name: Some("Ruby Pickaxe".to_string()),
+                kind: ToolKind::Pickaxe,
+                tier: "mymod:ruby".to_string(),
+                icon: "pickaxe.png".to_string(),
+            }],
+            recipes: vec![
+                RecipeEntry {
+                    id: "mymod:gem_from_stone".to_string(),
+                    pattern: vec!["SS".to_string(), "SS".to_string()],
+                    key: [('S', "stone".to_string())]
+                        .into_iter()
+                        .collect::<BTreeMap<_, _>>(),
+                    output: "mymod:gem".to_string(),
+                    count: 4,
+                },
+                RecipeEntry {
+                    id: "mymod:ruby_pickaxe".to_string(),
+                    pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
+                    key: [('R', "mymod:gem".to_string()), ('S', "stick".to_string())]
+                        .into_iter()
+                        .collect::<BTreeMap<_, _>>(),
+                    output: "mymod:ruby_pickaxe".to_string(),
+                    count: 1,
+                },
+            ],
+            ..PackContentSpec::default()
+        };
+        for icon in ["gem.png", "pickaxe.png"] {
+            spec.assets.insert(
+                icon.to_string(),
+                PackAsset {
+                    rgba: vec![0u8; 16 * 16 * 4],
+                    source_side: 16,
+                },
+            );
+        }
+        let (registry, report) = build_registry(
+            crate::content::ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "recipe fixture must not error");
+        registry
+    }
+
+    fn all_carryable_builtin_blocks() -> Vec<BlockId> {
+        (0..crate::world::block::BUILTIN_BLOCK_COUNT)
+            .map(BlockId::from_raw)
+            .filter(|block| block.is_carryable())
+            .collect()
+    }
+
+    fn all_materials() -> [Material; 11] {
+        [
+            Material::Stick,
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+            Material::Bone,
+            Material::Arrow,
+        ]
+    }
+
+    fn all_constructible_tools() -> Vec<ItemId> {
+        let mut ids = Vec::new();
+        for kind in [
+            ToolKind::Pickaxe,
+            ToolKind::Axe,
+            ToolKind::Shovel,
+            ToolKind::Hoe,
+            ToolKind::Sword,
+            ToolKind::Bow,
+        ] {
+            for &tier in kind.allowed_tiers() {
+                ids.push(ItemId::Tool { kind, tier });
+            }
+        }
+        ids
     }
 
     fn total_of(inventory: &Inventory, id: ItemId) -> u32 {
@@ -2298,6 +2709,35 @@ mod tests {
     }
 
     #[test]
+    fn widened_pack_item_identity_is_stackable_and_inert() {
+        let id = ItemId::Item(0);
+        assert_eq!(id.stack_limit(), MAX_STACK_COUNT);
+        assert!(!id.is_tool());
+        assert_eq!(id.tool(), None);
+        assert_eq!(id.name(), "Modded Item");
+
+        for count in [1, 2, MAX_STACK_COUNT] {
+            let built = Item::new(id, count).expect("pack items stack like blocks");
+            assert_eq!(built.id(), id);
+            assert_eq!(built.count(), count);
+            assert_eq!(built.durability(), None);
+            assert!(!built.is_tool());
+            assert!(built.is_stackable());
+            assert_eq!(built.block_stack(), None);
+            assert_eq!(built.max_durability(), None);
+        }
+        assert_eq!(Item::new(id, 0), Err(ItemError::EmptyStack));
+        assert_eq!(
+            Item::new(id, MAX_STACK_COUNT + 1),
+            Err(ItemError::StackOverflow)
+        );
+
+        let stack = Item::new(id, 2).expect("valid pack stack");
+        assert!(stack.mergeable_with(&stack));
+        assert_ne!(stack.id(), ItemId::Item(1));
+    }
+
+    #[test]
     fn item_identities_have_stable_names_and_limits() {
         assert_eq!(Material::Stick.name(), "Stick");
         assert_eq!(Material::Apple.name(), "Apple");
@@ -2473,6 +2913,173 @@ mod tests {
                 kind: ToolKind::Axe,
                 tier: ToolTier::Stone
             }
+        );
+    }
+
+    #[test]
+    fn new_with_matches_new_for_every_builtin_identity() {
+        let registry = ContentRegistry::builtin();
+
+        for block in all_carryable_builtin_blocks() {
+            let id = ItemId::Block(block);
+            for count in [1, 2, MAX_STACK_COUNT] {
+                assert_eq!(
+                    Item::new_with(registry, id, count),
+                    Item::new(id, count),
+                    "block {block:?} count {count} must answer identically"
+                );
+            }
+            assert_eq!(
+                Item::new_with(registry, id, MAX_STACK_COUNT + 1),
+                Item::new(id, MAX_STACK_COUNT + 1)
+            );
+            assert_eq!(
+                Item::new_with(registry, id, 0),
+                Item::new(id, 0),
+                "zero counts stay EmptyStack"
+            );
+        }
+
+        for material in all_materials() {
+            let id = ItemId::Material(material);
+            for count in [1, MATERIAL_STACK_LIMIT] {
+                assert_eq!(
+                    Item::new_with(registry, id, count),
+                    Item::new(id, count),
+                    "material {material:?} count {count} must answer identically"
+                );
+            }
+            assert_eq!(
+                Item::new_with(registry, id, MATERIAL_STACK_LIMIT + 1),
+                Item::new(id, MATERIAL_STACK_LIMIT + 1)
+            );
+        }
+
+        for id in all_constructible_tools() {
+            assert_eq!(
+                Item::new_with(registry, id, 1),
+                Item::new(id, 1),
+                "tool {id:?} must answer identically"
+            );
+            assert_eq!(
+                Item::new_with(registry, id, 2),
+                Item::new(id, 2),
+                "tool stack rejection must match"
+            );
+        }
+
+        // Uncarryable blocks and unconstructible tool pairs stay rejected.
+        assert_eq!(
+            Item::new_with(registry, ItemId::Block(BlockId::Water), 1),
+            Err(ItemError::UncarryableBlock)
+        );
+        assert_eq!(
+            Item::new_with(
+                registry,
+                ItemId::Tool {
+                    kind: ToolKind::Bow,
+                    tier: ToolTier::Iron
+                },
+                1
+            ),
+            Err(ItemError::TierNotAllowed)
+        );
+    }
+
+    #[test]
+    fn mod_tool_item_carries_full_authored_durability() {
+        let registry = fixture_registry();
+        assert_eq!(
+            registry.tool(0).map(|def| def.name.as_str()),
+            Some("mymod:ruby_pickaxe")
+        );
+        assert_eq!(registry.tier(3).map(|def| def.durability), Some(900));
+
+        let id = ItemId::ModTool(0);
+        assert_eq!(id.stack_limit(), 1);
+        assert!(id.is_tool());
+        assert_eq!(id.tool(), None);
+        assert_eq!(id.name(), "Modded Tool");
+
+        let fresh = Item::new_with(&registry, id, 1).expect("pack tool is constructible");
+        assert_eq!(fresh.id(), id);
+        assert_eq!(fresh.count(), 1);
+        assert_eq!(fresh.durability(), Some(900));
+        assert_eq!(fresh.max_durability(), Some(900));
+        assert!(fresh.is_tool());
+        assert!(!fresh.is_stackable());
+        assert_eq!(
+            fresh.use_tool_once(),
+            Ok(Some(
+                Item::tool_with_durability_with(&registry, id, 899).expect("899 is in range")
+            ))
+        );
+
+        // The built-in constructors cannot express a pack tool.
+        assert_eq!(Item::new(id, 1), Err(ItemError::RegistryRequired));
+    }
+
+    #[test]
+    fn new_with_rejects_unknown_content_and_bad_counts() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+
+        assert_eq!(
+            Item::new_with(&registry, id, 2),
+            Err(ItemError::StackableTool)
+        );
+        assert_eq!(
+            Item::new_with(&registry, id, 0),
+            Err(ItemError::StackableTool)
+        );
+        assert_eq!(
+            Item::new_with(&registry, ItemId::ModTool(99), 1),
+            Err(ItemError::UnknownContent)
+        );
+        assert_eq!(
+            Item::new_with(&registry, ItemId::Item(0), 1),
+            Err(ItemError::UnknownContent)
+        );
+    }
+
+    #[test]
+    fn tool_with_durability_with_accepts_authored_range_only() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, id, 0),
+            Err(ItemError::InvalidDurability)
+        );
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, id, 901),
+            Err(ItemError::InvalidDurability)
+        );
+        for durability in [1, 900] {
+            let item = Item::tool_with_durability_with(&registry, id, durability)
+                .expect("authored durability is valid");
+            assert_eq!(item.durability(), Some(durability));
+            assert_eq!(item.max_durability(), Some(900));
+        }
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, ItemId::ModTool(99), 1),
+            Err(ItemError::UnknownContent)
+        );
+        assert_eq!(
+            Item::tool_with_durability_with(&registry, ItemId::Material(Material::Stick), 1),
+            Err(ItemError::NotATool)
+        );
+        // Built-in ids delegate to the strict built-in rule.
+        assert_eq!(
+            Item::tool_with_durability_with(
+                &registry,
+                ItemId::Tool {
+                    kind: ToolKind::Pickaxe,
+                    tier: ToolTier::Iron
+                },
+                ToolTier::Iron.max_durability() + 1
+            ),
+            Err(ItemError::InvalidDurability)
         );
     }
 
@@ -2708,6 +3315,126 @@ mod tests {
         assert_eq!(inventory.collect_block(BlockId::Water, 1), None);
         assert_eq!(inventory.collect_block(BlockId::Stone, 0), None);
         assert_eq!(inventory, Inventory::empty());
+    }
+
+    #[test]
+    fn collect_limited_fills_to_the_authored_limit_then_spills_into_a_fresh_slot() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+
+        let outcome = inventory
+            .collect_limited(id, 100, 12)
+            .expect("the inventory has room");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 100);
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(12));
+        assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(12));
+        // 8 full slots of 12 plus a final partial stack of 4.
+        assert_eq!(inventory.hotbar(8).map(|item| item.count()), Some(4));
+        assert_eq!(total_of(&inventory, id), 100);
+        assert!(inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|item| item.id() == id)
+            .all(|item| item.count() <= 12));
+    }
+
+    #[test]
+    fn collect_limited_merges_an_existing_stack_before_opening_a_new_one() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+        inventory.slots[0] = Some(item(id, 10));
+
+        let outcome = inventory
+            .collect_limited(id, 5, 12)
+            .expect("the remainder fits");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 5);
+        assert_eq!(inventory.hotbar(0).map(|item| item.count()), Some(12));
+        assert_eq!(inventory.hotbar(1).map(|item| item.count()), Some(3));
+    }
+
+    #[test]
+    fn collect_limited_is_a_no_op_with_no_room_or_invalid_input() {
+        let id = ItemId::Item(0);
+
+        // Zero amount never mutates.
+        let mut inventory = Inventory::empty();
+        assert_eq!(inventory.collect_limited(id, 0, 12), None);
+        assert_eq!(inventory, Inventory::empty());
+
+        // A non-carryable identity cannot be constructed into a slot.
+        assert_eq!(
+            inventory.collect_limited(ItemId::Block(BlockId::Air), 1, MAX_STACK_COUNT),
+            None
+        );
+        assert_eq!(inventory, Inventory::empty());
+
+        // A full inventory accepts nothing and stays byte-identical.
+        let mut inventory = Inventory::empty();
+        fill_with(&mut inventory, ItemId::Block(BlockId::Brick));
+        let before = inventory.clone();
+        assert_eq!(inventory.collect_limited(id, 1, 12), None);
+        assert_eq!(inventory, before);
+    }
+
+    #[test]
+    fn collect_limited_clamps_degenerate_limits_to_one() {
+        let mut inventory = Inventory::empty();
+        let id = ItemId::Item(0);
+        let outcome = inventory
+            .collect_limited(id, 3, 0)
+            .expect("three single-item slots fit");
+        assert_eq!(outcome.accepted, 3);
+        for slot in 0..3 {
+            assert_eq!(inventory.hotbar(slot).map(|item| item.count()), Some(1));
+        }
+    }
+
+    #[test]
+    fn collect_limited_with_inserts_a_pack_tool_at_authored_durability() {
+        let registry = fixture_registry();
+        let id = ItemId::ModTool(0);
+        let mut inventory = Inventory::empty();
+
+        let outcome = inventory
+            .collect_limited_with(&registry, id, 1, 1)
+            .expect("an empty slot accepts the tool");
+        assert_eq!(outcome.first_slot, 0);
+        assert_eq!(outcome.accepted, 1);
+        let slot = inventory.slot(0).expect("the pack tool landed");
+        assert_eq!(slot.id(), id);
+        assert_eq!(slot.count(), 1);
+        assert_eq!(slot.durability(), Some(900));
+        assert_eq!(slot.max_durability(), Some(900));
+
+        // Tools are non-stackable: a second unit opens a second slot.
+        let outcome = inventory
+            .collect_limited_with(&registry, id, 1, 1)
+            .expect("a second slot accepts the tool");
+        assert_eq!(outcome.first_slot, 1);
+        assert_eq!(total_of(&inventory, id), 2);
+
+        // The legacy registry-free path refuses to forge a registry identity.
+        assert_eq!(Inventory::empty().collect_limited(id, 1, 1), None);
+    }
+
+    #[test]
+    fn collect_limited_with_matches_the_legacy_path_for_builtin_drops() {
+        let registry = ContentRegistry::builtin();
+        let mut legacy = Inventory::empty();
+        let mut aware = Inventory::empty();
+        let id = ItemId::Block(BlockId::Cobblestone);
+
+        let legacy_outcome = legacy
+            .collect_limited(id, 7, MAX_STACK_COUNT)
+            .expect("blocks fit");
+        let aware_outcome = aware
+            .collect_limited_with(registry, id, 7, MAX_STACK_COUNT)
+            .expect("blocks fit");
+        assert_eq!(legacy_outcome, aware_outcome);
+        assert_eq!(legacy.slots(), aware.slots());
     }
 
     // -- Best-effort batch collection ---------------------------------------
@@ -4369,11 +5096,304 @@ mod tests {
         }
     }
 
+    // -- Registry-aware shaped matching (S05-T02) ---------------------------
+
+    #[test]
+    fn pack_recipes_preview_and_craft_in_both_grids() {
+        let registry = recipe_fixture_registry();
+
+        // 2x2 player grid: four stone make four authored gems.
+        let mut player_grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..4 {
+            player_grid
+                .set(index, Some(block(BlockId::Stone, 1)))
+                .expect("2x2 cell");
+        }
+        let gem_recipe = registry
+            .recipe_by_name("mymod:gem_from_stone")
+            .expect("gem recipe exists");
+        let preview = player_grid
+            .preview_with(&registry)
+            .expect("the pack gem recipe matches the player grid");
+        assert_eq!(preview.recipe, RecipeId::Modded(gem_recipe.index));
+        assert_eq!(preview.output, ItemId::Item(0));
+        assert_eq!(preview.output_count, 4);
+
+        let mut inventory = Inventory::empty();
+        let crafted = player_grid
+            .take_result_with(&registry, &mut inventory)
+            .expect("pack gem recipe crafts");
+        assert_eq!(crafted.id(), ItemId::Item(0));
+        assert_eq!(crafted.count(), 4);
+        assert_eq!(
+            inventory.slot(0).map(|item| item.id()),
+            Some(ItemId::Item(0))
+        );
+        assert!(player_grid.is_empty());
+        assert!(
+            Item::new_with(&registry, ItemId::Item(0), 13).is_err(),
+            "the authored stack_limit 12 caps the crafted item"
+        );
+
+        // 4x4 table grid: three gems over two sticks make the pack tool.
+        let mut table_grid = CraftingGrid::new(GridKind::Table);
+        for (row, line) in ["RRR", " S ", " S "].iter().enumerate() {
+            for (col, byte) in line.bytes().enumerate() {
+                let cell = match byte {
+                    b'R' => {
+                        Item::new_with(&registry, ItemId::Item(0), 1).expect("authored gem item")
+                    }
+                    b'S' => stick(1),
+                    _ => continue,
+                };
+                table_grid
+                    .set(row * GridKind::Table.dim() + col, Some(cell))
+                    .expect("4x4 cell");
+            }
+        }
+        let pickaxe_recipe = registry
+            .recipe_by_name("mymod:ruby_pickaxe")
+            .expect("pickaxe recipe exists");
+        let preview = table_grid
+            .preview_with(&registry)
+            .expect("the pack pickaxe recipe matches the table grid");
+        assert_eq!(preview.recipe, RecipeId::Modded(pickaxe_recipe.index));
+        assert_eq!(preview.output, ItemId::ModTool(0));
+        assert_eq!(preview.output_count, 1);
+
+        let crafted = table_grid
+            .take_result_with(&registry, &mut Inventory::empty())
+            .expect("pack pickaxe crafts");
+        assert_eq!(crafted.id(), ItemId::ModTool(0));
+        assert_eq!(crafted.count(), 1);
+        assert_eq!(crafted.durability(), Some(900));
+        assert_eq!(crafted.max_durability(), Some(900));
+        assert!(table_grid.is_empty());
+    }
+
+    #[test]
+    fn disabled_builtin_recipe_never_previews_or_crafts() {
+        use crate::content::spec::RecipePatch;
+
+        let mut spec = crate::content::spec::PackContentSpec::default();
+        spec.recipe_patches.push(RecipePatch {
+            id: "shortbow".to_string(),
+            enabled: false,
+        });
+        let (registry, report) = crate::content::build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                crate::content::PackIdentity {
+                    folder: "fixture".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0);
+
+        let grid = grid_from_pattern(GridKind::Table, &[" SE", "S E", " S "]);
+        assert!(
+            grid.preview().is_some(),
+            "the frozen built-in table still knows the shortbow"
+        );
+        assert_eq!(
+            grid.preview_with(&registry),
+            None,
+            "a disabled recipe produces no preview"
+        );
+
+        let mut disabled_grid = grid.clone();
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            disabled_grid.take_result_with(&registry, &mut inventory),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(disabled_grid, grid, "the grid is untouched");
+        assert_eq!(inventory, Inventory::empty(), "nothing was inserted");
+    }
+
+    #[test]
+    fn partially_filled_grid_never_matches_a_pack_recipe() {
+        let registry = recipe_fixture_registry();
+        let mut grid = CraftingGrid::new(GridKind::Player);
+        for index in 0..3 {
+            grid.set(index, Some(block(BlockId::Stone, 1)))
+                .expect("2x2 cell");
+        }
+        assert_eq!(grid.preview_with(&registry), None);
+        let before = grid.clone();
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            grid.take_result_with(&registry, &mut inventory),
+            Err(CraftError::NoRecipe)
+        );
+        assert_eq!(grid, before);
+        assert_eq!(inventory, Inventory::empty());
+    }
+
+    #[test]
+    fn builtin_and_registry_aware_paths_answer_identically_for_every_builtin_recipe() {
+        let registry = ContentRegistry::builtin();
+        for recipe in RECIPES {
+            let grid = grid_from_pattern(GridKind::Table, recipe.pattern);
+            let mut legacy_grid = grid.clone();
+            let mut aware_grid = grid.clone();
+            assert_eq!(
+                legacy_grid.preview(),
+                aware_grid.preview_with(registry),
+                "preview mismatch for {:?}",
+                recipe.id
+            );
+
+            let mut legacy_inventory = Inventory::empty();
+            let mut aware_inventory = Inventory::empty();
+            assert_eq!(
+                legacy_grid.take_result(&mut legacy_inventory),
+                aware_grid.take_result_with(registry, &mut aware_inventory),
+                "craft mismatch for {:?}",
+                recipe.id
+            );
+            assert_eq!(legacy_grid, aware_grid);
+            assert_eq!(legacy_inventory, aware_inventory);
+        }
+    }
+
     #[test]
     fn default_crafting_grid_is_an_empty_player_grid() {
         let grid = CraftingGrid::default();
         assert_eq!(grid.kind(), GridKind::Player);
         assert!(grid.is_empty());
         assert_eq!(grid.preview(), None);
+    }
+
+    // -- Creative palette grants (S07-T02) --------------------------------
+
+    #[test]
+    fn palette_grant_hotbar_fills_empty_then_replaces_the_same_identity() {
+        let mut inventory = Inventory::empty();
+
+        assert_eq!(inventory.grant_hotbar(stick(7), 4), 0);
+        assert_eq!(
+            inventory.slot(0).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Stick), 7))
+        );
+
+        assert_eq!(inventory.grant_hotbar(wheat(3), 4), 1);
+        assert_eq!(
+            inventory.slot(1).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Wheat), 3))
+        );
+
+        // Fill the remaining seven slots so the next grant must take the
+        // same-identity branch rather than an empty slot.
+        for (offset, material) in [
+            Material::Apple,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                inventory.grant_hotbar(item(ItemId::Material(material), 1), 8),
+                2 + offset
+            );
+        }
+
+        // A same-identity grant replaces the existing hotbar stack wholesale
+        // (count 64 is the whole replacement, not a merge into 7).
+        assert_eq!(inventory.grant_hotbar(stick(64), 8), 0);
+        assert_eq!(
+            inventory.slot(0).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Stick), 64))
+        );
+        assert_eq!(
+            inventory.slot(1).map(|item| (item.id(), item.count())),
+            Some((ItemId::Material(Material::Wheat), 3)),
+            "another identity's stack is untouched"
+        );
+    }
+
+    #[test]
+    fn palette_grant_hotbar_replaces_preferred_when_the_hotbar_is_full() {
+        let mut inventory = Inventory::empty();
+        for (slot, material) in [
+            Material::Stick,
+            Material::Apple,
+            Material::Wheat,
+            Material::WheatSeeds,
+            Material::Bread,
+            Material::Leather,
+            Material::RawPorkchop,
+            Material::RawBeef,
+            Material::RottenFlesh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                inventory.grant_hotbar(item(ItemId::Material(material), 1), 0),
+                slot
+            );
+        }
+        assert!(inventory.slots()[..HOTBAR_SLOTS]
+            .iter()
+            .all(Option::is_some));
+
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Stone, 999), 6), 6);
+        assert_eq!(
+            inventory.slot(6).map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 999))
+        );
+
+        // Out-of-range preferred values clamp to the last hotbar slot.
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Dirt, 999), 99), 8);
+        assert_eq!(
+            inventory.slot(8).map(|item| item.id()),
+            Some(ItemId::Block(BlockId::Dirt))
+        );
+    }
+
+    #[test]
+    fn palette_grant_hotbar_never_touches_main_cursor_or_grid() {
+        let mut slots: [Option<Item>; INVENTORY_SLOTS] = [None; INVENTORY_SLOTS];
+        for slot in slots.iter_mut().take(HOTBAR_SLOTS) {
+            *slot = Some(item(ItemId::Material(Material::Apple), 1));
+        }
+        for slot in slots.iter_mut().skip(HOTBAR_SLOTS) {
+            *slot = Some(item(ItemId::Material(Material::Wheat), 2));
+        }
+        let cursor = item(ItemId::Material(Material::Bread), 3);
+        let mut inventory = Inventory::from_parts(slots, Some(cursor));
+
+        let mut grid = CraftingGrid::new(GridKind::Player);
+        grid.set(0, Some(item(ItemId::Material(Material::Stick), 1)))
+            .expect("player grid cell");
+
+        let main_before: Vec<Option<Item>> = inventory.slots()[HOTBAR_SLOTS..].to_vec();
+        let hotbar_before: Vec<Option<Item>> = inventory.slots()[..HOTBAR_SLOTS].to_vec();
+        let cursor_before = inventory.cursor();
+        let grid_before = grid.clone();
+
+        assert_eq!(inventory.grant_hotbar(block(BlockId::Stone, 999), 3), 3);
+
+        assert_eq!(
+            inventory.slot(3).map(|item| (item.id(), item.count())),
+            Some((ItemId::Block(BlockId::Stone), 999))
+        );
+        for (slot, before) in hotbar_before.iter().enumerate() {
+            if slot == 3 {
+                continue;
+            }
+            assert_eq!(inventory.slot(slot), *before);
+        }
+        assert_eq!(inventory.slots()[HOTBAR_SLOTS..].to_vec(), main_before);
+        assert_eq!(inventory.cursor(), cursor_before);
+        assert_eq!(grid, grid_before, "the crafting grid is never touched");
     }
 }

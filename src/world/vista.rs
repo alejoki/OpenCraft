@@ -89,8 +89,9 @@ pub fn vista_camera(anchor: Vec3, elapsed_secs: f32, fov_y_radians: f32) -> Came
 /// The single screen discriminator for the vista panorama.
 ///
 /// True only for the main-menu cluster: MainMenu, NewGame, LoadGame, and
-/// Settings opened from the main menu. Pause, Settings-from-pause, and Playing
-/// keep showing the player's world behind their panel.
+/// Settings (with the Packs screen it opens) when reached from the main menu.
+/// Pause, Settings-from-pause, and Playing keep showing the player's world
+/// behind their panel.
 pub fn vista_visible(screen: LifecycleScreen) -> bool {
     matches!(
         screen,
@@ -98,6 +99,7 @@ pub fn vista_visible(screen: LifecycleScreen) -> bool {
             | LifecycleScreen::NewGame
             | LifecycleScreen::LoadGame
             | LifecycleScreen::Settings(SettingsCaller::MainMenu)
+            | LifecycleScreen::Packs(SettingsCaller::MainMenu)
     )
 }
 
@@ -194,9 +196,11 @@ mod tests {
             (LifecycleScreen::NewGame, true),
             (LifecycleScreen::LoadGame, true),
             (LifecycleScreen::Settings(SettingsCaller::MainMenu), true),
+            (LifecycleScreen::Packs(SettingsCaller::MainMenu), true),
             (LifecycleScreen::Playing, false),
             (LifecycleScreen::Pause, false),
             (LifecycleScreen::Settings(SettingsCaller::Pause), false),
+            (LifecycleScreen::Packs(SettingsCaller::Pause), false),
         ];
         for (screen, expected) in truth_table {
             assert_eq!(vista_visible(screen), expected, "screen: {screen:?}");

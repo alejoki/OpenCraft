@@ -14,15 +14,20 @@
 
 use std::path::Path;
 
-use crate::render::texture::{
-    generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
-};
+use crate::render::texture::{generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS};
 use crate::settings::SettingsWarning;
 
+pub mod asset;
 pub mod decode;
 pub mod manifest;
 pub mod resample;
 pub mod sound;
+pub mod spec;
+pub mod v2;
+pub mod validate;
+
+/// Load an ordered stack of pack folders under `packs_root`.
+pub use spec::load_stack;
 
 /// Number of block texture layers a pack may author.
 ///
@@ -86,11 +91,6 @@ pub const MOB_LAYER_FILES: [&str; MOB_AUTHORABLE_TEX_LAYERS] = [
 /// working directory (same convention as `saves/` and `settings.toml`).
 pub const PACKS_DIR: &str = "packs";
 
-/// Smallest accepted layer side length, in pixels.
-const MIN_LAYER_SIDE: u32 = 16;
-/// Largest accepted layer side length, in pixels.
-const MAX_LAYER_SIDE: u32 = 256;
-
 /// A pack logo decoded at its native size (never resampled).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackLogo {
@@ -132,45 +132,7 @@ pub struct LoadedPack {
 /// Unknown files and unknown manifest keys are ignored. Never panics, never
 /// returns `Err`.
 pub fn load_pack_from_dir(dir: &Path) -> LoadedPack {
-    let mut warnings = Vec::new();
-
-    let manifest_path = dir.join("pack.toml");
-    let manifest = match std::fs::read_to_string(&manifest_path) {
-        Ok(text) => {
-            let (manifest, mut manifest_warnings) = manifest::parse_manifest(&text);
-            warnings.append(&mut manifest_warnings);
-            manifest
-        }
-        Err(err) => {
-            warnings.push(SettingsWarning {
-                field: "pack.toml".to_string(),
-                reason: format!("failed to read {}: {err}", manifest_path.display()),
-            });
-            manifest::PackManifest::default()
-        }
-    };
-
-    let layers = load_layers(dir, &mut warnings);
-    let logo = load_logo(dir, manifest.logo.as_deref(), &mut warnings);
-
-    let display_name = manifest
-        .name
-        .clone()
-        .or_else(|| {
-            dir.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "Unnamed Pack".to_string());
-
-    LoadedPack {
-        layers,
-        logo,
-        overlay_tint: manifest.overlay_tint,
-        description: manifest.description,
-        display_name,
-        warnings,
-    }
+    spec::resolve_presentation(&[spec::load_spec_from_dir(dir)])
 }
 
 /// Sorted names of the pack directories directly under `packs_root`.
@@ -219,106 +181,10 @@ pub fn load_pack_by_name(packs_root: &Path, name: &str) -> LoadedPack {
     load_pack_from_dir(&dir)
 }
 
-/// Resolve every layer index, keeping the procedural layer on any failure.
-fn load_layers(dir: &Path, warnings: &mut Vec<SettingsWarning>) -> Vec<Vec<u8>> {
-    let mut layers = generate_all_texture_layers_rgba();
-
-    apply_layer_files(&mut layers, dir, &LAYER_FILES, 0, warnings);
-    apply_layer_files(
-        &mut layers,
-        dir,
-        &MOB_LAYER_FILES,
-        MOB_LAYER_BASE as usize,
-        warnings,
-    );
-
-    layers
-}
-
-/// Decode one file-name table into `layers`, starting at `base`.
-///
-/// Every file follows the same per-layer fallback: a missing file keeps the
-/// procedural layer silently; a decode, squareness, or size failure keeps it
-/// and pushes one warning whose `field` is the bare file name.
-fn apply_layer_files(
-    layers: &mut [Vec<u8>],
-    dir: &Path,
-    files: &[&str],
-    base: usize,
-    warnings: &mut Vec<SettingsWarning>,
-) {
-    for (offset, file) in files.iter().enumerate() {
-        let index = base + offset;
-        let path = dir.join(file);
-        if !path.exists() {
-            // Missing layer files are legal: use the procedural texture silently.
-            continue;
-        }
-
-        let decoded = match decode::decode_png_rgba(&path) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                warnings.push(SettingsWarning {
-                    field: (*file).to_string(),
-                    reason: err,
-                });
-                continue;
-            }
-        };
-
-        if decoded.width != decoded.height {
-            warnings.push(SettingsWarning {
-                field: (*file).to_string(),
-                reason: format!(
-                    "image is {}x{}, layers must be square",
-                    decoded.width, decoded.height
-                ),
-            });
-            continue;
-        }
-
-        if decoded.width < MIN_LAYER_SIDE || decoded.width > MAX_LAYER_SIDE {
-            warnings.push(SettingsWarning {
-                field: (*file).to_string(),
-                reason: format!(
-                    "image is {}x{}, layers must be between {} and {} pixels per side",
-                    decoded.width, decoded.height, MIN_LAYER_SIDE, MAX_LAYER_SIDE
-                ),
-            });
-            continue;
-        }
-
-        layers[index] = resample::resample_to_16(&decoded.rgba, decoded.width);
-    }
-}
-
-/// Decode the optional manifest logo at native size, warning on failure.
-fn load_logo(
-    dir: &Path,
-    logo: Option<&str>,
-    warnings: &mut Vec<SettingsWarning>,
-) -> Option<PackLogo> {
-    let logo = logo?;
-    let path = dir.join(logo);
-    match decode::decode_png_native(&path) {
-        Ok(decoded) => Some(PackLogo {
-            rgba: decoded.rgba,
-            width: decoded.width,
-            height: decoded.height,
-        }),
-        Err(err) => {
-            warnings.push(SettingsWarning {
-                field: logo.to_string(),
-                reason: err,
-            });
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::texture::MOB_LAYER_BASE;
     use std::fs;
     use std::path::{Path, PathBuf};
 

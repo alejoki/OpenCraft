@@ -3,6 +3,7 @@
 //! No GPU or window types appear here: callers feed surface dimensions and
 //! append the returned [`Quad`]s to the existing UI quad list.
 
+use crate::content::ContentRegistry;
 use crate::player::inventory::{Inventory, Item, ItemStack, HOTBAR_SLOTS};
 use crate::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HEALTH, MAX_HUNGER};
 use crate::render::pipeline::hotbar_slot_rect_ndc;
@@ -184,12 +185,22 @@ pub fn hotbar_count_label_for(inventory: &Inventory, slot: usize) -> String {
 /// Selected-item title fragment for the window title: blocks and materials show
 /// `Name xCount`, tools show `Name (remaining/max)`, and empty shows `Empty`.
 pub fn selected_item_label(item: Option<Item>) -> String {
+    selected_item_label_with(item, None)
+}
+
+/// Registry-aware [`selected_item_label`]: pack items and tools display their
+/// authored name, while built-ins and unknown identities keep the static
+/// [`crate::player::inventory::ItemId::name`] fallback.
+pub fn selected_item_label_with(item: Option<Item>, registry: Option<&ContentRegistry>) -> String {
     let Some(item) = item else {
         return "Empty".to_string();
     };
+    let name = registry
+        .and_then(|registry| registry.item_display_name(item.id()))
+        .unwrap_or_else(|| item.id().name().to_string());
     match (item.durability(), item.max_durability()) {
-        (Some(remaining), Some(max)) => format!("{} ({}/{})", item.id().name(), remaining, max),
-        _ => format!("{} x{}", item.id().name(), item.count()),
+        (Some(remaining), Some(max)) => format!("{name} ({remaining}/{max})"),
+        _ => format!("{name} x{}", item.count()),
     }
 }
 
@@ -833,6 +844,25 @@ mod tests {
         let pickaxe =
             Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("tool");
         assert_eq!(selected_item_label(Some(pickaxe)), "Iron Pickaxe (137/250)");
+    }
+
+    #[test]
+    fn registry_aware_selected_item_label_uses_the_saved_or_authored_name() {
+        use crate::player::inventory::{Item, ItemId};
+
+        let mut registry = ContentRegistry::builtin().clone();
+        let index = registry.append_placeholder_item("mymod:ruby");
+        let item = Item::new_with(&registry, ItemId::Item(index), 6).expect("placeholder item");
+        assert_eq!(
+            selected_item_label_with(Some(item), Some(&registry)),
+            "mymod:ruby x6",
+            "a missing pack item must show its saved name, not `Modded Item`"
+        );
+        assert_eq!(
+            selected_item_label(Some(item)),
+            "Modded Item x6",
+            "the registry-free fallback stays unchanged"
+        );
     }
 
     #[test]

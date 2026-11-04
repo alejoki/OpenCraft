@@ -12,6 +12,7 @@
 //! clamps it to 0.1 s so a stalled frame or a debug time-scale cannot skip a
 //! meal. It deliberately does not know about `time_scale`.
 
+use crate::content::ContentRegistry;
 use crate::player::inventory::{Item, ItemId, Material, HOTBAR_SLOTS};
 use crate::player::survival::MAX_HUNGER;
 
@@ -45,6 +46,10 @@ pub const RAW_MEAT_HUNGER: u16 = 3;
 pub const ROTTEN_FLESH_HUNGER: u16 = 1;
 
 /// Hunger restored by eating one `id`, or `None` when `id` is not food.
+///
+/// This is the frozen built-in answer. Pack-authored food resolves through
+/// [`food_value_with`]; keeping this function registry-free preserves every
+/// built-in call site byte-for-byte.
 pub fn food_value(id: ItemId) -> Option<u16> {
     match id {
         ItemId::Material(Material::Apple) => Some(APPLE_HUNGER),
@@ -52,6 +57,35 @@ pub fn food_value(id: ItemId) -> Option<u16> {
         ItemId::Material(Material::RawPorkchop | Material::RawBeef) => Some(RAW_MEAT_HUNGER),
         ItemId::Material(Material::RottenFlesh) => Some(ROTTEN_FLESH_HUNGER),
         _ => None,
+    }
+}
+
+/// Hunger restored by eating `id`, resolving pack items through `registry`.
+///
+/// Built-in materials and blocks answer exactly like [`food_value`]; a
+/// registry-allocated generic item reads its authored [`FoodDef::nutrition`](crate::content::FoodDef).
+/// An unknown or placeholder item index is not food, so malformed content
+/// fails closed instead of eating for free. Pack tools are never food.
+pub fn food_value_with(registry: &ContentRegistry, id: ItemId) -> Option<u16> {
+    match id {
+        ItemId::Item(index) => registry
+            .item(index)
+            .filter(|def| !def.placeholder)
+            .and_then(|def| def.food)
+            .map(|food| food.nutrition),
+        other => food_value(other),
+    }
+}
+
+/// Authored hold duration for `id`, or the built-in constant when unset.
+fn food_duration_with(registry: &ContentRegistry, id: ItemId) -> Option<f32> {
+    match id {
+        ItemId::Item(index) => registry
+            .item(index)
+            .filter(|def| !def.placeholder)
+            .and_then(|def| def.food)
+            .map(|food| food.eat_seconds),
+        _ => Some(EAT_DURATION_SECS),
     }
 }
 
@@ -79,14 +113,48 @@ impl EatingTarget {
     pub fn new(slot: usize, item: Item, hunger: u16) -> Option<Self> {
         let id = item.id();
         let restore = food_value(id)?;
-        if hunger >= MAX_HUNGER || slot >= HOTBAR_SLOTS {
+        Self::validated(slot, id, restore, EAT_DURATION_SECS, hunger)
+    }
+
+    /// Validates `item` in `slot` against `registry` for a player at `hunger`.
+    ///
+    /// Pack-authored food restores its authored nutrition over its authored
+    /// `eat_seconds`; built-in food keeps [`EAT_DURATION_SECS`]. Full hunger
+    /// stays structurally unstartable exactly like [`EatingTarget::new`], and
+    /// a non-food, unknown or placeholder identity is refused.
+    pub fn new_with(
+        registry: &ContentRegistry,
+        slot: usize,
+        item: Item,
+        hunger: u16,
+    ) -> Option<Self> {
+        let id = item.id();
+        let restore = food_value_with(registry, id)?;
+        let duration = food_duration_with(registry, id)?;
+        Self::validated(slot, id, restore, duration, hunger)
+    }
+
+    /// Shared post-resolution validation.
+    fn validated(
+        slot: usize,
+        id: ItemId,
+        restore: u16,
+        duration: f32,
+        hunger: u16,
+    ) -> Option<Self> {
+        if hunger >= MAX_HUNGER
+            || slot >= HOTBAR_SLOTS
+            || restore == 0
+            || !duration.is_finite()
+            || duration <= 0.0
+        {
             return None;
         }
         Some(Self {
             slot,
             item: id,
             restore,
-            duration: EAT_DURATION_SECS,
+            duration,
         })
     }
 
@@ -196,8 +264,12 @@ impl EatingState {
         };
         // Fail closed even though `EatingTarget::new` already validated: a
         // degenerate target must never accumulate progress.
+        // `restore == 0` marks a forged non-food target: every constructor
+        // rejects zero nutrition, and authored nutrition is always 1..=20.
+        // This replaces the built-in-only `food_value` check so pack food can
+        // accumulate progress without a registry parameter on `tick`.
         if target.slot >= HOTBAR_SLOTS
-            || food_value(target.item).is_none()
+            || target.restore == 0
             || !target.duration.is_finite()
             || target.duration <= 0.0
         {
@@ -243,8 +315,85 @@ impl Default for EatingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::spec::{FoodSpec, ItemEntry, PackAsset};
+    use crate::content::{build_registry, ContentRegistry, PackContentSpec, PackIdentity};
     use crate::player::inventory::{ToolKind, ToolTier};
     use crate::world::block::BlockId;
+
+    /// A pack registry with `mymod:ruby_stew` (nutrition 7, 0.8 s) and a
+    /// non-food `mymod:ruby`.
+    fn pack_food_registry() -> ContentRegistry {
+        let mut spec = PackContentSpec::default();
+        spec.items.push(pack_item(
+            "mymod:ruby_stew",
+            "stew.png",
+            Some(FoodSpec {
+                nutrition: 7,
+                eat_seconds: 0.8,
+            }),
+        ));
+        spec.items.push(pack_item("mymod:ruby", "ruby.png", None));
+        for (name, byte) in [("stew.png", 0x11), ("ruby.png", 0x22)] {
+            spec.assets.insert(
+                name.to_string(),
+                PackAsset {
+                    rgba: vec![byte; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+        let pack = (
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(
+            registry
+                .item_by_name("mymod:ruby_stew")
+                .map(|def| def.index),
+            Some(pack_stew_index(&registry))
+        );
+        assert!(registry.item_by_name("mymod:ruby").is_some());
+        registry
+    }
+
+    fn pack_stew_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index
+    }
+
+    fn pack_gem_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby")
+            .expect("registered pack gem")
+            .index
+    }
+
+    fn pack_item(id: &str, icon: &str, food: Option<FoodSpec>) -> ItemEntry {
+        ItemEntry {
+            id: id.to_string(),
+            display_name: None,
+            icon: icon.to_string(),
+            stack_limit: 64,
+            food,
+        }
+    }
+
+    fn pack_stew(registry: &ContentRegistry) -> Item {
+        Item::new_with(registry, ItemId::Item(pack_stew_index(registry)), 3)
+            .expect("registered pack stew")
+    }
+
+    fn pack_stew_target(registry: &ContentRegistry, hunger: u16) -> EatingTarget {
+        EatingTarget::new_with(registry, 2, pack_stew(registry), hunger)
+            .expect("pack stew is edible below full hunger")
+    }
 
     fn apple() -> Item {
         Item::new(ItemId::Material(Material::Apple), 1).expect("valid apple")
@@ -301,6 +450,7 @@ mod tests {
                 kind: ToolKind::Pickaxe,
                 tier: ToolTier::Iron,
             },
+            ItemId::Item(0),
         ];
         for id in non_food {
             assert_eq!(food_value(id), None, "{id:?} must not be food");
@@ -543,6 +693,161 @@ mod tests {
             );
             assert!(eating.progress().is_none());
         }
+    }
+
+    #[test]
+    fn food_value_with_resolves_authored_nutrition_and_fails_closed() {
+        let registry = pack_food_registry();
+
+        assert_eq!(
+            food_value_with(&registry, ItemId::Item(pack_stew_index(&registry))),
+            Some(7)
+        );
+        assert_eq!(
+            food_value_with(&registry, ItemId::Item(pack_gem_index(&registry))),
+            None,
+            "a non-food pack item is never edible"
+        );
+        assert_eq!(
+            food_value_with(&registry, ItemId::Item(99)),
+            None,
+            "an unknown index must not eat for free"
+        );
+
+        // Built-in answers pass through the registry path unchanged.
+        for (id, value) in [
+            (ItemId::Material(Material::Apple), APPLE_HUNGER),
+            (ItemId::Material(Material::Bread), BREAD_HUNGER),
+            (ItemId::Material(Material::RawBeef), RAW_MEAT_HUNGER),
+            (ItemId::Material(Material::RottenFlesh), ROTTEN_FLESH_HUNGER),
+        ] {
+            assert_eq!(food_value_with(&registry, id), Some(value));
+            assert_eq!(food_value_with(&registry, id), food_value(id));
+        }
+        for id in [
+            ItemId::Material(Material::Stick),
+            ItemId::Block(BlockId::Stone),
+            ItemId::Tool {
+                kind: ToolKind::Sword,
+                tier: ToolTier::Iron,
+            },
+            ItemId::ModTool(0),
+        ] {
+            assert_eq!(food_value_with(&registry, id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn placeholder_pack_item_has_no_food_value_or_target() {
+        let mut registry = pack_food_registry();
+        let index = registry.append_placeholder_item("mymod:missing_stew");
+        assert!(
+            registry
+                .item(index)
+                .expect("placeholder registered")
+                .placeholder
+        );
+        assert_eq!(food_value_with(&registry, ItemId::Item(index)), None);
+
+        let placeholder =
+            Item::new_with(&registry, ItemId::Item(index), 1).expect("placeholder item constructs");
+        assert!(EatingTarget::new_with(&registry, 0, placeholder, 10).is_none());
+    }
+
+    #[test]
+    fn pack_food_target_uses_authored_nutrition_and_duration() {
+        let registry = pack_food_registry();
+        let target = pack_stew_target(&registry, MAX_HUNGER - 1);
+        assert_eq!(target.slot(), 2);
+        assert_eq!(target.item(), ItemId::Item(pack_stew_index(&registry)));
+        assert_eq!(target.restore(), 7);
+        assert!((target.duration() - 0.8).abs() < 1e-6);
+
+        assert!(
+            EatingTarget::new_with(&registry, 2, pack_stew(&registry), MAX_HUNGER).is_none(),
+            "full hunger must refuse pack food"
+        );
+        assert!(
+            EatingTarget::new_with(&registry, HOTBAR_SLOTS, pack_stew(&registry), 10).is_none(),
+            "a non-hotbar slot must refuse"
+        );
+        let gem = Item::new_with(&registry, ItemId::Item(pack_gem_index(&registry)), 1)
+            .expect("registered pack gem");
+        assert!(EatingTarget::new_with(&registry, 0, gem, 10).is_none());
+    }
+
+    #[test]
+    fn builtin_foods_keep_their_exact_values_and_durations_through_the_registry() {
+        let registry = ContentRegistry::builtin();
+        for (id, value) in [
+            (ItemId::Material(Material::Apple), APPLE_HUNGER),
+            (ItemId::Material(Material::Bread), BREAD_HUNGER),
+            (ItemId::Material(Material::RawPorkchop), RAW_MEAT_HUNGER),
+            (ItemId::Material(Material::RottenFlesh), ROTTEN_FLESH_HUNGER),
+        ] {
+            let item = Item::new(id, 1).expect("built-in food constructs");
+            let target = EatingTarget::new_with(registry, 0, item, 10).expect("built-in target");
+            assert_eq!(target.restore(), value);
+            assert_eq!(target.duration(), EAT_DURATION_SECS);
+        }
+    }
+
+    #[test]
+    fn pack_food_completes_at_its_authored_duration_and_restarts() {
+        let registry = pack_food_registry();
+        let target = pack_stew_target(&registry, MAX_HUNGER - 1);
+        let mut eating = EatingState::new();
+
+        // 0.79 s of real frame time must not finish a 0.8 s meal.
+        for _ in 0..7 {
+            assert!(matches!(
+                eating.tick(0.1, Some(target)),
+                EatingTick::Eating { .. }
+            ));
+        }
+        assert!(matches!(
+            eating.tick(0.09, Some(target)),
+            EatingTick::Eating { .. }
+        ));
+
+        // The 0.8 s tick completes exactly once with authored nutrition.
+        match eating.tick(0.01, Some(target)) {
+            EatingTick::Ate {
+                slot,
+                item,
+                restore,
+            } => {
+                assert_eq!(slot, 2);
+                assert_eq!(item, ItemId::Item(pack_stew_index(&registry)));
+                assert_eq!(restore, 7);
+            }
+            other => panic!("expected exactly one Ate, got {other:?}"),
+        }
+        assert!(eating.progress().is_none(), "completion must reset state");
+
+        // A changed slot or identity restarts instead of inheriting progress.
+        let _ = eating.tick(0.2, Some(target));
+        let moved =
+            EatingTarget::new_with(&registry, 3, pack_stew(&registry), 10).expect("moved target");
+        match eating.tick(0.1, Some(moved)) {
+            EatingTick::Eating { progress } => {
+                assert!(progress < 0.2, "slot change must restart progress");
+            }
+            other => panic!("expected a fresh Eating, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_pack_target_without_nutrition_goes_idle() {
+        let mut eating = EatingState::new();
+        let forged = EatingTarget {
+            slot: 0,
+            item: ItemId::Item(0),
+            restore: 0,
+            duration: 0.8,
+        };
+        assert_eq!(eating.tick(0.1, Some(forged)), EatingTick::Idle);
+        assert!(eating.progress().is_none());
     }
 
     #[test]

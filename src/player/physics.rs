@@ -1,11 +1,13 @@
 use glam::Vec3;
 
+use crate::content::ContentRegistry;
+
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
-use crate::player::eating::food_value;
+use crate::player::eating::{food_value, food_value_with};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
-    InventoryError, Item, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
+    InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
@@ -379,9 +381,57 @@ impl Player {
         self.selected_item()?.block_stack().map(|stack| stack.block)
     }
 
+    /// Grants a Creative palette stack into the hotbar from the session
+    /// registry (MEM190/MEM193).
+    ///
+    /// The authored stack limit comes from [`ContentRegistry::stack_limit`],
+    /// the item is built through [`Item::new_with`] (so pack tools start at
+    /// full authored durability and pack items respect their authored cap),
+    /// and exactly one hotbar slot is written. The granted slot is selected so
+    /// the content is immediately placeable or usable. Unknown and
+    /// placeholder identities fail with [`ItemError::UnknownContent`] without
+    /// mutating the inventory.
+    pub fn grant_palette_item_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+    ) -> Result<(usize, Item), ItemError> {
+        let limit = registry.stack_limit(id).ok_or(ItemError::UnknownContent)?;
+        let item = Item::new_with(registry, id, limit)?;
+        let slot = self.inventory.grant_hotbar(item, self.selected_slot);
+        self.select_slot(slot);
+        Ok((slot, item))
+    }
+
     /// Collects one broken block into the inventory (hotbar first, then main).
     pub fn collect_block(&mut self, block: BlockId) -> Option<CollectOutcome> {
         self.inventory.collect_block(block, 1)
+    }
+
+    /// Collects an authored drop under a registry-supplied stack limit.
+    pub fn collect_limited(
+        &mut self,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.inventory.collect_limited(id, amount, limit)
+    }
+
+    /// Collects a registry-allocated drop (pack item or pack tool).
+    ///
+    /// Thin forwarder over [`Inventory::collect_limited_with`]: the identity is
+    /// constructed through the session registry, so a non-stackable pack tool
+    /// can land in the freed hotbar slot under its authored identity.
+    pub fn collect_limited_with(
+        &mut self,
+        registry: &ContentRegistry,
+        id: ItemId,
+        amount: u16,
+        limit: u16,
+    ) -> Option<CollectOutcome> {
+        self.inventory
+            .collect_limited_with(registry, id, amount, limit)
     }
 
     /// Inserts one whole item stack, all-or-nothing.
@@ -441,10 +491,36 @@ impl Player {
     /// and `SurvivalState::restore_hunger` reports the applied amount after
     /// the cap.
     pub fn eat_selected(&mut self, slot: usize, expected: ItemId) -> Option<u16> {
+        self.eat_selected_resolved(slot, expected, food_value(expected)?)
+    }
+
+    /// Registry-aware completion half of the hold-to-eat flow.
+    ///
+    /// Mirrors [`Player::eat_selected`] exactly — selected-slot guard,
+    /// identity guard, hunger guard, one-unit consume and capped restore — but
+    /// resolves authored nutrition through `registry`, so pack food restores
+    /// its authored value while built-in food stays byte-identical. Every
+    /// guard still runs before any mutation, making a stale completion a
+    /// fail-closed `None`.
+    pub fn eat_selected_with(
+        &mut self,
+        registry: &ContentRegistry,
+        slot: usize,
+        expected: ItemId,
+    ) -> Option<u16> {
+        self.eat_selected_resolved(slot, expected, food_value_with(registry, expected)?)
+    }
+
+    /// Shared guarded consume used by both eating entry points.
+    fn eat_selected_resolved(
+        &mut self,
+        slot: usize,
+        expected: ItemId,
+        restore: u16,
+    ) -> Option<u16> {
         if slot != self.selected_slot || self.survival.hunger() >= MAX_HUNGER {
             return None;
         }
-        let restore = food_value(expected)?;
         if self.selected_item()?.id() != expected {
             return None;
         }
@@ -694,11 +770,43 @@ impl Player {
         }
     }
 
+    /// Crafts one result against `registry`.
+    ///
+    /// The registry-aware forwarder used by the production inventory click
+    /// seam (D196/MEM512): pack recipes match, disabled built-ins stay absent,
+    /// and the crafted stack is built from registry definitions.
+    pub fn take_craft_result_with(
+        &mut self,
+        registry: &ContentRegistry,
+        kind: GridKind,
+    ) -> Result<Item, CraftError> {
+        match kind {
+            GridKind::Player => self
+                .player_grid
+                .take_result_with(registry, &mut self.inventory),
+            GridKind::Table => self
+                .table_grid
+                .take_result_with(registry, &mut self.inventory),
+        }
+    }
+
     /// Read-only recipe preview for the matching grid. Never mutates.
     pub fn craft_preview(&self, kind: GridKind) -> Option<RecipePreview> {
         match kind {
             GridKind::Player => self.player_grid.preview(),
             GridKind::Table => self.table_grid.preview(),
+        }
+    }
+
+    /// Read-only registry-aware recipe preview for the matching grid.
+    pub fn craft_preview_with(
+        &self,
+        registry: &ContentRegistry,
+        kind: GridKind,
+    ) -> Option<RecipePreview> {
+        match kind {
+            GridKind::Player => self.player_grid.preview_with(registry),
+            GridKind::Table => self.table_grid.preview_with(registry),
         }
     }
 
@@ -2784,6 +2892,164 @@ mod tests {
         Item::new(ItemId::Material(Material::Bread), count).expect("valid bread stack")
     }
 
+    // -----------------------------------------------------------------------
+    // S05-T04: authored pack food through the same completion guards
+    // -----------------------------------------------------------------------
+
+    /// A pack registry with `mymod:ruby_stew` (nutrition 7, 0.8 s) and a
+    /// non-food `mymod:ruby`.
+    fn pack_food_registry() -> ContentRegistry {
+        use crate::content::spec::{FoodSpec, ItemEntry, PackAsset};
+        use crate::content::{build_registry, PackContentSpec, PackIdentity};
+
+        let mut spec = PackContentSpec::default();
+        for (id, icon, food) in [
+            (
+                "mymod:ruby_stew",
+                "stew.png",
+                Some(FoodSpec {
+                    nutrition: 7,
+                    eat_seconds: 0.8,
+                }),
+            ),
+            ("mymod:ruby", "ruby.png", None),
+        ] {
+            spec.items.push(ItemEntry {
+                id: id.to_string(),
+                display_name: None,
+                icon: icon.to_string(),
+                stack_limit: 64,
+                food,
+            });
+        }
+        for (name, byte) in [("stew.png", 0x11), ("ruby.png", 0x22)] {
+            spec.assets.insert(
+                name.to_string(),
+                PackAsset {
+                    rgba: vec![byte; 1024],
+                    source_side: 16,
+                },
+            );
+        }
+        let pack = (
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        );
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    fn pack_stew_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index
+    }
+
+    fn pack_gem_index(registry: &ContentRegistry) -> u16 {
+        registry
+            .item_by_name("mymod:ruby")
+            .expect("registered pack gem")
+            .index
+    }
+
+    fn pack_stew(registry: &ContentRegistry, count: u16) -> Item {
+        Item::new_with(registry, ItemId::Item(pack_stew_index(registry)), count)
+            .expect("registered pack stew")
+    }
+
+    #[test]
+    fn eat_selected_with_consumes_one_stew_and_restores_authored_seven() {
+        let registry = pack_food_registry();
+        let mut player = food_player(pack_stew(&registry, 2), 10);
+
+        let applied =
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry)));
+
+        assert_eq!(applied, Some(7), "authored nutrition drives the restore");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), Some(1));
+        // The second call consumes the last unit and caps at MAX_HUNGER.
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            Some(3),
+            "the last stew restores only the capped remainder"
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn eat_selected_with_refuses_full_hunger_without_mutation() {
+        let registry = pack_food_registry();
+        let mut player = food_player(pack_stew(&registry, 2), MAX_HUNGER);
+
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), MAX_HUNGER);
+        assert_eq!(selected_count(&player), Some(2), "nothing was consumed");
+    }
+
+    #[test]
+    fn eat_selected_with_refuses_non_food_and_unknown_indices() {
+        let registry = pack_food_registry();
+        let gem = Item::new_with(&registry, ItemId::Item(pack_gem_index(&registry)), 2)
+            .expect("registered pack gem");
+        let mut player = food_player(gem, 10);
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_gem_index(&registry))),
+            None,
+            "a non-food pack item is never edible"
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(2));
+
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(99)),
+            None,
+            "an unknown index is not food"
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), Some(1));
+    }
+
+    #[test]
+    fn eat_selected_with_rejects_stale_completions_fail_closed() {
+        let registry = pack_food_registry();
+
+        // Slot switched after the hold started.
+        let mut player = food_player(pack_stew(&registry, 2), 10);
+        assert!(player.select_slot(1));
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(
+            player.inventory().hotbar(0).map(|item| item.count()),
+            Some(2)
+        );
+
+        // The held item was picked up before completion.
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+        player
+            .inventory
+            .consume_one(0)
+            .expect("the selected stew exists");
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Item(pack_stew_index(&registry))),
+            None
+        );
+        assert_eq!(player.survival.hunger(), 10);
+        assert_eq!(selected_count(&player), None);
+    }
+
     /// A Survival player holding `item` in slot 0 at `hunger`.
     ///
     /// `Player::with_inventory` is always Creative, so the mode is set
@@ -2962,6 +3228,117 @@ mod tests {
             assert!(input.is_moving(), "key index {index} must count as moving");
             input.reset();
             assert!(!input.is_moving(), "reset clears every movement key");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S07-T02: Creative palette hotbar grants
+    // -----------------------------------------------------------------------
+
+    /// The checked-in reference pack through the same production mapping as
+    /// `main.rs::build_session_registry`.
+    fn reference_registry() -> ContentRegistry {
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let pack = (
+            crate::content::PackIdentity {
+                folder: spec.folder.clone(),
+                version: spec.version.clone(),
+            },
+            spec.content.clone(),
+        );
+        let (registry, report) =
+            crate::content::build_registry(ContentRegistry::builtin(), &[pack]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        registry
+    }
+
+    fn creative_player() -> Player {
+        Player::new_with_mode(Vec3::new(0.5, 10.0, 0.5), GameMode::Creative)
+    }
+
+    #[test]
+    fn palette_grant_builds_authored_stacks_and_selects_the_slot() {
+        let registry = reference_registry();
+        let mut player = creative_player();
+
+        let ore = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("registered pack ore")
+            .id;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Block(ore))
+            .expect("pack ore is grantable");
+        assert_eq!(slot, 0);
+        assert_eq!(player.selected_slot(), 0, "the granted slot becomes live");
+        assert_eq!(item.count(), 64, "the authored block stack is 64");
+        assert_eq!(player.selected_block(), Some(ore));
+
+        let stew = registry
+            .item_by_name("mymod:ruby_stew")
+            .expect("registered pack stew")
+            .index;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Item(stew))
+            .expect("pack stew is grantable");
+        assert_eq!(slot, 1);
+        assert_eq!(
+            item.count(),
+            16,
+            "16 is the authored stew limit, not 64 or 999"
+        );
+        assert_eq!(player.selected_slot(), 1);
+
+        let pickaxe = registry
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("registered pack pickaxe")
+            .index;
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::ModTool(pickaxe))
+            .expect("pack pickaxe is grantable");
+        assert_eq!(slot, 2);
+        assert_eq!(item.count(), 1);
+        assert_eq!(item.durability(), Some(900));
+        assert_eq!(item.max_durability(), Some(900));
+        assert!(item.is_tool());
+
+        let (slot, item) = player
+            .grant_palette_item_with(&registry, ItemId::Block(BlockId::Stone))
+            .expect("built-in stone is grantable");
+        assert_eq!(slot, 3);
+        assert_eq!(item.count(), 999);
+        assert_eq!(player.selected_block(), Some(BlockId::Stone));
+
+        for empty in 4..HOTBAR_SLOTS {
+            assert_eq!(
+                player.inventory().hotbar(empty),
+                None,
+                "grant writes exactly one slot"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_grant_rejects_unknown_and_placeholder_without_mutation() {
+        let mut registry = reference_registry();
+        let placeholder_block = registry.append_placeholder_block("save:missing_block");
+        let placeholder_item = registry.append_placeholder_item("save:missing_item");
+        let mut player = creative_player();
+        let before = player.inventory().clone();
+
+        for id in [
+            ItemId::Item(u16::MAX),
+            ItemId::ModTool(u16::MAX),
+            ItemId::Block(placeholder_block),
+            ItemId::Item(placeholder_item),
+            ItemId::Block(BlockId::Modded(0)),
+        ] {
+            assert_eq!(
+                player.grant_palette_item_with(&registry, id),
+                Err(ItemError::UnknownContent),
+                "{id:?} must fail closed"
+            );
+            assert_eq!(player.inventory(), &before, "{id:?} mutated the inventory");
+            assert_eq!(player.selected_slot(), 0, "{id:?} changed the selection");
         }
     }
 }
