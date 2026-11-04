@@ -126,7 +126,7 @@ SMOKE_PROFILE=release bash scripts/ui_smoke.sh
 
 `--demo-ui` can also be run directly (`target/debug/opencraft --demo-ui`). It prints the same three pinned `ui_demo:` lines and exits before creating a world, loading a save, or opening a window.
 
-`scripts/modding_smoke.sh` is the real-binary proof for the data-only content packs. It checks the `--validate-pack` exit codes for a valid, broken, and missing pack, runs a bounded launch with a broken pack, and repeats the authoring-doc reader-test. The checked-in reference packs `packs/mymod-ruby` (two blocks, two items, a ruby tier, two tools, two recipes, a disabled shortbow recipe, and two worldgen rules) and `packs/ruby-overlay` (a single `stone.png` layer) exercise the same paths a player does:
+`scripts/modding_smoke.sh` is the real-binary proof for the data-only content packs. It checks the `--validate-pack` exit codes for a valid, broken, and missing pack, runs a bounded launch with a broken pack, and repeats the authoring-doc reader-test. The checked-in test fixtures `tests/fixtures/packs/mymod-ruby` (two blocks, two items, a ruby tier, two tools, two recipes, a disabled shortbow recipe, and two worldgen rules) and `tests/fixtures/packs/ruby-overlay` (a single `stone.png` layer) exercise the same paths a player does:
 
 ```bash
 bash scripts/modding_smoke.sh

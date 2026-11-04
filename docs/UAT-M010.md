@@ -29,8 +29,8 @@ UAT_DIR=/tmp/m010-uat
 rm -rf "$UAT_DIR"
 mkdir -p "$UAT_DIR/with-pack/packs" "$UAT_DIR/no-pack"
 
-cp -R packs/mymod-ruby "$UAT_DIR/with-pack/packs/"
-cp -R packs/ruby-overlay "$UAT_DIR/with-pack/packs/"
+cp -R tests/fixtures/packs/mymod-ruby "$UAT_DIR/with-pack/packs/"
+cp -R tests/fixtures/packs/ruby-overlay "$UAT_DIR/with-pack/packs/"
 
 cat > "$UAT_DIR/with-pack/settings.toml" <<'EOF'
 [packs]

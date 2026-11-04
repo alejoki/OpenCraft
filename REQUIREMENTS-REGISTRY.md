@@ -255,7 +255,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M005 / S05 pack sounds
 - Primary owning slice: M005/S05
 - Supporting slices: M005/S09
-- Validation: cargo test --locked --lib -- pack::sound; bash scripts/pack_smoke.sh (incl. S09 scenario-0 doc reader-test: the author-creates-packs/ discoverability wording, the copy-paste four-sound example section, and the packs/uat-sound fixture as the documented runnable example)
+- Validation: cargo test --locked --lib -- pack::sound; bash scripts/pack_smoke.sh (incl. S09 scenario-0 doc reader-test: the author-creates-packs/ discoverability wording, the copy-paste four-sound example section, and the tests/fixtures/packs/uat-sound fixture as the documented runnable example)
 
 ### R026 — M005 closure surface: registry rows R021-R026, the M005 criterion trace, four green smoke harnesses, and recorded human UAT for the human-sensory criteria
 - Class: admin/support
@@ -265,7 +265,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M005 / S06 closure
 - Primary owning slice: M005/S06
 - Supporting slices: M005/S09
-- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh (S09 records the UAT-H5 re-test protocol against the packs/uat-sound fixture)
+- Validation: bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh (S09 records the UAT-H5 re-test protocol against the tests/fixtures/packs/uat-sound fixture)
 
 ### R027 — Four-biome terrain with sea-level ocean basins and worldgen-only water
 - Class: core-capability
@@ -692,7 +692,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 ### R069 — Reference packs, end-to-end acceptance and modding smoke
 - Class: integration
 - Status: active
-- Description: The checked-in `packs/mymod-ruby` content pack plus texture-only `packs/ruby-overlay` drive one headless acceptance test through generate, mine, craft, eat, place/use, save and reload, a placeholder removal/re-save/restore test preserves every reference block and item, and `scripts/modding_smoke.sh` proves validate-pack exit codes, the docs reader-test and bounded launches in debug and release.
+- Description: The checked-in `tests/fixtures/packs/mymod-ruby` content pack plus texture-only `tests/fixtures/packs/ruby-overlay` drive one headless acceptance test through generate, mine, craft, eat, place/use, save and reload, a placeholder removal/re-save/restore test preserves every reference block and item, and `scripts/modding_smoke.sh` proves validate-pack exit codes, the docs reader-test and bounded launches in debug and release.
 - Why it matters: The pack surface must be proven on the shipped example content, not only on synthetic fixtures.
 - Source: M010 / S08 reference packs and acceptance
 - Primary owning slice: M010/S08

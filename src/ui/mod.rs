@@ -137,6 +137,22 @@ impl UiRenderer {
         self.logo_renderer.set_logo(device, queue, logo);
     }
 
+    /// Replace the UI-only item sprite atlas after a session install.
+    ///
+    /// The built-in Default atlas is the procedural set; a loaded world whose
+    /// frozen registry carries pack item icons installs its composed atlas
+    /// here. The block texture array is re-uploaded separately through
+    /// `VoxelRenderer::write_block_layers`.
+    pub fn set_item_sprite_layers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sprite_layers: &[Vec<u8>],
+    ) {
+        self.icon_renderer
+            .set_sprite_layers(device, queue, sprite_layers);
+    }
+
     /// Rebuild the per-frame item-icon vertex buffers (block cubes and
     /// procedural material/tool sprites). Pure CPU work; call once per frame
     /// before the render pass opens. An empty batch clears that buffer so

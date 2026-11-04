@@ -1563,7 +1563,9 @@ mod tests {
     /// The checked-in reference pack through the same production mapping as
     /// `main.rs::build_session_registry`.
     fn reference_registry() -> ContentRegistry {
-        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new(
+            "tests/fixtures/packs/mymod-ruby",
+        ));
         let pack = (
             PackIdentity {
                 folder: spec.folder.clone(),

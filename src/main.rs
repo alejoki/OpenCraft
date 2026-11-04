@@ -9103,8 +9103,16 @@ impl GameApp {
     /// one copy means the background edit path cannot forget an input/mining/
     /// render-store reset that every other swap performs.
     fn on_session_installed(&mut self) {
+        // The installed session owns a frozen content registry. Its pack item
+        // icons may differ from the launch registry (for example a loaded
+        // world that carries a content pack), so rebuild the UI-only sprite
+        // atlas from the session's registry before the next frame. The
+        // built-in Default atlas is the same procedural set as startup.
+        let item_sprite_layers = compose_item_sprite_layers(self.session.registry.pack_icons());
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
+            gpu.ui
+                .set_item_sprite_layers(&gpu.ctx.device, &gpu.ctx.queue, &item_sprite_layers);
         }
         self.input.reset();
         self.left_mouse_held = false;
@@ -15138,10 +15146,10 @@ stack = 64
 
     #[test]
     fn crafting_demo_pins_the_checked_in_reference_pack_line_set() {
-        let pack_dir = Path::new("packs/mymod-ruby");
+        let pack_dir = Path::new("tests/fixtures/packs/mymod-ruby");
         assert!(
             pack_dir.join("pack.toml").is_file(),
-            "the reference pack must be checked in at packs/mymod-ruby"
+            "the reference pack must be checked in at tests/fixtures/packs/mymod-ruby"
         );
         let spec = pack::spec::load_spec_from_dir(pack_dir);
         let (registry, report) = build_session_registry(&[spec]);
@@ -15176,10 +15184,10 @@ stack = 64
 
     #[test]
     fn worldgen_demo_pins_the_checked_in_reference_pack_line_set() {
-        let pack_dir = Path::new("packs/mymod-ruby");
+        let pack_dir = Path::new("tests/fixtures/packs/mymod-ruby");
         assert!(
             pack_dir.join("pack.toml").is_file(),
-            "the reference pack must be checked in at packs/mymod-ruby"
+            "the reference pack must be checked in at tests/fixtures/packs/mymod-ruby"
         );
         let spec = pack::spec::load_spec_from_dir(pack_dir);
         let (registry, report) = build_session_registry(&[spec]);
@@ -15236,10 +15244,10 @@ stack = 64
 
     #[test]
     fn palette_demo_pins_the_checked_in_reference_pack_line_set() {
-        let pack_dir = Path::new("packs/mymod-ruby");
+        let pack_dir = Path::new("tests/fixtures/packs/mymod-ruby");
         assert!(
             pack_dir.join("pack.toml").is_file(),
-            "the reference pack must be checked in at packs/mymod-ruby"
+            "the reference pack must be checked in at tests/fixtures/packs/mymod-ruby"
         );
         let spec = pack::spec::load_spec_from_dir(pack_dir);
         let (registry, report) = build_session_registry(&[spec]);
@@ -20087,7 +20095,7 @@ stack = 64
     /// Loads the two checked-in reference packs (`mymod-ruby` content plus the
     /// texture-only `ruby-overlay`) exactly as a launch would.
     fn reference_pack_specs() -> (LoadedPack, Vec<PackSpec>) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs");
         let (loaded, specs, warnings) = pack::load_stack(
             &root,
             &["mymod-ruby".to_string(), "ruby-overlay".to_string()],
@@ -20103,7 +20111,7 @@ stack = 64
     /// player removes the `mymod-ruby` content pack. Every reference name the
     /// pack authored must degrade to a deterministic placeholder against it.
     fn removed_reference_pack_specs() -> Vec<PackSpec> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs");
         let (_, specs, warnings) = pack::load_stack(&root, &["ruby-overlay".to_string()]);
         assert!(
             warnings.is_empty(),
@@ -20246,7 +20254,7 @@ stack = 64
     fn modding_acceptance_fresh_world_with_reference_packs_end_to_end() {
         use opencraft::pack::manifest::PackFormat;
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs");
         let (full_pack, specs) = reference_pack_specs();
         let (content_only_pack, content_only_specs, content_only_warnings) =
             pack::load_stack(&root, &["mymod-ruby".to_string()]);

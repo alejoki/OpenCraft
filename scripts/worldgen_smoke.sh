@@ -5,7 +5,7 @@
 # Proves the S06 surface end to end through the production binary, with no test
 # harness and no screenshot automation:
 #
-#   Digest leg: `"$BIN" --demo-worldgen` (with the checked-in packs/mymod-ruby
+#   Digest leg: `"$BIN" --demo-worldgen` (with the checked-in test fixture at tests/fixtures/packs/mymod-ruby
 #   copied into the temp cwd and selected in settings.toml)
 #     (a) exit code 0 — the digest's own `worldgen_demo: ok=true` latch. A
 #         timeout kill or panic is an explicit FAILURE.
@@ -72,7 +72,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
-CRATE_PACK="$CRATE_ROOT/packs/mymod-ruby"
+CRATE_PACK="$CRATE_ROOT/tests/fixtures/packs/mymod-ruby"
 BUILD_LOG="$(mktemp /tmp/opencraft-worldgen-build.XXXXXX.log)" || {
     echo "WORLDGEN SMOKE FAIL: could not create a build log" >&2
     exit 1

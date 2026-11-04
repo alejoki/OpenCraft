@@ -1351,6 +1351,9 @@ fn create_item_sprite_array(
 /// [`Self::draw`], the block batch is issued before the sprite batch.
 pub struct IconRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Layout shared by the block and sprite bind groups. Kept so a session
+    /// install can replace the sprite atlas without rebuilding the pipeline.
+    bind_group_layout: wgpu::BindGroupLayout,
     block_bind_group: wgpu::BindGroup,
     sprite_bind_group: wgpu::BindGroup,
     block_vertex_buffer: Option<wgpu::Buffer>,
@@ -1377,8 +1380,9 @@ impl IconRenderer {
     ///
     /// `sprite_layers` is the final [`ITEM_SPRITE_ARRAY_LAYERS`]-layer atlas,
     /// normally [`compose_item_sprite_layers`] over the frozen session
-    /// registry's pack icons. The upload happens exactly once here; a changed
-    /// pack stack applies on the next load/restart like other content.
+    /// registry's pack icons. A changed pack stack applies on the next load;
+    /// [`Self::set_sprite_layers`] replaces the atlas when that session is
+    /// installed.
     pub fn new_with_sprite_layers(
         ctx: &RenderContext,
         block_texture_view: &wgpu::TextureView,
@@ -1508,6 +1512,7 @@ impl IconRenderer {
 
         Self {
             pipeline,
+            bind_group_layout,
             block_bind_group,
             sprite_bind_group,
             block_vertex_buffer: None,
@@ -1515,6 +1520,35 @@ impl IconRenderer {
             sprite_vertex_buffer: None,
             sprite_vertex_count: 0,
         }
+    }
+
+    /// Replace the sprite atlas and its bind group in place.
+    ///
+    /// A session install can change the frozen content registry (for example
+    /// loading a save whose pack authored item icons). The pipeline, block
+    /// bind group and per-frame vertex buffers are untouched; only the UI-only
+    /// sprite texture and its bind group are recreated.
+    pub fn set_sprite_layers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[Vec<u8>],
+    ) {
+        let (sprite_view, sprite_sampler) = create_item_sprite_array(device, queue, layers);
+        self.sprite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui_item_icon_sprite_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sprite_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sprite_sampler),
+                },
+            ],
+        });
     }
 
     /// Rebuild both per-frame icon vertex buffers. Pure CPU work (no texture
@@ -2878,6 +2912,60 @@ mod tests {
     }
 
     #[test]
+    fn default_item_atlas_has_visible_art_for_every_builtin_item() {
+        let layers = generate_item_sprite_layers_rgba();
+        assert_eq!(layers.len(), ITEM_SPRITE_LAYERS as usize);
+        for (id, layer) in ITEM_SPRITE_TABLE {
+            assert!(
+                layer < ITEM_SPRITE_LAYERS,
+                "{id:?} must stay inside the procedural default range"
+            );
+            assert!(
+                layers[layer as usize]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0),
+                "{id:?} must have visible default-pack art at layer {layer}"
+            );
+        }
+        for layer in 27..ITEM_SPRITE_LAYERS {
+            assert!(
+                layers[layer as usize].iter().all(|byte| *byte == 0),
+                "reserved default layer {layer} must stay transparent"
+            );
+        }
+
+        // Selecting Default (no pack) composes exactly the procedural base,
+        // so the built-in item textures never depend on a pack being enabled.
+        let composed = compose_item_sprite_layers(&[]);
+        assert_eq!(
+            &composed[..ITEM_SPRITE_LAYERS as usize],
+            layers.as_slice(),
+            "the no-pack atlas must be the built-in default set"
+        );
+    }
+
+    #[test]
+    fn session_install_rebuilds_the_item_sprite_atlas_from_the_installed_registry() {
+        let src = include_str!("../main.rs");
+        let start = src
+            .find("fn on_session_installed(&mut self)")
+            .expect("on_session_installed must exist");
+        let body = &src[start..];
+        let end = body.find("\n    fn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("compose_item_sprite_layers(self.session.registry.pack_icons())"),
+            "a session install must compose from the installed frozen registry"
+        );
+        assert!(
+            body.contains("set_item_sprite_layers"),
+            "a session install must replace the UI sprite atlas"
+        );
+    }
+
+    #[test]
     fn pack_icons_land_on_layer_32_and_the_rest_stay_transparent() {
         let icon0 = vec![0x5Au8; ITEM_SPRITE_BYTES];
         let icon1 = vec![0xA5u8; ITEM_SPRITE_BYTES];
@@ -3084,7 +3172,9 @@ mod tests {
     /// The checked-in reference pack through the same production mapping as
     /// `main.rs::build_session_registry`.
     fn reference_registry() -> ContentRegistry {
-        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new("packs/mymod-ruby"));
+        let spec = crate::pack::spec::load_spec_from_dir(std::path::Path::new(
+            "tests/fixtures/packs/mymod-ruby",
+        ));
         let pack = (
             PackIdentity {
                 folder: spec.folder.clone(),

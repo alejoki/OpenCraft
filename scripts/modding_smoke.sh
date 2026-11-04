@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-binary modding smoke for the checked-in reference packs (M010/S08-T06).
+# Real-binary modding smoke for the checked-in test fixture packs (M010/S08-T06).
 #
 # Proves the modding surface end to end through the production binary, with no
 # test harness and no screenshot automation:
@@ -73,8 +73,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
-CRATE_PACK="$CRATE_ROOT/packs/mymod-ruby"
-CRATE_OVERLAY="$CRATE_ROOT/packs/ruby-overlay"
+CRATE_PACK="$CRATE_ROOT/tests/fixtures/packs/mymod-ruby"
+CRATE_OVERLAY="$CRATE_ROOT/tests/fixtures/packs/ruby-overlay"
 DOC="$CRATE_ROOT/docs/TEXTURE-PACKS.md"
 BUILD_LOG="$(mktemp /tmp/opencraft-modding-build.XXXXXX.log)" || {
     echo "MODDING SMOKE FAIL: could not create a build log" >&2
@@ -221,8 +221,8 @@ done
 for needle in \
     '[[worldgen]]' \
     '## Declarative worldgen' \
-    'packs/mymod-ruby' \
-    'packs/ruby-overlay' \
+    'tests/fixtures/packs/mymod-ruby' \
+    'tests/fixtures/packs/ruby-overlay' \
     '--validate-pack' \
     '## Content packs and saves'; do
     grep -Fq -- "$needle" "$DOC" ||

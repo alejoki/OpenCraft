@@ -31,7 +31,7 @@ Packs are folders under `packs/`, relative to the game's working directory — t
 
 Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
 
-The repository ships three example packs you can copy into your own `packs/` folder: `mymod-ruby` (a complete Format v2 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). They are examples and test fixtures, not part of a normal install; a release build may not ship them, and the game never creates `packs/`.
+The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v2 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; the game never creates `packs/`.
 
 ## pack.toml reference
 
@@ -176,12 +176,12 @@ chance = 0.02
 
 **Observable.** `opencraft --demo-worldgen` prints a deterministic digest of the selected stack (rule counts, authored ore cells and y band, patch cells and biomes, coal/iron stability versus no rules, and empty-rule byte identity), and `scripts/worldgen_smoke.sh` pins that digest plus bounded real-binary launches with the pack present and removed.
 
-## Reference packs
+## Reference packs (test fixtures)
 
-The repository ships two content-oriented examples next to the sound fixture. Copy both folders into the game's `packs/` directory and select them in this order:
+The repository ships two content-oriented examples under `tests/fixtures/packs/` next to the sound fixture. Copy both folders into the game's `packs/` directory and select them in this order:
 
-1. `packs/mymod-ruby`
-2. `packs/ruby-overlay`
+1. `tests/fixtures/packs/mymod-ruby`
+2. `tests/fixtures/packs/ruby-overlay`
 
 `mymod-ruby` is a complete `format_version = 2` pack. It authors:
 
@@ -288,7 +288,7 @@ Mob part art shares the same texture array as block art, starting at layer 32. T
 
 The same image rules as block textures apply to every mob file: square PNG, 16 to 256 pixels per side, resampled to 16x16.
 
-The committed `packs/uat-sound/` folder is the per-file layout example: it shows the flat "one file per override, named exactly" layout a pack uses (its files happen to be sounds, so a mob texture pack keeps the same layout with the `pig_body.png`-style names from the table above).
+The committed `tests/fixtures/packs/uat-sound/` folder is the per-file layout example: it shows the flat "one file per override, named exactly" layout a pack uses (its files happen to be sounds, so a mob texture pack keeps the same layout with the `pig_body.png`-style names from the table above).
 
 - Each file is optional and overrides only its own layer.
 - A missing file silently keeps the built-in procedural art for that part.
@@ -369,9 +369,9 @@ that event, so you do not need placeholder files. Any of the five accepted
 extensions (`.wav`, `.ogg`, `.flac`, `.mp3`, `.m4a`) works; see [Sounds](#sounds)
 for the accepted formats and the 1 MiB per-file cap.
 
-### Runnable example: `packs/uat-sound/`
+### Runnable example: `tests/fixtures/packs/uat-sound/`
 
-The project repository ships a ready-made example pack at `packs/uat-sound/`. It
+The project repository ships a ready-made example pack at `tests/fixtures/packs/uat-sound/`. It
 holds seven files: the manifest plus six sounds, five valid and one deliberately
 corrupt.
 
@@ -386,7 +386,7 @@ corrupt.
 | `ui_click.wav` | deliberately corrupt ASCII | per-file fallback: the menu reports the decode failure and keeps the built-in tick |
 
 It is a test fixture, not part of a normal game install. To try it, copy the
-`uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
+`tests/fixtures/packs/uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
 creating the `packs/` folder yourself first if it does not exist — then open
 **Settings → Packs** and enable `uat-sound`. Break and place a block and finish a
 mining sequence to hear the custom sounds; hit a mob and land an arrow to hear the

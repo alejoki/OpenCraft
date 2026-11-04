@@ -5,7 +5,7 @@
 # Proves the S07 searchable Creative palette end to end through the production
 # binary, with no test harness and no screenshot automation:
 #
-#   Digest leg: `"$BIN" --demo-palette` (with the checked-in packs/mymod-ruby
+#   Digest leg: `"$BIN" --demo-palette` (with the checked-in test fixture at tests/fixtures/packs/mymod-ruby
 #   copied into the temp cwd and selected in settings.toml)
 #     (a) exit code 0 — the digest's own `palette: ok` latch. A timeout kill
 #         or panic is an explicit FAILURE.
@@ -78,7 +78,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
-CRATE_PACK="$CRATE_ROOT/packs/mymod-ruby"
+CRATE_PACK="$CRATE_ROOT/tests/fixtures/packs/mymod-ruby"
 BUILD_LOG="$(mktemp /tmp/opencraft-palette-build.XXXXXX.log)" || {
     echo "PALETTE SMOKE FAIL: could not create a build log" >&2
     exit 1
