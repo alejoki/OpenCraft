@@ -1,6 +1,6 @@
 # M010 human UAT runbook — data-only content packs
 
-**Status: PREPARED - awaiting operator. No PASS is claimed here; every checklist item starts as NEEDS-HUMAN.**
+**Status: PASS — owner runbook completed 2026-11-04. All five items re-tested after the palette, name and tooltip fixes.**
 
 M010's remaining acceptance surface is human-sensory: whether the Creative palette is discoverable and searchable, whether placeholders read clearly, whether the changed-stack warning is understandable, whether a ruby tool feels different from iron, and whether the stew's hold-to-eat feedback reads correctly. Executable digests and smoke scripts can prove the mechanics, but only an operator can record the experience (MEM140/MEM178/MEM294). This file is a runbook, not a verdict.
 
@@ -119,14 +119,14 @@ Fill this block only after playing the checklist above. Until the date, operator
 
 | Field | Value |
 | --- | --- |
-| Date | |
-| Operator | |
-| Build SHA-256 (debug) | |
+| Date | 2026-11-04 |
+| Operator | aleksi (project owner) |
+| Build SHA-256 (debug) | `3bbfdcfd4604725172af8d9641e2b861e40688307534be8674fe8d5e51316e7a` |
 | Pack stack | `mymod-ruby`, `ruby-overlay` |
-| Display / output / window size | |
-| Item 1 — palette discoverability and search | NEEDS-HUMAN |
-| Item 2 — placeholder readability | NEEDS-HUMAN |
-| Item 3 — changed-stack warning clarity | NEEDS-HUMAN |
-| Item 4 — ruby-versus-iron tool feel | NEEDS-HUMAN |
-| Item 5 — ruby stew feedback | NEEDS-HUMAN |
-| Verbatim notes / surprises | |
+| Display / output / window size | Wayland session (`DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0`); window not resized during the pass; palette digest at 1280x720 |
+| Item 1 — palette discoverability and search | PASS |
+| Item 2 — placeholder readability | PASS |
+| Item 3 — changed-stack warning clarity | PASS |
+| Item 4 — ruby-versus-iron tool feel | PASS |
+| Item 5 — ruby stew feedback | PASS |
+| Verbatim notes / surprises | Initial palette search showed missing slot icons; root cause was filtered-index double-indexing in `palette_icon_vertices_with`, fixed and re-tested. Pack items read `Modded Item` in the selected-name strip and tooltips; registry-aware display names added and re-tested. The palette had no hover tooltip; added and re-tested. Creative-world ruby ore disappears when the pack is disabled because generated worldgen is not persisted (expected global-stack drift); the saved-edit placeholder fixture retained its edits throughout removal/restore. `mymod:ruby` is a gem and intentionally unplaceable; `mymod:ruby_block` placement passes. |

@@ -8,8 +8,9 @@
 //! different stack (identity, count, or durability) — and fades smoothly to
 //! zero over [`SELECTED_NAME_SECS`].
 
+use crate::content::ContentRegistry;
 use crate::player::inventory::Item;
-use crate::ui::hud::selected_item_label;
+use crate::ui::hud::selected_item_label_with;
 
 /// Seconds the selected-item label stays on screen after a change.
 pub const SELECTED_NAME_SECS: f32 = 2.0;
@@ -82,10 +83,17 @@ impl SelectionLabel {
 
     /// Label text, or `None` while hidden.
     pub fn label(&self) -> Option<String> {
+        self.label_with(None)
+    }
+
+    /// Registry-aware [`Self::label`]: pack items and tools show their authored
+    /// display name instead of the static `Modded Item` fallback.
+    pub fn label_with(&self, registry: Option<&ContentRegistry>) -> Option<String> {
         if !self.is_visible() {
             return None;
         }
-        self.item.map(|item| selected_item_label(Some(item)))
+        self.item
+            .map(|item| selected_item_label_with(Some(item), registry))
     }
 
     /// Selected slot last observed (useful for diagnostics/tests).
@@ -127,6 +135,19 @@ mod tests {
         assert_eq!(label.alpha(), 0.0);
         assert!(!label.observe(0, None), "initial state is already observed");
         assert!(!label.is_visible());
+    }
+
+    #[test]
+    fn registry_aware_label_names_a_missing_pack_item_by_its_saved_name() {
+        let mut registry = ContentRegistry::builtin().clone();
+        let index = registry.append_placeholder_item("mymod:ruby");
+        let item = Item::new_with(&registry, ItemId::Item(index), 1).expect("placeholder item");
+        let mut label = SelectionLabel::new();
+        assert!(label.observe(0, Some(item)));
+        assert_eq!(
+            label.label_with(Some(&registry)).as_deref(),
+            Some("mymod:ruby x1")
+        );
     }
 
     #[test]
@@ -218,7 +239,7 @@ mod tests {
         label.observe(0, Some(stone(3)));
         assert_eq!(
             label.label(),
-            Some(selected_item_label(Some(stone(3)))),
+            Some(crate::ui::hud::selected_item_label(Some(stone(3)))),
             "block count text"
         );
         assert_eq!(label.label().as_deref(), Some("Stone x3"));

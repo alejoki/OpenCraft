@@ -1165,7 +1165,7 @@ pub fn palette_icon_vertices_with(
         return out;
     }
 
-    for (visible, filtered_index) in screen
+    for (visible, entry_index) in screen
         .filtered()
         .iter()
         .copied()
@@ -1173,7 +1173,10 @@ pub fn palette_icon_vertices_with(
         .take(palette::PALETTE_VISIBLE)
         .enumerate()
     {
-        let Some(entry) = screen.filtered_entry(filtered_index) else {
+        // `filtered()` stores indices into `entries`, not into `filtered`.
+        // Resolve the entry directly; calling `filtered_entry` here would
+        // double-index and drop or misdraw every icon after a search.
+        let Some(entry) = screen.entries().get(entry_index) else {
             continue;
         };
         let item = match registry {
@@ -1594,6 +1597,7 @@ mod tests {
         CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
         HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
+    use crate::ui::text_input::TextInputAction;
 
     const SLOT: Rect = (10.0, 20.0, 40.0, 40.0);
 
@@ -3124,6 +3128,45 @@ mod tests {
         for vertex in icons.block.iter().chain(icons.sprite.iter()) {
             assert!(vertex.clip_pos.iter().all(|value| value.is_finite()));
         }
+    }
+
+    #[test]
+    fn filtered_palette_icons_draw_exactly_the_matching_entries() {
+        let registry = Arc::new(reference_registry());
+        let mut screen = PaletteScreen::new();
+        screen.open(&registry);
+        let layout = palette::layout(1280, 720);
+
+        // One authored block match: exactly one 18-vertex cube, no sprites.
+        // Before the fix this resolved `filtered_entry(entry_index)` against
+        // the one-element filtered list and silently drew nothing.
+        screen.apply(TextInputAction::InsertText("mymod:ruby_ore".into()));
+        assert_eq!(screen.filtered().len(), 1);
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert_eq!(
+            icons.block.len(),
+            18,
+            "one filtered block must draw one cube icon"
+        );
+        assert!(
+            icons.sprite.is_empty(),
+            "a filtered block must not draw sprite icons"
+        );
+
+        // One authored item match: exactly one 6-vertex sprite, no cubes.
+        screen.apply(TextInputAction::Clear);
+        screen.apply(TextInputAction::InsertText("mymod:ruby_pickaxe".into()));
+        assert_eq!(screen.filtered().len(), 1);
+        let icons = palette_icon_vertices_with(Some(&registry), &screen, &layout, 1280, 720);
+        assert!(
+            icons.block.is_empty(),
+            "a filtered item must not draw block cubes"
+        );
+        assert_eq!(
+            icons.sprite.len(),
+            6,
+            "one filtered item must draw one sprite icon"
+        );
     }
 
     #[test]

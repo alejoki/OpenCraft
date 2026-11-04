@@ -51,13 +51,13 @@ use opencraft::ui::chest::{
 };
 use opencraft::ui::hud::{
     bow_progress_quads, damage_flash_quad, eating_progress_quads, hotbar_count_label_for,
-    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label,
+    hotbar_count_text_origin, hotbar_slot_rects, mining_progress_quads, selected_item_label_with,
     selected_name_rect, vitals_quads, vitals_stack_top, HOTBAR_COUNT_FONT_SIZE,
     HOTBAR_COUNT_LINE_HEIGHT,
 };
 use opencraft::ui::inventory::{
     hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
-    tooltip_lines, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
+    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
     LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
@@ -1086,6 +1086,23 @@ fn apply_palette_click(
     player.grant_palette_item_with(registry, entry.id).ok()
 }
 
+/// Resolves the palette entry under `cursor` into a tooltip item.
+///
+/// Uses the same filtered-entry model as the click and icon paths, so the
+/// tooltip describes exactly the row the user is pointing at. Returns `None`
+/// for a closed screen, empty space, or an identity the registry cannot
+/// construct (the palette excludes placeholders, so this is a defensive arm).
+fn palette_hovered_item(
+    registry: &ContentRegistry,
+    screen: &PaletteScreen,
+    layout: &palette::PaletteLayout,
+    cursor: Option<(f32, f32)>,
+) -> Option<Item> {
+    let index = palette::hit_test(screen, layout, cursor?)?;
+    let entry = screen.filtered_entry(index)?;
+    Item::new_with(registry, entry.id, 1).ok()
+}
+
 /// Which mouse button issued an inventory command.
 ///
 /// Left is whole-stack movement; right is the split-half / place-one
@@ -1434,8 +1451,10 @@ fn gameplay_notice_rect_above(
 /// Kept pure so the frame loop and the tests agree on the exact buffer text
 /// (`tooltip_lines` joined by newlines) and the line count fed to
 /// [`tooltip_rect`].
-fn tooltip_text(item: Item) -> (String, usize) {
-    let lines = tooltip_lines(item);
+/// Registry-aware [`tooltip_text`]: pack items and tools show their authored
+/// display name instead of the static `Modded Item` fallback.
+fn tooltip_text_with(item: Item, registry: Option<&ContentRegistry>) -> (String, usize) {
+    let lines = tooltip_lines_with(item, registry);
     let line_count = lines.len();
     (lines.join("\n"), line_count)
 }
@@ -11772,6 +11791,13 @@ impl ApplicationHandler for GameApp {
                                 }
                             });
                         chest_item.or_else(|| self.session.player.inventory().cursor())
+                    } else if let Some(layout) = palette_layout_value.as_ref() {
+                        palette_hovered_item(
+                            self.session_registry.as_ref(),
+                            &self.palette,
+                            layout,
+                            Some(cursor),
+                        )
                     } else {
                         None
                     }
@@ -11784,7 +11810,8 @@ impl ApplicationHandler for GameApp {
                 let mut tooltip_quad = None;
                 let mut tooltip_bounds = None;
                 if let (Some(item), Some(cursor)) = (tooltip_hover, self.cursor_pos) {
-                    let (text, line_count) = tooltip_text(item);
+                    let (text, line_count) =
+                        tooltip_text_with(item, Some(self.session_registry.as_ref()));
                     debug_assert!(
                         line_count <= 3,
                         "tooltip_lines is capped at name + count + durability"
@@ -11815,7 +11842,10 @@ impl ApplicationHandler for GameApp {
                 // (no new pipeline), and panels hide it entirely.
                 let mut selected_name_text_area = None;
                 if selected_name_visible {
-                    if let Some(label) = self.selection_label.label() {
+                    if let Some(label) = self
+                        .selection_label
+                        .label_with(Some(self.session_registry.as_ref()))
+                    {
                         let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                         gpu.selected_name_text.update(
                             &mut gpu.ui.font_system,
@@ -12220,8 +12250,10 @@ impl ApplicationHandler for GameApp {
                             } else {
                                 "Walk"
                             };
-                            let block_name =
-                                selected_item_label(self.session.player.selected_item());
+                            let block_name = selected_item_label_with(
+                                self.session.player.selected_item(),
+                                Some(self.session_registry.as_ref()),
+                            );
                             let save_tag = if self
                                 .last_saved_badge
                                 .map(|t| t.elapsed().as_secs_f32() < 2.0)
@@ -28380,13 +28412,13 @@ stack = 64
     #[test]
     fn tooltip_text_and_placement_stay_inside_at_every_corner_and_tiny_surfaces() {
         let stack = Item::new(ItemId::Block(BlockId::Stone), 64).expect("stack");
-        let (text, line_count) = tooltip_text(stack);
+        let (text, line_count) = tooltip_text_with(stack, None);
         assert_eq!(text, "Stone\nx64");
         assert_eq!(line_count, 2);
 
         let pickaxe =
             Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, 137).expect("pickaxe");
-        let (text, line_count) = tooltip_text(pickaxe);
+        let (text, line_count) = tooltip_text_with(pickaxe, None);
         assert_eq!(text, "Iron Pickaxe\nDurability 137/250");
         assert_eq!(line_count, 2);
 
@@ -28498,6 +28530,38 @@ stack = 64
             apply_palette_click(&mut player, registry, &screen, &layout, Some((0.0, 0.0)),)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn palette_hover_tooltip_resolves_the_filtered_entry_under_the_cursor() {
+        let registry = ContentRegistry::builtin();
+        let mut screen = PaletteScreen::new();
+        screen.open(registry);
+        let layout = palette::layout(1280, 720);
+        let slot = layout.slots[0];
+        let cursor = (slot.0 + slot.2 * 0.5, slot.1 + slot.3 * 0.5);
+
+        let item = palette_hovered_item(registry, &screen, &layout, Some(cursor))
+            .expect("the first slot has a tooltip item");
+        assert_eq!(
+            Some(item.id()),
+            screen.filtered_entry(0).map(|entry| entry.id),
+            "the tooltip must describe the row under the cursor"
+        );
+
+        // Filtering changes the visible row, and the tooltip follows it.
+        screen.apply(TextInputAction::InsertText("stone".into()));
+        let filtered = palette_hovered_item(registry, &screen, &layout, Some(cursor))
+            .expect("the filtered first slot has a tooltip item");
+        assert_eq!(
+            Some(filtered.id()),
+            screen.filtered_entry(0).map(|entry| entry.id),
+            "the tooltip must follow the filtered list, not the unfiltered stock"
+        );
+
+        assert!(palette_hovered_item(registry, &screen, &layout, Some((0.0, 0.0))).is_none());
+        let closed = PaletteScreen::new();
+        assert!(palette_hovered_item(registry, &closed, &layout, Some(cursor)).is_none());
     }
 
     #[test]

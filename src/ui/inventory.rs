@@ -490,8 +490,17 @@ fn preview_item_with(grid: &CraftingGrid, registry: &ContentRegistry) -> Option<
 /// `Durability {remaining}/{max}`. Empty detail lines are never emitted, so a
 /// single block produces just its name and a tool produces name + durability.
 pub fn tooltip_lines(item: Item) -> Vec<String> {
+    tooltip_lines_with(item, None)
+}
+
+/// Registry-aware [`tooltip_lines`]: pack items and tools show their authored
+/// display name, while built-ins keep their static label.
+pub fn tooltip_lines_with(item: Item, registry: Option<&ContentRegistry>) -> Vec<String> {
     let mut lines = Vec::with_capacity(3);
-    lines.push(item.id().name().to_string());
+    let name = registry
+        .and_then(|registry| registry.item_display_name(item.id()))
+        .unwrap_or_else(|| item.id().name().to_string());
+    lines.push(name);
     if item.count() > 1 {
         lines.push(format!("x{}", item.count()));
     }
@@ -856,8 +865,11 @@ fn push_result_label_with(
     });
 }
 
-fn held_summary(item: Item) -> String {
-    let mut text = format!("Holding: {} x{}", item.id().name(), item.count());
+fn held_summary_with(item: Item, registry: Option<&ContentRegistry>) -> String {
+    let name = registry
+        .and_then(|registry| registry.item_display_name(item.id()))
+        .unwrap_or_else(|| item.id().name().to_string());
+    let mut text = format!("Holding: {name} x{}", item.count());
     if let (Some(remaining), Some(max)) = (item.durability(), item.max_durability()) {
         text.push_str(&format!(" ({remaining}/{max})"));
     }
@@ -951,7 +963,7 @@ pub fn screen_labels_with(
     let footer_x = layout.panel.0 + pad_x;
     if let Some(item) = inventory.cursor() {
         labels.push(InventoryLabel {
-            text: held_summary(item),
+            text: held_summary_with(item, Some(registry)),
             left: footer_x,
             top: footer_top,
         });
@@ -2028,6 +2040,18 @@ mod tests {
         )
         .expect("fresh tool is valid");
         assert_eq!(tooltip_lines(fresh), vec!["Wood Axe", "Durability 59/59"]);
+    }
+
+    #[test]
+    fn registry_aware_tooltip_uses_the_saved_or_authored_name() {
+        let mut registry = ContentRegistry::builtin().clone();
+        let index = registry.append_placeholder_item("mymod:ruby");
+        let item = Item::new_with(&registry, ItemId::Item(index), 6).expect("placeholder item");
+        assert_eq!(
+            tooltip_lines_with(item, Some(&registry)),
+            vec!["mymod:ruby", "x6"],
+            "a missing pack item must show its saved name, not `Modded Item`"
+        );
     }
 
     #[test]
