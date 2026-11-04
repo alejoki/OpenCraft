@@ -180,8 +180,8 @@ chance = 0.02
 
 The repository ships two content-oriented examples next to the sound fixture. Copy both folders into the game's `packs/` directory and select them in this order:
 
-1. `mymod-ruby`
-2. `ruby-overlay`
+1. `packs/mymod-ruby`
+2. `packs/ruby-overlay`
 
 `mymod-ruby` is a complete `format_version = 2` pack. It authors:
 
