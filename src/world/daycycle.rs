@@ -335,29 +335,29 @@ fn lerp_color(start: [f32; 3], end: [f32; 3], fraction: f32) -> [f32; 3] {
 /// Linear RGB the sky/fog leans toward under rain, expressed as the base
 /// palette's own luminance scaled down: cool grey without repainting a
 /// midnight sky with a fixed bright slab.
-const RAIN_GREY_SCALE: f32 = 0.70;
+pub const RAIN_GREY_SCALE: f32 = 0.70;
 
 /// Linear RGB the sky/fog leans toward under snowfall, as a multiple of the
 /// base palette's luminance: a flat pale grey-white that still respects how
 /// dark the hour already is.
-const SNOW_GREY_SCALE: f32 = 1.18;
+pub const SNOW_GREY_SCALE: f32 = 1.18;
 
 /// Blend weight toward the rain grey. Conservative so rain reads as overcast
 /// rather than a hard colour cut; visual tuning happens in the windowed UAT.
-const RAIN_SKY_LERP: f32 = 0.45;
+pub const RAIN_SKY_LERP: f32 = 0.45;
 
 /// Blend weight toward the snow grey-white. Snow's flat bright overcast is a
 /// little more decisive than rain's grey so the two states stay distinguishable.
-const SNOW_SKY_LERP: f32 = 0.55;
+pub const SNOW_SKY_LERP: f32 = 0.55;
 
 /// Multiplier applied to `day_factor` under rain (dim, overcast light).
-const RAIN_DAY_FACTOR: f32 = 0.78;
+pub const RAIN_DAY_FACTOR: f32 = 0.78;
 
 /// Multiplier applied to `day_factor` under snowfall.
 ///
 /// The sky/fog brightens, but a snow-bearing overcast still blocks a little
 /// direct light, so the terrain light dims slightly rather than blowing out.
-const SNOW_DAY_FACTOR: f32 = 0.92;
+pub const SNOW_DAY_FACTOR: f32 = 0.92;
 
 /// Fog-range multiplier for clear weather; exactly `1.0` so the dry path is
 /// bit-identical to pre-weather rendering.

@@ -60,6 +60,28 @@ pub const SWIM_MAX_SINK_SPEED: f32 = 6.0;
 /// Horizontal walk-speed multiplier while submerged: 4.6 * 0.55 = 2.53 m/s, so
 /// swimming is always slower than the 4.6 m/s land walk (and the 7.2 sprint).
 pub const SWIM_WALK_SPEED_MULT: f32 = 0.55;
+/// Downward acceleration applied while submerged, in blocks per second
+/// squared. The swim branch subtracts this so the idle sink keeps matching the
+/// dry-land gravity feel while drag bounds the terminal speed.
+pub const SWIM_SINK_ACCEL: f32 = 28.0;
+
+/// Horizontal walking speed on land, in blocks per second.
+pub const WALK_SPEED: f32 = 4.6;
+/// Horizontal sprint speed in blocks per second. Crouching deliberately uses
+/// the sprint speed too, matching the pre-config behavior.
+pub const SPRINT_SPEED: f32 = 7.2;
+/// Flight speed in blocks per second while not sprinting.
+pub const FLY_SPEED: f32 = 18.0;
+/// Flight speed in blocks per second while sprinting.
+pub const FLY_SPRINT_SPEED: f32 = 48.0;
+/// Fraction of flight speed applied to vertical movement.
+pub const FLY_VERTICAL_FACTOR: f32 = 0.75;
+/// Upward launch speed of a standing jump, in blocks per second.
+pub const JUMP_VELOCITY: f32 = 9.0;
+/// Downward gravity acceleration, in blocks per second squared.
+pub const GRAVITY: f32 = 28.0;
+/// Maximum downward fall speed, in blocks per second.
+pub const TERMINAL_VELOCITY: f32 = 45.0;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Aabb {
@@ -849,13 +871,17 @@ impl Player {
         }
 
         if self.can_fly() {
-            let speed = if input.sprint { 48.0 } else { 18.0 };
+            let speed = if input.sprint {
+                FLY_SPRINT_SPEED
+            } else {
+                FLY_SPEED
+            };
             let mut vel = move_dir * speed;
             if input.jump_or_up {
-                vel.y += speed * 0.75;
+                vel.y += speed * FLY_VERTICAL_FACTOR;
             }
             if input.crouch_or_down {
-                vel.y -= speed * 0.75;
+                vel.y -= speed * FLY_VERTICAL_FACTOR;
             }
             self.velocity = vel;
             self.position += self.velocity * dt;
@@ -881,9 +907,9 @@ impl Player {
             || get_block(body_x, mid_block_y, body_z).is_liquid();
 
         let mut walk_speed = if input.sprint || input.crouch_or_down {
-            7.2
+            SPRINT_SPEED
         } else {
-            4.6
+            WALK_SPEED
         };
         if submerged {
             walk_speed *= SWIM_WALK_SPEED_MULT;
@@ -914,7 +940,7 @@ impl Player {
             let vertical_accel = if input.jump_or_up {
                 SWIM_RISE_ACCEL
             } else {
-                -28.0
+                -SWIM_SINK_ACCEL
             };
             self.velocity.y = (self.velocity.y + vertical_accel * dt)
                 .clamp(-SWIM_MAX_SINK_SPEED, SWIM_RISE_SPEED);
@@ -924,11 +950,12 @@ impl Player {
             self.on_ground = false;
         } else {
             if self.on_ground && input.jump_or_up {
-                self.velocity.y = 9.0;
+                self.velocity.y = JUMP_VELOCITY;
                 self.on_ground = false;
             }
 
-            self.velocity.y = (self.velocity.y - 28.0 * dt).max(-45.0);
+            self.velocity.y =
+                (self.velocity.y - GRAVITY * dt).max(-TERMINAL_VELOCITY);
         }
 
         // Sub-step physics dynamically so no single step exceeds 0.25 blocks

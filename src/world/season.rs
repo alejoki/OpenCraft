@@ -107,10 +107,10 @@ pub enum Weather {
 /// Winter only ever snows; the warmer seasons only ever rain. Clear days are
 /// always the majority within a season, so `Clear` interleaves instead of
 /// being a rare exception.
-const WINTER_SNOW_PERCENT: u32 = 40;
-const SPRING_RAIN_PERCENT: u32 = 30;
-const SUMMER_RAIN_PERCENT: u32 = 20;
-const AUTUMN_RAIN_PERCENT: u32 = 35;
+pub const WINTER_SNOW_PERCENT: u32 = 40;
+pub const SPRING_RAIN_PERCENT: u32 = 30;
+pub const SUMMER_RAIN_PERCENT: u32 = 20;
+pub const AUTUMN_RAIN_PERCENT: u32 = 35;
 
 /// FNV-1a 32-bit hash over the four little-endian bytes of `seed`.
 ///
