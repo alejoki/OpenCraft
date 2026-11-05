@@ -30,8 +30,15 @@ use crate::player::eating::EatingRules;
 use crate::player::melee::MeleeRules;
 use crate::player::physics::MovementRules;
 use crate::player::survival::SurvivalRules;
+use crate::player::tools::ToolRules;
 use crate::settings::SettingsWarning;
+use crate::ui::selection::SelectionRules;
 use crate::world::arrow::ArrowRules;
+use crate::world::daycycle::{ClockRules, RenderRules};
+use crate::world::farming::FarmingRules;
+use crate::world::season::WeatherRules;
+use crate::world::session::InteractionRules;
+use crate::world::spawning::SpawnRules;
 
 pub use registry::{
     docs_table, index_of, ApplyMode, ConfigFile, ConfigKind, ConfigRow, ConfigValue, REGISTRY,
@@ -103,6 +110,14 @@ pub struct RulesBundle {
     pub combat: CombatRules,
     pub bow: BowRules,
     pub arrow: ArrowRules,
+    pub clock: ClockRules,
+    pub weather: WeatherRules,
+    pub spawning: SpawnRules,
+    pub farming: FarmingRules,
+    pub tools: ToolRules,
+    pub interaction: InteractionRules,
+    pub render: RenderRules,
+    pub selection: SelectionRules,
 }
 
 impl Default for RulesBundle {
@@ -116,6 +131,14 @@ impl Default for RulesBundle {
             combat: CombatRules::default(),
             bow: BowRules::default(),
             arrow: ArrowRules::default(),
+            clock: ClockRules::default(),
+            weather: WeatherRules::default(),
+            spawning: SpawnRules::default(),
+            farming: FarmingRules::default(),
+            tools: ToolRules::default(),
+            interaction: InteractionRules::default(),
+            render: RenderRules::default(),
+            selection: SelectionRules::default(),
         }
     }
 }
@@ -456,6 +479,55 @@ impl ConfigRuntime {
                 lifetime_secs: self.f32("arrow.lifetime_secs"),
                 embed_secs: self.f32("arrow.embed_secs"),
             },
+            clock: ClockRules {
+                day_seconds: self.f32("clock.day_seconds"),
+            },
+            weather: WeatherRules {
+                winter_snow_percent: self.u32("weather.winter_snow_percent"),
+                spring_rain_percent: self.u32("weather.spring_rain_percent"),
+                summer_rain_percent: self.u32("weather.summer_rain_percent"),
+                autumn_rain_percent: self.u32("weather.autumn_rain_percent"),
+            },
+            spawning: SpawnRules {
+                safe_radius_blocks: self.i32("spawning.safe_radius_blocks"),
+                spawn_max_radius_blocks: self.i32("spawning.spawn_max_radius_blocks"),
+                despawn_radius_blocks: self.i32("spawning.despawn_radius_blocks"),
+                max_mobs_total: self.usize("spawning.max_mobs_total"),
+                spawn_region_blocks: self.i32("spawning.spawn_region_blocks"),
+                spawn_region_cap: self.usize("spawning.spawn_region_cap"),
+                spawn_attempt_secs: self.f32("spawning.spawn_attempt_secs"),
+                despawn_scan_secs: self.f32("spawning.despawn_scan_secs"),
+                burn_interval_secs: self.f32("spawning.burn_interval_secs"),
+                spawn_min_separation: self.f32("spawning.spawn_min_separation"),
+                hostile_cave_light: self.u8("spawning.hostile_cave_light"),
+                passive_surface_light: self.u8("spawning.passive_surface_light"),
+                max_spawn_attempts_per_call: self.u32("spawning.max_spawn_attempts_per_call"),
+            },
+            farming: FarmingRules {
+                wheat_stage_game_secs: self.f32("farming.wheat_stage_game_secs"),
+            },
+            tools: ToolRules {
+                wood_speed_multiplier: self.u8("tools.wood_speed_multiplier"),
+                stone_speed_multiplier: self.u8("tools.stone_speed_multiplier"),
+                iron_speed_multiplier: self.u8("tools.iron_speed_multiplier"),
+            },
+            interaction: InteractionRules {
+                table_reach: self.f32("interaction.table_reach"),
+            },
+            render: RenderRules {
+                rain_fog_factor: self.f32("fog.rain_factor"),
+                snow_fog_factor: self.f32("fog.snow_factor"),
+                rain_grey_scale: self.f32("palette.rain_grey_scale"),
+                snow_grey_scale: self.f32("palette.snow_grey_scale"),
+                rain_sky_lerp: self.f32("palette.rain_sky_lerp"),
+                snow_sky_lerp: self.f32("palette.snow_sky_lerp"),
+                rain_day_factor: self.f32("palette.rain_day_factor"),
+                snow_day_factor: self.f32("palette.snow_day_factor"),
+                moonlit_floor: self.f32("palette.moonlit_floor"),
+            },
+            selection: SelectionRules {
+                selected_name_secs: self.f32("ui.selected_name_secs"),
+            },
         }
     }
 
@@ -512,6 +584,22 @@ impl ConfigRuntime {
         let value = self.i64(key);
         u8::try_from(value)
             .unwrap_or_else(|_| panic!("config key {key} value {value} does not fit in u8"))
+    }
+
+    /// Effective integer narrowed to `i32`. Panics on an unknown key, wrong
+    /// kind, or a value that does not fit.
+    pub fn i32(&self, key: &str) -> i32 {
+        let value = self.i64(key);
+        i32::try_from(value)
+            .unwrap_or_else(|_| panic!("config key {key} value {value} does not fit in i32"))
+    }
+
+    /// Effective integer narrowed to `usize`. Panics on an unknown key, wrong
+    /// kind, or a value that does not fit.
+    pub fn usize(&self, key: &str) -> usize {
+        let value = self.i64(key);
+        usize::try_from(value)
+            .unwrap_or_else(|_| panic!("config key {key} value {value} does not fit in usize"))
     }
 
     /// Effective bool for a Bool row. Panics on an unknown key or wrong kind.
@@ -1369,6 +1457,70 @@ mod tests {
             rules.melee.swing_cooldown_secs,
             MeleeRules::default().swing_cooldown_secs
         );
+    }
+
+    #[test]
+    fn rules_bundle_reads_world_mining_and_render_domains() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[clock]\nday_seconds = 600.0\n\n[weather]\nwinter_snow_percent = 50\nspring_rain_percent = 25\nsummer_rain_percent = 10\nautumn_rain_percent = 45\n\n[spawning]\nsafe_radius_blocks = 20\nspawn_max_radius_blocks = 40\ndespawn_radius_blocks = 80\nmax_mobs_total = 40\nspawn_region_blocks = 24\nspawn_region_cap = 6\nspawn_attempt_secs = 0.5\ndespawn_scan_secs = 2.0\nburn_interval_secs = 1.0\nspawn_min_separation = 2.0\nhostile_cave_light = 5\npassive_surface_light = 12\nmax_spawn_attempts_per_call = 8\n\n[farming]\nwheat_stage_game_secs = 30.0\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::Mining,
+            "[tools]\nwood_speed_multiplier = 8\nstone_speed_multiplier = 12\niron_speed_multiplier = 16\n\n[interaction]\ntable_reach = 12.0\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::Render,
+            "[fog]\nrain_factor = 0.5\nsnow_factor = 0.6\n\n[palette]\nrain_grey_scale = 0.8\nsnow_grey_scale = 1.3\nrain_sky_lerp = 0.4\nsnow_sky_lerp = 0.7\nrain_day_factor = 0.6\nsnow_day_factor = 0.8\nmoonlit_floor = 0.2\n\n[ui]\nselected_name_secs = 0.5\n",
+        );
+
+        let rules = ConfigRuntime::load_dir(&config).rules();
+
+        assert_eq!(rules.clock.day_seconds, 600.0);
+        assert_eq!(rules.weather.winter_snow_percent, 50);
+        assert_eq!(rules.weather.spring_rain_percent, 25);
+        assert_eq!(rules.weather.summer_rain_percent, 10);
+        assert_eq!(rules.weather.autumn_rain_percent, 45);
+        assert_eq!(rules.spawning.safe_radius_blocks, 20);
+        assert_eq!(rules.spawning.spawn_max_radius_blocks, 40);
+        assert_eq!(rules.spawning.despawn_radius_blocks, 80);
+        assert_eq!(rules.spawning.max_mobs_total, 40);
+        assert_eq!(rules.spawning.spawn_region_blocks, 24);
+        assert_eq!(rules.spawning.spawn_region_cap, 6);
+        assert_eq!(rules.spawning.spawn_attempt_secs, 0.5);
+        assert_eq!(rules.spawning.despawn_scan_secs, 2.0);
+        assert_eq!(rules.spawning.burn_interval_secs, 1.0);
+        assert_eq!(rules.spawning.spawn_min_separation, 2.0);
+        assert_eq!(rules.spawning.hostile_cave_light, 5);
+        assert_eq!(rules.spawning.passive_surface_light, 12);
+        assert_eq!(rules.spawning.max_spawn_attempts_per_call, 8);
+        assert_eq!(rules.farming.wheat_stage_game_secs, 30.0);
+        assert_eq!(rules.tools.wood_speed_multiplier, 8);
+        assert_eq!(rules.tools.stone_speed_multiplier, 12);
+        assert_eq!(rules.tools.iron_speed_multiplier, 16);
+        assert_eq!(rules.interaction.table_reach, 12.0);
+        assert_eq!(rules.render.rain_fog_factor, 0.5);
+        assert_eq!(rules.render.snow_fog_factor, 0.6);
+        assert_eq!(rules.render.rain_grey_scale, 0.8);
+        assert_eq!(rules.render.snow_grey_scale, 1.3);
+        assert_eq!(rules.render.rain_sky_lerp, 0.4);
+        assert_eq!(rules.render.snow_sky_lerp, 0.7);
+        assert_eq!(rules.render.rain_day_factor, 0.6);
+        assert_eq!(rules.render.snow_day_factor, 0.8);
+        assert_eq!(rules.render.moonlit_floor, 0.2);
+        assert_eq!(rules.selection.selected_name_secs, 0.5);
+
+        // Files outside this domain were not written, so their rows must keep
+        // their registry defaults.
+        assert_eq!(
+            rules.movement.walk_speed,
+            MovementRules::default().walk_speed
+        );
+        assert_eq!(rules.arrow.gravity, ArrowRules::default().gravity);
     }
 
     #[test]

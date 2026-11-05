@@ -22,6 +22,30 @@ pub const STONE_SPEED_MULTIPLIER: u8 = 4;
 /// Speed multiplier for an iron tool: six times the bare-hand rate.
 pub const IRON_SPEED_MULTIPLIER: u8 = 6;
 
+/// Creator-tunable per-tier mining speed multipliers.
+///
+/// Kept in this module so the tool authority stays free of session and config
+/// types; defaults read the existing constants.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToolRules {
+    /// Speed multiplier for wooden tools.
+    pub wood_speed_multiplier: u8,
+    /// Speed multiplier for stone tools.
+    pub stone_speed_multiplier: u8,
+    /// Speed multiplier for iron tools.
+    pub iron_speed_multiplier: u8,
+}
+
+impl Default for ToolRules {
+    fn default() -> Self {
+        Self {
+            wood_speed_multiplier: WOOD_SPEED_MULTIPLIER,
+            stone_speed_multiplier: STONE_SPEED_MULTIPLIER,
+            iron_speed_multiplier: IRON_SPEED_MULTIPLIER,
+        }
+    }
+}
+
 /// The tool kind that is intended for `block`, or `None` when no tool in this
 /// game's set accelerates it (leaves, air, bedrock).
 ///
@@ -139,6 +163,14 @@ pub fn break_duration_for_pack_tier(
 mod tests {
     use super::*;
     use crate::player::inventory::{ItemId, Material};
+
+    #[test]
+    fn tool_rules_default_matches_constants() {
+        let rules = ToolRules::default();
+        assert_eq!(rules.wood_speed_multiplier, WOOD_SPEED_MULTIPLIER);
+        assert_eq!(rules.stone_speed_multiplier, STONE_SPEED_MULTIPLIER);
+        assert_eq!(rules.iron_speed_multiplier, IRON_SPEED_MULTIPLIER);
+    }
 
     const ALL_BLOCKS: [BlockId; 23] = [
         BlockId::Air,

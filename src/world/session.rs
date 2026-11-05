@@ -52,6 +52,24 @@ use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_heigh
 /// interaction uses one reach budget.
 pub const TABLE_INTERACT_REACH: f32 = 8.0;
 
+/// Creator-tunable interaction reach.
+///
+/// Owned here beside [`TABLE_INTERACT_REACH`] so the mining.toml interaction
+/// row does not force `player::tools` to import `world::session`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InteractionRules {
+    /// Maximum eye-to-block distance for table interaction, in blocks.
+    pub table_reach: f32,
+}
+
+impl Default for InteractionRules {
+    fn default() -> Self {
+        Self {
+            table_reach: TABLE_INTERACT_REACH,
+        }
+    }
+}
+
 /// One-shot notice for a v9 world saved under the same config schema but a
 /// different effective-value digest.
 pub const CONFIG_CHANGED_NOTICE: &str = "config changed since this world was saved";
@@ -2177,6 +2195,14 @@ mod tests {
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
     use crate::world::spawning::{DESPAWN_RADIUS, SAFE_RADIUS};
+
+    #[test]
+    fn interaction_rules_default_matches_constants() {
+        assert_eq!(
+            InteractionRules::default().table_reach,
+            TABLE_INTERACT_REACH
+        );
+    }
 
     fn make_save(seed: u32) -> WorldSaveData {
         WorldSaveData {

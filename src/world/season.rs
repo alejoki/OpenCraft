@@ -112,6 +112,33 @@ pub const SPRING_RAIN_PERCENT: u32 = 30;
 pub const SUMMER_RAIN_PERCENT: u32 = 20;
 pub const AUTUMN_RAIN_PERCENT: u32 = 35;
 
+/// Creator-tunable share of precipitation days per season, in percent.
+///
+/// Defaults read the existing constants so the percentages have one home
+/// until a live rules bundle overrides them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeatherRules {
+    /// Percent of winter days with snowfall.
+    pub winter_snow_percent: u32,
+    /// Percent of spring days with rain.
+    pub spring_rain_percent: u32,
+    /// Percent of summer days with rain.
+    pub summer_rain_percent: u32,
+    /// Percent of autumn days with rain.
+    pub autumn_rain_percent: u32,
+}
+
+impl Default for WeatherRules {
+    fn default() -> Self {
+        Self {
+            winter_snow_percent: WINTER_SNOW_PERCENT,
+            spring_rain_percent: SPRING_RAIN_PERCENT,
+            summer_rain_percent: SUMMER_RAIN_PERCENT,
+            autumn_rain_percent: AUTUMN_RAIN_PERCENT,
+        }
+    }
+}
+
 /// FNV-1a 32-bit hash over the four little-endian bytes of `seed`.
 ///
 /// Reuses the exact FNV-1a pattern of [`crate::world::catalog::resolve_seed`]:
@@ -180,6 +207,15 @@ pub fn weather_of(season: Season, day_index: u32, seed: u32) -> Weather {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_rules_default_matches_constants() {
+        let rules = WeatherRules::default();
+        assert_eq!(rules.winter_snow_percent, WINTER_SNOW_PERCENT);
+        assert_eq!(rules.spring_rain_percent, SPRING_RAIN_PERCENT);
+        assert_eq!(rules.summer_rain_percent, SUMMER_RAIN_PERCENT);
+        assert_eq!(rules.autumn_rain_percent, AUTUMN_RAIN_PERCENT);
+    }
 
     /// Seed 1 hashes to starting-season index 0 (Spring) under the documented
     /// FNV-1a scheme, so its boundary days land exactly on the named consts.

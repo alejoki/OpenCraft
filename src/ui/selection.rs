@@ -15,6 +15,24 @@ use crate::ui::hud::selected_item_label_with;
 /// Seconds the selected-item label stays on screen after a change.
 pub const SELECTED_NAME_SECS: f32 = 2.0;
 
+/// Creator-tunable selected-item label lifetime.
+///
+/// Kept in the UI module so the render.toml `ui.selected_name_secs` row does
+/// not move UI timing into `world::daycycle`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionRules {
+    /// Seconds the selected-item name stays visible after a change.
+    pub selected_name_secs: f32,
+}
+
+impl Default for SelectionRules {
+    fn default() -> Self {
+        Self {
+            selected_name_secs: SELECTED_NAME_SECS,
+        }
+    }
+}
+
 /// Selected hotbar slot plus the fade timer for its transient name.
 ///
 /// `new` starts empty and hidden: observing `(0, None)` is not a change, so a
@@ -118,6 +136,14 @@ mod tests {
     use super::*;
     use crate::player::inventory::{ItemId, Material, ToolKind, ToolTier};
     use crate::world::block::BlockId;
+
+    #[test]
+    fn selection_rules_default_matches_constants() {
+        assert_eq!(
+            SelectionRules::default().selected_name_secs,
+            SELECTED_NAME_SECS
+        );
+    }
 
     fn stone(count: u16) -> Item {
         Item::new(ItemId::Block(BlockId::Stone), count).expect("stone")

@@ -27,6 +27,21 @@ use crate::world::persistence::ChunkEditMap;
 /// one real second per stage under `--time-scale 60`.
 pub const WHEAT_STAGE_GAME_SECS: f32 = 60.0;
 
+/// Creator-tunable crop growth cadence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarmingRules {
+    /// Game seconds between wheat growth stages.
+    pub wheat_stage_game_secs: f32,
+}
+
+impl Default for FarmingRules {
+    fn default() -> Self {
+        Self {
+            wheat_stage_game_secs: WHEAT_STAGE_GAME_SECS,
+        }
+    }
+}
+
 /// One crop that crossed at least one stage during a [`CropRuntime::tick`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CropAdvance {
@@ -204,6 +219,14 @@ mod tests {
     use super::*;
 
     use crate::world::chunk::{linear_index, ChunkPos};
+
+    #[test]
+    fn farming_rules_default_matches_constants() {
+        assert_eq!(
+            FarmingRules::default().wheat_stage_game_secs,
+            WHEAT_STAGE_GAME_SECS
+        );
+    }
 
     fn add_edit(
         edits: &mut ChunkEditMap,

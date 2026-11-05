@@ -22,6 +22,25 @@ pub const DAY_TICKS: u32 = 24_000;
 /// Seconds of real time in one full cycle at `time_scale == 1.0`.
 pub const DAY_SECONDS: f32 = 1_200.0;
 
+/// Creator-tunable day-cycle length.
+///
+/// The default reads [`DAY_SECONDS`] rather than repeating the literal, so the
+/// constant remains the single source of truth until a live rules bundle
+/// overrides it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRules {
+    /// Real seconds in one full day cycle at normal time scale.
+    pub day_seconds: f32,
+}
+
+impl Default for ClockRules {
+    fn default() -> Self {
+        Self {
+            day_seconds: DAY_SECONDS,
+        }
+    }
+}
+
 /// Default time of day: noon.
 pub const DEFAULT_TIME_OF_DAY: u32 = 6_000;
 
@@ -369,6 +388,48 @@ pub const RAIN_FOG_RANGE_FACTOR: f32 = 0.75;
 /// Fog-range multiplier for snowfall; between clear and rain.
 pub const SNOW_FOG_RANGE_FACTOR: f32 = 0.85;
 
+/// Creator-tunable weather fog and palette values.
+///
+/// Every field defaults from the module constant it will eventually replace;
+/// no literal is duplicated here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderRules {
+    /// Fog-range multiplier applied during rain.
+    pub rain_fog_factor: f32,
+    /// Fog-range multiplier applied during snowfall.
+    pub snow_fog_factor: f32,
+    /// Brightness scale for the rain sky and fog tint.
+    pub rain_grey_scale: f32,
+    /// Brightness scale for the snow sky and fog tint.
+    pub snow_grey_scale: f32,
+    /// Blend fraction toward the rain grey palette.
+    pub rain_sky_lerp: f32,
+    /// Blend fraction toward the snow grey palette.
+    pub snow_sky_lerp: f32,
+    /// Daylight multiplier applied during rain.
+    pub rain_day_factor: f32,
+    /// Daylight multiplier applied during snowfall.
+    pub snow_day_factor: f32,
+    /// Dimmest daylight factor reached at midnight.
+    pub moonlit_floor: f32,
+}
+
+impl Default for RenderRules {
+    fn default() -> Self {
+        Self {
+            rain_fog_factor: RAIN_FOG_RANGE_FACTOR,
+            snow_fog_factor: SNOW_FOG_RANGE_FACTOR,
+            rain_grey_scale: RAIN_GREY_SCALE,
+            snow_grey_scale: SNOW_GREY_SCALE,
+            rain_sky_lerp: RAIN_SKY_LERP,
+            snow_sky_lerp: SNOW_SKY_LERP,
+            rain_day_factor: RAIN_DAY_FACTOR,
+            snow_day_factor: SNOW_DAY_FACTOR,
+            moonlit_floor: MOONLIT_FLOOR,
+        }
+    }
+}
+
 /// Rec. 709 luminance of a linear RGB triple.
 ///
 /// Used only to anchor the precipitation grey to the base palette so rain
@@ -602,6 +663,26 @@ mod tests {
     use std::time::Duration;
 
     const NOON_SKY: [f32; 3] = [0.53, 0.76, 0.96];
+
+    #[test]
+    fn clock_rules_default_matches_constants() {
+        let rules = ClockRules::default();
+        assert_eq!(rules.day_seconds, DAY_SECONDS);
+    }
+
+    #[test]
+    fn render_rules_default_matches_constants() {
+        let rules = RenderRules::default();
+        assert_eq!(rules.rain_fog_factor, RAIN_FOG_RANGE_FACTOR);
+        assert_eq!(rules.snow_fog_factor, SNOW_FOG_RANGE_FACTOR);
+        assert_eq!(rules.rain_grey_scale, RAIN_GREY_SCALE);
+        assert_eq!(rules.snow_grey_scale, SNOW_GREY_SCALE);
+        assert_eq!(rules.rain_sky_lerp, RAIN_SKY_LERP);
+        assert_eq!(rules.snow_sky_lerp, SNOW_SKY_LERP);
+        assert_eq!(rules.rain_day_factor, RAIN_DAY_FACTOR);
+        assert_eq!(rules.snow_day_factor, SNOW_DAY_FACTOR);
+        assert_eq!(rules.moonlit_floor, MOONLIT_FLOOR);
+    }
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(

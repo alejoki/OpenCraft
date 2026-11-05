@@ -100,6 +100,60 @@ pub const PASSIVE_SURFACE_LIGHT: u8 = 15;
 /// long stall cannot spiral into an unbounded catch-up burst.
 pub const MAX_SPAWN_ATTEMPTS_PER_CALL: u32 = 4;
 
+/// Creator-tunable mob population rules.
+///
+/// Every default reads the existing module constant, so the constants stay
+/// authoritative until a live rules bundle overrides them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpawnRules {
+    /// Radius around anchors where hostile mobs never spawn, in blocks.
+    pub safe_radius_blocks: i32,
+    /// Outer horizontal radius of the spawn ring, in blocks.
+    pub spawn_max_radius_blocks: i32,
+    /// Distance past which a record is culled, in blocks.
+    pub despawn_radius_blocks: i32,
+    /// Hard cap on mob records in the session list.
+    pub max_mobs_total: usize,
+    /// Edge length of one spawn region cell, in blocks.
+    pub spawn_region_blocks: i32,
+    /// Per-region mob cap.
+    pub spawn_region_cap: usize,
+    /// Seconds of game time between spawn attempts.
+    pub spawn_attempt_secs: f32,
+    /// Seconds of game time between despawn scans.
+    pub despawn_scan_secs: f32,
+    /// Seconds of game time between daylight-burn ticks.
+    pub burn_interval_secs: f32,
+    /// Minimum horizontal distance between two mob feet, in blocks.
+    pub spawn_min_separation: f32,
+    /// At or below this sky light a column counts as cave-dark.
+    pub hostile_cave_light: u8,
+    /// Minimum sky light for the lit-surface passive rules.
+    pub passive_surface_light: u8,
+    /// Whole spawn attempts one tick may execute.
+    pub max_spawn_attempts_per_call: u32,
+}
+
+impl Default for SpawnRules {
+    fn default() -> Self {
+        Self {
+            safe_radius_blocks: SAFE_RADIUS_BLOCKS,
+            spawn_max_radius_blocks: SPAWN_MAX_RADIUS_BLOCKS,
+            despawn_radius_blocks: DESPAWN_RADIUS_BLOCKS,
+            max_mobs_total: MAX_MOBS_TOTAL,
+            spawn_region_blocks: SPAWN_REGION_BLOCKS,
+            spawn_region_cap: SPAWN_REGION_CAP,
+            spawn_attempt_secs: SPAWN_ATTEMPT_SECS,
+            despawn_scan_secs: DESPAWN_SCAN_SECS,
+            burn_interval_secs: BURN_INTERVAL_SECS,
+            spawn_min_separation: SPAWN_MIN_SEPARATION,
+            hostile_cave_light: HOSTILE_CAVE_LIGHT,
+            passive_surface_light: PASSIVE_SURFACE_LIGHT,
+            max_spawn_attempts_per_call: MAX_SPAWN_ATTEMPTS_PER_CALL,
+        }
+    }
+}
+
 /// Absorbs `f32` accumulation drift when many small frame deltas are summed.
 ///
 /// Without it, `50 x 0.01 s` can land at 0.2499997 and fire one attempt later
@@ -682,6 +736,27 @@ mod tests {
     use crate::world::persistence::{ChunkEditMap, SavedMob};
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
     use crate::world::session::WorldSession;
+
+    #[test]
+    fn spawn_rules_default_matches_constants() {
+        let rules = SpawnRules::default();
+        assert_eq!(rules.safe_radius_blocks, SAFE_RADIUS_BLOCKS);
+        assert_eq!(rules.spawn_max_radius_blocks, SPAWN_MAX_RADIUS_BLOCKS);
+        assert_eq!(rules.despawn_radius_blocks, DESPAWN_RADIUS_BLOCKS);
+        assert_eq!(rules.max_mobs_total, MAX_MOBS_TOTAL);
+        assert_eq!(rules.spawn_region_blocks, SPAWN_REGION_BLOCKS);
+        assert_eq!(rules.spawn_region_cap, SPAWN_REGION_CAP);
+        assert_eq!(rules.spawn_attempt_secs, SPAWN_ATTEMPT_SECS);
+        assert_eq!(rules.despawn_scan_secs, DESPAWN_SCAN_SECS);
+        assert_eq!(rules.burn_interval_secs, BURN_INTERVAL_SECS);
+        assert_eq!(rules.spawn_min_separation, SPAWN_MIN_SEPARATION);
+        assert_eq!(rules.hostile_cave_light, HOSTILE_CAVE_LIGHT);
+        assert_eq!(rules.passive_surface_light, PASSIVE_SURFACE_LIGHT);
+        assert_eq!(
+            rules.max_spawn_attempts_per_call,
+            MAX_SPAWN_ATTEMPTS_PER_CALL
+        );
+    }
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
