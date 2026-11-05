@@ -23,6 +23,7 @@ use super::{
     ApplyMode, ConfigFile, ConfigRuntime, ConfigSeverity, ConfigValue, FileReload, ValueOrigin,
     REGISTRY,
 };
+use crate::settle::SettleTracker;
 
 /// Whether the dev-only creator surface (watcher, F6 overlay, trace) is
 /// compiled in. Config loading itself is never gated.
@@ -98,34 +99,14 @@ pub fn fingerprint_path(path: &Path) -> Option<FileSnapshot> {
     Some(FileSnapshot(fnv1a64(&contents)))
 }
 
-/// Settle state for one file.
-///
-/// The doubled `Option` distinguishes "never observed" (`None`) from a real
-/// baseline snapshot of `Some(None)` (observed as missing).
-#[derive(Clone, Copy, Debug)]
-struct FileWatch {
-    last_observed: Option<Option<FileSnapshot>>,
-    last_settled: Option<Option<FileSnapshot>>,
-    pending: Option<(Option<FileSnapshot>, Instant)>,
-}
-
-impl FileWatch {
-    const EMPTY: Self = Self {
-        last_observed: None,
-        last_settled: None,
-        pending: None,
-    };
-}
-
 /// Pure per-file settle machine plus poll scheduling.
 ///
-/// The app calls [`Self::observe`] for every curated file on each poll and
-/// reloads exactly the files for which it returns `true`.
+/// A thin wrapper over the shared [`SettleTracker`] keeps the config-facing
+/// `ConfigFile` API while the pack watcher reuses the exact same rules for a
+/// dynamic entry list. The app calls [`Self::observe`] for every curated file
+/// on each poll and reloads exactly the files for which it returns `true`.
 pub struct WatchState {
-    files: [FileWatch; super::FILE_COUNT],
-    poll: Duration,
-    settle: Duration,
-    next_poll_at: Instant,
+    tracker: SettleTracker<FileSnapshot>,
 }
 
 impl WatchState {
@@ -138,10 +119,7 @@ impl WatchState {
     /// Explicit timings for tests; production callers use [`Self::new`].
     pub fn with_timings(now: Instant, poll: Duration, settle: Duration) -> Self {
         Self {
-            files: std::array::from_fn(|_| FileWatch::EMPTY),
-            poll,
-            settle,
-            next_poll_at: now,
+            tracker: SettleTracker::new(super::FILE_COUNT, poll, settle, now),
         }
     }
 
@@ -163,64 +141,31 @@ impl WatchState {
         snapshot: Option<FileSnapshot>,
         now: Instant,
     ) -> bool {
-        let settle = self.settle;
-        let watch = &mut self.files[super::file_index(file)];
-
-        let Some(observed) = watch.last_observed else {
-            // Startup already loaded this tree: the first poll is the baseline.
-            watch.last_observed = Some(snapshot);
-            watch.last_settled = Some(snapshot);
-            return false;
-        };
-
-        if observed != snapshot {
-            watch.last_observed = Some(snapshot);
-            watch.pending = Some((snapshot, now));
-            return false;
-        }
-
-        let Some((pending_snapshot, since)) = watch.pending else {
-            return false;
-        };
-        if pending_snapshot != snapshot {
-            // The newest bytes went back to the previously observed snapshot;
-            // a pending write of some other snapshot can never settle now.
-            return false;
-        }
-        if now.saturating_duration_since(since) < settle {
-            return false;
-        }
-
-        watch.pending = None;
-        if watch.last_settled == Some(snapshot) {
-            // Reverted to the content that is already live: no reload needed.
-            return false;
-        }
-        watch.last_settled = Some(snapshot);
-        true
+        self.tracker.observe(super::file_index(file), snapshot, now)
     }
 
     /// Files with an unsettled write, in [`ConfigFile::ALL`] order.
     pub fn pending_files(&self) -> Vec<ConfigFile> {
-        ConfigFile::ALL
+        self.tracker
+            .pending_indices()
             .into_iter()
-            .filter(|file| self.files[super::file_index(*file)].pending.is_some())
+            .filter_map(|index| ConfigFile::ALL.get(index).copied())
             .collect()
     }
 
     /// Whether the next scheduled poll is due.
     pub fn is_due(&self, now: Instant) -> bool {
-        now >= self.next_poll_at
+        self.tracker.is_due(now)
     }
 
     /// Schedule the next poll one poll interval after `now`.
     pub fn mark_polled(&mut self, now: Instant) {
-        self.next_poll_at = now + self.poll;
+        self.tracker.mark_polled(now);
     }
 
     /// When the next poll becomes due.
     pub fn next_poll_at(&self) -> Instant {
-        self.next_poll_at
+        self.tracker.next_poll_at()
     }
 }
 

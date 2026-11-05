@@ -6,6 +6,7 @@ pub mod pack;
 pub mod player;
 pub mod render;
 pub mod settings;
+pub mod settle;
 pub mod ui;
 pub mod world;
 
