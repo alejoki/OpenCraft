@@ -187,19 +187,33 @@ pub fn season_of(day_index: u32, season_length_days: u32, seed: u32) -> Season {
     Season::from_index(starting_season.wrapping_add(seasons_elapsed))
 }
 
-/// The weather for `day_index` in the given season.
+/// The weather for `day_index` in the given season under default rules.
 ///
 /// Mixes seed and day through the shared FNV-1a stream and maps the high bits
 /// onto a per-season precipitation chance: Winter can only yield [`Weather::Snowfall`],
 /// Spring/Summer/Autumn can only yield [`Weather::Rain`], and every other day
-/// is [`Weather::Clear`]. Deterministic for fixed inputs.
+/// is [`Weather::Clear`]. Deterministic for fixed inputs. This is the default
+/// wrapper around [`weather_of_with`], kept so every pre-tuning caller (the
+/// menu/vista path and the calendar tests) stays byte-identical.
 pub fn weather_of(season: Season, day_index: u32, seed: u32) -> Weather {
+    weather_of_with(season, day_index, seed, &WeatherRules::default())
+}
+
+/// The weather for `day_index` in the given season under live [`WeatherRules`].
+///
+/// The roll is exactly [`weather_of`]'s FNV-1a stream and high-bit mapping;
+/// only the four percentage comparisons are tunable. Winter can only yield
+/// [`Weather::Snowfall`], Spring/Summer/Autumn can only yield [`Weather::Rain`],
+/// and every other roll is [`Weather::Clear`]. Deterministic for fixed inputs,
+/// so a live reload changes which days are wet but never makes one day flip
+/// arbitrarily between two runs with the same rules.
+pub fn weather_of_with(season: Season, day_index: u32, seed: u32, rules: &WeatherRules) -> Weather {
     let roll = (day_hash(seed, day_index) >> 8) % 100;
     match season {
-        Season::Winter if roll < WINTER_SNOW_PERCENT => Weather::Snowfall,
-        Season::Spring if roll < SPRING_RAIN_PERCENT => Weather::Rain,
-        Season::Summer if roll < SUMMER_RAIN_PERCENT => Weather::Rain,
-        Season::Autumn if roll < AUTUMN_RAIN_PERCENT => Weather::Rain,
+        Season::Winter if roll < rules.winter_snow_percent => Weather::Snowfall,
+        Season::Spring if roll < rules.spring_rain_percent => Weather::Rain,
+        Season::Summer if roll < rules.summer_rain_percent => Weather::Rain,
+        Season::Autumn if roll < rules.autumn_rain_percent => Weather::Rain,
         _ => Weather::Clear,
     }
 }
@@ -215,6 +229,97 @@ mod tests {
         assert_eq!(rules.spring_rain_percent, SPRING_RAIN_PERCENT);
         assert_eq!(rules.summer_rain_percent, SUMMER_RAIN_PERCENT);
         assert_eq!(rules.autumn_rain_percent, AUTUMN_RAIN_PERCENT);
+    }
+
+    #[test]
+    fn weather_of_with_default_rules_is_identical_to_weather_of() {
+        let defaults = WeatherRules::default();
+        for season in SEASON_CYCLE {
+            for seed in [0u32, 1, 2, 42, 12_345, 0xDEAD_BEEF] {
+                for day in [0u32, 1, 3, 17, 1_000, u32::MAX] {
+                    assert_eq!(
+                        weather_of(season, day, seed),
+                        weather_of_with(season, day, seed, &defaults),
+                        "default-rules mismatch ({season:?}, seed {seed}, day {day})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_percent_weather_rules_force_clear_in_every_season() {
+        let rules = WeatherRules {
+            winter_snow_percent: 0,
+            spring_rain_percent: 0,
+            summer_rain_percent: 0,
+            autumn_rain_percent: 0,
+        };
+        for season in SEASON_CYCLE {
+            for seed in [0u32, 1, 2, 42, 0xDEAD_BEEF] {
+                for day in [0u32, 1, 7, 999, u32::MAX] {
+                    assert_eq!(
+                        weather_of_with(season, day, seed, &rules),
+                        Weather::Clear,
+                        "zero percent must force clear ({season:?}, seed {seed}, day {day})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_percent_weather_rules_force_precipitation_by_season() {
+        let rules = WeatherRules {
+            winter_snow_percent: 100,
+            spring_rain_percent: 100,
+            summer_rain_percent: 100,
+            autumn_rain_percent: 100,
+        };
+        for seed in [0u32, 1, 2, 42, 0xDEAD_BEEF] {
+            for day in [0u32, 1, 7, 999, u32::MAX] {
+                for season in [Season::Spring, Season::Summer, Season::Autumn] {
+                    assert_eq!(
+                        weather_of_with(season, day, seed, &rules),
+                        Weather::Rain,
+                        "{season:?} must rain at 100 percent (seed {seed}, day {day})"
+                    );
+                }
+                assert_eq!(
+                    weather_of_with(Season::Winter, day, seed, &rules),
+                    Weather::Snowfall,
+                    "winter must snow at 100 percent (seed {seed}, day {day})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weather_of_with_changes_only_the_percentage_threshold() {
+        // Seed 1, day 0, Spring rolls 18 (< the default 30) -> Rain.
+        assert_eq!(weather_of(Season::Spring, 0, 1), Weather::Rain);
+        assert_eq!(
+            weather_of_with(Season::Spring, 0, 1, &WeatherRules::default()),
+            Weather::Rain
+        );
+
+        // Only spring is dried out; the same roll now falls above the
+        // threshold and the day turns clear.
+        let dry_spring = WeatherRules {
+            spring_rain_percent: 0,
+            ..WeatherRules::default()
+        };
+        assert_eq!(
+            weather_of_with(Season::Spring, 0, 1, &dry_spring),
+            Weather::Clear
+        );
+
+        // Untuned seasons keep their default thresholds: seed 42, day 0,
+        // Winter rolls 8 (< the default 40) -> Snowfall.
+        assert_eq!(
+            weather_of_with(Season::Winter, 0, 42, &dry_spring),
+            Weather::Snowfall
+        );
     }
 
     /// Seed 1 hashes to starting-season index 0 (Spring) under the documented

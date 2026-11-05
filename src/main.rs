@@ -116,7 +116,7 @@ use opencraft::world::persistence::{
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-use opencraft::world::season::{season_of, weather_of, Season, Weather};
+use opencraft::world::season::{season_of, weather_of_with, Season, Weather};
 use opencraft::world::session::{mob_drop_items, BowFireError, ChestCommandError};
 use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
@@ -1661,13 +1661,16 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summar
     lines.join("\n")
 }
 
-/// The live weather of a session, derived purely from its persisted calendar.
+/// The live weather of a session, derived purely from its persisted calendar
+/// and the live [`opencraft::world::season::WeatherRules`].
 ///
-/// `weather_of(season_of(day_index, season_length_days, seed), day_index,
-/// seed)` — the same three persisted scalars S05's season derivation reads,
-/// never the wall clock and never anything the player did. Deliberately *not*
-/// cached: the slice's anti-goal is that no `Weather` value lives outside the
-/// per-frame derivation, and the cost is one small FNV hash plus a match.
+/// `weather_of_with(season_of(day_index, season_length_days, seed), day_index,
+/// seed, &session.rules().weather)` — the same three persisted scalars S05's
+/// season derivation reads plus the live precipitation percentages, never the
+/// wall clock and never anything the player did. Deliberately *not* cached:
+/// the slice's anti-goal is that no `Weather` value lives outside the per-frame
+/// derivation, and the cost is one small FNV hash plus a match. Only this
+/// session seam is tunable; the menu/vista path keeps the default rules.
 ///
 /// A free function over `&WorldSession` rather than a `WorldSession` method:
 /// the Playing render arm runs with the `gpu` and `window` field borrows live
@@ -1675,10 +1678,12 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summar
 fn session_weather(session: &WorldSession) -> Weather {
     let day_index = session.clock.day_index;
     let seed = session.world.seed();
-    weather_of(
+    let rules = session.rules();
+    weather_of_with(
         season_of(day_index, session.season_length_days, seed),
         day_index,
         seed,
+        &rules.weather,
     )
 }
 
@@ -15367,7 +15372,7 @@ mod tests {
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
-    use opencraft::world::season::Season;
+    use opencraft::world::season::{weather_of, Season, WeatherRules};
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
@@ -27536,6 +27541,33 @@ stack = 64
                 "seed {seed}, season length {length}, day {day}"
             );
         }
+    }
+
+    /// S06-T03 (M014): the app seam reads the session's live weather rules, so
+    /// a reload that zeroes the percentages turns the seed-1 Spring day clear
+    /// without touching the persisted calendar.
+    #[test]
+    fn session_weather_reads_live_weather_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("live-weather-rules.mcvx");
+        let mut session = WorldSession::new_session(1, save_path, 1);
+
+        // Seed 1, day 0, Spring rolls 18 (< the default 30) -> Rain.
+        assert_eq!(session_weather(&session), Weather::Rain);
+
+        let rules = RulesBundle {
+            weather: WeatherRules {
+                winter_snow_percent: 0,
+                spring_rain_percent: 0,
+                summer_rain_percent: 0,
+                autumn_rain_percent: 0,
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.rules().weather, rules.weather);
+        assert_eq!(session_weather(&session), Weather::Clear);
     }
 
     /// S06-T04: weather reaches the render inputs, and the vista arm is pinned

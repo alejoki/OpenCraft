@@ -113,6 +113,14 @@ pub struct GameClock {
     /// astronomically large advances.
     pub day_index: u32,
     fractional_ticks: f32,
+    /// Live real seconds in one full cycle at `time_scale == 1.0`.
+    ///
+    /// Every constructor seeds this to [`DAY_SECONDS`];
+    /// [`GameClock::set_day_seconds`] replaces it when the session installs a
+    /// [`ClockRules`] bundle. Ephemeral: never persisted, so a save never pins
+    /// a tuned day length and a restored clock starts at the default until
+    /// `apply_rules` installs the live value.
+    day_seconds: f32,
     frame_marker: Option<Instant>,
 }
 
@@ -141,6 +149,7 @@ impl GameClock {
             time_of_day: time_of_day.min(DAY_TICKS - 1),
             day_index,
             fractional_ticks: 0.0,
+            day_seconds: DAY_SECONDS,
             frame_marker: None,
         }
     }
@@ -166,9 +175,13 @@ impl GameClock {
 
     /// Advance by `delta_secs` of real time at the given acceleration scale.
     ///
-    /// Pure math, no `Instant`: one second at scale 1.0 is 20 ticks. Fractional
-    /// ticks are accumulated because a 60 fps frame is only ~0.33 ticks —
-    /// truncating every frame would stall the clock forever.
+    /// Pure math, no `Instant`: one second at scale 1.0 is
+    /// `DAY_TICKS / day_seconds` ticks (20 at the default 1,200 s day). The
+    /// rate is live and may change mid-day; the phase and accumulator
+    /// semantics are unchanged, so a reload only rescales future advances and
+    /// never jumps the calendar. Fractional ticks are accumulated because a
+    /// 60 fps frame is only ~0.33 ticks — truncating every frame would stall
+    /// the clock forever.
     pub fn advance_secs(&mut self, delta_secs: f32, time_scale: f32) {
         if !delta_secs.is_finite() || delta_secs <= 0.0 {
             return;
@@ -177,7 +190,7 @@ impl GameClock {
             return;
         }
 
-        self.fractional_ticks += delta_secs * time_scale * (DAY_TICKS as f32 / DAY_SECONDS);
+        self.fractional_ticks += delta_secs * time_scale * (DAY_TICKS as f32 / self.day_seconds);
 
         // An overflowing product can reach infinity; reset instead of letting
         // `inf - inf` turn the accumulator into a sticky NaN.
@@ -200,6 +213,25 @@ impl GameClock {
             .day_index
             .saturating_add(u32::try_from(whole_days).unwrap_or(u32::MAX));
         self.time_of_day = (total_ticks % DAY_TICKS as u64) as u32;
+    }
+
+    /// Real seconds in one full cycle at `time_scale == 1.0`.
+    #[inline]
+    pub fn day_seconds(&self) -> f32 {
+        self.day_seconds
+    }
+
+    /// Replace the live day length, ignoring invalid input.
+    ///
+    /// Config validation already enforces 60..=86,400; this defensive layer
+    /// keeps a hand-built rule from stalling or reversing the clock:
+    /// non-finite and non-positive values leave the previous value in place.
+    /// The calendar (`time_of_day`, `day_index`, and the sub-tick accumulator)
+    /// is deliberately untouched, so a reload rescales only future advances.
+    pub fn set_day_seconds(&mut self, seconds: f32) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.day_seconds = seconds;
+        }
     }
 
     /// Continuous, clock-derived phase in whole ticks since day 0 dawn.
@@ -746,6 +778,49 @@ mod tests {
         }
         assert_eq!(clock.time_of_day, 6_020);
         assert!(clock.fractional_ticks < 1.0);
+    }
+
+    #[test]
+    fn live_day_length_scales_the_tick_rate() {
+        // 600 real seconds is a full 24,000-tick day at the tuned rate, so a
+        // clock starting at noon lands on noon one day later.
+        let mut clock = GameClock::new();
+        clock.set_day_seconds(600.0);
+        assert_eq!(clock.day_seconds(), 600.0);
+        clock.advance_secs(600.0, 1.0);
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+        assert_eq!(clock.fractional_ticks, 0.0);
+    }
+
+    #[test]
+    fn default_day_length_still_advances_one_day_in_day_seconds() {
+        let mut clock = GameClock::new();
+        assert_eq!(clock.day_seconds(), DAY_SECONDS);
+        clock.advance_secs(DAY_SECONDS, 1.0);
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+    }
+
+    #[test]
+    fn set_day_seconds_rejects_invalid_values_and_keeps_the_previous_rate() {
+        let mut clock = GameClock::new();
+        clock.set_day_seconds(600.0);
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            clock.set_day_seconds(invalid);
+            assert_eq!(
+                clock.day_seconds(),
+                600.0,
+                "invalid day length {invalid} must be ignored"
+            );
+        }
+        // A rejected update must not touch the calendar either.
+        assert_eq!(clock.day_index, 0);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+
+        // A valid update after rejects still takes effect.
+        clock.set_day_seconds(2_400.0);
+        assert_eq!(clock.day_seconds(), 2_400.0);
     }
 
     #[test]

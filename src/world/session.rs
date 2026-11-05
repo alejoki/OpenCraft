@@ -1654,14 +1654,17 @@ impl WorldSession {
 
     /// Applies effective gameplay tuning to this session.
     ///
-    /// Movement rules go to the player and projection planes to the camera.
-    /// The camera position/orientation and the world are deliberately
+    /// Movement rules go to the player, projection planes to the camera, and
+    /// the live day length to the session clock. The camera
+    /// position/orientation, the world, and the clock's calendar
+    /// (`day_index`/`time_of_day`/sub-tick remainder) are deliberately
     /// untouched, so a caller can re-apply rules mid-frame without moving the
-    /// view. S01 calls this once at startup; S02 re-applies after a live
-    /// config reload.
+    /// view or jumping time. S01 calls this once at startup; S02 re-applies
+    /// after a live config reload.
     pub fn apply_rules(&mut self, rules: &RulesBundle) {
         self.gameplay_rules = *rules;
         self.spawn_runtime.set_rules(rules.spawning);
+        self.clock.set_day_seconds(rules.clock.day_seconds);
         self.player.movement = rules.movement;
         self.camera.z_near = rules.camera.z_near;
         self.camera.z_far = rules.camera.z_far;
@@ -2192,6 +2195,7 @@ mod tests {
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::arrow::ArrowRules;
     use crate::world::block::BlockId;
+    use crate::world::daycycle::{ClockRules, DEFAULT_TIME_OF_DAY};
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -2407,6 +2411,32 @@ mod tests {
         assert_eq!(session.camera.z_near, 0.25);
         assert_eq!(session.camera.z_far, 512.0);
         assert_eq!(session.save_config(), meta);
+    }
+
+    #[test]
+    fn apply_rules_installs_live_day_length_without_moving_the_calendar() {
+        let mut session = WorldSession::new_session(
+            30u32,
+            PathBuf::from("/tmp/live-day-length.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let rules = RulesBundle {
+            clock: ClockRules { day_seconds: 600.0 },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.rules().clock.day_seconds, 600.0);
+        assert_eq!(session.clock.day_seconds(), 600.0);
+        // Installing the rate mid-day must not move the calendar.
+        assert_eq!(session.clock.day_index, 0);
+        assert_eq!(session.clock.time_of_day, DEFAULT_TIME_OF_DAY);
+
+        // 600 real seconds is one full 24,000-tick day at the tuned rate, so
+        // from noon the clock lands on noon one day later.
+        session.clock.advance_secs(600.0, 1.0);
+        assert_eq!(session.clock.day_index, 1);
+        assert_eq!(session.clock.time_of_day, DEFAULT_TIME_OF_DAY);
     }
 
     #[test]
