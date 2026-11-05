@@ -13,7 +13,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
-use opencraft::config::{ConfigRuntime, RulesBundle};
+use opencraft::config::watch::{self, CreatorRuntime};
+use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle};
 use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
 use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
@@ -8076,6 +8077,18 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
+/// The earlier of the vsync frame deadline and the next creator poll.
+///
+/// Clamping the dev watcher into the existing vsync wait keeps the 10 Hz poll
+/// from spinning or stalling the event loop; `None` (release builds, headless
+/// tests) leaves the vsync deadline untouched.
+fn next_wait_deadline(vsync: Instant, watcher: Option<Instant>) -> Instant {
+    match watcher {
+        Some(watcher) => vsync.min(watcher),
+        None => vsync,
+    }
+}
+
 /// Everything the pack-aware startup path builds before `GameApp` exists.
 ///
 /// Production loads this ONCE in `main` and hands the same instance to both
@@ -8090,6 +8103,11 @@ struct StartupContent {
     /// Loaded once at startup; `GameApp` keeps it so every later session
     /// install re-applies the same rules and S02 can replace it on reload.
     config: ConfigRuntime,
+    /// The directory `config` was loaded from (M014/S02). `None` in headless
+    /// tests, which load registry defaults; production keeps the real
+    /// `config/` path so the polling watcher can fingerprint and reload the
+    /// six curated files.
+    config_dir: Option<PathBuf>,
     current_pack: Option<LoadedPack>,
     available_packs: Vec<String>,
     audio: AudioEngine,
@@ -8154,6 +8172,7 @@ impl StartupContent {
             settings,
             startup_warnings,
             config,
+            config_dir: config_dir.map(Path::to_path_buf),
             current_pack,
             available_packs,
             audio,
@@ -8361,6 +8380,17 @@ struct GameApp {
     /// before the first frame and `on_session_installed` re-applies it after
     /// every world swap. S02 replaces this value on a live reload.
     config: ConfigRuntime,
+    /// Directory the runtime config was loaded from, retained for the dev-only
+    /// live-reload watcher (M014/S02). `None` in headless tests, where the
+    /// watcher is disabled entirely.
+    config_dir: Option<PathBuf>,
+    /// Dev-only creator state (M014/S02): settle machine, overlay visibility,
+    /// last reload status/error, and the future restart requirement. Nothing
+    /// here is read unless `watch::CREATOR_TOOLS` is compiled in.
+    creator: CreatorRuntime,
+    /// Whether `--creator-trace` was requested on this launch. The state is
+    /// read only under `watch::CREATOR_TOOLS`, so release builds stay silent.
+    creator_trace: bool,
     /// Set whenever the pack stack changes presentation, so the next
     /// `RedrawRequested` uploads the merged layers and logo once. Startup
     /// uploads directly in `resumed`, so this starts false.
@@ -8487,6 +8517,7 @@ impl GameApp {
             settings,
             startup_warnings,
             config,
+            config_dir,
             current_pack,
             available_packs,
             audio,
@@ -8643,7 +8674,12 @@ impl GameApp {
         } else {
             None
         };
-        Self {
+        // Dev-only creator state (M014/S02-T05): the watcher starts at this
+        // instant, and the launch flag is captured before `cli` is consumed by
+        // the field initializers below.
+        let creator = CreatorRuntime::new(Instant::now());
+        let creator_trace = cli.creator_trace;
+        let mut app = Self {
             window: None,
             gpu: None,
             session,
@@ -8697,6 +8733,9 @@ impl GameApp {
             current_pack,
             session_registry,
             config,
+            config_dir,
+            creator,
+            creator_trace,
             base_registry,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -8713,6 +8752,115 @@ impl GameApp {
             combat_demo,
             exit_failure: false,
             scripted_demo,
+        };
+        // Dev-only baseline poll (M014/S02-T05): startup already loaded the
+        // tree, so this first observation only records each file's fingerprint.
+        // Marking it polled immediately closes the startup-edit race: bytes
+        // changed during launch are already live, and the next real poll starts
+        // from a settled baseline instead of re-applying them as a change.
+        if watch::CREATOR_TOOLS && app.config_dir.is_some() {
+            let now = Instant::now();
+            app.poll_config_watcher(now);
+            app.creator.watch.mark_polled(now);
+        }
+        app
+    }
+
+    /// Re-apply the current effective config rules to the live session.
+    ///
+    /// This is the one seam shared by the first-frame apply, every session
+    /// install, and a live reload. A live edit must never go through
+    /// `on_session_installed`: that would reset input, panels, demos, and
+    /// frame accounting for what is only a tuning change.
+    fn apply_config_rules(&mut self) {
+        let rules = self.config.rules();
+        self.session.apply_rules(&rules);
+    }
+
+    /// One creator poll: observe every curated file, then reload the files
+    /// whose writes have settled.
+    ///
+    /// The watcher owns the settle policy; this seam owns the filesystem read,
+    /// the per-file last-good commit, rule re-application, and the user-visible
+    /// rejection notice. A rejected file never stops later files: each curated
+    /// file is an independent atomic unit.
+    fn poll_config_watcher(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS {
+            return;
+        }
+        let Some(dir) = self.config_dir.clone() else {
+            return;
+        };
+
+        let mut settled = Vec::new();
+        for file in ConfigFile::ALL {
+            let snapshot = watch::fingerprint_path(&dir.join(file.name()));
+            if self.creator.watch.observe(file, snapshot, now) {
+                settled.push(file);
+            }
+        }
+
+        for file in settled {
+            let report = self.config.reload_file(&dir, file);
+            self.creator.record(&report);
+            self.emit_creator_trace(&report);
+            if report.applied {
+                self.apply_config_rules();
+            } else {
+                // Rejections are data, never logs (D006/MEM009): the creator
+                // sees the same reason the overlay shows. Keep processing
+                // any later settled files; one bad file cannot mask a good
+                // sibling's valid edit.
+                self.game_message = Some(MenuMessage {
+                    text: self.creator.last_error.clone().unwrap_or_default(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+        }
+    }
+
+    /// Poll only when the watch schedule is due, then advance it.
+    ///
+    /// `about_to_wait` calls this every loop turn; the 10 Hz clamp lives here
+    /// so the watcher can never spin the event loop.
+    fn poll_config_watcher_if_due(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.config_dir.is_none() {
+            return;
+        }
+        if self.creator.watch.is_due(now) {
+            self.poll_config_watcher(now);
+            self.creator.watch.mark_polled(now);
+        }
+    }
+
+    /// When `about_to_wait` must wake for the next creator poll.
+    ///
+    /// `None` disables the seam entirely (release builds or headless tests),
+    /// leaving the vsync wait untouched.
+    fn creator_next_poll_at(&self) -> Option<Instant> {
+        if watch::CREATOR_TOOLS && self.config_dir.is_some() {
+            Some(self.creator.watch.next_poll_at())
+        } else {
+            None
+        }
+    }
+
+    /// Write one stable apply/reject line for `report` when the launch asked
+    /// for `--creator-trace` in a dev build.
+    ///
+    /// No timestamps and no absolute paths keep the lines diffable across runs.
+    /// A closed stdout pipe is ignored: tracing must never panic the game, and
+    /// a run without the flag stays log-free.
+    fn emit_creator_trace(&mut self, report: &FileReload) {
+        if !watch::CREATOR_TOOLS || !self.creator_trace {
+            return;
+        }
+        use std::io::Write as _;
+        let lines = watch::reload_trace_lines(report, self.config.digest());
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
         }
     }
 
@@ -9151,10 +9299,10 @@ impl GameApp {
     /// render-store reset that every other swap performs.
     fn on_session_installed(&mut self) {
         // Config rules are app-wide tuning, not session state: every newly
-        // installed session adopts the current effective values. S02 replaces
-        // `self.config` on a live reload and calls this same seam.
-        let rules = self.config.rules();
-        self.session.apply_rules(&rules);
+        // installed session adopts the current effective values. A live edit
+        // calls `apply_config_rules` directly instead, so it never resets
+        // input, panels, demos, or frame accounting.
+        self.apply_config_rules();
         // The installed session owns a frozen content registry. Its pack item
         // icons may differ from the launch registry (for example a loaded
         // world that carries a content pack), so rebuild the UI-only sprite
@@ -12560,6 +12708,13 @@ impl ApplicationHandler for GameApp {
             return;
         }
 
+        // Dev-only creator poll (M014/S02-T05): clamp the 10 Hz watcher into
+        // the event loop here, after the demo/death/deadline guards and before
+        // the `window` borrow, so a settled editor save becomes a gameplay
+        // change without touching the render path. The witness comments are
+        // pinned by tests: no polling may move into `RedrawRequested`.
+        self.poll_config_watcher_if_due(Instant::now());
+
         let Some(window) = &self.window else {
             return;
         };
@@ -12573,7 +12728,8 @@ impl ApplicationHandler for GameApp {
         // still waking immediately for input events.
         if self.settings.vsync {
             if let Some(interval) = vsync_interval(window) {
-                let deadline = self.last_frame + interval;
+                let deadline =
+                    next_wait_deadline(self.last_frame + interval, self.creator_next_poll_at());
                 let now = Instant::now();
                 if now >= deadline {
                     window.request_redraw();
@@ -14465,6 +14621,8 @@ fn main() {
 mod tests {
     use super::*;
     use opencraft::audio::default_buffers;
+    use opencraft::config::watch::ReloadStatus;
+    use opencraft::config::{ConfigSeverity, ValueOrigin};
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
@@ -32369,5 +32527,489 @@ stack = 64
             normalized.contains("Some(") && normalized.contains("CONFIG_DIR"),
             "production main must inject the real config dir: {normalized}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S02-T05: GameApp live-apply loop, watcher clamp, and creator trace
+    // -----------------------------------------------------------------------
+
+    fn write_config(dir: &Path, file: &str, contents: &str) {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join(file), contents).expect("write config file");
+    }
+
+    /// Build an app whose startup content came from `player_toml` in a temp
+    /// `config/` tree. `--new` keeps the test off any real save.
+    fn creator_app(dir: &Path, player_toml: &str) -> GameApp {
+        let content = startup_content_with_player_toml(dir, player_toml);
+        let save_path = dir.join("creator.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// First poll records the edit as pending; the second crosses the 250 ms
+    /// settle window. The injected clock means the tests never sleep.
+    fn settle_config(app: &mut GameApp, base: Instant) {
+        app.poll_config_watcher(base + Duration::from_millis(10));
+        app.poll_config_watcher(base + Duration::from_millis(400));
+    }
+
+    fn config_tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        let mut entries: Vec<(String, Vec<u8>)> = std::fs::read_dir(&config_dir)
+            .expect("read config dir")
+            .map(|entry| {
+                let path = entry.expect("dir entry").path();
+                let name = path
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned();
+                (name, std::fs::read(&path).expect("read config file"))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[test]
+    fn creator_live_player_edit_applies_and_reaches_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let digest_before = app.config.digest();
+        let t0 = Instant::now();
+        app.poll_config_watcher(t0);
+
+        write_config(
+            dir.path(),
+            "player.toml",
+            "[movement]\nwalk_speed = 8.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        app.poll_config_watcher(t0 + Duration::from_millis(10));
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            4.6,
+            "an unsettled write is not applied"
+        );
+        app.poll_config_watcher(t0 + Duration::from_millis(400));
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(app.config.f32("camera.z_far"), 800.0);
+        assert_ne!(app.config.digest(), digest_before);
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 2,
+            }
+        );
+        assert!(app.game_message.is_none(), "a successful apply is silent");
+    }
+
+    #[test]
+    fn creator_live_edit_does_not_reinstall_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        app.game_message = Some(MenuMessage {
+            text: "keep".to_string(),
+            ticks_left: 10,
+        });
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("a live edit must not clear an unrelated notice");
+        assert_eq!(message.text, "keep");
+        assert_eq!(message.ticks_left, 10);
+    }
+
+    #[test]
+    fn creator_live_edit_applies_sprint_fly_jump() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+
+        write_config(
+            dir.path(),
+            "player.toml",
+            "[movement]\nwalk_speed = 4.6\nsprint_speed = 8.5\nfly_speed = 22.0\njump_velocity = 12.0\n",
+        );
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.session.player.movement.sprint_speed, 8.5);
+        assert_eq!(app.session.player.movement.fly_speed, 22.0);
+        assert_eq!(app.session.player.movement.jump_velocity, 12.0);
+    }
+
+    #[test]
+    fn creator_invalid_edit_keeps_last_good() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, t0);
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        let digest = app.config.digest();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            8.0,
+            "a rejected file keeps its last good values"
+        );
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: Some("movement.walk_speed".to_string()),
+            }
+        );
+        let last_error = app
+            .creator
+            .last_error
+            .clone()
+            .expect("a rejection records its reason");
+        assert!(
+            last_error.starts_with("config/player.toml: movement.walk_speed:"),
+            "{last_error}"
+        );
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("the reason is user-visible");
+        assert_eq!(message.text, last_error);
+
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error:"))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one overlay error line: {lines:?}");
+        assert!(errors[0].contains("movement.walk_speed"), "{lines:?}");
+    }
+
+    #[test]
+    fn creator_invalid_sibling_does_not_block_valid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, t0);
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        let mut expected = app.config.clone();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        write_config(
+            dir.path(),
+            "survival.toml",
+            "[survival]\nhunger_drain_secs = 12.0\n",
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            8.0,
+            "the rejected file keeps its last good value"
+        );
+        assert_eq!(app.config.f32("survival.hunger_drain_secs"), 12.0);
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        let survival_report = expected.reload_file(&config_dir, ConfigFile::Survival);
+        assert!(survival_report.applied);
+        assert_eq!(
+            app.config.digest(),
+            expected.digest(),
+            "the digest reflects only the valid sibling's apply"
+        );
+    }
+
+    #[test]
+    fn creator_atomic_rename_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        let temp_path = config_dir.join("player.toml.tmp");
+        std::fs::write(&temp_path, "[movement]\nwalk_speed = 7.5\n").expect("write temp file");
+        std::fs::rename(&temp_path, config_dir.join("player.toml")).expect("atomic rename");
+
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 7.5);
+        assert_eq!(app.session.player.movement.walk_speed, 7.5);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn creator_partial_write_rejects_then_complete_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed =");
+        settle_config(&mut app, t0);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            4.6,
+            "a partial write keeps the last good value"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: None,
+            }
+        );
+        let last_error = app.creator.last_error.as_deref().expect("reason");
+        assert!(last_error.contains("invalid TOML"), "{last_error}");
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 7.5\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 7.5);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn creator_empty_and_comment_only_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "");
+        settle_config(&mut app, t0);
+
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: None,
+            }
+        );
+        assert_eq!(
+            app.creator.last_error.as_deref(),
+            Some("config/player.toml: file is empty; keeping last good values")
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "# comment\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.creator.last_error.as_deref(),
+            Some("config/player.toml: file has no recognized keys; keeping last good values")
+        );
+    }
+
+    #[test]
+    fn creator_deleted_file_applies_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 8.0\n");
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        std::fs::remove_file(config_dir.join("player.toml")).expect("remove player.toml");
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 4.6);
+        assert_eq!(
+            app.config.origin("movement.walk_speed"),
+            ValueOrigin::Default
+        );
+        assert_eq!(app.session.player.movement.walk_speed, 4.6);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+        assert!(
+            app.config.diagnostics().iter().any(|diagnostic| {
+                diagnostic.file == ConfigFile::Player
+                    && diagnostic.key.is_none()
+                    && diagnostic.severity == ConfigSeverity::Warning
+                    && diagnostic.reason == "file is missing; using defaults"
+            }),
+            "the missing-file warning is retained as data: {:?}",
+            app.config.diagnostics()
+        );
+    }
+
+    #[test]
+    fn creator_watcher_disabled_without_config_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("disabled.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(
+            &cli,
+            &ContentRegistry::builtin_arc(),
+            &RulesBundle::default(),
+        );
+        let mut app = GameApp::new_with_paths(
+            cli,
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+
+        assert!(app.creator_next_poll_at().is_none());
+        app.poll_config_watcher_if_due(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.creator.status, ReloadStatus::Idle);
+    }
+
+    #[test]
+    fn creator_next_wait_deadline_prefers_earlier() {
+        let base = Instant::now();
+        let vsync = base + Duration::from_millis(16);
+        let watcher = base + Duration::from_millis(7);
+        assert_eq!(next_wait_deadline(vsync, Some(watcher)), watcher);
+        assert_eq!(next_wait_deadline(watcher, Some(vsync)), watcher);
+        assert_eq!(next_wait_deadline(vsync, None), vsync);
+
+        let source = include_str!("main.rs");
+        let about_to_wait = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("main.rs must define about_to_wait")
+            .split("// Headless presentation digest")
+            .next()
+            .expect("about_to_wait must end before the presentation digest");
+        assert!(
+            about_to_wait.contains("poll_config_watcher_if_due(Instant::now())"),
+            "about_to_wait must poll the creator watcher"
+        );
+        assert!(
+            about_to_wait.contains("next_wait_deadline("),
+            "the vsync wait must include the watcher deadline"
+        );
+        assert!(
+            about_to_wait.contains("ControlFlow::Poll"),
+            "the non-vsync path must stay Poll"
+        );
+    }
+
+    #[test]
+    fn creator_trace_is_not_a_world_intent() {
+        let cli = CliConfig::parse_args(["--creator-trace"]);
+        assert!(!cli_has_world_intent(&cli));
+        assert!(!scripted_demo_requested(&cli));
+    }
+
+    #[test]
+    fn creator_reload_never_writes_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let initial = config_tree(dir.path());
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        let before_poll = config_tree(dir.path());
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(
+            initial.len(),
+            before_poll.len(),
+            "the test edit must not add or remove config files"
+        );
+        assert_eq!(
+            config_tree(dir.path()),
+            before_poll,
+            "a reload cycle must never rewrite, add, or remove config files"
+        );
+    }
+
+    #[test]
+    fn creator_trace_lines_are_gated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert!(!app.creator_trace, "a bare launch does not emit traces");
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        let applied = app.config.reload_file(&config_dir, ConfigFile::Player);
+        let digest = app.config.digest();
+        let lines = watch::reload_trace_lines(&applied, digest);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            format!("creator: applied file=config/player.toml changed=1 digest={digest:#018x}")
+        );
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        let rejected = app.config.reload_file(&config_dir, ConfigFile::Player);
+        let lines = watch::reload_trace_lines(&rejected, app.config.digest());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(
+                "creator: rejected file=config/player.toml field=movement.walk_speed reason="
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains('\n'), "a trace line is always one line");
+
+        // The flag is the per-launch half of the emission gate; the other half
+        // is `watch::CREATOR_TOOLS`, pinned in the method source because a test
+        // cannot capture process stdout safely.
+        let save_path = dir.path().join("traced.mcvx");
+        let cli = CliConfig::parse_args([
+            "--creator-trace",
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            Some(&config_dir),
+        );
+        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let traced =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert!(
+            traced.creator_trace,
+            "--creator-trace must reach the emission gate"
+        );
+
+        let source = include_str!("main.rs");
+        let emit = source
+            .split("fn emit_creator_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_creator_trace");
+        let emit = &emit[..emit
+            .find("\n    }\n")
+            .expect("emit_creator_trace must close")];
+        assert!(emit.contains("!watch::CREATOR_TOOLS"));
+        assert!(emit.contains("!self.creator_trace"));
     }
 }
