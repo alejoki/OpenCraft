@@ -10,7 +10,8 @@ use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::mob::{create_mob_pipeline, MobVertex};
 use crate::render::sky;
 use crate::render::texture::{
-    block_array_layers_match_shape, create_block_texture_array, upload_block_layers,
+    block_array_layers_match_shape, create_block_texture_array, upload_block_layer_at,
+    upload_block_layers,
 };
 use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
@@ -1053,6 +1054,16 @@ impl VoxelRenderer {
         upload_block_layers(&self.block_texture, queue, layers);
     }
 
+    /// Re-upload exactly one texture-array layer (base mip plus mip chain)
+    /// into the retained texture array.
+    ///
+    /// The dev-only live pack watcher feeds decoded PNGs here so an edited
+    /// block or mob texture touches only its own layer. Never recreates the
+    /// texture, its view, or the camera bind group (MEM111).
+    pub fn write_block_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
+        upload_block_layer_at(&self.block_texture, queue, layer, rgba);
+    }
+
     // 11 args: the existing world-pass parameters, the T04 batched mob vertex
     // slice (immediately after `store`), plus the T01 `ui_pass` hook, the T02
     // `show_overlays` gate, and the S02-T03 grouped `sky` inputs (which since
@@ -1990,6 +2001,27 @@ mod tests {
         assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
         assert!(x0.is_finite() && y0.is_finite());
         assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
+    }
+
+    #[test]
+    fn write_block_layer_targets_the_retained_texture_array() {
+        let src = include_str!("pipeline.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
+        let production = &src[..tests_at];
+        let at = production
+            .find("pub fn write_block_layer(")
+            .expect("write_block_layer exists");
+        let body = &production[at..];
+        let body = &body[..body.find("\n    }\n").expect("function body ends") + 6];
+
+        assert!(
+            body.contains("upload_block_layer_at(&self.block_texture, queue, layer, rgba)"),
+            "single-layer uploads must write into the retained texture array"
+        );
+        assert!(
+            !body.contains("create_block_texture_array"),
+            "live uploads must never recreate the texture, view, or bind group"
+        );
     }
 
     #[test]
