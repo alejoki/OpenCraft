@@ -18,10 +18,10 @@
 #         break ticks and one-point wear on the production break path, the
 #         authored 7-hunger / 0.8 s hold-to-eat flow, the disabled shortbow
 #         (no preview, no craft), an incomplete grid that matches nothing and
-#         consumes nothing, the v8 pack-tool round-trip (850 remaining), and
+#         consumes nothing, the v9 pack-tool round-trip (850 remaining), and
 #         the pack-removed placeholder (count 1, one unresolved name).
 #     (d) the fixture save starts with `MCVX` and the little-endian version
-#         word 8.
+#         word 9.
 #
 #   Bounded launch leg A: `timeout 10 "$BIN" --save fixture.mcvx` with the
 #   reference pack selected must exit 124 with no panic — the real renderer
@@ -216,7 +216,7 @@ done
 MAGIC_HEX="$(od -An -tx1 -N4 "$FIXTURE" | tr -d ' \n')"
 VERSION_HEX="$(od -An -tx1 -j4 -N4 "$FIXTURE" | tr -d ' \n')"
 [[ "$MAGIC_HEX" == "4d435658" ]] || fail "fixture magic is '$MAGIC_HEX' (expected 4d435658 = MCVX)"
-[[ "$VERSION_HEX" == "08000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 08000000 = little-endian 8)"
+[[ "$VERSION_HEX" == "09000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 09000000 = little-endian 9)"
 
 # --- Bounded launch leg A: reference pack present -------------------------
 set +e
@@ -293,7 +293,7 @@ if grep -q "panicked" "$LAUNCH_C_OUT" || grep -q "RUST_BACKTRACE" "$LAUNCH_C_OUT
 fi
 cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED_DIR/settings-broken.toml" || fail "the broken settings.toml was rewritten during the broken-pack leg"
 
-echo "CRAFTING SMOKE PASS [profile=$PROFILE]: --demo-crafting crafted mymod:ruby_pickaxe at the 4x4 table and mymod:ruby_stew at the 2x2 grid, broke mymod:ruby_ore in 7 ruby ticks vs 10 iron ticks with one-point wear (899/249), ate 7 hunger over the authored 0.8 s hold, proved the disabled shortbow and an incomplete grid never match, round-tripped a v8 pack tool at 850 durability, and degraded the same save to a count-1 placeholder with the pack removed; the real binary survived 10 s launches with the reference pack, no pack and a broken pack (exit 124, no panic)"
+echo "CRAFTING SMOKE PASS [profile=$PROFILE]: --demo-crafting crafted mymod:ruby_pickaxe at the 4x4 table and mymod:ruby_stew at the 2x2 grid, broke mymod:ruby_ore in 7 ruby ticks vs 10 iron ticks with one-point wear (899/249), ate 7 hunger over the authored 0.8 s hold, proved the disabled shortbow and an incomplete grid never match, round-tripped a v9 pack tool at 850 durability, and degraded the same save to a count-1 placeholder with the pack removed; the real binary survived 10 s launches with the reference pack, no pack and a broken pack (exit 124, no panic)"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "CRAFTING SMOKE EVIDENCE: $line"
 done

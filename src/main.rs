@@ -1934,7 +1934,7 @@ fn startup_session_with(
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
     // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v8 save tail must describe only what that
+    // digest and every bounded demo's v9 save tail must describe only what that
     // demo placed, so ambient spawning and daylight burning stay off for the
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {
@@ -4488,7 +4488,7 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// stage earns the wood bow and its arrows, and the Save stage writes the two
 /// surviving hostile records.
 ///
-/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v8_save`)
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v9_save`)
 /// and reading the file back, never computed by hand: every earned stack changes
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
@@ -4498,7 +4498,7 @@ const COMBAT_SAVE_BYTES: usize = 317;
 /// (10) after the mob records.
 #[cfg(test)]
 const COMBAT_SAVE_TAIL_BYTES: usize = 22;
-/// Measured offset of the v8 mob-count word in that save: the 19-byte Zombie
+/// Measured offset of the v9 mob-count word in that save: the 19-byte Zombie
 /// record starts 4 bytes later and the Skeleton record follows it, so the tail
 /// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
 #[cfg(test)]
@@ -6235,7 +6235,7 @@ fn combat_spot_feet_y(y: f32) -> f32 {
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
 /// * the player pose is restored afterwards, so the Shot stage and the Save
-///   witness start from the same pinned pose (the v8 layout itself is measured
+///   witness start from the same pinned pose (the v9 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
 ///
 /// The Skeleton is left where Drops left it: it is hostile and will chase, but
@@ -8473,7 +8473,7 @@ struct GameApp {
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
     /// `session_registry` (MEM512/D181).
     base_registry: Arc<ContentRegistry>,
-    /// The CURRENT session's immutable content registry. A loaded v8 world
+    /// The CURRENT session's immutable content registry. A loaded world
     /// carries the placeholder-augmented registry it was decoded with; a fresh
     /// world carries a clone of `base_registry`. Re-adopted by
     /// `on_session_installed`, never replaced while a session runs.
@@ -8775,7 +8775,7 @@ impl GameApp {
         } else {
             None
         };
-        // The session registry is the load-time registry: a loaded v8 world
+        // The session registry is the load-time registry: a loaded world
         // keeps its placeholder-augmented registry, a fresh world the launch
         // base. Only `on_session_installed` re-adopts it on a swap (MEM512).
         let session_registry = Arc::clone(&session.registry);
@@ -13258,7 +13258,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Shot stage's digest follows the Hostile line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` /
-            // `combat_hostile:` lines and the v8 witness keep their exact
+            // `combat_hostile:` lines and the v9 witness keep their exact
             // bytes.
             if let Some(line) = self
                 .combat_demo
@@ -13441,7 +13441,7 @@ fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16) ->
 /// pinned line set is machine-independent. All content comes through the
 /// production seams: the frozen session registry, the CPU composers the real
 /// renderer uploads, `mesh_chunk_with`, `MiningTarget::from_block_with` +
-/// `MiningState::tick_with`, `break_mined_block`, and the v8 save/load codec.
+/// `MiningState::tick_with`, `break_mined_block`, and the save/load codec.
 ///
 /// Returns `(lines, ok)`. `ok` is false exactly when a leg recorded a
 /// `failed=<name>` token; the caller exits non-zero on that flag.
@@ -14019,7 +14019,7 @@ fn crafting_demo_break(
 /// Every leg runs through a production function: the frozen registry resolved
 /// from the launch stack, [`apply_inventory_click_button_with`], the mining
 /// accumulator + [`break_mined_block`], [`EatingTarget::new_with`] +
-/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the v8 save/load
+/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the save/load
 /// codec. Each structural line is machine-independent (names, counts,
 /// booleans) and the caller exits non-zero when the latch is `crafting:
 /// failed`.
@@ -15185,7 +15185,7 @@ fn main() {
     // settings file and the persisted pack stack (read-only), builds the same
     // frozen registry a launch would, and prints structural facts about the
     // composed arrays, the authored content, the production mesh, the
-    // production break path, and the v8 save/load placeholder policy. It runs
+    // production break path, and the save/load placeholder policy. It runs
     // before `StartupContent::load`, so no window, GPU, audio engine, event
     // loop, or settings write happens here. The only write is the fixture save
     // (at the demo's `--save` path when given, otherwise a temp file).
@@ -15215,7 +15215,7 @@ fn main() {
     // `--demo-crafting` is the headless crafting digest: it reads the settings
     // file and the persisted pack stack (read-only), builds the same frozen
     // registry a launch would, and exercises crafting, mining, eating and the
-    // v8 save/load placeholder policy through production seams. It runs before
+    // save/load placeholder policy through production seams. It runs before
     // `StartupContent::load`, so no window, GPU, audio engine, event loop, or
     // settings write happens here. The only write is the fixture save (at the
     // demo's `--save` path when given, otherwise a temp file).
@@ -17803,7 +17803,7 @@ stack = 64
         assert!(!session.player.can_fly());
         assert!(
             !session.ambient_spawning(),
-            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v8 save tail"
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v9 save tail"
         );
         assert!(
             session.spawn_settle_pending(),
@@ -19100,13 +19100,13 @@ stack = 64
         (session, demo)
     }
 
-    /// The fresh leg writes the v8 save through the production save site, and
+    /// The fresh leg writes the v9 save through the production save site, and
     /// the file itself carries the two surviving hostile records plus the earned
     /// inventory. The file length and the mob-count offset are MEASURED by
     /// running the fresh leg, never computed by hand: they depend on the exact
     /// serialized size of the inventory stacks the demo earns.
     #[test]
-    fn combat_demo_fresh_leg_writes_and_verifies_a_v8_save() {
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v9_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = 12345;
         let save_path = dir.path().join("combat-fresh-leg.mcvx");
@@ -19161,7 +19161,7 @@ stack = 64
         assert_eq!(
             COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len() + COMBAT_SAVE_TAIL_BYTES,
             bytes.len(),
-            "the mob tail is followed only by the pack+digest tail"
+            "the mob tail is followed only by the pack-identity, digest, and config tail"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
@@ -20849,7 +20849,7 @@ stack = 64
         let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
         let save_path = saves.join("Modded.mcvx");
         save_world_to_path_with(&save_path, &modded_sample_save(31), registry.as_ref())
-            .expect("write v8 save with pack content");
+            .expect("write a save with pack content");
 
         // A temp settings path means an empty pack stack, so the launch base
         // is the built-in registry even if the developer's real packs exist.
@@ -20916,7 +20916,7 @@ stack = 64
         std::fs::create_dir_all(&matched_saves).expect("create saves dir");
         let matched_path = matched_saves.join("Modded.mcvx");
         save_world_to_path_with(&matched_path, &modded_sample_save(32), registry.as_ref())
-            .expect("write v8 save with matching content");
+            .expect("write a save with matching content");
         let mut matched = GameApp::new_with_paths(
             CliConfig::parse_args(Vec::<String>::new()),
             WorldSession::new_session(
@@ -22002,7 +22002,7 @@ stack = 64
 
         let mut saved = Vec::new();
         save_world_to_bytes_with(&mut saved, &data, full.as_ref())
-            .expect("leg=derive: the six-reference v8 save writes");
+            .expect("leg=derive: the six-reference save writes");
 
         // (4) Removing the content pack keeps the world loadable: every
         // reference becomes a deterministic placeholder and the notice names

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real-binary mid-winter save round-trip smoke (M007/S08-T03).
 #
-# Proves the v8 save's pinned v5 calendar tail survives a cold process restart
+# Proves the v9 save's pinned v5 calendar tail survives a cold process restart
 # through the real event loop, and that the season derived from it really is Winter:
 #
 #   Run A: `--new --seed 1 --season-length 1 --save P --time-scale 60
@@ -12,9 +12,10 @@
 #         a `timeout` kill surfaces as 124 and is an explicit failure here).
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 8 — the SAVE_VERSION that inserts the content table in the header
-#         and appends the v6 survival header, the v7 mob count, and the v8
-#         pack-identity + digest tail after the calendar tail.
+#         is 9 — the SAVE_VERSION that inserts the content table in the header
+#         and appends the v6 survival header, the v7 mob count, the v8
+#         pack-identity + digest tail, and the v9 config schema + digest tail
+#         after the calendar tail.
 #     (d) day_index (u32 LE at byte offset 134) is exactly 3 — the mid-winter
 #         save.
 #     (e) season_length_days (u32 LE at byte offset 138) is the chosen 1.
@@ -33,13 +34,15 @@
 # bytes: just the zero name count) + hotbar (27) + time_of_day (4) + chunk
 # count (4) + v4 inventory extension (59) = 134 bytes before the v5 calendar
 # tail. The v6 survival header (mode u8, health/hunger/air u16 each, chest
-# count u32 = 11 bytes), the v7 mob count (u32 = 4 bytes), and the v8
-# pack-identity + FNV-1a digest tail (u32 pack count + u64 digest = 12 bytes)
-# are appended after that tail, so the calendar offsets 134/138 stay pinned.
+# count u32 = 11 bytes), the v7 mob count (u32 = 4 bytes), the v8
+# pack-identity + FNV-1a digest tail (u32 pack count + u64 digest = 12 bytes),
+# and the v9 config schema + effective-value digest tail (u16 schema + u64
+# digest = 10 bytes) are appended after that tail, so the calendar offsets
+# 134/138 stay pinned.
 # Those offsets are pinned by the `V8_*` constants in
 # src/world/persistence.rs, so this script and the unit tests cannot drift
 # apart silently; the size check also requires the v6 survival header, v7 mob
-# count, and v8 tail to be present. Any header change before the chunk section
+# count, the v8 pack tail, and the v9 config tail to be present. Any header change before the chunk section
 # invalidates those offsets: update the
 # persistence test consts first, then copy them here.
 #
@@ -101,9 +104,11 @@ V6_HEADER_LEN=11
 # so the count sits at 153 and a fresh world writes 0.
 V7_MOB_COUNT_LEN=4
 V7_MOB_COUNT_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN))
-# v8 tail: a u32 pack count (zero in a built-in world) plus the u64 digest.
-V8_TAIL_LEN=12
-V8_SAVE_LEN=$((V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN + V8_TAIL_LEN))
+# Tail after the mob count: the v8 u32 pack count (zero in a built-in
+# world) plus the u64 digest (12 bytes), then the v9 u16 config schema plus
+# the u64 effective-value digest (10 bytes).
+V9_TAIL_LEN=22
+V9_SAVE_LEN=$((V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN + V9_TAIL_LEN))
 
 SEED=1
 SEASON_LENGTH=1
@@ -151,8 +156,8 @@ if [[ ! -f "$SAVE" ]]; then
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN + V8_TAIL_LEN)) ]]; then
-    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header, v7 mob count, and v8 digest tail after the v5 calendar tail"
+if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN + V9_TAIL_LEN)) ]]; then
+    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header, v7 mob count, v8 pack tail, and v9 config tail after the v5 calendar tail"
     exit 1
 fi
 
@@ -163,8 +168,8 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 8 ]]; then
-    echo "WINTER SMOKE FAIL: save version is $VERSION (expected 8)"
+if [[ "$VERSION" -ne 9 ]]; then
+    echo "WINTER SMOKE FAIL: save version is $VERSION (expected 9)"
     exit 1
 fi
 
@@ -181,8 +186,8 @@ if [[ "$MOB_COUNT" -ne 0 ]]; then
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ "$SAVE_SIZE" -ne "$V8_SAVE_LEN" ]]; then
-    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $V8_SAVE_LEN for an edit-free v8 save with no content names)"
+if [[ "$SAVE_SIZE" -ne "$V9_SAVE_LEN" ]]; then
+    echo "WINTER SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $V9_SAVE_LEN for an edit-free v9 save with no content names)"
     exit 1
 fi
 

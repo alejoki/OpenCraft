@@ -14,15 +14,16 @@
 #         skeleton ranged/drop proof, and the Creative inertness proof.
 #     (d) a `frame_budget:` line exists with `samples >= 126` and
 #         `p95 <= 16.6 ms`.
-#     (e) the save is exactly the 307-byte v8 witness: magic `MCVX`, version 8
+#     (e) the save is exactly the 317-byte v9 witness: magic `MCVX`, version 9
 #         at offset 4, a 72-byte save-local content table starting at offset 36,
 #         mob count 2 at offset 253, Zombie tag 2 @257 with health 11 @274,
 #         Skeleton tag 3 @276 with health 14 @293, the two 19-byte records
 #         ending at 295, then the 12-byte pack-identity + FNV-1a digest tail
-#         ending exactly at EOF (253 + 4 + 2*19 + 12 == 307).
+#         (295..307) and the 10-byte v9 config tail (307..317) ending exactly
+#         at EOF (253 + 4 + 2*19 + 22 == 317).
 #
 #   Reload leg: `--save c.mcvx --demo-combat` (no `--new`)
-#     (f) exit code 0, no panic, the save still 307 bytes, and the exact
+#     (f) exit code 0, no panic, the save still 317 bytes, and the exact
 #         `combat_demo: seed=1 stage=restored ...` line.
 #
 # The digest values are contractual: the script compares whole lines, never
@@ -111,7 +112,7 @@ trap cleanup EXIT
 OUTER_TIMEOUT=180
 FRAME_P95_TARGET=16.6
 FRAME_SAMPLES_MIN=126
-SAVE_BYTES=307
+SAVE_BYTES=317
 MOB_COUNT_OFFSET=253
 MOB_RECORD_LEN=19
 MOB_COUNT=2
@@ -119,8 +120,10 @@ MOB_COUNT=2
 # raw_porkchop, wood_bow, wood_sword) = u32 count + 7 * (2-byte length + name).
 CONTENT_TABLE_OFFSET=36
 CONTENT_NAME_COUNT=7
-# v8 tail: u32 pack count (zero for the built-in stack) + u64 FNV-1a digest.
-SAVE_TAIL_BYTES=12
+# v9 tail: the v8 u32 pack count (zero for the built-in stack) + u64 FNV-1a
+# digest (12 bytes), then the v9 u16 config schema + u64 effective-value
+# digest (10 bytes).
+SAVE_TAIL_BYTES=22
 
 read_u32_le() {
     od -An -tu4 --endian=little -j "$2" -N 4 "$1" | tr -d ' '
@@ -231,7 +234,7 @@ if ! awk -v p95="$P95_MS" -v target="$FRAME_P95_TARGET" \
     exit 1
 fi
 
-# Save witness: the exact 307-byte v8 layout the fresh leg writes.
+# Save witness: the exact 317-byte v9 layout the fresh leg writes.
 if [[ ! -f "$SAVE" ]]; then
     echo "COMBAT SMOKE FAIL: fresh leg exited 0 but wrote no save at $SAVE"
     exit 1
@@ -250,8 +253,8 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 8 ]]; then
-    echo "COMBAT SMOKE FAIL: save version is $VERSION (expected 8)"
+if [[ "$VERSION" -ne 9 ]]; then
+    echo "COMBAT SMOKE FAIL: save version is $VERSION (expected 9)"
     exit 1
 fi
 
@@ -295,7 +298,7 @@ fi
 
 MOB_TAIL_END=$((MOB_COUNT_OFFSET + 4 + MOB_COUNT * MOB_RECORD_LEN))
 if [[ "$MOB_TAIL_END" -ne $((SAVE_BYTES - SAVE_TAIL_BYTES)) ]]; then
-    echo "COMBAT SMOKE FAIL: mob records end at $MOB_TAIL_END (expected $((SAVE_BYTES - SAVE_TAIL_BYTES)): the 12-byte v8 tail must end at EOF)"
+    echo "COMBAT SMOKE FAIL: mob records end at $MOB_TAIL_END (expected $((SAVE_BYTES - SAVE_TAIL_BYTES)): the 22-byte pack + config tails must end at EOF)"
     exit 1
 fi
 
@@ -306,13 +309,21 @@ if [[ "$PACK_COUNT" -ne 0 ]]; then
     exit 1
 fi
 
-TAIL_END=$((PACK_COUNT_OFFSET + SAVE_TAIL_BYTES))
-if [[ "$TAIL_END" -ne "$SAVE_BYTES" ]]; then
-    echo "COMBAT SMOKE FAIL: v8 tail ends at $TAIL_END (expected EOF at $SAVE_BYTES)"
+# The config schema follows the u32 pack count and the u64 registry digest.
+CONFIG_SCHEMA_OFFSET=$((PACK_COUNT_OFFSET + 4 + 8))
+CONFIG_SCHEMA=$(read_u16_le "$SAVE" "$CONFIG_SCHEMA_OFFSET")
+if [[ "$CONFIG_SCHEMA" -ne 1 ]]; then
+    echo "COMBAT SMOKE FAIL: v9 config schema at offset $CONFIG_SCHEMA_OFFSET is $CONFIG_SCHEMA (expected 1)"
     exit 1
 fi
 
-SAVE_LAYOUT_LINE="save: bytes=${OBSERVED_BYTES} magic=${MAGIC} version=${VERSION} content_names=${CONTENT_NAME_COUNT_OBSERVED} mob_count=${MOB_COUNT_OBSERVED} zombie_tag=${ZOMBIE_TAG} zombie_health=${ZOMBIE_HEALTH} skeleton_tag=${SKELETON_TAG} skeleton_health=${SKELETON_HEALTH} mob_tail_end=${MOB_TAIL_END} pack_count=${PACK_COUNT} tail_end=${TAIL_END}"
+TAIL_END=$((PACK_COUNT_OFFSET + SAVE_TAIL_BYTES))
+if [[ "$TAIL_END" -ne "$SAVE_BYTES" ]]; then
+    echo "COMBAT SMOKE FAIL: v9 tail ends at $TAIL_END (expected EOF at $SAVE_BYTES)"
+    exit 1
+fi
+
+SAVE_LAYOUT_LINE="save: bytes=${OBSERVED_BYTES} magic=${MAGIC} version=${VERSION} content_names=${CONTENT_NAME_COUNT_OBSERVED} mob_count=${MOB_COUNT_OBSERVED} zombie_tag=${ZOMBIE_TAG} zombie_health=${ZOMBIE_HEALTH} skeleton_tag=${SKELETON_TAG} skeleton_health=${SKELETON_HEALTH} mob_tail_end=${MOB_TAIL_END} pack_count=${PACK_COUNT} config_schema=${CONFIG_SCHEMA} tail_end=${TAIL_END}"
 
 # Reload leg: the same save path, no `--new`, so the startup path loads the
 # fresh leg's witness and the demo's one-call Restore proves it.
@@ -352,7 +363,7 @@ if ! grep -q -F -x -e "$RESTORE_LINE" "$RESTORE_OUT"; then
     exit 1
 fi
 
-echo "COMBAT SMOKE PASS [profile=$PROFILE]: seed 1 ran the full --demo-combat capstone (ambient spawn/burn, quartet walk, melee, drops, zombie death/respawn, bow shot, skeleton shot, Creative inertness, v8 save) and restored the 307-byte witness; frame p95 ${P95_MS}ms <= ${FRAME_P95_TARGET}ms with ${SAMPLES} samples"
+echo "COMBAT SMOKE PASS [profile=$PROFILE]: seed 1 ran the full --demo-combat capstone (ambient spawn/burn, quartet walk, melee, drops, zombie death/respawn, bow shot, skeleton shot, Creative inertness, v9 save) and restored the 317-byte witness; frame p95 ${P95_MS}ms <= ${FRAME_P95_TARGET}ms with ${SAMPLES} samples"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "COMBAT SMOKE EVIDENCE: $line"
 done
