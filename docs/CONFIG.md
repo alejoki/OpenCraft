@@ -64,14 +64,95 @@ Diagnostics are ordinary data: the game converts only errors into the warning
 notice shown when the settings menu first opens. Missing files and unknown
 keys stay silent in-game and appear only in `--check-config` output.
 
-### Live reload (S02 forward note)
+### Live reload
 
-The initial S01 contract loads configuration at startup. S02 adds per-file
-live reload: when a file changes, the candidate file is parsed as a whole and
-committed only if it has no error, so a bad save or partial write cannot take
-down the running game. Reload is per-file atomic: one file's rejection keeps
-that file's last good values while other files continue to update. The
-`--check-config` rules below describe the same parser the reload path uses.
+Live reload is a development-build tool. A debug build polls the six files
+about ten times per second and applies a change only after the file's contents
+have stayed unchanged for 250 ms. An editor's atomic temp+rename save, or a
+burst of rapid saves, therefore collapses into one apply instead of several
+partial ones.
+
+The settle window alone cannot make a paused mid-write save safe: the bytes
+can still be syntactically valid TOML. Reload therefore applies a whole file or
+nothing. Any error in a file — invalid TOML, a wrong type, an out-of-range or
+non-finite value, or a cross-field violation — rejects that entire file and
+keeps its last good values and origins. Other files still apply normally in
+the same window, so one bad file never blocks a sibling's valid edit.
+
+Startup and live reload deliberately differ:
+
+- Startup falls back per field, so one bad value does not erase the rest of
+  the file. Live reload rejects the whole owning file on any error.
+- `--check-config` treats an empty file as all defaults, because it audits what
+  startup would load. Live reload treats an empty file, a comment-only file,
+  or a file with no recognized keys as an incomplete write and rejects it with
+  `file is empty; keeping last good values` or
+  `file has no recognized keys; keeping last good values`.
+- A missing file is a valid reset, not an error: its keys return to registry
+  defaults and the usual missing-file warning appears.
+
+An unknown key is not an error in either path: it is reported as a warning and
+ignored while the rest of the file applies, so renaming a key to a typo quietly
+returns that value to its default. A file with no recognized keys at all is
+caught by the incomplete-write guard above.
+
+The digest moves only when a file is actually committed, and only when its
+effective values change. That makes common edits predictable:
+
+- Editing comments, whitespace, table order, or numeric formatting re-parses
+  the file and reports an apply with no changed values. Values, origins, and
+  the digest stay as they were.
+- Adding a key that was previously absent changes its origin from default to
+  file even when it spells out the default value. The overlay drops the `*`
+  marker, `changed` counts the provenance change, and the digest stays the
+  same when the effective value does.
+- Setting a key that is still present in the file back to its default leaves
+  its origin as file, so the overlay shows it unmarked; the digest moves only
+  if the effective value actually changes.
+- Deleting a file restores that file's defaults and origins; the digest moves
+  if the live values were not already the defaults.
+
+## Creator tools (dev builds)
+
+Debug builds add two tools on top of live reload. Release builds load
+`config/` at startup exactly like debug builds and still support
+`--check-config`, but contain no watcher, no overlay, and no creator trace
+output; the creator tools are not available in release.
+
+### F6 overlay
+
+F6 toggles a read-only overlay; it has no editing controls and is off by
+default. The overlay groups every curated key under its `config/<file>` header
+and shows the current value. A `*` marks a value whose origin is still the
+registry default; an unmarked value came from the file, even when it happens
+to equal the default. Each file header also shows that file's apply mode
+(`[live]`).
+
+The overlay header shows the live digest, schema version, file count, files
+with a write still settling, and warning and error counts, followed by the
+last reload status. When an active restart requirement exists, a
+`restart required:` line names the reason. For a file with errors, the overlay
+shows the first error and a count of any additional errors.
+
+A rejected edit also produces a transient in-game message shaped
+`config/<file>: <key>: <reason>`, for example
+`config/player.toml: movement.walk_speed: value 0 is below minimum 0.5`.
+File-level rejections omit the key.
+
+### `--creator-trace`
+
+Pass `--creator-trace` on the command line to print one stable,
+timestamp-free line to stdout for each reloaded file:
+
+```text
+creator: applied file=config/player.toml changed=2 digest=0x...
+creator: rejected file=config/player.toml field=movement.walk_speed reason=value 0 is below minimum 0.5
+```
+
+File-level rejections omit `field`. Lines follow the order in which files
+settle, so a trace can be diffed across runs. The trace is an explicit opt-in
+even in a debug build: normal runs and `--demo-*` runs without the flag print
+nothing.
 
 ## Checking a config tree
 
@@ -125,10 +206,13 @@ the schema version so a save can notice that gameplay tuning changed.
 
 ## Development and release
 
-Configuration loading works in both development and release builds. The
-watcher, tuning overlay, and creator-only flags are development-only; release
-rejection for those flags lands in S09. No release build is required to edit
-`config/`; use `--check-config` in either build to validate before launching.
+Configuration loading works in both development and release builds. Debug
+builds also run the live loop described in [Live reload](#live-reload) and the
+[creator tools](#creator-tools-dev-builds). Release builds still load
+`config/` at startup and still support `--check-config`, but they contain no
+watcher, no F6 overlay, and no creator trace output. The creator tools are not
+available in release. No release build is required to edit `config/`; use
+`--check-config` in either build to validate before launching.
 
 ## Not in the curated registry
 

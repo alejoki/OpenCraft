@@ -10091,11 +10091,8 @@ impl ApplicationHandler for GameApp {
         // Read-only F6 creator overlay (M014/S02-T06): compact metrics keep
         // the registry readout inside the viewport at 720p. Hidden by
         // default; the buffer is only shaped while visible.
-        let creator_text = StatsOverlay::with_metrics(
-            &mut ui.font_system,
-            CREATOR_FONT_SIZE,
-            CREATOR_LINE_HEIGHT,
-        );
+        let creator_text =
+            StatsOverlay::with_metrics(&mut ui.font_system, CREATOR_FONT_SIZE, CREATOR_LINE_HEIGHT);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
         let title_text = StatsOverlay::with_metrics(
             &mut ui.font_system,
@@ -11703,8 +11700,7 @@ impl ApplicationHandler for GameApp {
                             .floor() as usize)
                             .max(16);
                         self.creator_overlay_text =
-                            watch::overlay_lines(&self.config, &self.creator, max_chars)
-                                .join("\n");
+                            watch::overlay_lines(&self.config, &self.creator, max_chars).join("\n");
                         self.creator_overlay_dirty = false;
                     }
                     gpu.creator_text.update(
@@ -11719,8 +11715,7 @@ impl ApplicationHandler for GameApp {
                         x: OVERLAY_TEXT_LEFT - 6.0,
                         y,
                         w: (gpu.creator_text.measured_width() + 16.0).min(surface_w),
-                        h: (line_count as f32 * CREATOR_LINE_HEIGHT + 8.0)
-                            .min(surface_h - y),
+                        h: (line_count as f32 * CREATOR_LINE_HEIGHT + 8.0).min(surface_h - y),
                         color: [0.0, 0.0, 0.0, 0.4],
                     });
                 }
@@ -12323,10 +12318,10 @@ impl ApplicationHandler for GameApp {
                 // stats area so the compact readout never hides the stats
                 // line. A hidden overlay or a release build adds no area.
                 if watch::CREATOR_TOOLS && self.creator.overlay_visible {
-                    areas.push(gpu.creator_text.text_area(
-                        OVERLAY_TEXT_LEFT,
-                        OVERLAY_TEXT_TOP + LINE_HEIGHT + 12.0,
-                    ));
+                    areas.push(
+                        gpu.creator_text
+                            .text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP + LINE_HEIGHT + 12.0),
+                    );
                 }
                 // The vista title draws before (under) the screen text, so a
                 // panel containing the title still wins visually.
@@ -33170,9 +33165,16 @@ stack = 64
         let quads_at = redraw
             .find("gpu.ui.set_quads(")
             .expect("the UI pass must upload quads in RedrawRequested");
-        let area_at = redraw
-            .find("gpu.creator_text.text_area(")
+        let area_at = redraw[quads_at..]
+            .find("gpu.creator_text")
+            .map(|offset| quads_at + offset)
             .expect("the overlay text area must be built in RedrawRequested");
+        let area = &redraw[area_at..];
+        let area = &area[..area.find(')').expect("the text area call must close")];
+        assert!(
+            area.contains(".text_area("),
+            "the creator buffer must build a text area: {area}"
+        );
         assert!(
             update_at < quads_at,
             "the creator buffer must be shaped before its panel quad upload"
@@ -33193,12 +33195,15 @@ stack = 64
         let stats_area_at = redraw
             .find("let stats_text_area = gpu.stats.text_area(")
             .expect("the stats text area must stay the first area");
-        let creator_area_at = redraw
-            .find("areas.push(gpu.creator_text.text_area(")
+        let push_at = redraw[stats_area_at..]
+            .find("areas.push(")
+            .map(|offset| stats_area_at + offset)
             .expect("the creator text area must be pushed after the stats area");
+        let pushed = &redraw[push_at..];
+        let pushed = &pushed[..pushed.find(");").expect("the areas push must close")];
         assert!(
-            stats_area_at < creator_area_at,
-            "the stats text must remain the first text area"
+            pushed.contains("gpu.creator_text") && pushed.contains(".text_area("),
+            "the creator text area must be pushed after the stats area: {pushed}"
         );
     }
 
@@ -33213,12 +33218,14 @@ stack = 64
             .next()
             .expect("resumed must end before window_event");
         let creator_at = resumed
-            .find("let creator_text = StatsOverlay::with_metrics(")
+            .find("let creator_text")
             .expect("resumed must build the creator buffer");
         let creator = &resumed[creator_at..];
         let creator = &creator[..creator.find(");").expect("the metrics call must close")];
         assert!(
-            creator.contains("CREATOR_FONT_SIZE") && creator.contains("CREATOR_LINE_HEIGHT"),
+            creator.contains("StatsOverlay::with_metrics(")
+                && creator.contains("CREATOR_FONT_SIZE")
+                && creator.contains("CREATOR_LINE_HEIGHT"),
             "the creator overlay must use its compact metrics: {creator}"
         );
     }
