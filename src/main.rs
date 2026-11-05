@@ -22,7 +22,7 @@ use opencraft::content::{
     ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule, PACK_LAYER_BASE,
 };
 use opencraft::mesh::quad::ChunkMesh;
-use opencraft::pack::presentation::{LayerInput, PackPresentation};
+use opencraft::pack::presentation::{ContentFingerprint, LayerInput, PackPresentation};
 use opencraft::pack::spec::PackSpec;
 use opencraft::pack::watch::{PackFileKind, PackWatch, PackWatchEntry};
 use opencraft::pack::{self, LoadedPack};
@@ -137,6 +137,11 @@ const OVERLAY_TEXT_TOP: f32 = 8.0;
 /// this only guarantees the whole readout fits the viewport.
 const CREATOR_FONT_SIZE: f32 = 14.0;
 const CREATOR_LINE_HEIGHT: f32 = 17.0;
+
+/// Deferred-content wording shared by the Packs screen digest warning and the
+/// live manifest restart guard. One spelling keeps the creator surfaces and
+/// their tests from drifting.
+const PACK_RESTART_WORDING: &str = "content changes apply when the world is loaded again";
 
 /// Message-expiry tick interval: the loop runs in `ControlFlow::Poll`,
 /// potentially far above 60 fps, while `menu::MESSAGE_TICKS` is calibrated
@@ -8429,6 +8434,11 @@ struct GameApp {
     /// `RedrawRequested` must upload individually. Cleared by every full
     /// compose, which already covers the whole array.
     pack_layer_uploads: BTreeSet<u32>,
+    /// Pack folders whose settled `pack.toml` edit changes the content
+    /// fingerprint (digest or pack layer/icon counts) and therefore needs a
+    /// restart. Sorted by folder name; never used to touch live allocation.
+    /// Cleared only by a user-initiated stack apply.
+    pack_restart_folders: BTreeSet<String>,
     /// The launch pack-stack registry: the base every new/loaded world is
     /// resolved against and the reference for a live pack-change digest
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
@@ -8816,6 +8826,7 @@ impl GameApp {
             pack_presentation,
             pack_watch,
             pack_layer_uploads: BTreeSet::new(),
+            pack_restart_folders: BTreeSet::new(),
             session_registry,
             config,
             config_dir,
@@ -9053,10 +9064,7 @@ impl GameApp {
     fn apply_settled_pack_entry(&mut self, entry: PackWatchEntry) {
         let pack_dir = self.packs_root.join(&entry.folder);
         match entry.kind {
-            PackFileKind::Manifest => {
-                // T05 owns manifest content/allocation changes; this task only
-                // observes the entry so the shared settle machine is complete.
-            }
+            PackFileKind::Manifest => self.apply_settled_pack_manifest(&entry),
             PackFileKind::BaseLayer(layer) => {
                 let Some(file) = entry.path.file_name() else {
                     return;
@@ -9098,6 +9106,125 @@ impl GameApp {
                 }
             }
         }
+    }
+
+    /// Evaluate one settled `pack.toml` edit without touching live allocation.
+    ///
+    /// A missing or syntactically invalid manifest keeps the last good
+    /// presentation and reports one rejection line (no restart flag). A valid
+    /// manifest is re-read into a candidate spec stack that preserves the
+    /// installed stack order and every other installed spec, so only the
+    /// edited folder can change the content fingerprint. Equal fingerprints
+    /// clear this folder's restart requirement (a texture-only manifest edit,
+    /// or a revert); a different fingerprint records one. Neither branch
+    /// assigns either registry, mutates the presentation, or queues an upload.
+    fn apply_settled_pack_manifest(&mut self, entry: &PackWatchEntry) {
+        let Some(presentation) = self.pack_presentation.as_ref() else {
+            return;
+        };
+        let installed_fingerprint = presentation.fingerprint;
+        let installed_specs = presentation.specs.clone();
+        let text = match std::fs::read_to_string(&entry.path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.reject_pack_entry(entry, &format!("failed to read: {err}"));
+                return;
+            }
+        };
+        let (_manifest, root, warnings) = pack::manifest::parse_pack_file(&text);
+        if root.is_none() {
+            let reason = warnings
+                .first()
+                .map(|warning| warning.reason.clone())
+                .unwrap_or_else(|| "invalid TOML".to_string());
+            self.reject_pack_entry(entry, &reason);
+            return;
+        }
+
+        // Rebuild only the edited folder; every other stack entry reuses the
+        // installed spec so a folder that was missing at install cannot start
+        // contributing content just because it exists now. Order is the
+        // frozen stack order, which is what the registry digest encodes.
+        let mut candidate_specs = Vec::with_capacity(self.settings.pack_stack.len());
+        let mut found_target = false;
+        for folder in &self.settings.pack_stack {
+            if folder == &entry.folder {
+                candidate_specs.push(pack::spec::load_spec_from_dir(
+                    &self.packs_root.join(folder),
+                ));
+                found_target = true;
+            } else if let Some(spec) = installed_specs.iter().find(|spec| &spec.folder == folder) {
+                candidate_specs.push(spec.clone());
+            }
+        }
+        if !found_target {
+            // The watch entry outlived its stack slot; nothing to compare.
+            return;
+        }
+
+        let (candidate, _report) = build_session_registry(&candidate_specs);
+        let candidate_fingerprint = ContentFingerprint::from_registry(&candidate);
+        let changed = candidate_fingerprint != installed_fingerprint;
+        if changed {
+            self.pack_restart_folders.insert(entry.folder.clone());
+        } else {
+            self.pack_restart_folders.remove(&entry.folder);
+        }
+
+        let restart = self.pack_restart_reason();
+        match restart {
+            Some(reason) => {
+                self.creator.set_restart_required(reason.clone());
+                self.creator.set_pack_status(Some(reason.clone()));
+                self.creator.last_error = None;
+                self.creator_overlay_dirty = true;
+                let notice =
+                    format!("{reason} | content changes apply when the world is loaded again");
+                self.packs_message = Some(MenuMessage {
+                    text: notice.clone(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                self.game_message = Some(MenuMessage {
+                    text: notice,
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                // Exactly one stable line per edit that raises the flag; a
+                // revert or an identity-preserving manifest edit emits none.
+                if changed {
+                    self.emit_pack_trace(pack::watch::restart_line(&reason));
+                }
+            }
+            None => {
+                self.creator.clear_restart_required();
+                self.creator.set_pack_status(None);
+                self.creator.last_error = None;
+                self.creator_overlay_dirty = true;
+                // The pending restart notice is no longer true; any other
+                // Packs-screen warning stays untouched.
+                if self
+                    .packs_message
+                    .as_ref()
+                    .is_some_and(|message| message.text.contains(PACK_RESTART_WORDING))
+                {
+                    self.packs_message = None;
+                }
+            }
+        }
+    }
+
+    /// Current restart requirement built from the sorted folder set, or
+    /// `None` when every pending manifest edit matches the installed content.
+    fn pack_restart_reason(&self) -> Option<String> {
+        if self.pack_restart_folders.is_empty() {
+            return None;
+        }
+        let folders = self
+            .pack_restart_folders
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("{folders}: content changed; restart to apply"))
     }
 
     /// Apply one decoded base-layer edit and queue its upload when visible.
@@ -9336,6 +9463,8 @@ impl GameApp {
         self.pack_presentation =
             loaded.map(|pack| PackPresentation::build(pack, specs, &candidate));
         self.pack_layer_uploads.clear();
+        self.pack_restart_folders.clear();
+        self.creator.clear_restart_required();
         self.pack_watch = build_pack_watch(
             self.pack_presentation.as_ref(),
             &self.packs_root,
@@ -9354,7 +9483,7 @@ impl GameApp {
         } else {
             let mut lines = menu::format_warnings(&warnings);
             if changed {
-                lines.push("content changes apply when the world is loaded again".to_string());
+                lines.push(PACK_RESTART_WORDING.to_string());
             }
             self.packs_message = Some(MenuMessage {
                 text: lines.join(" | "),
@@ -20164,7 +20293,9 @@ stack = 64
         app.pack_presentation = None;
         app.pack_watch = None;
         app.pack_layer_uploads.clear();
+        app.pack_restart_folders.clear();
         app.creator.pack_status = None;
+        app.creator.clear_restart_required();
         app
     }
 
@@ -34049,6 +34180,356 @@ stack = 64
         assert!(
             emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
             "pack traces need the dev build AND --creator-trace"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S03-T05: manifest content guard and restart-required
+    // -----------------------------------------------------------------------
+
+    /// Rewrite `pack.toml` as a v2 manifest whose one block references a new
+    /// PNG. This changes both the content digest and the pack-layer count, so
+    /// every frozen-fingerprint comparison must report a restart.
+    fn write_v2_block_manifest(pack: &Path) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+    }
+
+    #[test]
+    fn pack_manifest_add_block_sets_restart_required_without_moving_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        assert!(app.pack_layer_uploads.is_empty());
+
+        let (base_layers, pack_layers, base_sources, pack_layer_sources, fingerprint) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.base_sources.clone(),
+                presentation.pack_layer_sources.clone(),
+                presentation.fingerprint,
+            )
+        };
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+
+        let reason = app
+            .creator
+            .restart_required
+            .as_deref()
+            .expect("content change requires a restart");
+        assert_eq!(reason, "textures: content changed; restart to apply");
+        assert_eq!(app.creator.pack_status.as_deref(), Some(reason));
+        assert!(app.creator.last_error.is_none());
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a manifest change must never queue a live upload"
+        );
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.base_sources, base_sources);
+        assert_eq!(presentation.pack_layer_sources, pack_layer_sources);
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "the frozen watch list survives a manifest edit"
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a manifest edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+
+        let message = app.packs_message.as_ref().expect("packs restart notice");
+        assert!(
+            message.text.contains(PACK_RESTART_WORDING),
+            "deferred content wording: {}",
+            message.text
+        );
+        assert!(app
+            .game_message
+            .as_ref()
+            .expect("one transient notice")
+            .text
+            .contains(PACK_RESTART_WORDING));
+
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(overlay.contains("packs: "), "{overlay}");
+        assert!(overlay.contains("restart required:"), "{overlay}");
+        assert!(overlay.contains(reason), "{overlay}");
+    }
+
+    #[test]
+    fn pack_manifest_revert_clears_restart_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+
+        // Restoring the installed manifest content must satisfy the pending
+        // restart without touching the live layers it was already showing.
+        let t1 = t0 + Duration::from_secs(1);
+        write_pack_fixture(&pack, "textures");
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert_eq!(app.creator.pack_status, None);
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a revert queues no uploads"
+        );
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before
+        );
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(!overlay.contains("restart required:"), "{overlay}");
+    }
+
+    #[test]
+    fn pack_manifest_invalid_toml_keeps_last_good_and_does_not_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("pack.toml"), "format_version = 2\n[[blocks]\n")
+            .expect("write corrupt manifest");
+        settle_pack(&mut app, t0);
+
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(
+            status.starts_with("packs/textures/pack.toml: invalid TOML: "),
+            "{status}"
+        );
+        assert!(!status.contains('\n'));
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before,
+            "a corrupt manifest keeps the last good presentation"
+        );
+        assert!(app
+            .game_message
+            .as_ref()
+            .expect("one transient notice")
+            .text
+            .starts_with("packs/textures/pack.toml: "));
+    }
+
+    #[test]
+    fn pack_manifest_texture_edit_after_restart_flag_still_applies_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+        app.pack_layer_uploads.clear();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_solid_png(&pack.join("stone.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32]),
+            "a texture edit still applies at the frozen index"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[1, 2, 3, 255]
+        );
+        assert!(
+            app.creator.restart_required.is_some(),
+            "a live texture edit never clears a pending manifest restart"
+        );
+    }
+
+    #[test]
+    fn pack_manifest_missing_file_keeps_last_good_and_does_not_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::remove_file(pack.join("pack.toml")).expect("delete manifest");
+        settle_pack(&mut app, t0);
+
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(
+            status.starts_with("packs/textures/pack.toml: failed to read: "),
+            "{status}"
+        );
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before,
+            "a missing manifest keeps the last good presentation"
+        );
+        assert!(app.game_message.is_some(), "one transient notice");
+    }
+
+    #[test]
+    fn pack_manifest_creator_overlay_shows_pack_status_and_restart_reason() {
+        let runtime = ConfigRuntime::defaults();
+        let mut creator = CreatorRuntime::new(Instant::now());
+
+        creator.set_pack_status(Some(
+            "textures: content changed; restart to apply".to_string(),
+        ));
+        creator.set_restart_required("textures: content changed; restart to apply");
+        let both = watch::overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(
+            both.contains("packs: textures: content changed; restart to apply"),
+            "{both}"
+        );
+        assert!(
+            both.contains("restart required: textures: content changed; restart to apply"),
+            "{both}"
+        );
+
+        creator.set_pack_status(None);
+        let cleared = watch::overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(!cleared.contains("packs:"), "{cleared}");
+        assert!(
+            cleared.contains("restart required: textures: content changed; restart to apply"),
+            "{cleared}"
+        );
+    }
+
+    #[test]
+    fn pack_manifest_watcher_never_rebuilds_the_stack_and_stays_gated() {
+        let source = include_str!("main.rs");
+        let watcher = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_base_layer_upload(")
+            .next()
+            .expect("the watcher path must end before the per-layer apply");
+        assert!(
+            watcher.contains("fn apply_settled_pack_manifest("),
+            "the manifest arm must be handled in the watcher path"
+        );
+        assert!(
+            watcher.contains("PackFileKind::Manifest"),
+            "the manifest kind must be dispatched"
+        );
+        assert!(
+            !watcher.contains("apply_pack_stack("),
+            "no watch path may rebuild the stack"
+        );
+        assert!(watcher.contains("!watch::CREATOR_TOOLS"));
+
+        let handler = source
+            .split("fn apply_settled_pack_manifest(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_pack_manifest")
+            .split("fn pack_restart_reason(")
+            .next()
+            .expect("the manifest handler must end before the reason helper");
+        assert_eq!(
+            handler.matches("pack::watch::restart_line(").count(),
+            1,
+            "exactly one restart trace line per settled manifest edit"
+        );
+        assert!(!handler.contains("self.base_registry ="));
+        assert!(!handler.contains("self.session_registry ="));
+        assert!(!handler.contains("self.pack_presentation ="));
+        assert!(!handler.contains("self.pack_presentation.as_mut()"));
+        assert!(!handler.contains("self.pack_layer_uploads.insert"));
+
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(
+            emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
+            "pack status/trace stays behind the dev build AND --creator-trace"
         );
     }
 }
