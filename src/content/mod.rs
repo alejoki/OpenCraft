@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use crate::player::inventory::{
     self, Item, ItemId, Recipe, ToolKind, ToolTier, MATERIAL_STACK_LIMIT, MAX_STACK_COUNT, RECIPES,
 };
-use crate::player::tools;
+use crate::player::tools::{self, ToolRules};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 use crate::world::terrain::Biome;
 
@@ -534,9 +534,29 @@ impl ContentRegistry {
     /// index falls back to bare-hand timing. Unknown ids and unbreakable
     /// definitions return `None`.
     pub fn break_duration(&self, block: BlockId, selected: Option<Item>) -> Option<f32> {
+        self.break_duration_with_rules(block, selected, &ToolRules::default())
+    }
+
+    /// [`Self::break_duration`] with live [`ToolRules`] for built-in tiers.
+    ///
+    /// The live tuning only reaches the built-in `Tool { kind, tier }` path.
+    /// A pack tool keeps its authored [`TierDef::speed`] and is therefore
+    /// byte-identical to [`Self::break_duration`]; the mined `mining.toml`
+    /// rows can never retune a pack's own tier table.
+    pub fn break_duration_with_rules(
+        &self,
+        block: BlockId,
+        selected: Option<Item>,
+        rules: &ToolRules,
+    ) -> Option<f32> {
         let def = self.block(block)?;
         if !matches!(selected.map(|item| item.id()), Some(ItemId::ModTool(_))) {
-            return tools::break_duration_for(def.hardness, def.tool_class, selected);
+            return tools::break_duration_for_with_rules(
+                def.hardness,
+                def.tool_class,
+                selected,
+                rules,
+            );
         }
         let Some(ItemId::ModTool(index)) = selected.map(|item| item.id()) else {
             unreachable!("the match above proved a pack tool identity");
@@ -1475,6 +1495,50 @@ mod tests {
         assert_eq!(registry.break_duration(ruby, None), Some(0.5));
         registry.blocks[usize::from(ruby.to_raw())].hardness = None;
         assert_eq!(registry.break_duration(ruby, None), None);
+    }
+
+    #[test]
+    fn break_duration_with_rules_retunes_builtins_and_leaves_pack_tiers_alone() {
+        let rules = ToolRules {
+            wood_speed_multiplier: 8,
+            stone_speed_multiplier: 12,
+            iron_speed_multiplier: 16,
+        };
+        let registry = ContentRegistry::builtin();
+        let wood_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("built-in pickaxe");
+        assert_eq!(
+            registry.break_duration_with_rules(BlockId::Stone, Some(wood_pickaxe), &rules),
+            Some(1.2 / 8.0)
+        );
+        assert_eq!(
+            registry.break_duration(BlockId::Stone, Some(wood_pickaxe)),
+            Some(1.2 / 2.0),
+            "the default wrapper keeps the pinned 2x wood timing"
+        );
+
+        // A pack tool keeps its authored tier speed even under a tuned bundle:
+        // the mined.toml tier rows only retune the built-in economy.
+        let (mut registry, [ruby, ..]) = registry_with_drops();
+        let ruby_block = usize::from(ruby.to_raw());
+        registry.blocks[ruby_block].hardness = Some(3.0);
+        registry.blocks[ruby_block].tool_class = Some(ToolKind::Pickaxe);
+        let ruby_pickaxe = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        assert_eq!(
+            registry.break_duration_with_rules(ruby, Some(ruby_pickaxe), &rules),
+            Some(3.0 / 9.0)
+        );
+        assert_eq!(
+            registry.break_duration(ruby, Some(ruby_pickaxe)),
+            Some(3.0 / 9.0),
+            "the pack tier path is byte-identical with and without rules"
+        );
     }
 
     #[test]

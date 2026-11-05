@@ -60,6 +60,7 @@ pub struct CropAdvance {
 #[derive(Debug, Default)]
 pub struct CropRuntime {
     growth: FxHashMap<IVec3, f32>,
+    rules: FarmingRules,
 }
 
 impl CropRuntime {
@@ -98,6 +99,23 @@ impl CropRuntime {
         self.growth.remove(&pos);
     }
 
+    /// The crop growth tuning this runtime simulates with.
+    pub fn rules(&self) -> FarmingRules {
+        self.rules
+    }
+
+    /// Installs live crop growth tuning without touching banked progress.
+    ///
+    /// A non-finite or non-positive stage duration is ignored so a malformed
+    /// reload can neither stall growth nor make every crop mature at once;
+    /// the previous duration stays in force.
+    pub fn set_rules(&mut self, rules: FarmingRules) {
+        if !rules.wheat_stage_game_secs.is_finite() || rules.wheat_stage_game_secs <= 0.0 {
+            return;
+        }
+        self.rules = rules;
+    }
+
     /// Number of tracked candidates.
     pub fn len(&self) -> usize {
         self.growth.len()
@@ -128,8 +146,9 @@ impl CropRuntime {
     ///   [`BlockId::Farmland`] is removed. A non-resident support chunk is not
     ///   read and not treated as missing support.
     /// - While `paused` (Winter), a valid crop keeps its progress unchanged.
-    /// - Otherwise progress grows by `game_dt`, one
-    ///   [`WHEAT_STAGE_GAME_SECS`] is consumed per stage, and crops that
+    /// - Otherwise progress grows by `game_dt`, one configured
+    ///   [`FarmingRules::wheat_stage_game_secs`] (default
+    ///   [`WHEAT_STAGE_GAME_SECS`]) is consumed per stage, and crops that
     ///   crossed at least one stage produce one [`CropAdvance`] with their
     ///   final stage. Reaching stage 3 removes the candidate; otherwise the
     ///   leftover progress is retained.
@@ -177,6 +196,9 @@ impl CropRuntime {
                 continue;
             }
 
+            // Copy the live stage duration before taking the mutable progress
+            // borrow: `set_rules` may have changed it since the last tick.
+            let stage_secs = self.rules.wheat_stage_game_secs;
             let Some(progress) = self.growth.get_mut(&pos) else {
                 continue;
             };
@@ -184,7 +206,7 @@ impl CropRuntime {
 
             // Integer stage division keeps a huge finite dt from looping once
             // per elapsed stage; `next_wheat_stage` still owns stage order.
-            let stage_steps = (*progress / WHEAT_STAGE_GAME_SECS).floor() as u32;
+            let stage_steps = (*progress / stage_secs).floor() as u32;
             let mut to = live;
             let mut advanced_stages = 0u32;
             while advanced_stages < stage_steps {
@@ -195,7 +217,7 @@ impl CropRuntime {
                 advanced_stages += 1;
             }
             if advanced_stages > 0 {
-                *progress -= advanced_stages as f32 * WHEAT_STAGE_GAME_SECS;
+                *progress -= advanced_stages as f32 * stage_secs;
                 advances.push(CropAdvance {
                     pos,
                     from: live,
@@ -346,6 +368,85 @@ mod tests {
         );
         assert_eq!(runtime.progress(pos), Some(0.0));
         assert_eq!(runtime.len(), 1);
+    }
+
+    #[test]
+    fn tick_uses_the_configured_stage_seconds() {
+        let pos = IVec3::new(3, 4, 5);
+
+        // The default 60 s stage means 10 game seconds are not enough.
+        let mut default_runtime = runtime_at(&[pos]);
+        assert_eq!(
+            default_runtime.rules(),
+            FarmingRules::default(),
+            "a new runtime starts on the pinned default"
+        );
+        assert!(default_runtime
+            .tick(
+                10.0,
+                false,
+                |_| true,
+                one_crop_on_farmland(pos, BlockId::WheatStage0)
+            )
+            .is_empty());
+        assert_eq!(default_runtime.progress(pos), Some(10.0));
+
+        // A fresh runtime with a tuned 10 s stage advances in the same time.
+        let mut tuned = runtime_at(&[pos]);
+        tuned.set_rules(FarmingRules {
+            wheat_stage_game_secs: 10.0,
+        });
+        assert_eq!(tuned.rules().wheat_stage_game_secs, 10.0);
+        let advances = tuned.tick(
+            10.0,
+            false,
+            |_| true,
+            one_crop_on_farmland(pos, BlockId::WheatStage0),
+        );
+        assert_eq!(
+            advances,
+            vec![CropAdvance {
+                pos,
+                from: BlockId::WheatStage0,
+                to: BlockId::WheatStage1,
+            }]
+        );
+        assert_eq!(tuned.progress(pos), Some(0.0));
+    }
+
+    #[test]
+    fn set_rules_ignores_non_finite_and_non_positive_stage_seconds() {
+        let pos = IVec3::new(0, 0, 0);
+        let mut runtime = runtime_at(&[pos]);
+        runtime.set_rules(FarmingRules {
+            wheat_stage_game_secs: 10.0,
+        });
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            runtime.set_rules(FarmingRules {
+                wheat_stage_game_secs: bad,
+            });
+            assert_eq!(
+                runtime.rules().wheat_stage_game_secs,
+                10.0,
+                "stage seconds {bad} must be ignored"
+            );
+        }
+        // The retained 10 s duration still advances; a zero duration would
+        // otherwise mature the crop on any positive tick.
+        let advances = runtime.tick(
+            10.0,
+            false,
+            |_| true,
+            one_crop_on_farmland(pos, BlockId::WheatStage0),
+        );
+        assert_eq!(
+            advances,
+            vec![CropAdvance {
+                pos,
+                from: BlockId::WheatStage0,
+                to: BlockId::WheatStage1,
+            }]
+        );
     }
 
     #[test]

@@ -1654,16 +1654,17 @@ impl WorldSession {
 
     /// Applies effective gameplay tuning to this session.
     ///
-    /// Movement rules go to the player, projection planes to the camera, and
-    /// the live day length to the session clock. The camera
-    /// position/orientation, the world, and the clock's calendar
-    /// (`day_index`/`time_of_day`/sub-tick remainder) are deliberately
-    /// untouched, so a caller can re-apply rules mid-frame without moving the
-    /// view or jumping time. S01 calls this once at startup; S02 re-applies
-    /// after a live config reload.
+    /// Movement rules go to the player, projection planes to the camera,
+    /// crop growth cadence to the crop runtime, and the live day length to the
+    /// session clock. The camera position/orientation, the world, and the
+    /// clock's calendar (`day_index`/`time_of_day`/sub-tick remainder) are
+    /// deliberately untouched, so a caller can re-apply rules mid-frame
+    /// without moving the view or jumping time. S01 calls this once at
+    /// startup; S02 re-applies after a live config reload.
     pub fn apply_rules(&mut self, rules: &RulesBundle) {
         self.gameplay_rules = *rules;
         self.spawn_runtime.set_rules(rules.spawning);
+        self.crops.set_rules(rules.farming);
         self.clock.set_day_seconds(rules.clock.day_seconds);
         self.player.movement = rules.movement;
         self.camera.z_near = rules.camera.z_near;
@@ -1777,8 +1778,8 @@ impl WorldSession {
     }
 
     /// Opens the crafting table at `pos` only when the *live* world block
-    /// there is a crafting table and the player's eye is within
-    /// [`TABLE_INTERACT_REACH`].
+    /// there is a crafting table and the player's eye is within the configured
+    /// [`InteractionRules::table_reach`] (default [`TABLE_INTERACT_REACH`]).
     ///
     /// `pos` is treated as untrusted (it comes from a raycast or any caller),
     /// so the world is re-read at interaction time. A missing/wrong/replaced/
@@ -1808,10 +1809,11 @@ impl WorldSession {
     /// through to its normal placement/interaction path, so a non-table click
     /// behaves exactly as it did before table stations existed.
     pub fn try_open_targeted_table(&mut self) -> Option<IVec3> {
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
         let hit = raycast_voxels(
             self.camera.position,
             self.camera.forward(),
-            TABLE_INTERACT_REACH,
+            reach,
             |x, y, z| self.world.get_block(x, y, z),
         )?;
         if self.open_table_at(hit.block_pos) {
@@ -1845,7 +1847,8 @@ impl WorldSession {
     }
 
     /// Opens the chest at `pos` only when the *live* world block there is a
-    /// container and the player's eye is within [`TABLE_INTERACT_REACH`].
+    /// container and the player's eye is within the configured
+    /// [`InteractionRules::table_reach`] (default [`TABLE_INTERACT_REACH`]).
     ///
     /// `pos` is untrusted, so the world is re-read at interaction time. A
     /// generated LootChest materializes its deterministic record on first
@@ -1879,10 +1882,11 @@ impl WorldSession {
     /// non-container block, or the hit is out of reach. The caller then falls
     /// through to its normal placement/interaction path.
     pub fn try_open_targeted_chest(&mut self) -> Option<IVec3> {
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
         let hit = raycast_voxels(
             self.camera.position,
             self.camera.forward(),
-            TABLE_INTERACT_REACH,
+            reach,
             |x, y, z| self.world.get_block(x, y, z),
         )?;
         if self.open_chest_at(hit.block_pos) {
@@ -1959,14 +1963,15 @@ impl WorldSession {
     }
 
     /// Reach check against the block's axis-aligned box: the player may
-    /// interact when the nearest point of the station block is within
-    /// [`TABLE_INTERACT_REACH`] of the eye. Shared by the table and chest
-    /// stations so both use one reach budget.
+    /// interact when the nearest point of the station block is within the
+    /// live [`InteractionRules::table_reach`] of the eye. Shared by the table
+    /// and chest stations so both use one reach budget.
     fn station_within_reach(&self, pos: IVec3) -> bool {
         let eye = self.player.eye_position();
         let min = pos.as_vec3();
         let closest = eye.clamp(min, min + Vec3::ONE);
-        eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
+        eye.distance_squared(closest) <= reach * reach
     }
 
     /// Whether a block edit at `pos` can produce remesh work right now.
@@ -2196,6 +2201,7 @@ mod tests {
     use crate::world::arrow::ArrowRules;
     use crate::world::block::BlockId;
     use crate::world::daycycle::{ClockRules, DEFAULT_TIME_OF_DAY};
+    use crate::world::farming::FarmingRules;
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -3303,6 +3309,75 @@ mod tests {
             "a table beyond the reach budget must not open"
         );
         assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_tuned_reach_finds_a_table_beyond_the_default_ray_length() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(10, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        // Eye at y ~= 5.62, so a level yaw-0 ray crosses the table block at
+        // x = 10: eye-to-nearest-block-point is ~9.5 blocks.
+        session.player.position = Vec3::new(0.5, 4.0, 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+
+        assert_eq!(
+            session.try_open_targeted_table(),
+            None,
+            "the default 8-block ray must not reach a 9.5-block table"
+        );
+        assert_eq!(session.open_table_position(), None);
+
+        let rules = RulesBundle {
+            interaction: InteractionRules { table_reach: 12.0 },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().interaction.table_reach, 12.0);
+        assert_eq!(
+            session.try_open_targeted_table(),
+            Some(pos),
+            "the tuned 12-block reach and ray must find the same table"
+        );
+        assert_eq!(session.open_table_position(), Some(pos));
+
+        // Shrinking the reach live closes an already-open out-of-reach station.
+        session.apply_rules(&RulesBundle::default());
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_tuned_reach_finds_a_chest_beyond_the_default_ray_length() {
+        let mut session = chest_session();
+        let pos = IVec3::new(10, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        session.player.position = Vec3::new(0.5, 4.0, 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+
+        assert_eq!(
+            session.try_open_targeted_chest(),
+            None,
+            "the default 8-block ray must not reach a 9.5-block chest"
+        );
+        assert_eq!(session.open_chest_position(), None);
+
+        session.apply_rules(&RulesBundle {
+            interaction: InteractionRules { table_reach: 12.0 },
+            ..RulesBundle::default()
+        });
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        assert_eq!(session.open_chest_position(), Some(pos));
     }
 
     #[test]
@@ -4851,6 +4926,46 @@ mod tests {
         assert_eq!(
             session.world.get_block(crop.x, crop.y, crop.z),
             BlockId::WheatStage3
+        );
+    }
+
+    #[test]
+    fn apply_rules_drives_crop_growth_cadence() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        assert_eq!(session.season(), Season::Spring);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(1)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        assert!(session.plant_wheat_at(crop).is_some());
+
+        let rules = RulesBundle {
+            farming: FarmingRules {
+                wheat_stage_game_secs: 10.0,
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().farming, rules.farming);
+        assert_eq!(session.crops.rules(), rules.farming);
+
+        // 0.1 s clamped frame x 100 = exactly 10 game seconds. The default
+        // 60 s stage would still be at stage 0.
+        let remeshed = session.tick_crops(0.1, 100.0);
+        assert!(
+            !remeshed.is_empty(),
+            "the tuned stage must remesh the chunk"
+        );
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage1
         );
     }
 

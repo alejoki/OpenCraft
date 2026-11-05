@@ -90,12 +90,21 @@ pub const fn tier_sword_damage(tier: ToolTier) -> u16 {
 
 /// Speed multiplier for a tool tier. Always `>= 1`, so a matched tool can only
 /// ever shorten a break, never lengthen it.
-pub const fn tier_speed_multiplier(tier: ToolTier) -> u8 {
+pub fn tier_speed_multiplier(tier: ToolTier) -> u8 {
+    tier_speed_multiplier_with_rules(tier, &ToolRules::default())
+}
+
+/// Speed multiplier for a tool tier under live [`ToolRules`].
+///
+/// The configured value is clamped to at least 1: a degenerate `0` can neither
+/// divide by zero nor make a matched tool longer than bare hand.
+pub fn tier_speed_multiplier_with_rules(tier: ToolTier, rules: &ToolRules) -> u8 {
     match tier {
-        ToolTier::Wood => WOOD_SPEED_MULTIPLIER,
-        ToolTier::Stone => STONE_SPEED_MULTIPLIER,
-        ToolTier::Iron => IRON_SPEED_MULTIPLIER,
+        ToolTier::Wood => rules.wood_speed_multiplier,
+        ToolTier::Stone => rules.stone_speed_multiplier,
+        ToolTier::Iron => rules.iron_speed_multiplier,
     }
+    .max(1)
 }
 
 /// Seconds of held left-click needed to break `block` while `selected_item` is
@@ -107,10 +116,20 @@ pub const fn tier_speed_multiplier(tier: ToolTier) -> u8 {
 /// multiplier; a mismatched tool, a non-tool, and an empty slot all keep the
 /// base hardness.
 pub fn break_duration(block: BlockId, selected_item: Option<Item>) -> Option<f32> {
-    break_duration_for(
+    break_duration_with_rules(block, selected_item, &ToolRules::default())
+}
+
+/// [`break_duration`] with live [`ToolRules`] for the built-in tiers.
+pub fn break_duration_with_rules(
+    block: BlockId,
+    selected_item: Option<Item>,
+    rules: &ToolRules,
+) -> Option<f32> {
+    break_duration_for_with_rules(
         block.break_duration_secs(),
         block_tool_class(block),
         selected_item,
+        rules,
     )
 }
 
@@ -125,6 +144,16 @@ pub fn break_duration_for(
     tool_class: Option<ToolKind>,
     selected_item: Option<Item>,
 ) -> Option<f32> {
+    break_duration_for_with_rules(hardness, tool_class, selected_item, &ToolRules::default())
+}
+
+/// [`break_duration_for`] with live [`ToolRules`] for the built-in tiers.
+pub fn break_duration_for_with_rules(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    selected_item: Option<Item>,
+    rules: &ToolRules,
+) -> Option<f32> {
     let base = hardness?;
     let Some((kind, tier)) = selected_item.and_then(|item| item.id().tool()) else {
         return Some(base);
@@ -132,7 +161,7 @@ pub fn break_duration_for(
     if tool_class != Some(kind) {
         return Some(base);
     }
-    Some(base / f32::from(tier_speed_multiplier(tier)))
+    Some(base / f32::from(tier_speed_multiplier_with_rules(tier, rules)))
 }
 
 /// Registry-friendly core for a pack tool tier.
@@ -471,6 +500,84 @@ mod tests {
                 Some(tool(ToolKind::Axe, ToolTier::Iron))
             ),
             Some(0.2)
+        );
+    }
+
+    #[test]
+    fn tuned_tier_multipliers_drive_builtin_break_durations() {
+        let rules = ToolRules {
+            wood_speed_multiplier: 8,
+            stone_speed_multiplier: 12,
+            iron_speed_multiplier: 16,
+        };
+        // Stone base is 1.2 s, so tuned wood/stone/iron are 1.2/8, 1.2/12,
+        // 1.2/16 instead of the pinned 0.6/0.3/0.2.
+        for (tier, multiplier) in [
+            (ToolTier::Wood, 8u8),
+            (ToolTier::Stone, 12),
+            (ToolTier::Iron, 16),
+        ] {
+            assert_eq!(tier_speed_multiplier_with_rules(tier, &rules), multiplier);
+            approx(
+                break_duration_with_rules(
+                    BlockId::Stone,
+                    Some(tool(ToolKind::Pickaxe, tier)),
+                    &rules,
+                )
+                .unwrap(),
+                1.2 / f32::from(multiplier),
+            );
+        }
+
+        // The default wrapper still pins the pre-tuning 2x wood timing.
+        assert_eq!(
+            break_duration(
+                BlockId::Stone,
+                Some(tool(ToolKind::Pickaxe, ToolTier::Wood))
+            ),
+            Some(1.2 / 2.0)
+        );
+        assert_eq!(tier_speed_multiplier(ToolTier::Wood), WOOD_SPEED_MULTIPLIER);
+    }
+
+    #[test]
+    fn degenerate_tuned_multipliers_fail_closed_to_bare_hand() {
+        let rules = ToolRules {
+            wood_speed_multiplier: 0,
+            stone_speed_multiplier: 0,
+            iron_speed_multiplier: 0,
+        };
+        for tier in [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron] {
+            assert_eq!(
+                tier_speed_multiplier_with_rules(tier, &rules),
+                1,
+                "a zero multiplier must clamp to 1x, never divide by zero"
+            );
+            let duration = break_duration_with_rules(
+                BlockId::Stone,
+                Some(tool(ToolKind::Pickaxe, tier)),
+                &rules,
+            )
+            .expect("stone stays breakable");
+            approx(duration, 1.2);
+        }
+        // Unbreakable blocks stay unbreakable under any tuning.
+        assert_eq!(
+            break_duration_with_rules(
+                BlockId::Bedrock,
+                Some(tool(ToolKind::Pickaxe, ToolTier::Iron)),
+                &rules
+            ),
+            None
+        );
+        // A mismatched class is still not accelerated by a tuned tier.
+        assert_eq!(
+            break_duration_with_rules(
+                BlockId::OakLog,
+                Some(tool(ToolKind::Pickaxe, ToolTier::Iron)),
+                &rules
+            ),
+            Some(0.9)
         );
     }
 

@@ -2,6 +2,7 @@ use glam::IVec3;
 
 use crate::content::ContentRegistry;
 use crate::player::inventory::Item;
+use crate::player::tools::ToolRules;
 use crate::world::block::BlockId;
 
 /// A validated block-breaking target.
@@ -67,11 +68,26 @@ impl MiningTarget {
         block: BlockId,
         selected_item: Option<Item>,
     ) -> Option<Self> {
+        Self::from_block_with_rules(registry, pos, block, selected_item, &ToolRules::default())
+    }
+
+    /// [`MiningTarget::from_block_with`] with live built-in tier tuning.
+    ///
+    /// The duration still comes from the registry, so a pack block keeps its
+    /// authored hardness and a pack tool keeps its authored tier speed. Only
+    /// the built-in wood/stone/iron multipliers follow `rules`.
+    pub fn from_block_with_rules(
+        registry: &ContentRegistry,
+        pos: IVec3,
+        block: BlockId,
+        selected_item: Option<Item>,
+        rules: &ToolRules,
+    ) -> Option<Self> {
         Self::new_with(
             registry,
             pos,
             block,
-            registry.break_duration(block, selected_item)?,
+            registry.break_duration_with_rules(block, selected_item, rules)?,
         )
     }
 
@@ -309,6 +325,64 @@ mod tests {
         let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
         assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
         registry
+    }
+
+    #[test]
+    fn from_block_with_rules_uses_tuned_durations_and_default_wrapper_pins_old_ones() {
+        let registry = ContentRegistry::builtin();
+        let pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Stone,
+            },
+            1,
+        )
+        .expect("valid pickaxe");
+        let rules = ToolRules {
+            wood_speed_multiplier: 8,
+            stone_speed_multiplier: 12,
+            iron_speed_multiplier: 16,
+        };
+
+        let tuned = MiningTarget::from_block_with_rules(
+            &registry,
+            POS,
+            BlockId::Stone,
+            Some(pickaxe),
+            &rules,
+        )
+        .expect("stone is breakable");
+        assert_eq!(tuned.duration(), 1.2 / 12.0);
+
+        let default = MiningTarget::from_block_with(&registry, POS, BlockId::Stone, Some(pickaxe))
+            .expect("stone is breakable");
+        assert_eq!(default.duration(), 1.2 / 4.0);
+
+        // A zero multiplier clamps to bare hand instead of creating a
+        // zero/infinity duration that `new_with` would reject or mis-time.
+        let zero = ToolRules {
+            wood_speed_multiplier: 0,
+            stone_speed_multiplier: 0,
+            iron_speed_multiplier: 0,
+        };
+        let clamped = MiningTarget::from_block_with_rules(
+            &registry,
+            POS,
+            BlockId::Stone,
+            Some(pickaxe),
+            &zero,
+        )
+        .expect("a clamped multiplier still yields a valid target");
+        assert_eq!(clamped.duration(), 1.2);
+
+        assert!(MiningTarget::from_block_with_rules(
+            &registry,
+            POS,
+            BlockId::Bedrock,
+            Some(pickaxe),
+            &rules
+        )
+        .is_none());
     }
 
     #[test]
