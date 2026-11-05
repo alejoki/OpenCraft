@@ -294,6 +294,21 @@ impl BlockDef {
     }
 }
 
+/// Provenance of one frozen pack-authored block layer or icon.
+///
+/// `path` is the pack-relative authored path exactly as the pack names it
+/// (the bare file name for fixed-name layers). A source is metadata only: it
+/// identifies which `(pack, path)` produced a GPU layer, so a live edit can
+/// rewrite that layer without re-deriving allocation. Sources never enter the
+/// content digest.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LayerSource {
+    /// Pack folder name (stable identity inside `packs/`).
+    pub folder: String,
+    /// Pack-relative authored path.
+    pub path: String,
+}
+
 /// Immutable, session-scoped registry of content definitions.
 ///
 /// The built-in registry is created once and shared through a `OnceLock`; a
@@ -310,6 +325,8 @@ pub struct ContentRegistry {
     worldgen_rules: Vec<WorldgenRule>,
     pack_layers: Vec<Vec<u8>>,
     pack_icons: Vec<Vec<u8>>,
+    pack_layer_sources: Vec<LayerSource>,
+    pack_icon_sources: Vec<LayerSource>,
     packs: Vec<PackIdentity>,
     digest: u64,
 }
@@ -327,6 +344,8 @@ impl ContentRegistry {
             worldgen_rules: Vec::new(),
             pack_layers: Vec::new(),
             pack_icons: Vec::new(),
+            pack_layer_sources: Vec::new(),
+            pack_icon_sources: Vec::new(),
             packs: Vec::new(),
             digest: EMPTY_DIGEST,
         })
@@ -669,6 +688,22 @@ impl ContentRegistry {
         self.pack_icons.get(usize::from(index)).map(Vec::as_slice)
     }
 
+    /// Authored provenance for [`Self::pack_layers`], index-aligned with it.
+    ///
+    /// `pack_layer_sources()[i]` names the `(folder, path)` that produced the
+    /// layer reported as `PACK_LAYER_BASE + i`. Empty for built-in content.
+    pub fn pack_layer_sources(&self) -> &[LayerSource] {
+        &self.pack_layer_sources
+    }
+
+    /// Authored provenance for [`Self::pack_icons`], index-aligned with it.
+    ///
+    /// `pack_icon_sources()[i]` names the `(folder, path)` that produced the
+    /// icon reported as `PACK_ICON_BASE + i`. Empty for built-in content.
+    pub fn pack_icon_sources(&self) -> &[LayerSource] {
+        &self.pack_icon_sources
+    }
+
     /// Pack identities in the order they were stacked.
     pub fn packs(&self) -> &[PackIdentity] {
         &self.packs
@@ -947,6 +982,8 @@ mod tests {
         assert!(registry.worldgen_rules().is_empty());
         assert!(registry.pack_layers().is_empty());
         assert!(registry.pack_icons().is_empty());
+        assert!(registry.pack_layer_sources().is_empty());
+        assert!(registry.pack_icon_sources().is_empty());
         assert!(registry.packs().is_empty());
         assert_eq!(registry.digest(), EMPTY_DIGEST);
     }

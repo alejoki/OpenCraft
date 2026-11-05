@@ -23,7 +23,7 @@ use crate::content::spec::{
     WorldgenKind,
 };
 use crate::content::{
-    BlockDef, ContentRegistry, FoodDef, ItemDef, ItemRef, RecipeDef, TierDef, ToolDef,
+    BlockDef, ContentRegistry, FoodDef, ItemDef, ItemRef, LayerSource, RecipeDef, TierDef, ToolDef,
     WorldgenRule, EMPTY_DIGEST, PACK_ICON_BASE, PACK_ICON_CAP, PACK_LAYER_BASE, PACK_LAYER_CAP,
     PLACEHOLDER_BLOCK_LAYER, PLACEHOLDER_ICON_LAYER,
 };
@@ -545,6 +545,7 @@ pub fn build_registry(
 
     // ---- block face layers ---------------------------------------------
     let mut pack_layers: Vec<Vec<u8>> = Vec::new();
+    let mut pack_layer_sources: Vec<LayerSource> = Vec::new();
     let mut layer_slots: BTreeMap<(String, String), u8> = BTreeMap::new();
     // One diagnostic per (entry, path): `all` resolves to six identical faces
     // and a broken asset must not be reported six times.
@@ -593,6 +594,10 @@ pub fn build_registry(
                 }
                 let layer = PACK_LAYER_BASE + slot as u8;
                 pack_layers.push(assets[&key].rgba.clone());
+                pack_layer_sources.push(LayerSource {
+                    folder: folder.to_string(),
+                    path: path.clone(),
+                });
                 layer_slots.insert(key, layer);
                 layer
             };
@@ -602,12 +607,14 @@ pub fn build_registry(
 
     // ---- icons ----------------------------------------------------------
     let mut pack_icons: Vec<Vec<u8>> = Vec::new();
+    let mut pack_icon_sources: Vec<LayerSource> = Vec::new();
     let mut icon_slots: BTreeMap<(String, String), u8> = BTreeMap::new();
 
     for (id, (folder, entry)) in &item_entries {
         let layer = allocate_icon(
             &assets,
             &mut pack_icons,
+            &mut pack_icon_sources,
             &mut icon_slots,
             folder,
             &entry.icon,
@@ -620,6 +627,7 @@ pub fn build_registry(
         let layer = allocate_icon(
             &assets,
             &mut pack_icons,
+            &mut pack_icon_sources,
             &mut icon_slots,
             folder,
             &entry.icon,
@@ -659,6 +667,8 @@ pub fn build_registry(
         worldgen_rules,
         pack_layers,
         pack_icons,
+        pack_layer_sources,
+        pack_icon_sources,
         packs: identity_list,
         digest,
     };
@@ -680,6 +690,7 @@ pub fn build_registry(
 fn allocate_icon(
     assets: &BTreeMap<(String, String), &PackAsset>,
     pack_icons: &mut Vec<Vec<u8>>,
+    pack_icon_sources: &mut Vec<LayerSource>,
     icon_slots: &mut BTreeMap<(String, String), u8>,
     folder: &str,
     path: &str,
@@ -711,6 +722,10 @@ fn allocate_icon(
     }
     let layer = PACK_ICON_BASE + slot as u8;
     pack_icons.push(assets[&key].rgba.clone());
+    pack_icon_sources.push(LayerSource {
+        folder: folder.to_string(),
+        path: path.to_string(),
+    });
     icon_slots.insert(key, layer);
     layer
 }
@@ -1371,6 +1386,14 @@ mod tests {
             build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
         assert_eq!(registry.pack_layers().len(), 1);
+        assert_eq!(
+            registry.pack_layer_sources(),
+            &[LayerSource {
+                folder: "p".to_string(),
+                path: "shared.png".to_string(),
+            }],
+            "a shared asset is deduplicated into one layer and one source"
+        );
         let def = registry
             .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
             .expect("pack block");
@@ -1440,6 +1463,61 @@ mod tests {
         );
         assert_eq!(registry.items()[192].icon_layer, PLACEHOLDER_ICON_LAYER);
         assert_eq!(registry.pack_icon(PACK_ICON_BASE), Some(&[0u8; 1024][..]));
+    }
+
+    #[test]
+    fn layer_and_icon_sources_align_with_allocated_bytes() {
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(block_entry("mymod:block", "block.png"));
+        spec.assets.insert("block.png".to_string(), asset(0x21));
+        spec.items.push(item_entry("mymod:item", "icon.png"));
+        spec.assets.insert("icon.png".to_string(), asset(0x31));
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(identity("pack-a"), spec.clone())],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+
+        assert_eq!(registry.pack_layers().len(), 1);
+        assert_eq!(registry.pack_layers()[0], vec![0x21; 1024]);
+        assert_eq!(
+            registry.pack_layer_sources(),
+            &[LayerSource {
+                folder: "pack-a".to_string(),
+                path: "block.png".to_string(),
+            }]
+        );
+        assert_eq!(registry.pack_icons().len(), 1);
+        assert_eq!(registry.pack_icons()[0], vec![0x31; 1024]);
+        assert_eq!(
+            registry.pack_icon_sources(),
+            &[LayerSource {
+                folder: "pack-a".to_string(),
+                path: "icon.png".to_string(),
+            }]
+        );
+
+        // Asset bytes are not digest input: a recolor leaves both the digest
+        // and the frozen provenance unchanged.
+        let mut recolored = spec;
+        recolored
+            .assets
+            .insert("block.png".to_string(), asset(0xEE));
+        recolored.assets.insert("icon.png".to_string(), asset(0xFF));
+        let (recolored, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(identity("pack-a"), recolored)],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(recolored.digest(), registry.digest());
+        assert_eq!(
+            recolored.pack_layer_sources(),
+            registry.pack_layer_sources()
+        );
+        assert_eq!(recolored.pack_icon_sources(), registry.pack_icon_sources());
+        assert_eq!(recolored.pack_layers()[0], vec![0xEE; 1024]);
+        assert_eq!(recolored.pack_icons()[0], vec![0xFF; 1024]);
     }
 
     #[test]
