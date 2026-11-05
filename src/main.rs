@@ -126,6 +126,13 @@ use opencraft::{random_seed, WorldSession};
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
 const OVERLAY_TEXT_TOP: f32 = 8.0;
 
+/// F6 creator overlay text metrics (M014/S02-T06). 14/17 keeps all 85
+/// registry values, six file headers, and the header/legend/status lines
+/// inside ~35 wrapped lines at 720p. Human readability is judged in S10;
+/// this only guarantees the whole readout fits the viewport.
+const CREATOR_FONT_SIZE: f32 = 14.0;
+const CREATOR_LINE_HEIGHT: f32 = 17.0;
+
 /// Message-expiry tick interval: the loop runs in `ControlFlow::Poll`,
 /// potentially far above 60 fps, while `menu::MESSAGE_TICKS` is calibrated
 /// as ~10 seconds at ~60 ticks/s. Ticking the menu message at most this
@@ -2231,6 +2238,9 @@ struct Ready {
     vista_store: ChunkRenderStore,
     ui: UiRenderer,
     stats: StatsOverlay,
+    /// Read-only F6 creator overlay (M014/S02-T06): a change-gated buffer
+    /// with compact metrics, shaped only while the overlay is visible.
+    creator_text: StatsOverlay,
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
     /// drawn in the same UI pass, after the stats text area.
     menu_text: StatsOverlay,
@@ -8391,6 +8401,13 @@ struct GameApp {
     /// Whether `--creator-trace` was requested on this launch. The state is
     /// read only under `watch::CREATOR_TOOLS`, so release builds stay silent.
     creator_trace: bool,
+    /// Change gate for the F6 overlay text (M014/S02-T06): set on toggle,
+    /// resize, a settled reload, and a pending-set change; cleared after one
+    /// recomposition so a hidden overlay costs nothing and a visible one is
+    /// not re-shaped every frame.
+    creator_overlay_dirty: bool,
+    /// Last composed F6 overlay text. Empty until the overlay is first shown.
+    creator_overlay_text: String,
     /// Set whenever the pack stack changes presentation, so the next
     /// `RedrawRequested` uploads the merged layers and logo once. Startup
     /// uploads directly in `resumed`, so this starts false.
@@ -8736,6 +8753,8 @@ impl GameApp {
             config_dir,
             creator,
             creator_trace,
+            creator_overlay_dirty: true,
+            creator_overlay_text: String::new(),
             base_registry,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -8792,12 +8811,21 @@ impl GameApp {
             return;
         };
 
+        let pending_before = self.creator.pending_files();
         let mut settled = Vec::new();
         for file in ConfigFile::ALL {
             let snapshot = watch::fingerprint_path(&dir.join(file.name()));
             if self.creator.watch.observe(file, snapshot, now) {
                 settled.push(file);
+                // The overlay's `last:`/`pending` lines changed; recompose in
+                // the render pass, never inside this poll.
+                self.creator_overlay_dirty = true;
             }
+        }
+        // A write that is still settling changes the pending list even when
+        // nothing is due to reload yet, so the overlay must reflect it.
+        if self.creator.pending_files() != pending_before {
+            self.creator_overlay_dirty = true;
         }
 
         for file in settled {
@@ -10060,6 +10088,14 @@ impl ApplicationHandler for GameApp {
                 .and_then(|pack| pack.logo.as_ref()),
         );
         let stats = StatsOverlay::new(&mut ui.font_system);
+        // Read-only F6 creator overlay (M014/S02-T06): compact metrics keep
+        // the registry readout inside the viewport at 720p. Hidden by
+        // default; the buffer is only shaped while visible.
+        let creator_text = StatsOverlay::with_metrics(
+            &mut ui.font_system,
+            CREATOR_FONT_SIZE,
+            CREATOR_LINE_HEIGHT,
+        );
         let menu_text = StatsOverlay::new(&mut ui.font_system);
         let title_text = StatsOverlay::with_metrics(
             &mut ui.font_system,
@@ -10150,6 +10186,7 @@ impl ApplicationHandler for GameApp {
             vista_store,
             ui,
             stats,
+            creator_text,
             menu_text,
             title_text,
             load_play_text,
@@ -10196,6 +10233,9 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
+                // The creator overlay wraps at the surface width, so a resize
+                // must recompose it even when its text is unchanged.
+                self.creator_overlay_dirty = true;
                 // Re-shape the stats overlay at the new size so text does not
                 // keep the old layout (wrapping) after a resize.
                 gpu.stats.update(
@@ -10476,6 +10516,16 @@ impl ApplicationHandler for GameApp {
                                 self.last_saved_badge = Some(Instant::now());
                             }
                         }
+                        KeyCode::F6 if pressed && !event.repeat => {
+                            // Read-only creator overlay (M014/S02-T06): a
+                            // dev-only utility key consumed even in release
+                            // builds so it can never leak into gameplay.
+                            // Recomposition is deferred to the render pass.
+                            if watch::CREATOR_TOOLS {
+                                self.creator.toggle_overlay();
+                                self.creator_overlay_dirty = true;
+                            }
+                        }
                         KeyCode::Escape if pressed && !event.repeat => {
                             // Escape in-game opens the Pause screen (S02-T02:
                             // replaces the old direct settings-menu open —
@@ -10514,7 +10564,7 @@ impl ApplicationHandler for GameApp {
                             self.session.player.select_slot(8);
                         }
                         // Creative palette (S07-T03): a documented,
-                        // non-rebindable utility key beside F/F5/digits.
+                        // non-rebindable utility key beside F/F5/F6/digits.
                         // Survival stays silent — no message, no empty panel
                         // — because the palette is a Creative capability.
                         KeyCode::KeyC if pressed && !event.repeat => {
@@ -10539,7 +10589,7 @@ impl ApplicationHandler for GameApp {
                         // transitions route through the loaded keybind map
                         // via the pure helper. The 7 rebindable routes sit
                         // AFTER the non-rebindable utility keys on purpose:
-                        // Escape must always toggle the menu and F/F5/
+                        // Escape must always toggle the menu and F/F5/F6/
                         // digits keep their hardcoded behavior even
                         // if a gameplay action is rebound onto one of them
                         // (Escape is a rebindable target, so the menu must
@@ -11638,6 +11688,43 @@ impl ApplicationHandler for GameApp {
                     color: [0.0, 0.0, 0.0, 0.4],
                 }];
 
+                // Read-only creator overlay (M014/S02-T06): gated twice —
+                // `CREATOR_TOOLS` keeps release builds from shaping anything
+                // and the runtime flag controls visibility. Recompose only
+                // when dirty (toggle, resize, or a settled/pending reload);
+                // the text area is appended after the stats area below so the
+                // stats readout wins where the panels would overlap.
+                if watch::CREATOR_TOOLS && self.creator.overlay_visible {
+                    let surface_w = gpu.ctx.config.width as f32;
+                    let surface_h = gpu.ctx.config.height as f32;
+                    if self.creator_overlay_dirty {
+                        let max_chars = (((surface_w - OVERLAY_TEXT_LEFT * 2.0)
+                            / (CREATOR_FONT_SIZE * 0.62))
+                            .floor() as usize)
+                            .max(16);
+                        self.creator_overlay_text =
+                            watch::overlay_lines(&self.config, &self.creator, max_chars)
+                                .join("\n");
+                        self.creator_overlay_dirty = false;
+                    }
+                    gpu.creator_text.update(
+                        &mut gpu.ui.font_system,
+                        surface_w,
+                        surface_h,
+                        &self.creator_overlay_text,
+                    );
+                    let line_count = self.creator_overlay_text.lines().count().max(1);
+                    let y = OVERLAY_TEXT_TOP + LINE_HEIGHT + 8.0;
+                    quads.push(Quad {
+                        x: OVERLAY_TEXT_LEFT - 6.0,
+                        y,
+                        w: (gpu.creator_text.measured_width() + 16.0).min(surface_w),
+                        h: (line_count as f32 * CREATOR_LINE_HEIGHT + 8.0)
+                            .min(surface_h - y),
+                        color: [0.0, 0.0, 0.0, 0.4],
+                    });
+                }
+
                 // Vista branding (M004/S04), gated to the main-menu cluster:
                 // the pack's overlay tint darkens the panorama at the head of
                 // the quad list (all panels/text draw above it), the logo
@@ -12232,6 +12319,15 @@ impl ApplicationHandler for GameApp {
                 // no pipeline change (MEM014).
                 let stats_text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
                 let mut areas = vec![stats_text_area];
+                // Read-only creator overlay (M014/S02-T06): pushed after the
+                // stats area so the compact readout never hides the stats
+                // line. A hidden overlay or a release build adds no area.
+                if watch::CREATOR_TOOLS && self.creator.overlay_visible {
+                    areas.push(gpu.creator_text.text_area(
+                        OVERLAY_TEXT_LEFT,
+                        OVERLAY_TEXT_TOP + LINE_HEIGHT + 12.0,
+                    ));
+                }
                 // The vista title draws before (under) the screen text, so a
                 // panel containing the title still wins visually.
                 if let Some(title_text_area) = title_text_area {
@@ -33011,5 +33107,168 @@ stack = 64
             .expect("emit_creator_trace must close")];
         assert!(emit.contains("!watch::CREATOR_TOOLS"));
         assert!(emit.contains("!self.creator_trace"));
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S02-T06: F6 read-only creator overlay composition surface
+    // -----------------------------------------------------------------------
+
+    /// Bounded `RedrawRequested` arm source, shared by the draw-order tests.
+    fn creator_redraw_source() -> &'static str {
+        let source = include_str!("main.rs");
+        source
+            .split("WindowEvent::RedrawRequested =>")
+            .nth(1)
+            .expect("window_event must handle RedrawRequested")
+            .split("WindowEvent::CursorMoved")
+            .next()
+            .expect("the RedrawRequested arm must end before CursorMoved")
+    }
+
+    #[test]
+    fn creator_f6_is_a_gated_utility_key() {
+        let source = include_str!("main.rs");
+        let playing = source
+            .split("fn window_event(")
+            .nth(1)
+            .expect("main.rs must define window_event");
+        let f5_at = playing
+            .find("KeyCode::F5 if pressed && !event.repeat")
+            .expect("F5 must stay a utility key");
+        let escape_at = playing
+            .find("KeyCode::Escape if pressed && !event.repeat")
+            .expect("Escape must stay a utility key");
+        let f6_at = playing
+            .find("KeyCode::F6 if pressed && !event.repeat")
+            .expect("F6 must be handled in the Playing key match");
+        assert!(
+            f5_at < f6_at && f6_at < escape_at,
+            "F6 must sit beside F5 and before the Escape/Pause arm"
+        );
+
+        let f6 = &playing[f6_at..escape_at];
+        assert!(
+            f6.contains("watch::CREATOR_TOOLS"),
+            "F6 must be a dev-only utility key: {f6}"
+        );
+        assert!(
+            f6.contains("toggle_overlay"),
+            "F6 must toggle the creator overlay: {f6}"
+        );
+        assert!(
+            f6.contains("creator_overlay_dirty = true"),
+            "toggling must schedule a recompose: {f6}"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_draw_order() {
+        let redraw = creator_redraw_source();
+        let update_at = redraw
+            .find("gpu.creator_text.update(")
+            .expect("the overlay buffer must be updated in RedrawRequested");
+        let quads_at = redraw
+            .find("gpu.ui.set_quads(")
+            .expect("the UI pass must upload quads in RedrawRequested");
+        let area_at = redraw
+            .find("gpu.creator_text.text_area(")
+            .expect("the overlay text area must be built in RedrawRequested");
+        assert!(
+            update_at < quads_at,
+            "the creator buffer must be shaped before its panel quad upload"
+        );
+        assert!(
+            quads_at < area_at,
+            "the creator text area must be assembled after the quad upload"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_draw_is_gated() {
+        let redraw = creator_redraw_source();
+        assert!(
+            redraw.contains("if watch::CREATOR_TOOLS && self.creator.overlay_visible"),
+            "both the panel and the text area must share the dev+visibility gate"
+        );
+        let stats_area_at = redraw
+            .find("let stats_text_area = gpu.stats.text_area(")
+            .expect("the stats text area must stay the first area");
+        let creator_area_at = redraw
+            .find("areas.push(gpu.creator_text.text_area(")
+            .expect("the creator text area must be pushed after the stats area");
+        assert!(
+            stats_area_at < creator_area_at,
+            "the stats text must remain the first text area"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_uses_compact_metrics() {
+        let source = include_str!("main.rs");
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        let creator_at = resumed
+            .find("let creator_text = StatsOverlay::with_metrics(")
+            .expect("resumed must build the creator buffer");
+        let creator = &resumed[creator_at..];
+        let creator = &creator[..creator.find(");").expect("the metrics call must close")];
+        assert!(
+            creator.contains("CREATOR_FONT_SIZE") && creator.contains("CREATOR_LINE_HEIGHT"),
+            "the creator overlay must use its compact metrics: {creator}"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_recomposes_on_resize_and_reload() {
+        let source = include_str!("main.rs");
+        let resized = source
+            .split("WindowEvent::Resized(new_size) =>")
+            .nth(1)
+            .expect("window_event must handle Resized")
+            .split("WindowEvent::KeyboardInput")
+            .next()
+            .expect("the Resized arm must end before KeyboardInput");
+        assert!(
+            resized.contains("self.creator_overlay_dirty = true"),
+            "a resize must recompose the wrapped creator text"
+        );
+
+        let poll = source
+            .split("fn poll_config_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_config_watcher")
+            .split("fn poll_config_watcher_if_due(")
+            .next()
+            .expect("poll_config_watcher must end before the scheduling wrapper");
+        assert!(
+            poll.contains("settled.push(file)"),
+            "the poll must still collect settled files"
+        );
+        assert!(
+            poll.contains("self.creator_overlay_dirty = true"),
+            "a settled or pending-change reload must recompose the overlay"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_composes_only_when_dirty() {
+        let redraw = creator_redraw_source();
+        let gate_at = redraw
+            .find("if self.creator_overlay_dirty")
+            .expect("composition must be change-gated");
+        let after = &redraw[gate_at..];
+        assert!(
+            after.contains("watch::overlay_lines("),
+            "the dirty path must call the pure formatter"
+        );
+        assert!(
+            after.contains("self.creator_overlay_dirty = false"),
+            "the dirty flag must clear after one recomposition"
+        );
     }
 }
