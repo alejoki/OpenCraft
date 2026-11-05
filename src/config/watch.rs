@@ -210,6 +210,11 @@ pub struct CreatorRuntime {
     pub overlay_visible: bool,
     pub status: ReloadStatus,
     pub last_error: Option<String>,
+    /// Last live pack-texture outcome (`texture applied packs/<folder>/<file>`
+    /// or `packs/<folder>/<file>: <reason>`). `None` until a pack edit settles
+    /// and after every stack apply, so the overlay only grows a `packs:` line
+    /// when there is a real pack event to report.
+    pub pack_status: Option<String>,
     pub restart_required: Option<String>,
 }
 
@@ -221,6 +226,7 @@ impl CreatorRuntime {
             overlay_visible: false,
             status: ReloadStatus::Idle,
             last_error: None,
+            pack_status: None,
             restart_required: None,
         }
     }
@@ -261,6 +267,11 @@ impl CreatorRuntime {
             // truthful fallback rather than panicking on future callers.
             None => format!("{}: rejected", report.file.rel_path()),
         });
+    }
+
+    /// Record (or clear) the live pack-texture status line.
+    pub fn set_pack_status(&mut self, status: Option<String>) {
+        self.pack_status = status;
     }
 
     /// Hold a durable restart requirement (S03/S08); S02 only displays it.
@@ -410,6 +421,10 @@ pub fn overlay_lines(
         max_chars,
         "",
     ));
+
+    if let Some(status) = &creator.pack_status {
+        lines.extend(wrap_text(&format!("packs: {status}"), max_chars, ""));
+    }
 
     if let Some(reason) = &creator.restart_required {
         lines.extend(wrap_text(
@@ -954,6 +969,32 @@ mod tests {
         creator.clear_restart_required();
         let cleared = overlay_lines(&runtime, &creator, 140).join("\n");
         assert!(!cleared.contains("restart required:"));
+    }
+
+    #[test]
+    fn overlay_pack_status_line_appears_only_when_set() {
+        let runtime = ConfigRuntime::defaults();
+        let mut creator = CreatorRuntime::new(Instant::now());
+
+        // S02 behavior stays byte-identical: no `packs:` line until a pack
+        // edit settles.
+        let before = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(!before.contains("packs:"), "{before}");
+
+        creator.set_pack_status(Some("texture applied packs/v1/stone.png".to_string()));
+        let applied = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(
+            applied.contains("packs: texture applied packs/v1/stone.png"),
+            "{applied}"
+        );
+        // The line sits between `last:` and `restart required:`.
+        let last_at = applied.find("last:").expect("last line");
+        let packs_at = applied.find("packs:").expect("packs line");
+        assert!(last_at < packs_at, "{applied}");
+
+        creator.set_pack_status(None);
+        let cleared = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(!cleared.contains("packs:"), "{cleared}");
     }
 
     #[test]

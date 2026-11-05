@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,9 +18,13 @@ use opencraft::config::watch::{self, CreatorRuntime};
 use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle};
 use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
-use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
+use opencraft::content::{
+    ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule, PACK_LAYER_BASE,
+};
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::presentation::{LayerInput, PackPresentation};
 use opencraft::pack::spec::PackSpec;
+use opencraft::pack::watch::{PackFileKind, PackWatch, PackWatchEntry};
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
@@ -156,6 +161,41 @@ fn load_startup_stack(
     }
     let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
     (Some(loaded), specs, warnings)
+}
+
+/// Build and baseline the dev-only live pack watch list for `presentation`.
+///
+/// `PackWatch::build` records the frozen `(folder, path, kind)` entries and
+/// their settle slots; the baseline observation loop runs at the same `now`
+/// so startup (or a stack apply) already resolved these bytes and an edit made
+/// before the first real poll is never re-applied as a change. Returns `None`
+/// in release builds or when the stack is the built-in Default pack.
+fn build_pack_watch(
+    presentation: Option<&PackPresentation>,
+    packs_root: &Path,
+    stack: &[String],
+    now: Instant,
+) -> Option<PackWatch> {
+    if !watch::CREATOR_TOOLS {
+        return None;
+    }
+    let presentation = presentation?;
+    let mut watch = PackWatch::build(presentation, packs_root, stack, now);
+    for index in 0..watch.entry_count() {
+        let snapshot = watch
+            .entry(index)
+            .and_then(|entry| watch::fingerprint_path(&entry.path))
+            .map(|snapshot| snapshot.0);
+        watch.observe(index, snapshot, now);
+    }
+    watch.mark_polled(now);
+    Some(watch)
+}
+
+/// Collapse every run of whitespace so a pack status or trace reason is
+/// always one overlay line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Build the session's immutable content registry from the ordered pack specs.
@@ -8119,6 +8159,9 @@ struct StartupContent {
     /// six curated files.
     config_dir: Option<PathBuf>,
     current_pack: Option<LoadedPack>,
+    /// Authored specs that produced `current_pack`, retained so the app can
+    /// build a live [`PackPresentation`] with frozen layer provenance.
+    pack_specs: Vec<PackSpec>,
     available_packs: Vec<String>,
     audio: AudioEngine,
     /// The settings file this startup content was loaded from. `GameApp` keeps
@@ -8184,6 +8227,7 @@ impl StartupContent {
             config,
             config_dir: config_dir.map(Path::to_path_buf),
             current_pack,
+            pack_specs,
             available_packs,
             audio,
             settings_path: settings_path.to_path_buf(),
@@ -8371,10 +8415,20 @@ struct GameApp {
     /// walks this list; a pack authored while the game is running appears
     /// on the next launch (no filesystem polling in the menu).
     available_packs: Vec<String>,
-    /// The active pack's loaded layers and presentation data; `None` is
-    /// the built-in procedural Default pack (MEM113). Never holds a
-    /// half-loaded pack: `load_stack` always returns usable layers.
-    current_pack: Option<LoadedPack>,
+    /// The active pack presentation: the live source of truth for visible
+    /// layers and frozen `(pack, path)` provenance. `None` is the built-in
+    /// procedural Default pack (MEM113). Never holds a half-loaded pack:
+    /// `load_stack` always returns usable layers, and `build` recomputes the
+    /// visible base layers from the authored specs.
+    pack_presentation: Option<PackPresentation>,
+    /// Dev-only live texture watch list, rebuilt from the presentation on
+    /// every stack apply. Only present under `watch::CREATOR_TOOLS` with a
+    /// non-default stack.
+    pack_watch: Option<PackWatch>,
+    /// Texture-array layers a settled pack edit changed and the next
+    /// `RedrawRequested` must upload individually. Cleared by every full
+    /// compose, which already covers the whole array.
+    pack_layer_uploads: BTreeSet<u32>,
     /// The launch pack-stack registry: the base every new/loaded world is
     /// resolved against and the reference for a live pack-change digest
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
@@ -8536,6 +8590,7 @@ impl GameApp {
             config,
             config_dir,
             current_pack,
+            pack_specs,
             available_packs,
             audio,
             settings_path,
@@ -8696,6 +8751,17 @@ impl GameApp {
         // the field initializers below.
         let creator = CreatorRuntime::new(Instant::now());
         let creator_trace = cli.creator_trace;
+        // Live pack presentation (M014/S03): the app owns one presentation as
+        // the visible source of truth, plus a dev-only watch list baselined at
+        // this instant so a launch-time edit is never re-applied.
+        let pack_presentation =
+            current_pack.map(|pack| PackPresentation::build(pack, pack_specs, &base_registry));
+        let pack_watch = build_pack_watch(
+            pack_presentation.as_ref(),
+            &packs_root,
+            &settings.pack_stack,
+            Instant::now(),
+        );
         let mut app = Self {
             window: None,
             gpu: None,
@@ -8747,7 +8813,9 @@ impl GameApp {
             settings_path,
             packs_root,
             available_packs,
-            current_pack,
+            pack_presentation,
+            pack_watch,
+            pack_layer_uploads: BTreeSet::new(),
             session_registry,
             config,
             config_dir,
@@ -8783,6 +8851,14 @@ impl GameApp {
             app.creator.watch.mark_polled(now);
         }
         app
+    }
+
+    /// The resolved presentation's loaded pack, or `None` for the built-in
+    /// procedural Default pack.
+    fn current_pack(&self) -> Option<&LoadedPack> {
+        self.pack_presentation
+            .as_ref()
+            .map(|presentation| &presentation.base)
     }
 
     /// Re-apply the current effective config rules to the live session.
@@ -8866,10 +8942,18 @@ impl GameApp {
     /// `None` disables the seam entirely (release builds or headless tests),
     /// leaving the vsync wait untouched.
     fn creator_next_poll_at(&self) -> Option<Instant> {
-        if watch::CREATOR_TOOLS && self.config_dir.is_some() {
+        if !watch::CREATOR_TOOLS {
+            return None;
+        }
+        let config = if self.config_dir.is_some() {
             Some(self.creator.watch.next_poll_at())
         } else {
             None
+        };
+        let pack = self.pack_watch.as_ref().map(PackWatch::next_poll_at);
+        match (config, pack) {
+            (Some(config), Some(pack)) => Some(config.min(pack)),
+            (config, pack) => config.or(pack),
         }
     }
 
@@ -8890,6 +8974,194 @@ impl GameApp {
             let _ = writeln!(stdout, "{line}");
             let _ = stdout.flush();
         }
+    }
+
+    /// Poll only when the pack watch schedule is due, then advance it.
+    ///
+    /// Mirrors [`Self::poll_config_watcher_if_due`]: the 10 Hz clamp lives in
+    /// this scheduling wrapper so `about_to_wait` can call it every loop
+    /// turn. Gated by the dev-only creator surface and by having a non-default
+    /// presentation (the built-in pack has no watch list).
+    fn poll_pack_watcher_if_due(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.pack_presentation.is_none() {
+            return;
+        }
+        let Some(watch) = self.pack_watch.as_ref() else {
+            return;
+        };
+        if !watch.is_due(now) {
+            return;
+        }
+        self.poll_pack_watcher(now);
+        if let Some(watch) = self.pack_watch.as_mut() {
+            watch.mark_polled(now);
+        }
+    }
+
+    /// One live pack poll: observe every frozen entry, then apply the edits
+    /// whose writes settled.
+    ///
+    /// This is the ONLY live texture path. It mutates the presentation at the
+    /// frozen layer indices the watch list recorded at build time and queues
+    /// one upload per changed layer. It never rebuilds the presentation,
+    /// never touches `session_registry`, either digest, or allocation, and
+    /// never calls `apply_pack_stack` (a settled texture can only rewrite
+    /// bytes). A rejected file keeps the last good layer and never blocks a
+    /// valid sibling in the same poll.
+    fn poll_pack_watcher(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.pack_presentation.is_none() {
+            return;
+        }
+        let Some(watch) = self.pack_watch.as_mut() else {
+            return;
+        };
+
+        let pending_before = watch.pending_indices();
+        let mut settled = Vec::new();
+        for index in 0..watch.entry_count() {
+            let snapshot = watch
+                .entry(index)
+                .and_then(|entry| watch::fingerprint_path(&entry.path))
+                .map(|snapshot| snapshot.0);
+            if watch.observe(index, snapshot, now) {
+                settled.push(index);
+                // A settled edit changes the overlay's `packs:` line; recompose
+                // in the render pass, never inside this poll.
+                self.creator_overlay_dirty = true;
+            }
+        }
+        if watch.pending_indices() != pending_before {
+            // A write that is still settling changes the pending set even
+            // when nothing is due to apply yet.
+            self.creator_overlay_dirty = true;
+        }
+
+        for index in settled {
+            let Some(entry) = self
+                .pack_watch
+                .as_ref()
+                .and_then(|watch| watch.entry(index))
+                .cloned()
+            else {
+                continue;
+            };
+            self.apply_settled_pack_entry(entry);
+        }
+    }
+
+    /// Apply one settled watch entry to the live presentation.
+    fn apply_settled_pack_entry(&mut self, entry: PackWatchEntry) {
+        let pack_dir = self.packs_root.join(&entry.folder);
+        match entry.kind {
+            PackFileKind::Manifest => {
+                // T05 owns manifest content/allocation changes; this task only
+                // observes the entry so the shared settle machine is complete.
+            }
+            PackFileKind::BaseLayer(layer) => {
+                let Some(file) = entry.path.file_name() else {
+                    return;
+                };
+                let file = file.to_string_lossy().into_owned();
+                match pack::spec::decode_layer_file(&pack_dir, &file) {
+                    Ok(Some(bytes)) => {
+                        self.apply_base_layer_upload(&entry, layer, LayerInput::Bytes(bytes));
+                    }
+                    Ok(None) => {
+                        // A deleted file is a legal edit: reveal the stack
+                        // below it (or procedural art) at the same index.
+                        self.apply_base_layer_upload(&entry, layer, LayerInput::Absent);
+                    }
+                    Err(reason) => self.reject_pack_entry(&entry, &reason),
+                }
+            }
+            PackFileKind::Asset { slot } => {
+                let Ok(relative) = entry.path.strip_prefix(&pack_dir) else {
+                    return;
+                };
+                let relative = relative.to_string_lossy().into_owned();
+                match pack::spec::decode_asset_file(&pack_dir, &relative) {
+                    Ok(bytes) => {
+                        let changed = self
+                            .pack_presentation
+                            .as_mut()
+                            .map(|presentation| {
+                                presentation.apply_pack_asset(usize::from(slot), &bytes)
+                            })
+                            .unwrap_or(false);
+                        if changed {
+                            let layer = u32::from(PACK_LAYER_BASE) + u32::from(slot);
+                            self.pack_layer_uploads.insert(layer);
+                            self.record_pack_applied(&entry.display, layer);
+                        }
+                    }
+                    Err(reason) => self.reject_pack_entry(&entry, &reason),
+                }
+            }
+        }
+    }
+
+    /// Apply one decoded base-layer edit and queue its upload when visible.
+    fn apply_base_layer_upload(&mut self, entry: &PackWatchEntry, layer: u8, input: LayerInput) {
+        let change = self
+            .pack_presentation
+            .as_mut()
+            .and_then(|presentation| presentation.apply_base_layer(&entry.folder, layer, input));
+        if let Some(change) = change {
+            let layer = u32::from(change.layer);
+            self.pack_layer_uploads.insert(layer);
+            self.record_pack_applied(&entry.display, layer);
+        }
+    }
+
+    /// Record a visible live-texture apply on the creator surfaces and emit
+    /// the gated `--creator-trace` line.
+    fn record_pack_applied(&mut self, display: &str, layer: u32) {
+        self.creator
+            .set_pack_status(Some(format!("texture applied {display}")));
+        self.creator.last_error = None;
+        self.creator_overlay_dirty = true;
+        let digest = self
+            .pack_presentation
+            .as_ref()
+            .map(|presentation| presentation.fingerprint.digest)
+            .unwrap_or(0);
+        let line =
+            pack::watch::applied_line(display, u8::try_from(layer).unwrap_or(u8::MAX), digest);
+        self.emit_pack_trace(line);
+    }
+
+    /// Record one rejected texture edit: keep the last good layer (the
+    /// presentation is only mutated on success), surface one line on the
+    /// overlay and as a transient notice, and emit the gated trace line.
+    fn reject_pack_entry(&mut self, entry: &PackWatchEntry, reason: &str) {
+        let reason = one_line(reason);
+        let text = format!("{}: {reason}", entry.display);
+        self.creator.set_pack_status(Some(text.clone()));
+        self.creator.last_error = Some(text.clone());
+        self.game_message = Some(MenuMessage {
+            text,
+            ticks_left: menu::MESSAGE_TICKS,
+        });
+        self.creator_overlay_dirty = true;
+        let line = pack::watch::rejected_line(&entry.display, &reason);
+        self.emit_pack_trace(line);
+    }
+
+    /// Write one stable pack apply/reject line when the launch asked for
+    /// `--creator-trace` in a dev build.
+    ///
+    /// Same no-timestamp/no-absolute-path contract as
+    /// [`Self::emit_creator_trace`]; a closed stdout pipe is ignored so
+    /// tracing can never panic the game, and a run without the flag stays
+    /// log-free (D006/MEM009).
+    fn emit_pack_trace(&mut self, line: String) {
+        if !watch::CREATOR_TOOLS || !self.creator_trace {
+            return;
+        }
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
     }
 
     /// Route one mouse click while the menu is open: hit-test the row under
@@ -9056,7 +9328,22 @@ impl GameApp {
         warnings.extend(registry_warnings(&report));
         let changed = candidate.digest() != self.base_registry.digest();
 
-        self.current_pack = loaded;
+        // Rebuild the live presentation from the freshly loaded stack. Layer
+        // indices come from `candidate`, so allocation is frozen for the whole
+        // watch lifetime; live texture edits below only ever rewrite an index
+        // recorded here. A stack apply is the ONE presentation replacement
+        // path; no watcher code may call this function.
+        self.pack_presentation =
+            loaded.map(|pack| PackPresentation::build(pack, specs, &candidate));
+        self.pack_layer_uploads.clear();
+        self.pack_watch = build_pack_watch(
+            self.pack_presentation.as_ref(),
+            &self.packs_root,
+            &self.settings.pack_stack,
+            Instant::now(),
+        );
+        self.creator.pack_status = None;
+        self.creator_overlay_dirty = true;
         self.pack_presentation_dirty = true;
         // The candidate becomes the base for the NEXT load. The live session
         // keeps its frozen registry untouched (MEM512/D181).
@@ -10063,12 +10350,17 @@ impl ApplicationHandler for GameApp {
         // missing pack still carries usable procedural layers. The 256-layer
         // GPU array is always composed from the 48-layer base plus the
         // frozen session registry's pack faces; unused slots are checker.
-        let base = match &self.current_pack {
-            Some(pack) => pack.layers.clone(),
+        let base = match &self.pack_presentation {
+            Some(presentation) => presentation.base.layers.clone(),
             None => generate_all_texture_layers_rgba(),
         };
-        let pack_layers = self.base_registry.pack_layers().to_vec();
+        let pack_layers = match &self.pack_presentation {
+            Some(presentation) => presentation.pack_layers.clone(),
+            None => self.base_registry.pack_layers().to_vec(),
+        };
         renderer.write_block_layers(&ctx.queue, &compose_block_array_layers(&base, &pack_layers));
+        // A full compose covers every queued live layer.
+        self.pack_layer_uploads.clear();
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(
@@ -10083,9 +10375,7 @@ impl ApplicationHandler for GameApp {
         ui.set_logo(
             &ctx.device,
             &ctx.queue,
-            self.current_pack
-                .as_ref()
-                .and_then(|pack| pack.logo.as_ref()),
+            self.current_pack().and_then(|pack| pack.logo.as_ref()),
         );
         let stats = StatsOverlay::new(&mut ui.font_system);
         // Read-only F6 creator overlay (M014/S02-T06): compact metrics keep
@@ -11135,20 +11425,56 @@ impl ApplicationHandler for GameApp {
                 // returns. Content definitions stay frozen in
                 // `session_registry` (MEM512).
                 if self.pack_presentation_dirty {
-                    let base = match &self.current_pack {
-                        Some(pack) => pack.layers.clone(),
+                    let base = match &self.pack_presentation {
+                        Some(presentation) => presentation.base.layers.clone(),
                         None => generate_all_texture_layers_rgba(),
                     };
-                    let pack_layers = self.base_registry.pack_layers().to_vec();
+                    let pack_layers = match &self.pack_presentation {
+                        Some(presentation) => presentation.pack_layers.clone(),
+                        None => self.base_registry.pack_layers().to_vec(),
+                    };
                     let logo = self
-                        .current_pack
+                        .pack_presentation
                         .as_ref()
-                        .and_then(|pack| pack.logo.clone());
+                        .and_then(|presentation| presentation.base.logo.clone());
                     let composed = compose_block_array_layers(&base, &pack_layers);
                     gpu.renderer.write_block_layers(&gpu.ctx.queue, &composed);
                     gpu.ui
                         .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                    // The full compose already uploaded every layer, so any
+                    // pending single-layer upload is redundant.
+                    self.pack_layer_uploads.clear();
                     self.pack_presentation_dirty = false;
+                }
+
+                // Live pack texture uploads (M014/S03): a settled edit queued
+                // exactly the layers whose visible bytes changed. Clone the
+                // bytes BEFORE touching `gpu` (P005), then rewrite only those
+                // layers in the retained 256-layer array. This is the only
+                // partial-upload path; a bulk `write_block_layers` is never
+                // used for a single-file edit.
+                if !self.pack_layer_uploads.is_empty() {
+                    let mut uploads: Vec<(u32, Vec<u8>)> = Vec::new();
+                    if let Some(presentation) = self.pack_presentation.as_ref() {
+                        for &layer in &self.pack_layer_uploads {
+                            let bytes = if layer < u32::from(PACK_LAYER_BASE) {
+                                presentation.base.layers.get(layer as usize).cloned()
+                            } else {
+                                presentation
+                                    .pack_layers
+                                    .get((layer - u32::from(PACK_LAYER_BASE)) as usize)
+                                    .cloned()
+                            };
+                            if let Some(bytes) = bytes {
+                                uploads.push((layer, bytes));
+                            }
+                        }
+                    }
+                    for (layer, bytes) in uploads {
+                        gpu.renderer
+                            .write_block_layer(&gpu.ctx.queue, layer, &bytes);
+                    }
+                    self.pack_layer_uploads.clear();
                 }
 
                 // Message expiry at a bounded ~60 ticks/s (see
@@ -11730,16 +12056,16 @@ impl ApplicationHandler for GameApp {
                 let (brand_w, brand_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                 if vista {
                     if let Some(tint) = self
-                        .current_pack
+                        .pack_presentation
                         .as_ref()
-                        .and_then(|pack| pack.overlay_tint)
+                        .and_then(|presentation| presentation.base.overlay_tint)
                     {
                         quads.insert(0, logo::tint_quad(brand_w, brand_h, tint));
                     }
                 }
                 let logo_rect = if vista {
-                    self.current_pack.as_ref().and_then(|pack| {
-                        pack.logo.as_ref().map(|pack_logo| {
+                    self.pack_presentation.as_ref().and_then(|presentation| {
+                        presentation.base.logo.as_ref().map(|pack_logo| {
                             logo::logo_rect(
                                 brand_w,
                                 pack_logo.width,
@@ -12805,6 +13131,10 @@ impl ApplicationHandler for GameApp {
         // change without touching the render path. The witness comments are
         // pinned by tests: no polling may move into `RedrawRequested`.
         self.poll_config_watcher_if_due(Instant::now());
+        // Dev-only live pack poll (M014/S03): same 10 Hz clamp and the same
+        // pre-render region. A settled texture edit only queues per-layer
+        // uploads for the next frame; it never rebuilds the stack.
+        self.poll_pack_watcher_if_due(Instant::now());
 
         let Some(window) = &self.window else {
             return;
@@ -19831,7 +20161,10 @@ stack = 64
         app.packs_root = dir.join("packs");
         app.available_packs = pack::available_pack_names(&app.packs_root);
         app.settings.pack_stack.clear();
-        app.current_pack = None;
+        app.pack_presentation = None;
+        app.pack_watch = None;
+        app.pack_layer_uploads.clear();
+        app.creator.pack_status = None;
         app
     }
 
@@ -19934,7 +20267,7 @@ stack = 64
 
         assert_eq!(app.settings.pack_stack, vec!["alpha", "beta"]);
         assert!(app.pack_presentation_dirty, "a toggle schedules an upload");
-        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let loaded = app.current_pack().expect("stack loaded");
         assert_eq!(
             loaded.display_name, "Beta Pack",
             "the later pack's name wins"
@@ -20063,7 +20396,7 @@ stack = 64
         app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
         app.apply_pack_stack();
 
-        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let loaded = app.current_pack().expect("stack loaded");
         let procedural = generate_all_texture_layers_rgba();
         assert_eq!(
             &loaded.layers[0][..4],
@@ -33276,6 +33609,446 @@ stack = 64
         assert!(
             after.contains("self.creator_overlay_dirty = false"),
             "the dirty flag must clear after one recomposition"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S03-T04: live block/mob texture reload wiring
+    // -----------------------------------------------------------------------
+
+    /// A headless GameApp whose settings, packs, and background live entirely
+    /// in `dir`, so these tests never read the repository `packs/` or
+    /// `settings.toml`.
+    fn pack_app(dir: &Path) -> GameApp {
+        std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
+        let content = StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None);
+        let save_path = dir.join("pack-app.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// Write a v1 manifest and return the pack folder.
+    fn write_pack_manifest(app: &GameApp, folder: &str) -> PathBuf {
+        let dir = app.packs_root.join(folder);
+        write_pack_fixture(&dir, folder);
+        dir
+    }
+
+    /// Apply an ordered stack through the production seam.
+    fn apply_pack_stack_of(app: &mut GameApp, stack: &[&str]) {
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+        app.settings.pack_stack = stack.iter().map(|name| (*name).to_string()).collect();
+        app.apply_pack_stack();
+    }
+
+    /// First poll records the edit as pending; the second crosses the 250 ms
+    /// settle window. The injected clock means the tests never sleep.
+    fn settle_pack(app: &mut GameApp, base: Instant) {
+        app.poll_pack_watcher(base + Duration::from_millis(10));
+        app.poll_pack_watcher(base + Duration::from_millis(400));
+    }
+
+    #[test]
+    fn pack_texture_live_edit_updates_stone_and_pig_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        write_solid_png(&pack.join("pig_body.png"), [40, 50, 60, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        assert!(app.pack_layer_uploads.is_empty());
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("pig_body.png"), [20, 200, 10, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32, 32u32]),
+            "only stone and pig_body queue uploads"
+        );
+        let presentation = app
+            .pack_presentation
+            .as_ref()
+            .expect("non-default stack has a presentation");
+        assert_eq!(&presentation.base.layers[3][..4], &[200, 10, 20, 255]);
+        assert_eq!(&presentation.base.layers[32][..4], &[20, 200, 10, 255]);
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/textures/"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_texture_corrupt_png_keeps_last_good_layer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        let last_good = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers[3]
+            .clone();
+        assert_eq!(&last_good[..4], &[200, 10, 20, 255]);
+        app.pack_layer_uploads.clear();
+
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::write(pack.join("stone.png"), b"not a png at all")
+            .expect("corrupt the authored PNG");
+        settle_pack(&mut app, t1);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            presentation.base.layers[3], last_good,
+            "a corrupt file keeps the last good layer"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a rejected edit must not queue an upload"
+        );
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("a rejection is visible");
+        assert!(status.starts_with("packs/textures/stone.png: "), "{status}");
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        let message = app.game_message.as_ref().expect("one transient notice");
+        assert_eq!(message.text, status);
+
+        let line = pack::watch::rejected_line("packs/textures/stone.png", "failed to decode PNG");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.starts_with(
+            "creator: texture rejected path=packs/textures/stone.png reason=failed to decode PNG"
+        ));
+
+        // A test cannot capture process stdout safely, so pin the emission
+        // gate in the source instead.
+        let source = include_str!("main.rs");
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(emit.contains("!watch::CREATOR_TOOLS"));
+        assert!(emit.contains("!self.creator_trace"));
+    }
+
+    #[test]
+    fn pack_texture_live_edit_sibling_isolation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        write_solid_png(&pack.join("dirt.png"), [40, 50, 60, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let stone_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers[3]
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("stone.png"), b"broken").expect("corrupt stone");
+        write_solid_png(&pack.join("dirt.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([2u32]),
+            "the valid sibling still applies"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.base.layers[2][..4], &[1, 2, 3, 255]);
+        assert_eq!(
+            presentation.base.layers[3], stone_before,
+            "the rejected file keeps its last good layer"
+        );
+        assert!(app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("status")
+            .starts_with("packs/textures/stone.png: "));
+    }
+
+    #[test]
+    fn pack_texture_shadowed_pack_edit_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        let beta = write_pack_manifest(&app, "beta");
+        write_solid_png(&alpha.join("stone.png"), [1, 2, 3, 255]);
+        write_solid_png(&beta.join("stone.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha", "beta"]);
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[4, 5, 6, 255],
+            "the later pack wins the visible layer"
+        );
+
+        let t0 = Instant::now();
+        write_solid_png(&alpha.join("stone.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a shadowed lower-pack edit uploads nothing"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[4, 5, 6, 255],
+            "the visible winner is unchanged"
+        );
+    }
+
+    #[test]
+    fn pack_texture_missing_at_launch_appears_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "late");
+        apply_pack_stack_of(&mut app, &["late"]);
+        let procedural = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .procedural[3]
+            .clone();
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.base.layers[3][..4], &[70, 80, 90, 255]);
+        assert_ne!(presentation.base.layers[3], procedural);
+    }
+
+    #[test]
+    fn pack_asset_live_edit_updates_frozen_pack_layer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "mod");
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("unused.png"), [1, 1, 1, 255]);
+        apply_pack_stack_of(&mut app, &["mod"]);
+
+        let watch = app.pack_watch.as_ref().expect("v2 stack has a watch list");
+        assert!(watch
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/mod/ruby.png"));
+        assert!(
+            watch
+                .entries()
+                .iter()
+                .all(|entry| !entry.display.contains("unused.png")),
+            "an authored-but-unreferenced asset is never watched"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .pack_layers[0][..4],
+            &[200, 10, 20, 255]
+        );
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("ruby.png"), [20, 200, 30, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([u32::from(PACK_LAYER_BASE)]),
+            "the frozen 48+slot index is the only upload"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.pack_layers[0][..4], &[20, 200, 30, 255]);
+        assert_eq!(presentation.pack_layer_sources[0].path, "ruby.png");
+    }
+
+    #[test]
+    fn pack_texture_edit_leaves_digests_and_session_registry_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let fingerprint = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .fingerprint;
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a texture edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(&presentation.base.layers[3][..4], &[200, 10, 20, 255]);
+    }
+
+    #[test]
+    fn pack_watch_rebaselines_on_stack_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        let beta = write_pack_manifest(&app, "beta");
+        write_solid_png(&alpha.join("stone.png"), [1, 2, 3, 255]);
+        write_solid_png(&beta.join("stone.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha"]);
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.folder == "alpha"));
+
+        let t0 = Instant::now();
+        apply_pack_stack_of(&mut app, &["beta"]);
+
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a stack apply queues no live uploads"
+        );
+        assert_eq!(app.creator.pack_status, None);
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(
+            watch.entries().iter().all(|entry| entry.folder == "beta"),
+            "the old stack's entries are gone"
+        );
+        assert!(app.creator_next_poll_at().is_some());
+
+        // The rebuilt watch is already baselined: a poll with no change emits
+        // nothing and queues no upload.
+        app.poll_pack_watcher(t0 + Duration::from_millis(400));
+        assert!(app.pack_layer_uploads.is_empty());
+
+        // The new baseline still tracks real edits at the frozen index.
+        write_solid_png(&beta.join("stone.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0 + Duration::from_secs(1));
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[9, 9, 9, 255]
+        );
+    }
+
+    #[test]
+    fn pack_watch_scheduling_and_trace_gates() {
+        let source = include_str!("main.rs");
+        let about_to_wait = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("main.rs must define about_to_wait")
+            .split("// Headless presentation digest")
+            .next()
+            .expect("about_to_wait must end before the presentation digest");
+        assert!(
+            about_to_wait.contains("poll_pack_watcher_if_due(Instant::now())"),
+            "about_to_wait must poll the live pack watcher"
+        );
+        assert!(
+            about_to_wait.contains("next_wait_deadline("),
+            "the vsync wait must include the earlier creator deadline"
+        );
+
+        // The partial-upload path is the only way a settled edit reaches the
+        // GPU; a full compose must clear the queue it covers.
+        let redraw = creator_redraw_source();
+        assert!(
+            redraw.contains("write_block_layer(&gpu.ctx.queue"),
+            "a settled edit must upload one layer: {redraw}"
+        );
+        assert!(
+            redraw.contains("self.pack_layer_uploads.clear()"),
+            "both the full compose and the partial upload must drain the queue"
+        );
+
+        let poll_due = source
+            .split("fn poll_pack_watcher_if_due(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher_if_due")
+            .split("fn poll_pack_watcher(")
+            .next()
+            .expect("the scheduling wrapper must end before the poll");
+        assert!(poll_due.contains("!watch::CREATOR_TOOLS"));
+        assert!(
+            poll_due.contains("self.pack_presentation.is_none()"),
+            "the pack poll must be presentation-gated"
+        );
+
+        let poll = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_settled_pack_entry(")
+            .next()
+            .expect("poll_pack_watcher must end before the apply helper");
+        assert!(
+            !poll.contains("apply_pack_stack("),
+            "a watch path must never rebuild the stack"
+        );
+        assert!(poll.contains("!watch::CREATOR_TOOLS"));
+
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(
+            emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
+            "pack traces need the dev build AND --creator-trace"
         );
     }
 }

@@ -167,6 +167,14 @@ impl PackWatch {
         self.tracker.is_due(now)
     }
 
+    /// Entry indices with an unsettled write, in watch-list order.
+    ///
+    /// Mirrors [`crate::config::watch::WatchState::pending_files`] so the app
+    /// can recompose the overlay only when the pending set actually changes.
+    pub fn pending_indices(&self) -> Vec<usize> {
+        self.tracker.pending_indices()
+    }
+
     /// Schedule the next poll one shared poll interval after `now`.
     pub fn mark_polled(&mut self, now: Instant) {
         self.tracker.mark_polled(now);
