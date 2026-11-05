@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
+use crate::config::RulesBundle;
 use crate::content::faces::BlockFaces;
 use crate::content::{ContentRegistry, WorldgenRule};
 use crate::mesh::quad::ChunkMesh;
@@ -1558,6 +1559,19 @@ impl WorldSession {
         self.camera.pitch = self.player.pitch;
     }
 
+    /// Applies effective gameplay tuning to this session.
+    ///
+    /// Movement rules go to the player and projection planes to the camera.
+    /// The camera position/orientation and the world are deliberately
+    /// untouched, so a caller can re-apply rules mid-frame without moving the
+    /// view. S01 calls this once at startup; S02 re-applies after a live
+    /// config reload.
+    pub fn apply_rules(&mut self, rules: &RulesBundle) {
+        self.player.movement = rules.movement;
+        self.camera.z_near = rules.camera.z_near;
+        self.camera.z_far = rules.camera.z_far;
+    }
+
     /// The position of the crafting table whose interface is open, if any.
     ///
     /// Read-only accessor: validity is re-established by
@@ -2020,12 +2034,13 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::camera::CameraRules;
     use crate::player::container::Container;
     use crate::player::inventory::{
         InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
     };
     use crate::player::melee::attack_damage;
-    use crate::player::physics::InputState;
+    use crate::player::physics::{InputState, MovementRules};
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
     use crate::world::block::BlockId;
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
@@ -2082,6 +2097,38 @@ mod tests {
         assert_eq!(session.player.mode(), GameMode::Creative);
         assert!(session.player.can_fly());
         assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn apply_rules_sets_player_and_camera() {
+        let mut session = WorldSession::new_session(
+            21u32,
+            PathBuf::from("/tmp/apply-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let camera_position = session.camera.position;
+        let camera_yaw = session.camera.yaw;
+        let camera_pitch = session.camera.pitch;
+
+        let rules = RulesBundle {
+            movement: MovementRules {
+                walk_speed: 9.0,
+                jump_velocity: 12.0,
+                ..MovementRules::default()
+            },
+            camera: CameraRules {
+                z_near: 0.25,
+                z_far: 512.0,
+            },
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.player.movement, rules.movement);
+        assert_eq!(session.camera.z_near, 0.25);
+        assert_eq!(session.camera.z_far, 512.0);
+        assert_eq!(session.camera.position, camera_position);
+        assert_eq!(session.camera.yaw, camera_yaw);
+        assert_eq!(session.camera.pitch, camera_pitch);
     }
 
     #[test]

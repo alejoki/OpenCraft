@@ -22,6 +22,8 @@ pub mod registry;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::player::camera::CameraRules;
+use crate::player::physics::MovementRules;
 use crate::settings::SettingsWarning;
 
 pub use registry::{
@@ -77,6 +79,26 @@ pub struct ConfigDiagnostic {
 pub struct SaveConfigMeta {
     pub schema: u16,
     pub digest: u64,
+}
+
+/// Typed gameplay tuning built from the effective configuration.
+///
+/// The bundle is a plain value, so startup and live reload hand the same
+/// struct to [`crate::world::session::WorldSession::apply_rules`] and can
+/// derive it again on every reload without touching loader state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RulesBundle {
+    pub movement: MovementRules,
+    pub camera: CameraRules,
+}
+
+impl Default for RulesBundle {
+    fn default() -> Self {
+        Self {
+            movement: MovementRules::default(),
+            camera: CameraRules::default(),
+        }
+    }
 }
 
 /// Resolved configuration values and their provenance.
@@ -155,6 +177,36 @@ impl ConfigRuntime {
         SaveConfigMeta {
             schema: self.schema(),
             digest: self.digest(),
+        }
+    }
+
+    /// Typed gameplay rules from the effective values.
+    ///
+    /// Every key below is a curated registry row, so a missing or mistyped
+    /// key is a programmer error and panics with the key name; creator input
+    /// never reaches this path unvalidated (bad files fall back per field).
+    pub fn rules(&self) -> RulesBundle {
+        RulesBundle {
+            movement: MovementRules {
+                walk_speed: self.f32("movement.walk_speed"),
+                sprint_speed: self.f32("movement.sprint_speed"),
+                fly_speed: self.f32("movement.fly_speed"),
+                fly_sprint_speed: self.f32("movement.fly_sprint_speed"),
+                fly_vertical_factor: self.f32("movement.fly_vertical_factor"),
+                jump_velocity: self.f32("movement.jump_velocity"),
+                gravity: self.f32("movement.gravity"),
+                terminal_velocity: self.f32("movement.terminal_velocity"),
+                swim_vertical_drag: self.f32("movement.swim_vertical_drag"),
+                swim_rise_accel: self.f32("movement.swim_rise_accel"),
+                swim_rise_speed: self.f32("movement.swim_rise_speed"),
+                swim_max_sink_speed: self.f32("movement.swim_max_sink_speed"),
+                swim_walk_speed_mult: self.f32("movement.swim_walk_speed_mult"),
+                swim_sink_accel: self.f32("movement.swim_sink_accel"),
+            },
+            camera: CameraRules {
+                z_near: self.f32("camera.z_near"),
+                z_far: self.f32("camera.z_far"),
+            },
         }
     }
 
@@ -963,6 +1015,33 @@ mod tests {
         for file in ConfigFile::ALL {
             assert!(runtime.file_error(file).is_none(), "{}", file.name());
         }
+    }
+
+    #[test]
+    fn rules_bundle_matches_defaults_and_reads_effective_values() {
+        assert_eq!(ConfigRuntime::defaults().rules(), RulesBundle::default());
+
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 9.0\n\n[camera]\nz_far = 512.0\n",
+        );
+        let loaded = ConfigRuntime::load_dir(&config);
+        let rules = loaded.rules();
+
+        assert_eq!(rules.movement.walk_speed, 9.0);
+        assert_eq!(
+            rules.movement.sprint_speed,
+            MovementRules::default().sprint_speed,
+            "an absent movement field must keep its registry default"
+        );
+        assert_eq!(rules.camera.z_far, 512.0);
+        assert_eq!(
+            rules.camera.z_near,
+            CameraRules::default().z_near,
+            "an absent camera field must keep its registry default"
+        );
     }
 
     #[test]
