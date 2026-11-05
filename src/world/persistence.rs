@@ -251,6 +251,14 @@ pub struct CliConfig {
     /// launching the game. Like `demo_ui` it is a launch switch, never a world
     /// intent (it never affects `cli_has_world_intent`) and is never persisted.
     pub validate_pack: Option<String>,
+    /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
+    /// requested. A bare launch switch: it takes no value, is deliberately NOT
+    /// a world intent (so it never affects `cli_has_world_intent`), and is
+    /// never persisted. `main` consumes it before settings, packs, and world
+    /// startup, so the audit never opens a window, GPU, audio engine, event
+    /// loop, or save. Release rejection of the switch is deliberately deferred
+    /// to S09.
+    pub check_config: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -282,6 +290,7 @@ impl CliConfig {
         let mut demo_worldgen = false;
         let mut demo_palette = false;
         let mut validate_pack = None;
+        let mut check_config = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -389,6 +398,12 @@ impl CliConfig {
                             .unwrap_or_default(),
                     );
                 }
+                "--check-config" => {
+                    // Bare switch (no value to consume), mirroring `--new`:
+                    // a stray following token stays an independent argument.
+                    // `main` short-circuits on this before any world startup.
+                    check_config = true;
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -418,6 +433,7 @@ impl CliConfig {
             demo_worldgen,
             demo_palette,
             validate_pack,
+            check_config,
             mode,
         }
     }
@@ -5582,6 +5598,32 @@ mod tests {
         let world_flag = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
         assert!(world_flag.force_new_world);
         assert_eq!(world_flag.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn test_check_config_is_a_bare_launch_switch() {
+        // Absent keeps the seam off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.check_config);
+
+        // The switch alone turns the audit on and changes nothing else: it is
+        // a launch switch, not a world parameter.
+        let alone = CliConfig::parse_args(["--check-config"]);
+        assert!(alone.check_config);
+        assert!(!alone.force_new_world);
+        assert_eq!(alone.seed_override, None);
+        assert_eq!(alone.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A real world flag still parses independently and grants intent
+        // (which lives in main.rs via `cli_has_world_intent`).
+        let with_new = CliConfig::parse_args(["--check-config", "--new"]);
+        assert!(with_new.check_config);
+        assert!(with_new.force_new_world);
+
+        // A following independent flag is not consumed as a value.
+        let with_seed = CliConfig::parse_args(["--check-config", "--seed", "5"]);
+        assert!(with_seed.check_config);
+        assert_eq!(with_seed.seed_override, Some(5));
     }
 
     #[test]

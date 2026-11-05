@@ -14215,6 +14215,26 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
+    // `--check-config` is a headless, pre-startup audit: it prints stable
+    // file/key lines and exits 0/1 without settings, packs, a session, event
+    // loop, window, GPU, save, or world. This branch intentionally precedes
+    // all settings, pack-stack, and startup-content loading; S09 adds the
+    // release rejection of the switch.
+    if cli.check_config {
+        let (lines, ok) =
+            opencraft::config::check_config_lines(Path::new(opencraft::config::CONFIG_DIR));
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--validate-pack` is a headless, pre-startup short-circuit: it prints
     // stable per-entry lines and exits 0/1 without a session, event loop,
     // window, GPU, save, settings file or world. The empty-name case (a
@@ -14843,6 +14863,71 @@ mod tests {
             validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
             "validate-pack must precede the demo-ui branch"
         );
+    }
+
+    #[test]
+    fn check_config_is_a_launch_switch_and_never_a_world_intent() {
+        // The audit is a headless one-shot: asking for it must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let check = CliConfig::parse_args(["--check-config"]);
+        assert!(check.check_config);
+        assert!(!cli_has_world_intent(&check));
+        assert_eq!(cli_has_world_intent(&check), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the audit switch is not
+        // turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--check-config", "--new"]);
+        assert!(with_new.check_config);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_check_config_short_circuit_precedes_world_startup() {
+        // The config audit must run before any world/session startup: no save,
+        // settings file, pack stack, window, or GPU work is allowed on this
+        // launch. Pin the ordering in the real binary source so a later
+        // refactor cannot silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let check_at = body
+            .find("cli.check_config")
+            .expect("fn main must branch on cli.check_config");
+        let lines_at = body
+            .find("check_config_lines")
+            .expect("fn main must call check_config_lines");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            check_at < validate_pack_at,
+            "the check-config branch must precede the validate-pack branch"
+        );
+        assert!(
+            lines_at < validate_pack_at,
+            "check_config_lines must precede the validate-pack branch"
+        );
+        assert!(
+            check_at < startup_at,
+            "cli.check_config must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "check_config_lines must precede startup"
+        );
+        for marker in ["load_with_warnings", "load_startup_stack"] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("fn main must call {marker}"));
+            assert!(check_at < at, "cli.check_config must precede {marker}");
+            assert!(lines_at < at, "check_config_lines must precede {marker}");
+        }
     }
 
     #[test]
