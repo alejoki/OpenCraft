@@ -101,6 +101,46 @@ impl Default for RulesBundle {
     }
 }
 
+/// Outcome of one [`ConfigRuntime::reload_file`] call.
+///
+/// `diagnostics` is the effective diagnostic block for the reloaded file after
+/// the call: the candidate's own diagnostics on a commit or a candidate-error
+/// rejection, or the single synthetic file-level Error used to reject an
+/// incomplete write.
+#[derive(Clone, Debug)]
+pub struct FileReload {
+    pub file: ConfigFile,
+    pub applied: bool,
+    pub changed: usize,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+}
+
+impl FileReload {
+    /// First [`ConfigSeverity::Error`] diagnostic in the deterministic order
+    /// the parser emits: file-level, then registry order, then unknown keys.
+    pub fn first_error(&self) -> Option<&ConfigDiagnostic> {
+        self.diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == ConfigSeverity::Error)
+    }
+
+    /// Number of Error diagnostics in this file's block.
+    pub fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == ConfigSeverity::Error)
+            .count()
+    }
+
+    /// Number of Warning diagnostics in this file's block.
+    pub fn warning_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == ConfigSeverity::Warning)
+            .count()
+    }
+}
+
 /// Resolved configuration values and their provenance.
 ///
 /// The value and origin vectors are parallel to [`REGISTRY`]. Cloning is cheap
@@ -160,6 +200,148 @@ impl ConfigRuntime {
             file_errors,
             digest,
         }
+    }
+
+    /// Re-parse exactly one curated file and atomically commit it when valid.
+    ///
+    /// This is the dev live-reload boundary and it never fails: the only
+    /// outcomes are a commit or a rejection that leaves the running values
+    /// untouched. It never writes, prints, or logs.
+    ///
+    /// Live reload is deliberately stricter than startup. Startup falls back
+    /// per field so one typo cannot erase a whole file; live reload rejects the
+    /// whole owning file on any Error, keeping its last good values and
+    /// origins. A missing file is the exception: deletion is a valid reset to
+    /// registry defaults plus the usual missing-file warning (the watcher's
+    /// settle window hides the unlink phase of atomic temp+rename saves).
+    ///
+    /// Empty and no-recognized-key files are rejected as incomplete writes
+    /// with synthetic file-level Errors. This is a deliberate divergence from
+    /// `--check-config`, which treats an empty file as all defaults: the
+    /// checker audits what would load at startup, while live reload protects
+    /// the running game from an editor caught mid-write.
+    ///
+    /// Rejection replaces only this file's diagnostics block and `file_error`;
+    /// sibling files and their diagnostics are never touched, and the digest
+    /// only moves when a candidate is actually committed.
+    pub fn reload_file(&mut self, dir: &Path, file: ConfigFile) -> FileReload {
+        let FileLoad {
+            present,
+            contents_empty,
+            values: candidate_values,
+            origins: candidate_origins,
+            diagnostics: candidate_diagnostics,
+            file_error: candidate_file_error,
+            ..
+        } = parse_file(dir, file);
+
+        let has_error = candidate_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == ConfigSeverity::Error);
+
+        // Any candidate Error rejects the whole file: keep the last good
+        // values/origins/digest and surface only the candidate's diagnostics.
+        if has_error {
+            self.replace_file_diagnostics(file, candidate_diagnostics.clone());
+            self.file_errors[file_index(file)] = candidate_file_error;
+            return FileReload {
+                file,
+                applied: false,
+                changed: 0,
+                diagnostics: candidate_diagnostics,
+            };
+        }
+
+        // An empty file parses as "all defaults"; at startup that is fine, but
+        // live it almost always means the editor truncated the file mid-save.
+        if present && contents_empty {
+            let diagnostics = vec![ConfigDiagnostic {
+                file,
+                key: None,
+                severity: ConfigSeverity::Error,
+                reason: "file is empty; keeping last good values".to_string(),
+            }];
+            self.replace_file_diagnostics(file, diagnostics.clone());
+            self.file_errors[file_index(file)] = None;
+            return FileReload {
+                file,
+                applied: false,
+                changed: 0,
+                diagnostics,
+            };
+        }
+
+        // A comment-only file, bare section headers, or only unknown keys also
+        // leave every row at Default; treat it as an incomplete write rather
+        // than silently resetting the file's live values.
+        if present
+            && candidate_origins
+                .iter()
+                .all(|origin| *origin == ValueOrigin::Default)
+        {
+            let diagnostics = vec![ConfigDiagnostic {
+                file,
+                key: None,
+                severity: ConfigSeverity::Error,
+                reason: "file has no recognized keys; keeping last good values".to_string(),
+            }];
+            self.replace_file_diagnostics(file, diagnostics.clone());
+            self.file_errors[file_index(file)] = None;
+            return FileReload {
+                file,
+                applied: false,
+                changed: 0,
+                diagnostics,
+            };
+        }
+
+        // Commit: a missing file (present == false) resets this file to its
+        // registry defaults; otherwise this is a normal valid candidate.
+        // Origins count as a change because the overlay's `*` marker is
+        // provenance, not value equality.
+        let rows: Vec<&ConfigRow> = REGISTRY.iter().filter(|row| row.file == file).collect();
+        let mut changed = 0usize;
+        for (local, row) in rows.iter().enumerate() {
+            let index = index_of(row.key).expect("registry row key must resolve");
+            if self.values[index] != candidate_values[local]
+                || self.origins[index] != candidate_origins[local]
+            {
+                changed += 1;
+            }
+            self.values[index] = candidate_values[local];
+            self.origins[index] = candidate_origins[local];
+        }
+        self.replace_file_diagnostics(file, candidate_diagnostics.clone());
+        self.file_errors[file_index(file)] = candidate_file_error;
+        self.digest = compute_digest(&self.values);
+        FileReload {
+            file,
+            applied: true,
+            changed,
+            diagnostics: candidate_diagnostics,
+        }
+    }
+
+    /// Swap one file's diagnostic block while preserving `ConfigFile::ALL`
+    /// order across the whole vector.
+    ///
+    /// `retain` + `extend` would move the reloaded file to the end; rebuilding
+    /// by file order keeps `diagnostics()` stable for the checker and overlay.
+    fn replace_file_diagnostics(&mut self, file: ConfigFile, diagnostics: Vec<ConfigDiagnostic>) {
+        let mut merged = Vec::with_capacity(self.diagnostics.len() + diagnostics.len());
+        for ordered in ConfigFile::ALL {
+            if ordered == file {
+                merged.extend(diagnostics.iter().cloned());
+            } else {
+                merged.extend(
+                    self.diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.file == ordered)
+                        .cloned(),
+                );
+            }
+        }
+        self.diagnostics = merged;
     }
 
     /// Digest schema version carried in [`SaveConfigMeta`].
@@ -462,12 +644,24 @@ fn extra_config_files(dir: &Path) -> Vec<String> {
 /// its values/origins only when it produced no Error diagnostics.
 struct FileLoad {
     file: ConfigFile,
+    /// Whether a filesystem entry was observed. `false` only for `NotFound`.
+    /// Live reload treats `present == false` as a valid reset to defaults.
+    present: bool,
+    /// Whether the file contents are blank after trimming. Startup ignores
+    /// this (an empty file is all defaults); live reload rejects it as an
+    /// incomplete write.
+    contents_empty: bool,
     values: Vec<ConfigValue>,
     origins: Vec<ValueOrigin>,
     diagnostics: Vec<ConfigDiagnostic>,
     file_error: Option<String>,
 }
 
+/// Read one file's metadata and bytes, then delegate to [`parse_contents`].
+///
+/// `present` is `false` only for `ErrorKind::NotFound`; every other outcome
+/// (metadata/read/size/parse failure) is `present == true` with a whole-file
+/// Error, so live reload can tell a deletion from a broken file.
 fn parse_file(dir: &Path, file: ConfigFile) -> FileLoad {
     let rows: Vec<&ConfigRow> = REGISTRY.iter().filter(|row| row.file == file).collect();
     let defaults: Vec<ConfigValue> = rows.iter().map(|row| row.default).collect();
@@ -479,6 +673,8 @@ fn parse_file(dir: &Path, file: ConfigFile) -> FileLoad {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return FileLoad {
                 file,
+                present: false,
+                contents_empty: false,
                 values: defaults,
                 origins: default_origins,
                 diagnostics: vec![ConfigDiagnostic {
@@ -513,7 +709,21 @@ fn parse_file(dir: &Path, file: ConfigFile) -> FileLoad {
         }
     };
 
-    let root: toml::Value = match toml::from_str(&contents) {
+    parse_contents(file, &contents)
+}
+
+/// Parse already-read file contents into a [`FileLoad`].
+///
+/// This is the pure half of [`parse_file`]: no filesystem access, no writing.
+/// Every existing reason string, severity, and diagnostic order is preserved
+/// byte-for-byte so startup loading and `--check-config` output do not move.
+fn parse_contents(file: ConfigFile, contents: &str) -> FileLoad {
+    let contents_empty = contents.trim().is_empty();
+    let rows: Vec<&ConfigRow> = REGISTRY.iter().filter(|row| row.file == file).collect();
+    let defaults: Vec<ConfigValue> = rows.iter().map(|row| row.default).collect();
+    let default_origins = vec![ValueOrigin::Default; rows.len()];
+
+    let root: toml::Value = match toml::from_str(contents) {
         Ok(root) => root,
         Err(error) => {
             let reason = format!("invalid TOML: {}", single_line(&error.to_string()));
@@ -604,6 +814,8 @@ fn parse_file(dir: &Path, file: ConfigFile) -> FileLoad {
 
     FileLoad {
         file,
+        present: true,
+        contents_empty,
         values,
         origins,
         diagnostics,
@@ -619,6 +831,8 @@ fn whole_file_error(
 ) -> FileLoad {
     FileLoad {
         file,
+        present: true,
+        contents_empty: false,
         values,
         origins,
         diagnostics: vec![ConfigDiagnostic {
@@ -2091,5 +2305,472 @@ mod tests {
                 file.name()
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Live reload (`ConfigRuntime::reload_file`)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reload_valid_edit_commits_value_origin_and_digest() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 4.6\nsprint_speed = 8.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.5\nsprint_speed = 8.0\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+
+        assert!(report.applied);
+        assert_eq!(report.file, ConfigFile::Player);
+        assert_eq!(report.changed, 1);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 0);
+        assert!(report.first_error().is_none());
+        assert!(report.diagnostics.is_empty());
+
+        assert_eq!(runtime.f32("movement.walk_speed"), 6.5);
+        assert_eq!(
+            runtime.origin("movement.walk_speed"),
+            ValueOrigin::File(ConfigFile::Player)
+        );
+        assert_ne!(runtime.digest(), before);
+        assert!(diagnostics_for(&runtime, ConfigFile::Player).is_empty());
+    }
+
+    #[test]
+    fn reload_invalid_value_rejects_whole_file_and_keeps_last_good() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 4.6\nsprint_speed = 8.0\n[camera]\nz_far = 512.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 0.0\nsprint_speed = 9.0\n[camera]\nz_far = 600.0\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+
+        assert!(!report.applied);
+        assert_eq!(report.changed, 0);
+        assert_eq!(runtime.digest(), before);
+        // The valid sibling edits in the same file must not leak through.
+        assert_eq!(runtime.f32("movement.walk_speed"), 4.6);
+        assert_eq!(runtime.f32("movement.sprint_speed"), 8.0);
+        assert_eq!(runtime.f32("camera.z_far"), 512.0);
+        assert_eq!(
+            runtime.origin("movement.sprint_speed"),
+            ValueOrigin::File(ConfigFile::Player)
+        );
+
+        assert_eq!(report.error_count(), 1);
+        assert_eq!(report.warning_count(), 0);
+        let error = report.first_error().expect("one keyed error");
+        assert_eq!(error.key.as_deref(), Some("movement.walk_speed"));
+        assert_eq!(error.reason, "value 0 is below minimum 0.5");
+        assert!(runtime.file_error(ConfigFile::Player).is_none());
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::Player).len(), 1);
+    }
+
+    #[test]
+    fn reload_cross_field_violation_rejects_world_and_keeps_last_good() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[spawning]\nsafe_radius_blocks = 24\nspawn_max_radius_blocks = 48\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[spawning]\nsafe_radius_blocks = 24\nspawn_max_radius_blocks = 10\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::World);
+
+        assert!(!report.applied);
+        assert_eq!(report.changed, 0);
+        assert_eq!(runtime.digest(), before);
+        assert_eq!(runtime.i64("spawning.safe_radius_blocks"), 24);
+        assert_eq!(runtime.i64("spawning.spawn_max_radius_blocks"), 48);
+        assert_eq!(
+            runtime.origin("spawning.spawn_max_radius_blocks"),
+            ValueOrigin::File(ConfigFile::World)
+        );
+
+        let error = report.first_error().expect("cross-field error");
+        assert_eq!(
+            error.key.as_deref(),
+            Some("spawning.spawn_max_radius_blocks")
+        );
+        assert!(
+            error.reason.contains("spawning.safe_radius_blocks"),
+            "{}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("10 must be greater than"),
+            "{}",
+            error.reason
+        );
+        assert!(runtime.file_error(ConfigFile::World).is_none());
+    }
+
+    #[test]
+    fn reload_invalid_toml_and_oversize_keep_last_good_and_set_file_error() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        write_file(&config, ConfigFile::Player, "[movement\n");
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+        assert!(!report.applied);
+        assert_eq!(runtime.digest(), before);
+        assert_eq!(runtime.f32("movement.walk_speed"), 6.0);
+        assert!(report
+            .first_error()
+            .expect("file-level error")
+            .reason
+            .starts_with("invalid TOML: "));
+        assert!(runtime
+            .file_error(ConfigFile::Player)
+            .expect("file error")
+            .starts_with("invalid TOML: "));
+
+        let path = config.join(ConfigFile::Player.name());
+        std::fs::write(&path, vec![b' '; (MAX_CONFIG_FILE_BYTES + 1) as usize]).unwrap();
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+        assert!(!report.applied);
+        assert_eq!(report.changed, 0);
+        assert_eq!(runtime.f32("movement.walk_speed"), 6.0);
+        assert_eq!(runtime.digest(), before);
+        assert_eq!(
+            runtime.file_error(ConfigFile::Player),
+            Some("file is larger than 1 MiB")
+        );
+        assert_eq!(report.error_count(), 1);
+        assert!(report.diagnostics[0].key.is_none());
+    }
+
+    #[test]
+    fn reload_empty_comment_only_and_unknown_only_are_incomplete() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        let cases = [
+            ("", "file is empty; keeping last good values"),
+            ("   \n\t\n", "file is empty; keeping last good values"),
+            (
+                "# only a comment\n",
+                "file has no recognized keys; keeping last good values",
+            ),
+            (
+                "[movement]\n",
+                "file has no recognized keys; keeping last good values",
+            ),
+            (
+                "[movement]\nmystery = 1\n",
+                "file has no recognized keys; keeping last good values",
+            ),
+        ];
+
+        for (contents, expected_reason) in cases {
+            write_file(&config, ConfigFile::Player, contents);
+            let report = runtime.reload_file(&config, ConfigFile::Player);
+
+            assert!(!report.applied, "{contents:?}");
+            assert_eq!(report.changed, 0, "{contents:?}");
+            assert_eq!(runtime.f32("movement.walk_speed"), 6.0, "{contents:?}");
+            assert_eq!(runtime.digest(), before, "{contents:?}");
+            assert_eq!(report.diagnostics.len(), 1, "{contents:?}");
+            assert_eq!(report.diagnostics[0].key, None, "{contents:?}");
+            assert_eq!(
+                report.diagnostics[0].severity,
+                ConfigSeverity::Error,
+                "{contents:?}"
+            );
+            assert_eq!(
+                report.diagnostics[0].reason, expected_reason,
+                "{contents:?}"
+            );
+            assert_eq!(report.error_count(), 1, "{contents:?}");
+            assert!(
+                runtime.file_error(ConfigFile::Player).is_none(),
+                "{contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_missing_file_applies_defaults_with_missing_warning() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+
+        std::fs::remove_file(config.join(ConfigFile::Player.name())).unwrap();
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+
+        assert!(report.applied);
+        assert_eq!(report.changed, 1);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 1);
+        assert_eq!(
+            runtime.value("movement.walk_speed"),
+            default_of("movement.walk_speed")
+        );
+        assert_eq!(runtime.origin("movement.walk_speed"), ValueOrigin::Default);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].severity, ConfigSeverity::Warning);
+        assert_eq!(
+            report.diagnostics[0].reason,
+            "file is missing; using defaults"
+        );
+        assert!(runtime.file_error(ConfigFile::Player).is_none());
+    }
+
+    #[test]
+    fn reload_back_to_default_still_commits_and_keeps_file_origin() {
+        let (_temp, config) = tempdir_with_config();
+        let ConfigValue::Float(default_walk) = default_of("movement.walk_speed") else {
+            panic!("walk_speed must be a float");
+        };
+        let ConfigValue::Float(default_sprint) = default_of("movement.sprint_speed") else {
+            panic!("sprint_speed must be a float");
+        };
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 9.0\nsprint_speed = 12.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        let before = runtime.digest();
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            &format!("[movement]\nwalk_speed = {default_walk}\nsprint_speed = {default_sprint}\n"),
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+
+        assert!(report.applied);
+        assert_eq!(report.changed, 2);
+        assert_eq!(runtime.f32("movement.walk_speed"), default_walk);
+        assert_eq!(runtime.f32("movement.sprint_speed"), default_sprint);
+        // Origin is provenance: a file value equal to the default is still
+        // file-sourced and must not gain the overlay's `*` marker.
+        assert_eq!(
+            runtime.origin("movement.walk_speed"),
+            ValueOrigin::File(ConfigFile::Player)
+        );
+        assert_eq!(
+            runtime.origin("movement.sprint_speed"),
+            ValueOrigin::File(ConfigFile::Player)
+        );
+        assert_ne!(runtime.digest(), before);
+    }
+
+    #[test]
+    fn reload_warnings_do_not_block_a_commit() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 7.0\nmystery = 1\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+
+        assert!(report.applied);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 1);
+        assert!(report.first_error().is_none());
+        assert_eq!(
+            report.diagnostics[0].key.as_deref(),
+            Some("movement.mystery")
+        );
+        assert_eq!(runtime.f32("movement.walk_speed"), 7.0);
+    }
+
+    #[test]
+    fn reload_rejection_does_not_disturb_siblings_and_later_valid_sibling_applies() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::Survival,
+            "[survival]\nfall_safe_blocks = 5.0\n",
+        );
+        let mut runtime = ConfigRuntime::load_dir(&config);
+
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 0.0\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+        assert!(!report.applied);
+        assert_eq!(runtime.f32("survival.fall_safe_blocks"), 5.0);
+        assert_eq!(
+            runtime.origin("survival.fall_safe_blocks"),
+            ValueOrigin::File(ConfigFile::Survival)
+        );
+        assert!(diagnostics_for(&runtime, ConfigFile::Survival).is_empty());
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::Player).len(), 1);
+
+        write_file(
+            &config,
+            ConfigFile::Survival,
+            "[survival]\nfall_safe_blocks = 7.0\n",
+        );
+        let report = runtime.reload_file(&config, ConfigFile::Survival);
+        assert!(report.applied);
+        assert_eq!(report.changed, 1);
+        assert_eq!(runtime.f32("survival.fall_safe_blocks"), 7.0);
+        assert_eq!(runtime.f32("movement.walk_speed"), 6.0);
+        // The earlier player rejection block survives an unrelated commit.
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::Player).len(), 1);
+    }
+
+    #[test]
+    fn reload_preserves_diagnostics_in_config_file_order() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 0.0\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[spawning]\nsafe_radius_blocks = 24\nspawn_max_radius_blocks = 10\n",
+        );
+        fn first_position(runtime: &ConfigRuntime, file: ConfigFile) -> usize {
+            runtime
+                .diagnostics()
+                .iter()
+                .position(|diagnostic| diagnostic.file == file)
+                .unwrap_or_else(|| panic!("no diagnostics for {}", file.name()))
+        }
+        let mut runtime = ConfigRuntime::load_dir(&config);
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::Player).len(), 1);
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::World).len(), 1);
+        assert!(
+            first_position(&runtime, ConfigFile::Player)
+                < first_position(&runtime, ConfigFile::World)
+        );
+
+        // Replacing the player block must keep it first, not move it last.
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nsprint_speed = 0.0\n",
+        );
+        runtime.reload_file(&config, ConfigFile::Player);
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::Player).len(), 1);
+        assert_eq!(diagnostics_for(&runtime, ConfigFile::World).len(), 1);
+        assert!(
+            first_position(&runtime, ConfigFile::Player)
+                < first_position(&runtime, ConfigFile::World)
+        );
+
+        // Replacing the later world block also keeps ALL order.
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[spawning]\nsafe_radius_blocks = 24\nspawn_max_radius_blocks = 11\n",
+        );
+        runtime.reload_file(&config, ConfigFile::World);
+        assert!(
+            first_position(&runtime, ConfigFile::Player)
+                < first_position(&runtime, ConfigFile::World)
+        );
+    }
+
+    #[test]
+    fn reload_never_writes_config_files_or_creates_entries() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        let mut runtime = ConfigRuntime::load_dir(&config);
+
+        let snapshots = || -> Vec<Vec<u8>> {
+            ConfigFile::ALL
+                .iter()
+                .map(|file| std::fs::read(config.join(file.name())).unwrap())
+                .collect()
+        };
+        let entries = || -> Vec<std::ffi::OsString> {
+            let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&config)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Committed reload.
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 6.0\n",
+        );
+        let before_bytes = snapshots();
+        let before_entries = entries();
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+        assert!(report.applied);
+        assert_eq!(snapshots(), before_bytes);
+        assert_eq!(entries(), before_entries);
+
+        // Rejected reload.
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 0.0\n",
+        );
+        let before_bytes = snapshots();
+        let before_entries = entries();
+        let report = runtime.reload_file(&config, ConfigFile::Player);
+        assert!(!report.applied);
+        assert_eq!(snapshots(), before_bytes);
+        assert_eq!(entries(), before_entries);
     }
 }
