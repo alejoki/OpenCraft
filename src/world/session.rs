@@ -124,6 +124,12 @@ pub struct WorldSession {
     pub world: WorldManager,
     pub player: Player,
     pub camera: Camera,
+    /// The effective typed gameplay tuning this session simulates with.
+    ///
+    /// Installed by [`WorldSession::apply_rules`] at startup and after every
+    /// accepted live reload, then read by the session's gameplay seams.
+    /// Ephemeral: never serialized, so a save never pins a tuning value.
+    gameplay_rules: RulesBundle,
     /// The session-owned game clock. Every save/load boundary restores it
     /// from persisted game time, never from the wall clock.
     pub clock: GameClock,
@@ -293,6 +299,7 @@ impl WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player,
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock: GameClock::new(),
             season_length_days,
             save_mode: mode,
@@ -377,6 +384,7 @@ impl WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(position),
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock,
             season_length_days,
             // Edit Background is a Creative-rules editor; a stored world mode
@@ -530,6 +538,7 @@ impl WorldSession {
             ),
             player,
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock,
             season_length_days,
             save_mode: mode,
@@ -636,9 +645,14 @@ impl WorldSession {
             head_submerged,
             fall_distance: self.player.take_landing_fall(),
         };
-        let tick = self
-            .survival_runtime
-            .tick(&mut self.player.survival, ctx, game_dt);
+        // Copy the Copy rule slice before the mutable vitals borrow.
+        let survival_rules = self.gameplay_rules.survival;
+        let tick = self.survival_runtime.tick_with(
+            &mut self.player.survival,
+            ctx,
+            game_dt,
+            &survival_rules,
+        );
         // The survival rules are the ONLY writers of the `Fall`/`Drowning`/
         // `Starvation` causes (the mob-melee seam is the only writer of
         // `Zombie`). A tick that applied no damage never touches the tag, so an
@@ -784,7 +798,8 @@ impl WorldSession {
         if !holding_bow {
             return Err(BowFireError::NotHoldingBow);
         }
-        let arrow = Arrow::player(origin, dir, charge).ok_or(BowFireError::InvalidShot)?;
+        let arrow = Arrow::player_with_rules(origin, dir, charge, &self.gameplay_rules.arrow)
+            .ok_or(BowFireError::InvalidShot)?;
         if self.arrows.len() >= ARROW_CAP {
             return Err(BowFireError::ArrowCapReached);
         }
@@ -874,6 +889,9 @@ impl WorldSession {
 
         let arrows = std::mem::take(&mut self.arrows);
         let mut kept = Vec::with_capacity(arrows.len());
+        // Copy the Copy rule slices before the split mutable borrows below.
+        let arrow_rules = self.gameplay_rules.arrow;
+        let combat_rules = self.gameplay_rules.combat;
         // Kills are buffered, not granted, while the mob list is mutably
         // borrowed; `resolve_mob_kill` needs `&mut self` for the drop grant.
         let mut pending_kills: Vec<(usize, MobHit)> = Vec::new();
@@ -897,13 +915,13 @@ impl WorldSession {
             }
             let mut consumed = false;
             match arrow.state {
-                ArrowState::Embedded => arrow.advance(game_dt),
+                ArrowState::Embedded => arrow.advance_with_rules(game_dt, &arrow_rules),
                 ArrowState::Flying => {
                     let substeps = arrow.substeps(game_dt);
                     let sub_dt = game_dt / substeps as f32;
                     for _ in 0..substeps {
                         let before = arrow.position;
-                        arrow.advance(sub_dt);
+                        arrow.advance_with_rules(sub_dt, &arrow_rules);
                         if !position_is_resident(world, arrow.position) {
                             // The next cell lives in a chunk that has not
                             // streamed in: restore the last known-good point
@@ -944,13 +962,14 @@ impl WorldSession {
                                 // disjoint mutable borrows below.
                                 let mode = player.mode();
                                 let feet = player.position;
-                                let applied = player.combat.take_hit(
+                                let applied = player.combat.take_hit_with_rules(
                                     &mut player.survival,
                                     arrow.damage,
                                     mode,
                                     DamageCause::SkeletonArrow,
                                     feet,
                                     before,
+                                    &combat_rules,
                                 );
                                 if let Some(applied) = applied {
                                     self.last_damage_cause = Some(DamageCause::SkeletonArrow);
@@ -969,7 +988,7 @@ impl WorldSession {
                         let cell = arrow.position.floor();
                         let block = world.get_block(cell.x as i32, cell.y as i32, cell.z as i32);
                         if block.is_solid() {
-                            arrow.embed();
+                            arrow.embed_with_rules(&arrow_rules);
                             report.block_hits += 1;
                             break;
                         }
@@ -1146,7 +1165,9 @@ impl WorldSession {
     /// uses. Exactly `0.0` when no flash is active.
     #[inline]
     pub fn player_hurt_intensity(&self) -> f32 {
-        self.player.combat.hurt_intensity()
+        self.player
+            .combat
+            .hurt_intensity_with_rules(&self.gameplay_rules.combat)
     }
 
     /// Whether the population layer may create mobs and burn them in daylight.
@@ -1281,7 +1302,9 @@ impl WorldSession {
         // spawn the arrows those steps decided -> spawn/cull. A zero-step or
         // paused frame returns above, so it can neither age the i-frame window,
         // damage the player, nor emit a shot.
-        self.player.combat.advance(report.ai_steps);
+        self.player
+            .combat
+            .advance_with_rules(report.ai_steps, &self.gameplay_rules.combat);
         self.apply_mob_attacks(&report.attacks);
         self.apply_mob_shots(&report.shots);
         {
@@ -1335,13 +1358,14 @@ impl WorldSession {
             // of `combat` and `survival` below.
             let mode = self.player.mode();
             let feet = self.player.position;
-            let applied = self.player.combat.take_hit(
+            let applied = self.player.combat.take_hit_with_rules(
                 &mut self.player.survival,
                 profile.damage,
                 mode,
                 DamageCause::Zombie,
                 feet,
                 attack.from,
+                &self.gameplay_rules.combat,
             );
             if let Some(applied) = applied {
                 self.last_damage_cause = Some(DamageCause::Zombie);
@@ -1375,7 +1399,9 @@ impl WorldSession {
         }
         let mut spawned: u32 = 0;
         for shot in shots {
-            let Some(arrow) = Arrow::skeleton(shot.origin, shot.dir) else {
+            let Some(arrow) =
+                Arrow::skeleton_with_rules(shot.origin, shot.dir, &self.gameplay_rules.arrow)
+            else {
                 continue;
             };
             if self.spawn_arrow(arrow).is_some() {
@@ -1616,9 +1642,20 @@ impl WorldSession {
     /// view. S01 calls this once at startup; S02 re-applies after a live
     /// config reload.
     pub fn apply_rules(&mut self, rules: &RulesBundle) {
+        self.gameplay_rules = *rules;
         self.player.movement = rules.movement;
         self.camera.z_near = rules.camera.z_near;
         self.camera.z_far = rules.camera.z_far;
+    }
+
+    /// The effective gameplay tuning this session simulates with.
+    ///
+    /// `GameApp`-owned transient state (melee/bow/eating) reads the same
+    /// bundle the session's internal seams use, so one live reload changes
+    /// both halves of the frame at once.
+    #[inline]
+    pub fn rules(&self) -> RulesBundle {
+        self.gameplay_rules
     }
 
     /// Applies live tuning and records the config meta the next save writes.
@@ -2122,14 +2159,19 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::bow::BowRules;
     use crate::player::camera::CameraRules;
+    use crate::player::combat::CombatRules;
     use crate::player::container::Container;
     use crate::player::inventory::{
         InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
     };
     use crate::player::melee::attack_damage;
+    use crate::player::melee::MeleeRules;
     use crate::player::physics::{InputState, MovementRules};
+    use crate::player::survival::SurvivalRules;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
+    use crate::world::arrow::ArrowRules;
     use crate::world::block::BlockId;
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
@@ -2208,6 +2250,7 @@ mod tests {
                 z_near: 0.25,
                 z_far: 512.0,
             },
+            ..RulesBundle::default()
         };
         session.apply_rules(&rules);
 
@@ -2328,6 +2371,7 @@ mod tests {
                 z_near: 0.25,
                 z_far: 512.0,
             },
+            ..RulesBundle::default()
         };
 
         session.apply_config(&rules, meta);
@@ -2336,6 +2380,116 @@ mod tests {
         assert_eq!(session.camera.z_near, 0.25);
         assert_eq!(session.camera.z_far, 512.0);
         assert_eq!(session.save_config(), meta);
+    }
+
+    #[test]
+    fn fresh_session_reports_default_gameplay_rules() {
+        let session = WorldSession::new_session(
+            26u32,
+            PathBuf::from("/tmp/fresh-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(session.rules(), RulesBundle::default());
+    }
+
+    #[test]
+    fn apply_rules_drives_survival_and_combat_seams() {
+        let mut session = survival_session(27);
+        let rules = RulesBundle {
+            survival: SurvivalRules {
+                hunger_drain_secs: 1.0,
+                ..SurvivalRules::default()
+            },
+            combat: CombatRules {
+                iframe_secs: 0.0,
+                hurt_flash_secs: 2.0,
+                ..CombatRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules(), rules);
+        assert_eq!(session.rules().survival, rules.survival);
+        assert_eq!(session.rules().combat, rules.combat);
+
+        // One game second of the tuned 1 s drain costs exactly one hunger
+        // point; the 30 s default would cost none.
+        let hunger = session.player.survival.hunger();
+        tick_game_seconds(&mut session, 1, false);
+        assert_eq!(session.player.survival.hunger(), hunger - 1);
+
+        // A tuned zero i-frame lets the next hit land immediately; the default
+        // 0.5 s window would refuse it.
+        let feet = session.player.position;
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3,
+            "the stored zero iframe must not refuse the second hit"
+        );
+        assert_eq!(session.player.survival.health(), 14);
+    }
+
+    #[test]
+    fn apply_rules_reach_selects_a_farther_melee_candidate() {
+        let mut session = survival_hostile_session(28, MobKind::Zombie);
+        let origin = Vec3::new(8.5, 5.2, 8.5);
+        let dir = Vec3::Z;
+        assert!(
+            session.melee_candidate(origin, dir, 1.0).is_none(),
+            "the mob is out of the default reach"
+        );
+
+        let rules = RulesBundle {
+            melee: MeleeRules {
+                reach: 3.0,
+                ..MeleeRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().melee.reach, 3.0);
+        assert!(
+            session
+                .melee_candidate(origin, dir, session.rules().melee.reach)
+                .is_some(),
+            "the stored tuned reach reaches the mob"
+        );
+    }
+
+    #[test]
+    fn apply_rules_drives_bow_and_arrow_spawn_stats() {
+        let mut session = arrow_session(29);
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+        let rules = RulesBundle {
+            bow: BowRules {
+                min_charge_secs: 0.1,
+                full_charge_secs: 0.2,
+            },
+            arrow: ArrowRules {
+                speed_max: 64.0,
+                damage_max: 9,
+                lifetime_secs: 12.0,
+                ..ArrowRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        let arrow = session
+            .fire_bow(shot_origin(), Vec3::new(0.0, 0.0, 1.0), 1.0)
+            .expect("a full-draw shot with ammo");
+        assert_eq!(arrow.damage, 9);
+        assert!(
+            (arrow.velocity.length() - 64.0).abs() < 1e-3,
+            "tuned full-draw speed was {}",
+            arrow.velocity.length()
+        );
+        assert!((arrow.life - 12.0).abs() < 1e-6);
     }
 
     #[test]

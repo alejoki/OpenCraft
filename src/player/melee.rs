@@ -42,6 +42,64 @@ pub const SWING_COOLDOWN_SECS: f32 = 0.6;
 /// Largest frame delta one tick may integrate, so a stall cannot skip a swing.
 pub const MAX_DT: f32 = 0.1;
 
+/// Tunable melee tuning consumed by the `_with_rules` entry points.
+///
+/// [`MeleeRules::default`] is built from the constants above, so the default
+/// bundle reproduces [`attack_damage`], [`attack_damage_with`], and
+/// [`MeleeState::tick`] exactly. The struct is a plain value type: it carries
+/// no TOML/config vocabulary, only the numbers the simulation consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeleeRules {
+    /// Survival damage of an empty hand (or any non-sword item).
+    pub fist_damage: u16,
+    /// Survival damage of a wood sword.
+    pub sword_damage_wood: u16,
+    /// Survival damage of a stone sword.
+    pub sword_damage_stone: u16,
+    /// Survival damage of an iron sword.
+    pub sword_damage_iron: u16,
+    /// Reach of a melee swing in blocks (checked by the caller's ray test).
+    pub reach: f32,
+    /// Seconds a swing cooldown takes to elapse.
+    pub swing_cooldown_secs: f32,
+}
+
+impl Default for MeleeRules {
+    fn default() -> Self {
+        Self {
+            fist_damage: FIST_DAMAGE,
+            sword_damage_wood: SWORD_DAMAGE_WOOD,
+            sword_damage_stone: SWORD_DAMAGE_STONE,
+            sword_damage_iron: SWORD_DAMAGE_IRON,
+            reach: MELEE_REACH,
+            swing_cooldown_secs: SWING_COOLDOWN_SECS,
+        }
+    }
+}
+
+impl MeleeRules {
+    /// Survival damage for one built-in sword tier.
+    const fn sword_damage(self, tier: ToolTier) -> u16 {
+        match tier {
+            ToolTier::Wood => self.sword_damage_wood,
+            ToolTier::Stone => self.sword_damage_stone,
+            ToolTier::Iron => self.sword_damage_iron,
+        }
+    }
+
+    /// Cooldown actually armed after a swing.
+    ///
+    /// Non-finite rules fall back to the pinned default; a zero or negative
+    /// configured cooldown is a legal "swing every tick" rule.
+    fn effective_swing_cooldown_secs(self) -> f32 {
+        if self.swing_cooldown_secs.is_finite() {
+            self.swing_cooldown_secs.max(0.0)
+        } else {
+            SWING_COOLDOWN_SECS
+        }
+    }
+}
+
 /// Axis-parallel epsilon below which a ray component is treated as parallel to
 /// the slab. Also the floor below which a direction is structurally degenerate.
 const RAY_EPSILON_SQ: f32 = 1e-12;
@@ -50,29 +108,26 @@ const RAY_PARALLEL_EPSILON: f32 = 1e-6;
 
 /// Damage one swing applies to a mob that currently has `target_health`.
 ///
-/// Creative one-shots: the swing resolves to exactly the target's remaining
-/// health, so any weapon (or none) kills instantly. Survival returns the
-/// sword's tier damage for `ItemId::Tool { kind: Sword, tier }`; a fist, an
-/// empty slot, a non-sword tool, and a plain material all fall back to
-/// [`FIST_DAMAGE`].
+/// Default-rules wrapper over [`attack_damage_with_rules`]. Creative one-shots:
+/// the swing resolves to exactly the target's remaining health, so any weapon
+/// (or none) kills instantly. Survival returns the sword's tier damage for
+/// `ItemId::Tool { kind: Sword, tier }`; a fist, an empty slot, a non-sword
+/// tool, and a plain material all fall back to [`FIST_DAMAGE`].
 ///
 /// The result is never capped at `target_health` in Survival — [`Mob::take_hit`]
 /// saturates the subtraction, so a strong hit on a weak mob still reports the
 /// damage that was swung.
 pub fn attack_damage(selected: Option<Item>, mode: GameMode, target_health: u16) -> u16 {
-    if matches!(mode, GameMode::Creative) {
-        return target_health;
-    }
-    match selected.map(|item| item.id()) {
-        Some(ItemId::Tool {
-            kind: ToolKind::Sword,
-            tier,
-        }) => tier_sword_damage(tier),
-        _ => FIST_DAMAGE,
-    }
+    attack_damage_with_rules(
+        ContentRegistry::builtin(),
+        &MeleeRules::default(),
+        selected,
+        mode,
+        target_health,
+    )
 }
 
-/// Registry-aware counterpart of [`attack_damage`].
+/// Registry-aware counterpart of [`attack_damage`] using default rules.
 ///
 /// Built-in sword identities keep the frozen tier table, while a pack sword
 /// (`ItemId::ModTool`) resolves its [`ToolDef`] and authored [`TierDef::damage`].
@@ -89,6 +144,33 @@ pub fn attack_damage_with(
     mode: GameMode,
     target_health: u16,
 ) -> u16 {
+    attack_damage_with_rules(
+        registry,
+        &MeleeRules::default(),
+        selected,
+        mode,
+        target_health,
+    )
+}
+
+/// Rules-aware swing damage.
+///
+/// Built-in sword tiers map to the tuned `sword_damage_*` fields and every
+/// other non-pack identity uses `rules.fist_damage`. A pack sword keeps the
+/// damage its pack author set on [`TierDef::damage`] — content authored by a
+/// pack is never overridden by live config — while an unknown/non-sword pack
+/// tool falls back to the tuned fist damage. Creative still one-shots and the
+/// Survival result is still never capped at `target_health`.
+///
+/// [`ToolDef`]: crate::content::ToolDef
+/// [`TierDef`]: crate::content::TierDef
+pub fn attack_damage_with_rules(
+    registry: &ContentRegistry,
+    rules: &MeleeRules,
+    selected: Option<Item>,
+    mode: GameMode,
+    target_health: u16,
+) -> u16 {
     if matches!(mode, GameMode::Creative) {
         return target_health;
     }
@@ -96,13 +178,13 @@ pub fn attack_damage_with(
         Some(ItemId::Tool {
             kind: ToolKind::Sword,
             tier,
-        }) => tier_sword_damage(tier),
+        }) => rules.sword_damage(tier),
         Some(ItemId::ModTool(index)) => registry
             .tool(index)
             .filter(|tool| tool.kind == ToolKind::Sword)
             .and_then(|tool| registry.tier(tool.tier))
-            .map_or(FIST_DAMAGE, |tier| tier.damage),
-        _ => FIST_DAMAGE,
+            .map_or(rules.fist_damage, |tier| tier.damage),
+        _ => rules.fist_damage,
     }
 }
 
@@ -244,9 +326,9 @@ pub enum MeleeTick {
 ///
 /// Deep module, small interface: the only state is one cooldown float, and the
 /// caller owns the actual damage application. A swing fires only with a
-/// candidate *and* an elapsed cooldown, then re-arms to
-/// [`SWING_COOLDOWN_SECS`], so holding Left cannot out-damage the cooldown no
-/// matter how fast the frames arrive.
+/// candidate *and* an elapsed cooldown, then re-arms to the rules' cooldown
+/// (default [`SWING_COOLDOWN_SECS`]), so holding Left cannot out-damage the
+/// cooldown no matter how fast the frames arrive.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct MeleeState {
     cooldown: f32,
@@ -271,7 +353,7 @@ impl MeleeState {
         self.cooldown
     }
 
-    /// Advances the cooldown by one frame and reports what happened.
+    /// Advances the cooldown by one frame using default rules.
     ///
     /// `dt` is raw frame time: non-finite or negative values add nothing, and
     /// positive values are clamped to [`MAX_DT`] so a stalled frame cannot
@@ -279,6 +361,21 @@ impl MeleeState {
     /// a candidate and an elapsed cooldown, and otherwise reports
     /// [`MeleeTick::Cooling`] or [`MeleeTick::Idle`].
     pub fn tick(&mut self, dt: f32, candidate: Option<MeleeTarget>) -> MeleeTick {
+        self.tick_with(dt, candidate, &MeleeRules::default())
+    }
+
+    /// Rules-aware [`MeleeState::tick`].
+    ///
+    /// The swing re-arms to `rules.swing_cooldown_secs` instead of the pinned
+    /// constant; every other contract (raw frame dt, [`MAX_DT`] clamp, one
+    /// swing per elapsed cooldown) is identical. Reach is not stored here —
+    /// the caller passes [`MeleeRules::reach`] to its ray test.
+    pub fn tick_with(
+        &mut self,
+        dt: f32,
+        candidate: Option<MeleeTarget>,
+        rules: &MeleeRules,
+    ) -> MeleeTick {
         let dt = if !dt.is_finite() || dt <= 0.0 {
             0.0
         } else {
@@ -291,7 +388,7 @@ impl MeleeState {
         };
 
         if self.cooldown <= 0.0 {
-            self.cooldown = SWING_COOLDOWN_SECS;
+            self.cooldown = rules.effective_swing_cooldown_secs();
             MeleeTick::Swing {
                 index: target.index,
             }
@@ -820,5 +917,264 @@ mod tests {
         }
         assert_eq!(melee.cooldown(), 0.0);
         assert_eq!(melee.tick(0.1, target(2)), MeleeTick::Swing { index: 2 });
+    }
+
+    // ---- MeleeRules ----------------------------------------------------
+
+    #[test]
+    fn default_melee_rules_are_the_pinned_constants() {
+        assert_eq!(
+            MeleeRules::default(),
+            MeleeRules {
+                fist_damage: FIST_DAMAGE,
+                sword_damage_wood: SWORD_DAMAGE_WOOD,
+                sword_damage_stone: SWORD_DAMAGE_STONE,
+                sword_damage_iron: SWORD_DAMAGE_IRON,
+                reach: MELEE_REACH,
+                swing_cooldown_secs: SWING_COOLDOWN_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn tuned_melee_rules_change_fist_and_sword_damage() {
+        let rules = MeleeRules {
+            fist_damage: 3,
+            sword_damage_wood: 7,
+            sword_damage_stone: 8,
+            sword_damage_iron: 9,
+            ..MeleeRules::default()
+        };
+        let registry = ContentRegistry::builtin();
+
+        assert_eq!(
+            attack_damage_with_rules(registry, &rules, None, GameMode::Survival, 10),
+            3
+        );
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                sword(ToolTier::Wood),
+                GameMode::Survival,
+                10
+            ),
+            7
+        );
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                sword(ToolTier::Stone),
+                GameMode::Survival,
+                10
+            ),
+            8
+        );
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                sword(ToolTier::Iron),
+                GameMode::Survival,
+                10
+            ),
+            9
+        );
+        // A non-sword item uses the tuned fist damage.
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                Some(item(ItemId::Material(Material::Stick))),
+                GameMode::Survival,
+                10
+            ),
+            3
+        );
+        // Clamp/one-shot semantics are unchanged: Survival never caps at the
+        // target's health, and Creative still resolves to exactly it.
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                sword(ToolTier::Iron),
+                GameMode::Survival,
+                2
+            ),
+            9
+        );
+        assert_eq!(
+            attack_damage_with_rules(
+                registry,
+                &rules,
+                sword(ToolTier::Wood),
+                GameMode::Creative,
+                2
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn tuned_melee_rules_keep_pack_authored_damage_and_creative_one_shot() {
+        let registry = pack_tier_registry();
+        let ruby_sword = item_with(&registry, ItemId::ModTool(1));
+        let ruby_pickaxe = item_with(&registry, ItemId::ModTool(0));
+        let rules = MeleeRules {
+            fist_damage: 3,
+            sword_damage_wood: 7,
+            sword_damage_stone: 8,
+            sword_damage_iron: 9,
+            ..MeleeRules::default()
+        };
+
+        assert_eq!(
+            attack_damage_with_rules(&registry, &rules, Some(ruby_sword), GameMode::Survival, 10),
+            9,
+            "the pack's authored tier damage must beat the tuned built-in table"
+        );
+        assert_eq!(
+            attack_damage_with_rules(
+                &registry,
+                &rules,
+                Some(ruby_pickaxe),
+                GameMode::Survival,
+                10
+            ),
+            3,
+            "a non-sword pack tool falls back to the tuned fist damage"
+        );
+        assert_eq!(
+            attack_damage_with_rules(&registry, &rules, Some(ruby_sword), GameMode::Creative, 6),
+            6,
+            "Creative still one-shots under tuned rules"
+        );
+    }
+
+    #[test]
+    fn tuned_reach_extends_the_callers_ray_test_past_the_default() {
+        // Pig box entry is 3.65 blocks ahead: outside the default 3.0 reach,
+        // inside the tuned 5.0 reach.
+        let mobs = mobs_at(&[Vec3::new(0.0, 0.0, 4.0)]);
+        let rules = MeleeRules {
+            reach: 5.0,
+            ..MeleeRules::default()
+        };
+        assert_eq!(
+            nearest_mob_hit(Vec3::ZERO, Vec3::Z, MELEE_REACH, mobs.iter().enumerate()),
+            None,
+            "the default reach must not see a mob 3.65 blocks away"
+        );
+        let hit = nearest_mob_hit(Vec3::ZERO, Vec3::Z, rules.reach, mobs.iter().enumerate())
+            .expect("the tuned reach reaches the mob");
+        assert_eq!(hit.index, 0);
+    }
+
+    #[test]
+    fn tuned_swing_cooldown_changes_the_swing_cadence() {
+        let rules = MeleeRules {
+            swing_cooldown_secs: 0.25,
+            ..MeleeRules::default()
+        };
+        let mut tuned = MeleeState::new();
+        assert_eq!(
+            tuned.tick_with(0.1, target(0), &rules),
+            MeleeTick::Swing { index: 0 }
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                tuned.tick_with(0.1, target(0), &rules),
+                MeleeTick::Cooling { .. }
+            ));
+        }
+        assert_eq!(
+            tuned.tick_with(0.1, target(0), &rules),
+            MeleeTick::Swing { index: 0 },
+            "a 0.25 s cooldown must allow a second swing on the fourth 0.1 s tick"
+        );
+
+        // The same four ticks only swing once at the default 0.6 s cadence.
+        let mut legacy = MeleeState::new();
+        assert_eq!(legacy.tick(0.1, target(0)), MeleeTick::Swing { index: 0 });
+        for _ in 0..3 {
+            assert!(matches!(
+                legacy.tick(0.1, target(0)),
+                MeleeTick::Cooling { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_and_malformed_cooldown_rules_fail_closed() {
+        let zero = MeleeRules {
+            swing_cooldown_secs: 0.0,
+            ..MeleeRules::default()
+        };
+        let mut melee = MeleeState::new();
+        assert_eq!(
+            melee.tick_with(0.1, target(0), &zero),
+            MeleeTick::Swing { index: 0 }
+        );
+        assert_eq!(melee.cooldown(), 0.0);
+        assert_eq!(
+            melee.tick_with(0.1, target(0), &zero),
+            MeleeTick::Swing { index: 0 },
+            "zero cooldown means every candidate tick swings"
+        );
+
+        let nan = MeleeRules {
+            swing_cooldown_secs: f32::NAN,
+            ..MeleeRules::default()
+        };
+        let mut fallback = MeleeState::new();
+        assert_eq!(
+            fallback.tick_with(0.1, target(0), &nan),
+            MeleeTick::Swing { index: 0 }
+        );
+        assert_eq!(
+            fallback.cooldown(),
+            SWING_COOLDOWN_SECS,
+            "a corrupt cooldown falls back to the pinned default"
+        );
+    }
+
+    #[test]
+    fn default_melee_rules_reproduce_the_existing_wrappers() {
+        let registry = ContentRegistry::builtin();
+        let rules = MeleeRules::default();
+        let selections = [
+            None,
+            sword(ToolTier::Wood),
+            sword(ToolTier::Stone),
+            sword(ToolTier::Iron),
+            Some(item(ItemId::Material(Material::Stick))),
+        ];
+        for selected in selections {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                for health in [1, 10, 20] {
+                    assert_eq!(
+                        attack_damage_with_rules(registry, &rules, selected, mode, health),
+                        attack_damage_with(registry, selected, mode, health),
+                    );
+                    assert_eq!(
+                        attack_damage_with(registry, selected, mode, health),
+                        attack_damage(selected, mode, health),
+                    );
+                }
+            }
+        }
+
+        let mut legacy = MeleeState::new();
+        let mut tuned = MeleeState::new();
+        for step in 0..12 {
+            let candidate = if step % 3 == 0 { target(step) } else { None };
+            assert_eq!(
+                legacy.tick(0.1, candidate),
+                tuned.tick_with(0.1, candidate, &rules),
+                "default rules diverged on step {step}"
+            );
+            assert_eq!(legacy.cooldown(), tuned.cooldown());
+        }
     }
 }

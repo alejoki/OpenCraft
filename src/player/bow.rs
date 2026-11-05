@@ -48,6 +48,57 @@ pub const BOW_FULL_CHARGE_SECS: f32 = 1.0;
 /// Largest frame delta one tick may integrate, so a stall cannot skip a draw.
 pub const MAX_DT: f32 = 0.1;
 
+/// Tunable bow tuning consumed by the `_with_rules` entry points.
+///
+/// [`BowRules::default`] is built from the constants above, so the default
+/// bundle reproduces [`BowState::tick`], [`BowState::release`], and
+/// [`BowState::progress`] exactly. The struct is a plain value type: it
+/// carries no TOML/config vocabulary, only the numbers the simulation
+/// consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BowRules {
+    /// Shortest hold that produces a shot at all, in seconds.
+    pub min_charge_secs: f32,
+    /// Hold duration that reaches full draw, in seconds.
+    pub full_charge_secs: f32,
+}
+
+impl Default for BowRules {
+    fn default() -> Self {
+        Self {
+            min_charge_secs: BOW_MIN_CHARGE_SECS,
+            full_charge_secs: BOW_FULL_CHARGE_SECS,
+        }
+    }
+}
+
+impl BowRules {
+    /// Min charge actually applied.
+    ///
+    /// A non-finite value falls back to the pinned default; a zero or
+    /// negative configured minimum means any accumulated charge can fire.
+    fn effective_min_charge_secs(self) -> f32 {
+        if self.min_charge_secs.is_finite() {
+            self.min_charge_secs.max(0.0)
+        } else {
+            BOW_MIN_CHARGE_SECS
+        }
+    }
+
+    /// Full-charge duration actually applied.
+    ///
+    /// A non-finite or non-positive duration cannot be divided by, so it
+    /// falls back to the pinned default rather than producing an infinite or
+    /// NaN progress fraction.
+    fn effective_full_charge_secs(self) -> f32 {
+        if self.full_charge_secs.is_finite() && self.full_charge_secs > 0.0 {
+            self.full_charge_secs
+        } else {
+            BOW_FULL_CHARGE_SECS
+        }
+    }
+}
+
 /// A validated draw target: a wood bow sitting in a hotbar slot.
 ///
 /// Construction is the only gate, so a caller that holds a `BowTarget` knows
@@ -129,15 +180,25 @@ impl BowState {
         self.charge
     }
 
-    /// Draw fraction in `0.0..=1.0`, or `None` while no charge is held.
+    /// Draw fraction in `0.0..=1.0` using default rules, or `None` while no
+    /// charge is held.
     pub fn progress(&self) -> Option<f32> {
-        if self.charge <= 0.0 {
-            return None;
-        }
-        Some((self.charge / BOW_FULL_CHARGE_SECS).clamp(0.0, 1.0))
+        self.progress_with(&BowRules::default())
     }
 
-    /// Advances the draw by `dt` seconds against `target`.
+    /// Rules-aware [`BowState::progress`].
+    ///
+    /// The fraction divides by the tuned full-charge duration, so a HUD fed
+    /// from this method matches the draw the tuned [`BowState::tick_with`]
+    /// produces rather than the pinned constant.
+    pub fn progress_with(&self, rules: &BowRules) -> Option<f32> {
+        if !self.charge.is_finite() || self.charge <= 0.0 {
+            return None;
+        }
+        Some((self.charge / rules.effective_full_charge_secs()).clamp(0.0, 1.0))
+    }
+
+    /// Advances the draw by `dt` seconds against `target` using default rules.
     ///
     /// Contract:
     /// - non-finite or non-positive `dt` adds nothing; positive `dt` is clamped
@@ -148,6 +209,15 @@ impl BowState {
     /// - with a target the charge grows and saturates at
     ///   [`BOW_FULL_CHARGE_SECS`], returning [`BowTick::Full`] from then on.
     pub fn tick(&mut self, dt: f32, target: Option<BowTarget>) -> BowTick {
+        self.tick_with(dt, target, &BowRules::default())
+    }
+
+    /// Rules-aware [`BowState::tick`].
+    ///
+    /// Identical contract, but the charge saturates at
+    /// `rules.full_charge_secs` and the reported progress divides by that
+    /// tuned duration.
+    pub fn tick_with(&mut self, dt: f32, target: Option<BowTarget>, rules: &BowRules) -> BowTick {
         let dt = if !dt.is_finite() || dt <= 0.0 {
             0.0
         } else {
@@ -165,30 +235,42 @@ impl BowState {
             return BowTick::Idle;
         }
 
+        let full_charge = rules.effective_full_charge_secs();
         self.charge += dt;
-        if self.charge >= BOW_FULL_CHARGE_SECS {
+        if self.charge >= full_charge {
             // Saturate so an arbitrarily long hold cannot grow the value.
-            self.charge = BOW_FULL_CHARGE_SECS;
+            self.charge = full_charge;
             return BowTick::Full;
         }
         BowTick::Charging {
-            progress: self.charge / BOW_FULL_CHARGE_SECS,
+            progress: self.charge / full_charge,
         }
     }
 
-    /// Releases the draw, returning the charge fraction when the shot fires.
+    /// Releases the draw using default rules, returning the charge fraction
+    /// when the shot fires.
     ///
     /// Returns `Some(fraction)` with `fraction` in `0.0..=1.0` only when the
     /// charge reached [`BOW_MIN_CHARGE_SECS`]; a shorter tap returns `None`.
     /// The charge is **always** reset, so a quick tap is a cancel and never a
     /// queued shot, and a second release in a row is always `None`.
     pub fn release(&mut self) -> Option<f32> {
+        self.release_with(&BowRules::default())
+    }
+
+    /// Rules-aware [`BowState::release`].
+    ///
+    /// The firable threshold is `rules.min_charge_secs` and the returned
+    /// fraction divides by `rules.full_charge_secs`, so a tuned draw releases
+    /// the same fraction the tuned tick reported.
+    pub fn release_with(&mut self, rules: &BowRules) -> Option<f32> {
         let charge = self.charge;
         self.charge = 0.0;
-        if !charge.is_finite() || charge < BOW_MIN_CHARGE_SECS {
+        if !charge.is_finite() || charge < rules.effective_min_charge_secs() {
             return None;
         }
-        Some(charge.clamp(0.0, BOW_FULL_CHARGE_SECS) / BOW_FULL_CHARGE_SECS)
+        let full_charge = rules.effective_full_charge_secs();
+        Some(charge.clamp(0.0, full_charge) / full_charge)
     }
 }
 
@@ -411,5 +493,165 @@ mod tests {
         assert_eq!(fresh.charge_secs(), 0.0);
         let mut releasing = fresh;
         assert_eq!(releasing.release(), None);
+    }
+
+    // ---- BowRules ------------------------------------------------------
+
+    fn tuned_rules() -> BowRules {
+        BowRules {
+            min_charge_secs: 0.1,
+            full_charge_secs: 0.5,
+        }
+    }
+
+    #[test]
+    fn default_bow_rules_are_the_pinned_constants() {
+        assert_eq!(
+            BowRules::default(),
+            BowRules {
+                min_charge_secs: BOW_MIN_CHARGE_SECS,
+                full_charge_secs: BOW_FULL_CHARGE_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn tuned_bow_rules_change_tick_progress_and_saturation() {
+        let rules = tuned_rules();
+        let mut state = BowState::new();
+        for _ in 0..2 {
+            assert!(matches!(
+                state.tick_with(0.1, Some(bow(0)), &rules),
+                BowTick::Charging { .. }
+            ));
+        }
+        // 0.2 s of a 0.5 s tuned draw is 40%; the default full-charge time
+        // would report 20% for the same stored charge.
+        let tuned = state.progress_with(&rules).expect("still charging");
+        assert!((tuned - 0.4).abs() < 1e-6, "tuned progress was {tuned}");
+        let default = state.progress().expect("still charging");
+        assert!(
+            (default - 0.2).abs() < 1e-6,
+            "default progress was {default}"
+        );
+
+        // Only the third and fourth 0.1 s ticks (0.3 s and 0.4 s) are still
+        // charging; the fifth reaches the tuned 0.5 s saturation point.
+        for tick in 2..4 {
+            assert!(
+                matches!(
+                    state.tick_with(0.1, Some(bow(0)), &rules),
+                    BowTick::Charging { .. }
+                ),
+                "tick {tick} must still be charging"
+            );
+        }
+        assert_eq!(
+            state.tick_with(0.1, Some(bow(0)), &rules),
+            BowTick::Full,
+            "the tuned 0.5 s draw must be full on the fifth 0.1 s tick"
+        );
+        assert_eq!(state.charge_secs(), rules.full_charge_secs);
+        assert_eq!(state.progress_with(&rules), Some(1.0));
+        // Holding longer cannot grow the tuned saturation value.
+        state.tick_with(0.1, Some(bow(0)), &rules);
+        assert_eq!(state.charge_secs(), rules.full_charge_secs);
+    }
+
+    #[test]
+    fn tuned_minimum_charge_and_release_fraction() {
+        let rules = tuned_rules();
+        let mut state = BowState::new();
+        state.tick_with(0.1, Some(bow(0)), &rules);
+
+        // One 0.1 s frame meets the tuned 0.1 s minimum, so it fires 20% of
+        // the tuned draw; the pinned 0.2 s threshold would cancel the tap.
+        let released = state
+            .release_with(&rules)
+            .expect("the tuned minimum accepts a 0.1 s draw");
+        assert!((released - 0.2).abs() < 1e-6, "fraction was {released}");
+        assert_eq!(state.charge_secs(), 0.0, "release always resets");
+        assert_eq!(state.release_with(&rules), None);
+
+        let mut legacy = BowState::new();
+        legacy.tick(0.1, Some(bow(0)));
+        assert_eq!(
+            legacy.release(),
+            None,
+            "the default wrapper keeps the 0.2 s tap threshold"
+        );
+    }
+
+    #[test]
+    fn zero_and_malformed_bow_rules_fail_closed() {
+        // A zero/NaN full-charge time cannot be divided by, so it falls back
+        // to the pinned duration and keeps the draw usable.
+        for full in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let rules = BowRules {
+                min_charge_secs: 0.2,
+                full_charge_secs: full,
+            };
+            let mut state = BowState::new();
+            state.tick_with(0.1, Some(bow(0)), &rules);
+            let progress = state
+                .progress_with(&rules)
+                .expect("a corrupt duration still reports a finite fraction");
+            assert!(
+                progress.is_finite() && (progress - 0.1).abs() < 1e-6,
+                "full charge {full} produced progress {progress}"
+            );
+            assert_eq!(
+                state.charge_secs(),
+                0.1,
+                "no corruption may alter the stored charge"
+            );
+        }
+
+        // A zero minimum means any accumulated charge fires; a non-finite one
+        // falls back to the pinned threshold.
+        let zero_min = BowRules {
+            min_charge_secs: 0.0,
+            ..BowRules::default()
+        };
+        let mut state = BowState::new();
+        state.tick_with(0.1, Some(bow(0)), &zero_min);
+        assert!(state.release_with(&zero_min).is_some());
+
+        let nan_min = BowRules {
+            min_charge_secs: f32::NAN,
+            ..BowRules::default()
+        };
+        let mut state = BowState::new();
+        state.tick_with(0.1, Some(bow(0)), &nan_min);
+        assert_eq!(
+            state.release_with(&nan_min),
+            None,
+            "a corrupt minimum falls back to the pinned 0.2 s threshold"
+        );
+    }
+
+    #[test]
+    fn default_bow_rules_reproduce_the_existing_wrappers() {
+        let rules = BowRules::default();
+        let mut legacy = BowState::new();
+        let mut tuned = BowState::new();
+        for step in 0..12 {
+            assert_eq!(
+                legacy.tick(0.1, Some(bow(0))),
+                tuned.tick_with(0.1, Some(bow(0)), &rules),
+                "tick diverged on step {step}"
+            );
+            assert_eq!(legacy.charge_secs(), tuned.charge_secs());
+            assert_eq!(legacy.progress(), tuned.progress_with(&rules));
+        }
+        assert_eq!(legacy.release(), tuned.release_with(&rules));
+        assert_eq!(legacy.charge_secs(), 0.0);
+
+        // Cancellation stays structural under tuned rules too.
+        let mut cancelled = BowState::new();
+        cancelled.tick_with(0.1, Some(bow(0)), &rules);
+        assert_eq!(cancelled.tick_with(0.1, None, &rules), BowTick::Idle);
+        assert_eq!(cancelled.charge_secs(), 0.0);
+        assert_eq!(cancelled.progress_with(&rules), None);
     }
 }

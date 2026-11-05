@@ -62,6 +62,87 @@ pub const ARROW_MAX_SUBSTEPS: u32 = 16;
 /// Half extent of an arrow's render/collision AABB, in blocks.
 pub const ARROW_HALF_EXTENT: f32 = 0.05;
 
+/// Tunable arrow tuning consumed by the `_with_rules` entry points.
+///
+/// [`ArrowRules::default`] is built from the constants above, so the default
+/// bundle reproduces every existing wrapper exactly. The struct is a plain
+/// value type: it carries no TOML/config vocabulary, only the numbers the
+/// simulation consumes. Spawn-time fields (speed/damage/lifetime) are stored
+/// on the instance; gravity and embed time are read per tick so an in-flight
+/// arrow responds to live tuning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrowRules {
+    /// Downward acceleration in blocks per second squared.
+    pub gravity: f32,
+    /// Speed of a minimum-draw player arrow, in blocks per second.
+    pub speed_min: f32,
+    /// Speed of a full-draw player arrow, in blocks per second.
+    pub speed_max: f32,
+    /// Damage of a minimum-draw player arrow.
+    pub damage_min: u16,
+    /// Damage of a full-draw player arrow.
+    pub damage_max: u16,
+    /// Fixed speed of a skeleton arrow, in blocks per second.
+    pub skeleton_speed: f32,
+    /// Fixed damage of a skeleton arrow.
+    pub skeleton_damage: u16,
+    /// Seconds a flying arrow lives before it despawns in mid-air.
+    pub lifetime_secs: f32,
+    /// Seconds an embedded arrow stays stuck before it despawns.
+    pub embed_secs: f32,
+}
+
+impl Default for ArrowRules {
+    fn default() -> Self {
+        Self {
+            gravity: ARROW_GRAVITY,
+            speed_min: ARROW_SPEED_MIN,
+            speed_max: ARROW_SPEED_MAX,
+            damage_min: ARROW_DAMAGE_MIN,
+            damage_max: ARROW_DAMAGE_MAX,
+            skeleton_speed: ARROW_SPEED_SKELETON,
+            skeleton_damage: ARROW_DAMAGE_SKELETON,
+            lifetime_secs: ARROW_LIFETIME_SECS,
+            embed_secs: ARROW_EMBED_SECS,
+        }
+    }
+}
+
+impl ArrowRules {
+    /// Lifetime actually written onto a spawned arrow.
+    ///
+    /// A non-finite value falls back to the pinned default; a negative value
+    /// is inert and expires immediately rather than failing to drain.
+    fn effective_lifetime_secs(self) -> f32 {
+        if self.lifetime_secs.is_finite() {
+            self.lifetime_secs.max(0.0)
+        } else {
+            ARROW_LIFETIME_SECS
+        }
+    }
+
+    /// Embed lifetime actually armed by [`Arrow::embed_with_rules`].
+    fn effective_embed_secs(self) -> f32 {
+        if self.embed_secs.is_finite() {
+            self.embed_secs.max(0.0)
+        } else {
+            ARROW_EMBED_SECS
+        }
+    }
+
+    /// Gravity actually integrated.
+    ///
+    /// Non-finite and negative values are inert (no fall) so a corrupt rule
+    /// can never inject NaN into the velocity.
+    fn effective_gravity(self) -> f32 {
+        if self.gravity.is_finite() {
+            self.gravity.max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Squared length below which a direction is structurally degenerate.
 const DIRECTION_EPSILON_SQ: f32 = 1e-12;
 /// Per-axis parallel test for the slab sweep.
@@ -100,12 +181,26 @@ pub struct Arrow {
 }
 
 impl Arrow {
-    /// Builds a player arrow from `origin` along `dir` at `charge` in `0.0..=1.0`.
+    /// Builds a player arrow using default rules.
     ///
     /// Returns `None` for a non-finite origin/direction/charge, a charge
     /// outside `0.0..=1.0`, or a zero/degenerate direction. `dir` need not be
     /// normalized.
     pub fn player(origin: Vec3, dir: Vec3, charge: f32) -> Option<Self> {
+        Self::player_with_rules(origin, dir, charge, &ArrowRules::default())
+    }
+
+    /// Rules-aware [`Arrow::player`].
+    ///
+    /// The spawn speed, damage, and lifetime are written onto the instance
+    /// from `rules`; a later rule change cannot retune an arrow already in
+    /// flight (`gravity`/`embed` are the per-tick exceptions).
+    pub fn player_with_rules(
+        origin: Vec3,
+        dir: Vec3,
+        charge: f32,
+        rules: &ArrowRules,
+    ) -> Option<Self> {
         if !charge.is_finite() || !(0.0..=1.0).contains(&charge) {
             return None;
         }
@@ -113,25 +208,39 @@ impl Arrow {
             ArrowOwner::Player,
             origin,
             dir,
-            Self::speed_for_charge(charge),
-            Self::damage_for_charge(charge),
+            Self::speed_for_charge_with_rules(charge, rules),
+            Self::damage_for_charge_with_rules(charge, rules),
+            rules.effective_lifetime_secs(),
         )
     }
 
-    /// Builds a skeleton arrow at the fixed 28 b/s / 2 damage pair.
+    /// Builds a skeleton arrow using default rules (the fixed 28 b/s / 2 pair).
     ///
     /// Validation is identical to [`Arrow::player`].
     pub fn skeleton(origin: Vec3, dir: Vec3) -> Option<Self> {
+        Self::skeleton_with_rules(origin, dir, &ArrowRules::default())
+    }
+
+    /// Rules-aware [`Arrow::skeleton`].
+    pub fn skeleton_with_rules(origin: Vec3, dir: Vec3, rules: &ArrowRules) -> Option<Self> {
         Self::shot(
             ArrowOwner::Skeleton,
             origin,
             dir,
-            ARROW_SPEED_SKELETON,
-            ARROW_DAMAGE_SKELETON,
+            rules.skeleton_speed,
+            rules.skeleton_damage,
+            rules.effective_lifetime_secs(),
         )
     }
 
-    fn shot(owner: ArrowOwner, origin: Vec3, dir: Vec3, speed: f32, damage: u16) -> Option<Self> {
+    fn shot(
+        owner: ArrowOwner,
+        origin: Vec3,
+        dir: Vec3,
+        speed: f32,
+        damage: u16,
+        lifetime_secs: f32,
+    ) -> Option<Self> {
         if !origin.is_finite() || !dir.is_finite() || !speed.is_finite() || speed <= 0.0 {
             return None;
         }
@@ -144,24 +253,43 @@ impl Arrow {
             position: origin,
             velocity: dir * speed,
             damage,
-            life: ARROW_LIFETIME_SECS,
+            life: lifetime_secs,
             state: ArrowState::Flying,
         })
     }
 
-    /// Launch speed for a draw fraction, clamped to `0.0..=1.0`.
+    /// Launch speed for a draw fraction using default rules, clamped to
+    /// `0.0..=1.0`.
     ///
     /// Monotonic in `charge`: 0.0 → 18 b/s, 1.0 → 32 b/s.
     pub fn speed_for_charge(charge: f32) -> f32 {
-        ARROW_SPEED_MIN + (ARROW_SPEED_MAX - ARROW_SPEED_MIN) * charge.clamp(0.0, 1.0)
+        Self::speed_for_charge_with_rules(charge, &ArrowRules::default())
     }
 
-    /// Damage for a draw fraction, clamped to `0.0..=1.0`.
+    /// Rules-aware [`Arrow::speed_for_charge`].
+    ///
+    /// Interpolates linearly between `rules.speed_min` and
+    /// `rules.speed_max` so a tuned pair keeps the same monotonic curve.
+    pub fn speed_for_charge_with_rules(charge: f32, rules: &ArrowRules) -> f32 {
+        rules.speed_min + (rules.speed_max - rules.speed_min) * charge.clamp(0.0, 1.0)
+    }
+
+    /// Damage for a draw fraction using default rules, clamped to
+    /// `0.0..=1.0`.
     ///
     /// Monotonic in `charge`: 0.0 → 1, 0.2 → 2, 1.0 → 4.
     pub fn damage_for_charge(charge: f32) -> u16 {
-        let span = f32::from(ARROW_DAMAGE_MAX - ARROW_DAMAGE_MIN);
-        ARROW_DAMAGE_MIN + (span * charge.clamp(0.0, 1.0)).round() as u16
+        Self::damage_for_charge_with_rules(charge, &ArrowRules::default())
+    }
+
+    /// Rules-aware [`Arrow::damage_for_charge`].
+    ///
+    /// The span uses `f32` subtraction so a caller-provided inverted pair
+    /// (`damage_min > damage_max`) cannot underflow the integer subtraction;
+    /// the saturating float-to-int cast keeps the result in the u16 space.
+    pub fn damage_for_charge_with_rules(charge: f32, rules: &ArrowRules) -> u16 {
+        let span = f32::from(rules.damage_max) - f32::from(rules.damage_min);
+        rules.damage_min + (span * charge.clamp(0.0, 1.0)).round() as u16
     }
 
     /// Substep count that keeps every step `<= ARROW_SUBSTEP_MAX`.
@@ -184,7 +312,8 @@ impl Arrow {
         (raw as u32).clamp(1, ARROW_MAX_SUBSTEPS)
     }
 
-    /// Advances the arrow by one substep of `sub_dt` seconds.
+    /// Advances the arrow by one substep of `sub_dt` seconds using default
+    /// rules.
     ///
     /// Flying: gravity is applied to `velocity.y` first, then the position
     /// integrates the new velocity. Embedded: motion is frozen. Both states
@@ -193,29 +322,47 @@ impl Arrow {
     ///
     /// A non-finite or negative `sub_dt` is treated as `0.0`.
     pub fn advance(&mut self, sub_dt: f32) {
+        self.advance_with_rules(sub_dt, &ArrowRules::default())
+    }
+
+    /// Rules-aware [`Arrow::advance`].
+    ///
+    /// Gravity is read from the per-tick rules, so an arrow fired before a
+    /// live edit responds to the new value on its next substep. The stored
+    /// `damage`/spawn lifetime are deliberately untouched: those are spawn
+    /// facts and an existing arrow keeps its stored damage.
+    pub fn advance_with_rules(&mut self, sub_dt: f32, rules: &ArrowRules) {
         let sub_dt = if !sub_dt.is_finite() || sub_dt < 0.0 {
             0.0
         } else {
             sub_dt
         };
         if self.state == ArrowState::Flying {
-            self.velocity.y -= ARROW_GRAVITY * sub_dt;
+            self.velocity.y -= rules.effective_gravity() * sub_dt;
             self.position += self.velocity * sub_dt;
         }
         self.life -= sub_dt;
     }
 
-    /// Sticks the arrow into a block it just hit.
+    /// Sticks the arrow into a block it just hit using default rules.
     ///
     /// Only a flying arrow embeds. Position is unchanged (it stays where the
     /// sweep found the wall), velocity is kept for render orientation, and the
     /// lifetime restarts at [`ARROW_EMBED_SECS`].
     pub fn embed(&mut self) {
+        self.embed_with_rules(&ArrowRules::default())
+    }
+
+    /// Rules-aware [`Arrow::embed`].
+    ///
+    /// The restart lifetime is `rules.embed_secs`; a non-finite value falls
+    /// back to the pinned default and a negative one expires immediately.
+    pub fn embed_with_rules(&mut self, rules: &ArrowRules) {
         if self.state != ArrowState::Flying {
             return;
         }
         self.state = ArrowState::Embedded;
-        self.life = ARROW_EMBED_SECS;
+        self.life = rules.effective_embed_secs();
     }
 
     /// Whether the arrow should be dropped from the session.
@@ -743,5 +890,194 @@ mod tests {
             arrow.position.x > wall_min.x,
             "the arrow genuinely crossed the wall plane in this frame"
         );
+    }
+
+    // -- ArrowRules ---------------------------------------------------------
+
+    fn tuned_rules() -> ArrowRules {
+        ArrowRules {
+            gravity: 5.0,
+            speed_min: 10.0,
+            speed_max: 50.0,
+            damage_min: 2,
+            damage_max: 6,
+            skeleton_speed: 40.0,
+            skeleton_damage: 5,
+            lifetime_secs: 7.0,
+            embed_secs: 0.5,
+        }
+    }
+
+    #[test]
+    fn default_arrow_rules_are_the_pinned_constants() {
+        assert_eq!(
+            ArrowRules::default(),
+            ArrowRules {
+                gravity: ARROW_GRAVITY,
+                speed_min: ARROW_SPEED_MIN,
+                speed_max: ARROW_SPEED_MAX,
+                damage_min: ARROW_DAMAGE_MIN,
+                damage_max: ARROW_DAMAGE_MAX,
+                skeleton_speed: ARROW_SPEED_SKELETON,
+                skeleton_damage: ARROW_DAMAGE_SKELETON,
+                lifetime_secs: ARROW_LIFETIME_SECS,
+                embed_secs: ARROW_EMBED_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn tuned_player_arrow_rules_change_speed_damage_and_lifetime() {
+        let rules = tuned_rules();
+        approx(Arrow::speed_for_charge_with_rules(0.0, &rules), 10.0, 1e-6);
+        approx(Arrow::speed_for_charge_with_rules(0.5, &rules), 30.0, 1e-6);
+        approx(Arrow::speed_for_charge_with_rules(1.0, &rules), 50.0, 1e-6);
+        assert_eq!(Arrow::damage_for_charge_with_rules(0.0, &rules), 2);
+        assert_eq!(Arrow::damage_for_charge_with_rules(0.5, &rules), 4);
+        assert_eq!(Arrow::damage_for_charge_with_rules(1.0, &rules), 6);
+
+        let arrow = Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 0.5, &rules)
+            .expect("tuned shot constructs");
+        approx(arrow.velocity.length(), 30.0, 1e-5);
+        assert_eq!(arrow.damage, 4);
+        assert_eq!(arrow.life, 7.0, "spawn lifetime comes from the rules");
+        assert_eq!(arrow.owner, ArrowOwner::Player);
+
+        // An existing arrow keeps its stored damage when a later tick uses
+        // different rules; only gravity/embed are per-tick.
+        let newer = ArrowRules {
+            damage_min: 9,
+            damage_max: 9,
+            ..ArrowRules::default()
+        };
+        let mut in_flight = arrow;
+        in_flight.advance_with_rules(0.1, &newer);
+        assert_eq!(in_flight.damage, 4, "stored damage must not be retuned");
+    }
+
+    #[test]
+    fn tuned_skeleton_rules_change_speed_damage_and_lifetime() {
+        let rules = tuned_rules();
+        let arrow = Arrow::skeleton_with_rules(Vec3::ZERO, Vec3::X, &rules)
+            .expect("tuned skeleton shot constructs");
+        assert_eq!(arrow.owner, ArrowOwner::Skeleton);
+        approx(arrow.velocity.length(), 40.0, 1e-5);
+        assert_eq!(arrow.damage, 5);
+        assert_eq!(arrow.life, 7.0);
+    }
+
+    #[test]
+    fn tuned_gravity_and_embed_are_read_per_tick() {
+        let rules = tuned_rules();
+        let mut arrow = Arrow::player(Vec3::ZERO, Vec3::X, 1.0).expect("valid shot");
+        let start_y = arrow.position.y;
+        arrow.advance_with_rules(0.1, &rules);
+        approx(arrow.velocity.y, -5.0 * 0.1, 1e-6);
+        approx(arrow.position.y, start_y - 5.0 * 0.1 * 0.1, 1e-6);
+
+        // An in-flight arrow responds to gravity changing again mid-flight.
+        let gravity_free = ArrowRules {
+            gravity: 0.0,
+            ..ArrowRules::default()
+        };
+        let y = arrow.position.y;
+        let vy = arrow.velocity.y;
+        arrow.advance_with_rules(0.1, &gravity_free);
+        assert_eq!(arrow.velocity.y, vy, "zero gravity must not accelerate");
+        approx(arrow.position.y, y + vy * 0.1, 1e-6);
+
+        arrow.embed_with_rules(&rules);
+        assert_eq!(arrow.state, ArrowState::Embedded);
+        assert_eq!(arrow.life, 0.5, "the tuned embed timer is armed");
+        arrow.advance(0.5);
+        assert!(arrow.finished());
+
+        // A second embed under new rules is ignored, exactly like the default.
+        let mut once = Arrow::player(Vec3::ZERO, Vec3::X, 0.5).expect("valid shot");
+        once.embed_with_rules(&rules);
+        once.embed_with_rules(&ArrowRules::default());
+        assert_eq!(once.life, 0.5);
+    }
+
+    #[test]
+    fn malformed_arrow_rules_fail_closed() {
+        let rules = ArrowRules {
+            gravity: f32::NAN,
+            lifetime_secs: f32::NAN,
+            embed_secs: f32::INFINITY,
+            ..ArrowRules::default()
+        };
+        let mut arrow = Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 0.5, &rules)
+            .expect("corrupt tuning still constructs");
+        assert_eq!(
+            arrow.life, ARROW_LIFETIME_SECS,
+            "a corrupt lifetime falls back to the pinned default"
+        );
+        arrow.advance_with_rules(0.1, &rules);
+        assert_eq!(
+            arrow.velocity.y, 0.0,
+            "corrupt gravity is inert and cannot leak NaN"
+        );
+        arrow.embed_with_rules(&rules);
+        assert_eq!(arrow.life, ARROW_EMBED_SECS);
+
+        // A negative lifetime expires immediately; a negative embed timer
+        // does too, rather than never draining.
+        let negative = ArrowRules {
+            lifetime_secs: -1.0,
+            embed_secs: -1.0,
+            ..ArrowRules::default()
+        };
+        let mut expired =
+            Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 0.5, &negative).expect("constructs");
+        assert!(expired.finished(), "a negative lifetime must expire");
+        let mut embedded =
+            Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 0.5, &negative).expect("constructs");
+        embedded.embed_with_rules(&negative);
+        assert!(embedded.finished());
+
+        // Zero configured speeds make the shot structurally impossible, not
+        // a panic: spawn still fails closed through the existing validation.
+        let no_speed = ArrowRules {
+            speed_min: 0.0,
+            speed_max: 0.0,
+            ..ArrowRules::default()
+        };
+        assert!(Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 1.0, &no_speed).is_none());
+    }
+
+    #[test]
+    fn default_arrow_rules_reproduce_the_existing_wrappers() {
+        let rules = ArrowRules::default();
+        for charge in [0.0, 0.2, 0.5, 1.0] {
+            approx(
+                Arrow::speed_for_charge_with_rules(charge, &rules),
+                Arrow::speed_for_charge(charge),
+                0.0,
+            );
+            assert_eq!(
+                Arrow::damage_for_charge_with_rules(charge, &rules),
+                Arrow::damage_for_charge(charge)
+            );
+            assert_eq!(
+                Arrow::player_with_rules(Vec3::ZERO, Vec3::X, charge, &rules),
+                Arrow::player(Vec3::ZERO, Vec3::X, charge)
+            );
+        }
+        assert_eq!(
+            Arrow::skeleton_with_rules(Vec3::ZERO, Vec3::X, &rules),
+            Arrow::skeleton(Vec3::ZERO, Vec3::X)
+        );
+
+        let mut legacy = Arrow::player(Vec3::ZERO, Vec3::Y, 0.5).expect("valid shot");
+        let mut tuned = legacy;
+        for _ in 0..10 {
+            legacy.advance(0.05);
+            tuned.advance_with_rules(0.05, &rules);
+            assert_eq!(legacy, tuned, "default advance diverged");
+        }
+        legacy.embed();
+        tuned.embed_with_rules(&rules);
+        assert_eq!(legacy, tuned, "default embed diverged");
     }
 }

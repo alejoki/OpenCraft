@@ -23,9 +23,15 @@ pub mod watch;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::player::bow::BowRules;
 use crate::player::camera::CameraRules;
+use crate::player::combat::CombatRules;
+use crate::player::eating::EatingRules;
+use crate::player::melee::MeleeRules;
 use crate::player::physics::MovementRules;
+use crate::player::survival::SurvivalRules;
 use crate::settings::SettingsWarning;
+use crate::world::arrow::ArrowRules;
 
 pub use registry::{
     docs_table, index_of, ApplyMode, ConfigFile, ConfigKind, ConfigRow, ConfigValue, REGISTRY,
@@ -91,6 +97,12 @@ pub struct SaveConfigMeta {
 pub struct RulesBundle {
     pub movement: MovementRules,
     pub camera: CameraRules,
+    pub survival: SurvivalRules,
+    pub eating: EatingRules,
+    pub melee: MeleeRules,
+    pub combat: CombatRules,
+    pub bow: BowRules,
+    pub arrow: ArrowRules,
 }
 
 impl Default for RulesBundle {
@@ -98,6 +110,12 @@ impl Default for RulesBundle {
         Self {
             movement: MovementRules::default(),
             camera: CameraRules::default(),
+            survival: SurvivalRules::default(),
+            eating: EatingRules::default(),
+            melee: MeleeRules::default(),
+            combat: CombatRules::default(),
+            bow: BowRules::default(),
+            arrow: ArrowRules::default(),
         }
     }
 }
@@ -389,6 +407,54 @@ impl ConfigRuntime {
             camera: CameraRules {
                 z_near: self.f32("camera.z_near"),
                 z_far: self.f32("camera.z_far"),
+            },
+            survival: SurvivalRules {
+                fall_safe_blocks: self.f32("survival.fall_safe_blocks"),
+                air_drain_per_sec: self.f32("survival.air_drain_per_sec"),
+                drown_interval_secs: self.f32("survival.drown_interval_secs"),
+                drown_damage: self.i64("survival.drown_damage") as u16,
+                hunger_drain_secs: self.f32("survival.hunger_drain_secs"),
+                starve_interval_secs: self.f32("survival.starve_interval_secs"),
+                starve_damage: self.i64("survival.starve_damage") as u16,
+                regen_hunger_threshold: self.i64("survival.regen_hunger_threshold") as u16,
+                regen_interval_secs: self.f32("survival.regen_interval_secs"),
+                regen_hunger_cost: self.i64("survival.regen_hunger_cost") as u16,
+            },
+            eating: EatingRules {
+                eat_duration_secs: self.f32("eating.eat_duration_secs"),
+                apple_hunger: self.i64("eating.apple_hunger") as u16,
+                bread_hunger: self.i64("eating.bread_hunger") as u16,
+                raw_meat_hunger: self.i64("eating.raw_meat_hunger") as u16,
+                rotten_flesh_hunger: self.i64("eating.rotten_flesh_hunger") as u16,
+            },
+            melee: MeleeRules {
+                fist_damage: self.i64("melee.fist_damage") as u16,
+                sword_damage_wood: self.i64("melee.sword_damage_wood") as u16,
+                sword_damage_stone: self.i64("melee.sword_damage_stone") as u16,
+                sword_damage_iron: self.i64("melee.sword_damage_iron") as u16,
+                reach: self.f32("melee.reach"),
+                swing_cooldown_secs: self.f32("melee.swing_cooldown_secs"),
+            },
+            combat: CombatRules {
+                iframe_secs: self.f32("player.iframe_secs"),
+                hurt_flash_secs: self.f32("player.hurt_flash_secs"),
+                knockback_speed: self.f32("player.knockback_speed"),
+                knockback_decay: self.f32("player.knockback_decay"),
+            },
+            bow: BowRules {
+                min_charge_secs: self.f32("bow.min_charge_secs"),
+                full_charge_secs: self.f32("bow.full_charge_secs"),
+            },
+            arrow: ArrowRules {
+                gravity: self.f32("arrow.gravity"),
+                speed_min: self.f32("arrow.speed_min"),
+                speed_max: self.f32("arrow.speed_max"),
+                damage_min: self.i64("arrow.damage_min") as u16,
+                damage_max: self.i64("arrow.damage_max") as u16,
+                skeleton_speed: self.f32("arrow.skeleton_speed"),
+                skeleton_damage: self.i64("arrow.skeleton_damage") as u16,
+                lifetime_secs: self.f32("arrow.lifetime_secs"),
+                embed_secs: self.f32("arrow.embed_secs"),
             },
         }
     }
@@ -1256,6 +1322,52 @@ mod tests {
             rules.camera.z_near,
             CameraRules::default().z_near,
             "an absent camera field must keep its registry default"
+        );
+    }
+
+    #[test]
+    fn rules_bundle_reads_survival_eating_and_combat_domains() {
+        let (_temp, config) = tempdir_with_config();
+        write_file(
+            &config,
+            ConfigFile::Survival,
+            "[survival]\nfall_safe_blocks = 9.0\ndrown_damage = 5\nhunger_drain_secs = 2.5\n\n[eating]\neat_duration_secs = 0.75\napple_hunger = 7\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::Combat,
+            "[melee]\nreach = 7.5\nfist_damage = 4\n\n[player]\niframe_secs = 1.25\nknockback_speed = 12.0\n\n[bow]\nfull_charge_secs = 0.5\n\n[arrow]\nspeed_max = 48.0\ndamage_max = 9\nlifetime_secs = 12.0\n",
+        );
+
+        let rules = ConfigRuntime::load_dir(&config).rules();
+        assert_eq!(rules.survival.fall_safe_blocks, 9.0);
+        assert_eq!(rules.survival.drown_damage, 5);
+        assert_eq!(rules.survival.hunger_drain_secs, 2.5);
+        assert_eq!(rules.eating.eat_duration_secs, 0.75);
+        assert_eq!(rules.eating.apple_hunger, 7);
+        assert_eq!(rules.melee.reach, 7.5);
+        assert_eq!(rules.melee.fist_damage, 4);
+        assert_eq!(rules.combat.iframe_secs, 1.25);
+        assert_eq!(rules.combat.knockback_speed, 12.0);
+        assert_eq!(rules.bow.full_charge_secs, 0.5);
+        assert_eq!(rules.arrow.speed_max, 48.0);
+        assert_eq!(rules.arrow.damage_max, 9);
+        assert_eq!(rules.arrow.lifetime_secs, 12.0);
+
+        // Absent rows keep their registry defaults; a partial file is not a
+        // reason to re-default its siblings.
+        assert_eq!(
+            rules.survival.air_drain_per_sec,
+            SurvivalRules::default().air_drain_per_sec
+        );
+        assert_eq!(
+            rules.combat.hurt_flash_secs,
+            CombatRules::default().hurt_flash_secs
+        );
+        assert_eq!(rules.arrow.gravity, ArrowRules::default().gravity);
+        assert_eq!(
+            rules.melee.swing_cooldown_secs,
+            MeleeRules::default().swing_cooldown_secs
         );
     }
 

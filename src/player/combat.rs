@@ -45,6 +45,49 @@ pub const PLAYER_KNOCKBACK_DECAY: f32 = 0.6;
 /// body provably comes to rest instead of creeping forever.
 pub const PLAYER_KNOCKBACK_EPSILON_SQ: f32 = 1e-4;
 
+/// Tunable player-combat tuning consumed by the `_with_rules` entry points.
+///
+/// [`CombatRules::default`] is built from the constants above, so the default
+/// bundle reproduces [`PlayerCombat::take_hit`], [`PlayerCombat::advance`], and
+/// [`PlayerCombat::hurt_intensity`] exactly. The struct is a plain value type:
+/// it carries no TOML/config vocabulary, only the numbers the simulation
+/// consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CombatRules {
+    /// Seconds a player ignores further hits after one lands.
+    pub iframe_secs: f32,
+    /// Seconds the red damage flash stays at full intensity after a hit.
+    pub hurt_flash_secs: f32,
+    /// Initial horizontal speed of the knockback impulse, blocks/second.
+    pub knockback_speed: f32,
+    /// Per-fixed-step multiplier applied to the remaining impulse.
+    pub knockback_decay: f32,
+}
+
+impl Default for CombatRules {
+    fn default() -> Self {
+        Self {
+            iframe_secs: PLAYER_IFRAME_SECS,
+            hurt_flash_secs: PLAYER_HURT_FLASH_SECS,
+            knockback_speed: PLAYER_KNOCKBACK_SPEED,
+            knockback_decay: PLAYER_KNOCKBACK_DECAY,
+        }
+    }
+}
+
+/// Clamp a rules timer/speed to a finite, non-negative value.
+///
+/// Non-finite rules (impossible through the validated config path) fail
+/// closed as zero rather than leaking NaN into a timer or the physics
+/// integrator; negative values are inert for the same reason.
+fn sanitize_non_negative(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// Squared horizontal length below which a separation vector is treated as
 /// degenerate. Mirrors [`crate::world::mob::Mob::take_hit`] so player and mob
 /// knockback fall back the same way.
@@ -120,15 +163,28 @@ pub struct PlayerCombat {
 }
 
 impl PlayerCombat {
-    /// Red flash intensity in `0.0..=1.0`, exactly `0.0` when quiescent.
+    /// Red flash intensity in `0.0..=1.0` using default rules.
     ///
     /// Non-finite and non-positive timers both read as "no flash", so a
     /// corrupted value can never paint a garbage colour.
     pub fn hurt_intensity(&self) -> f32 {
+        self.hurt_intensity_with_rules(&CombatRules::default())
+    }
+
+    /// Rules-aware [`PlayerCombat::hurt_intensity`].
+    ///
+    /// The flash fraction divides by `rules.hurt_flash_secs`, so tuning the
+    /// flash duration changes the fade speed without moving the stored timer.
+    /// A non-finite or non-positive duration reads as "no flash".
+    pub fn hurt_intensity_with_rules(&self, rules: &CombatRules) -> f32 {
         if !self.hurt.is_finite() || self.hurt <= 0.0 {
             return 0.0;
         }
-        (self.hurt / PLAYER_HURT_FLASH_SECS).clamp(0.0, 1.0)
+        let duration = sanitize_non_negative(rules.hurt_flash_secs);
+        if duration <= 0.0 {
+            return 0.0;
+        }
+        (self.hurt / duration).clamp(0.0, 1.0)
     }
 
     /// Remaining i-frame seconds. `> 0.0` means the next hit is refused.
@@ -148,7 +204,8 @@ impl PlayerCombat {
         self.knockback = Vec3::ZERO;
     }
 
-    /// Applies one player hit, or refuses it without mutating anything.
+    /// Applies one player hit using default rules, or refuses it without
+    /// mutating anything.
     ///
     /// Refuses when the mode is not Survival, the player is already dead
     /// (`health == 0`), the i-frame window is open, or `damage == 0`. On
@@ -175,6 +232,34 @@ impl PlayerCombat {
         player_feet: Vec3,
         from: Vec3,
     ) -> Option<AppliedHit> {
+        self.take_hit_with_rules(
+            vitals,
+            damage,
+            mode,
+            cause,
+            player_feet,
+            from,
+            &CombatRules::default(),
+        )
+    }
+
+    /// Rules-aware [`PlayerCombat::take_hit`].
+    ///
+    /// The same acceptance gate and saturating damage apply; the armed flash,
+    /// i-frame window, and initial knockback speed come from `rules`.
+    /// `knockback_decay` is not used here — [`PlayerCombat::advance_with_rules`]
+    /// owns the per-fixed-step decay exactly like the pinned constant did.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_hit_with_rules(
+        &mut self,
+        vitals: &mut SurvivalState,
+        damage: u16,
+        mode: GameMode,
+        cause: DamageCause,
+        player_feet: Vec3,
+        from: Vec3,
+        rules: &CombatRules,
+    ) -> Option<AppliedHit> {
         if mode != GameMode::Survival || vitals.health() == 0 || self.iframe > 0.0 || damage == 0 {
             return None;
         }
@@ -183,8 +268,8 @@ impl PlayerCombat {
         // session is the only writer of `last_damage_cause` (T04).
         let _ = cause;
 
-        self.hurt = PLAYER_HURT_FLASH_SECS;
-        self.iframe = PLAYER_IFRAME_SECS;
+        self.hurt = sanitize_non_negative(rules.hurt_flash_secs);
+        self.iframe = sanitize_non_negative(rules.iframe_secs);
 
         let delta = player_feet - from;
         let horizontal = Vec3::new(delta.x, 0.0, delta.z);
@@ -197,7 +282,7 @@ impl PlayerCombat {
             // A corrupted position must still not produce a zero or NaN push.
             dir = Vec3::Z;
         }
-        self.knockback = dir * PLAYER_KNOCKBACK_SPEED;
+        self.knockback = dir * sanitize_non_negative(rules.knockback_speed);
 
         let applied = vitals.damage(damage);
         let health_after = vitals.health();
@@ -208,16 +293,29 @@ impl PlayerCombat {
         })
     }
 
-    /// Advances the timers by `ai_steps` executed fixed mob steps.
+    /// Advances the timers by `ai_steps` executed fixed mob steps using
+    /// default rules.
     ///
     /// Driven by `MobTick.ai_steps`, never by render `dt`, so i-frames and the
     /// flash are frame-rate independent (MEM410/MEM415). A non-finite impulse
     /// is dropped rather than propagated into the physics integration.
     pub fn advance(&mut self, ai_steps: u32) {
+        self.advance_with_rules(ai_steps, &CombatRules::default())
+    }
+
+    /// Rules-aware [`PlayerCombat::advance`].
+    ///
+    /// `rules.knockback_decay` is applied **once per executed fixed step**,
+    /// preserving the existing multiplier semantics; it is not reinterpreted
+    /// as a per-second rate even though the registry documents the field that
+    /// way. A zero decay stops the impulse immediately, and a non-finite one
+    /// fails closed to zero.
+    pub fn advance_with_rules(&mut self, ai_steps: u32, rules: &CombatRules) {
+        let decay = sanitize_non_negative(rules.knockback_decay);
         for _ in 0..ai_steps {
             self.hurt = (self.hurt - MOB_TICK_SECS).max(0.0);
             self.iframe = (self.iframe - MOB_TICK_SECS).max(0.0);
-            self.knockback *= PLAYER_KNOCKBACK_DECAY;
+            self.knockback *= decay;
             if self.knockback.length_squared() < PLAYER_KNOCKBACK_EPSILON_SQ {
                 self.knockback = Vec3::ZERO;
             }
@@ -643,5 +741,265 @@ mod tests {
         assert_eq!(DamageCause::Drowning.label(), "Drowning");
         assert_eq!(DamageCause::Starvation.label(), "Starvation");
         assert_eq!(DamageCause::SkeletonArrow.label(), "Skeleton arrow");
+    }
+
+    // ---- CombatRules ---------------------------------------------------
+
+    fn tuned_rules() -> CombatRules {
+        CombatRules {
+            iframe_secs: 1.0,
+            hurt_flash_secs: 1.0,
+            knockback_speed: 2.0,
+            knockback_decay: 0.5,
+        }
+    }
+
+    #[test]
+    fn default_combat_rules_are_the_pinned_constants() {
+        assert_eq!(
+            CombatRules::default(),
+            CombatRules {
+                iframe_secs: PLAYER_IFRAME_SECS,
+                hurt_flash_secs: PLAYER_HURT_FLASH_SECS,
+                knockback_speed: PLAYER_KNOCKBACK_SPEED,
+                knockback_decay: PLAYER_KNOCKBACK_DECAY,
+            }
+        );
+    }
+
+    #[test]
+    fn tuned_combat_rules_change_iframe_flash_and_knockback() {
+        let rules = tuned_rules();
+        let mut combat = PlayerCombat::default();
+        let mut vitals = survival_full();
+        let player_feet = Vec3::new(0.5, 5.0, 0.5);
+        let from = player_feet + Vec3::Z;
+
+        let hit = combat
+            .take_hit_with_rules(
+                &mut vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+                &rules,
+            )
+            .expect("a legal hit lands");
+        assert_eq!(hit.health_after, 17);
+        assert_eq!(combat.iframe(), 1.0, "the tuned i-frame is armed");
+        assert_eq!(combat.hurt_intensity_with_rules(&rules), 1.0);
+        assert!(
+            (combat.knockback() - Vec3::Z * -2.0).length() < 1e-6,
+            "the tuned 2 b/s impulse points away from the attacker, got {:?}",
+            combat.knockback()
+        );
+
+        // One fixed step at the tuned 0.5 decay halves the impulse; the
+        // pinned default would leave 2 * 0.6 = 1.2.
+        combat.advance_with_rules(1, &rules);
+        assert!(
+            (combat.knockback() - Vec3::Z * -1.0).length() < 1e-6,
+            "tuned decay must be applied once per fixed step, got {:?}",
+            combat.knockback()
+        );
+        // One fixed 0.05 s step of the tuned 1.0 s flash leaves 0.95; the
+        // default wrapper still divides by the pinned 0.5 s duration and
+        // clamps, so it reads 1.0 for the same timer.
+        let intensity = combat.hurt_intensity_with_rules(&rules);
+        assert!(
+            (intensity - 0.95).abs() < 1e-5,
+            "tuned flash fade was {intensity}"
+        );
+        assert_eq!(
+            combat.hurt_intensity(),
+            1.0,
+            "the default wrapper still divides by the pinned flash duration"
+        );
+
+        // The tuned 1.0 s window is still open after 0.5 s but accepts the
+        // hit after a full second.
+        combat.advance_with_rules(9, &rules);
+        assert!(combat.iframe() > 0.0);
+        // Ten 0.05 s steps consume half of the tuned flash: 0.50 remains.
+        let half_intensity = combat.hurt_intensity_with_rules(&rules);
+        assert!(
+            (half_intensity - 0.5).abs() < 1e-5,
+            "tuned half-flash fade was {half_intensity}"
+        );
+        assert_eq!(
+            combat.take_hit_with_rules(
+                &mut vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+                &rules,
+            ),
+            None,
+            "the tuned window must refuse a hit at 0.5 s"
+        );
+        combat.advance_with_rules(10, &rules);
+        assert_eq!(combat.iframe(), 0.0);
+        assert!(
+            combat
+                .take_hit_with_rules(
+                    &mut vitals,
+                    3,
+                    GameMode::Survival,
+                    DamageCause::Zombie,
+                    player_feet,
+                    from,
+                    &rules,
+                )
+                .is_some(),
+            "the tuned window must open after 1.0 s"
+        );
+    }
+
+    #[test]
+    fn zero_tuned_iframe_allows_back_to_back_hits() {
+        let rules = CombatRules {
+            iframe_secs: 0.0,
+            ..CombatRules::default()
+        };
+        let mut combat = PlayerCombat::default();
+        let mut vitals = survival_full();
+        let player_feet = Vec3::new(0.5, 5.0, 0.5);
+        let from = player_feet + Vec3::Z;
+
+        assert!(combat
+            .take_hit_with_rules(
+                &mut vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+                &rules,
+            )
+            .is_some());
+        assert_eq!(combat.iframe(), 0.0);
+        let second = combat
+            .take_hit_with_rules(
+                &mut vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+                &rules,
+            )
+            .expect("a zero i-frame window never blocks");
+        assert_eq!(second.health_after, 14);
+    }
+
+    #[test]
+    fn zero_and_malformed_combat_rules_fail_closed() {
+        let zero = CombatRules {
+            iframe_secs: 0.0,
+            hurt_flash_secs: 0.0,
+            knockback_speed: 0.0,
+            knockback_decay: 0.0,
+        };
+        let mut combat = PlayerCombat::default();
+        let mut vitals = survival_full();
+        let player_feet = Vec3::new(0.5, 5.0, 0.5);
+        assert!(combat
+            .take_hit_with_rules(
+                &mut vitals,
+                1,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                player_feet + Vec3::Z,
+                &zero,
+            )
+            .is_some());
+        assert_eq!(combat.hurt_intensity_with_rules(&zero), 0.0);
+        assert_eq!(combat.iframe(), 0.0);
+        assert_eq!(combat.knockback(), Vec3::ZERO);
+        combat.advance_with_rules(30, &zero);
+        assert_eq!(combat.knockback(), Vec3::ZERO);
+
+        let malformed = CombatRules {
+            iframe_secs: f32::NAN,
+            hurt_flash_secs: f32::NEG_INFINITY,
+            knockback_speed: f32::INFINITY,
+            knockback_decay: f32::NAN,
+        };
+        let mut corrupt = PlayerCombat::default();
+        let mut corrupt_vitals = survival_full();
+        assert!(corrupt
+            .take_hit_with_rules(
+                &mut corrupt_vitals,
+                1,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                player_feet + Vec3::Z,
+                &malformed,
+            )
+            .is_some());
+        assert_eq!(corrupt.hurt_intensity_with_rules(&malformed), 0.0);
+        assert_eq!(corrupt.iframe(), 0.0);
+        assert_eq!(corrupt.knockback(), Vec3::ZERO);
+        corrupt.advance_with_rules(30, &malformed);
+        assert_eq!(corrupt.knockback(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn default_combat_rules_reproduce_the_existing_wrappers() {
+        let rules = CombatRules::default();
+        let player_feet = Vec3::new(0.5, 5.0, 0.5);
+        let from = player_feet + Vec3::Z;
+
+        let mut legacy = PlayerCombat::default();
+        let mut legacy_vitals = survival_full();
+        let mut tuned = PlayerCombat::default();
+        let mut tuned_vitals = survival_full();
+
+        assert_eq!(
+            legacy.take_hit(
+                &mut legacy_vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+            ),
+            tuned.take_hit_with_rules(
+                &mut tuned_vitals,
+                3,
+                GameMode::Survival,
+                DamageCause::Zombie,
+                player_feet,
+                from,
+                &rules,
+            )
+        );
+        assert_eq!(
+            legacy.hurt_intensity(),
+            tuned.hurt_intensity_with_rules(&rules)
+        );
+        assert_eq!(legacy.iframe(), tuned.iframe());
+        assert_eq!(legacy.knockback(), tuned.knockback());
+
+        for steps in [1, 4, 10, 30] {
+            legacy.advance(steps);
+            tuned.advance_with_rules(steps, &rules);
+            assert_eq!(legacy.iframe(), tuned.iframe(), "iframe diverged");
+            assert_eq!(
+                legacy.knockback(),
+                tuned.knockback(),
+                "knockback diverged after {steps} steps"
+            );
+            assert_eq!(
+                legacy.hurt_intensity(),
+                tuned.hurt_intensity_with_rules(&rules),
+                "flash diverged after {steps} steps"
+            );
+        }
     }
 }
