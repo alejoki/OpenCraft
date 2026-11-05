@@ -6512,6 +6512,40 @@ mod tests {
         data
     }
 
+    /// Deterministic v8 baseline payload for the frozen migration fixture:
+    /// rich inventory and both grids, chest, pinned mobs, Survival vitals,
+    /// calendar values, and a chunk edit.
+    fn v8_fixture_data() -> WorldSaveData {
+        migration_data(MOB_VERSION)
+    }
+
+    /// Writes `tests/fixtures/saves/v8-baseline.mcvx` once with the current v8
+    /// writer. The no-op-if-present guard is deliberate: after the save version
+    /// bumps to v9 this generator must never overwrite the frozen v8 bytes that
+    /// the migration test reads.
+    #[test]
+    #[ignore]
+    fn write_frozen_v8_fixture() {
+        let path = Path::new("tests/fixtures/saves/v8-baseline.mcvx");
+        if path.exists() {
+            return;
+        }
+        assert_eq!(SAVE_VERSION, 8, "freeze the v8 baseline before bumping");
+        assert_eq!(
+            CONTENT_TABLE_VERSION, 8,
+            "v8 baseline must carry the content table tail"
+        );
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &v8_fixture_data(), ContentRegistry::builtin())
+            .expect("frozen v8 fixture must encode");
+        assert_eq!(&bytes[4..8], &8u32.to_le_bytes());
+
+        let parent = path.parent().expect("fixture path has a parent");
+        std::fs::create_dir_all(parent).expect("create fixture directory");
+        std::fs::write(path, &bytes).expect("write frozen v8 fixture");
+    }
+
     /// Loads the fixture for one legacy version, then proves the public v8
     /// path is deterministic: v -> load -> v8 -> load -> v8 is byte-stable and
     /// never changes the decoded domain values.
