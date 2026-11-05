@@ -37,6 +37,9 @@ pub const CONFIG_SCHEMA_VERSION: u16 = 1;
 /// Hard size cap for a single config file; anything larger is rejected whole.
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Exact reason recorded by the loader for an absent curated file.
+const MISSING_FILE_REASON: &str = "file is missing; using defaults";
+
 const FILE_COUNT: usize = 6;
 
 /// Where one effective value came from.
@@ -251,6 +254,153 @@ pub fn startup_warnings(runtime: &ConfigRuntime) -> Vec<SettingsWarning> {
 }
 
 // ---------------------------------------------------------------------------
+// Headless --check-config report
+// ---------------------------------------------------------------------------
+
+/// Render the deterministic `--check-config` report for `dir`.
+///
+/// Returns `(lines, ok)` where `ok` is true iff the loader produced no Error
+/// diagnostics. The function reads `dir` (and scans it for unexpected `*.toml`
+/// entries) but never writes, opens a window, touches settings, or reads a
+/// pack. Every path in the output is a logical `config/<file>` path, so the
+/// report is independent of the process CWD.
+///
+/// Line contract:
+/// - files render in [`ConfigFile::ALL`] order;
+/// - per file, diagnostics order file-level, known keys in registry order,
+///   then unknown keys lexicographically;
+/// - a present file with no Error prints `ok: config/<file>: <N> values`;
+/// - a missing file prints one warning and is counted in `missing`;
+/// - unexpected `*.toml` entries print sorted `not a config file` warnings;
+/// - the final line is the fixed summary carrying counts, schema and digest.
+///
+/// This module never prints; the caller owns stdout and the exit status
+/// (`ok` false means exit non-zero).
+pub fn check_config_lines(dir: &Path) -> (Vec<String>, bool) {
+    let runtime = ConfigRuntime::load_dir(dir);
+    let mut lines = Vec::new();
+    let mut missing = 0usize;
+    let mut warnings = 0usize;
+    let mut errors = 0usize;
+
+    for file in ConfigFile::ALL {
+        let diagnostics = ordered_file_diagnostics(&runtime, file);
+
+        // The loader records an absent file as exactly one file-level warning
+        // and never records anything else for it.
+        let is_missing = diagnostics.len() == 1
+            && diagnostics[0].key.is_none()
+            && diagnostics[0].severity == ConfigSeverity::Warning
+            && diagnostics[0].reason == MISSING_FILE_REASON;
+        if is_missing {
+            missing += 1;
+            warnings += 1;
+            lines.push(format!(
+                "warning: {}: {MISSING_FILE_REASON}",
+                file.rel_path()
+            ));
+            continue;
+        }
+
+        let mut file_has_error = false;
+        for diagnostic in diagnostics {
+            let label = match diagnostic.severity {
+                ConfigSeverity::Error => {
+                    errors += 1;
+                    file_has_error = true;
+                    "error"
+                }
+                ConfigSeverity::Warning => {
+                    warnings += 1;
+                    "warning"
+                }
+            };
+            match &diagnostic.key {
+                Some(key) => lines.push(format!(
+                    "{label}: {}: {key}: {}",
+                    file.rel_path(),
+                    diagnostic.reason
+                )),
+                None => lines.push(format!(
+                    "{label}: {}: {}",
+                    file.rel_path(),
+                    diagnostic.reason
+                )),
+            }
+        }
+
+        if !file_has_error {
+            let values = REGISTRY.iter().filter(|row| row.file == file).count();
+            lines.push(format!("ok: {}: {values} values", file.rel_path()));
+        }
+    }
+
+    for name in extra_config_files(dir) {
+        warnings += 1;
+        lines.push(format!("warning: config/{name}: not a config file"));
+    }
+
+    lines.push(format!(
+        "config: files={} missing={missing} warnings={warnings} errors={errors} \
+         keys={} schema={} digest={:#018x}",
+        ConfigFile::ALL.len(),
+        REGISTRY.len(),
+        runtime.schema(),
+        runtime.digest(),
+    ));
+
+    (lines, errors == 0)
+}
+
+/// One file's diagnostics in the report's stable order: file-level first,
+/// known keys by registry index, unknown keys lexicographically.
+fn ordered_file_diagnostics(runtime: &ConfigRuntime, file: ConfigFile) -> Vec<&ConfigDiagnostic> {
+    let mut file_level: Vec<&ConfigDiagnostic> = Vec::new();
+    let mut known: Vec<(usize, &ConfigDiagnostic)> = Vec::new();
+    let mut unknown: Vec<&ConfigDiagnostic> = Vec::new();
+
+    for diagnostic in runtime
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic.file == file)
+    {
+        match &diagnostic.key {
+            None => file_level.push(diagnostic),
+            Some(key) => match row_index_for(file, key) {
+                Some(index) => known.push((index, diagnostic)),
+                None => unknown.push(diagnostic),
+            },
+        }
+    }
+
+    known.sort_by_key(|(index, _)| *index);
+    unknown.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let mut ordered = file_level;
+    ordered.extend(known.into_iter().map(|(_, diagnostic)| diagnostic));
+    ordered.extend(unknown);
+    ordered
+}
+
+/// Sorted names of `*.toml` entries in `dir` that are not one of the six
+/// curated file names. A missing or unreadable directory has no extras; the
+/// six expected files still report their own state from the loader.
+fn extra_config_files(dir: &Path) -> Vec<String> {
+    let expected = ConfigFile::ALL.map(ConfigFile::name);
+    let mut extras: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.ends_with(".toml") && !expected.contains(&name.as_str())).then_some(name)
+        })
+        .collect();
+    extras.sort();
+    extras
+}
+
+// ---------------------------------------------------------------------------
 // Per-file loading
 // ---------------------------------------------------------------------------
 
@@ -283,7 +433,7 @@ fn parse_file(dir: &Path, file: ConfigFile) -> FileLoad {
                     file,
                     key: None,
                     severity: ConfigSeverity::Warning,
-                    reason: "file is missing; using defaults".to_string(),
+                    reason: MISSING_FILE_REASON.to_string(),
                 }],
                 file_error: None,
             };
@@ -1508,5 +1658,359 @@ mod tests {
     #[should_panic(expected = "config key movement.walk_speed is not a bool")]
     fn accessor_panics_on_wrong_kind() {
         ConfigRuntime::defaults().bool("movement.walk_speed");
+    }
+
+    // -----------------------------------------------------------------
+    // --check-config report
+    // -----------------------------------------------------------------
+
+    /// Copy the git-tracked `config/` tree so tests can mutate a real tree
+    /// without touching the checkout.
+    fn tempdir_with_checked_in_config() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(CONFIG_DIR);
+        std::fs::create_dir(&config).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(CONFIG_DIR);
+        for file in ConfigFile::ALL {
+            std::fs::copy(source.join(file.name()), config.join(file.name())).unwrap();
+        }
+        (temp, config)
+    }
+
+    fn expected_ok_line(file: ConfigFile) -> String {
+        let values = REGISTRY.iter().filter(|row| row.file == file).count();
+        format!("ok: {}: {values} values", file.rel_path())
+    }
+
+    fn summary_digest(lines: &[String]) -> &str {
+        lines
+            .last()
+            .expect("summary line")
+            .rsplit_once("digest=0x")
+            .expect("summary digest")
+            .1
+    }
+
+    fn assert_lower_hex_digest(digest: &str) {
+        assert_eq!(digest.len(), 16, "digest {digest:?} must be 16 hex digits");
+        assert!(
+            digest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "digest {digest:?} must be lowercase hex"
+        );
+    }
+
+    #[test]
+    fn check_config_accepts_checked_in_tree() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        let (lines, ok) = check_config_lines(&config);
+
+        assert!(ok, "checked-in tree must pass: {lines:#?}");
+        for file in ConfigFile::ALL {
+            assert!(
+                lines.contains(&expected_ok_line(file)),
+                "{} missing from {lines:#?}",
+                file.rel_path()
+            );
+        }
+        assert_eq!(
+            lines.iter().filter(|line| line.starts_with("ok: ")).count(),
+            6
+        );
+
+        let digest = format!("{:#018x}", ConfigRuntime::defaults().digest());
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!(
+                "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest={digest}"
+            )
+        );
+        assert_lower_hex_digest(summary_digest(&lines));
+    }
+
+    #[test]
+    fn check_config_reports_field_error_and_omits_ok_line() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        write_file(&config, ConfigFile::Player, "[movement]\nwalk_speed = 0\n");
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(!ok);
+
+        let expected =
+            "error: config/player.toml: movement.walk_speed: value 0 is below minimum 0.5";
+        assert_eq!(
+            lines.iter().filter(|line| *line == expected).count(),
+            1,
+            "{lines:#?}"
+        );
+        assert!(!lines.contains(&expected_ok_line(ConfigFile::Player)));
+        let summary = lines.last().unwrap();
+        assert!(summary.contains("missing=0"), "{summary}");
+        assert!(summary.contains("warnings=0"), "{summary}");
+        assert!(summary.contains("errors=1"), "{summary}");
+    }
+
+    #[test]
+    fn check_config_cross_field_error_names_both_keys_and_falls_back_whole_file() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        write_file(
+            &config,
+            ConfigFile::World,
+            "[spawning]\nspawn_max_radius_blocks = 10\n",
+        );
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(!ok);
+
+        let error = lines
+            .iter()
+            .find(|line| {
+                line.starts_with("error: config/world.toml: spawning.spawn_max_radius_blocks:")
+            })
+            .unwrap_or_else(|| panic!("cross-field error line missing: {lines:#?}"));
+        assert!(
+            error.contains("spawning.spawn_max_radius_blocks"),
+            "{error}"
+        );
+        assert!(error.contains("spawning.safe_radius_blocks"), "{error}");
+        assert!(!lines.contains(&expected_ok_line(ConfigFile::World)));
+
+        // The whole world file fell back, so the effective digest is the
+        // registry-default digest even though the file exists and parses.
+        let defaults = format!("{:016x}", ConfigRuntime::defaults().digest());
+        assert_eq!(summary_digest(&lines), defaults.as_str());
+    }
+
+    #[test]
+    fn check_config_missing_file_warns_without_failing() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        std::fs::remove_file(config.join(ConfigFile::Player.name())).unwrap();
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(ok);
+        assert!(lines
+            .contains(&"warning: config/player.toml: file is missing; using defaults".to_string()));
+        assert!(!lines.contains(&expected_ok_line(ConfigFile::Player)));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("warning: config/"))
+                .count(),
+            1,
+            "{lines:#?}"
+        );
+        let summary = lines.last().unwrap();
+        assert!(summary.contains("files=6 missing=1"), "{summary}");
+        assert!(summary.contains("warnings=1 errors=0"), "{summary}");
+    }
+
+    #[test]
+    fn check_config_empty_or_missing_dir_reports_six_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(CONFIG_DIR);
+        std::fs::create_dir(&config).unwrap();
+
+        for dir in [config, temp.path().join("absent")] {
+            let (lines, ok) = check_config_lines(&dir);
+            assert!(ok, "{dir:?}");
+            for file in ConfigFile::ALL {
+                assert!(
+                    lines.contains(&format!(
+                        "warning: {}: file is missing; using defaults",
+                        file.rel_path()
+                    )),
+                    "{} missing from {lines:#?}",
+                    file.rel_path()
+                );
+            }
+            assert_eq!(
+                lines.iter().filter(|line| line.starts_with("ok: ")).count(),
+                0
+            );
+            let summary = lines.last().unwrap();
+            assert!(
+                summary.contains("files=6 missing=6 warnings=6 errors=0"),
+                "{summary}"
+            );
+            assert!(summary.contains("keys=85 schema=1"), "{summary}");
+        }
+    }
+
+    #[test]
+    fn check_config_unknown_key_warns_and_still_passes() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 5.0\nmystery = 1\n",
+        );
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(ok);
+        assert!(lines
+            .contains(&"warning: config/player.toml: movement.mystery: unknown key".to_string()));
+        assert!(lines.contains(&expected_ok_line(ConfigFile::Player)));
+        assert!(lines.last().unwrap().contains("warnings=1 errors=0"));
+    }
+
+    #[test]
+    fn check_config_extra_toml_warns_sorted_and_still_passes() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        std::fs::write(config.join("plyer.toml"), "[movement]\n").unwrap();
+        std::fs::write(config.join("aaa.toml"), "").unwrap();
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(ok);
+
+        let aaa = lines
+            .iter()
+            .position(|line| line == "warning: config/aaa.toml: not a config file")
+            .expect("aaa.toml warning");
+        let plyer = lines
+            .iter()
+            .position(|line| line == "warning: config/plyer.toml: not a config file")
+            .expect("plyer.toml warning");
+        assert!(aaa < plyer, "extra files must be sorted: {lines:#?}");
+        assert!(plyer < lines.len() - 1, "summary must stay last");
+        assert!(lines.last().unwrap().contains("warnings=2 errors=0"));
+    }
+
+    #[test]
+    fn check_config_reports_fatal_file_errors() {
+        struct Case {
+            file: ConfigFile,
+            contents: Vec<u8>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                file: ConfigFile::Survival,
+                contents: b"[survival\n".to_vec(),
+                expected: "error: config/survival.toml: invalid TOML: ",
+            },
+            Case {
+                file: ConfigFile::Player,
+                contents: b"[movement]\nwalk_speed = \"fast\"\n".to_vec(),
+                expected:
+                    "error: config/player.toml: movement.walk_speed: expected float, got string",
+            },
+            Case {
+                file: ConfigFile::Player,
+                contents: b"[movement]\nwalk_speed = nan\n".to_vec(),
+                expected: "error: config/player.toml: movement.walk_speed: value must be finite",
+            },
+            Case {
+                file: ConfigFile::Player,
+                contents: vec![b' '; (MAX_CONFIG_FILE_BYTES + 1) as usize],
+                expected: "error: config/player.toml: file is larger than 1 MiB",
+            },
+        ];
+
+        for case in cases {
+            let (_temp, config) = tempdir_with_checked_in_config();
+            std::fs::write(config.join(case.file.name()), &case.contents).unwrap();
+
+            let (lines, ok) = check_config_lines(&config);
+            assert!(!ok, "{} must fail: {lines:#?}", case.expected);
+            let found = lines.iter().any(|line| {
+                if case.expected.ends_with("invalid TOML: ") {
+                    line.starts_with(case.expected)
+                } else {
+                    line == case.expected
+                }
+            });
+            assert!(found, "expected {:?} in {lines:#?}", case.expected);
+            assert!(
+                !lines.contains(&expected_ok_line(case.file)),
+                "{} must not print ok",
+                case.file.name()
+            );
+            assert!(lines.last().unwrap().contains("errors=1"), "{lines:#?}");
+        }
+    }
+
+    #[test]
+    fn check_config_orders_files_and_diagnostics_deterministically() {
+        let (_temp, config) = tempdir_with_checked_in_config();
+        write_file(
+            &config,
+            ConfigFile::Player,
+            "[movement]\nwalk_speed = 0\nzzz = 1\naaa = 2\n",
+        );
+        write_file(
+            &config,
+            ConfigFile::Combat,
+            "[bow]\nmin_charge_secs = 9.0\n",
+        );
+        write_file(&config, ConfigFile::World, "[spawning]\nmystery = true\n");
+
+        let (lines, ok) = check_config_lines(&config);
+        assert!(!ok);
+
+        let position = |prefix: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no line starts with {prefix:?}: {lines:#?}"))
+        };
+
+        // Known-key error before unknown keys inside one file.
+        assert!(
+            position("error: config/player.toml: movement.walk_speed:")
+                < position("warning: config/player.toml: movement.aaa:")
+        );
+        assert!(
+            position("warning: config/player.toml: movement.aaa:")
+                < position("warning: config/player.toml: movement.zzz:")
+        );
+        // Files render in ConfigFile::ALL order, ok lines after diagnostics.
+        assert!(position("ok: config/survival.toml:") < position("error: config/combat.toml:"));
+        assert!(position("error: config/combat.toml:") < position("warning: config/world.toml:"));
+        assert!(position("warning: config/world.toml:") < position("ok: config/world.toml:"));
+
+        let digest = format!("{:#018x}", ConfigRuntime::defaults().digest());
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!(
+                "config: files=6 missing=0 warnings=3 errors=2 keys=85 schema=1 digest={digest}"
+            )
+        );
+    }
+
+    #[test]
+    fn check_config_is_read_only() {
+        let (temp, config) = tempdir_with_checked_in_config();
+
+        let read_entries = |dir: &Path| {
+            let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let before_config = read_entries(&config);
+        let before_root = read_entries(temp.path());
+        let before_bytes: Vec<Vec<u8>> = ConfigFile::ALL
+            .iter()
+            .map(|file| std::fs::read(config.join(file.name())).unwrap())
+            .collect();
+
+        let (_, ok) = check_config_lines(&config);
+        assert!(ok);
+
+        assert_eq!(read_entries(&config), before_config);
+        assert_eq!(read_entries(temp.path()), before_root);
+        for (file, before) in ConfigFile::ALL.iter().zip(before_bytes) {
+            assert_eq!(
+                std::fs::read(config.join(file.name())).unwrap(),
+                before,
+                "{} changed",
+                file.name()
+            );
+        }
     }
 }
