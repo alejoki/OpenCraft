@@ -4,7 +4,9 @@ use crate::content::ContentRegistry;
 
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
-use crate::player::eating::{food_value, food_value_with};
+use crate::player::eating::{
+    food_value, food_value_with, food_value_with_registry_rules, EatingRules,
+};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
     InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
@@ -581,7 +583,29 @@ impl Player {
         slot: usize,
         expected: ItemId,
     ) -> Option<u16> {
-        self.eat_selected_resolved(slot, expected, food_value_with(registry, expected)?)
+        self.eat_selected_with_rules(registry, &EatingRules::default(), slot, expected)
+    }
+
+    /// Rules-aware completion half of the hold-to-eat flow.
+    ///
+    /// Mirrors [`Player::eat_selected_with`] exactly, but built-in food
+    /// restores the tuned [`EatingRules`] amount. Pack-authored nutrition
+    /// still wins over the rules, matching [`EatingTarget::new_with_rules`],
+    /// so a meal can never restore a different amount than the target
+    /// displayed. Every guard still runs before any mutation, making a stale
+    /// completion a fail-closed `None`.
+    pub fn eat_selected_with_rules(
+        &mut self,
+        registry: &ContentRegistry,
+        rules: &EatingRules,
+        slot: usize,
+        expected: ItemId,
+    ) -> Option<u16> {
+        self.eat_selected_resolved(
+            slot,
+            expected,
+            food_value_with_registry_rules(registry, expected, rules)?,
+        )
     }
 
     /// Shared guarded consume used by both eating entry points.
@@ -3062,6 +3086,50 @@ mod tests {
             "the last stew restores only the capped remainder"
         );
         assert_eq!(player.survival.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn eat_selected_with_rules_restores_the_tuned_builtin_amount() {
+        let registry = ContentRegistry::builtin();
+        let rules = EatingRules {
+            apple_hunger: 7,
+            ..EatingRules::default()
+        };
+        let mut player = food_player(apple_item(2), 10);
+
+        let applied =
+            player.eat_selected_with_rules(&registry, &rules, 0, ItemId::Material(Material::Apple));
+
+        assert_eq!(applied, Some(7), "the tuned built-in restore applies");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), Some(1));
+
+        // The default wrapper still restores the frozen four.
+        let mut player = food_player(apple_item(1), 10);
+        assert_eq!(
+            player.eat_selected_with(&registry, 0, ItemId::Material(Material::Apple)),
+            Some(4)
+        );
+        assert_eq!(player.survival.hunger(), 14);
+    }
+
+    #[test]
+    fn eat_selected_with_rules_keeps_pack_authored_nutrition() {
+        let registry = pack_food_registry();
+        let rules = EatingRules {
+            apple_hunger: 19,
+            bread_hunger: 19,
+            raw_meat_hunger: 19,
+            rotten_flesh_hunger: 19,
+            ..EatingRules::default()
+        };
+        let stew = ItemId::Item(pack_stew_index(&registry));
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+
+        let applied = player.eat_selected_with_rules(&registry, &rules, 0, stew);
+        assert_eq!(applied, Some(7), "pack nutrition wins over tuned rules");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), None, "one stew consumed");
     }
 
     #[test]
