@@ -19,7 +19,10 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
-use super::ConfigFile;
+use super::{
+    ApplyMode, ConfigFile, ConfigRuntime, ConfigSeverity, ConfigValue, FileReload, ValueOrigin,
+    REGISTRY,
+};
 
 /// Whether the dev-only creator surface (watcher, F6 overlay, trace) is
 /// compiled in. Config loading itself is never gated.
@@ -221,8 +224,349 @@ impl WatchState {
     }
 }
 
+/// Last completed reload event, shown on the overlay `last:` line.
+///
+/// This is presentation state only: the long rejection reason lives in
+/// [`CreatorRuntime::last_error`] so the overlay can keep `last:` compact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReloadStatus {
+    Idle,
+    Applied {
+        file: ConfigFile,
+        changed: usize,
+    },
+    Rejected {
+        file: ConfigFile,
+        field: Option<String>,
+    },
+}
+
+impl ReloadStatus {
+    /// Stable one-line spelling for the overlay and diagnostics.
+    pub fn display(&self) -> String {
+        match self {
+            ReloadStatus::Idle => "idle".to_string(),
+            ReloadStatus::Applied { file, changed } => {
+                format!("applied {} changed={changed}", file.rel_path())
+            }
+            ReloadStatus::Rejected { file, field } => match field {
+                Some(key) => format!("rejected {} field={key}", file.rel_path()),
+                None => format!("rejected {}", file.rel_path()),
+            },
+        }
+    }
+}
+
+/// Dev-only creator state: watcher plus the overlay/restart facts the app
+/// reads each frame. The struct owns no GPU, logging, or wall-clock state,
+/// so every field is testable headlessly.
+pub struct CreatorRuntime {
+    pub watch: WatchState,
+    pub overlay_visible: bool,
+    pub status: ReloadStatus,
+    pub last_error: Option<String>,
+    pub restart_required: Option<String>,
+}
+
+impl CreatorRuntime {
+    /// F6 overlay hidden, no reload observed yet, no restart pending.
+    pub fn new(now: Instant) -> Self {
+        Self {
+            watch: WatchState::new(now),
+            overlay_visible: false,
+            status: ReloadStatus::Idle,
+            last_error: None,
+            restart_required: None,
+        }
+    }
+
+    /// F6 toggles the read-only overlay.
+    pub fn toggle_overlay(&mut self) {
+        self.overlay_visible = !self.overlay_visible;
+    }
+
+    /// Fold one per-file reload outcome into the status surfaces.
+    ///
+    /// An apply clears the previous error; a rejection records the first
+    /// Error's field (when keyed) and a single-line `config/<file>: ...`
+    /// message for the transient game notice.
+    pub fn record(&mut self, report: &FileReload) {
+        if report.applied {
+            self.status = ReloadStatus::Applied {
+                file: report.file,
+                changed: report.changed,
+            };
+            self.last_error = None;
+            return;
+        }
+
+        let first = report.first_error();
+        self.status = ReloadStatus::Rejected {
+            file: report.file,
+            field: first.and_then(|diagnostic| diagnostic.key.clone()),
+        };
+        self.last_error = Some(match first {
+            Some(diagnostic) => match &diagnostic.key {
+                Some(key) => {
+                    format!("{}: {key}: {}", report.file.rel_path(), diagnostic.reason)
+                }
+                None => format!("{}: {}", report.file.rel_path(), diagnostic.reason),
+            },
+            // `reload_file` always produces an Error on rejection; keep a
+            // truthful fallback rather than panicking on future callers.
+            None => format!("{}: rejected", report.file.rel_path()),
+        });
+    }
+
+    /// Hold a durable restart requirement (S03/S08); S02 only displays it.
+    pub fn set_restart_required(&mut self, reason: impl Into<String>) {
+        self.restart_required = Some(reason.into());
+    }
+
+    /// Clear a satisfied restart requirement.
+    pub fn clear_restart_required(&mut self) {
+        self.restart_required = None;
+    }
+
+    /// Files with an unsettled write, in [`ConfigFile::ALL`] order.
+    pub fn pending_files(&self) -> Vec<ConfigFile> {
+        self.watch.pending_files()
+    }
+}
+
+/// `[live]`, `[restart]`, or `[live+restart]` for the rows in `applies`.
+///
+/// Derived from the registry, never hardcoded: adding the first
+/// restart-only row updates both the legend and its file header.
+fn apply_summary(applies: impl Iterator<Item = ApplyMode>) -> &'static str {
+    let mut live = false;
+    let mut restart = false;
+    for apply in applies {
+        match apply {
+            ApplyMode::Live => live = true,
+            ApplyMode::Restart => restart = true,
+        }
+    }
+    match (live, restart) {
+        (true, true) => "[live+restart]",
+        (true, false) => "[live]",
+        (false, true) => "[restart]",
+        (false, false) => "[none]",
+    }
+}
+
+/// Word-boundary wrap with hard splitting for single tokens wider than the
+/// line. `indent` is prepended to every emitted line, so the returned lines
+/// always satisfy `chars().count() <= max_chars.max(16)`.
+fn wrap_text(text: &str, max_chars: usize, indent: &str) -> Vec<String> {
+    // A floor keeps progress guaranteed even if a caller passes 0.
+    let width = max_chars.max(16);
+    let available = width.saturating_sub(indent.chars().count()).max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    let flush = |lines: &mut Vec<String>, current: &mut String, current_len: &mut usize| {
+        if !current.is_empty() {
+            lines.push(format!("{indent}{current}"));
+            current.clear();
+            *current_len = 0;
+        }
+    };
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > available {
+            flush(&mut lines, &mut current, &mut current_len);
+
+            let mut chunk = String::new();
+            for character in word.chars() {
+                chunk.push(character);
+                if chunk.chars().count() == available {
+                    lines.push(format!("{indent}{chunk}"));
+                    chunk.clear();
+                }
+            }
+            current = chunk;
+            current_len = current.chars().count();
+            continue;
+        }
+
+        if current.is_empty() {
+            current.push_str(word);
+            current_len = word_len;
+        } else if current_len + 1 + word_len <= available {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            flush(&mut lines, &mut current, &mut current_len);
+            current.push_str(word);
+            current_len = word_len;
+        }
+    }
+
+    flush(&mut lines, &mut current, &mut current_len);
+    lines
+}
+
+/// Render the complete read-only F6 overlay as explicit wrapped lines.
+///
+/// Everything is derived from registry metadata and the runtime's
+/// provenance/diagnostics: there are no hardcoded keys, values, or apply
+/// modes. The caller sizes the panel from `lines.len()`.
+pub fn overlay_lines(
+    runtime: &ConfigRuntime,
+    creator: &CreatorRuntime,
+    max_chars: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let errors = runtime
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == ConfigSeverity::Error)
+        .count();
+    let warnings = runtime
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == ConfigSeverity::Warning)
+        .count();
+    let pending = creator.pending_files();
+    let pending_text = if pending.is_empty() {
+        "0".to_string()
+    } else {
+        pending
+            .iter()
+            .map(|file| file.name())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let header = format!(
+        "CREATOR (dev) digest={:#018x} schema={} files={} pending={} warnings={} errors={}",
+        runtime.digest(),
+        runtime.schema(),
+        ConfigFile::ALL.len(),
+        pending_text,
+        warnings,
+        errors,
+    );
+    lines.extend(wrap_text(&header, max_chars, ""));
+
+    let legend = format!(
+        "(* default; unmarked = from file; {} = applies without restart)",
+        apply_summary(REGISTRY.iter().map(|row| row.apply)),
+    );
+    lines.extend(wrap_text(&legend, max_chars, ""));
+
+    lines.extend(wrap_text(
+        &format!("last: {}", creator.status.display()),
+        max_chars,
+        "",
+    ));
+
+    if let Some(reason) = &creator.restart_required {
+        lines.extend(wrap_text(
+            &format!("restart required: {reason}"),
+            max_chars,
+            "",
+        ));
+    }
+
+    for file in ConfigFile::ALL {
+        let summary = apply_summary(
+            REGISTRY
+                .iter()
+                .filter(|row| row.file == file)
+                .map(|row| row.apply),
+        );
+        lines.extend(wrap_text(
+            &format!("{} {summary}", file.rel_path()),
+            max_chars,
+            "",
+        ));
+
+        let tokens: Vec<String> = REGISTRY
+            .iter()
+            .filter(|row| row.file == file)
+            .map(|row| {
+                let value: ConfigValue = runtime.value(row.key);
+                let mut token = format!("{}={}", row.key, value.display());
+                if runtime.origin(row.key) == ValueOrigin::Default {
+                    token.push('*');
+                }
+                token
+            })
+            .collect();
+        lines.extend(wrap_text(&tokens.join(" "), max_chars, "  "));
+
+        let file_errors: Vec<_> = runtime
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.file == file && diagnostic.severity == ConfigSeverity::Error
+            })
+            .collect();
+        if let Some(first) = file_errors.first() {
+            let error = match &first.key {
+                Some(key) => format!("error: {key}: {}", first.reason),
+                None => format!("error: {}", first.reason),
+            };
+            lines.extend(wrap_text(&error, max_chars, "  "));
+
+            let more = file_errors.len() - 1;
+            if more > 0 {
+                lines.extend(wrap_text(
+                    &format!("(+{more} more errors)"),
+                    max_chars,
+                    "  ",
+                ));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Collapse every run of whitespace so a trace line is always one line.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stable `--creator-trace` output for one reloaded file.
+///
+/// Exactly one line, no timestamp and no absolute path, so shell smoke
+/// tests can diff it across runs. The digest is the current runtime digest
+/// and uses the same `{:#018x}` spelling as `--check-config`.
+pub fn reload_trace_lines(report: &FileReload, digest: u64) -> Vec<String> {
+    let file = report.file.rel_path();
+    let line = if report.applied {
+        format!(
+            "creator: applied file={file} changed={} digest={digest:#018x}",
+            report.changed
+        )
+    } else {
+        match report.first_error() {
+            Some(diagnostic) => match &diagnostic.key {
+                Some(key) => format!(
+                    "creator: rejected file={file} field={key} reason={}",
+                    single_line(&diagnostic.reason)
+                ),
+                None => format!(
+                    "creator: rejected file={file} reason={}",
+                    single_line(&diagnostic.reason)
+                ),
+            },
+            None => format!("creator: rejected file={file} reason=unknown"),
+        }
+    };
+    vec![line]
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::ConfigDiagnostic;
     use super::*;
     use std::path::PathBuf;
 
@@ -500,5 +844,350 @@ mod tests {
         // Metadata fingerprint tracks length, so growth is still visible.
         write_bytes(&path, &vec![b' '; size + 1]);
         assert_ne!(first, fingerprint_path(&path));
+    }
+
+    // -----------------------------------------------------------------
+    // CreatorRuntime, overlay, and trace
+    // -----------------------------------------------------------------
+
+    fn empty_config_dir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        for file in ConfigFile::ALL {
+            std::fs::write(temp.path().join(file.name()), b"").unwrap();
+        }
+        temp
+    }
+
+    fn applied_report(file: ConfigFile, changed: usize) -> FileReload {
+        FileReload {
+            file,
+            applied: true,
+            changed,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn rejected_report(file: ConfigFile, key: Option<&str>, reason: &str) -> FileReload {
+        FileReload {
+            file,
+            applied: false,
+            changed: 0,
+            diagnostics: vec![ConfigDiagnostic {
+                file,
+                key: key.map(str::to_string),
+                severity: ConfigSeverity::Error,
+                reason: reason.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn overlay_header_carries_digest_schema_files_pending_and_counts() {
+        let temp = empty_config_dir();
+        std::fs::write(
+            temp.path().join("player.toml"),
+            "[movement]\nwalk_speed = 0.0\nmystery = 1\n",
+        )
+        .unwrap();
+        let runtime = ConfigRuntime::load_dir(temp.path());
+        assert_eq!(runtime.diagnostics().len(), 2, "one error plus one warning");
+
+        let base = Instant::now();
+        let mut creator = CreatorRuntime::new(base);
+        // Baseline, then leave one file with an unsettled write.
+        assert!(!creator
+            .watch
+            .observe(ConfigFile::Player, Some(FileSnapshot(1)), base));
+        assert!(!creator
+            .watch
+            .observe(ConfigFile::Player, Some(FileSnapshot(2)), at(base, 10)));
+        assert_eq!(creator.pending_files(), vec![ConfigFile::Player]);
+
+        let lines = overlay_lines(&runtime, &creator, 140);
+        let header = &lines[0];
+        assert!(
+            header.contains(&format!("digest={:#018x}", runtime.digest())),
+            "{header}"
+        );
+        assert!(header.contains("schema=1"), "{header}");
+        assert!(header.contains("files=6"), "{header}");
+        assert!(header.contains("pending=player.toml"), "{header}");
+        assert!(header.contains("warnings=1"), "{header}");
+        assert!(header.contains("errors=1"), "{header}");
+    }
+
+    #[test]
+    fn overlay_groups_every_registry_row_by_file_with_source_markers() {
+        let temp = empty_config_dir();
+        let walk_index = super::super::index_of("movement.walk_speed").unwrap();
+        let walk_default = REGISTRY[walk_index].default;
+        std::fs::write(
+            temp.path().join("player.toml"),
+            format!("[movement]\nwalk_speed = {}\n", walk_default.display()),
+        )
+        .unwrap();
+        let runtime = ConfigRuntime::load_dir(temp.path());
+        let creator = CreatorRuntime::new(Instant::now());
+        let lines = overlay_lines(&runtime, &creator, 140);
+        let joined = lines.join(" ");
+
+        for row in REGISTRY {
+            assert!(
+                joined.contains(&format!("{}=", row.key)),
+                "overlay is missing {}",
+                row.key
+            );
+        }
+        for file in ConfigFile::ALL {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{} ", file.rel_path()))),
+                "overlay is missing the {} group header",
+                file.name()
+            );
+        }
+        assert!(lines.iter().any(|line| line.contains("[live]")));
+
+        // A file value equal to the default has no `*`: provenance, not equality.
+        assert_eq!(
+            runtime.origin("movement.walk_speed"),
+            ValueOrigin::File(ConfigFile::Player)
+        );
+        let walk_token = joined
+            .split_whitespace()
+            .find(|token| token.starts_with("movement.walk_speed="))
+            .expect("walk_speed token");
+        assert_eq!(
+            walk_token,
+            format!("movement.walk_speed={}", walk_default.display())
+        );
+
+        let sprint_index = super::super::index_of("movement.sprint_speed").unwrap();
+        let sprint_default = REGISTRY[sprint_index].default;
+        let sprint_token = joined
+            .split_whitespace()
+            .find(|token| token.starts_with("movement.sprint_speed="))
+            .expect("sprint_speed token");
+        assert_eq!(
+            sprint_token,
+            format!("movement.sprint_speed={}*", sprint_default.display())
+        );
+    }
+
+    #[test]
+    fn overlay_last_and_restart_lines_reflect_creator_state() {
+        let runtime = ConfigRuntime::defaults();
+        let mut creator = CreatorRuntime::new(Instant::now());
+
+        let before = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(before.contains("last: idle"), "{before}");
+        assert!(!before.contains("restart required:"));
+
+        creator.record(&applied_report(ConfigFile::Player, 2));
+        let applied = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(
+            applied.contains("last: applied config/player.toml changed=2"),
+            "{applied}"
+        );
+
+        creator.record(&rejected_report(
+            ConfigFile::Player,
+            Some("movement.walk_speed"),
+            "value 0 is below minimum 0.5",
+        ));
+        let rejected = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(
+            rejected.contains("last: rejected config/player.toml field=movement.walk_speed"),
+            "{rejected}"
+        );
+
+        creator.set_restart_required("recipe changed");
+        let restart = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(restart.contains("restart required: recipe changed"));
+
+        creator.clear_restart_required();
+        let cleared = overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(!cleared.contains("restart required:"));
+    }
+
+    #[test]
+    fn overlay_shows_first_error_and_more_count_while_keeping_last_good_values() {
+        let temp = empty_config_dir();
+        std::fs::write(
+            temp.path().join("player.toml"),
+            "[movement]\nwalk_speed = 6.0\n",
+        )
+        .unwrap();
+        let mut runtime = ConfigRuntime::load_dir(temp.path());
+        assert_eq!(runtime.f32("movement.walk_speed"), 6.0);
+
+        std::fs::write(
+            temp.path().join("player.toml"),
+            "[movement]\nwalk_speed = 0.0\nsprint_speed = 0.0\n",
+        )
+        .unwrap();
+        let report = runtime.reload_file(temp.path(), ConfigFile::Player);
+        assert!(!report.applied);
+        assert_eq!(report.error_count(), 2);
+
+        let mut creator = CreatorRuntime::new(Instant::now());
+        creator.record(&report);
+        let lines = overlay_lines(&runtime, &creator, 140);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("movement.walk_speed=6.0"), "{joined}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.trim_start().starts_with("error:"))
+                .count(),
+            1,
+            "exactly the first error is rendered"
+        );
+        assert!(joined.contains("error: movement.walk_speed:"), "{joined}");
+        assert!(joined.contains("(+1 more errors)"), "{joined}");
+    }
+
+    #[test]
+    fn overlay_respects_line_budget_at_supported_widths() {
+        let temp = empty_config_dir();
+        let runtime = ConfigRuntime::load_dir(temp.path());
+        let creator = CreatorRuntime::new(Instant::now());
+
+        let wide = overlay_lines(&runtime, &creator, 220);
+        let narrow = overlay_lines(&runtime, &creator, 140);
+        let tiny = overlay_lines(&runtime, &creator, 16);
+
+        assert!(
+            narrow.iter().all(|line| line.chars().count() <= 140),
+            "a 140-column line is too wide"
+        );
+        assert!(
+            narrow.len() <= 40,
+            "narrow overlay used {} lines",
+            narrow.len()
+        );
+        assert!(wide.iter().all(|line| line.chars().count() <= 220));
+        assert!(wide.len() <= narrow.len());
+        assert!(tiny.iter().all(|line| line.chars().count() <= 16));
+        assert!(
+            tiny.iter()
+                .any(|line| line.chars().count() == 16 && !line.trim().contains(' ')),
+            "expected at least one hard-split long token"
+        );
+    }
+
+    #[test]
+    fn trace_lines_are_exact_and_stable() {
+        let applied = applied_report(ConfigFile::Player, 2);
+        let expected_applied =
+            "creator: applied file=config/player.toml changed=2 digest=0x00000000000000ab";
+        assert_eq!(
+            reload_trace_lines(&applied, 0x0000_0000_0000_00ab),
+            vec![expected_applied.to_string()]
+        );
+        // Identical inputs produce byte-identical output: no timestamps.
+        assert_eq!(
+            reload_trace_lines(&applied, 0x0000_0000_0000_00ab),
+            reload_trace_lines(&applied, 0x0000_0000_0000_00ab)
+        );
+
+        let keyed = rejected_report(
+            ConfigFile::Player,
+            Some("movement.walk_speed"),
+            "value 0 is below minimum 0.5",
+        );
+        assert_eq!(
+            reload_trace_lines(&keyed, 0),
+            vec![
+                "creator: rejected file=config/player.toml field=movement.walk_speed \
+                 reason=value 0 is below minimum 0.5"
+                    .to_string()
+            ]
+        );
+
+        let file_level = rejected_report(
+            ConfigFile::Player,
+            None,
+            "invalid TOML: expected `]` at line 1 column 12",
+        );
+        assert_eq!(
+            reload_trace_lines(&file_level, 0),
+            vec!["creator: rejected file=config/player.toml \
+                 reason=invalid TOML: expected `]` at line 1 column 12"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn trace_reason_is_collapsed_to_one_line() {
+        let report = rejected_report(
+            ConfigFile::World,
+            Some("spawning.spawn_max_radius_blocks"),
+            "line one\nline\ttwo   three",
+        );
+        let lines = reload_trace_lines(&report, 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "creator: rejected file=config/world.toml field=spawning.spawn_max_radius_blocks \
+             reason=line one line two three"
+        );
+        assert!(!lines[0].contains('\n') && !lines[0].contains('\t'));
+    }
+
+    #[test]
+    fn creator_record_clears_errors_on_apply_and_prefixes_rejects() {
+        let mut creator = CreatorRuntime::new(Instant::now());
+
+        creator.record(&rejected_report(
+            ConfigFile::Player,
+            Some("movement.walk_speed"),
+            "value 0 is below minimum 0.5",
+        ));
+        assert_eq!(
+            creator.last_error.as_deref(),
+            Some("config/player.toml: movement.walk_speed: value 0 is below minimum 0.5")
+        );
+        assert_eq!(
+            creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: Some("movement.walk_speed".to_string()),
+            }
+        );
+
+        creator.record(&rejected_report(
+            ConfigFile::World,
+            None,
+            "invalid TOML: expected `]`",
+        ));
+        assert_eq!(
+            creator.last_error.as_deref(),
+            Some("config/world.toml: invalid TOML: expected `]`")
+        );
+        assert_eq!(
+            creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::World,
+                field: None,
+            }
+        );
+
+        creator.record(&applied_report(ConfigFile::Render, 1));
+        assert_eq!(creator.last_error, None);
+        assert_eq!(
+            creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Render,
+                changed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn creator_tools_matches_the_build_profile() {
+        assert_eq!(CREATOR_TOOLS, cfg!(debug_assertions));
     }
 }

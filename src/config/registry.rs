@@ -79,6 +79,14 @@ pub enum ConfigValue {
     Bool(bool),
 }
 
+impl ConfigValue {
+    /// Creator-facing rendering: whole floats keep one decimal place so the
+    /// overlay spells values exactly like the docs table and checked-in TOML.
+    pub fn display(self) -> String {
+        format_default(self)
+    }
+}
+
 /// How an edited value reaches the running game.
 ///
 /// Every curated M014 row is [`ApplyMode::Live`]; the variant exists so the
@@ -87,6 +95,13 @@ pub enum ConfigValue {
 pub enum ApplyMode {
     Live,
     Restart,
+}
+
+impl ApplyMode {
+    /// Stable short name shared by the docs table and the creator overlay.
+    pub fn name(self) -> &'static str {
+        apply_name(self)
+    }
 }
 
 /// One curated configuration row.
@@ -1294,5 +1309,24 @@ mod tests {
     #[ignore = "prints the docs/CONFIG.md registry block for a manual paste"]
     fn print_docs_table() {
         print!("{}", docs_table());
+    }
+
+    #[test]
+    fn public_formatters_match_the_docs_table_spelling() {
+        assert_eq!(ConfigValue::Float(8.0).display(), "8.0");
+        assert_eq!(ConfigValue::Float(4.6).display(), "4.6");
+        assert_eq!(ConfigValue::Int(12).display(), "12");
+        assert_eq!(ConfigValue::Bool(true).display(), "true");
+        assert_eq!(ApplyMode::Live.name(), "live");
+        assert_eq!(ApplyMode::Restart.name(), "restart");
+
+        let table = docs_table();
+        for row in REGISTRY {
+            assert!(
+                table.contains(&format!("| {} |", row.apply.name())),
+                "docs table is missing apply name {}",
+                row.apply.name()
+            );
+        }
     }
 }
