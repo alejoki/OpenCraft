@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::config::{ConfigRuntime, RulesBundle};
 use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
 use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
@@ -1780,7 +1781,11 @@ fn demo_owns_world_witness(cli: &CliConfig) -> bool {
 /// calls [`startup_session_with`] with its base registry.
 #[cfg(test)]
 fn startup_session(cli: &CliConfig) -> WorldSession {
-    startup_session_with(cli, &ContentRegistry::builtin_arc())
+    startup_session_with(
+        cli,
+        &ContentRegistry::builtin_arc(),
+        &RulesBundle::default(),
+    )
 }
 
 /// The startup world session resolved against `registry`.
@@ -1788,8 +1793,13 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
 /// The load branch keeps the placeholder-augmented registry and the one-shot
 /// changed-stack notice; the fresh branch freezes the supplied registry on the
 /// new session. [`startup_session`] is the built-in wrapper every existing
-/// test and demo launch uses.
-fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> WorldSession {
+/// test and demo launch uses. `rules` is the effective gameplay tuning loaded
+/// from `config/` (M014/S01) and is applied to both branches.
+fn startup_session_with(
+    cli: &CliConfig,
+    registry: &Arc<ContentRegistry>,
+    rules: &RulesBundle,
+) -> WorldSession {
     if !cli.force_new_world && cli.save_path.exists() {
         if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
             let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
@@ -1810,6 +1820,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
                 // session must still start closed for the scripted run.
                 session.set_hostile_ai_enabled(false);
             }
+            session.apply_rules(rules);
             return session;
         }
     }
@@ -1862,6 +1873,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
             arm_swim_route(&mut session, route);
         }
     }
+    session.apply_rules(rules);
     session
 }
 
@@ -8074,6 +8086,10 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
 struct StartupContent {
     settings: Settings,
     startup_warnings: Vec<SettingsWarning>,
+    /// Effective gameplay tuning from the checked-in `config/` tree (M014).
+    /// Loaded once at startup; `GameApp` keeps it so every later session
+    /// install re-applies the same rules and S02 can replace it on reload.
+    config: ConfigRuntime,
     current_pack: Option<LoadedPack>,
     available_packs: Vec<String>,
     audio: AudioEngine,
@@ -8091,11 +8107,25 @@ struct StartupContent {
 impl StartupContent {
     /// Load settings, the persisted pack stack, sound overrides and the
     /// session content registry in the historical warning order.
-    fn load(settings_path: &Path, packs_root: PathBuf) -> StartupContent {
+    fn load(
+        settings_path: &Path,
+        packs_root: PathBuf,
+        config_dir: Option<&Path>,
+    ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
         let (settings, mut startup_warnings) = load_with_warnings(settings_path);
+        // Curated gameplay config (M014/S01): loaded once here, in the
+        // settings -> config -> packs -> sounds -> registry warning order.
+        // The loader never fails; only Error diagnostics become startup
+        // warnings. Headless tests inject `None` so the suite never reads the
+        // repository `config/` tree (F13 isolation).
+        let config = match config_dir {
+            Some(dir) => ConfigRuntime::load_dir(dir),
+            None => ConfigRuntime::defaults(),
+        };
+        startup_warnings.extend(opencraft::config::startup_warnings(&config));
         // Pack discovery and startup apply (M004/S03): the persisted choice
         // is re-applied on every launch. A missing/deleted pack folder still
         // yields a fully usable procedural pack plus one warning naming it,
@@ -8123,6 +8153,7 @@ impl StartupContent {
         StartupContent {
             settings,
             startup_warnings,
+            config,
             current_pack,
             available_packs,
             audio,
@@ -8325,6 +8356,11 @@ struct GameApp {
     /// world carries a clone of `base_registry`. Re-adopted by
     /// `on_session_installed`, never replaced while a session runs.
     session_registry: Arc<ContentRegistry>,
+    /// Effective gameplay tuning from startup `config/` loading (M014/S01).
+    /// App-wide, like the loaded settings: `new_with_content` applies it
+    /// before the first frame and `on_session_installed` re-applies it after
+    /// every world swap. S02 replaces this value on a live reload.
+    config: ConfigRuntime,
     /// Set whenever the pack stack changes presentation, so the next
     /// `RedrawRequested` uploads the merged layers and logo once. Startup
     /// uploads directly in `resumed`, so this starts false.
@@ -8428,8 +8464,11 @@ impl GameApp {
         settings_path: PathBuf,
         background_path: PathBuf,
     ) -> Self {
-        let content =
-            StartupContent::load(&settings_path, Path::new(pack::PACKS_DIR).to_path_buf());
+        let content = StartupContent::load(
+            &settings_path,
+            Path::new(pack::PACKS_DIR).to_path_buf(),
+            None,
+        );
         Self::new_with_content(cli, session, content, background_path)
     }
 
@@ -8447,6 +8486,7 @@ impl GameApp {
         let StartupContent {
             settings,
             startup_warnings,
+            config,
             current_pack,
             available_packs,
             audio,
@@ -8454,6 +8494,12 @@ impl GameApp {
             packs_root,
             base_registry,
         } = content;
+        // Effective gameplay rules apply before the first frame and are
+        // re-applied on every session install (the S02 live-reload seam).
+        // Production already applied them in `startup_session_with`; doing it
+        // again here is idempotent and keeps injected sessions (tests) tuned
+        // by the same app-wide config.
+        session.apply_rules(&config.rules());
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8650,6 +8696,7 @@ impl GameApp {
             available_packs,
             current_pack,
             session_registry,
+            config,
             base_registry,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -9103,6 +9150,11 @@ impl GameApp {
     /// one copy means the background edit path cannot forget an input/mining/
     /// render-store reset that every other swap performs.
     fn on_session_installed(&mut self) {
+        // Config rules are app-wide tuning, not session state: every newly
+        // installed session adopts the current effective values. S02 replaces
+        // `self.config` on a live reload and calls this same seam.
+        let rules = self.config.rules();
+        self.session.apply_rules(&rules);
         // The installed session owns a frozen content registry. Its pack item
         // icons may differ from the launch registry (for example a loaded
         // world that carries a content pack), so rebuild the UI-only sprite
@@ -14387,8 +14439,9 @@ fn main() {
     let content = StartupContent::load(
         Path::new(DEFAULT_SETTINGS_PATH),
         Path::new(pack::PACKS_DIR).to_path_buf(),
+        Some(Path::new(opencraft::config::CONFIG_DIR)),
     );
-    let session = startup_session_with(&cli, &content.base_registry);
+    let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -32051,7 +32104,7 @@ stack = 64
         let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
 
         let cli = CliConfig::parse_args(["--save", path_str]);
-        let mut loaded = startup_session_with(&cli, &registry);
+        let mut loaded = startup_session_with(&cli, &registry, &RulesBundle::default());
         assert_eq!(
             loaded
                 .registry
@@ -32070,7 +32123,11 @@ stack = 64
 
         // The same save under the built-in registry still opens, with the saved
         // names as placeholders and a readable non-blocking notice.
-        let mut builtin = startup_session_with(&cli, &ContentRegistry::builtin_arc());
+        let mut builtin = startup_session_with(
+            &cli,
+            &ContentRegistry::builtin_arc(),
+            &RulesBundle::default(),
+        );
         assert_eq!(
             builtin
                 .registry
@@ -32093,7 +32150,224 @@ stack = 64
         let fresh = startup_session_with(
             &CliConfig::parse_args(["--new", "--seed", "9", "--save", path_str]),
             &registry,
+            &RulesBundle::default(),
         );
         assert!(Arc::ptr_eq(&fresh.registry, &registry));
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S01-T07: startup config loading and app/session rules wiring
+    // -----------------------------------------------------------------------
+
+    /// Build a settings/packs/config temp tree with a custom player config.
+    fn startup_content_with_player_toml(dir: &Path, player_toml: &str) -> StartupContent {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join("player.toml"), player_toml).expect("write player.toml");
+        StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            Some(&config_dir),
+        )
+    }
+
+    fn config_warnings(content: &StartupContent) -> Vec<&SettingsWarning> {
+        content
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("config/"))
+            .collect()
+    }
+
+    fn one_second_walk_displacement(session: &mut WorldSession) -> f32 {
+        session.player.fly_mode = false;
+        session.player.yaw = 0.0;
+        let input = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        let start = session.player.position;
+        for _ in 0..60 {
+            session
+                .player
+                .update(1.0 / 60.0, &input, |_, _, _| BlockId::Air);
+        }
+        Vec3::new(
+            session.player.position.x - start.x,
+            0.0,
+            session.player.position.z - start.z,
+        )
+        .length()
+    }
+
+    #[test]
+    fn startup_config_loads_from_injected_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+
+        assert_eq!(content.config.f32("movement.walk_speed"), 6.0);
+        assert_eq!(content.config.f32("camera.z_far"), 800.0);
+        assert!(
+            config_warnings(&content).is_empty(),
+            "a valid injected config must not surface a config warning: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn startup_config_rules_reach_startup_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("fresh.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+
+        let mut session =
+            startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        assert_eq!(session.player.movement.walk_speed, 6.0);
+        assert_eq!(session.camera.z_far, 800.0);
+        let fast = one_second_walk_displacement(&mut session);
+        assert!(
+            (fast - 6.0).abs() < 0.2,
+            "walk_speed = 6.0 must move 6 blocks in 1 s, got {fast}"
+        );
+
+        // The same launch with default rules keeps today's 4.6 blocks/s.
+        let mut default_session =
+            startup_session_with(&cli, &content.base_registry, &RulesBundle::default());
+        let normal = one_second_walk_displacement(&mut default_session);
+        assert!(
+            (normal - 4.6).abs() < 0.2,
+            "default walk speed must move 4.6 blocks in 1 s, got {normal}"
+        );
+    }
+
+    #[test]
+    fn startup_config_invalid_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content =
+            startup_content_with_player_toml(dir.path(), "[movement]\nwalk_speed = 0.0\n");
+
+        assert_eq!(
+            content.config.rules(),
+            RulesBundle::default(),
+            "an invalid field falls back per field, leaving every other default"
+        );
+        assert!(
+            content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field == "config/player.toml: movement.walk_speed"),
+            "the invalid field surfaces as a startup warning: {:?}",
+            content.startup_warnings
+        );
+
+        // The world remains constructible with the fallback rules.
+        let save_path = dir.path().join("fallback.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        assert_eq!(session.player.movement.walk_speed, 4.6);
+    }
+
+    #[test]
+    fn startup_config_missing_dir_is_error_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            Some(&dir.path().join("absent-config")),
+        );
+
+        assert_eq!(content.config.rules(), RulesBundle::default());
+        assert_eq!(
+            content.config.digest(),
+            ConfigRuntime::defaults().digest(),
+            "a missing dir leaves every registry default in place"
+        );
+        assert!(
+            config_warnings(&content).is_empty(),
+            "missing files are warnings, never startup errors: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn game_app_applies_config_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("app.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        // Start from a default-rules session so the app's apply is observable.
+        let session = startup_session_with(&cli, &content.base_registry, &RulesBundle::default());
+        assert_eq!(session.player.movement.walk_speed, 4.6);
+
+        let mut app = GameApp::new_with_content(
+            cli.clone(),
+            session,
+            content,
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.session.player.movement.walk_speed, 6.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+
+        // A session swap re-applies the app-wide rules (the S02 seam).
+        let registry = Arc::clone(&app.base_registry);
+        let fresh = startup_session_with(&cli, &registry, &RulesBundle::default());
+        assert_eq!(fresh.player.movement.walk_speed, 4.6);
+        app.session = fresh;
+        app.on_session_installed();
+        assert_eq!(app.session.player.movement.walk_speed, 6.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+    }
+
+    #[test]
+    fn new_with_paths_does_not_load_repo_config() {
+        // F13 isolation: headless constructors inject `None`, so the suite can
+        // never read the developer's checked-in `config/` tree implicitly.
+        // Production `main` is the only path that passes the real directory.
+        let source = include_str!("main.rs");
+        let new_with_paths = source
+            .split("fn new_with_paths(")
+            .nth(1)
+            .expect("main.rs must define new_with_paths")
+            .split("fn new_with_content(")
+            .next()
+            .expect("new_with_content must follow new_with_paths");
+        let call_at = new_with_paths
+            .find("StartupContent::load(")
+            .expect("new_with_paths must build StartupContent");
+        let call = &new_with_paths[call_at..];
+        let call = &call[..call.find(");").expect("the load call must close")];
+        let normalized = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(", None"),
+            "new_with_paths must inject no config dir: {normalized}"
+        );
+
+        let main_body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let call_at = main_body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent");
+        let call = &main_body[call_at..];
+        let call = &call[..call.find(");").expect("the load call must close")];
+        let normalized = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("Some(") && normalized.contains("CONFIG_DIR"),
+            "production main must inject the real config dir: {normalized}"
+        );
     }
 }
