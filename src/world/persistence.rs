@@ -259,6 +259,13 @@ pub struct CliConfig {
     /// loop, or save. Release rejection of the switch is deliberately deferred
     /// to S09.
     pub check_config: bool,
+    /// Whether the dev-only creator trace (`--creator-trace`, M014/S02-T04) is
+    /// requested. A bare launch switch: it takes no value, is deliberately NOT
+    /// a world intent (so it never affects `cli_has_world_intent`), and is
+    /// never persisted. `main` prints apply/reject lines only in debug builds
+    /// (`watch::CREATOR_TOOLS`) and only when this flag is set; release
+    /// rejection of the switch is deliberately deferred to S09.
+    pub creator_trace: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -291,6 +298,7 @@ impl CliConfig {
         let mut demo_palette = false;
         let mut validate_pack = None;
         let mut check_config = false;
+        let mut creator_trace = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -404,6 +412,13 @@ impl CliConfig {
                     // `main` short-circuits on this before any world startup.
                     check_config = true;
                 }
+                "--creator-trace" => {
+                    // Bare switch (no value to consume), mirroring
+                    // `--check-config`: a stray following token stays an
+                    // independent argument. Trace emission itself is gated by
+                    // `CREATOR_TOOLS` in `main`.
+                    creator_trace = true;
+                }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
                 // launch with only a mode flag still opens the main menu.
@@ -434,6 +449,7 @@ impl CliConfig {
             demo_palette,
             validate_pack,
             check_config,
+            creator_trace,
             mode,
         }
     }
@@ -5624,6 +5640,58 @@ mod tests {
         let with_seed = CliConfig::parse_args(["--check-config", "--seed", "5"]);
         assert!(with_seed.check_config);
         assert_eq!(with_seed.seed_override, Some(5));
+    }
+
+    #[test]
+    fn test_creator_trace_is_a_bare_launch_switch() {
+        // Absent keeps the dev-only trace off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.creator_trace);
+
+        // The switch alone turns the trace on and changes nothing else: it is
+        // a launch switch, not a world parameter.
+        let alone = CliConfig::parse_args(["--creator-trace"]);
+        assert!(alone.creator_trace);
+        assert!(!alone.force_new_world);
+        assert_eq!(alone.seed_override, None);
+        assert_eq!(alone.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A real world flag still parses independently and grants intent
+        // (which lives in main.rs via `cli_has_world_intent`); the trace flag
+        // consumes no token, so `--new` is not swallowed.
+        let with_new = CliConfig::parse_args(["--creator-trace", "--new"]);
+        assert!(with_new.creator_trace);
+        assert!(with_new.force_new_world);
+
+        // A following independent value flag is not consumed as a value.
+        let with_save = CliConfig::parse_args(["--creator-trace", "--save", "fixture.mcvx"]);
+        assert!(with_save.creator_trace);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+        assert_eq!(with_save.seed_override, None);
+        assert!(!with_save.force_new_world);
+
+        let with_seed = CliConfig::parse_args(["--creator-trace", "--seed", "5"]);
+        assert!(with_seed.creator_trace);
+        assert_eq!(with_seed.seed_override, Some(5));
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--creator-trace", "5"]);
+        assert!(stray.creator_trace);
+        assert_eq!(stray.seed_override, None);
+
+        // Repeated flags stay on (idempotent boolean, not a toggle).
+        let repeated =
+            CliConfig::parse_args(["--creator-trace", "--creator-trace", "--creator-trace"]);
+        assert!(repeated.creator_trace);
+        assert!(!repeated.force_new_world);
+        assert_eq!(repeated.seed_override, None);
+        assert_eq!(
+            repeated.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
     }
 
     #[test]
