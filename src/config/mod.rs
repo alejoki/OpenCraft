@@ -18,6 +18,7 @@
 //! comments and formatting are silent while creator edits are visible.
 
 pub mod registry;
+pub mod watch;
 
 use std::collections::BTreeMap;
 use std::path::Path;
