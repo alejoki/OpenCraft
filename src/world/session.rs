@@ -1661,6 +1661,7 @@ impl WorldSession {
     /// config reload.
     pub fn apply_rules(&mut self, rules: &RulesBundle) {
         self.gameplay_rules = *rules;
+        self.spawn_runtime.set_rules(rules.spawning);
         self.player.movement = rules.movement;
         self.camera.z_near = rules.camera.z_near;
         self.camera.z_far = rules.camera.z_far;
@@ -2194,7 +2195,7 @@ mod tests {
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-    use crate::world::spawning::{DESPAWN_RADIUS, SAFE_RADIUS};
+    use crate::world::spawning::{SpawnRules, DESPAWN_RADIUS, SAFE_RADIUS};
 
     #[test]
     fn interaction_rules_default_matches_constants() {
@@ -5901,6 +5902,46 @@ mod tests {
             "a re-enabled gate spawned nothing: {:?}",
             session.spawn_report()
         );
+    }
+
+    #[test]
+    fn apply_rules_drives_the_spawn_cap_and_counts_blocks() {
+        let mut session = lit_grass_plain_session(55, 2);
+        session.clock = GameClock::from_time(NIGHT_TICK);
+        let rules = RulesBundle {
+            spawning: SpawnRules {
+                max_mobs_total: 1,
+                ..SpawnRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().spawning.max_mobs_total, 1);
+
+        // 30 s of night over a ready, lit plain: the tuned cap holds the list
+        // at one record and every later attempt is counted as blocked.
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+
+        assert_eq!(
+            session.mobs().len(),
+            1,
+            "the tuned global cap must hold at one record: {:?}",
+            session.spawn_report()
+        );
+        assert!(
+            session.spawn_report().cap_blocked > 0,
+            "attempts past the tuned cap must be counted: {:?}",
+            session.spawn_report()
+        );
+
+        // A live re-apply of the same bundle is not a runtime reset.
+        let report = session.spawn_report();
+        let same = session.rules();
+        session.apply_rules(&same);
+        assert_eq!(session.spawn_report(), report);
+        assert_eq!(session.mobs().len(), 1);
     }
 
     #[test]
