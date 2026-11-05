@@ -34,8 +34,8 @@ use opencraft::player::inventory::{
     ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
 };
 use opencraft::player::melee::{
-    attack_damage, attack_damage_with, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH,
-    SWORD_DAMAGE_WOOD,
+    attack_damage, attack_damage_with_rules, MeleeHit, MeleeState, MeleeTarget, MeleeTick,
+    MELEE_REACH, SWORD_DAMAGE_WOOD,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
@@ -717,8 +717,9 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
             if food_value_with(session.registry.as_ref(), item.id()).is_some() {
-                return match EatingTarget::new_with(
+                return match EatingTarget::new_with_rules(
                     session.registry.as_ref(),
+                    &session.rules().eating,
                     session.player.selected_slot(),
                     item,
                     session.player.survival.hunger(),
@@ -854,8 +855,9 @@ fn eating_candidate(
         return None;
     }
     let item = player.selected_item()?;
-    EatingTarget::new_with(
+    EatingTarget::new_with_rules(
         session.registry.as_ref(),
+        &session.rules().eating,
         player.selected_slot(),
         item,
         player.survival.hunger(),
@@ -914,7 +916,7 @@ fn release_bow(
     gameplay: bool,
     cursor_grabbed: bool,
 ) -> BowRelease {
-    let Some(charge) = bow.release() else {
+    let Some(charge) = bow.release_with(&session.rules().bow) else {
         return BowRelease::default();
     };
     if !(gameplay && cursor_grabbed) {
@@ -11898,9 +11900,13 @@ impl ApplicationHandler for GameApp {
                     if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
                     {
                         // Authored nutrition resolves through the frozen
-                        // session registry; built-in food answers unchanged.
-                        self.session.player.eat_selected_with(
+                        // session registry; built-in food answers from the
+                        // session's live eating rules, matching the target
+                        // that computed the displayed restore.
+                        let eating_rules = self.session.rules().eating;
+                        self.session.player.eat_selected_with_rules(
                             self.session.registry.as_ref(),
+                            &eating_rules,
                             slot,
                             item,
                         );
@@ -11918,7 +11924,8 @@ impl ApplicationHandler for GameApp {
                         gameplay,
                         self.cursor_grabbed,
                     );
-                    self.bow.tick(dt, bow_target);
+                    let bow_rules = self.session.rules().bow;
+                    self.bow.tick_with(dt, bow_target, &bow_rules);
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -12035,11 +12042,12 @@ impl ApplicationHandler for GameApp {
                 // forward, never a borrow of the session, and the list can
                 // still change before the swing resolves (streaming, death),
                 // so every later step re-reads live state by index.
+                let melee_rules = self.session.rules().melee;
                 let attack_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
                     self.session.melee_candidate(
                         self.session.camera.position,
                         self.session.camera.forward(),
-                        MELEE_REACH,
+                        melee_rules.reach,
                     )
                 } else {
                     None
@@ -12078,7 +12086,9 @@ impl ApplicationHandler for GameApp {
                     let health = self.session.mobs().get(hit.index)?.health;
                     MeleeTarget::new(hit.index, health)
                 });
-                if let MeleeTick::Swing { index } = self.melee.tick(dt, melee_target) {
+                if let MeleeTick::Swing { index } =
+                    self.melee.tick_with(dt, melee_target, &melee_rules)
+                {
                     // The swing itself is the only mutation site: damage is
                     // derived from the live item/mode/health, the session
                     // re-checks residency and the i-frame window, and only a
@@ -12086,8 +12096,9 @@ impl ApplicationHandler for GameApp {
                     // i-frame-blocked swing mutate nothing (MEM392).
                     let target_health = self.session.mobs().get(index).map(|mob| mob.health);
                     if let Some(target_health) = target_health {
-                        let damage = attack_damage_with(
+                        let damage = attack_damage_with_rules(
                             &self.session.registry,
+                            &melee_rules,
                             self.session.player.selected_item(),
                             self.session.player.mode(),
                             target_health,
@@ -12484,9 +12495,10 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
                     ));
+                    let bow_rules = self.session.rules().bow;
                     if let Some(bar) = frame_progress_bar(
                         self.eating.progress(),
-                        self.bow.progress(),
+                        self.bow.progress_with(&bow_rules),
                         self.mining.progress(),
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
@@ -33595,6 +33607,21 @@ stack = 64
         GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
     }
 
+    /// [`creator_app`] variant whose fresh session is Survival, so survival
+    /// rules are observable through real hunger/air gameplay.
+    fn creator_survival_app(dir: &Path, player_toml: &str) -> GameApp {
+        let content = startup_content_with_player_toml(dir, player_toml);
+        let save_path = dir.join("creator-survival.mcvx");
+        let cli = CliConfig::parse_args([
+            "--survival",
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
     /// First poll records the edit as pending; the second crosses the 250 ms
     /// settle window. The injected clock means the tests never sleep.
     fn settle_config(app: &mut GameApp, base: Instant) {
@@ -33654,6 +33681,380 @@ stack = 64
             }
         );
         assert!(app.game_message.is_none(), "a successful apply is silent");
+    }
+
+    /// Full tuned survival.toml: a 1 s hunger drain, 0.4 s apple meal, 7-point
+    /// apple, and a 6-block fall-safe window. Every other key is explicit so
+    /// the apply is a complete file, not a partial one that would re-default
+    /// its siblings.
+    const TUNED_SURVIVAL_TOML: &str = "\
+[survival]
+fall_safe_blocks = 6.0
+air_drain_per_sec = 20.0
+drown_interval_secs = 1.0
+drown_damage = 2
+hunger_drain_secs = 1.0
+starve_interval_secs = 4.0
+starve_damage = 1
+regen_hunger_threshold = 18
+regen_interval_secs = 4.0
+regen_hunger_cost = 1
+
+[eating]
+eat_duration_secs = 0.4
+apple_hunger = 7
+bread_hunger = 6
+raw_meat_hunger = 3
+rotten_flesh_hunger = 1
+";
+
+    /// Full tuned combat.toml: 6-block reach, 0.25 s swing, 0.5 s full bow
+    /// draw, and a 40 blocks/s fastest arrow.
+    const TUNED_COMBAT_TOML: &str = "\
+[melee]
+fist_damage = 1
+sword_damage_wood = 4
+sword_damage_stone = 5
+sword_damage_iron = 6
+reach = 6.0
+swing_cooldown_secs = 0.25
+
+[player]
+iframe_secs = 0.5
+hurt_flash_secs = 0.5
+knockback_speed = 6.0
+knockback_decay = 0.6
+
+[bow]
+min_charge_secs = 0.1
+full_charge_secs = 0.5
+
+[arrow]
+gravity = 20.0
+speed_min = 18.0
+speed_max = 40.0
+damage_min = 1
+damage_max = 4
+skeleton_speed = 28.0
+skeleton_damage = 2
+lifetime_secs = 20.0
+embed_secs = 2.0
+";
+
+    #[test]
+    fn creator_live_survival_and_combat_edits_change_gameplay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_survival_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert_eq!(
+            app.session.rules(),
+            RulesBundle::default(),
+            "a fresh session starts on the registry defaults"
+        );
+
+        let t0 = Instant::now();
+        write_config(dir.path(), "survival.toml", TUNED_SURVIVAL_TOML);
+        write_config(dir.path(), "combat.toml", TUNED_COMBAT_TOML);
+        settle_config(&mut app, t0);
+
+        let rules = app.session.rules();
+        assert_eq!(rules.survival.hunger_drain_secs, 1.0);
+        assert_eq!(rules.eating.apple_hunger, 7);
+        assert_eq!(rules.eating.eat_duration_secs, 0.4);
+        assert_eq!(rules.melee.reach, 6.0);
+        assert_eq!(rules.melee.swing_cooldown_secs, 0.25);
+        assert_eq!(rules.bow.full_charge_secs, 0.5);
+        assert_eq!(rules.arrow.speed_max, 40.0);
+        assert!(
+            matches!(app.creator.status, ReloadStatus::Applied { .. }),
+            "the tuned edit applies: {:?}",
+            app.creator.status
+        );
+
+        // 1. Hunger drain: one game second at the tuned 1 s interval.
+        assert_eq!(app.session.player.survival.hunger(), MAX_HUNGER);
+        app.session.tick_survival(0.1, 10.0, false);
+        assert_eq!(
+            app.session.player.survival.hunger(),
+            MAX_HUNGER - 1,
+            "the session consumes the tuned hunger drain"
+        );
+
+        // 2. Melee reach: a pig 5 blocks east is inside the tuned 6.0 reach
+        //    and outside the pinned default 3.0.
+        app.session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        app.session.camera.position = Vec3::new(0.5, 9.65, 0.5);
+        app.session.camera.yaw = 0.0;
+        app.session.camera.pitch = 0.0;
+        app.session.mobs_mut().clear();
+        app.session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        let tuned_hit = app.session.melee_candidate(
+            app.session.camera.position,
+            app.session.camera.forward(),
+            app.session.rules().melee.reach,
+        );
+        assert_eq!(
+            tuned_hit.map(|hit| hit.index),
+            Some(0),
+            "the tuned 6.0 reach selects the pig"
+        );
+        assert_eq!(
+            app.session.melee_candidate(
+                app.session.camera.position,
+                app.session.camera.forward(),
+                MELEE_REACH,
+            ),
+            None,
+            "the pinned default reach cannot select the same pig"
+        );
+
+        // 3. Bow charge: five 0.1 s ticks fill the tuned 0.5 s draw (one
+        //    tick integrates at most MAX_DT = 0.1 s).
+        let bow_item = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood bow");
+        let bow_target = BowTarget::new(0, bow_item).expect("bow in a hotbar slot");
+        let mut bow = BowState::new();
+        for tick in 0..4 {
+            assert!(
+                matches!(
+                    bow.tick_with(0.1, Some(bow_target), &rules.bow),
+                    BowTick::Charging { .. }
+                ),
+                "tick {tick} of the tuned 0.5 s draw is still charging"
+            );
+        }
+        assert_eq!(
+            bow.tick_with(0.1, Some(bow_target), &rules.bow),
+            BowTick::Full
+        );
+        assert_eq!(bow.progress_with(&rules.bow), Some(1.0));
+
+        // 4. Eating setup: the tuned apple target reaches the frame helper.
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("apple");
+        assert!(app.session.player.insert_items(&[apple]).is_ok());
+        let apple_slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                app.session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(ItemId::Material(Material::Apple))
+            })
+            .expect("the apple landed in a hotbar slot");
+        assert!(app.session.player.select_slot(apple_slot));
+        let eating_target =
+            eating_candidate(&app.session, &InputState::default(), true, true, true)
+                .expect("Survival food while hungry");
+        assert_eq!(
+            eating_target.restore(),
+            7,
+            "the tuned apple value reaches eating_candidate"
+        );
+        assert!((eating_target.duration() - 0.4).abs() < 1e-6);
+
+        // 5. A range-invalid survival edit is rejected whole and keeps the
+        //    last good tuned values, digest, and behavior.
+        let digest = app.config.digest();
+        let rules_before = app.session.rules();
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "survival.toml",
+            "[survival]\nhunger_drain_secs = 0.5\n",
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("survival.hunger_drain_secs"),
+            1.0,
+            "a rejected file keeps its last good tuned value"
+        );
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Survival,
+                field: Some("survival.hunger_drain_secs".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+
+        // Restoring the tuned survival file clears its diagnostic before the
+        // next rejection scenario, so each rejection is measured on its own.
+        let t_recover = t1 + Duration::from_secs(1);
+        write_config(dir.path(), "survival.toml", TUNED_SURVIVAL_TOML);
+        settle_config(&mut app, t_recover);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Survival,
+                ..
+            }
+        ));
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+
+        // 6. A bow min>full cross-field edit is rejected whole as well.
+        let t2 = t_recover + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "combat.toml",
+            &TUNED_COMBAT_TOML.replace("min_charge_secs = 0.1", "min_charge_secs = 0.9"),
+        );
+        settle_config(&mut app, t2);
+
+        assert_eq!(app.config.f32("bow.min_charge_secs"), 0.1);
+        assert_eq!(app.config.f32("bow.full_charge_secs"), 0.5);
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Combat,
+                field: Some("bow.min_charge_secs".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+
+        // The rejected edits leave the previously tuned drain active: one
+        // more game second still spends exactly one hunger point.
+        app.session.tick_survival(0.1, 10.0, false);
+        assert_eq!(app.session.player.survival.hunger(), 18);
+    }
+
+    #[test]
+    fn default_rule_wrappers_preserve_pinned_gameplay_numbers() {
+        use opencraft::player::bow::BowRules;
+        use opencraft::player::eating::{EatingRules, EAT_DURATION_SECS};
+        use opencraft::player::melee::{MeleeRules, SWING_COOLDOWN_SECS};
+
+        let rules = RulesBundle::default();
+        assert_eq!(rules.melee, MeleeRules::default());
+        assert_eq!(rules.bow, BowRules::default());
+        assert_eq!(rules.eating, EatingRules::default());
+        assert_eq!(rules.melee.reach, MELEE_REACH);
+        assert_eq!(rules.melee.swing_cooldown_secs, SWING_COOLDOWN_SECS);
+        assert_eq!(rules.eating.eat_duration_secs, EAT_DURATION_SECS);
+        assert_eq!(rules.eating.apple_hunger, 4);
+        assert_eq!(rules.survival.hunger_drain_secs, 30.0);
+        assert_eq!(rules.combat.iframe_secs, 0.5);
+        assert_eq!(rules.bow.min_charge_secs, 0.2);
+        assert_eq!(rules.bow.full_charge_secs, 1.0);
+        assert_eq!(rules.arrow.speed_max, 32.0);
+
+        // Default damage wrapper: fist 1, wood/stone/iron 4/5/6, Creative
+        // one-shots the target's remaining health.
+        let sword = |tier| {
+            Item::new(
+                ItemId::Tool {
+                    kind: ToolKind::Sword,
+                    tier,
+                },
+                1,
+            )
+            .expect("a sword")
+        };
+        assert_eq!(attack_damage(None, GameMode::Survival, 20), 1);
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Wood)), GameMode::Survival, 20),
+            4
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Stone)), GameMode::Survival, 20),
+            5
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Iron)), GameMode::Survival, 20),
+            6
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Iron)), GameMode::Creative, 20),
+            20
+        );
+
+        // Default melee wrapper re-arms the pinned 0.6 s cooldown.
+        let mut melee = MeleeState::new();
+        let melee_target = MeleeTarget::new(0, 10).expect("a live target");
+        assert_eq!(
+            melee.tick(0.0, Some(melee_target)),
+            MeleeTick::Swing { index: 0 }
+        );
+        assert_eq!(melee.cooldown(), SWING_COOLDOWN_SECS);
+        assert!(matches!(
+            melee.tick(0.05, Some(melee_target)),
+            MeleeTick::Cooling { .. }
+        ));
+
+        // Default bow wrapper saturates after the pinned 1.0 s draw and
+        // refuses a tap shorter than the pinned 0.2 s threshold.
+        let bow_item = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood bow");
+        let bow_target = BowTarget::new(0, bow_item).expect("bow in a hotbar slot");
+        let mut bow = BowState::new();
+        assert!(matches!(
+            bow.tick(0.1, Some(bow_target)),
+            BowTick::Charging { .. }
+        ));
+        assert_eq!(bow.release(), None, "a 0.1 s tap is below the threshold");
+        let mut bow = BowState::new();
+        for _ in 0..9 {
+            assert!(matches!(
+                bow.tick(0.1, Some(bow_target)),
+                BowTick::Charging { .. }
+            ));
+        }
+        assert_eq!(bow.tick(0.1, Some(bow_target)), BowTick::Full);
+        assert_eq!(bow.release(), Some(1.0));
+
+        // Default eating wrapper restores the pinned apple value over the
+        // pinned meal duration.
+        let registry = ContentRegistry::builtin_arc();
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("apple");
+        let target = EatingTarget::new_with(registry.as_ref(), 0, apple, 10)
+            .expect("an apple with room for more hunger");
+        assert_eq!(target.restore(), 4);
+        assert_eq!(target.duration(), EAT_DURATION_SECS);
     }
 
     #[test]
