@@ -109,10 +109,10 @@ use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropRepor
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
 use opencraft::world::persistence::{
-    load_world_from_path, load_world_from_path_with, save_world_to_path_with,
-    save_world_to_path_with_config, ChunkEditMap, CliConfig, PersistenceError, SavedMob,
-    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
-    DEFAULT_TIME_SCALE,
+    load_world_from_bytes_with, load_world_from_path, load_world_from_path_with,
+    save_world_to_path_with, save_world_to_path_with_config, ChunkEditMap, CliConfig,
+    PersistenceError, SavedMob, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
+    DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -4493,11 +4493,11 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 307;
-/// Bytes of the v8 pack-identity + digest tail after the mob records: a `u32`
-/// pack count (zero here) plus the `u64` FNV-1a digest.
+const COMBAT_SAVE_BYTES: usize = 317;
+/// Bytes of the v8 pack-identity + digest tail (12) plus the v9 config tail
+/// (10) after the mob records.
 #[cfg(test)]
-const COMBAT_SAVE_TAIL_BYTES: usize = 12;
+const COMBAT_SAVE_TAIL_BYTES: usize = 22;
 /// Measured offset of the v8 mob-count word in that save: the 19-byte Zombie
 /// record starts 4 bytes later and the Skeleton record follows it, so the tail
 /// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
@@ -4548,7 +4548,7 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 /// to Creative rules — no target selection, no melee, no arrows, no damage —
 /// and then that one melee swing and one charge-0 arrow each one-shot a
 /// full-health Zombie with the pinned drop table intact. It consumes exactly
-/// the two rotten-flesh units its kills earned, so the measured 307-byte v8
+/// the two rotten-flesh units its kills earned, so the measured 317-byte v9
 /// witness and every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
 /// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
 /// Save -> Restore -> Done`.
@@ -7369,7 +7369,7 @@ fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
 ///    the real projectile sweep, granting exactly one more rotten flesh.
 /// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
 ///    again and the inventory total must return to its pre-stage value, which
-///    is what keeps the measured 307-byte v8 save byte-identical.
+///    is what keeps the measured 317-byte v9 save byte-identical.
 ///
 /// Documented demo pins, not gameplay rules: the two survivors are parked 20
 /// blocks behind the camera (position *and* leash anchor, so the synthetic
@@ -7692,7 +7692,7 @@ fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
         .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
 
     // 4. Conserve the save witness: both earned units are consumed again, so
-    //    the inventory section (and therefore the measured 307-byte v8 layout)
+    //    the inventory section (and therefore the measured 317-byte v9 layout)
     //    is byte-identical.
     if session.player.consume_item(flesh_id).is_none()
         || session.player.consume_item(flesh_id).is_none()
@@ -13248,7 +13248,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 307-byte v8 witness keep their exact bytes.
+            // measured 317-byte v9 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -13277,7 +13277,7 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             // The Creative stage's digest follows the Skeleton line for the
-            // same reason: every earlier line and the 307-byte v8 witness keep
+            // same reason: every earlier line and the 317-byte v9 witness keep
             // their exact bytes.
             if let Some(line) = self
                 .combat_demo
@@ -15019,6 +15019,110 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     (lines, true)
 }
 
+// ---------------------------------------------------------------------------
+// Headless v8-to-v9 save proof (`--demo-save-v9`, M014/S04-T05)
+// ---------------------------------------------------------------------------
+
+/// Build the deterministic `--demo-save-v9` proof.
+///
+/// Reads `input` as bytes (never writing it), decodes it through the production
+/// v8/v9 loader with the built-in registry, reports the load leg, then writes a
+/// v9 file next to the input through the one production save site and reloads
+/// that output under the same effective config. A missing input is reported as
+/// `missing-input`; every other read/decode failure is `load`. No settings
+/// file, pack stack, window, GPU, audio engine, or event loop is touched.
+fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let output = input.with_extension("v9.mcvx");
+
+    let bytes = match std::fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            lines.push("save_v9: failed reason=missing-input".to_string());
+            return (lines, false);
+        }
+        Err(_) => {
+            lines.push("save_v9: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+    let Some(version_bytes) = bytes.get(4..8) else {
+        lines.push("save_v9: failed reason=load".to_string());
+        return (lines, false);
+    };
+    let version = u32::from_le_bytes(version_bytes.try_into().expect("4-byte version slice"));
+    let loaded = match load_world_from_bytes_with(&bytes, ContentRegistry::builtin()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("save_v9: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+
+    let packs = loaded
+        .saved_content
+        .as_ref()
+        .map(|content| content.packs.len())
+        .unwrap_or(0);
+    let saved_config = loaded.saved_config.is_some();
+    let current = config.meta();
+    let mut session = WorldSession::from_loaded_world(loaded, output.clone());
+    let notice = session.take_config_notice(current);
+    let playable = !session.is_dead();
+    lines.push(format!(
+        "save_v9: leg=load version={version} packs={packs} saved_config={} notice={} playable={playable}",
+        if saved_config { "some" } else { "none" },
+        notice.as_deref().unwrap_or("none"),
+    ));
+
+    // Install the running effective config, then save through the one
+    // production save site: the session's `save_path` is the derived output.
+    session.apply_config(&config.rules(), current);
+    if save_current_world(&mut session).is_err() {
+        lines.push("save_v9: failed reason=save".to_string());
+        return (lines, false);
+    }
+    let saved_bytes = match std::fs::read(&output) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            lines.push("save_v9: failed reason=resave".to_string());
+            return (lines, false);
+        }
+    };
+    let resave_version = saved_bytes
+        .get(4..8)
+        .map(|raw| u32::from_le_bytes(raw.try_into().expect("4-byte version slice")))
+        .unwrap_or(0);
+    lines.push(format!(
+        "save_v9: leg=resave version={resave_version} config_schema={} config_digest=0x{:016x} bytes={}",
+        current.schema,
+        current.digest,
+        saved_bytes.len(),
+    ));
+
+    let reloaded = match load_world_from_path_with(&output, ContentRegistry::builtin()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("save_v9: failed reason=reload".to_string());
+            return (lines, false);
+        }
+    };
+    let mut reload_session = WorldSession::from_loaded_world(reloaded, output);
+    let match_notice = reload_session.take_config_notice(current);
+    let match_playable = !reload_session.is_dead();
+    lines.push(format!(
+        "save_v9: leg=match notice={} playable={match_playable}",
+        match_notice.as_deref().unwrap_or("none"),
+    ));
+
+    if resave_version != 9 || match_notice.is_some() || !playable || !match_playable {
+        lines.push("save_v9: failed reason=mismatch".to_string());
+        return (lines, false);
+    }
+    lines.push("save_v9: ok".to_string());
+    (lines, true)
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -15175,6 +15279,27 @@ fn main() {
             load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
         let (registry, _report) = build_session_registry(&specs);
         let (lines, ok) = palette_demo_lines(&registry);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-save-v9` is the headless v8-to-v9 save proof: it loads the
+    // `--save` input through the production decoder, writes the derived v9
+    // file next to it through the one production save site, and reloads that
+    // output under the effective config. It runs after the palette digest and
+    // before `StartupContent::load`, so no window, GPU, audio engine, event
+    // loop, settings write, pack load, or world startup happens here.
+    if cli.demo_save_v9 {
+        let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
+        let (lines, ok) = demo_save_v9_lines(&cli.save_path, &config);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -15846,6 +15971,56 @@ mod tests {
         assert!(!cli_has_world_intent(&crafting));
         assert_eq!(cli_has_world_intent(&crafting), cli_has_world_intent(&bare));
         let with_new = CliConfig::parse_args(["--new", "--demo-crafting"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_save_v9_short_circuit_precedes_world_startup() {
+        // The v8-to-v9 proof must run after the palette digest and before any
+        // world/session startup: no settings write, pack load, window, GPU,
+        // audio engine, event loop, or world startup is allowed here.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_palette_at = body
+            .find("cli.demo_palette")
+            .expect("fn main must branch on cli.demo_palette");
+        let demo_save_v9_at = body
+            .find("cli.demo_save_v9")
+            .expect("fn main must branch on cli.demo_save_v9");
+        let proof_at = body
+            .find("demo_save_v9_lines(")
+            .expect("fn main must call demo_save_v9_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_palette_at < demo_save_v9_at,
+            "the v9 proof must follow the palette branch"
+        );
+        assert!(
+            demo_save_v9_at < startup_at,
+            "cli.demo_save_v9 must precede startup"
+        );
+        assert!(
+            proof_at < startup_at,
+            "demo_save_v9_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_save_v9_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless proof,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let save_v9 = CliConfig::parse_args(["--demo-save-v9"]);
+        assert!(!cli_has_world_intent(&save_v9));
+        assert_eq!(cli_has_world_intent(&save_v9), cli_has_world_intent(&bare));
+        // A real world flag still grants intent; the proof flag is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--demo-save-v9"]);
         assert!(cli_has_world_intent(&with_new));
     }
 
@@ -18977,7 +19152,7 @@ stack = 64
             COMBAT_SAVE_MOB_COUNT_OFFSET,
             "pinned mob-count offset"
         );
-        assert_eq!(&bytes[4..8], &8u32.to_le_bytes(), "v8 version word");
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes(), "v9 version word");
         assert_eq!(
             &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
             &2u32.to_le_bytes(),
@@ -21660,7 +21835,7 @@ stack = 64
             "leg=place: one ruby block is consumed"
         );
 
-        // (12) Save v8, reload against the same stack, and prove the writer is
+        // (12) Save v9, reload against the same stack, and prove the writer is
         // deterministic.
         save_current_world(&mut session).expect("leg=save: the session save writes");
         let bytes = std::fs::read(&save_path).expect("leg=save: the save file is readable");
@@ -21673,7 +21848,7 @@ stack = 64
                 .try_into()
                 .expect("leg=save: the version word is present"),
         );
-        assert_eq!(version, 8, "leg=save: the file is v8");
+        assert_eq!(version, 9, "leg=save: the file is v9");
         let loaded = load_world_from_path_with(&save_path, full_reg.as_ref())
             .expect("leg=reload: the save loads");
         assert_eq!(
@@ -21718,7 +21893,7 @@ stack = 64
         .expect("leg=reload: the loaded world re-saves");
         assert_eq!(
             resaved, bytes,
-            "leg=reload: a loaded v8 save re-saves byte-identically"
+            "leg=reload: a loaded v9 save re-saves byte-identically"
         );
     }
 

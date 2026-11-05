@@ -250,6 +250,15 @@ pub struct CliConfig {
     /// opens a window, GPU, audio engine, event loop or settings write, and
     /// never writes a save.
     pub demo_palette: bool,
+    /// Whether the headless v8-to-v9 save proof (`--demo-save-v9`,
+    /// M014/S04-T05) is requested. Same bare-switch contract as
+    /// `demo_palette`: it takes no value, is deliberately NOT a world intent
+    /// (so it never affects `cli_has_world_intent`), and is never persisted.
+    /// `main` consumes it before `StartupContent::load`, so the proof never
+    /// opens a window, GPU, audio engine, event loop, settings write, or pack
+    /// load. Its only writes are the derived v9 file next to `--save`; the
+    /// input is never overwritten.
+    pub demo_save_v9: bool,
     /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
     /// `main` consumes it before `startup_session`, so validation never opens
     /// a window, GPU, world, save or settings file. A switch with no following
@@ -302,6 +311,7 @@ impl CliConfig {
         let mut demo_crafting = false;
         let mut demo_worldgen = false;
         let mut demo_palette = false;
+        let mut demo_save_v9 = false;
         let mut validate_pack = None;
         let mut check_config = false;
         let mut creator_trace = false;
@@ -402,6 +412,13 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_palette = true;
                 }
+                "--demo-save-v9" => {
+                    // Same bare-switch rule as `--demo-palette`. `main`
+                    // short-circuits on this before `StartupContent::load`;
+                    // the next token stays available as an independent
+                    // argument (normally `--save <input>`).
+                    demo_save_v9 = true;
+                }
                 "--validate-pack" => {
                     // Value switch: consume the next token. A missing value
                     // stores an empty name so the request fails closed in
@@ -453,6 +470,7 @@ impl CliConfig {
             demo_crafting,
             demo_worldgen,
             demo_palette,
+            demo_save_v9,
             validate_pack,
             check_config,
             creator_trace,
@@ -5676,6 +5694,44 @@ mod tests {
         // A stray non-flag token after the switch never becomes the seed.
         let stray = CliConfig::parse_args(["--demo-palette", "5"]);
         assert!(stray.demo_palette);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_save_v9_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_save_v9);
+        assert!(!bare.demo_palette);
+        assert!(!bare.demo_worldgen);
+        assert!(!bare.demo_crafting);
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let flag = CliConfig::parse_args(["--demo-save-v9"]);
+        assert!(flag.demo_save_v9);
+        assert!(!flag.demo_palette);
+        assert!(!flag.demo_worldgen);
+        assert!(!flag.demo_crafting);
+        assert!(!flag.demo_presentation);
+        assert!(!flag.demo_ui);
+        assert!(!flag.force_new_world);
+        assert_eq!(flag.seed_override, None);
+        assert_eq!(flag.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A following `--save fixture.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value.
+        let with_save = CliConfig::parse_args(["--demo-save-v9", "--save", "fixture.mcvx"]);
+        assert!(with_save.demo_save_v9);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-save-v9", "5"]);
+        assert!(stray.demo_save_v9);
         assert_eq!(stray.seed_override, None);
     }
 
