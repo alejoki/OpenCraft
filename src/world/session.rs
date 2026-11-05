@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
-use crate::config::RulesBundle;
+use crate::config::{ConfigRuntime, RulesBundle, SaveConfigMeta};
 use crate::content::faces::BlockFaces;
 use crate::content::{ContentRegistry, WorldgenRule};
 use crate::mesh::quad::ChunkMesh;
@@ -51,6 +51,29 @@ use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_heigh
 /// reachable. Shared with the placement/mining ray length so every world
 /// interaction uses one reach budget.
 pub const TABLE_INTERACT_REACH: f32 = 8.0;
+
+/// One-shot notice for a v9 world saved under the same config schema but a
+/// different effective-value digest.
+pub const CONFIG_CHANGED_NOTICE: &str = "config changed since this world was saved";
+
+/// One-shot notice for a v9 world whose config schema differs from the
+/// running one; every effective value may still look the same by name.
+pub const CONFIG_SCHEMA_CHANGED_NOTICE: &str = "config schema changed since this world was saved";
+
+/// Notice matrix for one saved-meta/current-meta pair.
+///
+/// A schema mismatch wins over a digest mismatch: the digest is only
+/// comparable within one schema version, so the caller must be told the more
+/// actionable fact first.
+fn config_notice_for(saved: SaveConfigMeta, current: SaveConfigMeta) -> Option<String> {
+    if saved.schema != current.schema {
+        Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+    } else if saved.digest != current.digest {
+        Some(CONFIG_CHANGED_NOTICE.to_string())
+    } else {
+        None
+    }
+}
 
 /// Why [`WorldSession::fire_bow`] refused a shot.
 ///
@@ -122,6 +145,14 @@ pub struct WorldSession {
     /// the registry it resolved against here too. A live pack-stack change
     /// never replaces it (MEM512/D181); the next loaded world does.
     pub registry: Arc<ContentRegistry>,
+    /// Config metadata this session writes with. Fresh sessions write the
+    /// registry defaults; a loaded world inherits the running config after
+    /// [`WorldSession::apply_config`], and the next save names it.
+    save_config: SaveConfigMeta,
+    /// Config metadata the loaded world carried, or `None` for fresh sessions
+    /// and v1-v8 saves. Ephemeral: the pending notice and this record are
+    /// consumed together by [`WorldSession::take_config_notice`].
+    saved_config: Option<SaveConfigMeta>,
     /// Ephemeral changed-stack note computed once at load time and consumed by
     /// [`WorldSession::take_content_notice`]. Never persisted and never
     /// re-derived per frame.
@@ -268,6 +299,8 @@ impl WorldSession {
             chests: ChestMap::default(),
             save_path,
             registry,
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config: None,
             content_notice: None,
             open_table: None,
             open_chest: None,
@@ -352,6 +385,8 @@ impl WorldSession {
             chests: ChestMap::default(),
             save_path,
             registry,
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config: None,
             content_notice: None,
             open_table: None,
             open_chest: None,
@@ -390,7 +425,13 @@ impl WorldSession {
     /// selection or a grid stored under the wrong kind. `set_mode` runs after
     /// the raw fly assignment, so a Survival record cannot restore flight.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
-        Self::session_from_save_with_registry(data, save_path, ContentRegistry::builtin_arc(), None)
+        Self::session_from_save_with_registry(
+            data,
+            save_path,
+            ContentRegistry::builtin_arc(),
+            None,
+            None,
+        )
     }
 
     /// Rebuild a session from a registry-aware load, preserving the placeholder
@@ -401,11 +442,13 @@ impl WorldSession {
     /// once by the UI and never persisted.
     pub fn from_loaded_world(loaded: LoadedWorld, save_path: PathBuf) -> WorldSession {
         let content_notice = loaded.content_notice();
+        let saved_config = loaded.saved_config;
         Self::session_from_save_with_registry(
             loaded.data,
             save_path,
             Arc::new(loaded.registry),
             content_notice,
+            saved_config,
         )
     }
 
@@ -422,6 +465,7 @@ impl WorldSession {
         save_path: PathBuf,
         registry: Arc<ContentRegistry>,
         content_notice: Option<String>,
+        saved_config: Option<SaveConfigMeta>,
     ) -> WorldSession {
         let WorldSaveData {
             seed,
@@ -492,6 +536,11 @@ impl WorldSession {
             chests,
             save_path,
             registry,
+            // A loaded session first presents its saved config through the
+            // one-shot notice; `apply_config` then installs the running meta
+            // the next save writes.
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config,
             content_notice,
             open_table: None,
             open_chest: None,
@@ -1572,6 +1621,45 @@ impl WorldSession {
         self.camera.z_far = rules.camera.z_far;
     }
 
+    /// Applies live tuning and records the config meta the next save writes.
+    ///
+    /// S02's live reload replaces `GameApp.config` and re-enters the session
+    /// install path, so this is the single writer that keeps the session's
+    /// save metadata in step with the running values. The saved-world notice
+    /// is deliberately unchanged here: it is load-scoped, not reload-scoped.
+    pub fn apply_config(&mut self, rules: &RulesBundle, meta: SaveConfigMeta) {
+        self.apply_rules(rules);
+        self.save_config = meta;
+    }
+
+    /// The config metadata this session will attach to its next save.
+    pub const fn save_config(&self) -> SaveConfigMeta {
+        self.save_config
+    }
+
+    /// The non-blocking note describing how this session's loaded config
+    /// differs from `current`, or `None` when they match or the world carries
+    /// no config record (v1-v8).
+    ///
+    /// Pure read: unlike [`Self::take_config_notice`] it does not consume the
+    /// record, so a caller that only wants to display the note must use
+    /// `take_config_notice` to preserve the one-shot contract.
+    pub fn config_notice(&self, current: SaveConfigMeta) -> Option<String> {
+        self.saved_config
+            .and_then(|saved| config_notice_for(saved, current))
+    }
+
+    /// Takes the pending config notice, if any.
+    ///
+    /// The loaded record is consumed even when the metas match, so a notice is
+    /// presented at most once per session and a later tuning edit can never
+    /// re-warn after the player has already been told (or told nothing
+    /// because the config matched).
+    pub fn take_config_notice(&mut self, current: SaveConfigMeta) -> Option<String> {
+        let saved = self.saved_config.take()?;
+        config_notice_for(saved, current)
+    }
+
     /// The position of the crafting table whose interface is open, if any.
     ///
     /// Read-only accessor: validity is re-established by
@@ -2129,6 +2217,154 @@ mod tests {
         assert_eq!(session.camera.position, camera_position);
         assert_eq!(session.camera.yaw, camera_yaw);
         assert_eq!(session.camera.pitch, camera_pitch);
+    }
+
+    fn config_meta(schema: u16, digest: u64) -> SaveConfigMeta {
+        SaveConfigMeta { schema, digest }
+    }
+
+    #[test]
+    fn config_notice_matrix_and_one_shot() {
+        let current = config_meta(1, 0xAAAA);
+        let mut session = WorldSession::new_session(
+            22u32,
+            PathBuf::from("/tmp/config-notice.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+
+        // Pin the exact player-facing strings, not just the enum of outcomes.
+        assert_eq!(
+            CONFIG_CHANGED_NOTICE,
+            "config changed since this world was saved"
+        );
+        assert_eq!(
+            CONFIG_SCHEMA_CHANGED_NOTICE,
+            "config schema changed since this world was saved"
+        );
+
+        // Row 1: saved None (fresh session or v1-v8 payload) is silent.
+        assert_eq!(session.config_notice(current), None);
+        assert_eq!(session.take_config_notice(current), None);
+
+        // Row 2: same schema and digest is silent, but `take` still consumes.
+        session.saved_config = Some(current);
+        assert_eq!(session.config_notice(current), None);
+        assert_eq!(session.take_config_notice(current), None);
+        assert!(session.saved_config.is_none());
+        // A silent matching take must not leave a record that a later tuning
+        // edit could turn into a warning.
+        assert_eq!(session.take_config_notice(config_meta(2, 0xBBBB)), None);
+
+        // Row 3: same schema, different digest -> changed-config notice once.
+        session.saved_config = Some(config_meta(1, 0xBBBB));
+        assert_eq!(
+            session.config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(
+            session.take_config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(current), None);
+
+        // Row 4: different schema (any digest) -> schema notice, and the
+        // schema mismatch wins even when the digest looks unchanged.
+        session.saved_config = Some(config_meta(0, 0xAAAA));
+        assert_eq!(
+            session.config_notice(config_meta(1, 0xAAAA)),
+            Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(
+            session.take_config_notice(config_meta(1, 0xAAAA)),
+            Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(config_meta(1, 0xAAAA)), None);
+    }
+
+    #[test]
+    fn from_loaded_world_carries_saved_config() {
+        let saved = config_meta(1, 0x1234);
+        let current = config_meta(1, 0x5678);
+        let mut session = WorldSession::from_loaded_world(
+            LoadedWorld {
+                data: make_save(23u32),
+                registry: ContentRegistry::builtin().clone(),
+                saved_content: None,
+                saved_config: Some(saved),
+                unresolved: 0,
+            },
+            PathBuf::from("/tmp/v9-config.mcvx"),
+        );
+
+        assert_eq!(
+            session.config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        // The loaded world's record is a load-time fact, not the meta a fresh
+        // save would write; `apply_config` installs the running meta.
+        assert_eq!(session.save_config(), ConfigRuntime::defaults().meta());
+        assert_eq!(
+            session.take_config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(current), None);
+    }
+
+    #[test]
+    fn apply_config_sets_rules_and_save_meta() {
+        let mut session = WorldSession::new_session(
+            24u32,
+            PathBuf::from("/tmp/apply-config.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let meta = config_meta(4, 0xDEAD_BEEF);
+        let rules = RulesBundle {
+            movement: MovementRules {
+                walk_speed: 9.0,
+                jump_velocity: 12.0,
+                ..MovementRules::default()
+            },
+            camera: CameraRules {
+                z_near: 0.25,
+                z_far: 512.0,
+            },
+        };
+
+        session.apply_config(&rules, meta);
+
+        assert_eq!(session.player.movement, rules.movement);
+        assert_eq!(session.camera.z_near, 0.25);
+        assert_eq!(session.camera.z_far, 512.0);
+        assert_eq!(session.save_config(), meta);
+    }
+
+    #[test]
+    fn fresh_session_writes_defaults_meta() {
+        let defaults = ConfigRuntime::defaults().meta();
+        let registry = ContentRegistry::builtin_arc();
+
+        let session = WorldSession::new_session_with_mode_and_registry(
+            25u32,
+            PathBuf::from("/tmp/fresh-meta.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        assert_eq!(session.save_config(), defaults);
+        assert!(session.saved_config.is_none());
+        assert_eq!(session.config_notice(defaults), None);
+
+        let editor = WorldSession::new_at_with_registry(
+            25u32,
+            PathBuf::from("/tmp/editor-meta.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.0, 20.0, 2.0),
+            GameClock::new(),
+            registry,
+        );
+        assert_eq!(editor.save_config(), defaults);
+        assert!(editor.saved_config.is_none());
+        assert_eq!(editor.config_notice(defaults), None);
     }
 
     #[test]
@@ -7435,6 +7671,7 @@ mod tests {
             make_save(7),
             PathBuf::from("/tmp/save-rules.mcvx"),
             Arc::clone(&registry),
+            None,
             None,
         );
         assert_eq!(
