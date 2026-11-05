@@ -424,6 +424,37 @@ The exit code is `0` when there are no errors (warnings still pass) and `1` when
 - If an enabled pack folder is deleted or renamed, the game keeps running with the remaining packs and shows a warning naming the missing pack. The missing row stays in the stack, so restoring the folder makes it apply again.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
 
+## Live texture reload (dev builds)
+
+Development builds watch the active pack stack while the game is running, so you can tune artwork without relaunching. The watcher checks the files about every 100 ms (ten times per second) and applies an edit only after the file has stayed unchanged for 250 ms; an editor's atomic save or a burst of saves therefore becomes one apply. Release builds have no file watcher: a direct file edit appears on the next launch or after a Packs action.
+
+**Applies live**
+
+- The 25 block textures and 13 mob textures listed above. A fixed-name file that was missing from a loaded pack can be created later and immediately replaces that layer. When the edited pack is the visible author of the layer, only that one texture-array layer is re-uploaded.
+- The block-face images that a `format_version = 2` stack loaded and allocated when it was applied. Each image keeps its allocated layer index and only its bytes are replaced, so the live path can never move allocation.
+- Deleting one of the 38 fixed-name files is live too: the layer falls back to the next pack in the stack that authors it, or to the built-in procedural art when no pack does.
+- A corrupt, non-square, or out-of-range PNG (outside 16 to 256 pixels per side) is rejected. The layer keeps its last good image and the game shows one message naming the file and reason; a valid edit settling in the same poll still applies.
+
+**Applies when the world is loaded again**
+
+Editing `pack.toml` is compared against the content identity captured when the stack was applied. An edit that moves content — blocks, items, tiers, tools, recipes, worldgen, or the block-face/icon allocation that follows from them — sets `restart required: <folder>: content changed; restart to apply` in the F6 overlay and shows the same reason on its `packs:` line. The Packs screen and a transient notice add `content changes apply when the world is loaded again`. No live layer index moves and no layer is re-uploaded. Quit and relaunch the game, then load the same save, to use the new registry. Editing the manifest back to the installed content clears the requirement.
+
+**Not live-texture-reloaded**
+
+- Pack item and tool icons are part of the world session's frozen content registry. The live watcher does not re-upload them; a Packs action captures new icon art for the next world session.
+- A manifest's `logo` and `overlay_tint` apply when you toggle or reorder packs on the Packs screen (or relaunch), not from a direct manifest edit.
+- Sounds also apply on a Packs action, not from a watched file edit.
+
+In a development build, the F6 creator overlay reports the last pack outcome on its `packs:` line. Launching with `--creator-trace` prints one stable line for each applied texture, each rejected edit, and each manifest edit that raises a restart requirement:
+
+```text
+creator: texture applied path=packs/my-first-pack/stone.png layer=3 digest=0x0123456789abcdef
+creator: texture rejected path=packs/my-first-pack/stone.png reason=failed to decode PNG
+creator: restart-required reason=my-first-pack: content changed; restart to apply
+```
+
+Release builds contain no pack watcher, no creator overlay, and no trace output.
+
 ## Packs screen
 
 The dedicated **Packs** screen lists enabled packs first in stack order, then every remaining pack folder alphabetically, greyed out and disabled. Click a row to toggle that pack: disabling removes it from the stack, enabling appends it at the end. Enabled rows carry `^` and `v` actions at the right edge to move one step up or down the stack, so the last enabled pack wins. **Escape** or the **Back** row leaves the screen. A pack folder that no longer exists stays listed and marked `(missing)` while it is in the stack, so restoring the folder makes it apply again without re-adding it.

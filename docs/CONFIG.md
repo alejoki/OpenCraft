@@ -130,9 +130,13 @@ to equal the default. Each file header also shows that file's apply mode
 
 The overlay header shows the live digest, schema version, file count, files
 with a write still settling, and warning and error counts, followed by the
-last reload status. When an active restart requirement exists, a
-`restart required:` line names the reason. For a file with errors, the overlay
-shows the first error and a count of any additional errors.
+last reload status. When a settled pack edit has an outcome to report, a
+`packs: <status>` line follows the last reload status; it shows the last
+applied texture path or the rejected file and reason. When an active restart
+requirement exists, a `restart required:` line names the reason; besides a
+config reason, it can name a pack-content change such as
+`my-first-pack: content changed; restart to apply`. For a file with errors,
+the overlay shows the first error and a count of any additional errors.
 
 A rejected edit also produces a transient in-game message shaped
 `config/<file>: <key>: <reason>`, for example
