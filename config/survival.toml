@@ -1,0 +1,27 @@
+# OpenCraft creator configuration: survival, health, hunger, and eating.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[survival]
+fall_safe_blocks = 3.0
+air_drain_per_sec = 20.0
+drown_interval_secs = 1.0
+drown_damage = 2
+hunger_drain_secs = 30.0
+starve_interval_secs = 4.0
+starve_damage = 1
+regen_hunger_threshold = 18
+regen_interval_secs = 4.0
+regen_hunger_cost = 1
+
+[eating]
+eat_duration_secs = 1.6
+apple_hunger = 4
+bread_hunger = 6
+raw_meat_hunger = 3
+rotten_flesh_hunger = 1

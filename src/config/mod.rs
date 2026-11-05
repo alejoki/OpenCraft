@@ -816,6 +816,29 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_config_tree_is_complete_and_default() {
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CONFIG_DIR);
+        let runtime = ConfigRuntime::load_dir(&config_dir);
+
+        assert_eq!(REGISTRY.len(), 85);
+        assert!(
+            runtime.diagnostics().is_empty(),
+            "checked-in config tree must load without diagnostics: {:?}",
+            runtime.diagnostics()
+        );
+        assert_eq!(runtime.digest(), ConfigRuntime::defaults().digest());
+        for row in REGISTRY {
+            assert_eq!(runtime.value(row.key), row.default, "{}", row.key);
+            assert_eq!(
+                runtime.origin(row.key),
+                ValueOrigin::File(row.file),
+                "{}",
+                row.key
+            );
+        }
+    }
+
+    #[test]
     fn default_digest_is_pinned_and_stable() {
         let first = ConfigRuntime::defaults();
         let second = ConfigRuntime::defaults();

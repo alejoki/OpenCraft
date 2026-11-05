@@ -1,0 +1,16 @@
+# OpenCraft creator configuration: mining tools and block interaction.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[tools]
+wood_speed_multiplier = 2
+stone_speed_multiplier = 4
+iron_speed_multiplier = 6
+
+[interaction]
+table_reach = 8.0

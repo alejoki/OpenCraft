@@ -1247,6 +1247,41 @@ mod tests {
     }
 
     #[test]
+    fn docs_table_matches_config_md() {
+        const BEGIN: &str = "<!-- BEGIN CONFIG REGISTRY -->";
+        const END: &str = "<!-- END CONFIG REGISTRY -->";
+        let doc = include_str!("../../docs/CONFIG.md");
+
+        assert_eq!(
+            doc.matches(BEGIN).count(),
+            1,
+            "begin marker must appear once"
+        );
+        assert_eq!(doc.matches(END).count(), 1, "end marker must appear once");
+
+        let after_begin = doc.split_once(BEGIN).expect("begin marker").1;
+        let (block, _after_end) = after_begin.split_once(END).expect("end marker");
+
+        let block = block.trim_matches('\n');
+        let expected = docs_table();
+        assert_eq!(block, expected.trim_matches('\n'));
+
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(
+            lines.len(),
+            REGISTRY.len() + 2,
+            "header, separator, 85 rows"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("| config/"))
+                .count(),
+            85
+        );
+    }
+
+    #[test]
     fn index_of_finds_known_keys_and_rejects_unknown_ones() {
         assert_eq!(index_of("movement.walk_speed"), Some(0));
         assert_eq!(index_of("camera.z_far"), Some(15));
