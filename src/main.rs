@@ -15,7 +15,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
 use opencraft::config::watch::{self, CreatorRuntime};
-use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle};
+use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle, SaveConfigMeta};
 use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
 use opencraft::content::{
@@ -109,9 +109,10 @@ use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropRepor
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
 use opencraft::world::persistence::{
-    load_world_from_path, load_world_from_path_with, save_world_to_path_with, ChunkEditMap,
-    CliConfig, PersistenceError, SavedMob, SavedPlayerState, WorldSaveData,
-    DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    load_world_from_path, load_world_from_path_with, save_world_to_path_with,
+    save_world_to_path_with_config, ChunkEditMap, CliConfig, PersistenceError, SavedMob,
+    SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
+    DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -345,11 +346,36 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
-    let result = save_world_to_path_with(&session.save_path, &data, session.registry.as_ref());
+    // S04: the one production save site writes the session's validated
+    // effective config meta (schema + digest), never a re-derived or default
+    // one. The meta is captured at every startup/install/apply seam.
+    let result = save_world_to_path_with_config(
+        &session.save_path,
+        &data,
+        session.registry.as_ref(),
+        session.save_config(),
+    );
     if result.is_ok() {
         session.world.mark_saved();
     }
     result
+}
+
+/// Join the two one-shot session notices into the single transient gameplay
+/// message channel.
+///
+/// The content notice (changed pack stack) is ordered first and the config
+/// notice (changed tuning/schema) last, separated by the existing `"; "` used
+/// for stacked messages. Either side may be absent; both absent stays silent.
+/// Taking the notices is the caller's job (startup seeding and
+/// `on_session_installed`), so this helper is pure and never re-derives them.
+fn joined_session_notices(content: Option<String>, config: Option<String>) -> Option<String> {
+    match (content, config) {
+        (Some(content), Some(config)) => Some(format!("{content}; {config}")),
+        (Some(content), None) => Some(content),
+        (None, Some(config)) => Some(config),
+        (None, None) => None,
+    }
 }
 
 /// Why a mining break produced no world edit, and therefore no wear and no
@@ -1837,7 +1863,7 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
     startup_session_with(
         cli,
         &ContentRegistry::builtin_arc(),
-        &RulesBundle::default(),
+        &ConfigRuntime::defaults(),
     )
 }
 
@@ -1846,13 +1872,16 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
 /// The load branch keeps the placeholder-augmented registry and the one-shot
 /// changed-stack notice; the fresh branch freezes the supplied registry on the
 /// new session. [`startup_session`] is the built-in wrapper every existing
-/// test and demo launch uses. `rules` is the effective gameplay tuning loaded
-/// from `config/` (M014/S01) and is applied to both branches.
+/// test and demo launch uses. `config` is the effective gameplay tuning loaded
+/// from `config/` (M014/S01); both branches record its rules and its validated
+/// save meta (M014/S04) so the next save and the one-shot notice agree.
 fn startup_session_with(
     cli: &CliConfig,
     registry: &Arc<ContentRegistry>,
-    rules: &RulesBundle,
+    config: &ConfigRuntime,
 ) -> WorldSession {
+    let rules: RulesBundle = config.rules();
+    let meta: SaveConfigMeta = config.meta();
     if !cli.force_new_world && cli.save_path.exists() {
         if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
             let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
@@ -1873,7 +1902,7 @@ fn startup_session_with(
                 // session must still start closed for the scripted run.
                 session.set_hostile_ai_enabled(false);
             }
-            session.apply_rules(rules);
+            session.apply_config(&rules, meta);
             return session;
         }
     }
@@ -1926,7 +1955,7 @@ fn startup_session_with(
             arm_swim_route(&mut session, route);
         }
     }
-    session.apply_rules(rules);
+    session.apply_config(&rules, meta);
     session
 }
 
@@ -8611,8 +8640,11 @@ impl GameApp {
         // re-applied on every session install (the S02 live-reload seam).
         // Production already applied them in `startup_session_with`; doing it
         // again here is idempotent and keeps injected sessions (tests) tuned
-        // by the same app-wide config.
-        session.apply_rules(&config.rules());
+        // by the same app-wide config. S04: the same call records the
+        // validated save meta, so the next save and the one-shot notice use
+        // exactly the effective values this app runs.
+        let config_meta: SaveConfigMeta = config.meta();
+        session.apply_config(&config.rules(), config_meta);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8756,6 +8788,14 @@ impl GameApp {
         } else {
             None
         };
+        // S04: the config notice rides the same one-shot channel and is seeded
+        // once, under the same direct-to-gameplay rule (D193). The two notices
+        // are joined content-first into the single `game_message` slot.
+        let startup_config_notice = if startup_screen == LifecycleScreen::Playing {
+            session.take_config_notice(config_meta)
+        } else {
+            None
+        };
         // Dev-only creator state (M014/S02-T05): the watcher starts at this
         // instant, and the launch flag is captured before `cli` is consumed by
         // the field initializers below.
@@ -8796,10 +8836,11 @@ impl GameApp {
             chest_status: None,
             palette: PaletteScreen::new(),
             palette_status: None,
-            game_message: startup_content_notice.map(|text| MenuMessage {
-                text,
-                ticks_left: menu::MESSAGE_TICKS,
-            }),
+            game_message: joined_session_notices(startup_content_notice, startup_config_notice)
+                .map(|text| MenuMessage {
+                    text,
+                    ticks_left: menu::MESSAGE_TICKS,
+                }),
             selection_label: SelectionLabel::new(),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
@@ -8880,7 +8921,8 @@ impl GameApp {
     /// frame accounting for what is only a tuning change.
     fn apply_config_rules(&mut self) {
         let rules = self.config.rules();
-        self.session.apply_rules(&rules);
+        let meta = self.config.meta();
+        self.session.apply_config(&rules, meta);
     }
 
     /// One creator poll: observe every curated file, then reload the files
@@ -9777,14 +9819,18 @@ impl GameApp {
         // The installed session owns the registry every save names content
         // through: a loaded world keeps its placeholder-augmented registry, a
         // fresh world the base it was built from (MEM512/D181). Its one-shot
-        // changed-stack notice becomes the existing transient notice.
+        // changed-stack notice and its one-shot config notice share the single
+        // transient message channel; both are taken here (content first) and
+        // never re-derived per frame.
         self.session_registry = Arc::clone(&self.session.registry);
-        if let Some(text) = self.session.take_content_notice() {
-            self.game_message = Some(MenuMessage {
+        let config_meta = self.config.meta();
+        let content_notice = self.session.take_content_notice();
+        let config_notice = self.session.take_config_notice(config_meta);
+        self.game_message =
+            joined_session_notices(content_notice, config_notice).map(|text| MenuMessage {
                 text,
                 ticks_left: menu::MESSAGE_TICKS,
             });
-        }
         self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
@@ -9851,6 +9897,9 @@ impl GameApp {
             // edit session must not surface the changed-stack note either. The
             // placeholders still render, keeping the scene readable.
             session.take_content_notice();
+            // The config notice is likewise a playable-world channel only: a
+            // creator tuning change must never nag from the menu editor.
+            session.take_config_notice(self.config.meta());
             session
         } else {
             let position = self.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
@@ -15147,7 +15196,7 @@ fn main() {
         Path::new(pack::PACKS_DIR).to_path_buf(),
         Some(Path::new(opencraft::config::CONFIG_DIR)),
     );
-    let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+    let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -15172,7 +15221,7 @@ mod tests {
     use super::*;
     use opencraft::audio::default_buffers;
     use opencraft::config::watch::ReloadStatus;
-    use opencraft::config::{ConfigSeverity, ValueOrigin};
+    use opencraft::config::{ConfigSeverity, ValueOrigin, CONFIG_SCHEMA_VERSION};
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
@@ -32817,7 +32866,7 @@ stack = 64
         let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
 
         let cli = CliConfig::parse_args(["--save", path_str]);
-        let mut loaded = startup_session_with(&cli, &registry, &RulesBundle::default());
+        let mut loaded = startup_session_with(&cli, &registry, &ConfigRuntime::defaults());
         assert_eq!(
             loaded
                 .registry
@@ -32839,7 +32888,7 @@ stack = 64
         let mut builtin = startup_session_with(
             &cli,
             &ContentRegistry::builtin_arc(),
-            &RulesBundle::default(),
+            &ConfigRuntime::defaults(),
         );
         assert_eq!(
             builtin
@@ -32863,7 +32912,7 @@ stack = 64
         let fresh = startup_session_with(
             &CliConfig::parse_args(["--new", "--seed", "9", "--save", path_str]),
             &registry,
-            &RulesBundle::default(),
+            &ConfigRuntime::defaults(),
         );
         assert!(Arc::ptr_eq(&fresh.registry, &registry));
     }
@@ -32941,8 +32990,7 @@ stack = 64
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
 
-        let mut session =
-            startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let mut session = startup_session_with(&cli, &content.base_registry, &content.config);
         assert_eq!(session.player.movement.walk_speed, 6.0);
         assert_eq!(session.camera.z_far, 800.0);
         let fast = one_second_walk_displacement(&mut session);
@@ -32953,7 +33001,7 @@ stack = 64
 
         // The same launch with default rules keeps today's 4.6 blocks/s.
         let mut default_session =
-            startup_session_with(&cli, &content.base_registry, &RulesBundle::default());
+            startup_session_with(&cli, &content.base_registry, &ConfigRuntime::defaults());
         let normal = one_second_walk_displacement(&mut default_session);
         assert!(
             (normal - 4.6).abs() < 0.2,
@@ -32985,7 +33033,7 @@ stack = 64
         let save_path = dir.path().join("fallback.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
-        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
         assert_eq!(session.player.movement.walk_speed, 4.6);
     }
 
@@ -33022,8 +33070,10 @@ stack = 64
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
         // Start from a default-rules session so the app's apply is observable.
-        let session = startup_session_with(&cli, &content.base_registry, &RulesBundle::default());
+        let session =
+            startup_session_with(&cli, &content.base_registry, &ConfigRuntime::defaults());
         assert_eq!(session.player.movement.walk_speed, 4.6);
+        let config_meta = content.config.meta();
 
         let mut app = GameApp::new_with_content(
             cli.clone(),
@@ -33033,15 +33083,280 @@ stack = 64
         );
         assert_eq!(app.session.player.movement.walk_speed, 6.0);
         assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(
+            app.session.save_config(),
+            config_meta,
+            "the app records the effective config meta for the next save"
+        );
 
-        // A session swap re-applies the app-wide rules (the S02 seam).
+        // A session swap re-applies the app-wide rules and save meta (S02/S04).
         let registry = Arc::clone(&app.base_registry);
-        let fresh = startup_session_with(&cli, &registry, &RulesBundle::default());
+        let fresh = startup_session_with(&cli, &registry, &ConfigRuntime::defaults());
         assert_eq!(fresh.player.movement.walk_speed, 4.6);
+        assert_eq!(fresh.save_config(), ConfigRuntime::defaults().meta());
         app.session = fresh;
         app.on_session_installed();
         assert_eq!(app.session.player.movement.walk_speed, 6.0);
         assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(app.session.save_config(), config_meta);
+    }
+
+    #[test]
+    fn joined_session_notices_orders_content_then_config() {
+        assert_eq!(
+            joined_session_notices(
+                Some("content changed".to_string()),
+                Some("config changed".to_string())
+            ),
+            Some("content changed; config changed".to_string()),
+            "content comes first, separated by the established `; `"
+        );
+        assert_eq!(
+            joined_session_notices(Some("content changed".to_string()), None),
+            Some("content changed".to_string()),
+            "a lone content notice is unchanged"
+        );
+        assert_eq!(
+            joined_session_notices(None, Some("config changed".to_string())),
+            Some("config changed".to_string()),
+            "a lone config notice is unchanged"
+        );
+        assert_eq!(
+            joined_session_notices(None, None),
+            None,
+            "silence stays silent"
+        );
+    }
+
+    #[test]
+    fn startup_config_notice_is_one_shot_and_non_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0xDEAD_BEEF_DEAD_BEEF,
+        };
+        assert_ne!(
+            saved.digest,
+            content.config.meta().digest,
+            "the fixture must describe a changed effective config"
+        );
+        let changed_path = dir.path().join("changed-config.mcvx");
+        save_world_to_path_with_config(
+            &changed_path,
+            &sample_save(41),
+            ContentRegistry::builtin(),
+            saved,
+        )
+        .expect("write the changed-config save");
+
+        let cli = CliConfig::parse_args(["--save", changed_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("a changed config must surface one notice");
+        assert_eq!(message.text, "config changed since this world was saved");
+        assert!(!app.session.is_dead(), "the world stays playable");
+
+        app.on_session_installed();
+        assert!(
+            app.game_message.is_none(),
+            "the startup notice is one-shot, not re-derived on install"
+        );
+
+        // A save written under the running effective config is silent.
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let matching_path = dir.path().join("matching-config.mcvx");
+        save_world_to_path_with_config(
+            &matching_path,
+            &sample_save(42),
+            ContentRegistry::builtin(),
+            content.config.meta(),
+        )
+        .expect("write the matching-config save");
+        let cli = CliConfig::parse_args(["--save", matching_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.game_message.is_none(),
+            "a save from the same effective config is silent"
+        );
+    }
+
+    #[test]
+    fn startup_v8_save_is_silent_about_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v8-baseline.mcvx");
+        std::fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/saves/v8-baseline.mcvx"),
+        )
+        .expect("write the frozen v8 fixture");
+
+        // A creator-config launch over the frozen v8 save must not invent a
+        // config notice: v1-v8 carry no config meta, so this is the silent
+        // migration leg of the slice acceptance.
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let cli = CliConfig::parse_args(["--save", path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.game_message.is_none(),
+            "a v8 save carries no config meta and must stay silent"
+        );
+        assert!(
+            !app.session.is_dead(),
+            "the migrated v8 world remains playable"
+        );
+    }
+
+    #[test]
+    fn startup_notice_joins_content_and_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-config.mcvx");
+        let registry = main_ruby_registry();
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0x0123_4567_89AB_CDEF,
+        };
+        save_world_to_path_with_config(&path, &modded_sample_save(33), registry.as_ref(), saved)
+            .expect("write the modded save");
+
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        assert_ne!(saved.digest, content.config.meta().digest);
+        let cli = CliConfig::parse_args(["--save", path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("both one-shot notices must share one message");
+        assert!(
+            message.text.contains("missing pack `mymod-ruby`"),
+            "the content notice comes first: {}",
+            message.text
+        );
+        assert!(
+            message
+                .text
+                .ends_with("; config changed since this world was saved"),
+            "the config notice is joined last: {}",
+            message.text
+        );
+        assert_eq!(
+            message
+                .text
+                .matches("config changed since this world was saved")
+                .count(),
+            1,
+            "exactly one config notice: {}",
+            message.text
+        );
+    }
+
+    #[test]
+    fn background_edit_discards_config_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0xDEAD_BEEF_DEAD_BEEF,
+        };
+        save_world_to_path_with_config(
+            &background_path,
+            &sample_save(777),
+            ContentRegistry::builtin(),
+            saved,
+        )
+        .expect("write the background save");
+
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        assert_ne!(saved.digest, content.config.meta().digest);
+        let session = WorldSession::new_session(
+            1,
+            PathBuf::from("/nonexistent/initial.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let mut app = GameApp::new_with_content(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            content,
+            background_path,
+        );
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.background.persisted);
+        assert!(app.main_menu_message.is_none());
+        assert!(app.begin_background_edit(), "enters the editor");
+        assert!(
+            app.game_message.is_none(),
+            "the background editor must discard the config notice (D179)"
+        );
+        assert!(
+            app.main_menu_message.is_none(),
+            "entering the editor must not nag on the menu either"
+        );
+    }
+
+    #[test]
+    fn save_current_world_writes_the_current_config_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("current-meta.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        let expected = app.config.meta();
+        assert_eq!(app.session.save_config(), expected);
+
+        save_current_world(&mut app.session).expect("the production save site writes");
+
+        let bytes = std::fs::read(&save_path).expect("read the saved world");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("the version word")),
+            9,
+            "the production save site writes v9"
+        );
+        let loaded = load_world_from_path_with(&save_path, ContentRegistry::builtin())
+            .expect("the v9 save loads");
+        assert_eq!(
+            loaded.saved_config,
+            Some(expected),
+            "the save carries the running effective config meta"
+        );
     }
 
     #[test]
@@ -33101,7 +33416,7 @@ stack = 64
         let save_path = dir.join("creator.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
-        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
         GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
     }
 
@@ -33428,7 +33743,7 @@ stack = 64
         let session = startup_session_with(
             &cli,
             &ContentRegistry::builtin_arc(),
-            &RulesBundle::default(),
+            &ConfigRuntime::defaults(),
         );
         let mut app = GameApp::new_with_paths(
             cli,
@@ -33548,7 +33863,7 @@ stack = 64
             dir.path().join("packs"),
             Some(&config_dir),
         );
-        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
         let traced =
             GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
         assert!(
@@ -33756,7 +34071,7 @@ stack = 64
         let save_path = dir.join("pack-app.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
-        let session = startup_session_with(&cli, &content.base_registry, &content.config.rules());
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
         GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
     }
 
