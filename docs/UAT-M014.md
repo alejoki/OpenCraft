@@ -1,6 +1,7 @@
 # M014 human UAT runbook — creator tuning and live content reload
 
 **Status: NEEDS-HUMAN — no owner verdict recorded.**
+**UAT mode: human-experience** — automated PASS may coexist with human-only NEEDS-HUMAN checks.
 
 M014's remaining acceptance surface is human-sensory: whether live tuning feels responsive
 across all five gameplay domains, whether block/mob/built-in item art is actually visible,
@@ -24,14 +25,20 @@ human PASS**.
 | --- | --- |
 | Build commands | `cargo build --locked` (debug) and `cargo build --locked --release` |
 | Debug binary | `target/debug/opencraft` |
-| Debug SHA-256 | `<fill: sha256sum target/debug/opencraft at run time>` |
+| Debug SHA-256 | `7ab1f9d7d8635325e48c13490e36c7a891ee4748a13035567511711de09a1b4d` |
 | Release binary | `target/release/opencraft` |
-| Release SHA-256 | `<fill: sha256sum target/release/opencraft at run time>` |
-| Revision under test | `<fill: git rev-parse HEAD>` |
+| Release SHA-256 | `1cf99d9c4829236f8c86b50d8d1363ef460a46528b60d51062ada64dd8718bc6` |
+| Revision under test | `a76fce6d1aa6361dcc8bac8d7cf8162d1c4e5c16` |
 | Pack stack under test | `creator-uat` (the `mymod-ruby` fixture plus live art and a `[builtin_icons]` entry) |
 | Config tree under test | A byte copy of the checked-in `config/` |
 | Host / display | `<fill: desktop, compositor, Wayland/XWayland, output resolution>` |
 | Capture tool | `<fill: e.g. spectacle -b -n -a -o FILE, or the host's screenshot tool>` |
+
+The Debug SHA-256, Release SHA-256, and Revision values describe the S10 closure tree: the
+binaries were rebuilt from `git rev-parse HEAD` = `a76fce6d1aa6361dcc8bac8d7cf8162d1c4e5c16`,
+and the only changes on top of that revision are this runbook and the S10 docs/scripts edits,
+which do not alter either binary. Rebuild both profiles and re-check these values before
+signing if the source tree changes.
 
 Run every command from the repository checkout unless a step says otherwise. The scratch
 directory keeps the real `saves/`, `settings.toml`, `packs/`, and `config/` untouched.
@@ -125,8 +132,9 @@ Record exactly one verdict per item, `PASS` or `FAIL`, in the owner verdict bloc
 
 ### 1. Debug startup and the creator overlay
 
-From `$UAT_DIR/creator`, launch a real window in Survival. Session A is used for the
-Survival and combat rows in item 2 and the invalid-edit pass in item 3:
+From `$UAT_DIR/creator`, launch a real window in Survival. Session A (Survival) judges item 1
+and only the Survival and combat rows of item 2. Session B (Creative) judges the remaining
+item-2 domains plus items 3-7 and 9-10:
 
 ```sh
 "$GAME" --new --survival --save "$UAT_DIR/creator/domains.mcvx"
@@ -156,7 +164,7 @@ session B running for items 3-7 and 9-10.
 Restore both files to their defaults and confirm the behavior returns, then quit session A
 (Save and Quit or close the window).
 
-**Session B (Creative, for the texture and recipe pass)**
+**Session B (Creative, for the remaining item-2 domains and items 3-7 and 9-10)**
 
 ```sh
 cd "$UAT_DIR/creator"
@@ -168,8 +176,14 @@ cd "$UAT_DIR/creator"
 | Player movement | `config/player.toml` | `movement.walk_speed` | 4.6 → 8.0 | Walking is clearly faster |
 | Player camera | `config/player.toml` | `camera.z_far` | 1200.0 → 512.0 | Distant terrain clips/fades closer |
 | World | `config/world.toml` | `clock.day_seconds` | 1200.0 → 120.0 | Sky and clock advance about ten times faster |
-| Mining | `config/mining.toml` | `tools.wood_speed_multiplier` | 2 → 16 | With a Wooden Pickaxe granted from the Creative palette (**C**), Stone breaks much faster |
+| Mining | `config/mining.toml` | `tools.wood_speed_multiplier`, `tools.stone_speed_multiplier`, `tools.iron_speed_multiplier` | 2/4/6 → 16/20/24 | With a Wooden Pickaxe granted from the Creative palette (**C**), Stone breaks much faster |
 | Render/UI | `config/render.toml` | `ui.selected_name_secs` | 2.0 → 10.0 | The selected-item name strip lingers |
+
+The three mining multipliers are validated as one cross-field invariant:
+`tools.wood_speed_multiplier <= tools.stone_speed_multiplier <= tools.iron_speed_multiplier`.
+Editing only wood to 16 while stone stays 4 rejects the whole file with
+`error: config/mining.toml: tools.stone_speed_multiplier: tool speed multipliers must satisfy ...`;
+edit all three together, and restore all three to 2/4/6 afterwards.
 
 Every edit should apply within about a second after the file settles; the overlay's `last:`
 line and the affected section should update, and the game must keep running. Restore each
@@ -240,7 +254,8 @@ PY
 ```
 
 Expected: within about a second the Stone blocks, the Pig body, and the Apple icon change
-color live, and the overlay's `packs:` line reports the applied files. Then write junk bytes
+color live, and the overlay's `packs:` line shows the most recently applied file (one line,
+latest status), not a list of every applied file. Then write junk bytes
 to `stone.png` (`printf 'not a png' > .../stone.png`). Expected: one rejected outcome
 naming `packs/creator-uat/stone.png` and a reason, the layer keeps the last good yellow
 image, the game stays playable, and no panic or freeze occurs. Suggested evidence:
@@ -428,11 +443,18 @@ The following are useful pre-checks but **must not** be copied into the owner ve
 human PASS:
 
 - `bash scripts/creator_smoke.sh` and `SMOKE_PROFILE=release bash scripts/creator_smoke.sh`
-  prove the executable legs in isolated temp cwds (config check/apply/reject, live block and
-  mob and built-in item textures, restart-required plus same-save restart, v8-to-v9, release
-  rejection and bounded launch).
-- `cargo test --locked` covers the config registry/loader/watcher, pack reload, save v9, and
-  the real-binary CLI contracts.
+  prove the executable legs in isolated temp cwds: the six-file all-domain live config apply,
+  the one-shot v8/v9 `config changed since this world was saved` mismatch, config
+  check/apply/reject, live block and mob and built-in item textures, restart-required plus
+  same-save restart, v8-to-v9, and release rejection plus bounded launch.
+- `cargo clippy --locked --all-targets -- -D warnings` is the R081 lint half; `cargo test
+  --locked` covers the config registry/loader/watcher, pack reload, save v9, and the
+  real-binary CLI contracts.
+- `python3 scripts/verify_m014_uat.py` checks the durable UAT package: runbook structure (11
+  checklist items, 11 owner verdict rows, all three mining multipliers), the `creator-uat`
+  fixture preflight (default and six-edit digests, 13-entry `--validate-pack`, invalid-mining
+  rejection), and release rejection with no startup side effects. It prints
+  `M014 UAT PACKAGE PASS (human pass pending)` until a dated owner verdict is recorded.
 - The existing slice UAT records under `.gsd/phases/14-creator-tuning-and-live-content-reload/`
   carry the per-slice executable evidence.
 
