@@ -2,11 +2,12 @@
 //!
 //! The config watcher has a compile-time list of six files; the pack watcher
 //! has a dynamic list built from the frozen [`PackPresentation`]: every stack
-//! manifest, the 25 block and 13 mob fixed names, and one already-allocated
-//! v2 block-face asset per frozen slot. Nothing here touches the GPU, decodes
-//! a PNG, or reads the filesystem: callers feed in fingerprints and react to
-//! the settled indices. That keeps allocation frozen — a settled entry can
-//! only rewrite an index that was recorded at build time.
+//! manifest, the 25 block and 13 mob fixed names, one already-allocated v2
+//! block-face asset per frozen slot, and one authored `[builtin_icons]` PNG
+//! per override name. Nothing here touches the GPU, decodes a PNG, or reads
+//! the filesystem: callers feed in fingerprints and react to the settled
+//! indices. That keeps allocation frozen — a settled entry can only rewrite an
+//! index that was recorded at build time.
 //!
 //! Paths are recorded as `packs_root/folder/relative`, while `display` is
 //! always the pack-relative `packs/<folder>/<relative>` spelling used by the
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::watch::{CONFIG_POLL_INTERVAL, CONFIG_SETTLE_INTERVAL};
+use crate::content::names;
 use crate::pack::presentation::PackPresentation;
 use crate::pack::{LAYER_FILES, MOB_LAYER_FILES, PACKS_DIR};
 use crate::render::texture::MOB_LAYER_BASE;
@@ -29,7 +31,8 @@ const MANIFEST_FILE: &str = "pack.toml";
 ///
 /// `BaseLayer` uses the fixed texture-array index (`0..=24`, `32..=44`).
 /// `Asset` uses the frozen pack-layer slot, whose GPU layer is
-/// `PACK_LAYER_BASE + slot`.
+/// `PACK_LAYER_BASE + slot`. `BuiltinIcon` names the pinned procedural item
+/// sprite layer and never consumes block-layer allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackFileKind {
     /// `pack.toml`; content/allocation changes need a restart.
@@ -38,6 +41,10 @@ pub enum PackFileKind {
     BaseLayer(u8),
     /// One already-allocated v2 block-face asset.
     Asset { slot: u8 },
+    /// One authored `[builtin_icons]` PNG, keyed by its canonical built-in
+    /// sprite name. The name is resolved to a `'static` spelling at build time
+    /// so the enum stays `Copy`.
+    BuiltinIcon { name: &'static str },
 }
 
 /// One watched pack file with frozen provenance.
@@ -125,6 +132,24 @@ impl PackWatch {
                 path: packs_root.join(&source.folder).join(&source.path),
                 display: format!("{PACKS_DIR}/{}/{}", source.folder, source.path),
                 kind: PackFileKind::Asset { slot },
+            });
+        }
+
+        // One entry per authored override, including a path that is missing
+        // at launch: the file appearing later must settle like any edit. The
+        // same authored path may back two names, so these entries are
+        // deliberately NOT deduplicated — each destination drives its own
+        // pinned sprite layer.
+        for (folder, name, path) in presentation.builtin_icon_paths() {
+            let Some(name) = names::builtin_item_sprite_name(name) else {
+                debug_assert!(false, "`{name}` is not an overridable builtin sprite");
+                continue;
+            };
+            entries.push(PackWatchEntry {
+                folder: folder.to_string(),
+                path: packs_root.join(folder).join(path),
+                display: format!("{PACKS_DIR}/{folder}/{path}"),
+                kind: PackFileKind::BuiltinIcon { name },
             });
         }
 
@@ -310,6 +335,30 @@ mod tests {
             .collect()
     }
 
+    fn builtin_icon_entries(watch: &PackWatch) -> Vec<&PackWatchEntry> {
+        watch
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, PackFileKind::BuiltinIcon { .. }))
+            .collect()
+    }
+
+    /// A v2 spec with a `[builtin_icons]` table and no content arrays. The
+    /// authored PNGs are deliberately not in `assets`, so every override is
+    /// "missing at launch" for watch purposes.
+    fn builtin_icon_fixture(
+        folder: &str,
+        overrides: &[(&str, &str)],
+    ) -> (PackSpec, ContentRegistry) {
+        let (mut spec, registry) = v2_fixture(folder, &[], &[]);
+        for (name, path) in overrides {
+            spec.content
+                .builtin_icons
+                .insert((*name).to_string(), (*path).to_string());
+        }
+        (spec, registry)
+    }
+
     #[test]
     fn v1_pack_watches_manifest_and_all_thirty_eight_fixed_names() {
         let root = tempfile::tempdir().unwrap();
@@ -438,6 +487,112 @@ mod tests {
         let assets = asset_entries(&watch);
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].kind, PackFileKind::Asset { slot: 0 });
+    }
+
+    #[test]
+    fn v2_pack_watches_builtin_icon_overrides_even_when_missing_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = "icons";
+        fs::create_dir_all(root.path().join(folder)).unwrap();
+        let (spec, registry) = builtin_icon_fixture(
+            folder,
+            &[
+                ("apple", "apple.png"),
+                ("wood_pickaxe", "textures/pickaxe.png"),
+            ],
+        );
+
+        // The files are authored but do not exist at launch.
+        assert!(!root.path().join(folder).join("apple.png").exists());
+        assert!(!root
+            .path()
+            .join(folder)
+            .join("textures")
+            .join("pickaxe.png")
+            .exists());
+
+        let presentation = presentation_with(vec![spec], &registry);
+        let watch = PackWatch::build(
+            &presentation,
+            root.path(),
+            &[folder.to_string()],
+            Instant::now(),
+        );
+
+        assert_eq!(watch.entry_count(), 1 + 38 + 2);
+        let icons = builtin_icon_entries(&watch);
+        assert_eq!(icons.len(), 2, "one entry per authored override name");
+        assert_eq!(icons[0].kind, PackFileKind::BuiltinIcon { name: "apple" });
+        assert_eq!(icons[0].folder, "icons");
+        assert_eq!(icons[0].display, "packs/icons/apple.png");
+        assert_eq!(icons[0].path, root.path().join("icons").join("apple.png"));
+        assert_eq!(
+            icons[1].kind,
+            PackFileKind::BuiltinIcon {
+                name: "wood_pickaxe"
+            }
+        );
+        assert_eq!(icons[1].display, "packs/icons/textures/pickaxe.png");
+        assert_eq!(
+            icons[1].path,
+            root.path()
+                .join("icons")
+                .join("textures")
+                .join("pickaxe.png")
+        );
+        assert!(
+            icons
+                .iter()
+                .all(|entry| entry.display.starts_with("packs/")),
+            "override display paths stay pack-relative"
+        );
+    }
+
+    #[test]
+    fn v2_pack_without_builtin_icons_keeps_the_existing_entry_count() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = "plain";
+        let (spec, registry) = v2_fixture(folder, &["ruby.png"], &[]);
+        let presentation = presentation_with(vec![spec], &registry);
+        let watch = PackWatch::build(
+            &presentation,
+            root.path(),
+            &[folder.to_string()],
+            Instant::now(),
+        );
+
+        assert_eq!(watch.entry_count(), 1 + 38 + 1);
+        assert!(
+            builtin_icon_entries(&watch).is_empty(),
+            "a table-less v2 pack adds no sprite entries"
+        );
+    }
+
+    #[test]
+    fn two_builtin_icon_names_sharing_one_path_produce_two_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = "shared";
+        let (spec, registry) = builtin_icon_fixture(
+            folder,
+            &[("apple", "sprite.png"), ("wood_pickaxe", "sprite.png")],
+        );
+        let presentation = presentation_with(vec![spec], &registry);
+        let watch = PackWatch::build(
+            &presentation,
+            root.path(),
+            &[folder.to_string()],
+            Instant::now(),
+        );
+
+        assert_eq!(watch.entry_count(), 1 + 38 + 2);
+        let icons = builtin_icon_entries(&watch);
+        assert_eq!(icons.len(), 2);
+        assert_eq!(icons[0].display, "packs/shared/sprite.png");
+        assert_eq!(icons[1].display, "packs/shared/sprite.png");
+        assert_ne!(
+            icons[0].kind, icons[1].kind,
+            "the two names remain distinct destinations"
+        );
     }
 
     #[test]

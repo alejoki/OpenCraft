@@ -3076,12 +3076,16 @@ mod tests {
         let end = body.find("\n    fn ").unwrap_or(body.len());
         let body = &body[..end];
         assert!(
-            body.contains("compose_item_sprite_layers(self.session.registry.pack_icons())"),
+            body.contains("compose_item_sprite_layers_for(self.session.registry.pack_icons())"),
             "a session install must compose from the installed frozen registry"
         );
         assert!(
             body.contains("set_item_sprite_layers"),
             "a session install must replace the UI sprite atlas"
+        );
+        assert!(
+            body.contains("pack_item_sprite_dirty = false"),
+            "a successful session-install upload must clear the pending sprite flag"
         );
     }
 

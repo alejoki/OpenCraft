@@ -68,8 +68,9 @@ use opencraft::ui::inventory::{
     LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
-    compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
-    palette_icon_vertices_with, IconDrawList,
+    builtin_icon_layer, compose_item_sprite_layers, compose_item_sprite_layers_with_overrides,
+    hotbar_icon_vertices_with, inventory_icon_vertices_with, palette_icon_vertices_with,
+    IconDrawList,
 };
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
@@ -196,6 +197,25 @@ fn build_pack_watch(
     }
     watch.mark_polled(now);
     Some(watch)
+}
+
+/// Compose the UI-only item sprite atlas for one frozen pack-icon set,
+/// applying the live presentation-owned `[builtin_icons]` overrides when a
+/// pack stack is installed.
+///
+/// Inputs are explicit instead of `&self` so the `RedrawRequested` arm can
+/// compose while `gpu` holds a mutable borrow of `self.gpu` (P005); a
+/// whole-`self` method would conflict with that borrow.
+fn compose_item_sprite_layers_with_presentation(
+    presentation: Option<&PackPresentation>,
+    pack_icons: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    match presentation {
+        Some(presentation) => {
+            compose_item_sprite_layers_with_overrides(pack_icons, &presentation.builtin_icons)
+        }
+        None => compose_item_sprite_layers(pack_icons),
+    }
 }
 
 /// Collapse every run of whitespace so a pack status or trace reason is
@@ -8516,6 +8536,12 @@ struct GameApp {
     /// `RedrawRequested` must upload individually. Cleared by every full
     /// compose, which already covers the whole array.
     pack_layer_uploads: BTreeSet<u32>,
+    /// Whether the UI-only 256-layer item sprite atlas changed and the next
+    /// `RedrawRequested` must re-upload it through
+    /// `UiRenderer::set_item_sprite_layers`. Set by a stack apply (new override
+    /// set) and by a settled `[builtin_icons]` edit; block texture edits never
+    /// touch it.
+    pack_item_sprite_dirty: bool,
     /// Pack folders whose settled `pack.toml` edit changes the content
     /// fingerprint (digest or pack layer/icon counts) and therefore needs a
     /// restart. Sorted by folder name; never used to touch live allocation.
@@ -8921,6 +8947,7 @@ impl GameApp {
             pack_presentation,
             pack_watch,
             pack_layer_uploads: BTreeSet::new(),
+            pack_item_sprite_dirty: false,
             pack_restart_folders: BTreeSet::new(),
             session_registry,
             config,
@@ -9204,6 +9231,57 @@ impl GameApp {
                         }
                     }
                     Err(reason) => self.reject_pack_entry(&entry, &reason),
+                }
+            }
+            PackFileKind::BuiltinIcon { name } => {
+                let Ok(relative) = entry.path.strip_prefix(&pack_dir) else {
+                    return;
+                };
+                let relative = relative.to_string_lossy().into_owned();
+                // A missing file is a legal edit (`Absent`): reveal the lower
+                // pack's override or the procedural sprite. A present but
+                // malformed file is a rejection that keeps the last good bytes.
+                let input = match pack::spec::decode_builtin_icon_file(&pack_dir, &relative) {
+                    Ok(Some(bytes)) => LayerInput::Bytes(bytes),
+                    Ok(None) => LayerInput::Absent,
+                    Err(reason) => {
+                        self.reject_pack_entry(&entry, &reason);
+                        return;
+                    }
+                };
+                let change = self.pack_presentation.as_mut().and_then(|presentation| {
+                    presentation.apply_builtin_icon(&entry.folder, name, input)
+                });
+                let Some(change) = change else {
+                    // Shadowed by a later pack or byte-identical: nothing to
+                    // upload, but the lower pack's bytes were still stored for
+                    // a later reveal.
+                    return;
+                };
+                // The UI sprite atlas is not the block texture array: queue no
+                // partial block upload, only one full atlas compose/upload.
+                self.pack_item_sprite_dirty = true;
+                match (&change.bytes, &change.source) {
+                    (Some(_), Some(source)) => {
+                        let display =
+                            format!("{}/{}/{}", pack::PACKS_DIR, source.folder, source.path);
+                        let Some(layer) = builtin_icon_layer(&change.name) else {
+                            debug_assert!(
+                                false,
+                                "`{}` must resolve to a pinned sprite layer",
+                                change.name
+                            );
+                            return;
+                        };
+                        self.record_pack_applied(&display, layer);
+                    }
+                    (None, _) => {
+                        self.creator
+                            .set_pack_status(Some(format!("builtin icon {name} restored")));
+                        self.creator.last_error = None;
+                        self.creator_overlay_dirty = true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -9575,6 +9653,9 @@ impl GameApp {
         self.creator.pack_status = None;
         self.creator_overlay_dirty = true;
         self.pack_presentation_dirty = true;
+        // The new stack owns a new visible override set. Upload it in the
+        // next `RedrawRequested`; the menu path never touches the GPU.
+        self.pack_item_sprite_dirty = true;
         // The candidate becomes the base for the NEXT load. The live session
         // keeps its frozen registry untouched (MEM512/D181).
         self.base_registry = candidate;
@@ -9836,6 +9917,18 @@ impl GameApp {
         self.on_session_installed();
     }
 
+    /// Compose the item sprite atlas for `pack_icons`, applying the
+    /// presentation-owned live `[builtin_icons]` overrides when present.
+    fn compose_item_sprite_layers_for(&self, pack_icons: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        compose_item_sprite_layers_with_presentation(self.pack_presentation.as_ref(), pack_icons)
+    }
+
+    /// Compose the current item sprite atlas from the frozen session registry
+    /// plus the presentation's live built-in overrides.
+    fn compose_current_item_sprite_layers(&self) -> Vec<Vec<u8>> {
+        self.compose_item_sprite_layers_for(self.session_registry.pack_icons())
+    }
+
     /// Shared reset boundary after `self.session` has been replaced.
     ///
     /// Called by [`GameApp::start_world_session`] for normal create/load swaps
@@ -9851,13 +9944,20 @@ impl GameApp {
         // The installed session owns a frozen content registry. Its pack item
         // icons may differ from the launch registry (for example a loaded
         // world that carries a content pack), so rebuild the UI-only sprite
-        // atlas from the session's registry before the next frame. The
-        // built-in Default atlas is the same procedural set as startup.
-        let item_sprite_layers = compose_item_sprite_layers(self.session.registry.pack_icons());
+        // atlas from the session's registry (plus the live built-in overrides)
+        // before the next frame. The built-in Default atlas is the same
+        // procedural set as startup.
+        let item_sprite_layers =
+            self.compose_item_sprite_layers_for(self.session.registry.pack_icons());
+        let mut uploaded = false;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
             gpu.ui
                 .set_item_sprite_layers(&gpu.ctx.device, &gpu.ctx.queue, &item_sprite_layers);
+            uploaded = true;
+        }
+        if uploaded {
+            self.pack_item_sprite_dirty = false;
         }
         self.input.reset();
         self.left_mouse_held = false;
@@ -10604,8 +10704,11 @@ impl ApplicationHandler for GameApp {
             &ctx,
             &renderer.block_texture_view,
             &renderer.block_texture_sampler,
-            &compose_item_sprite_layers(self.session_registry.pack_icons()),
+            &self.compose_current_item_sprite_layers(),
         );
+        // The startup atlas already includes every presentation override, so
+        // no delayed sprite upload is pending once the renderer exists.
+        self.pack_item_sprite_dirty = false;
         // Startup logo upload (M004/S04): the texture is created exactly once
         // per pack selection, never on the render hot path. Default (`None`)
         // leaves the logo renderer empty so the text title shows instead.
@@ -11712,6 +11815,23 @@ impl ApplicationHandler for GameApp {
                             .write_block_layer(&gpu.ctx.queue, layer, &bytes);
                     }
                     self.pack_layer_uploads.clear();
+                }
+
+                // Live built-in item sprite overrides (M014/S07): a settled
+                // `[builtin_icons]` edit or a stack apply set the dirty flag.
+                // Compose the 256-layer UI-only atlas from the presentation's
+                // visible override set BEFORE touching `gpu` (P005). The
+                // helper takes explicit fields because `gpu` already holds a
+                // mutable borrow of `self.gpu` here; one upload per frame
+                // coalesces every edit that settled in the same poll.
+                if self.pack_item_sprite_dirty {
+                    let layers = compose_item_sprite_layers_with_presentation(
+                        self.pack_presentation.as_ref(),
+                        self.session_registry.pack_icons(),
+                    );
+                    gpu.ui
+                        .set_item_sprite_layers(&gpu.ctx.device, &gpu.ctx.queue, &layers);
+                    self.pack_item_sprite_dirty = false;
                 }
 
                 // Message expiry at a bounded ~60 ticks/s (see
@@ -35477,6 +35597,368 @@ selected_name_secs = 0.5
         let presentation = app.pack_presentation.as_ref().expect("presentation");
         assert_eq!(&presentation.pack_layers[0][..4], &[20, 200, 30, 255]);
         assert_eq!(presentation.pack_layer_sources[0].path, "ruby.png");
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S07-T03: live built-in icon sprite overrides
+    // -----------------------------------------------------------------------
+
+    /// Write a v2 manifest whose only content is a `[builtin_icons]` table.
+    /// The paths are authored even when the PNGs do not exist yet.
+    fn write_v2_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
+        let mut text = String::from("format_version = 2\nname = \"icons\"\n\n[builtin_icons]\n");
+        for (name, path) in overrides {
+            text.push_str(&format!("{name} = \"{path}\"\n"));
+        }
+        std::fs::write(pack.join("pack.toml"), text).expect("write v2 builtin manifest");
+    }
+
+    #[test]
+    fn pack_builtin_icon_live_edit_updates_sprite_atlas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(
+            &pack,
+            &[
+                ("apple", "apple.png"),
+                ("wood_pickaxe", "textures/pickaxe.png"),
+            ],
+        );
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        std::fs::create_dir_all(pack.join("textures")).expect("create textures dir");
+        write_solid_png(
+            &pack.join("textures").join("pickaxe.png"),
+            [40, 50, 60, 255],
+        );
+        apply_pack_stack_of(&mut app, &["icons"]);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[10, 20, 30, 255]
+        );
+        assert_eq!(
+            &presentation.builtin_icons["wood_pickaxe"][..4],
+            &[40, 50, 60, 255]
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a stack apply schedules one atlas upload"
+        );
+
+        let before = app.compose_current_item_sprite_layers();
+        assert_eq!(&before[1][..4], &[10, 20, 30, 255], "apple layer");
+        assert_eq!(&before[11][..4], &[40, 50, 60, 255], "wood_pickaxe layer");
+
+        app.pack_item_sprite_dirty = false;
+        app.pack_layer_uploads.clear();
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a visible sprite edit schedules one atlas upload"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a sprite edit must never queue a block texture layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[200, 10, 20, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+
+        let after = app.compose_current_item_sprite_layers();
+        assert_eq!(&after[1][..4], &[200, 10, 20, 255]);
+        for layer in 0..after.len() {
+            if layer == 1 {
+                continue;
+            }
+            assert_eq!(after[layer], before[layer], "layer {layer} must not move");
+        }
+    }
+
+    #[test]
+    fn pack_builtin_icon_malformed_keeps_last_good_or_procedural() {
+        // A valid override that is later corrupted keeps its last good bytes
+        // and queues no upload.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        let last_good = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons["apple"]
+            .clone();
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("apple.png"), b"not a png at all")
+            .expect("corrupt the authored override");
+        settle_pack(&mut app, t0);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.builtin_icons["apple"], last_good);
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a rejected sprite edit must not upload"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(status.starts_with("packs/icons/apple.png: "), "{status}");
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+
+        // An override that is already corrupt at apply keeps procedural art
+        // and is still watched so a fixed file appears live.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "bad");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        std::fs::write(pack.join("apple.png"), b"not a png").expect("corrupt at launch");
+        apply_pack_stack_of(&mut app, &["bad"]);
+
+        let procedural = compose_item_sprite_layers(&[]);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        assert_eq!(app.compose_current_item_sprite_layers()[1], procedural[1]);
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.kind == PackFileKind::BuiltinIcon { name: "apple" }));
+
+        app.pack_item_sprite_dirty = false;
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a fixed file applies live at the pinned layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[70, 80, 90, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_missing_at_launch_appears_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "late");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        apply_pack_stack_of(&mut app, &["late"]);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        let watch = app.pack_watch.as_ref().expect("watch");
+        let entry = watch
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == PackFileKind::BuiltinIcon { name: "apple" })
+            .expect("a missing override is still watched");
+        assert_eq!(entry.display, "packs/late/apple.png");
+        assert!(!entry.path.exists());
+
+        app.pack_item_sprite_dirty = false;
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(app.pack_item_sprite_dirty);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[70, 80, 90, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/late/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_later_pack_wins_and_shadowed_edit_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        write_v2_builtin_manifest(&alpha, &[("apple", "apple.png")]);
+        write_solid_png(&alpha.join("apple.png"), [1, 2, 3, 255]);
+        let beta = write_pack_manifest(&app, "beta");
+        write_v2_builtin_manifest(&beta, &[("apple", "apple.png")]);
+        write_solid_png(&beta.join("apple.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha", "beta"]);
+
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[4, 5, 6, 255],
+            "the later pack wins the visible override"
+        );
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        write_solid_png(&alpha.join("apple.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a shadowed lower-pack edit uploads nothing"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[4, 5, 6, 255]
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::remove_file(beta.join("apple.png")).expect("delete the visible override");
+        settle_pack(&mut app, t1);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "deleting the winner reveals the lower override live"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[9, 9, 9, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_edit_leaves_digests_and_registries_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["icons"]);
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let (fingerprint, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(app.pack_item_sprite_dirty);
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a sprite edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[200, 10, 20, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_source_pin_uploads_via_set_item_sprite_layers() {
+        let source = include_str!("main.rs");
+
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        assert!(resumed.contains("compose_current_item_sprite_layers"));
+        assert!(resumed.contains("self.pack_item_sprite_dirty = false"));
+
+        let installed = source
+            .split("fn on_session_installed(&mut self)")
+            .nth(1)
+            .expect("main.rs must define on_session_installed");
+        let installed = &installed[..installed.find("\n    fn ").unwrap_or(installed.len())];
+        assert!(installed
+            .contains("compose_item_sprite_layers_for(self.session.registry.pack_icons())"));
+        assert!(installed.contains("set_item_sprite_layers"));
+        assert!(installed.contains("self.pack_item_sprite_dirty = false"));
+
+        let redraw = creator_redraw_source();
+        assert!(redraw.contains("compose_item_sprite_layers_with_presentation"));
+        assert!(redraw.contains("self.pack_presentation.as_ref()"));
+        assert!(redraw.contains("self.session_registry.pack_icons()"));
+        assert!(redraw.contains("set_item_sprite_layers"));
+        assert!(redraw.contains("self.pack_item_sprite_dirty = false"));
+
+        let handler = source
+            .split("fn apply_settled_pack_entry(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_pack_entry")
+            .split("fn apply_settled_pack_manifest(")
+            .next()
+            .expect("the watcher dispatch must end before the manifest handler");
+        assert!(handler.contains("PackFileKind::BuiltinIcon { name }"));
+        assert!(handler.contains("decode_builtin_icon_file"));
+        assert!(handler.contains("apply_builtin_icon"));
+        let icon_arm = handler
+            .split("PackFileKind::BuiltinIcon { name }")
+            .nth(1)
+            .expect("the builtin icon arm must exist");
+        assert!(
+            !icon_arm.contains("pack_layer_uploads"),
+            "a sprite edit must never queue a block layer upload"
+        );
+
+        let poll = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_settled_pack_entry(")
+            .next()
+            .expect("poll_pack_watcher must end before the apply helper");
+        assert!(!poll.contains("apply_pack_stack("));
     }
 
     #[test]
