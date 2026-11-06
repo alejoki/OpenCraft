@@ -9175,24 +9175,32 @@ impl GameApp {
             self.creator_overlay_dirty = true;
         }
 
-        for index in settled {
-            let Some(entry) = self
-                .pack_watch
-                .as_ref()
-                .and_then(|watch| watch.entry(index))
-                .cloned()
-            else {
-                continue;
-            };
-            self.apply_settled_pack_entry(entry);
+        // Snapshot the settled entries before applying any of them: a
+        // manifest edit that changes the authored `[builtin_icons]` table
+        // rebuilds `pack_watch` from inside its handler, so later indices in
+        // this batch would otherwise name different files.
+        let settled_entries: Vec<PackWatchEntry> = settled
+            .iter()
+            .filter_map(|&index| {
+                self.pack_watch
+                    .as_ref()
+                    .and_then(|watch| watch.entry(index))
+                    .cloned()
+            })
+            .collect();
+        for entry in settled_entries {
+            self.apply_settled_pack_entry(entry, now);
         }
     }
 
     /// Apply one settled watch entry to the live presentation.
-    fn apply_settled_pack_entry(&mut self, entry: PackWatchEntry) {
+    ///
+    /// `now` is the injected poll clock; the manifest arm needs it to
+    /// baseline a rebuilt watch list without reading wall time.
+    fn apply_settled_pack_entry(&mut self, entry: PackWatchEntry, now: Instant) {
         let pack_dir = self.packs_root.join(&entry.folder);
         match entry.kind {
-            PackFileKind::Manifest => self.apply_settled_pack_manifest(&entry),
+            PackFileKind::Manifest => self.apply_settled_pack_manifest(&entry, now),
             PackFileKind::BaseLayer(layer) => {
                 let Some(file) = entry.path.file_name() else {
                     return;
@@ -9296,8 +9304,15 @@ impl GameApp {
     /// edited folder can change the content fingerprint. Equal fingerprints
     /// clear this folder's restart requirement (a texture-only manifest edit,
     /// or a revert); a different fingerprint records one. Neither branch
-    /// assigns either registry, mutates the presentation, or queues an upload.
-    fn apply_settled_pack_manifest(&mut self, entry: &PackWatchEntry) {
+    /// assigns either registry, replaces the presentation, or queues a block
+    /// upload.
+    ///
+    /// `[builtin_icons]` is presentation-only, so the edited folder's table is
+    /// reconciled for every valid manifest — including one whose content still
+    /// needs a restart. Newly authored paths join the watch list and removed
+    /// paths leave it; the list is rebaselined at the poll's `now` so the edit
+    /// that just applied is not re-applied.
+    fn apply_settled_pack_manifest(&mut self, entry: &PackWatchEntry, now: Instant) {
         let Some(presentation) = self.pack_presentation.as_ref() else {
             return;
         };
@@ -9351,6 +9366,7 @@ impl GameApp {
         }
 
         let restart = self.pack_restart_reason();
+        let restart_required = restart.is_some();
         match restart {
             Some(reason) => {
                 self.creator.set_restart_required(reason.clone());
@@ -9389,6 +9405,97 @@ impl GameApp {
                 }
             }
         }
+
+        // Reconcile only the presentation-owned override table. This runs for
+        // every valid settled manifest, even when content still needs a
+        // restart: overrides never allocate, so they can apply live while the
+        // restart reason stays visible.
+        let target_content = candidate_specs
+            .iter()
+            .find(|spec| spec.folder == entry.folder)
+            .map(|spec| &spec.content);
+        let paths_changed = match target_content {
+            Some(content) => {
+                self.apply_settled_builtin_icon_table(entry, content, restart_required)
+            }
+            None => false,
+        };
+
+        // The authored path set changed, so new files (including ones still
+        // missing) must be watched and removed ones dropped. Rebaseline at the
+        // poll clock: the table update already consumed the current bytes, so
+        // the next real edit — not this manifest write — settles.
+        if paths_changed {
+            self.pack_watch = build_pack_watch(
+                self.pack_presentation.as_ref(),
+                &self.packs_root,
+                &self.settings.pack_stack,
+                now,
+            );
+        }
+    }
+
+    /// Reconcile one pack's presentation-owned `[builtin_icons]` table after a
+    /// settled manifest edit.
+    ///
+    /// The presentation borrow ends inside this helper, before any status or
+    /// message work, so the restart/apply surfaces are updated with disjoint
+    /// borrows. Returns whether the authored path table changed, which is the
+    /// caller's signal to rebuild the watch list. A restart-required edit still
+    /// queues the sprite atlas (`pack_item_sprite_dirty`) but never overwrites
+    /// the restart reason with an apply status.
+    fn apply_settled_builtin_icon_table(
+        &mut self,
+        entry: &PackWatchEntry,
+        content: &PackContentSpec,
+        restart_required: bool,
+    ) -> bool {
+        let Some(table) = self.pack_presentation.as_mut().map(|presentation| {
+            presentation.apply_builtin_icon_table(
+                &entry.folder,
+                &content.builtin_icons,
+                &content.assets,
+            )
+        }) else {
+            return false;
+        };
+        if table.changes.is_empty() {
+            return table.paths_changed;
+        }
+        // The sprite atlas is one full UI texture, never a block layer: queue
+        // exactly one compose/upload for the next frame.
+        self.pack_item_sprite_dirty = true;
+        if restart_required {
+            // The content restart is the authoritative status for this edit.
+            return table.paths_changed;
+        }
+        match table.changes.last() {
+            Some(change) => match (&change.bytes, &change.source) {
+                (Some(_), Some(source)) => {
+                    let display = format!("{}/{}/{}", pack::PACKS_DIR, source.folder, source.path);
+                    let Some(layer) = builtin_icon_layer(&change.name) else {
+                        debug_assert!(
+                            false,
+                            "`{}` must resolve to a pinned sprite layer",
+                            change.name
+                        );
+                        return table.paths_changed;
+                    };
+                    self.record_pack_applied(&display, layer);
+                }
+                (None, _) => {
+                    // A removal reveals the lower pack or procedural art; there
+                    // is no authored path to report as applied.
+                    self.creator
+                        .set_pack_status(Some(format!("builtin icon {} restored", change.name)));
+                    self.creator.last_error = None;
+                    self.creator_overlay_dirty = true;
+                }
+                _ => {}
+            },
+            None => {}
+        }
+        table.paths_changed
     }
 
     /// Current restart requirement built from the sorted folder set, or
@@ -35613,6 +35720,17 @@ selected_name_secs = 0.5
         std::fs::write(pack.join("pack.toml"), text).expect("write v2 builtin manifest");
     }
 
+    /// Write a v2 manifest with no content arrays and no `[builtin_icons]`
+    /// table. Its pack identity matches [`write_v2_builtin_manifest`], so
+    /// switching between the two never changes the content fingerprint.
+    fn write_v2_empty_manifest(pack: &Path) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"icons\"\n",
+        )
+        .expect("write v2 empty manifest");
+    }
+
     #[test]
     fn pack_builtin_icon_live_edit_updates_sprite_atlas() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -35902,6 +36020,296 @@ selected_name_secs = 0.5
     }
 
     #[test]
+    fn pack_builtin_icon_manifest_add_and_remove_are_live_without_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        assert_eq!(app.creator.restart_required, None);
+
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let (fingerprint, base_layers, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_item_sprite_dirty = false;
+        let procedural = compose_item_sprite_layers(&[]);
+
+        // Adding the override table and its PNG is one manifest edit that
+        // must apply live: the table is presentation-only.
+        let t0 = Instant::now();
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [11, 22, 33, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator.restart_required, None,
+            "an identity-free override table must not require a restart"
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a visible override queues the sprite atlas"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "an override must never queue a block layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[11, 22, 33, 255]
+        );
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [11, 22, 33, 255],
+            "apple is pinned to sprite layer 1"
+        );
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(
+            watch.entries().iter().any(|entry| {
+                entry.kind == PackFileKind::BuiltinIcon { name: "apple" }
+                    && entry.display == "packs/icons/apple.png"
+            }),
+            "the newly authored path joins the watch list"
+        );
+        assert_eq!(watch.entry_count(), watch_count + 1);
+        let status = app.creator.pack_status.as_deref().expect("applied status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+
+        // Every frozen allocation/identity surface is untouched.
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(Arc::as_ptr(&app.session_registry), session_ptr);
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+
+        // Removing the table restores procedural art live and drops the path
+        // from the watch list.
+        app.pack_item_sprite_dirty = false;
+        let t1 = t0 + Duration::from_secs(1);
+        write_v2_empty_manifest(&pack);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_item_sprite_dirty);
+        assert!(app.pack_layer_uploads.is_empty());
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1],
+            procedural[1],
+            "removing the override reveals procedural apple art"
+        );
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(!watch
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/icons/apple.png"));
+        assert_eq!(
+            watch.entry_count(),
+            watch_count,
+            "the removed authored path leaves the watch list"
+        );
+        assert_eq!(
+            app.creator.pack_status.as_deref(),
+            Some("builtin icon apple restored")
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_manifest_add_with_missing_or_corrupt_art_is_watchable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        app.pack_item_sprite_dirty = false;
+        let procedural = compose_item_sprite_layers(&[]);
+
+        // The manifest authors a path before the file exists: it must be
+        // watched so the later write applies live.
+        let t0 = Instant::now();
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a missing override changes no visible bytes"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        assert!(app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons
+            .is_empty());
+        let watch = app.pack_watch.as_ref().expect("watch");
+        let entry = watch
+            .entries()
+            .iter()
+            .find(|entry| entry.display == "packs/icons/apple.png")
+            .expect("a missing override is still watched");
+        assert_eq!(entry.kind, PackFileKind::BuiltinIcon { name: "apple" });
+        assert!(!entry.path.exists());
+        assert_eq!(app.compose_current_item_sprite_layers()[1], procedural[1]);
+
+        // A corrupt file is rejected: procedural art stays and the path stays
+        // watched for the fix.
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::write(pack.join("apple.png"), b"not a png").expect("write corrupt png");
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(!app.pack_item_sprite_dirty);
+        assert!(
+            app.creator
+                .pack_status
+                .as_deref()
+                .expect("rejection status")
+                .starts_with("packs/icons/apple.png: "),
+            "the rejection names the authored path"
+        );
+        assert!(app.creator.last_error.is_some());
+        assert!(!app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons
+            .contains_key("apple"));
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/icons/apple.png"));
+
+        // Fixing the same path applies live at the pinned apple layer.
+        let t2 = t1 + Duration::from_secs(1);
+        write_solid_png(&pack.join("apple.png"), [7, 8, 9, 255]);
+        settle_pack(&mut app, t2);
+
+        assert!(app.pack_item_sprite_dirty);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[7, 8, 9, 255]
+        );
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [7, 8, 9, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("applied status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_manifest_add_block_still_requires_restart_without_moving_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
+        app.pack_layer_uploads.clear();
+
+        let (fingerprint, base_layers, pack_layers, base_sources, pack_layer_sources) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.base_sources.clone(),
+                presentation.pack_layer_sources.clone(),
+            )
+        };
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+
+        // One edit adds both allocated content (a block) and an identity-free
+        // override. The block still needs a restart; the override may apply
+        // live without moving any layer.
+        let t0 = Instant::now();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
+        )
+        .expect("write combined manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("apple.png"), [4, 5, 6, 255]);
+        settle_pack(&mut app, t0);
+
+        let reason = app
+            .creator
+            .restart_required
+            .as_deref()
+            .expect("content changes still require a restart");
+        assert_eq!(reason, "textures: content changed; restart to apply");
+        assert_eq!(
+            app.creator.pack_status.as_deref(),
+            Some(reason),
+            "the restart reason wins over the live override status"
+        );
+        assert!(app.creator.last_error.is_none());
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "adding a block must never queue a live layer upload"
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "the identity-free override still applies live"
+        );
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.base_sources, base_sources);
+        assert_eq!(presentation.pack_layer_sources, pack_layer_sources);
+        assert_eq!(&presentation.builtin_icons["apple"][..4], &[4, 5, 6, 255]);
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [4, 5, 6, 255]
+        );
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/textures/apple.png"));
+        assert_eq!(Arc::as_ptr(&app.session_registry), session_ptr);
+        assert_eq!(app.session_registry.digest(), session_digest);
+    }
+
+    #[test]
     fn pack_builtin_icon_source_pin_uploads_via_set_item_sprite_layers() {
         let source = include_str!("main.rs");
 
@@ -36140,6 +36548,7 @@ selected_name_secs = 0.5
         write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["textures"]);
         assert!(app.pack_layer_uploads.is_empty());
+        app.pack_item_sprite_dirty = false;
 
         let (base_layers, pack_layers, base_sources, pack_layer_sources, fingerprint) = {
             let presentation = app.pack_presentation.as_ref().expect("presentation");
@@ -36171,6 +36580,10 @@ selected_name_secs = 0.5
         assert!(
             app.pack_layer_uploads.is_empty(),
             "a manifest change must never queue a live upload"
+        );
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a content manifest edit without builtin icons must not compose the sprite atlas"
         );
 
         let presentation = app.pack_presentation.as_ref().expect("presentation");
@@ -36218,6 +36631,8 @@ selected_name_secs = 0.5
         let pack = write_pack_manifest(&app, "textures");
         write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
         let layers_before = app
             .pack_presentation
             .as_ref()
@@ -36230,6 +36645,12 @@ selected_name_secs = 0.5
         write_v2_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "a manifest edit without override paths keeps the frozen watch list"
+        );
+        assert!(!app.pack_item_sprite_dirty);
 
         // Restoring the installed manifest content must satisfy the pending
         // restart without touching the live layers it was already showing.
@@ -36242,6 +36663,12 @@ selected_name_secs = 0.5
         assert!(
             app.pack_layer_uploads.is_empty(),
             "a revert queues no uploads"
+        );
+        assert!(!app.pack_item_sprite_dirty);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "a revert rebuilds nothing"
         );
         assert_eq!(
             app.pack_presentation
@@ -36312,11 +36739,16 @@ selected_name_secs = 0.5
         let pack = write_pack_manifest(&app, "textures");
         write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
 
         let t0 = Instant::now();
         write_v2_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a content-only manifest edit leaves the sprite atlas alone"
+        );
         app.pack_layer_uploads.clear();
 
         let t1 = t0 + Duration::from_secs(1);
@@ -36437,6 +36869,15 @@ selected_name_secs = 0.5
         );
         assert!(watcher.contains("!watch::CREATOR_TOOLS"));
 
+        assert!(
+            watcher.contains("self.apply_settled_pack_entry(entry, now)"),
+            "the poll must thread its injected clock into the settler"
+        );
+        assert!(
+            !watcher.contains("Instant::now()"),
+            "the watcher path must use the poll clock, never wall time"
+        );
+
         let handler = source
             .split("fn apply_settled_pack_manifest(")
             .nth(1)
@@ -36449,11 +36890,42 @@ selected_name_secs = 0.5
             1,
             "exactly one restart trace line per settled manifest edit"
         );
+        // S07-T04 deliberately widens the guard: an identity-free
+        // `[builtin_icons]` edit may reconcile presentation overrides and
+        // rebuild the watch list, but never the stack or live allocation.
+        assert!(
+            handler.contains("apply_settled_builtin_icon_table("),
+            "a settled manifest must reconcile the override table"
+        );
+        assert!(
+            handler.contains("build_pack_watch("),
+            "a changed override path table must rebuild the watch list"
+        );
+        assert!(!handler.contains("apply_pack_stack("));
         assert!(!handler.contains("self.base_registry ="));
         assert!(!handler.contains("self.session_registry ="));
         assert!(!handler.contains("self.pack_presentation ="));
-        assert!(!handler.contains("self.pack_presentation.as_mut()"));
         assert!(!handler.contains("self.pack_layer_uploads.insert"));
+        assert!(
+            !handler.contains("icon_sources[") && !handler.contains("pack_icons["),
+            "a manifest edit must never assign icon layers"
+        );
+
+        let helper = source
+            .split("fn apply_settled_builtin_icon_table(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_builtin_icon_table")
+            .split("fn apply_base_layer_upload(")
+            .next()
+            .expect("the reconcile helper must end before the per-layer apply");
+        assert!(helper.contains("apply_builtin_icon_table"));
+        assert!(helper.contains("self.pack_presentation.as_mut()"));
+        assert!(helper.contains("self.pack_item_sprite_dirty = true"));
+        assert!(!helper.contains("self.pack_presentation ="));
+        assert!(
+            !helper.contains("pack_layer_uploads.insert"),
+            "a builtin icon table edit must never queue a block layer"
+        );
 
         let emit = source
             .split("fn emit_pack_trace(")
