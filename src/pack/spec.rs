@@ -169,6 +169,26 @@ pub fn decode_asset_file(dir: &Path, relative: &str) -> Result<Vec<u8>, String> 
     Ok(resample::resample_to_16(&decoded.rgba, decoded.width))
 }
 
+/// Decode one optional `[builtin_icons]` PNG into resampled 16x16 RGBA bytes.
+///
+/// This is the live-reload seam for built-in sprite overrides. It applies the
+/// same confinement, byte cap, and square 16..=256 rules as
+/// [`decode_asset_file`], but a missing file is `Ok(None)` instead of an error:
+/// a deleted override must reveal the lower pack or procedural art. A path
+/// that escapes the pack folder, or a present-but-invalid/oversized image, is
+/// `Err(reason)`.
+pub fn decode_builtin_icon_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = asset::resolve_asset_path(dir, relative)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
+    let decoded = decode::decode_png_rgba_bytes(&bytes, relative)?;
+    validate_square_16_to_256(&decoded, "assets")?;
+    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
+}
+
 /// Require a square image between [`MIN_LAYER_SIDE`] and [`MAX_LAYER_SIDE`].
 ///
 /// `noun` selects the exact startup wording: `layers` for fixed-name layers
@@ -924,5 +944,34 @@ hardness = 1.0
 
         let expected = authored_layer(&dir, "ore.png", 32);
         assert_eq!(decode_asset_file(&dir, "ore.png").unwrap(), expected);
+    }
+
+    #[test]
+    fn decode_builtin_icon_file_returns_none_for_missing_and_rejects_bad_art() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "decode-builtin-icon");
+
+        // Missing overrides are legal live edits: fall back without an error.
+        assert_eq!(decode_builtin_icon_file(&dir, "apple.png").unwrap(), None);
+
+        let err = decode_builtin_icon_file(&dir, "../escape.png").unwrap_err();
+        assert!(err.contains("must not contain `..`"), "{err}");
+
+        fs::write(dir.join("apple.png"), b"not a png").unwrap();
+        assert!(decode_builtin_icon_file(&dir, "apple.png").is_err());
+
+        write_png(&dir.join("apple.png"), 8);
+        let err = decode_builtin_icon_file(&dir, "apple.png").unwrap_err();
+        assert!(err.contains("assets must be between 16 and 256"), "{err}");
+
+        write_png_sized(&dir.join("apple.png"), 32, 16);
+        let err = decode_builtin_icon_file(&dir, "apple.png").unwrap_err();
+        assert!(err.contains("assets must be square"), "{err}");
+
+        let expected = authored_layer(&dir, "apple.png", 32);
+        assert_eq!(
+            decode_builtin_icon_file(&dir, "apple.png").unwrap(),
+            Some(expected)
+        );
     }
 }
