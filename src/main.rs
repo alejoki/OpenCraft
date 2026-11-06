@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8544,9 +8544,10 @@ struct GameApp {
     pack_item_sprite_dirty: bool,
     /// Pack folders whose settled `pack.toml` edit changes the content
     /// fingerprint (digest or pack layer/icon counts) and therefore needs a
-    /// restart. Sorted by folder name; never used to touch live allocation.
+    /// restart, keyed by folder and classified as recipe-only or broader
+    /// content. Sorted by folder name; never used to touch live allocation.
     /// Cleared only by a user-initiated stack apply.
-    pack_restart_folders: BTreeSet<String>,
+    pack_restart_folders: BTreeMap<String, pack::watch::RestartKind>,
     /// The launch pack-stack registry: the base every new/loaded world is
     /// resolved against and the reference for a live pack-change digest
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
@@ -8948,7 +8949,7 @@ impl GameApp {
             pack_watch,
             pack_layer_uploads: BTreeSet::new(),
             pack_item_sprite_dirty: false,
-            pack_restart_folders: BTreeSet::new(),
+            pack_restart_folders: BTreeMap::new(),
             session_registry,
             config,
             config_dir,
@@ -9360,7 +9361,20 @@ impl GameApp {
         let candidate_fingerprint = ContentFingerprint::from_registry(&candidate);
         let changed = candidate_fingerprint != installed_fingerprint;
         if changed {
-            self.pack_restart_folders.insert(entry.folder.clone());
+            // Classify against the installed spec, never the candidate alone:
+            // only an edit confined to recipes/recipe patches is `Recipe`.
+            // The map stays sorted by folder for a stable reason string.
+            let installed_content = installed_specs
+                .iter()
+                .find(|spec| spec.folder == entry.folder)
+                .map(|spec| &spec.content);
+            let candidate_content = candidate_specs
+                .iter()
+                .find(|spec| spec.folder == entry.folder)
+                .map(|spec| &spec.content)
+                .expect("the edited folder always has a candidate spec");
+            let kind = pack::watch::restart_kind(installed_content, candidate_content);
+            self.pack_restart_folders.insert(entry.folder.clone(), kind);
         } else {
             self.pack_restart_folders.remove(&entry.folder);
         }
@@ -9498,19 +9512,15 @@ impl GameApp {
         table.paths_changed
     }
 
-    /// Current restart requirement built from the sorted folder set, or
+    /// Current restart requirement built from the sorted folder map, or
     /// `None` when every pending manifest edit matches the installed content.
     fn pack_restart_reason(&self) -> Option<String> {
-        if self.pack_restart_folders.is_empty() {
-            return None;
-        }
-        let folders = self
+        let entries = self
             .pack_restart_folders
             .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("{folders}: content changed; restart to apply"))
+            .map(|(folder, kind)| (folder.clone(), *kind))
+            .collect::<Vec<_>>();
+        pack::watch::restart_reason(&entries)
     }
 
     /// Apply one decoded base-layer edit and queue its upload when visible.
@@ -36269,7 +36279,8 @@ selected_name_secs = 0.5
         let reason = app
             .creator
             .restart_required
-            .as_deref()
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
             .expect("content changes still require a restart");
         assert_eq!(reason, "textures: content changed; restart to apply");
         assert_eq!(
@@ -36540,6 +36551,451 @@ selected_name_secs = 0.5
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
     }
 
+    /// Write a v2 manifest with one craftable item and one 1x1 recipe.
+    /// Changing `count` is a recipe-only edit: identity and allocation stay
+    /// identical, only the recipe definition moves.
+    fn write_v2_recipe_manifest(pack: &Path, count: u16) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            format!(
+                "format_version = 2\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
+            ),
+        )
+        .expect("write v2 recipe manifest");
+        write_solid_png(&pack.join("gem.png"), [40, 50, 60, 255]);
+    }
+
+    /// Write a v2 manifest whose only content is one built-in recipe patch.
+    fn write_v2_recipe_patch_manifest(pack: &Path, enabled: bool) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            format!(
+                "format_version = 2\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
+            ),
+        )
+        .expect("write v2 recipe patch manifest");
+    }
+
+    /// Build a 1x1 stone grid through the production crafting seam so the
+    /// preview is evaluated by the same matcher a player uses.
+    fn recipe_preview_output_count(app: &GameApp) -> Option<u16> {
+        let grid = crafting_demo_grid(
+            &app.session_registry,
+            GridKind::Player,
+            &["S"],
+            &[('S', ItemId::Block(BlockId::Stone))],
+        );
+        grid.preview_with(&app.session_registry)
+            .map(|preview| preview.output_count)
+    }
+
+    /// Install one fresh live session resolved against the current
+    /// `base_registry`, the same path the New Game flow uses.
+    fn install_pack_session(app: &mut GameApp, save_path: &Path) {
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &app.base_registry, &app.config);
+        app.start_world_session(session);
+    }
+
+    #[test]
+    fn pack_recipe_edit_sets_restart_required_without_moving_the_live_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+        install_pack_session(&mut app, &dir.path().join("recipe-save.mcvx"));
+
+        let live_recipe = (0..app.session_registry.recipe_count())
+            .filter_map(|index| app.session_registry.recipe(index))
+            .find(|recipe| recipe.name == "mymod:gem_recipe")
+            .expect("the live session carries the installed pack recipe");
+        assert_eq!(live_recipe.count, 1);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the installed recipe is previewable before the edit"
+        );
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let (fingerprint, base_layers, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_layer_uploads.clear();
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+
+        let reason = "demo: recipe changed; restart to apply";
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason)
+        );
+        assert_eq!(app.creator.pack_status.as_deref(), Some(reason));
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Recipe)
+        );
+        assert!(app.creator.last_error.is_none());
+
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(overlay.contains(&format!("packs: {reason}")), "{overlay}");
+        assert!(
+            overlay.contains(&format!("restart required: {reason}")),
+            "{overlay}"
+        );
+        let packs_message = app.packs_message.as_ref().expect("packs restart notice");
+        assert!(
+            packs_message.text.contains(reason),
+            "{}",
+            packs_message.text
+        );
+        assert!(packs_message.text.contains(PACK_RESTART_WORDING));
+        let game_message = app.game_message.as_ref().expect("game restart notice");
+        assert!(game_message.text.contains(reason), "{}", game_message.text);
+        assert!(game_message.text.contains(PACK_RESTART_WORDING));
+
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a recipe edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the live registry still previews the installed count"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a recipe edit never queues a texture upload"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "the frozen watch list survives a recipe edit"
+        );
+    }
+
+    #[test]
+    fn pack_recipe_patch_edit_sets_recipe_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_patch_manifest(&pack, false);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some("demo: recipe changed; restart to apply")
+        );
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Recipe)
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+    }
+
+    #[test]
+    fn pack_recipe_and_block_edit_says_content_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
+        )
+        .expect("write mixed manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some("demo: content changed; restart to apply"),
+            "a mixed recipe + block edit keeps the broad reason"
+        );
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Content)
+        );
+    }
+
+    #[test]
+    fn pack_recipe_revert_clears_restart_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_v2_recipe_manifest(&pack, 1);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert_eq!(app.creator.pack_status, None);
+        assert!(
+            app.pack_restart_folders.is_empty(),
+            "a revert deletes the folder entry"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(!overlay.contains("restart required:"), "{overlay}");
+    }
+
+    #[test]
+    fn pack_recipe_edit_keeps_texture_edits_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+        let reason = app
+            .creator
+            .restart_required
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
+            .expect("recipe edit requires a restart")
+            .to_string();
+        assert_eq!(reason, "demo: recipe changed; restart to apply");
+        assert!(app.pack_layer_uploads.is_empty());
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_solid_png(&pack.join("stone.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32]),
+            "a texture edit still applies at the frozen layer"
+        );
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason.as_str()),
+            "a live texture edit never clears the recipe restart"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[1, 2, 3, 255]
+        );
+    }
+
+    /// End-to-end proof of the recipe restart boundary: the live process keeps
+    /// its frozen registry while a fresh process loads the same save against
+    /// the edited registry, resolves every saved name, previews and crafts the
+    /// new count, and surfaces the existing one-time changed-content notice.
+    #[test]
+    fn pack_recipe_same_save_restart_previews_and_crafts_new_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let save_path = dir.path().join("pack-app.mcvx");
+        install_pack_session(&mut app, &save_path);
+        app.session.clock.day_index = 3;
+        app.session.clock.time_of_day = 6_000;
+        save_current_world(&mut app.session).expect("the installed session saves");
+
+        let installed_recipe = app
+            .session_registry
+            .recipe_by_name("mymod:gem_recipe")
+            .expect("the live session carries the installed pack recipe");
+        assert_eq!(installed_recipe.count, 1);
+        assert!(installed_recipe.enabled);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the installed recipe previews before the edit"
+        );
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+
+        let reason = "demo: recipe changed; restart to apply";
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason)
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a settled recipe edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(
+            app.base_registry.digest(),
+            base_digest,
+            "a settled recipe edit never rebuilds the launch base registry"
+        );
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the live matcher still crafts the installed count"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a recipe edit never queues a texture upload"
+        );
+
+        // A same-process load against the stale in-memory base must not adopt
+        // the file edit: only a fresh process rebuilds the registry, and the
+        // pending restart flag stays raised across the session swap.
+        let stale_cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let stale = startup_session_with(&stale_cli, &app.base_registry, &app.config);
+        app.start_world_session(stale);
+        assert_eq!(
+            app.session_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(1),
+            "the stale base registry is not adopted by an in-process load"
+        );
+        assert_eq!(recipe_preview_output_count(&app), Some(1));
+        assert!(
+            app.creator.restart_required.is_some(),
+            "an in-process load never clears the pending file-edit restart"
+        );
+
+        // Fresh-process simulation: rebuild StartupContent from the on-disk
+        // settings/packs exactly like the next launch would.
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+        );
+        assert_eq!(
+            content
+                .base_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(2),
+            "a fresh process loads the edited recipe registry"
+        );
+        let loaded = load_world_from_path_with(&save_path, content.base_registry.as_ref())
+            .expect("the same save loads against the fresh registry");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "a count-only recipe edit resolves every saved name"
+        );
+
+        let fresh_cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let mut fresh = startup_session_with(&fresh_cli, &content.base_registry, &content.config);
+        assert_eq!(fresh.clock.day_index, 3, "the same save reopens its day");
+        assert_eq!(
+            fresh.clock.time_of_day, 6_000,
+            "the same save reopens its time of day"
+        );
+        let fresh_recipe = fresh
+            .registry
+            .recipe_by_name("mymod:gem_recipe")
+            .expect("the fresh registry carries the edited recipe");
+        assert_eq!(fresh_recipe.count, 2);
+        assert!(fresh_recipe.enabled);
+
+        let mut grid = crafting_demo_grid(
+            &fresh.registry,
+            GridKind::Player,
+            &["S"],
+            &[('S', ItemId::Block(BlockId::Stone))],
+        );
+        assert_eq!(
+            grid.preview_with(&fresh.registry)
+                .map(|preview| preview.output_count),
+            Some(2),
+            "the production matcher previews the new count"
+        );
+        let mut inventory = Inventory::empty();
+        let crafted = grid
+            .take_result_with(&fresh.registry, &mut inventory)
+            .expect("the new count crafts through the production matcher");
+        assert_eq!(crafted.count(), 2);
+        assert_eq!(
+            fresh.take_content_notice().as_deref(),
+            Some("content definitions changed"),
+            "the existing one-time content notice is unchanged"
+        );
+
+        let fresh_app_cli =
+            CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let fresh_app = GameApp::new_with_content(
+            fresh_app_cli,
+            fresh,
+            content,
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(
+            fresh_app.creator.restart_required, None,
+            "a fresh process starts with no pending restart"
+        );
+        assert_eq!(
+            fresh_app
+                .base_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(2)
+        );
+    }
+
     #[test]
     fn pack_manifest_add_block_sets_restart_required_without_moving_layers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -36572,7 +37028,8 @@ selected_name_secs = 0.5
         let reason = app
             .creator
             .restart_required
-            .as_deref()
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
             .expect("content change requires a restart");
         assert_eq!(reason, "textures: content changed; restart to apply");
         assert_eq!(app.creator.pack_status.as_deref(), Some(reason));

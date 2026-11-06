@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use crate::config::watch::{CONFIG_POLL_INTERVAL, CONFIG_SETTLE_INTERVAL};
 use crate::content::names;
+use crate::content::spec::PackContentSpec;
 use crate::pack::presentation::PackPresentation;
 use crate::pack::{LAYER_FILES, MOB_LAYER_FILES, PACKS_DIR};
 use crate::render::texture::MOB_LAYER_BASE;
@@ -45,6 +46,30 @@ pub enum PackFileKind {
     /// sprite name. The name is resolved to a `'static` spelling at build time
     /// so the enum stays `Copy`.
     BuiltinIcon { name: &'static str },
+}
+
+/// Why one settled `pack.toml` edit needs a restart.
+///
+/// `Recipe` is the truthful narrow case: only authored recipes or built-in
+/// recipe patches changed, while every other content field (including
+/// presentation-only assets and `[builtin_icons]`) repaired to the installed
+/// value. Everything else is `Content`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartKind {
+    /// Allocated content, identity, or any non-recipe definition changed.
+    Content,
+    /// Only `[[recipes]]` or `[[recipe_patches]]` changed.
+    Recipe,
+}
+
+impl RestartKind {
+    /// Stable phrase used by the overlay, the Packs message, and the trace.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::Content => "content changed",
+            Self::Recipe => "recipe changed",
+        }
+    }
 }
 
 /// One watched pack file with frozen provenance.
@@ -238,6 +263,63 @@ pub fn restart_line(reason: &str) -> String {
     format!("creator: restart-required reason={}", single_line(reason))
 }
 
+/// Classify one settled manifest edit as recipe-only or broader content.
+///
+/// Recipe/recipe-patch edits live inside the watched `pack.toml` and move the
+/// content fingerprint like any other definition. A recipe-only edit must say
+/// so, but only when nothing else changed: both specs are cloned and their
+/// recipe fields are cleared, so equality after clearing proves the edit was
+/// confined to recipes. Authored asset bytes and `[builtin_icons]` are cleared
+/// too because they are presentation-only (S07/MEM635): a texture/icon edit
+/// settled in the same manifest write must not turn a recipe rename into
+/// `content changed`.
+///
+/// An installed spec is always present for a loaded pack; `None` means the
+/// folder did not contribute a spec at install time, which is broad content.
+pub fn restart_kind(
+    installed: Option<&PackContentSpec>,
+    candidate: &PackContentSpec,
+) -> RestartKind {
+    let Some(installed) = installed else {
+        return RestartKind::Content;
+    };
+    let recipes_changed = installed.recipes != candidate.recipes
+        || installed.recipe_patches != candidate.recipe_patches;
+    if !recipes_changed {
+        return RestartKind::Content;
+    }
+
+    let mut installed_rest = installed.clone();
+    let mut candidate_rest = candidate.clone();
+    for spec in [&mut installed_rest, &mut candidate_rest] {
+        spec.recipes.clear();
+        spec.recipe_patches.clear();
+        spec.assets.clear();
+        spec.builtin_icons.clear();
+    }
+    if installed_rest == candidate_rest {
+        RestartKind::Recipe
+    } else {
+        RestartKind::Content
+    }
+}
+
+/// Compose the sorted per-folder restart reasons, or `None` when empty.
+///
+/// Entries are rendered in input order: `"a: recipe changed, b: content
+/// changed; restart to apply"`. The caller supplies folders in sorted order.
+pub fn restart_reason(entries: &[(String, RestartKind)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let folders = entries
+        .iter()
+        .map(|(folder, kind)| format!("{folder}: {}", kind.phrase()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{folders}; restart to apply"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +327,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::content::registry::{build_registry, PackIdentity};
-    use crate::content::spec::{BlockEntry, BlockTextures, PackAsset, PackContentSpec};
+    use crate::content::spec::{
+        BlockEntry, BlockTextures, PackAsset, PackContentSpec, RecipeEntry, RecipePatch,
+    };
     use crate::content::ContentRegistry;
     use crate::pack::manifest;
     use crate::pack::sound::SoundSpec;
@@ -680,6 +764,113 @@ mod tests {
         assert!(!watch.observe(0, Some(7), base + Duration::from_millis(259)));
         assert!(watch.observe(0, Some(7), base + Duration::from_millis(260)));
         assert!(!watch.observe(0, Some(7), base + Duration::from_millis(400)));
+    }
+
+    fn restart_recipe(id: &str) -> RecipeEntry {
+        RecipeEntry {
+            id: id.to_string(),
+            pattern: vec!["S".to_string()],
+            key: std::collections::BTreeMap::from([('S', "stone".to_string())]),
+            output: "mymod:gem".to_string(),
+            count: 1,
+        }
+    }
+
+    fn restart_element() -> BlockEntry {
+        BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 3.0,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+        }
+    }
+
+    #[test]
+    fn restart_kind_classifies_recipe_only_edits() {
+        let installed = PackContentSpec::default();
+        let mut candidate = installed.clone();
+        candidate.recipes.push(restart_recipe("mymod:gem_recipe"));
+        assert_eq!(
+            restart_kind(Some(&installed), &candidate),
+            RestartKind::Recipe,
+            "a recipe-only edit says recipe changed"
+        );
+        assert_eq!(RestartKind::Recipe.phrase(), "recipe changed");
+        assert_eq!(RestartKind::Content.phrase(), "content changed");
+
+        // Recipe patches are the same restart class as authored recipes.
+        let mut installed_patch = PackContentSpec::default();
+        installed_patch.recipe_patches.push(RecipePatch {
+            id: "planks".to_string(),
+            enabled: true,
+        });
+        let mut candidate_patch = installed_patch.clone();
+        candidate_patch.recipe_patches[0].enabled = false;
+        assert_eq!(
+            restart_kind(Some(&installed_patch), &candidate_patch),
+            RestartKind::Recipe
+        );
+
+        // A mixed edit keeps the broad reason even though recipes also moved.
+        let mut mixed = candidate.clone();
+        mixed.blocks.push(restart_element());
+        assert_eq!(restart_kind(Some(&installed), &mixed), RestartKind::Content);
+
+        // Presentation-only bytes/overrides never make a recipe edit broad:
+        // both clones clear them before comparing the remaining definitions.
+        let mut installed_asset = installed.clone();
+        installed_asset.assets.insert(
+            "gem.png".to_string(),
+            PackAsset {
+                rgba: vec![1; LAYER_BYTES],
+                source_side: 16,
+            },
+        );
+        let mut candidate_asset = candidate.clone();
+        candidate_asset.assets.insert(
+            "gem.png".to_string(),
+            PackAsset {
+                rgba: vec![2; LAYER_BYTES],
+                source_side: 16,
+            },
+        );
+        candidate_asset
+            .builtin_icons
+            .insert("apple".to_string(), "apple.png".to_string());
+        assert_eq!(
+            restart_kind(Some(&installed_asset), &candidate_asset),
+            RestartKind::Recipe,
+            "asset bytes and builtin icons are presentation-only"
+        );
+
+        // No change at all is still the broad class (there is no cause).
+        assert_eq!(
+            restart_kind(Some(&installed), &installed),
+            RestartKind::Content
+        );
+        assert_eq!(restart_kind(None, &candidate), RestartKind::Content);
+    }
+
+    #[test]
+    fn restart_reason_joins_sorted_entries_with_the_shared_suffix() {
+        assert_eq!(restart_reason(&[]), None);
+        assert_eq!(
+            restart_reason(&[("demo".to_string(), RestartKind::Recipe)]),
+            Some("demo: recipe changed; restart to apply".to_string())
+        );
+        assert_eq!(
+            restart_reason(&[
+                ("a".to_string(), RestartKind::Recipe),
+                ("b".to_string(), RestartKind::Content),
+            ]),
+            Some("a: recipe changed, b: content changed; restart to apply".to_string())
+        );
     }
 
     #[test]

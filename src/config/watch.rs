@@ -202,6 +202,36 @@ impl ReloadStatus {
     }
 }
 
+/// Durable reason a settled pack edit cannot apply to the live session.
+///
+/// Kept as a typed wrapper so callers cannot confuse the restart reason with
+/// any other free-form status line (pack apply status, last error, or a
+/// transient menu message).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartRequired {
+    pub reason: String,
+}
+
+impl RestartRequired {
+    /// Hold one already-composed reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Borrow the reason for equality checks and status composition.
+    pub fn as_str(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for RestartRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
 /// Dev-only creator state: watcher plus the overlay/restart facts the app
 /// reads each frame. The struct owns no GPU, logging, or wall-clock state,
 /// so every field is testable headlessly.
@@ -215,7 +245,7 @@ pub struct CreatorRuntime {
     /// and after every stack apply, so the overlay only grows a `packs:` line
     /// when there is a real pack event to report.
     pub pack_status: Option<String>,
-    pub restart_required: Option<String>,
+    pub restart_required: Option<RestartRequired>,
 }
 
 impl CreatorRuntime {
@@ -276,7 +306,7 @@ impl CreatorRuntime {
 
     /// Hold a durable restart requirement (S03/S08); S02 only displays it.
     pub fn set_restart_required(&mut self, reason: impl Into<String>) {
-        self.restart_required = Some(reason.into());
+        self.restart_required = Some(RestartRequired::new(reason));
     }
 
     /// Clear a satisfied restart requirement.
@@ -965,6 +995,17 @@ mod tests {
         creator.set_restart_required("recipe changed");
         let restart = overlay_lines(&runtime, &creator, 140).join("\n");
         assert!(restart.contains("restart required: recipe changed"));
+        assert_eq!(
+            creator
+                .restart_required
+                .as_ref()
+                .map(RestartRequired::as_str),
+            Some("recipe changed")
+        );
+        assert_eq!(
+            creator.restart_required.as_ref().map(ToString::to_string),
+            Some("recipe changed".to_string())
+        );
 
         creator.clear_restart_required();
         let cleared = overlay_lines(&runtime, &creator, 140).join("\n");
