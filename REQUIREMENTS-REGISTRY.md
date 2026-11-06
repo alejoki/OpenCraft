@@ -709,6 +709,116 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M010/S01, M010/S02, M010/S03, M010/S04, M010/S05, M010/S06, M010/S07
 - Validation: bash scripts/modding_smoke.sh; SMOKE_PROFILE=release bash scripts/modding_smoke.sh; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings; cargo test --locked; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
 
+### R071 — Curated six-file config tree, typed registry, and generated docs
+- Class: core-capability
+- Status: active
+- Description: A checked-in `config/` tree of six files (player, survival, combat, world, mining, render) is the single creator balance surface: a static registry of 85 typed keys declares each file, kind, default, range, unit, apply mode, and description; `docs/CONFIG.md` embeds the registry table; and no game path writes, creates, or rewrites a config file.
+- Why it matters: Creator balance must be data with one source of truth, not scattered constants or a second settings file.
+- Source: M014 / S01 config tree and registry
+- Primary owning slice: M014/S01
+- Supporting slices: M014/S02, M014/S05, M014/S06
+- Validation: cargo test --locked --lib -- config::registry; cargo test --locked --test config_cli; bash scripts/creator_smoke.sh
+
+### R072 — Config per-field fallback, per-file live atomicity, and effective-value digest
+- Class: quality-attribute
+- Status: active
+- Description: Startup loads each curated file with per-field fallback, typed range/type diagnostics, and whole-file cross-field rejection; live reload commits a file only when the whole candidate is valid, keeps the file's last-good values/origins/digest on any rejection, and treats a missing file as a legal reset to defaults; the digest hashes effective values and schema, never file bytes.
+- Why it matters: A typo must never half-apply a file or silently move the save digest.
+- Source: M014 / S01 loader and S02 live atomicity
+- Primary owning slice: M014/S01
+- Supporting slices: M014/S02
+- Validation: cargo test --locked --lib -- config::; cargo test --locked --bin opencraft creator; bash scripts/creator_smoke.sh
+
+### R073 — Dev polling watcher with settle, burst/atomic handling, and last-good apply
+- Class: primary-user-loop
+- Status: active
+- Description: A dev-only 10 Hz content-fingerprint watcher baselines the six config files and active pack entries, collapses atomic temp+rename and rapid/partial writes behind a 250 ms settle, applies valid settled edits live, rejects invalid/truncated/empty/no-key files without replacing last good, never blocks a valid sibling, and is clamped into the existing event-loop wait.
+- Why it matters: The tuning loop is only useful if external editor saves apply promptly and one bad file cannot break the session.
+- Source: M014 / S02 watcher
+- Primary owning slice: M014/S02
+- Supporting slices: M014/S03, M014/S08
+- Validation: cargo test --locked --lib -- config::watch; cargo test --locked --lib -- settle; cargo test --locked --bin opencraft creator; bash scripts/creator_smoke.sh
+
+### R074 — Read-only F6 overlay and stable no-timestamp creator trace
+- Class: operability
+- Status: active
+- Description: A toggleable, off-by-default read-only F6 overlay groups every live registry value by file with current value, default/file origin, and apply mode; it shows digest/schema/pending/error counts, last reload status, pack status, and any restart-required reason. `--creator-trace` prints stable timestamp-free applied/rejected/texture/restart lines; both are dev-only and never ship in release.
+- Why it matters: A creator must be able to see what is live and why an edit failed without reading logs or source.
+- Source: M014 / S02 overlay and trace
+- Primary owning slice: M014/S02
+- Supporting slices: M014/S03, M014/S08
+- Validation: cargo test --locked --lib -- config::watch; cargo test --locked --bin opencraft creator; bash scripts/creator_smoke.sh
+
+### R075 — Headless --check-config exit and diagnostic contract
+- Class: operability
+- Status: active
+- Description: `--check-config` is a headless pre-startup audit: it opens no window, GPU, settings file, save, or pack stack; valid input exits 0 even with missing files/unknown keys; invalid TOML/types/ranges/cross-field errors exit nonzero with stable `config/<file>[: <key>]: <reason>` lines; release builds reject the switch with `check-config: dev build only` and exit nonzero without launching.
+- Why it matters: Creators need deterministic validation evidence without a launch, and release builds must not expose the dev audit.
+- Source: M014 / S01 check-config and S09 release rejection
+- Primary owning slice: M014/S01
+- Supporting slices: M014/S09
+- Validation: cargo test --locked --test config_cli; cargo test --release --locked --test config_cli; SMOKE_PROFILE=release bash scripts/creator_smoke.sh
+
+### R076 — Live block/mob texture reload with frozen allocation
+- Class: core-capability
+- Status: active
+- Description: In a dev build, the 25 block and 13 mob fixed-name textures and the allocated v2 block-face assets re-decode and re-upload only changed array layers at frozen indices; corrupt/non-square/out-of-range PNGs keep the last good layer; deletion reveals the lower pack or procedural art; manifest content/allocation changes set restart-required without moving a layer or touching the live registry.
+- Why it matters: Visual tuning is the core loop, and allocation drift would render the wrong texture.
+- Source: M014 / S03 live texture reload
+- Primary owning slice: M014/S03
+- Supporting slices: M014/S09
+- Validation: cargo test --locked --bin opencraft pack_texture; cargo test --locked --bin opencraft pack_manifest; bash scripts/pack_smoke.sh; bash scripts/creator_smoke.sh
+
+### R077 — Live built-in item sprite overrides
+- Class: core-capability
+- Status: active
+- Description: A v2 `[builtin_icons]` table maps frozen built-in material/tool names to pack-relative PNGs; later packs win per name; overrides target fixed base layers 0..=26 and never pack icons; malformed/missing art keeps the last good override or procedural sprite; add/remove/repoint edits apply live through the item-sprite atlas without moving the content digest or requiring restart.
+- Why it matters: Built-in item art is a visible tuning surface and must be overrideable without identity churn.
+- Source: M014 / S07 built-in item overrides
+- Primary owning slice: M014/S07
+- Supporting slices: M014/S03, M014/S09
+- Validation: cargo test --locked --lib -- pack::v2; cargo test --locked --bin opencraft pack_builtin_icon; bash scripts/pack_smoke.sh; bash scripts/ui_smoke.sh
+
+### R078 — Durable restart-required recipe/pack content boundary with same-save restart
+- Class: primary-user-loop
+- Status: active
+- Description: A settled `pack.toml` edit that changes only recipes or recipe patches reports `<folder>: recipe changed; restart to apply` (mixed/other content says `content changed`) in the overlay, packs message, and one trace line while the live session registry, allocation, and texture path stay frozen; after relaunch the same save resolves every name, previews/crafts the new recipe, and shows the existing one-time content notice.
+- Why it matters: Recipes are identity-bearing content, so the restart boundary must be explicit and provably safe on the same save.
+- Source: M014 / S08 restart boundary
+- Primary owning slice: M014/S08
+- Supporting slices: M014/S03, M014/S09
+- Validation: cargo test --locked --bin opencraft pack_recipe; bash scripts/crafting_smoke.sh; bash scripts/creator_smoke.sh
+
+### R079 — Save v9 config schema+digest, v8 migration, and one-shot notice
+- Class: continuity
+- Status: active
+- Description: SAVE_VERSION 9 appends a bounded 10-byte config tail (u16 schema + u64 effective-value digest) after the content tail; v8 loads with `saved_config=None` and no config notice; zero/truncated/trailing tails fail closed; a changed schema or digest produces exactly one non-blocking notice while the world stays playable; the writer emits only validated effective metadata.
+- Why it matters: A save must remain explainable against the tuning that wrote it without freezing config per world or blocking old saves.
+- Source: M014 / S04 save v9
+- Primary owning slice: M014/S04
+- Supporting slices: None
+- Validation: cargo test --locked --test save_v9_cli; cargo test --locked --lib -- world::persistence; bash scripts/creator_smoke.sh
+
+### R080 — Release gating for creator tooling
+- Class: constraint
+- Status: active
+- Description: Release builds load `config/` and packs at startup but expose no watcher, F6 overlay, or creator trace; `--check-config` and `--creator-trace` print stable `...: dev build only` lines and exit nonzero without launching; no test pack ships under `packs/`; the headless `--demo-save-v9` and `--demo-restart` proof seams remain usable in release; a bounded release launch from an empty temp cwd survives without creator output or writes.
+- Why it matters: Release hygiene is the milestone guardrail: players get stable defaults and pack loading, never creator tooling or test fixtures.
+- Source: M014 / S09 release gating
+- Primary owning slice: M014/S09
+- Supporting slices: M014/S02, M014/S03
+- Validation: cargo build --locked --release; cargo test --release --locked --test config_cli; SMOKE_PROFILE=release bash scripts/creator_smoke.sh
+
+### R081 — M014 closure surface: docs, creator smoke, requirements trace, human UAT
+- Class: launchability
+- Status: active
+- Description: M014 closes with updated CONFIG/TEXTURE-PACKS/SAVE-NOTES/README docs, a debug+release `scripts/creator_smoke.sh` covering config, texture, restart-recipe, v8-to-v9, and release legs, a checked-in `docs/UAT-M014.md` runbook, the registry/checker/selftest carrying R071-R080 and a 12-row M014 criterion trace, and an owner tuning pass whose human judgments are recorded rather than inferred.
+- Why it matters: Closure must be reproducible on the assembled tree, and the sensory tuning judgments require a human owner.
+- Source: M014 / S09 closure and S10 human UAT
+- Primary owning slice: M014/S09
+- Supporting slices: M014/S01, M014/S02, M014/S03, M014/S04, M014/S05, M014/S06, M014/S07, M014/S08, M014/S10
+- Validation: bash scripts/creator_smoke.sh; SMOKE_PROFILE=release bash scripts/creator_smoke.sh; cargo test --locked; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; recorded human tuning pass in docs/UAT-M014.md
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -811,3 +921,20 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 9 | R064 | S03 | cargo test --locked --lib -- world::persistence && cargo test --locked --bin opencraft -- modding_acceptance_placeholder |
 | 10 | R063, R069 | S02, S08 | bash scripts/validate_pack_smoke.sh && bash scripts/modding_smoke.sh |
 | 11 | R062, R063, R064, R065, R066, R067, R068, R069 | S01, S02, S03, S04, S05, S06, S07, S08 | cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && bash scripts/modding_smoke.sh && bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh |
+
+## M014 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R071, R072 | S01, S02, S05, S06 | cargo test --locked --lib -- config::; cargo test --locked --bin opencraft creator; cargo test --locked --lib -- player::survival; cargo test --locked --lib -- world::spawning; bash scripts/creator_smoke.sh |
+| 2 | R075 | S01, S09 | cargo test --locked --test config_cli; SMOKE_PROFILE=release bash scripts/creator_smoke.sh |
+| 3 | R073 | S02 | cargo test --locked --lib -- config::watch; cargo test --locked --lib -- settle; cargo test --locked --bin opencraft creator |
+| 4 | R074 | S02 | cargo test --locked --lib -- config::watch; cargo test --locked --bin opencraft creator |
+| 5 | R076, R065 | S03 | cargo test --locked --bin opencraft pack_texture; cargo test --locked --bin opencraft pack_manifest; bash scripts/pack_smoke.sh |
+| 6 | R077, R055 | S07 | cargo test --locked --lib -- pack::v2; cargo test --locked --bin opencraft pack_builtin_icon; bash scripts/ui_smoke.sh |
+| 7 | R078, R063 | S08 | cargo test --locked --bin opencraft pack_recipe; bash scripts/crafting_smoke.sh; bash scripts/creator_smoke.sh |
+| 8 | R079, R064 | S04 | cargo test --locked --test save_v9_cli; bash scripts/creator_smoke.sh |
+| 9 | R080 | S09 | cargo build --locked --release; SMOKE_PROFILE=release bash scripts/creator_smoke.sh |
+| 10 | R081, R069 | S09 | bash scripts/creator_smoke.sh; SMOKE_PROFILE=release bash scripts/creator_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh |
+| 11 | R081 | S10 | recorded human tuning pass in docs/UAT-M014.md |
+| 12 | R081 | S09, S10 | cargo test --locked; M014 out-of-scope guardrail recorded in docs and decisions |
