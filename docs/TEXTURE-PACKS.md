@@ -463,7 +463,23 @@ Development builds watch the active pack stack while the game is running, so you
 
 **Applies when the world is loaded again**
 
-Editing `pack.toml` is compared against the content identity captured when the stack was applied. An edit that moves content — blocks, items, tiers, tools, recipes, worldgen, or the pack block-face/icon allocation that follows from them — sets `restart required: <folder>: content changed; restart to apply` in the F6 overlay and shows the same reason on its `packs:` line. The Packs screen and a transient notice add `content changes apply when the world is loaded again`. No live layer index moves and no layer is re-uploaded. Quit and relaunch the game, then load the same save, to use the new registry. Editing the manifest back to the installed content clears the requirement. `[builtin_icons]` edits are the exception: the table is presentation-only and reconciles live even when another field in the same manifest edit still requires a restart.
+Editing `pack.toml` is compared against the content identity captured when the stack was applied. An edit that moves content sets a restart requirement whose reason names exactly what moved:
+
+- An edit confined to `[[recipes]]` or `[[recipe_patches]]` says `recipe changed`, for example `restart required: <folder>: recipe changed; restart to apply`.
+- An edit that touches blocks, items, tiers, tools, worldgen, or the pack block-face/icon allocation that follows from them — or a mixed edit that changes recipes alongside any of those — says `content changed`, for example `restart required: <folder>: content changed; restart to apply`.
+
+The same reason appears on the overlay's `packs:` line. When several packs need a restart, their reasons are joined in folder order, for example `a: recipe changed, b: content changed; restart to apply`. The Packs screen and a transient notice add `content changes apply when the world is loaded again`. `[builtin_icons]` edits are the exception: the table is presentation-only and reconciles live even when another field in the same manifest edit still requires a restart.
+
+The live registry, allocation, and texture path stays frozen while a restart is required. No live layer index moves, no layer is re-uploaded, and the current session keeps the content it loaded. Presentation still updates immediately, so texture and `[builtin_icons]` edits keep applying live while a content edit waits for the restart. Quit and relaunch the game, then load the same save, to use the new registry. That same-save load shows the one-time `content definitions changed` notice after the world is open and playable, and the edited recipe or definition then works normally on that save. Editing the manifest back to the installed content clears the requirement without a restart.
+
+The two-run `--demo-restart` seam proves that path headlessly in debug and release. With the `mymod-ruby` fixture installed as `packs/mymod-ruby`, its first run (with `--new`) writes a fixture save; after the recipe edit, a second run on the same save reports the content notice and the edited recipe's preview and craft counts:
+
+```text
+restart: leg=save recipe=mymod:ruby_stew count=1 day=3 tick=6000 saved=true
+restart: ok
+restart: leg=load recipe=mymod:ruby_stew count=2 preview=2 crafted=2 unresolved=0 day=3 tick=6000 notice=content definitions changed playable=true
+restart: ok
+```
 
 **Not live-texture-reloaded**
 

@@ -21,6 +21,7 @@ OpenCraft is an open-source voxel game engine built from scratch in Rust, inspir
     *   Settings are saved to and loaded from a `settings.toml` file.
 *   **Texture Packs**: Swap block and mob textures plus menu presentation with folder-based packs — a `pack.toml` plus optional PNGs, no code required. The texture array has 48 layers: 23 authorable block textures (the original 16 plus Farmland, four Wheat stages, Chest, and LootChest) and 13 authorable mob part textures, each with optional per-layer overrides; a pack that supplies only the original 16 block layers falls back per layer to the built-in procedural art. See the [texture pack authoring guide](docs/TEXTURE-PACKS.md).
 *   **Data-Only Content Packs**: A `format_version = 2` pack adds blocks, items, food, custom tool tiers and tools, shaped recipes, per-field block patches, recipe toggles, and declarative ore or surface worldgen without writing code. Save format 8 stores content by name, so a removed pack's blocks and items survive as readable placeholders and resolve again when the pack returns; a changed stack reports a non-blocking notice, and `--validate-pack` checks a pack headlessly. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#format-v2).
+*   **Creator Tuning (dev builds)**: A curated six-file `config/` tree — `player.toml`, `survival.toml`, `combat.toml`, `world.toml`, `mining.toml`, and `render.toml` — covers movement/camera, survival, combat, world/weather/spawning, mining/farming, and render/UI. Edits apply live in a debug build through a polling watcher, a read-only F6 overlay shows every curated value's source and apply mode, and `--creator-trace` prints stable timestamp-free lines; `--check-config` audits a tree headlessly. Pack block, mob, and built-in item textures reload live, while recipe and other content edits set a clear restart-required boundary and apply on the next load of the same save. Save v9 records the effective config schema and digest so a changed config warns once without blocking the world. Release builds keep config and pack loading but expose none of the creator tools. See the [configuration guide](docs/CONFIG.md).
 *   **Customizable Menu Background**: The panorama behind the main menu is its own saved world at `saves/background/background.mcvx`. Choose **Edit Background** on the main menu to build it with the normal controls; the menu resumes your saved vantage point, time of day, and season. A missing or unreadable file falls back to the built-in scenery and never blocks launch.
 *   **Save Compatibility**: Loading a world from an older release keeps every block you edited, regenerates the terrain you never touched, and starts its calendar at day 0. Version 9 saves round-trip the game mode, health/hunger/air, every chest's contents, every live mob's kind, position, facing, and health, the save-local content names, and the effective config schema and digest. Version 1-8 saves load and gain the newer tails on the next save, and version 1-5 saves also load as Creative with full vitals. A version 8 save carries no config record, so it loads with no config notice; a changed config or schema shows exactly one non-blocking notice. Malformed mob, content, or config data is rejected rather than skipped. See the [save and release notes](docs/SAVE-NOTES.md).
 *   **Comprehensive UI System**:
@@ -90,6 +91,11 @@ You can also launch directly into a world using command-line flags, bypassing th
 *   `--creative` / `--survival`: Select the game mode for a fresh world only. The last flag wins; a loaded world keeps its stored mode.
 *   `--demo-combat`: Run the scripted mob/combat capstone — dusk spawn, walking, melee and drops, a zombie fight, a bow shot, a skeleton shot, Creative inertness, save, and a relaunch restore — then exit. This is a development flag, not a player feature.
 *   `--demo-save-v9`: Load a v8 save, write a derived v9 file next to it without modifying the input, and print the load, resave, and matching-config proof, then exit. This is a development flag, not a player feature.
+*   `--demo-restart`: Run the two-run same-save restart proof. The first run (with `--new`) writes a fixture save; after a recipe edit, a second run on the same save reports the one-time content notice and previews and crafts the edited recipe, then exits. This is a development flag, and it also works in release.
+*   `--check-config`: Audit `config/` headlessly and print stable `ok:`/`warning:`/`error:` lines. Debug builds only; a release build rejects it before any startup work.
+*   `--creator-trace`: Print one stable, timestamp-free line per applied or rejected config/pack reload. Debug builds only; a release build rejects it before any startup work.
+
+A release build loads `config/` and packs at startup exactly like a debug build, but it contains no watcher, no F6 overlay, and no creator trace output. It rejects `--check-config` with exactly `check-config: dev build only` and `--creator-trace` with exactly `creator-trace: dev build only`, each exiting 1 and creating no settings, saves, or packs. The headless `--demo-save-v9`, `--demo-restart`, and `--validate-pack` seams remain available in release.
 
 For example, to start a new world with seed 4242:
 
@@ -140,6 +146,13 @@ SMOKE_PROFILE=release bash scripts/modding_smoke.sh
 ```
 
 The headless `--demo-presentation`, `--demo-crafting`, `--demo-worldgen`, and `--demo-palette` digests replay the authored content through the production seams. See the [content pack authoring guide](docs/TEXTURE-PACKS.md#reference-packs) for the stack order and what each digest covers.
+
+`scripts/creator_smoke.sh` is the real-binary proof for the M014 creator surface. In isolated temp cwds it checks `--check-config` on a copied `config/` tree (valid, invalid, and restored), live config apply/reject under `--creator-trace`, live block/mob/built-in item texture reload, the restart-required recipe boundary with the two-run `--demo-restart` proof, the v8-to-v9 save migration, and release hygiene: rejection of `--check-config` and `--creator-trace`, and a bounded release launch with no creator output and no test packs. It is green in debug and release:
+
+```bash
+bash scripts/creator_smoke.sh
+SMOKE_PROFILE=release bash scripts/creator_smoke.sh
+```
 
 ## 🎮 Controls
 

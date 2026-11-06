@@ -115,9 +115,19 @@ effective values change. That makes common edits predictable:
 ## Creator tools (dev builds)
 
 Debug builds add two tools on top of live reload. Release builds load
-`config/` at startup exactly like debug builds and still support
-`--check-config`, but contain no watcher, no overlay, and no creator trace
-output; the creator tools are not available in release.
+`config/` at startup exactly like debug builds, but contain no watcher, no F6
+overlay, and no trace output, and they reject both creator switches before any
+startup work:
+
+- `--check-config` prints exactly `check-config: dev build only` and exits 1.
+- `--creator-trace` prints exactly `creator-trace: dev build only` and exits 1.
+- When both switches are present, the check-config line wins and is the only
+  line printed.
+
+A rejected release launch reads no settings file, pack stack, save, or config
+tree. The creator tools are not available in release. The headless demo and
+validation seams (`--demo-save-v9`, `--demo-restart`, `--validate-pack`) are
+separate from the creator tools and remain available.
 
 ### F6 overlay
 
@@ -135,8 +145,13 @@ last reload status. When a settled pack edit has an outcome to report, a
 applied texture path or the rejected file and reason. When an active restart
 requirement exists, a `restart required:` line names the reason; besides a
 config reason, it can name a pack-content change such as
-`my-first-pack: content changed; restart to apply`. For a file with errors,
-the overlay shows the first error and a count of any additional errors.
+`my-first-pack: content changed; restart to apply` or, for an edit confined to
+recipes, `my-first-pack: recipe changed; restart to apply`. A recipe-only edit
+(only `[[recipes]]` or `[[recipe_patches]]` differs from the installed
+manifest) says `recipe changed`; a mixed edit that also changes blocks, items,
+tiers, tools, worldgen, or allocation says `content changed`. For a file with
+errors, the overlay shows the first error and a count of any additional
+errors.
 
 A rejected edit also produces a transient in-game message shaped
 `config/<file>: <key>: <reason>`, for example
@@ -153,16 +168,24 @@ creator: applied file=config/player.toml changed=2 digest=0x...
 creator: rejected file=config/player.toml field=movement.walk_speed reason=value 0 is below minimum 0.5
 ```
 
-File-level rejections omit `field`. Lines follow the order in which files
-settle, so a trace can be diffed across runs. The trace is an explicit opt-in
-even in a debug build: normal runs and `--demo-*` runs without the flag print
-nothing.
+File-level rejections omit `field`. Within one poll, lines follow registry file
+order — player, survival, combat, world, mining, render — and a line appears
+when its file settles. A file that did not change in that poll produces no
+line, so the trace stays stable and timestamp-free and can be diffed across
+runs. The trace is an explicit opt-in even in a debug build: normal runs and
+`--demo-*` runs without the flag print nothing.
 
 ## Checking a config tree
 
-Run `opencraft --check-config` from the directory containing `config/`. It is
-a headless check: it opens no window, GPU, save, pack stack, or settings file,
-and it never writes anything.
+`--check-config` is a debug-build audit. Run it from the directory containing
+`config/`. It is a headless check: it opens no window, GPU, save, pack stack,
+or settings file, and it never writes anything.
+
+A release build rejects the switch before any startup work. It prints exactly
+`check-config: dev build only`, exits 1, and reads no settings file, pack
+stack, save, or config tree; `--creator-trace` is rejected the same way with
+`creator-trace: dev build only`. The debug behavior, exit status, and line
+shapes below are unchanged.
 
 ```text
 opencraft --check-config
@@ -212,11 +235,18 @@ the schema version so a save can notice that gameplay tuning changed.
 
 Configuration loading works in both development and release builds. Debug
 builds also run the live loop described in [Live reload](#live-reload) and the
-[creator tools](#creator-tools-dev-builds). Release builds still load
-`config/` at startup and still support `--check-config`, but they contain no
-watcher, no F6 overlay, and no creator trace output. The creator tools are not
-available in release. No release build is required to edit `config/`; use
-`--check-config` in either build to validate before launching.
+[creator tools](#creator-tools-dev-builds). Release builds load `config/` at
+startup exactly like debug builds, but they contain no watcher, no F6 overlay,
+and no trace output. They also reject the two creator switches before any
+startup work:
+
+- `--check-config` prints exactly `check-config: dev build only` and exits 1.
+- `--creator-trace` prints exactly `creator-trace: dev build only` and exits 1.
+
+No release build is required to edit `config/`; validate a tree before
+launching with `--check-config` in a debug build. Normal config and pack
+loading, and the headless `--demo-save-v9`, `--demo-restart`, and
+`--validate-pack` seams, remain available in release.
 
 ## Not in the curated registry
 
