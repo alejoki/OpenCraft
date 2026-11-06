@@ -4,9 +4,7 @@ use crate::content::ContentRegistry;
 
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
-use crate::player::eating::{
-    food_value, food_value_with, food_value_with_registry_rules, EatingRules,
-};
+use crate::player::eating::{food_value, food_value_with_registry_rules, EatingRules};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
     InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
@@ -3098,7 +3096,7 @@ mod tests {
         let mut player = food_player(apple_item(2), 10);
 
         let applied =
-            player.eat_selected_with_rules(&registry, &rules, 0, ItemId::Material(Material::Apple));
+            player.eat_selected_with_rules(registry, &rules, 0, ItemId::Material(Material::Apple));
 
         assert_eq!(applied, Some(7), "the tuned built-in restore applies");
         assert_eq!(player.survival.hunger(), 17);
@@ -3107,7 +3105,7 @@ mod tests {
         // The default wrapper still restores the frozen four.
         let mut player = food_player(apple_item(1), 10);
         assert_eq!(
-            player.eat_selected_with(&registry, 0, ItemId::Material(Material::Apple)),
+            player.eat_selected_with(registry, 0, ItemId::Material(Material::Apple)),
             Some(4)
         );
         assert_eq!(player.survival.hunger(), 14);

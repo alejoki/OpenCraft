@@ -982,14 +982,14 @@ mod tests {
         );
 
         let registry = ContentRegistry::builtin();
-        let target = EatingTarget::new_with_rules(&registry, &rules, 0, apple(), 10)
+        let target = EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10)
             .expect("tuned apple target");
         assert_eq!(target.restore(), 7);
         assert!((target.duration() - 0.5).abs() < 1e-6);
 
         // The default wrapper keeps the frozen table and 1.6 s duration.
         let default_target =
-            EatingTarget::new_with(&registry, 0, apple(), 10).expect("default apple target");
+            EatingTarget::new_with(registry, 0, apple(), 10).expect("default apple target");
         assert_eq!(default_target.restore(), APPLE_HUNGER);
         assert_eq!(default_target.duration(), EAT_DURATION_SECS);
     }
@@ -1030,7 +1030,7 @@ mod tests {
         };
         let registry = ContentRegistry::builtin();
         let target =
-            EatingTarget::new_with_rules(&registry, &rules, 0, apple(), 10).expect("tuned target");
+            EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10).expect("tuned target");
         let mut eating = EatingState::new();
 
         assert!(matches!(
@@ -1056,7 +1056,7 @@ mod tests {
                 ..EatingRules::default()
             };
             assert!(
-                EatingTarget::new_with_rules(&registry, &rules, 0, apple(), 10).is_none(),
+                EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10).is_none(),
                 "duration {duration} must not become a target"
             );
         }

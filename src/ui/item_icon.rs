@@ -23,11 +23,11 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
-use super::inventory::{InventoryLayout, InventoryMode, Rect};
+use super::inventory::{InventoryMode, InventoryPanel, Rect};
 use super::palette::{self, PaletteLayout, PaletteScreen};
 use crate::content::{ContentRegistry, PACK_ICON_BASE, PACK_ICON_CAP};
 use crate::player::inventory::{
-    CraftingGrid, Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
+    Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
 };
 use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
@@ -1058,30 +1058,14 @@ impl IconDrawList {
 /// in [`InventoryMode::Table`], both result previews, and the cursor ghost.
 /// Closed screens emit nothing. Block identities produce cubes, materials and
 /// tools produce sprite quads.
-#[allow(clippy::too_many_arguments)]
 pub fn inventory_icon_vertices(
-    mode: InventoryMode,
-    layout: &InventoryLayout,
-    inventory: &Inventory,
-    player_grid: &CraftingGrid,
-    table_grid: &CraftingGrid,
+    panel: InventoryPanel<'_>,
     cursor_item: Option<Item>,
     cursor_pos: Option<(f32, f32)>,
     surface_w: u32,
     surface_h: u32,
 ) -> IconDrawList {
-    inventory_icon_vertices_with(
-        None,
-        mode,
-        layout,
-        inventory,
-        player_grid,
-        table_grid,
-        cursor_item,
-        cursor_pos,
-        surface_w,
-        surface_h,
-    )
+    inventory_icon_vertices_with(None, panel, cursor_item, cursor_pos, surface_w, surface_h)
 }
 
 /// [`inventory_icon_vertices`] with pack identities resolved through the frozen
@@ -1089,19 +1073,21 @@ pub fn inventory_icon_vertices(
 ///
 /// `None` is exactly the registry-free behavior; `Some` clones the `Arc` once
 /// into the batch so each slot lookup is a plain table read.
-#[allow(clippy::too_many_arguments)]
 pub fn inventory_icon_vertices_with(
     registry: Option<&Arc<ContentRegistry>>,
-    mode: InventoryMode,
-    layout: &InventoryLayout,
-    inventory: &Inventory,
-    player_grid: &CraftingGrid,
-    table_grid: &CraftingGrid,
+    panel: InventoryPanel<'_>,
     cursor_item: Option<Item>,
     cursor_pos: Option<(f32, f32)>,
     surface_w: u32,
     surface_h: u32,
 ) -> IconDrawList {
+    let InventoryPanel {
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+    } = panel;
     let mut out = match registry {
         Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
         None => IconDrawList::new(),
@@ -1951,11 +1937,13 @@ mod tests {
         let table_grid = CraftingGrid::new(GridKind::Table);
         let layout = open_layout(InventoryMode::Player);
         let verts = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &full,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &full,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -1966,11 +1954,13 @@ mod tests {
 
         let empty = Inventory::empty();
         let none = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &empty,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &empty,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -1979,11 +1969,13 @@ mod tests {
         assert!(none.is_empty(), "an empty inventory draws no icons");
 
         let closed = inventory_icon_vertices(
-            InventoryMode::Closed,
-            &layout,
-            &full,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Closed,
+                layout: &layout,
+                inventory: &full,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2005,11 +1997,13 @@ mod tests {
 
         let player_layout = open_layout(InventoryMode::Player);
         let player_verts = inventory_icon_vertices(
-            InventoryMode::Player,
-            &player_layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &player_layout,
+                inventory: &inventory,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2019,11 +2013,13 @@ mod tests {
 
         let table_layout = open_layout(InventoryMode::Table);
         let table_verts = inventory_icon_vertices(
-            InventoryMode::Table,
-            &table_layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Table,
+                layout: &table_layout,
+                inventory: &inventory,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2045,11 +2041,13 @@ mod tests {
         let layout = open_layout(InventoryMode::Player);
 
         let with_preview = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2068,11 +2066,13 @@ mod tests {
             .set(0, Some(item(ItemId::Block(BlockId::Stone))))
             .expect("player cell");
         let cell_only = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &no_recipe,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &no_recipe,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2089,11 +2089,13 @@ mod tests {
             Some(item(ItemId::Block(BlockId::Stone))),
         );
         let with_cursor = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &cursor_inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &cursor_inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &table_grid,
+            },
             cursor_inventory.cursor(),
             Some((640.0, 360.0)),
             1280,
@@ -2102,11 +2104,13 @@ mod tests {
         assert_eq!(with_cursor.block.len(), 18, "cursor ghost cube");
 
         let no_cursor_pos = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &cursor_inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &cursor_inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &table_grid,
+            },
             cursor_inventory.cursor(),
             None,
             1280,
@@ -2118,11 +2122,13 @@ mod tests {
         );
 
         let nan_cursor = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &cursor_inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &cursor_inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &table_grid,
+            },
             cursor_inventory.cursor(),
             Some((f32::NAN, 360.0)),
             1280,
@@ -2146,11 +2152,13 @@ mod tests {
         }
         let layout = open_layout(InventoryMode::Table);
         let verts = inventory_icon_vertices(
-            InventoryMode::Table,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
+            InventoryPanel {
+                mode: InventoryMode::Table,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &player_grid,
+                table_grid: &table_grid,
+            },
             None,
             None,
             1280,
@@ -2167,11 +2175,13 @@ mod tests {
         let inventory = Inventory::from_parts([Some(stick); INVENTORY_SLOTS], None);
         let layout = open_layout(InventoryMode::Player);
         let verts = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &CraftingGrid::new(GridKind::Table),
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &CraftingGrid::new(GridKind::Table),
+            },
             None,
             None,
             1280,
@@ -2701,11 +2711,13 @@ mod tests {
         let inventory = sprite_inventory();
         let layout = open_layout(InventoryMode::Player);
         let icons = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &CraftingGrid::new(GridKind::Table),
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &CraftingGrid::new(GridKind::Table),
+            },
             None,
             None,
             1280,
@@ -2733,11 +2745,13 @@ mod tests {
         let inventory = Inventory::from_parts(slots, None);
         let layout = open_layout(InventoryMode::Player);
         let icons = inventory_icon_vertices(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &CraftingGrid::new(GridKind::Player),
-            &CraftingGrid::new(GridKind::Table),
+            InventoryPanel {
+                mode: InventoryMode::Player,
+                layout: &layout,
+                inventory: &inventory,
+                player_grid: &CraftingGrid::new(GridKind::Player),
+                table_grid: &CraftingGrid::new(GridKind::Table),
+            },
             None,
             None,
             1280,
@@ -3015,7 +3029,7 @@ mod tests {
     fn icon_source_with_apple_keeps_the_overridden_sprite_layer() {
         let registry = ContentRegistry::builtin();
         assert_eq!(
-            icon_source_with(&registry, ItemId::Material(Material::Apple)),
+            icon_source_with(registry, ItemId::Material(Material::Apple)),
             Some(IconSource::Sprite(1))
         );
 
@@ -3023,7 +3037,7 @@ mod tests {
         let mut overrides = BTreeMap::new();
         overrides.insert("apple".to_string(), override_bytes.clone());
         let composed = compose_item_sprite_layers_with_overrides(&[], &overrides);
-        match icon_source_with(&registry, ItemId::Material(Material::Apple)) {
+        match icon_source_with(registry, ItemId::Material(Material::Apple)) {
             Some(IconSource::Sprite(layer)) => {
                 assert_eq!(composed[layer as usize], override_bytes);
             }

@@ -345,7 +345,7 @@ mod tests {
         };
 
         let tuned = MiningTarget::from_block_with_rules(
-            &registry,
+            registry,
             POS,
             BlockId::Stone,
             Some(pickaxe),
@@ -354,7 +354,7 @@ mod tests {
         .expect("stone is breakable");
         assert_eq!(tuned.duration(), 1.2 / 12.0);
 
-        let default = MiningTarget::from_block_with(&registry, POS, BlockId::Stone, Some(pickaxe))
+        let default = MiningTarget::from_block_with(registry, POS, BlockId::Stone, Some(pickaxe))
             .expect("stone is breakable");
         assert_eq!(default.duration(), 1.2 / 4.0);
 
@@ -366,7 +366,7 @@ mod tests {
             iron_speed_multiplier: 0,
         };
         let clamped = MiningTarget::from_block_with_rules(
-            &registry,
+            registry,
             POS,
             BlockId::Stone,
             Some(pickaxe),
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(clamped.duration(), 1.2);
 
         assert!(MiningTarget::from_block_with_rules(
-            &registry,
+            registry,
             POS,
             BlockId::Bedrock,
             Some(pickaxe),

@@ -100,7 +100,7 @@ pub struct SaveConfigMeta {
 /// The bundle is a plain value, so startup and live reload hand the same
 /// struct to [`crate::world::session::WorldSession::apply_rules`] and can
 /// derive it again on every reload without touching loader state.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RulesBundle {
     pub movement: MovementRules,
     pub camera: CameraRules,
@@ -118,29 +118,6 @@ pub struct RulesBundle {
     pub interaction: InteractionRules,
     pub render: RenderRules,
     pub selection: SelectionRules,
-}
-
-impl Default for RulesBundle {
-    fn default() -> Self {
-        Self {
-            movement: MovementRules::default(),
-            camera: CameraRules::default(),
-            survival: SurvivalRules::default(),
-            eating: EatingRules::default(),
-            melee: MeleeRules::default(),
-            combat: CombatRules::default(),
-            bow: BowRules::default(),
-            arrow: ArrowRules::default(),
-            clock: ClockRules::default(),
-            weather: WeatherRules::default(),
-            spawning: SpawnRules::default(),
-            farming: FarmingRules::default(),
-            tools: ToolRules::default(),
-            interaction: InteractionRules::default(),
-            render: RenderRules::default(),
-            selection: SelectionRules::default(),
-        }
-    }
 }
 
 /// Outcome of one [`ConfigRuntime::reload_file`] call.
@@ -1363,10 +1340,7 @@ mod tests {
         REGISTRY[index_of(key).expect("registry row")].default
     }
 
-    fn diagnostics_for<'a>(
-        runtime: &'a ConfigRuntime,
-        file: ConfigFile,
-    ) -> Vec<&'a ConfigDiagnostic> {
+    fn diagnostics_for(runtime: &ConfigRuntime, file: ConfigFile) -> Vec<&ConfigDiagnostic> {
         runtime
             .diagnostics()
             .iter()

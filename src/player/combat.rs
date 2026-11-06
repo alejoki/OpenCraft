@@ -135,6 +135,24 @@ impl DamageCause {
     }
 }
 
+/// One incoming player hit: how much, what caused it, and the geometry the
+/// knockback direction derives from.
+///
+/// `cause` is carried so the caller passes one authoritative tag at the damage
+/// site, but [`PlayerCombat`] never stores it: the session owns the single
+/// cause writer.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HitRequest {
+    /// Requested damage before the vitals' saturating clamp.
+    pub damage: u16,
+    /// Ambient cause tag for the session's death screen.
+    pub cause: DamageCause,
+    /// Player feet position at hit time.
+    pub player_feet: Vec3,
+    /// Attacker/projectile position the knockback direction points away from.
+    pub from: Vec3,
+}
+
 /// One accepted player hit, as reported back to the caller.
 ///
 /// `damage` is the *applied* damage: a 3-damage hit on a 2 hp player reports
@@ -208,39 +226,28 @@ impl PlayerCombat {
     /// mutating anything.
     ///
     /// Refuses when the mode is not Survival, the player is already dead
-    /// (`health == 0`), the i-frame window is open, or `damage == 0`. On
+    /// (`health == 0`), the i-frame window is open, or `hit.damage == 0`. On
     /// acceptance it arms the hurt flash and i-frames, sets the knockback
-    /// impulse pointing horizontally away from `from`, and saturates vitals
+    /// impulse pointing horizontally away from `hit.from`, and saturates vitals
     /// damage through [`SurvivalState::damage`] — no negative or wrapped
     /// health can be stored.
     ///
-    /// `cause` is accepted so the caller passes one authoritative tag at the
-    /// damage site, but it is deliberately **not** stored here: the session
+    /// `hit.cause` is accepted so the caller passes one authoritative tag at
+    /// the damage site, but it is deliberately **not** stored here: the session
     /// owns the single cause writer, so there is exactly one authority.
     ///
-    /// The knockback direction is the horizontal vector from `from` to
-    /// `player_feet`. A degenerate direction (attacker inside the player) or a
-    /// non-finite one falls back to `Vec3::Z`, so the impulse is always finite
-    /// and non-zero. Vertical knockback is deliberately absent: the player is
-    /// never pushed into the floor or the ceiling.
+    /// The knockback direction is the horizontal vector from `hit.from` to
+    /// `hit.player_feet`. A degenerate direction (attacker inside the player)
+    /// or a non-finite one falls back to `Vec3::Z`, so the impulse is always
+    /// finite and non-zero. Vertical knockback is deliberately absent: the
+    /// player is never pushed into the floor or the ceiling.
     pub fn take_hit(
         &mut self,
         vitals: &mut SurvivalState,
-        damage: u16,
+        hit: HitRequest,
         mode: GameMode,
-        cause: DamageCause,
-        player_feet: Vec3,
-        from: Vec3,
     ) -> Option<AppliedHit> {
-        self.take_hit_with_rules(
-            vitals,
-            damage,
-            mode,
-            cause,
-            player_feet,
-            from,
-            &CombatRules::default(),
-        )
+        self.take_hit_with_rules(vitals, hit, mode, &CombatRules::default())
     }
 
     /// Rules-aware [`PlayerCombat::take_hit`].
@@ -249,17 +256,19 @@ impl PlayerCombat {
     /// i-frame window, and initial knockback speed come from `rules`.
     /// `knockback_decay` is not used here — [`PlayerCombat::advance_with_rules`]
     /// owns the per-fixed-step decay exactly like the pinned constant did.
-    #[allow(clippy::too_many_arguments)]
     pub fn take_hit_with_rules(
         &mut self,
         vitals: &mut SurvivalState,
-        damage: u16,
+        hit: HitRequest,
         mode: GameMode,
-        cause: DamageCause,
-        player_feet: Vec3,
-        from: Vec3,
         rules: &CombatRules,
     ) -> Option<AppliedHit> {
+        let HitRequest {
+            damage,
+            cause,
+            player_feet,
+            from,
+        } = hit;
         if mode != GameMode::Survival || vitals.health() == 0 || self.iframe > 0.0 || damage == 0 {
             return None;
         }
@@ -359,11 +368,13 @@ mod tests {
 
         let hit = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            from,
         );
 
         assert_eq!(
@@ -388,11 +399,13 @@ mod tests {
 
         let first = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            from,
         );
         assert!(first.is_some());
         // Let one fixed step pass so the timers are mid-window, then snapshot
@@ -405,11 +418,13 @@ mod tests {
         // Different attacker, same window: still refused, nothing changes.
         let second = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from: player_feet - Vec3::X,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            player_feet - Vec3::X,
         );
 
         assert_eq!(second, None);
@@ -429,11 +444,13 @@ mod tests {
         assert!(combat
             .take_hit(
                 &mut vitals,
-                3,
-                GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
+                GameMode::Survival
             )
             .is_some());
 
@@ -445,11 +462,13 @@ mod tests {
         );
         let blocked = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            from,
         );
         assert_eq!(blocked, None);
         assert_eq!(vitals.health(), 17);
@@ -458,11 +477,13 @@ mod tests {
         assert_eq!(combat.iframe(), 0.0, "the tenth step closes the window");
         let landed = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            from,
         );
         assert_eq!(
             landed,
@@ -484,11 +505,13 @@ mod tests {
         let hit = combat
             .take_hit(
                 &mut vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from,
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
             )
             .expect("a lethal hit still lands");
         assert_eq!(vitals.health(), 0, "health must saturate, not wrap");
@@ -501,11 +524,13 @@ mod tests {
         combat.advance(20);
         let corpse = combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            from,
         );
         assert_eq!(corpse, None);
         assert_eq!(vitals.health(), 0);
@@ -522,11 +547,13 @@ mod tests {
         assert_eq!(
             creative_combat.take_hit(
                 &mut creative_vitals,
-                3,
-                GameMode::Creative,
-                DamageCause::Zombie,
-                player_feet,
-                from,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
+                GameMode::Creative
             ),
             None
         );
@@ -541,11 +568,13 @@ mod tests {
         assert_eq!(
             zero_combat.take_hit(
                 &mut zero_vitals,
-                0,
-                GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
+                HitRequest {
+                    damage: 0,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
+                GameMode::Survival
             ),
             None
         );
@@ -559,11 +588,13 @@ mod tests {
         assert_eq!(
             dead_combat.take_hit(
                 &mut dead_vitals,
-                3,
-                GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
+                GameMode::Survival
             ),
             None
         );
@@ -581,11 +612,13 @@ mod tests {
         let mut away = PlayerCombat::default();
         away.take_hit(
             &mut vitals,
-            1,
+            HitRequest {
+                damage: 1,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from: player_feet + Vec3::Z,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            player_feet + Vec3::Z,
         );
         assert!((away.knockback().z + PLAYER_KNOCKBACK_SPEED).abs() < 1e-5);
         assert_eq!(away.knockback().x, 0.0);
@@ -595,11 +628,13 @@ mod tests {
         let mut degenerate = PlayerCombat::default();
         degenerate.take_hit(
             &mut vitals,
-            1,
+            HitRequest {
+                damage: 1,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from: player_feet,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            player_feet,
         );
         let fallback = degenerate.knockback();
         assert!(fallback.is_finite());
@@ -610,11 +645,13 @@ mod tests {
         let mut corrupt = PlayerCombat::default();
         corrupt.take_hit(
             &mut vitals,
-            1,
+            HitRequest {
+                damage: 1,
+                cause: DamageCause::Zombie,
+                player_feet,
+                from: Vec3::new(f32::NAN, f32::NAN, f32::NAN),
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player_feet,
-            Vec3::new(f32::NAN, f32::NAN, f32::NAN),
         );
         let recovered = corrupt.knockback();
         assert!(
@@ -690,11 +727,13 @@ mod tests {
         let mut vitals = player.survival;
         let hit = player.combat.take_hit(
             &mut vitals,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet: player.position,
+                from: player.position + Vec3::Z,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            player.position,
-            player.position + Vec3::Z,
         );
         assert!(hit.is_some());
         player.survival = vitals;
@@ -778,11 +817,13 @@ mod tests {
         let hit = combat
             .take_hit_with_rules(
                 &mut vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from,
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
                 &rules,
             )
             .expect("a legal hit lands");
@@ -830,12 +871,14 @@ mod tests {
         assert_eq!(
             combat.take_hit_with_rules(
                 &mut vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
-                &rules,
+                &rules
             ),
             None,
             "the tuned window must refuse a hit at 0.5 s"
@@ -846,12 +889,14 @@ mod tests {
             combat
                 .take_hit_with_rules(
                     &mut vitals,
-                    3,
+                    HitRequest {
+                        damage: 3,
+                        cause: DamageCause::Zombie,
+                        player_feet,
+                        from
+                    },
                     GameMode::Survival,
-                    DamageCause::Zombie,
-                    player_feet,
-                    from,
-                    &rules,
+                    &rules
                 )
                 .is_some(),
             "the tuned window must open after 1.0 s"
@@ -872,23 +917,27 @@ mod tests {
         assert!(combat
             .take_hit_with_rules(
                 &mut vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
-                &rules,
+                &rules
             )
             .is_some());
         assert_eq!(combat.iframe(), 0.0);
         let second = combat
             .take_hit_with_rules(
                 &mut vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from,
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
                 &rules,
             )
             .expect("a zero i-frame window never blocks");
@@ -909,12 +958,14 @@ mod tests {
         assert!(combat
             .take_hit_with_rules(
                 &mut vitals,
-                1,
+                HitRequest {
+                    damage: 1,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from: player_feet + Vec3::Z
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                player_feet + Vec3::Z,
-                &zero,
+                &zero
             )
             .is_some());
         assert_eq!(combat.hurt_intensity_with_rules(&zero), 0.0);
@@ -934,12 +985,14 @@ mod tests {
         assert!(corrupt
             .take_hit_with_rules(
                 &mut corrupt_vitals,
-                1,
+                HitRequest {
+                    damage: 1,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from: player_feet + Vec3::Z
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                player_feet + Vec3::Z,
-                &malformed,
+                &malformed
             )
             .is_some());
         assert_eq!(corrupt.hurt_intensity_with_rules(&malformed), 0.0);
@@ -963,20 +1016,24 @@ mod tests {
         assert_eq!(
             legacy.take_hit(
                 &mut legacy_vitals,
-                3,
-                GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
+                GameMode::Survival
             ),
             tuned.take_hit_with_rules(
                 &mut tuned_vitals,
-                3,
+                HitRequest {
+                    damage: 3,
+                    cause: DamageCause::Zombie,
+                    player_feet,
+                    from
+                },
                 GameMode::Survival,
-                DamageCause::Zombie,
-                player_feet,
-                from,
-                &rules,
+                &rules
             )
         );
         assert_eq!(

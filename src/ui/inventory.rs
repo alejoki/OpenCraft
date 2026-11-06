@@ -707,6 +707,25 @@ fn preview_fill_with(
     Some(rect_quad(cell_fill(rect), item_color(item)))
 }
 
+/// One resolved inventory frame: the open mode, its pixel layout, and the three
+/// slot grids the panel draws.
+///
+/// Bundled so the quad and icon builders stay pure functions of one frame
+/// snapshot instead of growing a parallel argument per grid.
+#[derive(Clone, Copy)]
+pub struct InventoryPanel<'a> {
+    /// Which surface is open (player, table, or closed).
+    pub mode: InventoryMode,
+    /// Resolved pixel-space geometry for `mode`.
+    pub layout: &'a InventoryLayout,
+    /// The player's 36 storage/hotbar slots and cursor.
+    pub inventory: &'a Inventory,
+    /// The 2x2 player crafting grid.
+    pub player_grid: &'a CraftingGrid,
+    /// The 4x4 crafting-table grid.
+    pub table_grid: &'a CraftingGrid,
+}
+
 /// All quads for one frame: backdrop, the storage/hotbar separator, slot/grid
 /// outlines, item fills, result previews, and the cursor ghost. Empty for a
 /// closed screen. Draw order is intentional: the separator lands after the
@@ -722,11 +741,13 @@ pub fn screen_quads(
     cursor_pos: Option<(f32, f32)>,
 ) -> Vec<Quad> {
     screen_quads_with(
-        mode,
-        layout,
-        inventory,
-        player_grid,
-        table_grid,
+        InventoryPanel {
+            mode,
+            layout,
+            inventory,
+            player_grid,
+            table_grid,
+        },
         cursor_item,
         cursor_pos,
         ContentRegistry::builtin(),
@@ -736,19 +757,21 @@ pub fn screen_quads(
 /// Registry-aware [`screen_quads`]: result previews resolve through `registry`
 /// so a pack-tool preview renders with its authored identity/colour.
 ///
-/// Eight arguments is the pure frame plumbing plus the session registry; the
-/// geometry stays a pure function of its inputs (no hidden state).
-#[allow(clippy::too_many_arguments)]
+/// The frame plumbing travels in one [`InventoryPanel`]; the geometry stays a
+/// pure function of its inputs (no hidden state).
 pub fn screen_quads_with(
-    mode: InventoryMode,
-    layout: &InventoryLayout,
-    inventory: &Inventory,
-    player_grid: &CraftingGrid,
-    table_grid: &CraftingGrid,
+    panel: InventoryPanel<'_>,
     cursor_item: Option<Item>,
     cursor_pos: Option<(f32, f32)>,
     registry: &ContentRegistry,
 ) -> Vec<Quad> {
+    let InventoryPanel {
+        mode,
+        layout,
+        inventory,
+        player_grid,
+        table_grid,
+    } = panel;
     if !mode.is_open() {
         return Vec::new();
     }

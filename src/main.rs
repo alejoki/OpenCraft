@@ -45,7 +45,7 @@ use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER}
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
-use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
+use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
@@ -64,8 +64,8 @@ use opencraft::ui::hud::{
 };
 use opencraft::ui::inventory::{
     hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
-    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
-    LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
+    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryPanel, InventoryScreen,
+    InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
     builtin_icon_layer, compose_item_sprite_layers, compose_item_sprite_layers_with_overrides,
@@ -1047,25 +1047,46 @@ fn reset_panel_holds(mining: &mut MiningState, eating: &mut EatingState, bow: &m
     bow.reset();
 }
 
+/// Mutable gameplay-input handles shared by every panel open/close boundary.
+///
+/// The helpers below stay free functions because `window_event` already holds
+/// disjoint `gpu`/`window` borrows (P005); bundling these handles keeps each
+/// signature focused without hiding the individual field borrows at the call
+/// site.
+struct PanelHolds<'a> {
+    input: &'a mut InputState,
+    left_mouse_held: &'a mut bool,
+    right_mouse_held: &'a mut bool,
+    drag: &'a mut Option<InventoryTarget>,
+    mining: &'a mut MiningState,
+    eating: &'a mut EatingState,
+    bow: &'a mut BowState,
+    cursor_grabbed: &'a mut bool,
+}
+
+impl PanelHolds<'_> {
+    /// Clear the shared hold state: queued keys, both mouse buttons, and the
+    /// three gameplay hold accumulators. Drag and cursor ownership differ per
+    /// panel boundary and stay explicit at each call site.
+    fn reset(&mut self) {
+        self.input.reset();
+        reset_panel_holds(self.mining, self.eating, self.bow);
+        *self.left_mouse_held = false;
+        *self.right_mouse_held = false;
+    }
+}
+
 /// Opens the inventory panel from either the E key (`via_table = false`) or a
 /// successful table interaction (`via_table = true`), releasing the cursor and
 /// dropping every gameplay hold so the panel owns the pointer.
 ///
 /// A free function because `window_event` already holds disjoint `gpu`/`window`
 /// borrows, making a `&mut self` method unusable there (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_inventory(
     screen: &mut InventoryScreen,
     table_open: Option<IVec3>,
     via_table: bool,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     if via_table {
@@ -1073,40 +1094,26 @@ fn open_inventory(
     } else {
         screen.toggle(table_open);
     }
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = false;
     set_cursor_grab(window, false);
 }
 
 /// Closes the inventory panel from the E/Escape paths and restores gameplay
 /// input ownership: the cursor is re-grabbed, holds are cleared, and the
 /// session station is closed so the 4x4 grid cannot outlive the screen.
-#[allow(clippy::too_many_arguments)]
 fn close_inventory(
     screen: &mut InventoryScreen,
     session: &mut WorldSession,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     session.close_table();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -1116,27 +1123,17 @@ fn close_inventory(
 /// entry stock is cached once here rather than rebuilt per frame. Every
 /// gameplay hold is dropped so a held mouse button cannot mine behind the
 /// screen. A free function for the same disjoint-borrow reason (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_palette(
     screen: &mut PaletteScreen,
     registry: &Arc<ContentRegistry>,
     status: &mut Option<String>,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.open(registry);
     *status = None;
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.cursor_grabbed = false;
     set_cursor_grab(window, false);
 }
 
@@ -1145,26 +1142,16 @@ fn open_palette(
 /// Escape is the only close path while the palette is open; it re-grabs the
 /// cursor exactly like [`close_inventory`] and clears every hold so no stale
 /// press survives the screen boundary.
-#[allow(clippy::too_many_arguments)]
 fn close_palette(
     screen: &mut PaletteScreen,
     status: &mut Option<String>,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     *status = None;
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -1403,31 +1390,20 @@ fn revalidate_inventory_station(screen: &mut InventoryScreen, session: &mut Worl
 /// so two gameplay panels can never share the pointer. A free function
 /// because `window_event` already holds disjoint `gpu`/`window` borrows,
 /// making a `&mut self` method unusable there (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_chest_screen(
     screen: &mut ChestScreen,
     session: &mut WorldSession,
     inventory: &mut InventoryScreen,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     status: &mut Option<String>,
     window: &Window,
 ) {
     inventory.close();
     session.close_table();
     screen.open();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = false;
     *status = None;
     set_cursor_grab(window, false);
 }
@@ -1435,26 +1411,16 @@ fn open_chest_screen(
 /// Closes the chest screen from the E/Escape paths and restores gameplay
 /// input ownership: the cursor is re-grabbed, holds are cleared, and the
 /// session station is closed so the 27-slot view cannot outlive the screen.
-#[allow(clippy::too_many_arguments)]
 fn close_chest_screen(
     screen: &mut ChestScreen,
     session: &mut WorldSession,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     session.close_chest();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -6311,7 +6277,7 @@ fn combat_spot_feet_y(y: f32) -> f32 {
 ///   witness start from the same pinned pose (the v9 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
 ///
-/// The Skeleton is left where Drops left it: it is hostile and will chase, but
+/// The Skeleton is left where Drops left it is hostile and will chase, but
 /// it has no attack profile, so it can never add a damage event.
 fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
     let mobs = session.mobs().len();
@@ -8360,7 +8326,7 @@ struct GameApp {
     /// Path the background scene loads from and edits save to. Injected so
     /// headless tests can point at a tempdir.
     background_path: PathBuf,
-    /// Construction epoch for the vista's procedural yaw drift: drift is
+    /// Construction epoch for the vista's procedural yaw drift is
     /// `elapsed()` from this single Instant, so it survives menu<->game
     /// transitions with no per-frame accumulation or reset bookkeeping.
     vista_epoch: Instant,
@@ -9483,8 +9449,8 @@ impl GameApp {
             // The content restart is the authoritative status for this edit.
             return table.paths_changed;
         }
-        match table.changes.last() {
-            Some(change) => match (&change.bytes, &change.source) {
+        if let Some(change) = table.changes.last() {
+            match (&change.bytes, &change.source) {
                 (Some(_), Some(source)) => {
                     let display = format!("{}/{}/{}", pack::PACKS_DIR, source.folder, source.path);
                     let Some(layer) = builtin_icon_layer(&change.name) else {
@@ -9506,8 +9472,7 @@ impl GameApp {
                     self.creator_overlay_dirty = true;
                 }
                 _ => {}
-            },
-            None => {}
+            }
         }
         table.paths_changed
     }
@@ -11099,14 +11064,16 @@ impl ApplicationHandler for GameApp {
                             close_inventory(
                                 &mut self.inventory,
                                 &mut self.session,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.inventory_drag,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -11126,13 +11093,16 @@ impl ApplicationHandler for GameApp {
                             close_chest_screen(
                                 &mut self.chest,
                                 &mut self.session,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -11157,13 +11127,16 @@ impl ApplicationHandler for GameApp {
                                 close_palette(
                                     &mut self.palette,
                                     &mut self.palette_status,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -11237,14 +11210,16 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory,
                                 self.session.open_table_position(),
                                 false,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.inventory_drag,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -11317,13 +11292,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.palette,
                                     &self.session_registry,
                                     &mut self.palette_status,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -11803,14 +11781,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.chest,
                                     &mut self.session,
                                     &mut self.inventory,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.inventory_drag,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     &mut self.chest_status,
                                     window,
                                 );
@@ -11824,14 +11804,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory,
                                     self.session.open_table_position(),
                                     true,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.inventory_drag,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -12809,11 +12791,13 @@ impl ApplicationHandler for GameApp {
                     let layout =
                         layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
                     quads.extend(screen_quads_with(
-                        inventory_mode,
-                        &layout,
-                        self.session.player.inventory(),
-                        self.session.player.player_grid(),
-                        self.session.player.table_grid(),
+                        InventoryPanel {
+                            mode: inventory_mode,
+                            layout: &layout,
+                            inventory: self.session.player.inventory(),
+                            player_grid: self.session.player.player_grid(),
+                            table_grid: self.session.player.table_grid(),
+                        },
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                         &self.session_registry,
@@ -12985,11 +12969,13 @@ impl ApplicationHandler for GameApp {
                 if let Some(layout) = inventory_layout.as_ref() {
                     icons.append(inventory_icon_vertices_with(
                         Some(&self.session_registry),
-                        inventory_mode,
-                        layout,
-                        self.session.player.inventory(),
-                        self.session.player.player_grid(),
-                        self.session.player.table_grid(),
+                        InventoryPanel {
+                            mode: inventory_mode,
+                            layout,
+                            inventory: self.session.player.inventory(),
+                            player_grid: self.session.player.player_grid(),
+                            table_grid: self.session.player.table_grid(),
+                        },
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                         gpu.ctx.config.width,
@@ -13281,16 +13267,20 @@ impl ApplicationHandler for GameApp {
                         // draws them, so the vista path passes an empty slice
                         // and allocates no mob vertex buffer.
                         &[],
-                        vista_camera,
-                        self.background.world.render_distance(),
-                        None,
-                        self.session.player.selected_slot(),
-                        false,
-                        // Menu frames render the scene from its own world, whose
-                        // camera anchors over land (or wherever the player
-                        // chose): never submerged.
-                        vista_sky_params(palette, self.background.clock.time_of_day),
-                        ui_pass,
+                        FrameView {
+                            camera: vista_camera,
+                            render_distance: self.background.world.render_distance(),
+                            target_block: None,
+                            selected_slot: self.session.player.selected_slot(),
+                        },
+                        FramePresentation {
+                            show_overlays: false,
+                            // Menu frames render the scene from its own world,
+                            // whose camera anchors over land (or wherever the
+                            // player chose): never submerged.
+                            sky: vista_sky_params(palette, self.background.clock.time_of_day),
+                            ui_pass,
+                        },
                     )
                 } else {
                     // Per-frame weather, derived from the persisted calendar
@@ -13326,20 +13316,24 @@ impl ApplicationHandler for GameApp {
                         &gpu.ctx,
                         &gpu.render_store,
                         &mob_vertices,
-                        &self.session.camera,
-                        self.session.world.render_distance(),
-                        target_block,
-                        self.session.player.selected_slot(),
-                        playing,
-                        sky_params(
-                            palette,
-                            self.session.clock.time_of_day,
-                            underwater,
-                            weather,
-                            session_fog_range_factor(&self.session, weather),
-                            self.session.clock.cycle_phase(),
-                        ),
-                        ui_pass,
+                        FrameView {
+                            camera: &self.session.camera,
+                            render_distance: self.session.world.render_distance(),
+                            target_block,
+                            selected_slot: self.session.player.selected_slot(),
+                        },
+                        FramePresentation {
+                            show_overlays: playing,
+                            sky: sky_params(
+                                palette,
+                                self.session.clock.time_of_day,
+                                underwater,
+                                weather,
+                                session_fog_range_factor(&self.session, weather),
+                                self.session.clock.cycle_phase(),
+                            ),
+                            ui_pass,
+                        },
                     )
                 };
                 match frame_result {
@@ -17442,7 +17436,7 @@ stack = 64
 
     // ---- Scripted ocean-crossing seam (S08-T02) ----
 
-    /// The pinned route for the smoke seed: seed 12345 starts in an Ocean
+    /// The pinned route for the smoke seed 12345 starts in an Ocean
     /// column at the origin and the first land at or above SEA_LEVEL along +Z
     /// is the far shore S03 swims to.
     #[test]
@@ -24660,11 +24654,13 @@ stack = 64
         );
 
         let pack_quads = screen_quads_with(
-            InventoryMode::Table,
-            &ui_layout,
-            player.inventory(),
-            player.player_grid(),
-            player.table_grid(),
+            InventoryPanel {
+                mode: InventoryMode::Table,
+                layout: &ui_layout,
+                inventory: player.inventory(),
+                player_grid: player.player_grid(),
+                table_grid: player.table_grid(),
+            },
             None,
             None,
             &registry,
@@ -28474,7 +28470,7 @@ stack = 64
     /// healed player draws the vitals alone and Creative draws nothing.
     #[test]
     fn playing_hud_quads_draws_the_damage_flash_only_while_hurt() {
-        use opencraft::player::combat::DamageCause;
+        use opencraft::player::combat::{DamageCause, HitRequest};
         use opencraft::ui::hud::{DAMAGE_FLASH_ALPHA, HEART_FILL_COLOR};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28499,11 +28495,13 @@ stack = 64
         let feet = session.player.position;
         let hit = session.player.combat.take_hit(
             &mut session.player.survival,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet: feet,
+                from: feet + Vec3::Z,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            feet,
-            feet + Vec3::Z,
         );
         assert!(hit.is_some(), "a Survival hit must land");
 
@@ -28570,11 +28568,13 @@ stack = 64
                 .combat
                 .take_hit(
                     &mut creative.player.survival,
-                    3,
-                    GameMode::Creative,
-                    DamageCause::Zombie,
-                    feet,
-                    feet + Vec3::Z,
+                    HitRequest {
+                        damage: 3,
+                        cause: DamageCause::Zombie,
+                        player_feet: feet,
+                        from: feet + Vec3::Z
+                    },
+                    GameMode::Creative
                 )
                 .is_none(),
             "Creative can never be hurt"

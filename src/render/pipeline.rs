@@ -732,6 +732,34 @@ pub struct VoxelRenderer {
     weather_stage: Option<WeatherStage>,
 }
 
+/// Camera framing for one [`Renderer::render_frame`] invocation.
+///
+/// Groups the view state that changes per frame (camera, distance, selection)
+/// so the frame entry point reads as data in, pixels out.
+pub struct FrameView<'a> {
+    /// Camera providing this frame's view-projection.
+    pub camera: &'a Camera,
+    /// Horizontal render distance in chunks.
+    pub render_distance: i32,
+    /// Block-face highlight target, if any.
+    pub target_block: Option<IVec3>,
+    /// Selected hotbar slot, drawn as the selection outline.
+    pub selected_slot: usize,
+}
+
+/// Presentation switches for one [`Renderer::render_frame`] invocation.
+///
+/// The overlay gate, the resolved sky palette, and the optional UI pass are
+/// independent of the world geometry, so they travel together.
+pub struct FramePresentation<'a> {
+    /// Draw the target/selection overlay lines.
+    pub show_overlays: bool,
+    /// Resolved sky/fog/weather palette for this frame.
+    pub sky: SkyParams,
+    /// Deferred UI pass, drawn after the overlay and before presentation.
+    pub ui_pass: Option<&'a dyn UiPass>,
+}
+
 impl VoxelRenderer {
     pub fn new(ctx: &RenderContext) -> Self {
         let (block_texture, tex_view, sampler) =
@@ -1064,30 +1092,34 @@ impl VoxelRenderer {
         upload_block_layer_at(&self.block_texture, queue, layer, rgba);
     }
 
-    // 11 args: the existing world-pass parameters, the T04 batched mob vertex
-    // slice (immediately after `store`), plus the T01 `ui_pass` hook, the T02
-    // `show_overlays` gate, and the S02-T03 grouped `sky` inputs (which since
-    // S03 also carry `time_of_day` for the sky pass). Kept flat rather than
-    // grouped further to avoid churn at the single call site in src/main.rs;
-    // this is the frame-draw entry point, not a general-purpose API.
-    //
+    /// Draw one frame: sky, world, overlays, then the optional UI pass.
+    ///
+    /// The view and presentation inputs are bundled ([`FrameView`],
+    /// [`FramePresentation`]) so the frame entry point stays a focused list of
+    /// the three geometry sources plus the two per-frame bundles.
+    ///
     // Pass order on the encoder: sky (clears color) -> world (loads color,
     // clears depth: opaque -> mobs -> water -> weather) -> overlay -> optional
     // UI (loads color).
-    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
         ctx: &RenderContext,
         store: &ChunkRenderStore,
         mob_vertices: &[MobVertex],
-        camera: &Camera,
-        render_distance: i32,
-        target_block: Option<IVec3>,
-        selected_slot: usize,
-        show_overlays: bool,
-        sky: SkyParams,
-        ui_pass: Option<&dyn UiPass>,
+        view: FrameView<'_>,
+        presentation: FramePresentation<'_>,
     ) -> Result<usize, wgpu::SurfaceError> {
+        let FrameView {
+            camera,
+            render_distance,
+            target_block,
+            selected_slot,
+        } = view;
+        let FramePresentation {
+            show_overlays,
+            sky,
+            ui_pass,
+        } = presentation;
         let output = ctx.surface.get_current_texture()?;
         let view = output
             .texture

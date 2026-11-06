@@ -235,6 +235,20 @@ pub struct SpawnContext {
     pub world_spawn: Vec3,
 }
 
+/// One already-resolved placement candidate for [`try_spawn_at`].
+///
+/// Bundling the placement facts keeps the eligibility pipeline within the
+/// argument-count budget without changing the pipeline order.
+#[derive(Copy, Clone, Debug)]
+struct SpawnCandidate {
+    /// Candidate feet position, already snapped to the surface scan.
+    feet: Vec3,
+    /// Yaw the new mob record receives.
+    yaw: f32,
+    /// Session attempt index used by the deterministic kind roll.
+    attempt_index: u64,
+}
+
 /// What one population step did.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnReport {
@@ -523,9 +537,11 @@ fn attempt_spawn(
         ctx,
         world,
         mobs,
-        Vec3::new(feet_x, feet_y as f32, feet_z),
-        angle,
-        attempt_index,
+        SpawnCandidate {
+            feet: Vec3::new(feet_x, feet_y as f32, feet_z),
+            yaw: angle,
+            attempt_index,
+        },
         report,
         rules,
     );
@@ -706,12 +722,15 @@ fn try_spawn_at(
     ctx: &SpawnContext,
     world: &impl SpawnWorld,
     mobs: &mut Vec<Mob>,
-    feet: Vec3,
-    yaw: f32,
-    attempt_index: u64,
+    candidate: SpawnCandidate,
     report: &mut SpawnReport,
     rules: &SpawnRules,
 ) {
+    let SpawnCandidate {
+        feet,
+        yaw,
+        attempt_index,
+    } = candidate;
     let feet_block = IVec3::new(feet.x.floor() as i32, feet.y as i32, feet.z.floor() as i32);
     if world.block(feet_block) != BlockId::Air {
         return;
@@ -1031,9 +1050,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            candidate,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1063,9 +1084,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1186,9 +1209,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1204,9 +1229,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 33.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 33.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1234,9 +1261,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            occupied,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: occupied,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1247,9 +1276,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(31.6, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(31.6, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1274,9 +1305,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(20.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(20.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1286,9 +1319,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(52.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(52.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1304,9 +1339,11 @@ mod tests {
             &near_spawn,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1316,9 +1353,11 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1529,9 +1568,11 @@ mod tests {
             &ctx,
             &cave,
             &mut mobs,
-            candidate,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1545,9 +1586,11 @@ mod tests {
             &ctx,
             &cave,
             &mut mobs,
-            candidate,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules {
                 hostile_cave_light: 0,
@@ -1565,9 +1608,11 @@ mod tests {
             &ctx,
             &twilight,
             &mut mobs,
-            candidate,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules::default(),
         );
@@ -1579,9 +1624,11 @@ mod tests {
             &ctx,
             &twilight,
             &mut mobs,
-            candidate,
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
             &SpawnRules {
                 passive_surface_light: 10,

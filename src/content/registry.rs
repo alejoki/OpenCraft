@@ -624,50 +624,40 @@ pub fn build_registry(
     let mut pack_icon_sources: Vec<LayerSource> = Vec::new();
     let mut icon_slots: BTreeMap<(String, String), u8> = BTreeMap::new();
 
+    let mut icons = IconAllocation {
+        assets: &assets,
+        pack_icons: &mut pack_icons,
+        pack_icon_sources: &mut pack_icon_sources,
+        icon_slots: &mut icon_slots,
+        diagnostics: &mut diagnostics,
+    };
+
     for (id, (folder, entry)) in &item_entries {
-        let layer = allocate_icon(
-            &assets,
-            &mut pack_icons,
-            &mut pack_icon_sources,
-            &mut icon_slots,
-            folder,
-            &entry.icon,
-            &format!("item {id}"),
-            &mut diagnostics,
-        );
+        let layer = icons.allocate(folder, &entry.icon, &format!("item {id}"));
         items[usize::from(item_indices[id])].icon_layer = layer;
     }
     for (id, (folder, entry)) in &tool_entries {
-        let layer = allocate_icon(
-            &assets,
-            &mut pack_icons,
-            &mut pack_icon_sources,
-            &mut icon_slots,
-            folder,
-            &entry.icon,
-            &format!("tool {id}"),
-            &mut diagnostics,
-        );
+        let layer = icons.allocate(folder, &entry.icon, &format!("tool {id}"));
         tools[usize::from(tool_indices[id])].icon_layer = layer;
     }
 
     // ---- digest ---------------------------------------------------------
-    let digest = compute_digest(
+    let digest = compute_digest(&DigestInputs {
         packs,
-        &blocks,
-        &items,
-        &tiers,
-        &tools,
-        &recipes,
+        blocks: &blocks,
+        items: &items,
+        tiers: &tiers,
+        tools: &tools,
+        recipes: &recipes,
         builtin_recipe_count,
-        &worldgen_rules,
-        &block_entries,
-        &item_entries,
-        &tier_entries,
-        &tool_entries,
-        &block_patches,
-        &recipe_patches,
-    );
+        worldgen_rules: &worldgen_rules,
+        block_entries: &block_entries,
+        item_entries: &item_entries,
+        tier_entries: &tier_entries,
+        tool_entries: &tool_entries,
+        block_patches: &block_patches,
+        recipe_patches: &recipe_patches,
+    });
 
     let identity_list: Vec<PackIdentity> =
         packs.iter().map(|(identity, _)| identity.clone()).collect();
@@ -695,53 +685,55 @@ pub fn build_registry(
     )
 }
 
-/// Allocate one icon layer for an authored icon path.
-///
-/// Icons are deduplicated by `(pack folder, path)` and appended from
-/// [`PACK_ICON_BASE`] up to [`PACK_ICON_CAP`]. A missing asset or an exhausted
-/// icon space records a diagnostic and returns the built-in sprite placeholder
-/// instead of panicking.
-fn allocate_icon(
-    assets: &BTreeMap<(String, String), &PackAsset>,
-    pack_icons: &mut Vec<Vec<u8>>,
-    pack_icon_sources: &mut Vec<LayerSource>,
-    icon_slots: &mut BTreeMap<(String, String), u8>,
-    folder: &str,
-    path: &str,
-    entry: &str,
-    diagnostics: &mut Vec<ContentDiagnostic>,
-) -> u8 {
-    let key = (folder.to_string(), path.to_string());
-    if !assets.contains_key(&key) {
-        error(
-            diagnostics,
-            entry.to_string(),
-            format!("icon `{path}` is not a loaded asset"),
-        );
-        return PLACEHOLDER_ICON_LAYER;
+/// Mutable icon-layer allocation state for one pack-stack build.
+struct IconAllocation<'a> {
+    assets: &'a BTreeMap<(String, String), &'a PackAsset>,
+    pack_icons: &'a mut Vec<Vec<u8>>,
+    pack_icon_sources: &'a mut Vec<LayerSource>,
+    icon_slots: &'a mut BTreeMap<(String, String), u8>,
+    diagnostics: &'a mut Vec<ContentDiagnostic>,
+}
+
+impl IconAllocation<'_> {
+    /// Allocate one icon layer for an authored icon path.
+    ///
+    /// Icons are deduplicated by `(pack folder, path)` and appended from
+    /// [`PACK_ICON_BASE`] up to [`PACK_ICON_CAP`]. A missing asset or an exhausted
+    /// icon space records a diagnostic and returns the built-in sprite placeholder
+    /// instead of panicking.
+    fn allocate(&mut self, folder: &str, path: &str, entry: &str) -> u8 {
+        let key = (folder.to_string(), path.to_string());
+        if !self.assets.contains_key(&key) {
+            error(
+                self.diagnostics,
+                entry.to_string(),
+                format!("icon `{path}` is not a loaded asset"),
+            );
+            return PLACEHOLDER_ICON_LAYER;
+        }
+        if let Some(existing) = self.icon_slots.get(&key) {
+            return *existing;
+        }
+        let slot = self.pack_icons.len();
+        if PACK_ICON_BASE as usize + slot >= PACK_ICON_CAP as usize {
+            error(
+                self.diagnostics,
+                entry.to_string(),
+                format!(
+                    "icon space exhausted at {PACK_ICON_CAP}; `{path}` falls back to layer {PLACEHOLDER_ICON_LAYER}"
+                ),
+            );
+            return PLACEHOLDER_ICON_LAYER;
+        }
+        let layer = PACK_ICON_BASE + slot as u8;
+        self.pack_icons.push(self.assets[&key].rgba.clone());
+        self.pack_icon_sources.push(LayerSource {
+            folder: folder.to_string(),
+            path: path.to_string(),
+        });
+        self.icon_slots.insert(key, layer);
+        layer
     }
-    if let Some(existing) = icon_slots.get(&key) {
-        return *existing;
-    }
-    let slot = pack_icons.len();
-    if PACK_ICON_BASE as usize + slot >= PACK_ICON_CAP as usize {
-        error(
-            diagnostics,
-            entry.to_string(),
-            format!(
-                "icon space exhausted at {PACK_ICON_CAP}; `{path}` falls back to layer {PLACEHOLDER_ICON_LAYER}"
-            ),
-        );
-        return PLACEHOLDER_ICON_LAYER;
-    }
-    let layer = PACK_ICON_BASE + slot as u8;
-    pack_icons.push(assets[&key].rgba.clone());
-    pack_icon_sources.push(LayerSource {
-        folder: folder.to_string(),
-        path: path.to_string(),
-    });
-    icon_slots.insert(key, layer);
-    layer
 }
 
 fn entry_kind_block(entry: &WorldgenEntry) -> &'static str {
@@ -992,23 +984,46 @@ fn tool_tier_tag(tier: ToolTier) -> u8 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_digest(
-    packs: &[(PackIdentity, PackContentSpec)],
-    blocks: &[BlockDef],
-    items: &[ItemDef],
-    tiers: &[TierDef],
-    tools: &[ToolDef],
-    recipes: &[RecipeDef],
+/// Everything the deterministic registry digest folds in.
+///
+/// The builder's working set (resolved definitions, authored patch lists, and
+/// the winning entry map per content kind) travels as one bundle so the digest
+/// stays a single entry point as new content kinds appear.
+#[derive(Clone, Copy)]
+struct DigestInputs<'a> {
+    packs: &'a [(PackIdentity, PackContentSpec)],
+    blocks: &'a [BlockDef],
+    items: &'a [ItemDef],
+    tiers: &'a [TierDef],
+    tools: &'a [ToolDef],
+    recipes: &'a [RecipeDef],
     builtin_recipe_count: usize,
-    worldgen_rules: &[WorldgenRule],
-    block_entries: &BTreeMap<&str, (&str, &BlockEntry)>,
-    item_entries: &BTreeMap<&str, (&str, &ItemEntry)>,
-    tier_entries: &BTreeMap<&str, (&str, &TierEntry)>,
-    tool_entries: &BTreeMap<&str, (&str, &ToolEntry)>,
-    block_patches: &[(&str, &BlockPatch)],
-    recipe_patches: &[(&str, &RecipePatch)],
-) -> u64 {
+    worldgen_rules: &'a [WorldgenRule],
+    block_entries: &'a BTreeMap<&'a str, (&'a str, &'a BlockEntry)>,
+    item_entries: &'a BTreeMap<&'a str, (&'a str, &'a ItemEntry)>,
+    tier_entries: &'a BTreeMap<&'a str, (&'a str, &'a TierEntry)>,
+    tool_entries: &'a BTreeMap<&'a str, (&'a str, &'a ToolEntry)>,
+    block_patches: &'a [(&'a str, &'a BlockPatch)],
+    recipe_patches: &'a [(&'a str, &'a RecipePatch)],
+}
+
+fn compute_digest(input: &DigestInputs<'_>) -> u64 {
+    let DigestInputs {
+        packs,
+        blocks,
+        items,
+        tiers,
+        tools,
+        recipes,
+        builtin_recipe_count,
+        worldgen_rules,
+        block_entries,
+        item_entries,
+        tier_entries,
+        tool_entries,
+        block_patches,
+        recipe_patches,
+    } = *input;
     // No packs means no pack definitions: report the empty-stack digest so a
     // rebuilt stack with zero packs matches the built-in registry exactly.
     if packs.is_empty() {

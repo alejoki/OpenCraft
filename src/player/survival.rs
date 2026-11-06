@@ -1150,8 +1150,10 @@ mod tests {
 
     #[test]
     fn tuned_hunger_drain_uses_the_live_interval() {
-        let mut rules = SurvivalRules::default();
-        rules.hunger_drain_secs = 1.0;
+        let rules = SurvivalRules {
+            hunger_drain_secs: 1.0,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::full();
 
@@ -1168,13 +1170,17 @@ mod tests {
 
     #[test]
     fn tuned_fall_safe_blocks_moves_the_damage_threshold() {
-        let mut rules = SurvivalRules::default();
-        rules.fall_safe_blocks = 0.0;
+        let rules = SurvivalRules {
+            fall_safe_blocks: 0.0,
+            ..SurvivalRules::default()
+        };
         assert_eq!(fall_damage_with(0.9, &rules), 0);
         assert_eq!(fall_damage_with(4.0, &rules), 4);
 
-        let mut rules = SurvivalRules::default();
-        rules.fall_safe_blocks = 10.0;
+        let rules = SurvivalRules {
+            fall_safe_blocks: 10.0,
+            ..SurvivalRules::default()
+        };
         assert_eq!(fall_damage_with(9.0, &rules), 0);
         assert_eq!(fall_damage_with(12.0, &rules), 2);
 
@@ -1185,9 +1191,11 @@ mod tests {
 
     #[test]
     fn tuned_drown_interval_and_damage_apply_per_tick() {
-        let mut rules = SurvivalRules::default();
-        rules.drown_interval_secs = 0.5;
-        rules.drown_damage = 3;
+        let rules = SurvivalRules {
+            drown_interval_secs: 0.5,
+            drown_damage: 3,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
         let ctx = SurvivalContext {
@@ -1203,9 +1211,11 @@ mod tests {
 
     #[test]
     fn tuned_starve_interval_and_damage_apply_per_tick() {
-        let mut rules = SurvivalRules::default();
-        rules.starve_interval_secs = 1.0;
-        rules.starve_damage = 3;
+        let rules = SurvivalRules {
+            starve_interval_secs: 1.0,
+            starve_damage: 3,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(MAX_HEALTH, 0, FULL_AIR).unwrap();
 
@@ -1220,9 +1230,11 @@ mod tests {
         // interval 0.5 s with the 10 s per-tick clamp is 20 steps; damage 1
         // must apply all 20, i.e. the old default-derived cap of 10 would
         // wrongly leave the player alive.
-        let mut rules = SurvivalRules::default();
-        rules.drown_interval_secs = 0.5;
-        rules.drown_damage = 1;
+        let rules = SurvivalRules {
+            drown_interval_secs: 0.5,
+            drown_damage: 1,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
         let ctx = SurvivalContext {
@@ -1234,9 +1246,11 @@ mod tests {
         assert_eq!(vitals.health(), 0);
 
         // Starvation has the same live-cap behavior.
-        let mut rules = SurvivalRules::default();
-        rules.starve_interval_secs = 0.5;
-        rules.starve_damage = 1;
+        let rules = SurvivalRules {
+            starve_interval_secs: 0.5,
+            starve_damage: 1,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(MAX_HEALTH, 0, FULL_AIR).unwrap();
         let tick = runtime.tick_with(&mut vitals, survival_ctx(), MAX_TICK_GAME_SECS, &rules);
@@ -1246,13 +1260,15 @@ mod tests {
 
     #[test]
     fn malformed_zero_damage_and_zero_intervals_fail_closed() {
-        let mut rules = SurvivalRules::default();
-        rules.drown_damage = 0;
-        rules.starve_damage = 0;
-        rules.drown_interval_secs = 0.0;
-        rules.starve_interval_secs = 0.0;
-        rules.hunger_drain_secs = 0.0;
-        rules.regen_interval_secs = 0.0;
+        let rules = SurvivalRules {
+            drown_damage: 0,
+            starve_damage: 0,
+            drown_interval_secs: 0.0,
+            starve_interval_secs: 0.0,
+            hunger_drain_secs: 0.0,
+            regen_interval_secs: 0.0,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(10, 0, 0).unwrap();
         let ctx = SurvivalContext {
@@ -1267,10 +1283,12 @@ mod tests {
 
     #[test]
     fn tuned_regen_threshold_interval_and_cost_drive_healing() {
-        let mut rules = SurvivalRules::default();
-        rules.regen_hunger_threshold = 5;
-        rules.regen_interval_secs = 1.0;
-        rules.regen_hunger_cost = 1;
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 5,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 1,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(10, 5, FULL_AIR).unwrap();
 
@@ -1289,10 +1307,12 @@ mod tests {
 
     #[test]
     fn zero_regen_cost_is_free_regeneration() {
-        let mut rules = SurvivalRules::default();
-        rules.regen_hunger_threshold = 0;
-        rules.regen_interval_secs = 1.0;
-        rules.regen_hunger_cost = 0;
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 0,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 0,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(10, 0, FULL_AIR).unwrap();
 
@@ -1304,10 +1324,12 @@ mod tests {
 
     #[test]
     fn positive_regen_cost_is_not_healed_when_unaffordable() {
-        let mut rules = SurvivalRules::default();
-        rules.regen_hunger_threshold = 3;
-        rules.regen_interval_secs = 1.0;
-        rules.regen_hunger_cost = 5;
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 3,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 5,
+            ..SurvivalRules::default()
+        };
         let mut runtime = SurvivalRuntime::default();
         let mut vitals = SurvivalState::new(10, 4, FULL_AIR).unwrap();
 

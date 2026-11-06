@@ -1028,7 +1028,7 @@ mod tests {
             embed_secs: -1.0,
             ..ArrowRules::default()
         };
-        let mut expired =
+        let expired =
             Arrow::player_with_rules(Vec3::ZERO, Vec3::X, 0.5, &negative).expect("constructs");
         assert!(expired.finished(), "a negative lifetime must expire");
         let mut embedded =

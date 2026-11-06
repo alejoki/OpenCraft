@@ -17,7 +17,7 @@ use crate::content::faces::BlockFaces;
 use crate::content::{ContentRegistry, WorldgenRule};
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
-use crate::player::combat::DamageCause;
+use crate::player::combat::{DamageCause, HitRequest};
 use crate::player::container::Container;
 use crate::player::inventory::{
     ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
@@ -982,11 +982,13 @@ impl WorldSession {
                                 let feet = player.position;
                                 let applied = player.combat.take_hit_with_rules(
                                     &mut player.survival,
-                                    arrow.damage,
+                                    HitRequest {
+                                        damage: arrow.damage,
+                                        cause: DamageCause::SkeletonArrow,
+                                        player_feet: feet,
+                                        from: before,
+                                    },
                                     mode,
-                                    DamageCause::SkeletonArrow,
-                                    feet,
-                                    before,
                                     &combat_rules,
                                 );
                                 if let Some(applied) = applied {
@@ -1378,11 +1380,13 @@ impl WorldSession {
             let feet = self.player.position;
             let applied = self.player.combat.take_hit_with_rules(
                 &mut self.player.survival,
-                profile.damage,
+                HitRequest {
+                    damage: profile.damage,
+                    cause: DamageCause::Zombie,
+                    player_feet: feet,
+                    from: attack.from,
+                },
                 mode,
-                DamageCause::Zombie,
-                feet,
-                attack.from,
                 &self.gameplay_rules.combat,
             );
             if let Some(applied) = applied {
