@@ -15425,8 +15425,135 @@ fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>, boo
     (lines, true)
 }
 
+// ---------------------------------------------------------------------------
+// Headless two-run recipe restart proof (`--demo-restart`, M014/S09-T02)
+// ---------------------------------------------------------------------------
+
+/// Build the deterministic `--demo-restart` same-save recipe proof.
+///
+/// A bare launch switch usable in release. Leg one (`--new`, or a missing
+/// fixture save) creates a session through the production startup seam, pins
+/// day 3 / tick 6000, and saves to the explicit `--save` path. Leg two (the
+/// fixture save exists and `--new` is absent) decodes that save directly with
+/// the freshly built registry, requires the persisted clock and zero
+/// unresolved names, then previews and crafts the edited `mymod:ruby_stew`
+/// recipe and requires the existing one-time content notice. The default save
+/// path is refused before any settings, pack, or world work, so the proof can
+/// never write into the repository. Never constructs `StartupContent`, a
+/// window, GPU, audio engine, or event loop.
+fn demo_restart_lines(cli: &CliConfig) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    if cli.save_path == Path::new(DEFAULT_SAVE_PATH) {
+        lines.push("restart: failed reason=save-path-required".to_string());
+        return (lines, false);
+    }
+
+    let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+    let (_loaded, specs, _pack_warnings) =
+        load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+    let (registry, _report) = build_session_registry(&specs);
+    let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
+
+    let Some(recipe) = registry.recipe_by_name("mymod:ruby_stew") else {
+        lines.push("restart: failed reason=missing-recipe".to_string());
+        return (lines, false);
+    };
+    let count = recipe.count;
+
+    if cli.force_new_world || !cli.save_path.is_file() {
+        let mut session = startup_session_with(cli, &registry, &config);
+        session.clock.day_index = 3;
+        session.clock.time_of_day = 6_000;
+        if save_current_world(&mut session).is_err() {
+            lines.push("restart: failed reason=save".to_string());
+            return (lines, false);
+        }
+        lines.push(format!(
+            "restart: leg=save recipe=mymod:ruby_stew count={count} day=3 tick=6000 saved=true"
+        ));
+        lines.push("restart: ok".to_string());
+        return (lines, true);
+    }
+
+    let loaded = match load_world_from_path_with(&cli.save_path, registry.as_ref()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("restart: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+    let unresolved = loaded.unresolved;
+    let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
+    if unresolved != 0 || session.clock.day_index != 3 || session.clock.time_of_day != 6_000 {
+        lines.push("restart: failed reason=load".to_string());
+        return (lines, false);
+    }
+
+    let Some(recipe) = session.registry.recipe_by_name("mymod:ruby_stew") else {
+        lines.push("restart: failed reason=missing-recipe".to_string());
+        return (lines, false);
+    };
+    let count = recipe.count;
+    let key: Vec<(char, ItemId)> = recipe
+        .key
+        .iter()
+        .map(|(character, reference)| {
+            let id = session
+                .registry
+                .resolve_item_ref(*reference)
+                .expect("the loaded recipe key resolves through its own registry");
+            (*character, id)
+        })
+        .collect();
+    let mut grid = crafting_demo_grid(&session.registry, GridKind::Player, &["RR", "WW"], &key);
+    let preview = grid
+        .preview_with(&session.registry)
+        .map(|preview| preview.output_count);
+    if preview != Some(count) {
+        lines.push("restart: failed reason=preview".to_string());
+        return (lines, false);
+    }
+    let crafted = grid
+        .take_result_with(&session.registry, &mut Inventory::empty())
+        .map(|item| item.count());
+    if crafted != Ok(count) {
+        lines.push("restart: failed reason=craft".to_string());
+        return (lines, false);
+    }
+    if session.take_content_notice().as_deref() != Some("content definitions changed") {
+        lines.push("restart: failed reason=notice".to_string());
+        return (lines, false);
+    }
+    if session.is_dead() {
+        lines.push("restart: failed reason=not-playable".to_string());
+        return (lines, false);
+    }
+    lines.push(format!(
+        "restart: leg=load recipe=mymod:ruby_stew count={count} preview={} crafted={} unresolved=0 day=3 tick=6000 notice=content definitions changed playable=true",
+        preview.expect("preview was validated above"),
+        crafted.expect("craft was validated above"),
+    ));
+    lines.push("restart: ok".to_string());
+    (lines, true)
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
+
+    // M014/S09 release gate: release builds expose no creator CLI. Reject the
+    // two dev-only switches before any other switch branch is evaluated, so a
+    // release launch cannot reach the config audit or a headless demo seam
+    // through a flag release does not implement. Debug builds compile this
+    // block out (`watch::CREATOR_TOOLS` is true).
+    if !watch::CREATOR_TOOLS {
+        if let Some(line) = watch::release_rejection_line(cli.check_config, cli.creator_trace) {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+            std::process::exit(1);
+        }
+    }
 
     // `--check-config` is a headless, pre-startup audit: it prints stable
     // file/key lines and exits 0/1 without settings, packs, a session, event
@@ -15602,6 +15729,28 @@ fn main() {
     if cli.demo_save_v9 {
         let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
         let (lines, ok) = demo_save_v9_lines(&cli.save_path, &config);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-restart` is the headless two-run recipe restart proof: leg one
+    // pins day 3 / tick 6000 and saves the explicit `--save` fixture; leg two
+    // loads that save in a fresh process against the edited registry and
+    // previews/crafts the new recipe count. It runs after the v9 proof and
+    // before the pack-aware startup content is built, so no window, GPU,
+    // audio engine, or event loop happens here. The default save path is
+    // refused inside the proof, and the switch is deliberately not
+    // release-gated: the release smoke proves the same recipe boundary.
+    if cli.demo_restart {
+        let (lines, ok) = demo_restart_lines(&cli);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -16327,6 +16476,57 @@ mod tests {
     }
 
     #[test]
+    fn demo_restart_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless proof,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let restart = CliConfig::parse_args(["--demo-restart"]);
+        assert!(!cli_has_world_intent(&restart));
+        assert_eq!(cli_has_world_intent(&restart), cli_has_world_intent(&bare));
+        // A real world flag still grants intent.
+        let with_new = CliConfig::parse_args(["--new", "--demo-restart"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_restart_short_circuit_precedes_world_startup() {
+        // The two-run restart proof must run after the v9 proof and before any
+        // world/session startup: no settings write, window, GPU, audio engine,
+        // event loop, or world startup is allowed on this launch. Pin the
+        // ordering in the real binary source so a later refactor cannot
+        // silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_save_v9_at = body
+            .find("cli.demo_save_v9")
+            .expect("fn main must branch on cli.demo_save_v9");
+        let demo_restart_at = body
+            .find("cli.demo_restart")
+            .expect("fn main must branch on cli.demo_restart");
+        let proof_at = body
+            .find("demo_restart_lines(")
+            .expect("fn main must call demo_restart_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_save_v9_at < demo_restart_at,
+            "the restart proof must follow the v9 proof"
+        );
+        assert!(
+            demo_restart_at < startup_at,
+            "cli.demo_restart must precede startup"
+        );
+        assert!(
+            proof_at < startup_at,
+            "demo_restart_lines must precede startup"
+        );
+    }
+
+    #[test]
     fn demo_palette_is_a_launch_switch_and_never_a_world_intent() {
         // The flag alone must not bypass the menus: it is a headless digest,
         // not a world parameter.
@@ -16355,6 +16555,47 @@ mod tests {
         // persisted or turned into a world parameter.
         let with_new = CliConfig::parse_args(["--new", "--demo-presentation"]);
         assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_release_gate_rejects_creator_flags_before_startup() {
+        // Release builds must reject the two creator switches before any other
+        // CLI branch or startup work can run. Pin both the gate text and its
+        // position in the real binary source so a refactor cannot silently
+        // move it behind a startup seam.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let gate_start = body
+            .find("if !watch::CREATOR_TOOLS {")
+            .expect("fn main must contain the release creator gate");
+        let exit = "std::process::exit(1);";
+        let gate_end = body.find(exit).expect("the release creator gate must exit") + exit.len();
+        let gate = &body[gate_start..gate_end];
+        assert!(
+            gate.contains("!watch::CREATOR_TOOLS"),
+            "the gate must be compile-time-dead in debug: {gate}"
+        );
+        assert!(
+            gate.contains("release_rejection_line"),
+            "the gate must use the pinned release line helper: {gate}"
+        );
+
+        let after_gate = &body[gate_end..];
+        for marker in [
+            "cli.check_config",
+            "check_config_lines",
+            "cli.validate_pack",
+            "cli.demo_save_v9",
+            "StartupContent::load",
+        ] {
+            assert!(
+                after_gate.contains(marker),
+                "the release creator gate must precede {marker} in fn main"
+            );
+        }
     }
 
     #[test]

@@ -259,6 +259,16 @@ pub struct CliConfig {
     /// load. Its only writes are the derived v9 file next to `--save`; the
     /// input is never overwritten.
     pub demo_save_v9: bool,
+    /// Whether the headless two-run recipe restart proof (`--demo-restart`,
+    /// M014/S09-T02) is requested. A bare launch switch: it takes no value,
+    /// is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before the startup content is built, so the proof never opens a
+    /// window, GPU, audio engine, or event loop. Its only write is the
+    /// explicit `--save` fixture: the default save path is refused before any
+    /// world work, so the demo can never write into the repository. Unlike
+    /// `--check-config` and `--creator-trace`, it is usable in release.
+    pub demo_restart: bool,
     /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
     /// `main` consumes it before `startup_session`, so validation never opens
     /// a window, GPU, world, save or settings file. A switch with no following
@@ -271,15 +281,18 @@ pub struct CliConfig {
     /// a world intent (so it never affects `cli_has_world_intent`), and is
     /// never persisted. `main` consumes it before settings, packs, and world
     /// startup, so the audit never opens a window, GPU, audio engine, event
-    /// loop, or save. Release rejection of the switch is deliberately deferred
-    /// to S09.
+    /// loop, or save. Release builds reject the switch at startup with
+    /// exactly `check-config: dev build only` on stdout and exit 1, before any
+    /// other switch or startup work runs (M014/S09).
     pub check_config: bool,
     /// Whether the dev-only creator trace (`--creator-trace`, M014/S02-T04) is
     /// requested. A bare launch switch: it takes no value, is deliberately NOT
     /// a world intent (so it never affects `cli_has_world_intent`), and is
     /// never persisted. `main` prints apply/reject lines only in debug builds
-    /// (`watch::CREATOR_TOOLS`) and only when this flag is set; release
-    /// rejection of the switch is deliberately deferred to S09.
+    /// (`watch::CREATOR_TOOLS`) and only when this flag is set. Release builds
+    /// reject the flag at startup with exactly `creator-trace: dev build only`
+    /// on stdout and exit 1, before any other switch or startup work runs
+    /// (M014/S09).
     pub creator_trace: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
@@ -312,6 +325,7 @@ impl CliConfig {
         let mut demo_worldgen = false;
         let mut demo_palette = false;
         let mut demo_save_v9 = false;
+        let mut demo_restart = false;
         let mut validate_pack = None;
         let mut check_config = false;
         let mut creator_trace = false;
@@ -419,6 +433,13 @@ impl CliConfig {
                     // argument (normally `--save <input>`).
                     demo_save_v9 = true;
                 }
+                "--demo-restart" => {
+                    // Same bare-switch rule as `--demo-save-v9`. `main`
+                    // short-circuits on this before the startup content is
+                    // built; the next token stays available as an independent
+                    // argument (normally `--save <fixture>`).
+                    demo_restart = true;
+                }
                 "--validate-pack" => {
                     // Value switch: consume the next token. A missing value
                     // stores an empty name so the request fails closed in
@@ -471,6 +492,7 @@ impl CliConfig {
             demo_worldgen,
             demo_palette,
             demo_save_v9,
+            demo_restart,
             validate_pack,
             check_config,
             creator_trace,
@@ -5733,6 +5755,40 @@ mod tests {
         let stray = CliConfig::parse_args(["--demo-save-v9", "5"]);
         assert!(stray.demo_save_v9);
         assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_restart_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every sibling demo seam stays off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_restart);
+        assert!(!bare.demo_save_v9);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let flag = CliConfig::parse_args(["--demo-restart"]);
+        assert!(flag.demo_restart);
+        assert!(!flag.demo_save_v9);
+        assert!(!flag.force_new_world);
+        assert_eq!(flag.seed_override, None);
+        assert_eq!(flag.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-restart", "5"]);
+        assert!(stray.demo_restart);
+        assert_eq!(stray.seed_override, None);
+
+        // `--new` and `--save` keep parsing independently around it.
+        let with_new = CliConfig::parse_args(["--new", "--demo-restart"]);
+        assert!(with_new.demo_restart);
+        assert!(with_new.force_new_world);
+        let with_save = CliConfig::parse_args(["--demo-restart", "--save", "recipe.mcvx"]);
+        assert!(with_save.demo_restart);
+        assert_eq!(with_save.save_path, std::path::PathBuf::from("recipe.mcvx"));
+
+        // Repeating a bare switch is idempotent, not a value consumption.
+        let repeated = CliConfig::parse_args(["--demo-restart", "--demo-restart"]);
+        assert!(repeated.demo_restart);
+        assert_eq!(repeated.seed_override, None);
     }
 
     #[test]

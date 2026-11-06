@@ -29,6 +29,30 @@ use crate::settle::SettleTracker;
 /// compiled in. Config loading itself is never gated.
 pub const CREATOR_TOOLS: bool = cfg!(debug_assertions);
 
+/// Exact stdout line a release build prints for `--check-config` and then
+/// exits 1 with, before any other CLI switch or startup work runs.
+pub const CHECK_CONFIG_RELEASE_LINE: &str = "check-config: dev build only";
+
+/// Exact stdout line a release build prints for `--creator-trace` and then
+/// exits 1 with, before any other CLI switch or startup work runs.
+pub const CREATOR_TRACE_RELEASE_LINE: &str = "creator-trace: dev build only";
+
+/// The release rejection line for the requested creator CLI switches.
+///
+/// `--check-config` wins when both switches are present, so a combined launch
+/// always prints exactly one deterministic line. Debug builds never consult
+/// this function ([`CREATOR_TOOLS`] is true); it stays compiled in both
+/// profiles so the exact strings and selector are unit-testable.
+pub fn release_rejection_line(check_config: bool, creator_trace: bool) -> Option<&'static str> {
+    if check_config {
+        Some(CHECK_CONFIG_RELEASE_LINE)
+    } else if creator_trace {
+        Some(CREATOR_TRACE_RELEASE_LINE)
+    } else {
+        None
+    }
+}
+
 /// How often the app may poll the six config files.
 pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1216,5 +1240,29 @@ mod tests {
     #[test]
     fn creator_tools_matches_the_build_profile() {
         assert_eq!(CREATOR_TOOLS, cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn release_rejection_lines_are_pinned() {
+        assert_eq!(CHECK_CONFIG_RELEASE_LINE, "check-config: dev build only");
+        assert_eq!(CREATOR_TRACE_RELEASE_LINE, "creator-trace: dev build only");
+    }
+
+    #[test]
+    fn release_rejection_line_selects_by_switch_with_check_config_precedence() {
+        assert_eq!(
+            release_rejection_line(true, false),
+            Some(CHECK_CONFIG_RELEASE_LINE)
+        );
+        assert_eq!(
+            release_rejection_line(false, true),
+            Some(CREATOR_TRACE_RELEASE_LINE)
+        );
+        assert_eq!(
+            release_rejection_line(true, true),
+            Some(CHECK_CONFIG_RELEASE_LINE),
+            "check-config must win when both creator switches are present"
+        );
+        assert_eq!(release_rejection_line(false, false), None);
     }
 }

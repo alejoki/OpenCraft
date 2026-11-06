@@ -1,20 +1,29 @@
-//! Real-binary integration proof for `opencraft --check-config` (M014/S01).
+//! Real-binary integration proof for `opencraft --check-config` (M014/S01)
+//! and its release rejection (M014/S09).
 //!
 //! These tests spawn the actual compiled binary in isolated temporary working
 //! directories, so the CLI contract is pinned at the process boundary: exit
 //! codes, exact stdout lines, logical `config/<file>` paths independent of the
-//! process CWD, and the absence of startup side effects. Loader/renderer unit
-//! tests live in `src/config/mod.rs`; this file covers the real launch path.
+//! process CWD, and the absence of startup side effects. Debug builds prove
+//! the audit itself; release builds prove the dev-only gate prints exactly one
+//! pinned line and exits 1 before any startup state exists. Loader/renderer
+//! unit tests live in `src/config/mod.rs`; this file covers the real launch
+//! path.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
+
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 
 /// The binary Cargo built for this integration test.
 const BIN: &str = env!("CARGO_BIN_EXE_opencraft");
 /// The checkout root containing the checked-in `config/` tree.
+#[cfg(debug_assertions)]
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 /// The six curated files in registry/report order with their value counts.
+#[cfg(debug_assertions)]
 const CONFIG_FILES: [(&str, usize); 6] = [
     ("player.toml", 16),
     ("survival.toml", 15),
@@ -24,12 +33,15 @@ const CONFIG_FILES: [(&str, usize); 6] = [
     ("render.toml", 10),
 ];
 
+#[cfg(debug_assertions)]
 const SUMMARY_PREFIX: &str =
     "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=0x";
+#[cfg(debug_assertions)]
 const MISSING_SUMMARY_PREFIX: &str =
     "config: files=6 missing=6 warnings=6 errors=0 keys=85 schema=1 digest=0x";
 
 /// Copy the six checked-in config files byte-for-byte into `dest/config`.
+#[cfg(debug_assertions)]
 fn copy_config(dest: &Path) -> PathBuf {
     let source = Path::new(MANIFEST_DIR).join("config");
     let config = dest.join("config");
@@ -43,6 +55,7 @@ fn copy_config(dest: &Path) -> PathBuf {
 }
 
 /// Run the real binary with `--check-config` from `dir` as the process CWD.
+#[cfg(debug_assertions)]
 fn run_check(dir: &Path) -> Output {
     Command::new(BIN)
         .arg("--check-config")
@@ -68,12 +81,14 @@ fn report(output: &Output) -> String {
     )
 }
 
+#[cfg(debug_assertions)]
 fn last_line(lines: &[String]) -> &str {
     lines.last().expect("report must end with a summary line")
 }
 
 /// Assert the summary starts with `expected_prefix` and ends with a lowercase
 /// 16-hex-digit FNV-1a digest.
+#[cfg(debug_assertions)]
 fn assert_summary(lines: &[String], expected_prefix: &str) {
     let summary = last_line(lines);
     let digest = summary
@@ -93,6 +108,7 @@ fn assert_summary(lines: &[String], expected_prefix: &str) {
 }
 
 /// Replace exactly one occurrence, proving the fixture edit actually landed.
+#[cfg(debug_assertions)]
 fn replace_once(path: &Path, from: &str, to: &str) {
     let contents = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
@@ -107,6 +123,7 @@ fn replace_once(path: &Path, from: &str, to: &str) {
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
 }
 
+#[cfg(debug_assertions)]
 fn sorted_entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("read_dir {}: {error}", dir.display()))
@@ -122,6 +139,7 @@ fn sorted_entries(dir: &Path) -> Vec<String> {
     names
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn valid_checked_in_config_exits_zero() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -167,6 +185,7 @@ fn valid_checked_in_config_exits_zero() {
     assert_summary(&lines, SUMMARY_PREFIX);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn invalid_value_exits_nonzero_with_stable_line() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -200,6 +219,7 @@ fn invalid_value_exits_nonzero_with_stable_line() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn cross_field_exits_nonzero_and_names_both_keys() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -234,6 +254,7 @@ fn cross_field_exits_nonzero_and_names_both_keys() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn missing_config_dir_warns_and_exits_zero() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -275,6 +296,7 @@ fn missing_config_dir_warns_and_exits_zero() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn extra_toml_warns_and_exits_zero() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -305,6 +327,7 @@ fn extra_toml_warns_and_exits_zero() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn check_config_creates_no_settings_pack_or_save_state() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -343,4 +366,77 @@ fn check_config_creates_no_settings_pack_or_save_state() {
     assert!(!temp.path().join("settings.toml").exists());
     assert!(!temp.path().join("saves").exists());
     assert!(!temp.path().join("packs").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Release profile: the dev-only creator switches fail closed before startup.
+// ---------------------------------------------------------------------------
+
+/// Run the real binary from `dir` as the process CWD.
+#[cfg(not(debug_assertions))]
+fn run_in(dir: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn opencraft {args:?}: {error}"))
+}
+
+/// A rejected creator switch must not create any startup state.
+#[cfg(not(debug_assertions))]
+fn assert_no_startup_state(dir: &Path) {
+    for entry in ["settings.toml", "saves", "packs", "config"] {
+        assert!(
+            !dir.join(entry).exists(),
+            "release rejection must not create {entry}"
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_check_config_rejected_with_one_pinned_line() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let output = run_in(temp.path(), &["--check-config"]);
+    assert_eq!(output.status.code(), Some(1), "{}", report(&output));
+    assert_eq!(
+        stdout_lines(&output),
+        vec!["check-config: dev build only".to_string()],
+        "{}",
+        report(&output)
+    );
+    assert_no_startup_state(temp.path());
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_creator_trace_rejected_with_one_pinned_line() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let output = run_in(temp.path(), &["--creator-trace"]);
+    assert_eq!(output.status.code(), Some(1), "{}", report(&output));
+    assert_eq!(
+        stdout_lines(&output),
+        vec!["creator-trace: dev build only".to_string()],
+        "{}",
+        report(&output)
+    );
+    assert_no_startup_state(temp.path());
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_check_config_line_wins_when_both_flags_are_present() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let output = run_in(temp.path(), &["--creator-trace", "--check-config"]);
+    assert_eq!(output.status.code(), Some(1), "{}", report(&output));
+    assert_eq!(
+        stdout_lines(&output),
+        vec!["check-config: dev build only".to_string()],
+        "check-config must win precedence: {}",
+        report(&output)
+    );
+    assert_no_startup_state(temp.path());
 }
