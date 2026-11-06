@@ -1687,6 +1687,52 @@ fn session_weather(session: &WorldSession) -> Weather {
     )
 }
 
+/// The live sky palette of a session: its clock's time of day, its live
+/// [`opencraft::world::daycycle::RenderRules`] (moonlit floor), and its
+/// calendar-derived weather palette.
+///
+/// The Playing render arm's single seam for palette tuning. The menu/vista
+/// arm deliberately keeps the default [`daycycle::sky_palette`] (its own
+/// persisted clock, no session rules), so a render.toml palette edit never
+/// repaints the panorama.
+fn session_sky_palette(session: &WorldSession, weather: Weather) -> daycycle::SkyPalette {
+    let rules = session.rules();
+    daycycle::weather_palette_with(
+        daycycle::sky_palette_with(session.clock.time_of_day, &rules.render),
+        weather,
+        &rules.render,
+    )
+}
+
+/// The live weather fog-range multiplier of a session.
+///
+/// Only the Playing arm uses this; the vista arm pins the Clear identity
+/// factor so the panorama never compresses fog for weather it never draws.
+fn session_fog_range_factor(session: &WorldSession, weather: Weather) -> f32 {
+    daycycle::weather_fog_range_factor_with(weather, &session.rules().render)
+}
+
+/// The live mining candidate under the crosshair.
+///
+/// Reads the session's own registry, selected item, and live
+/// [`opencraft::player::tools::ToolRules`], so a mining.toml reload changes
+/// the hold-to-mine duration on the very next frame. The bare
+/// [`MiningTarget::from_block_with`] call remains the default wrapper used by
+/// demo/diagnostic/scripted paths.
+fn session_mining_target(
+    session: &WorldSession,
+    pos: IVec3,
+    block: BlockId,
+) -> Option<MiningTarget> {
+    MiningTarget::from_block_with_rules(
+        &session.registry,
+        pos,
+        block,
+        session.player.selected_item(),
+        &session.rules().tools,
+    )
+}
+
 /// Weather ambient-audio seam — deliberately empty in M007.
 ///
 /// There is no looped-ambient engine in `src/audio` (MEM227): [`AudioEngine`]
@@ -8819,6 +8865,7 @@ impl GameApp {
             &settings.pack_stack,
             Instant::now(),
         );
+        let selection_seconds = config.rules().selection.selected_name_secs;
         let mut app = Self {
             window: None,
             gpu: None,
@@ -8848,7 +8895,7 @@ impl GameApp {
                     text,
                     ticks_left: menu::MESSAGE_TICKS,
                 }),
-            selection_label: SelectionLabel::new(),
+            selection_label: SelectionLabel::with_seconds(selection_seconds),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -8930,6 +8977,11 @@ impl GameApp {
         let rules = self.config.rules();
         let meta = self.config.meta();
         self.session.apply_config(&rules, meta);
+        // render.toml's `ui.selected_name_secs` is app-owned UI timing, not
+        // session state: install it on the same seam so a live reload retunes
+        // the very next Playing frame's fade without reinstalling the session.
+        self.selection_label
+            .set_seconds(rules.selection.selected_name_secs);
     }
 
     /// One creator poll: observe every curated file, then reload the files
@@ -12072,12 +12124,7 @@ impl ApplicationHandler for GameApp {
                             h.block_pos.y,
                             h.block_pos.z,
                         );
-                        MiningTarget::from_block_with(
-                            &self.session.registry,
-                            h.block_pos,
-                            block,
-                            self.session.player.selected_item(),
-                        )
+                        session_mining_target(&self.session, h.block_pos, block)
                     })
                 } else {
                     None
@@ -13009,9 +13056,6 @@ impl ApplicationHandler for GameApp {
                         ui_pass,
                     )
                 } else {
-                    // Per-frame palette from the live session clock (pure math,
-                    // cheap — same rationale as the per-frame vista camera).
-                    let palette = daycycle::sky_palette(self.session.clock.time_of_day);
                     // Per-frame weather, derived from the persisted calendar
                     // only: no `Weather` value is cached anywhere, so the
                     // calendar remains the sole home of the weather state. A
@@ -13021,7 +13065,11 @@ impl ApplicationHandler for GameApp {
                     // The ambient-audio seam is exercised on every session
                     // frame and is a deliberate no-op in M007 (MEM227).
                     weather_ambient_hook(weather);
-                    let palette = daycycle::weather_palette(palette, weather);
+                    // Per-frame palette from the live session clock and the
+                    // live render rules (pure math, cheap — same rationale as
+                    // the per-frame vista camera). Only this Playing arm is
+                    // tunable; the menu arm keeps the default palette.
+                    let palette = session_sky_palette(&self.session, weather);
                     // Eye submersion (S04-T03): one bounded block lookup per
                     // session frame against the live eye position (synced from
                     // `player.eye_position()` above), never a scan. It flips the
@@ -13051,7 +13099,7 @@ impl ApplicationHandler for GameApp {
                             self.session.clock.time_of_day,
                             underwater,
                             weather,
-                            daycycle::weather_fog_range_factor(weather),
+                            session_fog_range_factor(&self.session, weather),
                             self.session.clock.cycle_phase(),
                         ),
                         ui_pass,
@@ -27635,8 +27683,12 @@ stack = 64
             "every session frame must exercise the audio seam"
         );
         assert!(
-            src.contains("let palette = daycycle::weather_palette(palette, weather);"),
-            "the session palette must be weather-tinted before upload"
+            src.contains("let palette = session_sky_palette(&self.session, weather);"),
+            "the session palette must be weather-tinted from live render rules before upload"
+        );
+        assert!(
+            src.contains("session_fog_range_factor(&self.session, weather),"),
+            "the session fog range must read the live render rules"
         );
         assert!(
             src.contains("self.session.clock.cycle_phase(),"),
@@ -33772,6 +33824,482 @@ skeleton_damage = 2
 lifetime_secs = 20.0
 embed_secs = 2.0
 ";
+
+    /// Full tuned world.toml: 600 s day, all weather percents zero, a tighter
+    /// spawn envelope, and a 30 s wheat stage. Every cross-field invariant
+    /// holds (safe < spawn_max < despawn, region cap < max total).
+    const TUNED_WORLD_TOML: &str = "\
+[clock]
+day_seconds = 600.0
+
+[weather]
+winter_snow_percent = 0
+spring_rain_percent = 0
+summer_rain_percent = 0
+autumn_rain_percent = 0
+
+[spawning]
+safe_radius_blocks = 16
+spawn_max_radius_blocks = 40
+despawn_radius_blocks = 80
+max_mobs_total = 24
+spawn_region_blocks = 16
+spawn_region_cap = 3
+spawn_attempt_secs = 0.1
+despawn_scan_secs = 0.5
+burn_interval_secs = 0.25
+spawn_min_separation = 1.5
+hostile_cave_light = 5
+passive_surface_light = 15
+max_spawn_attempts_per_call = 8
+
+[farming]
+wheat_stage_game_secs = 30.0
+";
+
+    /// Full tuned mining.toml: faster but still monotonic tiers and a 12-block
+    /// table reach.
+    const TUNED_MINING_TOML: &str = "\
+[tools]
+wood_speed_multiplier = 8
+stone_speed_multiplier = 12
+iron_speed_multiplier = 16
+
+[interaction]
+table_reach = 12.0
+";
+
+    /// Full tuned render.toml: tighter fog, stronger tints, a 0.2 midnight
+    /// floor, and a 0.5 s selected-name timer.
+    const TUNED_RENDER_TOML: &str = "\
+[fog]
+rain_factor = 0.5
+snow_factor = 0.6
+
+[palette]
+rain_grey_scale = 0.5
+snow_grey_scale = 1.4
+rain_sky_lerp = 0.6
+snow_sky_lerp = 0.7
+rain_day_factor = 0.6
+snow_day_factor = 0.8
+moonlit_floor = 0.2
+
+[ui]
+selected_name_secs = 0.5
+";
+
+    /// S06-T05: the whole live loop through the real watcher and the real
+    /// production frame helpers. world.toml, mining.toml, and render.toml
+    /// edits must change what the Playing frame sees (day rate, weather,
+    /// palette, fog, selection timer, mining duration), and a cross-field
+    /// spawn/tool violation must reject the whole file with last-good rules
+    /// and digest while naming both fields in the overlay.
+    #[test]
+    fn creator_live_world_mining_render_edits_reach_the_live_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert_eq!(app.session.rules(), RulesBundle::default());
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+        let digest_before = app.config.digest();
+
+        let t0 = Instant::now();
+        write_config(dir.path(), "world.toml", TUNED_WORLD_TOML);
+        write_config(dir.path(), "mining.toml", TUNED_MINING_TOML);
+        write_config(dir.path(), "render.toml", TUNED_RENDER_TOML);
+        settle_config(&mut app, t0);
+
+        assert!(
+            matches!(app.creator.status, ReloadStatus::Applied { .. }),
+            "the three tuned files must apply: {:?}",
+            app.creator.status
+        );
+        assert_ne!(app.config.digest(), digest_before);
+
+        let rules = app.session.rules();
+        assert_eq!(rules.clock.day_seconds, 600.0);
+        assert_eq!(rules.weather.spring_rain_percent, 0);
+        assert_eq!(rules.spawning.spawn_max_radius_blocks, 40);
+        assert_eq!(rules.spawning.max_mobs_total, 24);
+        assert_eq!(rules.farming.wheat_stage_game_secs, 30.0);
+        assert_eq!(rules.tools.wood_speed_multiplier, 8);
+        assert_eq!(rules.interaction.table_reach, 12.0);
+        assert_eq!(rules.render.rain_fog_factor, 0.5);
+        assert_eq!(rules.render.moonlit_floor, 0.2);
+        assert_eq!(rules.selection.selected_name_secs, 0.5);
+
+        // Clock: 600 real seconds per day = 40 ticks per real second, so one
+        // second from noon lands exactly on tick 6,040.
+        assert_eq!(app.session.clock.day_seconds(), 600.0);
+        app.session.clock.advance_secs(1.0, 1.0);
+        assert_eq!(app.session.clock.time_of_day, 6_040);
+
+        // Weather palette/fog: the all-zero percentages make every day clear,
+        // and the tuned midnight floor plus rain fog factor reach the frame
+        // helpers.
+        assert_eq!(session_weather(&app.session), Weather::Clear);
+        app.session.clock.time_of_day = 18_000;
+        assert_eq!(
+            session_sky_palette(&app.session, Weather::Clear).day_factor,
+            0.2
+        );
+        assert_eq!(session_fog_range_factor(&app.session, Weather::Rain), 0.5);
+
+        // Selected-name timer: initialized from render.toml at startup, then
+        // retuned by the same live reload. Half-life behavior at 0.25 s.
+        assert_eq!(app.selection_label.seconds(), 0.5);
+        let wood_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood pickaxe");
+        assert!(app.selection_label.observe(1, Some(wood_pickaxe)));
+        assert_eq!(app.selection_label.remaining(), 0.5);
+        app.selection_label.tick(0.25);
+        assert!((app.selection_label.remaining() - 0.25).abs() < 1e-6);
+        assert!(app.selection_label.alpha() > 0.0);
+        app.selection_label.tick(0.25);
+        assert_eq!(app.selection_label.remaining(), 0.0);
+        assert_eq!(app.selection_label.alpha(), 0.0);
+
+        // Mining: the live tool rules cut the wooden tier's stone duration to
+        // 1.2 / 8 while the default wrapper stays at 1.2 / 2.
+        app.session
+            .player
+            .insert_items(&[wood_pickaxe])
+            .expect("the pickaxe fits");
+        let slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                app.session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(ItemId::Tool {
+                        kind: ToolKind::Pickaxe,
+                        tier: ToolTier::Wood,
+                    })
+            })
+            .expect("the pickaxe landed in a hotbar slot");
+        assert!(app.session.player.select_slot(slot));
+        let pos = IVec3::new(0, 64, 0);
+        let tuned =
+            session_mining_target(&app.session, pos, BlockId::Stone).expect("stone is breakable");
+        assert_eq!(tuned.duration(), 1.2 / 8.0);
+        assert_eq!(
+            MiningTarget::from_block_with(
+                &app.session.registry,
+                pos,
+                BlockId::Stone,
+                Some(wood_pickaxe),
+            )
+            .expect("the default wrapper still resolves stone")
+            .duration(),
+            1.2 / 2.0
+        );
+
+        // Cross-field rejection: a spawn_max below safe rejects the whole
+        // world file, keeps the last-good rules and digest, and names both
+        // fields in the single overlay error line.
+        let digest = app.config.digest();
+        let rules_before = app.session.rules();
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "world.toml",
+            &TUNED_WORLD_TOML.replace(
+                "spawn_max_radius_blocks = 40",
+                "spawn_max_radius_blocks = 10",
+            ),
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::World,
+                field: Some("spawning.spawn_max_radius_blocks".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+        let error = lines
+            .iter()
+            .find(|line| line.contains("error:"))
+            .expect("a rejection must show an error line");
+        assert!(
+            error.contains("spawning.safe_radius_blocks")
+                && error.contains("spawning.spawn_max_radius_blocks"),
+            "the cross-field error must name both radius keys: {error}"
+        );
+
+        // Restoring the tuned world file clears the diagnostic and applies.
+        let t2 = t1 + Duration::from_secs(1);
+        write_config(dir.path(), "world.toml", TUNED_WORLD_TOML);
+        settle_config(&mut app, t2);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::World,
+                ..
+            }
+        ));
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+
+        // The same whole-file guard on the mining cross-field invariant: a
+        // wood multiplier above stone is rejected and names both tool keys.
+        let t3 = t2 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "mining.toml",
+            &TUNED_MINING_TOML.replace("wood_speed_multiplier = 8", "wood_speed_multiplier = 20"),
+        );
+        settle_config(&mut app, t3);
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Mining,
+                field: Some("tools.stone_speed_multiplier".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+        let error = lines
+            .iter()
+            .find(|line| line.contains("error:"))
+            .expect("a rejection must show an error line");
+        assert!(
+            error.contains("tools.wood_speed_multiplier")
+                && error.contains("tools.stone_speed_multiplier"),
+            "the cross-field error must name both tool keys: {error}"
+        );
+
+        // Restoring the tuned mining file clears the error as well.
+        let t4 = t3 + Duration::from_secs(1);
+        write_config(dir.path(), "mining.toml", TUNED_MINING_TOML);
+        settle_config(&mut app, t4);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Mining,
+                ..
+            }
+        ));
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+    }
+
+    /// S06-T05: every new rule struct's Default is its module constant, and
+    /// every `_with` seam is byte-identical to its default wrapper under
+    /// default rules. This is the regression guard that keeps pre-tuning
+    /// rendering, weather, farming, and UI timing unchanged.
+    #[test]
+    fn default_world_mining_render_wrappers_preserve_pinned_numbers() {
+        use opencraft::player::tools::{
+            ToolRules, IRON_SPEED_MULTIPLIER, STONE_SPEED_MULTIPLIER, WOOD_SPEED_MULTIPLIER,
+        };
+        use opencraft::ui::selection::{SelectionRules, SELECTED_NAME_SECS};
+        use opencraft::world::daycycle::{
+            ClockRules, RenderRules, DAY_SECONDS, MOONLIT_FLOOR, RAIN_DAY_FACTOR,
+            RAIN_FOG_RANGE_FACTOR, RAIN_GREY_SCALE, RAIN_SKY_LERP, SNOW_DAY_FACTOR,
+            SNOW_FOG_RANGE_FACTOR, SNOW_GREY_SCALE, SNOW_SKY_LERP,
+        };
+        use opencraft::world::farming::{FarmingRules, WHEAT_STAGE_GAME_SECS};
+        use opencraft::world::season::{
+            weather_of, Season, WeatherRules, AUTUMN_RAIN_PERCENT, SPRING_RAIN_PERCENT,
+            SUMMER_RAIN_PERCENT, WINTER_SNOW_PERCENT,
+        };
+        use opencraft::world::session::{InteractionRules, TABLE_INTERACT_REACH};
+        use opencraft::world::spawning::{
+            SpawnRules, BURN_INTERVAL_SECS, DESPAWN_RADIUS_BLOCKS, DESPAWN_SCAN_SECS,
+            HOSTILE_CAVE_LIGHT, MAX_MOBS_TOTAL, MAX_SPAWN_ATTEMPTS_PER_CALL, PASSIVE_SURFACE_LIGHT,
+            SAFE_RADIUS_BLOCKS, SPAWN_ATTEMPT_SECS, SPAWN_MAX_RADIUS_BLOCKS, SPAWN_MIN_SEPARATION,
+            SPAWN_REGION_BLOCKS, SPAWN_REGION_CAP,
+        };
+
+        let rules = RulesBundle::default();
+        assert_eq!(
+            rules.clock,
+            ClockRules {
+                day_seconds: DAY_SECONDS
+            }
+        );
+        assert_eq!(
+            rules.weather,
+            WeatherRules {
+                winter_snow_percent: WINTER_SNOW_PERCENT,
+                spring_rain_percent: SPRING_RAIN_PERCENT,
+                summer_rain_percent: SUMMER_RAIN_PERCENT,
+                autumn_rain_percent: AUTUMN_RAIN_PERCENT,
+            }
+        );
+        assert_eq!(
+            rules.spawning,
+            SpawnRules {
+                safe_radius_blocks: SAFE_RADIUS_BLOCKS,
+                spawn_max_radius_blocks: SPAWN_MAX_RADIUS_BLOCKS,
+                despawn_radius_blocks: DESPAWN_RADIUS_BLOCKS,
+                max_mobs_total: MAX_MOBS_TOTAL,
+                spawn_region_blocks: SPAWN_REGION_BLOCKS,
+                spawn_region_cap: SPAWN_REGION_CAP,
+                spawn_attempt_secs: SPAWN_ATTEMPT_SECS,
+                despawn_scan_secs: DESPAWN_SCAN_SECS,
+                burn_interval_secs: BURN_INTERVAL_SECS,
+                spawn_min_separation: SPAWN_MIN_SEPARATION,
+                hostile_cave_light: HOSTILE_CAVE_LIGHT,
+                passive_surface_light: PASSIVE_SURFACE_LIGHT,
+                max_spawn_attempts_per_call: MAX_SPAWN_ATTEMPTS_PER_CALL,
+            }
+        );
+        assert_eq!(
+            rules.farming,
+            FarmingRules {
+                wheat_stage_game_secs: WHEAT_STAGE_GAME_SECS
+            }
+        );
+        assert_eq!(
+            rules.tools,
+            ToolRules {
+                wood_speed_multiplier: WOOD_SPEED_MULTIPLIER,
+                stone_speed_multiplier: STONE_SPEED_MULTIPLIER,
+                iron_speed_multiplier: IRON_SPEED_MULTIPLIER,
+            }
+        );
+        assert_eq!(
+            rules.interaction,
+            InteractionRules {
+                table_reach: TABLE_INTERACT_REACH
+            }
+        );
+        assert_eq!(
+            rules.render,
+            RenderRules {
+                rain_fog_factor: RAIN_FOG_RANGE_FACTOR,
+                snow_fog_factor: SNOW_FOG_RANGE_FACTOR,
+                rain_grey_scale: RAIN_GREY_SCALE,
+                snow_grey_scale: SNOW_GREY_SCALE,
+                rain_sky_lerp: RAIN_SKY_LERP,
+                snow_sky_lerp: SNOW_SKY_LERP,
+                rain_day_factor: RAIN_DAY_FACTOR,
+                snow_day_factor: SNOW_DAY_FACTOR,
+                moonlit_floor: MOONLIT_FLOOR,
+            }
+        );
+        assert_eq!(
+            rules.selection,
+            SelectionRules {
+                selected_name_secs: SELECTED_NAME_SECS
+            }
+        );
+
+        // Palettes: the default `_with` calls are bit-identical to the
+        // default wrappers at every keyframe boundary, and across weather.
+        for time_of_day in [0, daycycle::DEFAULT_TIME_OF_DAY, 12_000, 18_000] {
+            assert_eq!(
+                daycycle::sky_palette_with(time_of_day, &RenderRules::default()),
+                daycycle::sky_palette(time_of_day),
+                "sky palette at tick {time_of_day}"
+            );
+        }
+        let base = daycycle::sky_palette(daycycle::DEFAULT_TIME_OF_DAY);
+        for weather in [Weather::Clear, Weather::Rain, Weather::Snowfall] {
+            assert_eq!(
+                daycycle::weather_palette_with(base, weather, &RenderRules::default()),
+                daycycle::weather_palette(base, weather),
+                "weather palette for {weather:?}"
+            );
+            assert_eq!(
+                daycycle::weather_fog_range_factor_with(weather, &RenderRules::default()),
+                daycycle::weather_fog_range_factor(weather),
+                "weather fog factor for {weather:?}"
+            );
+        }
+
+        // Pinned seed-1 calendar cases: the live-rule seam defaults exactly
+        // to the pure derivation the session already used.
+        for day in [0u32, 1, 17, 1_000] {
+            for season in [
+                Season::Spring,
+                Season::Summer,
+                Season::Autumn,
+                Season::Winter,
+            ] {
+                assert_eq!(
+                    weather_of_with(season, day, 1, &WeatherRules::default()),
+                    weather_of(season, day, 1),
+                    "weather for {season:?} day {day}"
+                );
+            }
+        }
+
+        // Registry mining durations and the UI label timer also default to
+        // exactly the pre-tuning values.
+        let registry = ContentRegistry::builtin();
+        for block in [BlockId::Stone, BlockId::Dirt, BlockId::OakLog] {
+            assert_eq!(
+                registry.break_duration_with_rules(
+                    block,
+                    Some(wood_pickaxe()),
+                    &ToolRules::default()
+                ),
+                registry.break_duration(block, Some(wood_pickaxe())),
+                "break duration for {block:?}"
+            );
+        }
+        let mut fresh = SelectionLabel::new();
+        let mut explicit = SelectionLabel::with_seconds(SELECTED_NAME_SECS);
+        assert_eq!(fresh.seconds(), explicit.seconds());
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone");
+        assert_eq!(
+            fresh.observe(0, Some(stone)),
+            explicit.observe(0, Some(stone))
+        );
+        fresh.tick(0.5);
+        explicit.tick(0.5);
+        assert_eq!(fresh, explicit);
+        assert_eq!(fresh.alpha(), explicit.alpha());
+    }
+
+    fn wood_pickaxe() -> Item {
+        Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood pickaxe")
+    }
 
     #[test]
     fn creator_live_survival_and_combat_edits_change_gameplay() {

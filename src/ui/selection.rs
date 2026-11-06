@@ -37,11 +37,14 @@ impl Default for SelectionRules {
 ///
 /// `new` starts empty and hidden: observing `(0, None)` is not a change, so a
 /// freshly launched game does not flash an "Empty" label for doing nothing.
+/// `seconds` is the live label duration; it defaults to
+/// [`SELECTED_NAME_SECS`] and is replaced from render.toml by the app.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectionLabel {
     slot: usize,
     item: Option<Item>,
     remaining: f32,
+    seconds: f32,
 }
 
 impl SelectionLabel {
@@ -51,13 +54,44 @@ impl SelectionLabel {
             slot: 0,
             item: None,
             remaining: 0.0,
+            seconds: SELECTED_NAME_SECS,
         }
+    }
+
+    /// A hidden label whose fade lasts `seconds`.
+    ///
+    /// Non-finite or negative durations are ignored, leaving the default
+    /// lifetime in place.
+    pub fn with_seconds(seconds: f32) -> Self {
+        let mut label = Self::new();
+        label.set_seconds(seconds);
+        label
+    }
+
+    /// Replace the live label duration.
+    ///
+    /// A non-finite or negative value is ignored (the previous duration
+    /// stands); a valid value clamps an active `remaining` into
+    /// `0.0..=seconds`, so shrinking the duration mid-fade takes effect
+    /// immediately instead of leaving a label stuck past its lifetime. A
+    /// zero duration is valid and hides the label: render.toml may disable it.
+    pub fn set_seconds(&mut self, seconds: f32) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        self.seconds = seconds;
+        self.remaining = self.remaining.clamp(0.0, seconds);
+    }
+
+    /// The live label duration in seconds.
+    pub const fn seconds(&self) -> f32 {
+        self.seconds
     }
 
     /// Reports whether `(slot, item)` differs from the observed selection.
     ///
-    /// When it differs the state is adopted and the timer restarts at
-    /// [`SELECTED_NAME_SECS`]. Item equality covers identity, count, and
+    /// When it differs the state is adopted and the timer restarts at the
+    /// current [`Self::seconds`]. Item equality covers identity, count, and
     /// durability, so picking up or consuming part of a stack restarts the
     /// label too.
     pub fn observe(&mut self, slot: usize, item: Option<Item>) -> bool {
@@ -65,7 +99,7 @@ impl SelectionLabel {
         if changed {
             self.slot = slot;
             self.item = item;
-            self.remaining = SELECTED_NAME_SECS;
+            self.remaining = self.seconds;
         }
         changed
     }
@@ -74,20 +108,24 @@ impl SelectionLabel {
     ///
     /// Negative and non-finite deltas are ignored (a paused/corrupted clock
     /// must not resurrect or permanently hide the label), and the remainder is
-    /// clamped to `0.0..=SELECTED_NAME_SECS`.
+    /// clamped to `0.0..=Self::seconds`.
     pub fn tick(&mut self, dt: f32) {
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
-        self.remaining = (self.remaining - dt).clamp(0.0, SELECTED_NAME_SECS);
+        self.remaining = (self.remaining - dt).clamp(0.0, self.seconds);
     }
 
     /// Smooth fade factor in `0.0..=1.0`, zero once the timer expires.
     ///
     /// Smoothstep keeps the appearance and disappearance soft at both ends
-    /// without any extra state.
+    /// without any extra state. A zero live duration is a completed fade, not
+    /// a division by zero: it always reports `0.0`.
     pub fn alpha(&self) -> f32 {
-        let t = (self.remaining / SELECTED_NAME_SECS).clamp(0.0, 1.0);
+        if self.seconds <= 0.0 {
+            return 0.0;
+        }
+        let t = (self.remaining / self.seconds).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     }
 
@@ -151,6 +189,56 @@ mod tests {
 
     fn pickaxe(durability: u16) -> Item {
         Item::tool_with_durability(ToolKind::Pickaxe, ToolTier::Iron, durability).expect("pickaxe")
+    }
+
+    #[test]
+    fn live_seconds_govern_observe_tick_and_alpha() {
+        let mut label = SelectionLabel::with_seconds(0.5);
+        assert_eq!(label.seconds(), 0.5);
+        label.observe(1, Some(stone(1)));
+        assert_eq!(label.remaining(), 0.5);
+        label.tick(0.25);
+        assert!((label.remaining() - 0.25).abs() < 1e-6);
+        assert!(label.alpha() > 0.0 && label.alpha() < 1.0);
+
+        // Shrinking mid-fade clamps the live remainder into the new window so
+        // a render.toml edit takes effect on the very next frame.
+        label.set_seconds(0.1);
+        assert_eq!(label.remaining(), 0.1);
+        label.tick(0.1);
+        assert_eq!(label.remaining(), 0.0);
+        assert_eq!(label.alpha(), 0.0);
+        assert!(!label.is_visible());
+    }
+
+    #[test]
+    fn invalid_and_zero_durations_are_safe() {
+        let mut label = SelectionLabel::with_seconds(f32::NAN);
+        assert_eq!(label.seconds(), SELECTED_NAME_SECS);
+        label.set_seconds(-1.0);
+        assert_eq!(label.seconds(), SELECTED_NAME_SECS);
+        label.set_seconds(f32::INFINITY);
+        assert_eq!(label.seconds(), SELECTED_NAME_SECS);
+
+        // Zero is a valid render.toml value: the label can be disabled. It
+        // must never divide by zero or stick visible.
+        label.set_seconds(0.0);
+        label.observe(2, Some(stone(1)));
+        label.tick(0.1);
+        assert!(!label.is_visible());
+        assert_eq!(label.alpha(), 0.0);
+        assert!(!label.alpha().is_nan());
+    }
+
+    #[test]
+    fn new_matches_with_default_seconds() {
+        let mut left = SelectionLabel::new();
+        let mut right = SelectionLabel::with_seconds(SELECTED_NAME_SECS);
+        left.observe(3, Some(stone(5)));
+        right.observe(3, Some(stone(5)));
+        left.tick(0.5);
+        right.tick(0.5);
+        assert_eq!(left, right);
     }
 
     #[test]

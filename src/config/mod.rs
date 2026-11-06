@@ -1224,8 +1224,10 @@ fn cross_field_violation(
                 return Some((
                     "tools.stone_speed_multiplier",
                     format!(
-                        "tool speed multipliers must satisfy wood ({wood}) <= \
-                         stone ({stone}) <= iron ({iron})"
+                        "tool speed multipliers must satisfy \
+                         tools.wood_speed_multiplier ({wood}) <= \
+                         tools.stone_speed_multiplier ({stone}) <= \
+                         tools.iron_speed_multiplier ({iron})"
                     ),
                 ));
             }
@@ -1901,7 +1903,8 @@ mod tests {
         );
         assert_eq!(
             diagnostics[0].reason,
-            "tool speed multipliers must satisfy wood (5) <= stone (3) <= iron (10)"
+            "tool speed multipliers must satisfy tools.wood_speed_multiplier (5) <= \
+             tools.stone_speed_multiplier (3) <= tools.iron_speed_multiplier (10)"
         );
         assert!(startup_warnings(&runtime)
             .iter()

@@ -274,9 +274,36 @@ pub struct SkyPalette {
 
 /// Linear keyframe palette over one cycle (dawn → noon → dusk → night → dawn).
 pub fn sky_palette(time_of_day: u32) -> SkyPalette {
+    sky_palette_from_keyframes(time_of_day, &KEYFRAMES)
+}
+
+/// [`sky_palette`] with the creator-tunable midnight floor.
+///
+/// Only the night keyframe's `day_factor` comes from `rules.moonlit_floor`;
+/// every tick, color, and interpolation step is the same keyframe loop the
+/// default uses, so passing a default [`RenderRules`] is bit-identical to
+/// [`sky_palette`].
+pub fn sky_palette_with(time_of_day: u32, rules: &RenderRules) -> SkyPalette {
+    let night = SkyPalette {
+        day_factor: rules.moonlit_floor,
+        ..NIGHT
+    };
+    let keyframes = [
+        (0, DAWN),
+        (DEFAULT_TIME_OF_DAY, NOON),
+        (12_000, DUSK),
+        (NIGHTFALL_TICK, night),
+        (PRE_DAWN_TICK, night),
+        (DAY_TICKS, DAWN),
+    ];
+    sky_palette_from_keyframes(time_of_day, &keyframes)
+}
+
+/// Shared interpolation core for [`sky_palette`] and [`sky_palette_with`].
+fn sky_palette_from_keyframes(time_of_day: u32, keyframes: &[(u32, SkyPalette)]) -> SkyPalette {
     let t = time_of_day % DAY_TICKS;
 
-    for window in KEYFRAMES.windows(2) {
+    for window in keyframes.windows(2) {
         let (start_tick, start) = window[0];
         let (end_tick, end) = window[1];
         if t >= start_tick && t <= end_tick {
@@ -488,24 +515,33 @@ fn grey_at(color: [f32; 3], scale: f32) -> [f32; 3] {
 /// weather keeps today's exact colors. Colors are RGB `[f32; 3]`; no alpha
 /// channel exists to disturb.
 pub fn weather_palette(base: SkyPalette, weather: Weather) -> SkyPalette {
+    weather_palette_with(base, weather, &RenderRules::default())
+}
+
+/// [`weather_palette`] with creator-tunable palette and fog values.
+///
+/// Every precipitation constant the default wrapper reads comes from `rules`;
+/// [`Weather::Clear`] still returns `base` untouched. A default `rules` value
+/// is bit-identical to [`weather_palette`].
+pub fn weather_palette_with(base: SkyPalette, weather: Weather, rules: &RenderRules) -> SkyPalette {
     match weather {
         Weather::Clear => base,
         Weather::Rain => {
-            let target = grey_at(base.sky_color, RAIN_GREY_SCALE);
-            let fog_target = grey_at(base.fog_color, RAIN_GREY_SCALE);
+            let target = grey_at(base.sky_color, rules.rain_grey_scale);
+            let fog_target = grey_at(base.fog_color, rules.rain_grey_scale);
             SkyPalette {
-                day_factor: base.day_factor * RAIN_DAY_FACTOR,
-                sky_color: lerp_color(base.sky_color, target, RAIN_SKY_LERP),
-                fog_color: lerp_color(base.fog_color, fog_target, RAIN_SKY_LERP),
+                day_factor: base.day_factor * rules.rain_day_factor,
+                sky_color: lerp_color(base.sky_color, target, rules.rain_sky_lerp),
+                fog_color: lerp_color(base.fog_color, fog_target, rules.rain_sky_lerp),
             }
         }
         Weather::Snowfall => {
-            let target = grey_at(base.sky_color, SNOW_GREY_SCALE);
-            let fog_target = grey_at(base.fog_color, SNOW_GREY_SCALE);
+            let target = grey_at(base.sky_color, rules.snow_grey_scale);
+            let fog_target = grey_at(base.fog_color, rules.snow_grey_scale);
             SkyPalette {
-                day_factor: base.day_factor * SNOW_DAY_FACTOR,
-                sky_color: lerp_color(base.sky_color, target, SNOW_SKY_LERP),
-                fog_color: lerp_color(base.fog_color, fog_target, SNOW_SKY_LERP),
+                day_factor: base.day_factor * rules.snow_day_factor,
+                sky_color: lerp_color(base.sky_color, target, rules.snow_sky_lerp),
+                fog_color: lerp_color(base.fog_color, fog_target, rules.snow_sky_lerp),
             }
         }
     }
@@ -518,10 +554,19 @@ pub fn weather_palette(base: SkyPalette, weather: Weather) -> SkyPalette {
 /// rain (`0.75`) more enclosing than snowfall (`0.85`). This value is computed
 /// CPU-side and must not be smuggled through `CameraUniform`'s spare lane.
 pub fn weather_fog_range_factor(weather: Weather) -> f32 {
+    weather_fog_range_factor_with(weather, &RenderRules::default())
+}
+
+/// [`weather_fog_range_factor`] with creator-tunable rain/snow factors.
+///
+/// Clear stays exactly `1.0`: the dry path has no config row and must remain
+/// bit-identical. A default `rules` value is bit-identical to
+/// [`weather_fog_range_factor`].
+pub fn weather_fog_range_factor_with(weather: Weather, rules: &RenderRules) -> f32 {
     match weather {
         Weather::Clear => CLEAR_FOG_RANGE_FACTOR,
-        Weather::Rain => RAIN_FOG_RANGE_FACTOR,
-        Weather::Snowfall => SNOW_FOG_RANGE_FACTOR,
+        Weather::Rain => rules.rain_fog_factor,
+        Weather::Snowfall => rules.snow_fog_factor,
     }
 }
 
