@@ -30,6 +30,15 @@
 #     pinned field reason; the edited config tree stays byte-identical. The
 #     release leg is a bounded launch with no `creator:` output and no panic.
 #
+#   Leg B2 all-domain live config (debug only): one bounded launch applies a
+#     single edit in each curated file (player, survival, combat, world,
+#     mining, render) through the live watcher. The trace must contain exactly
+#     six applied lines (one per file) and zero rejections, the edited tree
+#     must stay byte-identical, and the post-run `--check-config` digest must
+#     equal the final applied digest `0x66965e5a33dcbd8c` (not the default
+#     `0x7aa35ddbdb5a30b7`). The release profile skips this leg: release has
+#     no creator watcher.
+#
 #   Leg C live textures (debug only): a v2 texture-only pack overrides
 #     block stone (layer 3), mob pig_body (layer 32), and the built-in apple
 #     sprite (layer 1); rewriting all three applies each frozen layer, and a
@@ -46,6 +55,13 @@
 #   Leg E v8-to-v9: `--demo-save-v9` loads the checked-in v8 fixture, re-saves
 #     v9 with config schema 1 and a digest, reloads with no notice, and leaves
 #     the input bytes untouched; the derived file is exactly input+10 bytes.
+#     Both profiles then prove the one-shot config-mismatch notice: a
+#     `walk_speed = 6.0` edit makes the derived v9 file warn exactly once
+#     (`config changed since this world was saved`), re-save with digest
+#     `0x9a0c860806183bec` at 446 bytes, and a third run on that output loads
+#     with no notice (the notice is one-shot, not repeated). The debug profile
+#     additionally re-checks the mismatched tree's `--check-config` digest;
+#     release rejects `--check-config` by design (Leg A).
 #
 #   Leg F release hygiene (release only): a bare bounded launch in an empty
 #     temp cwd exits 124, does not panic, and creates no packs/ or config/;
@@ -140,6 +156,7 @@ for path in \
     "$CRATE_ROOT/docs/CONFIG.md" \
     "$CRATE_ROOT/docs/TEXTURE-PACKS.md" \
     "$CRATE_ROOT/docs/SAVE-NOTES.md" \
+    "$CRATE_ROOT/docs/UAT-M014.md" \
     "$CRATE_ROOT/README.md"; do
     [[ -e "$path" ]] || fail "checked-in input not found at $path"
 done
@@ -160,6 +177,8 @@ check_doc "$CRATE_ROOT/docs/TEXTURE-PACKS.md" 'recipe changed'
 check_doc "$CRATE_ROOT/docs/TEXTURE-PACKS.md" '--demo-restart'
 check_doc "$CRATE_ROOT/docs/SAVE-NOTES.md" '--demo-restart'
 check_doc "$CRATE_ROOT/docs/SAVE-NOTES.md" 'content definitions changed'
+check_doc "$CRATE_ROOT/docs/UAT-M014.md" 'stone_speed_multiplier'
+check_doc "$CRATE_ROOT/docs/UAT-M014.md" 'iron_speed_multiplier'
 check_doc "$CRATE_ROOT/README.md" 'creator_smoke.sh'
 check_doc "$CRATE_ROOT/README.md" '--check-config'
 check_doc "$CRATE_ROOT/README.md" '--creator-trace'
@@ -507,6 +526,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Leg B2: all-domain live config (debug only).
+# ---------------------------------------------------------------------------
+if [[ "$PROFILE" == "debug" ]]; then
+    LEG_B2="$(mktemp -d "$TEMP_DIR/leg-b2.XXXXXX")" || fail "mktemp failed for leg B2"
+    install_config "$LEG_B2"
+
+    start_live "$LEG_B2" 14 "$LEG_B2/live.log" --new --save domains.mcvx --creator-trace
+    sleep 5
+    sed -i 's/^walk_speed = 4\.6$/walk_speed = 8.0/' "$LEG_B2/config/player.toml" ||
+        fail "leg B2: cannot edit config/player.toml"
+    sed -i 's/^hunger_drain_secs = 30\.0$/hunger_drain_secs = 2.0/' "$LEG_B2/config/survival.toml" ||
+        fail "leg B2: cannot edit config/survival.toml"
+    sed -i 's/^reach = 3\.0$/reach = 8.0/' "$LEG_B2/config/combat.toml" ||
+        fail "leg B2: cannot edit config/combat.toml"
+    sed -i 's/^day_seconds = 1200\.0$/day_seconds = 120.0/' "$LEG_B2/config/world.toml" ||
+        fail "leg B2: cannot edit config/world.toml"
+    sed -i 's/^table_reach = 8\.0$/table_reach = 16.0/' "$LEG_B2/config/mining.toml" ||
+        fail "leg B2: cannot edit config/mining.toml"
+    sed -i 's/^selected_name_secs = 2\.0$/selected_name_secs = 10.0/' "$LEG_B2/config/render.toml" ||
+        fail "leg B2: cannot edit config/render.toml"
+    sleep 3
+    cp -R "$LEG_B2/config" "$LEG_B2/config.snapshot" ||
+        fail "leg B2: cannot snapshot the edited config tree"
+    finish_live "leg B2 all-domain live config" "$LEG_B2/live.log"
+
+    assert_tree_unchanged "leg B2 all-domain live config" "$LEG_B2/config" "$LEG_B2/config.snapshot"
+    for file in player survival combat world mining render; do
+        expect_regex_count "leg B2 all-domain live config" 1 "$LEG_B2/live.log" \
+            "^creator: applied file=config/${file}\\.toml changed=1 digest=0x[0-9a-f]+\$"
+    done
+    expect_regex_count "leg B2 all-domain live config" 0 "$LEG_B2/live.log" '^creator: rejected '
+    expect_regex_count "leg B2 all-domain live config" 6 "$LEG_B2/live.log" '^creator: '
+
+    run_headless "$LEG_B2" "$LEG_B2/check.out" "$LEG_B2/check.err" --check-config
+    CHECK_RC=$?
+    if [[ $CHECK_RC -ne 0 ]]; then
+        cat "$LEG_B2/check.out" "$LEG_B2/check.err" || true
+        fail "leg B2: post-live --check-config exit code $CHECK_RC (expected 0)"
+    fi
+    expect_regex_count "leg B2 post-live check-config" 6 "$LEG_B2/check.out" '^ok: config/'
+    B2_LAST_LINE="$(grep -E '^creator: applied ' "$LEG_B2/live.log" | tail -n 1 || true)"
+    [[ -n "$B2_LAST_LINE" ]] || fail "leg B2: no applied trace line found"
+    B2_LAST_DIGEST="${B2_LAST_LINE##*digest=}"
+    [[ "$B2_LAST_DIGEST" == "0x66965e5a33dcbd8c" ]] ||
+        fail "leg B2: last applied digest is [$B2_LAST_DIGEST], expected 0x66965e5a33dcbd8c"
+    [[ "$B2_LAST_DIGEST" != "0x7aa35ddbdb5a30b7" ]] ||
+        fail "leg B2: last applied digest is the default 0x7aa35ddbdb5a30b7"
+    B2_SUMMARY="$(tail -n 1 "$LEG_B2/check.out")"
+    [[ "$B2_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=$B2_LAST_DIGEST" ]] ||
+        fail "leg B2: post-live summary drifted: [$B2_SUMMARY]"
+fi
+
+# ---------------------------------------------------------------------------
 # Leg C: live block/mob/builtin-item textures (debug) or bounded release.
 # ---------------------------------------------------------------------------
 if [[ "$PROFILE" == "debug" ]]; then
@@ -642,6 +714,85 @@ V9_EXPECTED_SIZE=$((V8_INPUT_SIZE + 10))
 [[ "$V9_OUTPUT_SIZE" -eq "$V9_EXPECTED_SIZE" ]] ||
     fail "leg E: v9 size $V9_OUTPUT_SIZE (expected $V9_EXPECTED_SIZE = input+10)"
 
+# --- One-shot config mismatch (both profiles) ------------------------------
+# The derived v9 file is now a saved-config witness. Editing the config makes
+# the next load warn exactly once, re-save the same 446-byte shape with the
+# new digest, and the third run on that output is silent: the notice is
+# one-shot, not repeated on every load.
+cp "$LEG_E/v8.v9.mcvx" "$LEG_E/v8.v9.snapshot" ||
+    fail "leg E: cannot snapshot the derived v9 output"
+V9_SNAPSHOT_SIZE="$(wc -c <"$LEG_E/v8.v9.snapshot")"
+[[ "$V9_SNAPSHOT_SIZE" -eq 446 ]] ||
+    fail "leg E: v9 snapshot size $V9_SNAPSHOT_SIZE (expected 446)"
+
+sed -i 's/^walk_speed = 4\.6$/walk_speed = 6.0/' "$LEG_E/config/player.toml" ||
+    fail "leg E: cannot apply the config-mismatch edit"
+
+run_headless "$LEG_E" "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" --demo-save-v9 --save v8.v9.mcvx
+MISMATCH_RC=$?
+if [[ $MISMATCH_RC -ne 0 ]]; then
+    cat "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" || true
+    fail "leg E: config-mismatch --demo-save-v9 exit code $MISMATCH_RC (expected 0)"
+fi
+mapfile -t MISMATCH_LINES <"$LEG_E/mismatch.out"
+[[ ${#MISMATCH_LINES[@]} -eq 4 ]] ||
+    fail "leg E: config-mismatch run printed ${#MISMATCH_LINES[@]} stdout lines (expected 4)"
+[[ "${MISMATCH_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=config changed since this world was saved playable=true' ]] ||
+    fail "leg E: config-mismatch load line drifted: [${MISMATCH_LINES[0]}]"
+MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x9a0c860806183bec bytes=[0-9]+$'
+[[ "${MISMATCH_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
+    fail "leg E: config-mismatch resave line drifted: [${MISMATCH_LINES[1]}]"
+MISMATCH_BYTES="${MISMATCH_LINES[1]##*bytes=}"
+[[ "$MISMATCH_BYTES" -eq "$V9_SNAPSHOT_SIZE" ]] ||
+    fail "leg E: resave bytes $MISMATCH_BYTES (expected snapshot size $V9_SNAPSHOT_SIZE)"
+[[ "${MISMATCH_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
+    fail "leg E: config-mismatch match line drifted: [${MISMATCH_LINES[2]}]"
+[[ "${MISMATCH_LINES[3]}" == 'save_v9: ok' ]] ||
+    fail "leg E: config-mismatch ok line drifted: [${MISMATCH_LINES[3]}]"
+
+assert_file_unchanged "leg E config-mismatch input" "$LEG_E/v8.v9.mcvx" "$LEG_E/v8.v9.snapshot"
+[[ -f "$LEG_E/v8.v9.v9.mcvx" ]] ||
+    fail "leg E: config-mismatch run did not write v8.v9.v9.mcvx"
+V9_MISMATCH_OUTPUT_SIZE="$(wc -c <"$LEG_E/v8.v9.v9.mcvx")"
+[[ "$V9_MISMATCH_OUTPUT_SIZE" -eq "$V9_SNAPSHOT_SIZE" ]] ||
+    fail "leg E: v8.v9.v9.mcvx size $V9_MISMATCH_OUTPUT_SIZE (expected $V9_SNAPSHOT_SIZE)"
+expect_regex_count "leg E config mismatch" 1 "$LEG_E/mismatch.out" \
+    'notice=config changed since this world was saved'
+
+if [[ "$PROFILE" == "debug" ]]; then
+    # `--check-config` is dev-only (Leg A pins the release rejection), so only
+    # debug can re-check the mismatched tree's effective digest from outside
+    # the save proof. The resave line above already pins the digest above.
+    run_headless "$LEG_E" "$LEG_E/check-mismatch.out" "$LEG_E/check-mismatch.err" --check-config
+    CHECK_RC=$?
+    if [[ $CHECK_RC -ne 0 ]]; then
+        cat "$LEG_E/check-mismatch.out" "$LEG_E/check-mismatch.err" || true
+        fail "leg E: config-mismatch --check-config exit code $CHECK_RC (expected 0)"
+    fi
+    expect_regex_count "leg E config-mismatch check-config" 6 "$LEG_E/check-mismatch.out" '^ok: config/'
+    LEG_E_SUMMARY="$(tail -n 1 "$LEG_E/check-mismatch.out")"
+    [[ "$LEG_E_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=0x9a0c860806183bec" ]] ||
+        fail "leg E: config-mismatch summary drifted: [$LEG_E_SUMMARY]"
+fi
+
+run_headless "$LEG_E" "$LEG_E/one-shot.out" "$LEG_E/one-shot.err" --demo-save-v9 --save v8.v9.v9.mcvx
+ONE_SHOT_RC=$?
+if [[ $ONE_SHOT_RC -ne 0 ]]; then
+    cat "$LEG_E/one-shot.out" "$LEG_E/one-shot.err" || true
+    fail "leg E: one-shot --demo-save-v9 exit code $ONE_SHOT_RC (expected 0)"
+fi
+mapfile -t ONE_SHOT_LINES <"$LEG_E/one-shot.out"
+[[ ${#ONE_SHOT_LINES[@]} -eq 4 ]] ||
+    fail "leg E: one-shot run printed ${#ONE_SHOT_LINES[@]} stdout lines (expected 4)"
+[[ "${ONE_SHOT_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=none playable=true' ]] ||
+    fail "leg E: one-shot load line drifted: [${ONE_SHOT_LINES[0]}]"
+[[ "${ONE_SHOT_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
+    fail "leg E: one-shot resave line drifted: [${ONE_SHOT_LINES[1]}]"
+[[ "${ONE_SHOT_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
+    fail "leg E: one-shot match line drifted: [${ONE_SHOT_LINES[2]}]"
+[[ "${ONE_SHOT_LINES[3]}" == 'save_v9: ok' ]] ||
+    fail "leg E: one-shot ok line drifted: [${ONE_SHOT_LINES[3]}]"
+
 # ---------------------------------------------------------------------------
 # Leg F: release hygiene (release only).
 # ---------------------------------------------------------------------------
@@ -680,4 +831,4 @@ if [[ "$PROFILE" == "release" ]]; then
     expect_regex_count "leg F config+pack launch" 0 "$LEG_F_PACK/live.log" '^creator: '
 fi
 
-echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v9 migration, and profile-appropriate release hygiene all passed"
+echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, all-domain live config (six files), block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v9 migration with one-shot config mismatch, and profile-appropriate release hygiene all passed"
