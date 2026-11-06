@@ -382,7 +382,7 @@ edit_stew_recipe_count() {
     local stew
     stew=$(awk '
         /^\[\[/ {
-            if (in_stew && count != "") { print count; exit }
+            if (in_stew && count != "") { print count; in_stew = 0; exit }
             in_recipes = ($0 == "[[recipes]]"); in_stew = 0; count = ""
         }
         in_recipes && /^id = "mymod:ruby_stew"$/ { in_stew = 1 }
@@ -394,7 +394,7 @@ edit_stew_recipe_count() {
     local pickaxe
     pickaxe=$(awk '
         /^\[\[/ {
-            if (in_stew && count != "") { print count; exit }
+            if (in_stew && count != "") { print count; in_stew = 0; exit }
             in_recipes = ($0 == "[[recipes]]"); in_stew = 0; count = ""
         }
         in_recipes && /^id = "mymod:ruby_pickaxe"$/ { in_stew = 1 }
@@ -587,6 +587,10 @@ if [[ "$PROFILE" == "debug" ]]; then
         "$LEG_D/watch.log"
     expect_regex_count "leg D restart watch" 0 "$LEG_D/watch.log" '^creator: texture applied '
     expect_regex_count "leg D restart watch" 1 "$LEG_D/watch.log" '^creator: '
+else
+    # Release has no watcher leg, but the same-save restart proof still needs
+    # the content edit between phase 1 and phase 2.
+    edit_stew_recipe_count "$LEG_D/packs/mymod-ruby/pack.toml"
 fi
 
 run_headless "$LEG_D" "$LEG_D/load.out" "$LEG_D/load.err" \
@@ -623,7 +627,8 @@ mapfile -t V9_LINES <"$LEG_E/v9.out"
     fail "leg E: expected 4 stdout lines, found ${#V9_LINES[@]}"
 [[ "${V9_LINES[0]}" == 'save_v9: leg=load version=8 packs=0 saved_config=none notice=none playable=true' ]] ||
     fail "leg E: load line drifted: [${V9_LINES[0]}]"
-[[ "${V9_LINES[1]}" =~ ^save_v9:\ leg=resave\ version=9\ config_schema=1\ config_digest=0x[0-9a-f]+\ bytes=[0-9]+$ ]] ||
+V9_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x[0-9a-f]+ bytes=[0-9]+$'
+[[ "${V9_LINES[1]}" =~ $V9_RESAVE_RE ]] ||
     fail "leg E: resave line drifted: [${V9_LINES[1]}]"
 [[ "${V9_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
     fail "leg E: match line drifted: [${V9_LINES[2]}]"
