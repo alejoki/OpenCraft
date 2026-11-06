@@ -151,6 +151,20 @@ pub fn build_registry(
         for (path, asset) in &spec.assets {
             assets.insert((folder.to_string(), path.clone()), asset);
         }
+        // `[builtin_icons]` is presentation-only: it never allocates a pack
+        // icon slot or enters the digest. A path that failed to load is still
+        // worth explaining, because the built-in sprite silently stays.
+        for (name, path) in &spec.builtin_icons {
+            if !spec.assets.contains_key(path) {
+                warning(
+                    &mut diagnostics,
+                    format!("builtin_icon {name}"),
+                    format!(
+                        "icon `{path}` is not a loaded asset; the built-in sprite stays visible"
+                    ),
+                );
+            }
+        }
         for block in &spec.blocks {
             if let Some((previous, _)) = block_entries.insert(block.id.as_str(), (folder, block)) {
                 warning(
@@ -1763,5 +1777,101 @@ mod tests {
         assert_eq!(derive_display_name("mymod:ruby_ore"), "Ruby Ore");
         assert_eq!(derive_display_name("mymod:Iron"), "Iron");
         assert_eq!(derive_display_name("stone"), "Stone");
+    }
+
+    #[test]
+    fn builtin_icons_do_not_move_digest_allocation_or_entry_count() {
+        let mut plain = PackContentSpec::default();
+        plain.items.push(item_entry("mymod:iconful", "icon.png"));
+        plain.assets.insert("icon.png".to_string(), asset(0x22));
+
+        let mut with_override = plain.clone();
+        with_override
+            .builtin_icons
+            .insert("apple".to_string(), "apple.png".to_string());
+        with_override
+            .builtin_icons
+            .insert("wood_pickaxe".to_string(), "pickaxe.png".to_string());
+        with_override
+            .assets
+            .insert("apple.png".to_string(), asset(0x33));
+        with_override
+            .assets
+            .insert("pickaxe.png".to_string(), asset(0x44));
+
+        let (plain_registry, plain_report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(identity("p"), plain.clone())],
+        );
+        let (override_registry, override_report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(identity("p"), with_override.clone())],
+        );
+
+        assert_eq!(override_report.entries, plain_report.entries);
+        assert_eq!(
+            override_report.errors(),
+            0,
+            "{:?}",
+            override_report.diagnostics
+        );
+        assert_eq!(
+            override_report.warnings(),
+            0,
+            "{:?}",
+            override_report.diagnostics
+        );
+        assert_eq!(override_registry.digest(), plain_registry.digest());
+        assert_eq!(
+            override_registry.pack_layers(),
+            plain_registry.pack_layers()
+        );
+        assert_eq!(override_registry.pack_icons(), plain_registry.pack_icons());
+        assert_eq!(
+            override_registry.pack_icon_sources(),
+            plain_registry.pack_icon_sources()
+        );
+        assert_eq!(
+            override_registry.pack_layers().len(),
+            plain_registry.pack_layers().len()
+        );
+        assert_eq!(
+            override_registry.pack_icons().len(),
+            plain_registry.pack_icons().len()
+        );
+
+        // Removing the override again is the same identity.
+        let (restored, restored_report) =
+            build_registry(ContentRegistry::builtin(), &[(identity("p"), plain)]);
+        assert_eq!(restored.digest(), override_registry.digest());
+        assert_eq!(restored_report.entries, override_report.entries);
+    }
+
+    #[test]
+    fn builtin_icon_with_unloaded_asset_warns_without_changing_identity() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_icons
+            .insert("apple".to_string(), "missing.png".to_string());
+
+        let (registry, report) =
+            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
+        let (empty, empty_report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(identity("p"), PackContentSpec::default())],
+        );
+
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(report.warnings(), 1, "{:?}", report.diagnostics);
+        assert_eq!(report.diagnostics[0].severity, Severity::Warning);
+        assert_eq!(report.diagnostics[0].entry, "builtin_icon apple");
+        assert!(
+            report.diagnostics[0].reason.contains("not a loaded asset"),
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.entries, empty_report.entries);
+        assert_eq!(registry.digest(), empty.digest());
+        assert_eq!(registry.pack_layers().len(), 0);
+        assert_eq!(registry.pack_icons().len(), 0);
     }
 }

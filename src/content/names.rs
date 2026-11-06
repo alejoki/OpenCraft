@@ -187,6 +187,36 @@ pub fn builtin_item_id_by_name(name: &str) -> Option<ItemId> {
     builtin_tool_id_by_name(name)
 }
 
+/// Resolve `name` to a built-in item identity that owns a procedural sprite.
+///
+/// Blocks are rejected: their icons are sampled from the block texture array,
+/// not the item sprite atlas. Forged tool pairs are rejected too, so only
+/// constructible `(kind, tier)` tools (the wood-only bow included) can be
+/// overridden.
+#[allow(dead_code)] // Consumed by the S07 parser and presentation layers.
+pub fn builtin_item_sprite_id_by_name(name: &str) -> Option<ItemId> {
+    sprite_identity(builtin_item_id_by_name(name)?)
+}
+
+/// Canonical short name for a built-in material/tool sprite identity.
+#[allow(dead_code)] // Consumed by the S07 presentation layer.
+pub fn builtin_item_sprite_name(name: &str) -> Option<&'static str> {
+    match sprite_identity(builtin_item_id_by_name(name)?)? {
+        ItemId::Material(material) => Some(builtin_material_id_name(material)),
+        ItemId::Tool { kind, tier } => builtin_tool_id_name(kind, tier),
+        _ => None,
+    }
+}
+
+/// Keep only identities backed by a procedural item sprite layer.
+fn sprite_identity(id: ItemId) -> Option<ItemId> {
+    match id {
+        id @ ItemId::Material(_) => Some(id),
+        id @ ItemId::Tool { kind, tier } if kind.allowed_tiers().contains(&tier) => Some(id),
+        _ => None,
+    }
+}
+
 const MATERIAL_VALUES: [Material; 11] = [
     Material::Stick,
     Material::Apple,
@@ -568,6 +598,73 @@ mod tests {
             );
         }
         assert_eq!(builtin_recipe_id_name(RecipeId::Modded(22)), None);
+    }
+
+    #[test]
+    fn builtin_sprite_identities_reject_blocks_forged_tools_and_unknown_names() {
+        assert_eq!(
+            builtin_item_sprite_id_by_name("apple"),
+            Some(ItemId::Material(Material::Apple))
+        );
+        assert_eq!(
+            builtin_item_sprite_id_by_name("wood_pickaxe"),
+            Some(ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            })
+        );
+        assert_eq!(
+            builtin_item_sprite_id_by_name("wood_bow"),
+            Some(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            })
+        );
+        assert_eq!(
+            builtin_item_sprite_name("apple"),
+            Some("apple"),
+            "the canonical name round-trips"
+        );
+        assert_eq!(builtin_item_sprite_name("wood_bow"), Some("wood_bow"));
+
+        // Blocks are not sprite identities: their art lives in the block
+        // texture array.
+        assert_eq!(builtin_item_sprite_id_by_name("stone"), None);
+        assert_eq!(builtin_item_sprite_name("stone"), None);
+
+        // Forged tool names normalize to the same rejection; the inner guard
+        // also rejects forged `(Bow, Stone/Iron)` identities directly.
+        assert_eq!(builtin_item_sprite_id_by_name("stone_bow"), None);
+        assert_eq!(builtin_item_sprite_id_by_name("iron_bow"), None);
+        assert_eq!(
+            sprite_identity(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Stone,
+            }),
+            None
+        );
+        assert_eq!(
+            sprite_identity(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Iron,
+            }),
+            None
+        );
+        assert_eq!(sprite_identity(ItemId::Block(BlockId::Stone)), None);
+        assert_eq!(sprite_identity(ItemId::Item(0)), None);
+        assert_eq!(sprite_identity(ItemId::ModTool(0)), None);
+
+        assert_eq!(builtin_item_sprite_id_by_name("diamond"), None);
+        assert_eq!(builtin_item_sprite_name("not_a_thing"), None);
+
+        // Every table entry with a procedural sprite round-trips to its
+        // canonical short name.
+        for name in MATERIAL_ID_NAMES {
+            assert_eq!(builtin_item_sprite_name(name), Some(name));
+        }
+        for name in TOOL_ID_NAMES {
+            assert_eq!(builtin_item_sprite_name(name), Some(name));
+        }
     }
 
     #[test]
