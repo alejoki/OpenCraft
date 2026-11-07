@@ -6,10 +6,18 @@
 //! with `.` meaning air), and optional `[[sockets]]` with an origin-relative
 //! position plus a cardinal [`Direction`].
 //!
-//! This module is deliberately pure: no filesystem, window, GPU, save or pack
-//! access. The catalog walker in `world::prefab` (a later task) is the only
-//! layer allowed to touch disk, and every read is capped by
-//! [`MAX_PREFAB_FILE_BYTES`].
+//! The parser and serializer are deliberately pure: no window, GPU, save or
+//! pack access. The [`PrefabCatalog`] walker is the only layer that touches
+//! disk, and every read is capped by [`MAX_PREFAB_FILE_BYTES`].
+//!
+//! Two failure policies coexist here and must not be confused:
+//!
+//! * [`PrefabCatalog::load_sorted`] is **fail-soft**. It never returns an
+//!   error and never blocks world load: a bad file degrades to one diagnostic
+//!   string and is skipped.
+//! * [`validate_worldgen_lines`] is **fail-closed**. It reuses the same walk
+//!   but reports `ok == false` when any file was rejected, which the
+//!   release-facing `--validate-worldgen` switch turns into a non-zero exit.
 //!
 //! Coordinate model: `origin` is the grid cell aligned to the placement
 //! anchor; block positions are grid cells `0..size`; socket positions are
@@ -17,8 +25,12 @@
 //! checked against [`PREFAB_CAPS`] before it is used, and no authored input can
 //! panic this parser or overflow an accumulator.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
+use std::io::Read;
+use std::path::Path;
 
 use crate::content::names;
 use crate::world::block::BlockId;
@@ -546,6 +558,202 @@ impl Prefab {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Catalog: the only filesystem-facing layer.
+// ---------------------------------------------------------------------------
+
+/// One prefab file's outcome during a sorted directory walk.
+struct PrefabFile {
+    file_name: String,
+    outcome: Result<Prefab, String>,
+}
+
+/// A name-sorted, fail-soft collection of prefabs loaded from disk.
+///
+/// [`PrefabCatalog::load_sorted`] never fails: every unreadable, oversize or
+/// malformed file degrades to one diagnostic string and is skipped, so world
+/// load can always continue with whatever parsed. Only
+/// [`validate_worldgen_lines`] turns those rejections into a non-zero exit
+/// code; that is the release-facing `--validate-worldgen` contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrefabCatalog {
+    prefabs: BTreeMap<String, Prefab>,
+}
+
+impl PrefabCatalog {
+    /// Walk `root/prefabs` in raw file-name order and load every `*.toml`
+    /// regular file.
+    ///
+    /// Fail-soft by contract. A missing root, a non-directory root, a missing
+    /// `prefabs/` subdirectory, or an unreadable directory yields an empty
+    /// catalog with no diagnostics. Per file the first failure wins and the
+    /// file is skipped:
+    ///
+    /// 1. metadata/read error -> `could not read file: <error>`;
+    /// 2. more than [`MAX_PREFAB_FILE_BYTES`] -> `file is larger than 1 MiB`;
+    /// 3. [`parse_prefab`] error -> its `Display` reason;
+    /// 4. duplicate header `name` -> the sorted-first file wins and the later
+    ///    file reports `duplicate prefab name '<name>'`.
+    ///
+    /// Non-regular files, directories and non-`toml` extensions are ignored
+    /// silently. Diagnostics always use the logical `worldgen/prefabs/<file>`
+    /// label, never the caller's spelling of `root`.
+    pub fn load_sorted(root: &Path) -> (Self, Vec<String>) {
+        let mut catalog = PrefabCatalog::default();
+        let mut diagnostics = Vec::new();
+        for file in scan_prefab_dir(root) {
+            match file.outcome {
+                Ok(prefab) => {
+                    catalog.prefabs.insert(prefab.name.clone(), prefab);
+                }
+                Err(reason) => diagnostics.push(logical_file_label(&file.file_name, &reason)),
+            }
+        }
+        (catalog, diagnostics)
+    }
+
+    /// Look a prefab up by its header `name`.
+    pub fn get(&self, name: &str) -> Option<&Prefab> {
+        self.prefabs.get(name)
+    }
+
+    /// Iterate loaded prefab names in ascending order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.prefabs.keys().map(String::as_str)
+    }
+
+    /// Number of accepted prefabs.
+    pub fn len(&self) -> usize {
+        self.prefabs.len()
+    }
+
+    /// Whether no prefab was accepted.
+    pub fn is_empty(&self) -> bool {
+        self.prefabs.is_empty()
+    }
+}
+
+/// Run the sorted walk and render the stable `--validate-worldgen` report.
+///
+/// One `ok: prefab <name>` line per accepted file, one
+/// `error: worldgen/prefabs/<file>: <reason>` line per rejected file (which
+/// suppresses that file's `ok:` line), then always a final
+/// `validate-worldgen: <n> prefabs, <e> errors, <w> warnings` summary where
+/// `w` is currently always `0` and stays wired for the village pass.
+///
+/// Returns `(lines, ok)` with `ok == (errors == 0)`. Missing or unreadable
+/// trees are valid empty content: only the zero summary line, `ok == true`.
+/// This is the fail-closed half of the catalog policy: unlike
+/// [`PrefabCatalog::load_sorted`], any rejected file makes `ok` false.
+pub fn validate_worldgen_lines(root: &Path) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut accepted = 0usize;
+    let mut errors = 0usize;
+    for file in scan_prefab_dir(root) {
+        match file.outcome {
+            Ok(prefab) => {
+                accepted += 1;
+                lines.push(format!("ok: prefab {}", prefab.name));
+            }
+            Err(reason) => {
+                errors += 1;
+                lines.push(format!(
+                    "error: {}",
+                    logical_file_label(&file.file_name, &reason)
+                ));
+            }
+        }
+    }
+    let warnings = 0usize;
+    lines.push(format!(
+        "validate-worldgen: {accepted} prefabs, {errors} errors, {warnings} warnings"
+    ));
+    (lines, errors == 0)
+}
+
+/// Logical `worldgen/prefabs/<file>: <reason>` label used by every diagnostic.
+fn logical_file_label(file_name: &str, reason: &str) -> String {
+    format!("{WORLDGEN_DIR}/{PREFABS_SUBDIR}/{file_name}: {reason}")
+}
+
+/// Walk `root/prefabs` in raw file-name order, applying the per-file policy.
+///
+/// Sorting by `OsString` (raw bytes on Unix) removes `fs::read_dir` ordering
+/// nondeterminism, so first-wins duplicate handling and report order are
+/// stable across filesystems.
+fn scan_prefab_dir(root: &Path) -> Vec<PrefabFile> {
+    let dir = root.join(PREFABS_SUBDIR);
+    let Ok(read_dir) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<_> = read_dir.filter_map(Result::ok).collect();
+    entries.sort_by_key(|left| left.file_name());
+
+    let mut seen_names: BTreeSet<String> = BTreeSet::new();
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("toml") {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                files.push(PrefabFile {
+                    file_name,
+                    outcome: Err(format!("could not read file: {error}")),
+                });
+                continue;
+            }
+        }
+
+        let outcome = match read_prefab_file(&path) {
+            Ok(text) => parse_prefab(&text)
+                .map_err(|error| error.to_string())
+                .and_then(|prefab| {
+                    if seen_names.contains(&prefab.name) {
+                        Err(format!("duplicate prefab name '{}'", prefab.name))
+                    } else {
+                        seen_names.insert(prefab.name.clone());
+                        Ok(prefab)
+                    }
+                }),
+            Err(reason) => Err(reason),
+        };
+        files.push(PrefabFile { file_name, outcome });
+    }
+    files
+}
+
+/// Read one prefab file with a hard byte cap.
+///
+/// The metadata check rejects oversize files before allocating, and the
+/// `take(MAX + 1)` read catches a file that grew between stat and read. Both
+/// failures return the pinned `file is larger than 1 MiB` reason. Non-UTF-8
+/// bytes normalize to `invalid TOML`.
+fn read_prefab_file(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|error| format!("could not read file: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not read file: {error}"))?;
+    if metadata.len() > MAX_PREFAB_FILE_BYTES {
+        return Err(PrefabError::FileTooLarge.to_string());
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_PREFAB_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read file: {error}"))?;
+    if bytes.len() as u64 > MAX_PREFAB_FILE_BYTES {
+        return Err(PrefabError::FileTooLarge.to_string());
+    }
+    String::from_utf8(bytes).map_err(|_| PrefabError::InvalidToml.to_string())
+}
+
 fn validate_prefab_name(name: &str) -> Result<(), PrefabError> {
     if name.len() > 64 {
         return Err(PrefabError::NameTooLong);
@@ -931,6 +1139,257 @@ direction = "west"
         assert_eq!(
             PrefabError::DuplicateSocket([1, -2, 3]).to_string(),
             "duplicate socket at [1, -2, 3]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    const ZERO_SUMMARY: &str = "validate-worldgen: 0 prefabs, 0 errors, 0 warnings";
+
+    fn prefab_text(name: &str) -> String {
+        format!(
+            "format = 1\nname = \"{name}\"\norigin = [0, 0, 0]\nsize = [2, 1, 1]\n\n\
+             layers = [\n  [ \"##\" ],\n]\n\n[palette]\n\"#\" = \"stone\"\n"
+        )
+    }
+
+    fn sized_prefab_text(name: &str, size: [u32; 3]) -> String {
+        let mut rows = String::new();
+        for _ in 0..size[1] {
+            rows.push_str("  [ ");
+            for z in 0..size[2] {
+                if z > 0 {
+                    rows.push_str(", ");
+                }
+                rows.push('"');
+                rows.push_str(&"#".repeat(size[0] as usize));
+                rows.push('"');
+            }
+            rows.push_str(" ],\n");
+        }
+        format!(
+            "format = 1\nname = \"{name}\"\norigin = [0, 0, 0]\nsize = [{}, {}, {}]\n\n\
+             layers = [\n{rows}]\n\n[palette]\n\"#\" = \"stone\"\n",
+            size[0], size[1], size[2]
+        )
+    }
+
+    fn write_prefab(root: &Path, file_name: &str, contents: impl AsRef<[u8]>) {
+        let path = root.join(PREFABS_SUBDIR).join(file_name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create prefab fixture dir");
+        }
+        fs::write(path, contents).expect("write prefab fixture");
+    }
+
+    #[test]
+    fn missing_root_and_missing_prefabs_dir_are_valid_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let absent_root = temp.path().join("absent");
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(&absent_root);
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.len(), 0);
+        assert_eq!(catalog.names().count(), 0);
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            validate_worldgen_lines(&absent_root),
+            (vec![ZERO_SUMMARY.to_owned()], true)
+        );
+
+        let empty_prefabs = temp.path().join("empty");
+        fs::create_dir_all(empty_prefabs.join(PREFABS_SUBDIR)).expect("create prefabs dir");
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(&empty_prefabs);
+        assert!(catalog.is_empty());
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            validate_worldgen_lines(&empty_prefabs),
+            (vec![ZERO_SUMMARY.to_owned()], true)
+        );
+
+        let root_is_file = temp.path().join("root_is_file");
+        fs::write(&root_is_file, b"not a directory").expect("write root file");
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(&root_is_file);
+        assert!(catalog.is_empty());
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            validate_worldgen_lines(&root_is_file),
+            (vec![ZERO_SUMMARY.to_owned()], true)
+        );
+    }
+
+    #[test]
+    fn non_toml_files_and_directories_are_ignored_silently() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(root, "valid.toml", prefab_text("kept"));
+        write_prefab(root, "notes.txt", prefab_text("ignored_text"));
+        write_prefab(root, "UPPER.TOML", prefab_text("ignored_upper"));
+        write_prefab(root, "nested/inner.toml", prefab_text("ignored_nested"));
+        fs::create_dir_all(root.join(PREFABS_SUBDIR).join("subdir.toml")).expect("create fake dir");
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.get("kept").is_some());
+        assert!(catalog.get("ignored_text").is_none());
+        assert_eq!(
+            validate_worldgen_lines(root),
+            (
+                vec![
+                    "ok: prefab kept".to_owned(),
+                    "validate-worldgen: 1 prefabs, 0 errors, 0 warnings".to_owned(),
+                ],
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn files_load_in_sorted_filename_order_not_creation_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(root, "b.toml", prefab_text("zeta"));
+        write_prefab(root, "a.toml", prefab_text("alpha"));
+
+        let (lines, ok) = validate_worldgen_lines(root);
+        assert!(ok);
+        assert_eq!(
+            lines,
+            vec![
+                "ok: prefab alpha".to_owned(),
+                "ok: prefab zeta".to_owned(),
+                "validate-worldgen: 2 prefabs, 0 errors, 0 warnings".to_owned(),
+            ]
+        );
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert!(diagnostics.is_empty());
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn duplicate_header_name_keeps_the_sorted_first_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(root, "a.toml", sized_prefab_text("same", [2, 1, 1]));
+        write_prefab(root, "b.toml", sized_prefab_text("same", [3, 1, 1]));
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog.get("same").expect("first file wins").size,
+            [2, 1, 1]
+        );
+        assert_eq!(
+            diagnostics,
+            vec!["worldgen/prefabs/b.toml: duplicate prefab name 'same'".to_owned()]
+        );
+
+        let (lines, ok) = validate_worldgen_lines(root);
+        assert!(!ok);
+        assert_eq!(
+            lines,
+            vec![
+                "ok: prefab same".to_owned(),
+                "error: worldgen/prefabs/b.toml: duplicate prefab name 'same'".to_owned(),
+                "validate-worldgen: 1 prefabs, 1 errors, 0 warnings".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_file_yields_one_error_line_and_valid_sibling_still_loads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(root, "a_valid.toml", prefab_text("valid"));
+        write_prefab(root, "b_broken.toml", "format = [\n");
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            diagnostics,
+            vec!["worldgen/prefabs/b_broken.toml: invalid TOML".to_owned()]
+        );
+
+        let (lines, ok) = validate_worldgen_lines(root);
+        assert!(!ok);
+        assert_eq!(
+            lines,
+            vec![
+                "ok: prefab valid".to_owned(),
+                "error: worldgen/prefabs/b_broken.toml: invalid TOML".to_owned(),
+                "validate-worldgen: 1 prefabs, 1 errors, 0 warnings".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn oversize_file_is_rejected_before_parsing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(
+            root,
+            "huge.toml",
+            vec![b' '; MAX_PREFAB_FILE_BYTES as usize + 1],
+        );
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert!(catalog.is_empty());
+        assert_eq!(
+            diagnostics,
+            vec!["worldgen/prefabs/huge.toml: file is larger than 1 MiB".to_owned()]
+        );
+
+        let (lines, ok) = validate_worldgen_lines(root);
+        assert!(!ok);
+        assert_eq!(
+            lines,
+            vec![
+                "error: worldgen/prefabs/huge.toml: file is larger than 1 MiB".to_owned(),
+                "validate-worldgen: 0 prefabs, 1 errors, 0 warnings".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_root_spelling_still_uses_the_logical_label() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("custom").join("gen");
+        write_prefab(&root, "bad.toml", "not toml at all");
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(&root);
+        assert!(catalog.is_empty());
+        assert_eq!(
+            diagnostics,
+            vec!["worldgen/prefabs/bad.toml: invalid TOML".to_owned()]
+        );
+
+        let (lines, _ok) = validate_worldgen_lines(&root);
+        assert_eq!(
+            lines,
+            vec![
+                "error: worldgen/prefabs/bad.toml: invalid TOML".to_owned(),
+                "validate-worldgen: 0 prefabs, 1 errors, 0 warnings".to_owned(),
+            ]
+        );
+        assert!(!lines.iter().any(|line| line.contains("custom")));
+    }
+
+    #[test]
+    fn non_utf8_file_reports_invalid_toml_without_panicking() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_prefab(root, "binary.toml", [0xff, 0xfe, 0x00, 0x01]);
+
+        let (catalog, diagnostics) = PrefabCatalog::load_sorted(root);
+        assert!(catalog.is_empty());
+        assert_eq!(
+            diagnostics,
+            vec!["worldgen/prefabs/binary.toml: invalid TOML".to_owned()]
         );
     }
 }
