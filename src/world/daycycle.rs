@@ -22,6 +22,25 @@ pub const DAY_TICKS: u32 = 24_000;
 /// Seconds of real time in one full cycle at `time_scale == 1.0`.
 pub const DAY_SECONDS: f32 = 1_200.0;
 
+/// Creator-tunable day-cycle length.
+///
+/// The default reads [`DAY_SECONDS`] rather than repeating the literal, so the
+/// constant remains the single source of truth until a live rules bundle
+/// overrides it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRules {
+    /// Real seconds in one full day cycle at normal time scale.
+    pub day_seconds: f32,
+}
+
+impl Default for ClockRules {
+    fn default() -> Self {
+        Self {
+            day_seconds: DAY_SECONDS,
+        }
+    }
+}
+
 /// Default time of day: noon.
 pub const DEFAULT_TIME_OF_DAY: u32 = 6_000;
 
@@ -94,6 +113,14 @@ pub struct GameClock {
     /// astronomically large advances.
     pub day_index: u32,
     fractional_ticks: f32,
+    /// Live real seconds in one full cycle at `time_scale == 1.0`.
+    ///
+    /// Every constructor seeds this to [`DAY_SECONDS`];
+    /// [`GameClock::set_day_seconds`] replaces it when the session installs a
+    /// [`ClockRules`] bundle. Ephemeral: never persisted, so a save never pins
+    /// a tuned day length and a restored clock starts at the default until
+    /// `apply_rules` installs the live value.
+    day_seconds: f32,
     frame_marker: Option<Instant>,
 }
 
@@ -122,6 +149,7 @@ impl GameClock {
             time_of_day: time_of_day.min(DAY_TICKS - 1),
             day_index,
             fractional_ticks: 0.0,
+            day_seconds: DAY_SECONDS,
             frame_marker: None,
         }
     }
@@ -147,9 +175,13 @@ impl GameClock {
 
     /// Advance by `delta_secs` of real time at the given acceleration scale.
     ///
-    /// Pure math, no `Instant`: one second at scale 1.0 is 20 ticks. Fractional
-    /// ticks are accumulated because a 60 fps frame is only ~0.33 ticks —
-    /// truncating every frame would stall the clock forever.
+    /// Pure math, no `Instant`: one second at scale 1.0 is
+    /// `DAY_TICKS / day_seconds` ticks (20 at the default 1,200 s day). The
+    /// rate is live and may change mid-day; the phase and accumulator
+    /// semantics are unchanged, so a reload only rescales future advances and
+    /// never jumps the calendar. Fractional ticks are accumulated because a
+    /// 60 fps frame is only ~0.33 ticks — truncating every frame would stall
+    /// the clock forever.
     pub fn advance_secs(&mut self, delta_secs: f32, time_scale: f32) {
         if !delta_secs.is_finite() || delta_secs <= 0.0 {
             return;
@@ -158,7 +190,7 @@ impl GameClock {
             return;
         }
 
-        self.fractional_ticks += delta_secs * time_scale * (DAY_TICKS as f32 / DAY_SECONDS);
+        self.fractional_ticks += delta_secs * time_scale * (DAY_TICKS as f32 / self.day_seconds);
 
         // An overflowing product can reach infinity; reset instead of letting
         // `inf - inf` turn the accumulator into a sticky NaN.
@@ -181,6 +213,25 @@ impl GameClock {
             .day_index
             .saturating_add(u32::try_from(whole_days).unwrap_or(u32::MAX));
         self.time_of_day = (total_ticks % DAY_TICKS as u64) as u32;
+    }
+
+    /// Real seconds in one full cycle at `time_scale == 1.0`.
+    #[inline]
+    pub fn day_seconds(&self) -> f32 {
+        self.day_seconds
+    }
+
+    /// Replace the live day length, ignoring invalid input.
+    ///
+    /// Config validation already enforces 60..=86,400; this defensive layer
+    /// keeps a hand-built rule from stalling or reversing the clock:
+    /// non-finite and non-positive values leave the previous value in place.
+    /// The calendar (`time_of_day`, `day_index`, and the sub-tick accumulator)
+    /// is deliberately untouched, so a reload rescales only future advances.
+    pub fn set_day_seconds(&mut self, seconds: f32) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.day_seconds = seconds;
+        }
     }
 
     /// Continuous, clock-derived phase in whole ticks since day 0 dawn.
@@ -223,9 +274,36 @@ pub struct SkyPalette {
 
 /// Linear keyframe palette over one cycle (dawn → noon → dusk → night → dawn).
 pub fn sky_palette(time_of_day: u32) -> SkyPalette {
+    sky_palette_from_keyframes(time_of_day, &KEYFRAMES)
+}
+
+/// [`sky_palette`] with the creator-tunable midnight floor.
+///
+/// Only the night keyframe's `day_factor` comes from `rules.moonlit_floor`;
+/// every tick, color, and interpolation step is the same keyframe loop the
+/// default uses, so passing a default [`RenderRules`] is bit-identical to
+/// [`sky_palette`].
+pub fn sky_palette_with(time_of_day: u32, rules: &RenderRules) -> SkyPalette {
+    let night = SkyPalette {
+        day_factor: rules.moonlit_floor,
+        ..NIGHT
+    };
+    let keyframes = [
+        (0, DAWN),
+        (DEFAULT_TIME_OF_DAY, NOON),
+        (12_000, DUSK),
+        (NIGHTFALL_TICK, night),
+        (PRE_DAWN_TICK, night),
+        (DAY_TICKS, DAWN),
+    ];
+    sky_palette_from_keyframes(time_of_day, &keyframes)
+}
+
+/// Shared interpolation core for [`sky_palette`] and [`sky_palette_with`].
+fn sky_palette_from_keyframes(time_of_day: u32, keyframes: &[(u32, SkyPalette)]) -> SkyPalette {
     let t = time_of_day % DAY_TICKS;
 
-    for window in KEYFRAMES.windows(2) {
+    for window in keyframes.windows(2) {
         let (start_tick, start) = window[0];
         let (end_tick, end) = window[1];
         if t >= start_tick && t <= end_tick {
@@ -335,29 +413,29 @@ fn lerp_color(start: [f32; 3], end: [f32; 3], fraction: f32) -> [f32; 3] {
 /// Linear RGB the sky/fog leans toward under rain, expressed as the base
 /// palette's own luminance scaled down: cool grey without repainting a
 /// midnight sky with a fixed bright slab.
-const RAIN_GREY_SCALE: f32 = 0.70;
+pub const RAIN_GREY_SCALE: f32 = 0.70;
 
 /// Linear RGB the sky/fog leans toward under snowfall, as a multiple of the
 /// base palette's luminance: a flat pale grey-white that still respects how
 /// dark the hour already is.
-const SNOW_GREY_SCALE: f32 = 1.18;
+pub const SNOW_GREY_SCALE: f32 = 1.18;
 
 /// Blend weight toward the rain grey. Conservative so rain reads as overcast
 /// rather than a hard colour cut; visual tuning happens in the windowed UAT.
-const RAIN_SKY_LERP: f32 = 0.45;
+pub const RAIN_SKY_LERP: f32 = 0.45;
 
 /// Blend weight toward the snow grey-white. Snow's flat bright overcast is a
 /// little more decisive than rain's grey so the two states stay distinguishable.
-const SNOW_SKY_LERP: f32 = 0.55;
+pub const SNOW_SKY_LERP: f32 = 0.55;
 
 /// Multiplier applied to `day_factor` under rain (dim, overcast light).
-const RAIN_DAY_FACTOR: f32 = 0.78;
+pub const RAIN_DAY_FACTOR: f32 = 0.78;
 
 /// Multiplier applied to `day_factor` under snowfall.
 ///
 /// The sky/fog brightens, but a snow-bearing overcast still blocks a little
 /// direct light, so the terrain light dims slightly rather than blowing out.
-const SNOW_DAY_FACTOR: f32 = 0.92;
+pub const SNOW_DAY_FACTOR: f32 = 0.92;
 
 /// Fog-range multiplier for clear weather; exactly `1.0` so the dry path is
 /// bit-identical to pre-weather rendering.
@@ -368,6 +446,48 @@ pub const RAIN_FOG_RANGE_FACTOR: f32 = 0.75;
 
 /// Fog-range multiplier for snowfall; between clear and rain.
 pub const SNOW_FOG_RANGE_FACTOR: f32 = 0.85;
+
+/// Creator-tunable weather fog and palette values.
+///
+/// Every field defaults from the module constant it will eventually replace;
+/// no literal is duplicated here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderRules {
+    /// Fog-range multiplier applied during rain.
+    pub rain_fog_factor: f32,
+    /// Fog-range multiplier applied during snowfall.
+    pub snow_fog_factor: f32,
+    /// Brightness scale for the rain sky and fog tint.
+    pub rain_grey_scale: f32,
+    /// Brightness scale for the snow sky and fog tint.
+    pub snow_grey_scale: f32,
+    /// Blend fraction toward the rain grey palette.
+    pub rain_sky_lerp: f32,
+    /// Blend fraction toward the snow grey palette.
+    pub snow_sky_lerp: f32,
+    /// Daylight multiplier applied during rain.
+    pub rain_day_factor: f32,
+    /// Daylight multiplier applied during snowfall.
+    pub snow_day_factor: f32,
+    /// Dimmest daylight factor reached at midnight.
+    pub moonlit_floor: f32,
+}
+
+impl Default for RenderRules {
+    fn default() -> Self {
+        Self {
+            rain_fog_factor: RAIN_FOG_RANGE_FACTOR,
+            snow_fog_factor: SNOW_FOG_RANGE_FACTOR,
+            rain_grey_scale: RAIN_GREY_SCALE,
+            snow_grey_scale: SNOW_GREY_SCALE,
+            rain_sky_lerp: RAIN_SKY_LERP,
+            snow_sky_lerp: SNOW_SKY_LERP,
+            rain_day_factor: RAIN_DAY_FACTOR,
+            snow_day_factor: SNOW_DAY_FACTOR,
+            moonlit_floor: MOONLIT_FLOOR,
+        }
+    }
+}
 
 /// Rec. 709 luminance of a linear RGB triple.
 ///
@@ -395,24 +515,33 @@ fn grey_at(color: [f32; 3], scale: f32) -> [f32; 3] {
 /// weather keeps today's exact colors. Colors are RGB `[f32; 3]`; no alpha
 /// channel exists to disturb.
 pub fn weather_palette(base: SkyPalette, weather: Weather) -> SkyPalette {
+    weather_palette_with(base, weather, &RenderRules::default())
+}
+
+/// [`weather_palette`] with creator-tunable palette and fog values.
+///
+/// Every precipitation constant the default wrapper reads comes from `rules`;
+/// [`Weather::Clear`] still returns `base` untouched. A default `rules` value
+/// is bit-identical to [`weather_palette`].
+pub fn weather_palette_with(base: SkyPalette, weather: Weather, rules: &RenderRules) -> SkyPalette {
     match weather {
         Weather::Clear => base,
         Weather::Rain => {
-            let target = grey_at(base.sky_color, RAIN_GREY_SCALE);
-            let fog_target = grey_at(base.fog_color, RAIN_GREY_SCALE);
+            let target = grey_at(base.sky_color, rules.rain_grey_scale);
+            let fog_target = grey_at(base.fog_color, rules.rain_grey_scale);
             SkyPalette {
-                day_factor: base.day_factor * RAIN_DAY_FACTOR,
-                sky_color: lerp_color(base.sky_color, target, RAIN_SKY_LERP),
-                fog_color: lerp_color(base.fog_color, fog_target, RAIN_SKY_LERP),
+                day_factor: base.day_factor * rules.rain_day_factor,
+                sky_color: lerp_color(base.sky_color, target, rules.rain_sky_lerp),
+                fog_color: lerp_color(base.fog_color, fog_target, rules.rain_sky_lerp),
             }
         }
         Weather::Snowfall => {
-            let target = grey_at(base.sky_color, SNOW_GREY_SCALE);
-            let fog_target = grey_at(base.fog_color, SNOW_GREY_SCALE);
+            let target = grey_at(base.sky_color, rules.snow_grey_scale);
+            let fog_target = grey_at(base.fog_color, rules.snow_grey_scale);
             SkyPalette {
-                day_factor: base.day_factor * SNOW_DAY_FACTOR,
-                sky_color: lerp_color(base.sky_color, target, SNOW_SKY_LERP),
-                fog_color: lerp_color(base.fog_color, fog_target, SNOW_SKY_LERP),
+                day_factor: base.day_factor * rules.snow_day_factor,
+                sky_color: lerp_color(base.sky_color, target, rules.snow_sky_lerp),
+                fog_color: lerp_color(base.fog_color, fog_target, rules.snow_sky_lerp),
             }
         }
     }
@@ -425,10 +554,19 @@ pub fn weather_palette(base: SkyPalette, weather: Weather) -> SkyPalette {
 /// rain (`0.75`) more enclosing than snowfall (`0.85`). This value is computed
 /// CPU-side and must not be smuggled through `CameraUniform`'s spare lane.
 pub fn weather_fog_range_factor(weather: Weather) -> f32 {
+    weather_fog_range_factor_with(weather, &RenderRules::default())
+}
+
+/// [`weather_fog_range_factor`] with creator-tunable rain/snow factors.
+///
+/// Clear stays exactly `1.0`: the dry path has no config row and must remain
+/// bit-identical. A default `rules` value is bit-identical to
+/// [`weather_fog_range_factor`].
+pub fn weather_fog_range_factor_with(weather: Weather, rules: &RenderRules) -> f32 {
     match weather {
         Weather::Clear => CLEAR_FOG_RANGE_FACTOR,
-        Weather::Rain => RAIN_FOG_RANGE_FACTOR,
-        Weather::Snowfall => SNOW_FOG_RANGE_FACTOR,
+        Weather::Rain => rules.rain_fog_factor,
+        Weather::Snowfall => rules.snow_fog_factor,
     }
 }
 
@@ -603,6 +741,26 @@ mod tests {
 
     const NOON_SKY: [f32; 3] = [0.53, 0.76, 0.96];
 
+    #[test]
+    fn clock_rules_default_matches_constants() {
+        let rules = ClockRules::default();
+        assert_eq!(rules.day_seconds, DAY_SECONDS);
+    }
+
+    #[test]
+    fn render_rules_default_matches_constants() {
+        let rules = RenderRules::default();
+        assert_eq!(rules.rain_fog_factor, RAIN_FOG_RANGE_FACTOR);
+        assert_eq!(rules.snow_fog_factor, SNOW_FOG_RANGE_FACTOR);
+        assert_eq!(rules.rain_grey_scale, RAIN_GREY_SCALE);
+        assert_eq!(rules.snow_grey_scale, SNOW_GREY_SCALE);
+        assert_eq!(rules.rain_sky_lerp, RAIN_SKY_LERP);
+        assert_eq!(rules.snow_sky_lerp, SNOW_SKY_LERP);
+        assert_eq!(rules.rain_day_factor, RAIN_DAY_FACTOR);
+        assert_eq!(rules.snow_day_factor, SNOW_DAY_FACTOR);
+        assert_eq!(rules.moonlit_floor, MOONLIT_FLOOR);
+    }
+
     fn assert_close(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 1e-6,
@@ -665,6 +823,49 @@ mod tests {
         }
         assert_eq!(clock.time_of_day, 6_020);
         assert!(clock.fractional_ticks < 1.0);
+    }
+
+    #[test]
+    fn live_day_length_scales_the_tick_rate() {
+        // 600 real seconds is a full 24,000-tick day at the tuned rate, so a
+        // clock starting at noon lands on noon one day later.
+        let mut clock = GameClock::new();
+        clock.set_day_seconds(600.0);
+        assert_eq!(clock.day_seconds(), 600.0);
+        clock.advance_secs(600.0, 1.0);
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+        assert_eq!(clock.fractional_ticks, 0.0);
+    }
+
+    #[test]
+    fn default_day_length_still_advances_one_day_in_day_seconds() {
+        let mut clock = GameClock::new();
+        assert_eq!(clock.day_seconds(), DAY_SECONDS);
+        clock.advance_secs(DAY_SECONDS, 1.0);
+        assert_eq!(clock.day_index, 1);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+    }
+
+    #[test]
+    fn set_day_seconds_rejects_invalid_values_and_keeps_the_previous_rate() {
+        let mut clock = GameClock::new();
+        clock.set_day_seconds(600.0);
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            clock.set_day_seconds(invalid);
+            assert_eq!(
+                clock.day_seconds(),
+                600.0,
+                "invalid day length {invalid} must be ignored"
+            );
+        }
+        // A rejected update must not touch the calendar either.
+        assert_eq!(clock.day_index, 0);
+        assert_eq!(clock.time_of_day, DEFAULT_TIME_OF_DAY);
+
+        // A valid update after rejects still takes effect.
+        clock.set_day_seconds(2_400.0);
+        assert_eq!(clock.day_seconds(), 2_400.0);
     }
 
     #[test]

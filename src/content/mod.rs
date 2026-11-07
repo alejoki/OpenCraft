@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use crate::player::inventory::{
     self, Item, ItemId, Recipe, ToolKind, ToolTier, MATERIAL_STACK_LIMIT, MAX_STACK_COUNT, RECIPES,
 };
-use crate::player::tools;
+use crate::player::tools::{self, ToolRules};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 use crate::world::terrain::Biome;
 
@@ -294,6 +294,21 @@ impl BlockDef {
     }
 }
 
+/// Provenance of one frozen pack-authored block layer or icon.
+///
+/// `path` is the pack-relative authored path exactly as the pack names it
+/// (the bare file name for fixed-name layers). A source is metadata only: it
+/// identifies which `(pack, path)` produced a GPU layer, so a live edit can
+/// rewrite that layer without re-deriving allocation. Sources never enter the
+/// content digest.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LayerSource {
+    /// Pack folder name (stable identity inside `packs/`).
+    pub folder: String,
+    /// Pack-relative authored path.
+    pub path: String,
+}
+
 /// Immutable, session-scoped registry of content definitions.
 ///
 /// The built-in registry is created once and shared through a `OnceLock`; a
@@ -310,6 +325,8 @@ pub struct ContentRegistry {
     worldgen_rules: Vec<WorldgenRule>,
     pack_layers: Vec<Vec<u8>>,
     pack_icons: Vec<Vec<u8>>,
+    pack_layer_sources: Vec<LayerSource>,
+    pack_icon_sources: Vec<LayerSource>,
     packs: Vec<PackIdentity>,
     digest: u64,
 }
@@ -327,6 +344,8 @@ impl ContentRegistry {
             worldgen_rules: Vec::new(),
             pack_layers: Vec::new(),
             pack_icons: Vec::new(),
+            pack_layer_sources: Vec::new(),
+            pack_icon_sources: Vec::new(),
             packs: Vec::new(),
             digest: EMPTY_DIGEST,
         })
@@ -515,9 +534,29 @@ impl ContentRegistry {
     /// index falls back to bare-hand timing. Unknown ids and unbreakable
     /// definitions return `None`.
     pub fn break_duration(&self, block: BlockId, selected: Option<Item>) -> Option<f32> {
+        self.break_duration_with_rules(block, selected, &ToolRules::default())
+    }
+
+    /// [`Self::break_duration`] with live [`ToolRules`] for built-in tiers.
+    ///
+    /// The live tuning only reaches the built-in `Tool { kind, tier }` path.
+    /// A pack tool keeps its authored [`TierDef::speed`] and is therefore
+    /// byte-identical to [`Self::break_duration`]; the mined `mining.toml`
+    /// rows can never retune a pack's own tier table.
+    pub fn break_duration_with_rules(
+        &self,
+        block: BlockId,
+        selected: Option<Item>,
+        rules: &ToolRules,
+    ) -> Option<f32> {
         let def = self.block(block)?;
         if !matches!(selected.map(|item| item.id()), Some(ItemId::ModTool(_))) {
-            return tools::break_duration_for(def.hardness, def.tool_class, selected);
+            return tools::break_duration_for_with_rules(
+                def.hardness,
+                def.tool_class,
+                selected,
+                rules,
+            );
         }
         let Some(ItemId::ModTool(index)) = selected.map(|item| item.id()) else {
             unreachable!("the match above proved a pack tool identity");
@@ -667,6 +706,22 @@ impl ContentRegistry {
     pub fn pack_icon(&self, layer: u8) -> Option<&[u8]> {
         let index = layer.checked_sub(PACK_ICON_BASE)?;
         self.pack_icons.get(usize::from(index)).map(Vec::as_slice)
+    }
+
+    /// Authored provenance for [`Self::pack_layers`], index-aligned with it.
+    ///
+    /// `pack_layer_sources()[i]` names the `(folder, path)` that produced the
+    /// layer reported as `PACK_LAYER_BASE + i`. Empty for built-in content.
+    pub fn pack_layer_sources(&self) -> &[LayerSource] {
+        &self.pack_layer_sources
+    }
+
+    /// Authored provenance for [`Self::pack_icons`], index-aligned with it.
+    ///
+    /// `pack_icon_sources()[i]` names the `(folder, path)` that produced the
+    /// icon reported as `PACK_ICON_BASE + i`. Empty for built-in content.
+    pub fn pack_icon_sources(&self) -> &[LayerSource] {
+        &self.pack_icon_sources
     }
 
     /// Pack identities in the order they were stacked.
@@ -947,6 +1002,8 @@ mod tests {
         assert!(registry.worldgen_rules().is_empty());
         assert!(registry.pack_layers().is_empty());
         assert!(registry.pack_icons().is_empty());
+        assert!(registry.pack_layer_sources().is_empty());
+        assert!(registry.pack_icon_sources().is_empty());
         assert!(registry.packs().is_empty());
         assert_eq!(registry.digest(), EMPTY_DIGEST);
     }
@@ -1438,6 +1495,50 @@ mod tests {
         assert_eq!(registry.break_duration(ruby, None), Some(0.5));
         registry.blocks[usize::from(ruby.to_raw())].hardness = None;
         assert_eq!(registry.break_duration(ruby, None), None);
+    }
+
+    #[test]
+    fn break_duration_with_rules_retunes_builtins_and_leaves_pack_tiers_alone() {
+        let rules = ToolRules {
+            wood_speed_multiplier: 8,
+            stone_speed_multiplier: 12,
+            iron_speed_multiplier: 16,
+        };
+        let registry = ContentRegistry::builtin();
+        let wood_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("built-in pickaxe");
+        assert_eq!(
+            registry.break_duration_with_rules(BlockId::Stone, Some(wood_pickaxe), &rules),
+            Some(1.2 / 8.0)
+        );
+        assert_eq!(
+            registry.break_duration(BlockId::Stone, Some(wood_pickaxe)),
+            Some(1.2 / 2.0),
+            "the default wrapper keeps the pinned 2x wood timing"
+        );
+
+        // A pack tool keeps its authored tier speed even under a tuned bundle:
+        // the mined.toml tier rows only retune the built-in economy.
+        let (mut registry, [ruby, ..]) = registry_with_drops();
+        let ruby_block = usize::from(ruby.to_raw());
+        registry.blocks[ruby_block].hardness = Some(3.0);
+        registry.blocks[ruby_block].tool_class = Some(ToolKind::Pickaxe);
+        let ruby_pickaxe = Item::new_with(&registry, ItemId::ModTool(0), 1).expect("pack pickaxe");
+        assert_eq!(
+            registry.break_duration_with_rules(ruby, Some(ruby_pickaxe), &rules),
+            Some(3.0 / 9.0)
+        );
+        assert_eq!(
+            registry.break_duration(ruby, Some(ruby_pickaxe)),
+            Some(3.0 / 9.0),
+            "the pack tier path is byte-identical with and without rules"
+        );
     }
 
     #[test]

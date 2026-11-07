@@ -1,5 +1,29 @@
 use glam::{Mat4, Vec3, Vec4};
 
+/// Near clipping plane of the default camera, in blocks.
+pub const DEFAULT_Z_NEAR: f32 = 0.1;
+/// Far clipping plane of the default camera, in blocks.
+pub const DEFAULT_Z_FAR: f32 = 1200.0;
+
+/// Effective camera projection tuning.
+///
+/// The defaults reference [`DEFAULT_Z_NEAR`]/[`DEFAULT_Z_FAR`], so an applied
+/// rule set reintroduces exactly the values [`Camera::new`] starts with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraRules {
+    pub z_near: f32,
+    pub z_far: f32,
+}
+
+impl Default for CameraRules {
+    fn default() -> Self {
+        Self {
+            z_near: DEFAULT_Z_NEAR,
+            z_far: DEFAULT_Z_FAR,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Camera {
     pub position: Vec3,
@@ -17,8 +41,8 @@ impl Camera {
             yaw: -std::f32::consts::FRAC_PI_4,
             pitch: -0.25,
             fov_y_radians: 75.0_f32.to_radians(),
-            z_near: 0.1,
-            z_far: 1200.0,
+            z_near: DEFAULT_Z_NEAR,
+            z_far: DEFAULT_Z_FAR,
         }
     }
 
@@ -135,5 +159,15 @@ mod tests {
         );
         assert_eq!(mask & (1 << 0), 0); // +X face culled
         assert_ne!(mask & (1 << 1), 0); // -X face visible
+    }
+
+    #[test]
+    fn default_camera_rules_equal_camera_new() {
+        let rules = CameraRules::default();
+        let camera = Camera::new(Vec3::ZERO);
+        assert_eq!(rules.z_near, camera.z_near);
+        assert_eq!(rules.z_far, camera.z_far);
+        assert_eq!(rules.z_near, DEFAULT_Z_NEAR);
+        assert_eq!(rules.z_far, DEFAULT_Z_FAR);
     }
 }

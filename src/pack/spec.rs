@@ -140,49 +140,92 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
 
 /// Decode one optional layer file into resampled 16x16 RGBA bytes.
 ///
-/// A missing file is silent `None`; a present-but-invalid file is `None` plus
-/// one warning named after the bare file, matching v1 `apply_layer_files`.
-fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> Option<Vec<u8>> {
+/// This is the single-file seam shared by startup loading and live texture
+/// reload. A missing file is `Ok(None)` (the stack keeps whatever is below);
+/// a present-but-invalid file is `Err(reason)` using the exact startup reason
+/// strings. It never warns or touches presentation state.
+pub fn decode_layer_file(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, String> {
     let path = dir.join(file);
     if !path.exists() {
         // Missing layer files are legal: the stack keeps whatever is below.
-        return None;
+        return Ok(None);
     }
 
-    let decoded = match decode::decode_png_rgba(&path) {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            warnings.push(SettingsWarning {
-                field: file.to_string(),
-                reason: err,
-            });
-            return None;
-        }
-    };
+    let decoded = decode::decode_png_rgba(&path)?;
+    validate_square_16_to_256(&decoded, "layers")?;
+    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
+}
 
+/// Decode one v2 pack asset into resampled 16x16 RGBA bytes.
+///
+/// Uses the same confinement, byte cap, and dimension rules as
+/// [`crate::pack::v2::load_content_assets`], but returns the failure reason to
+/// the caller instead of recording a diagnostic. This is the live-reload seam
+/// for pack block-face assets.
+pub fn decode_asset_file(dir: &Path, relative: &str) -> Result<Vec<u8>, String> {
+    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
+    let decoded = decode::decode_png_rgba_bytes(&bytes, relative)?;
+    validate_square_16_to_256(&decoded, "assets")?;
+    Ok(resample::resample_to_16(&decoded.rgba, decoded.width))
+}
+
+/// Decode one optional `[builtin_icons]` PNG into resampled 16x16 RGBA bytes.
+///
+/// This is the live-reload seam for built-in sprite overrides. It applies the
+/// same confinement, byte cap, and square 16..=256 rules as
+/// [`decode_asset_file`], but a missing file is `Ok(None)` instead of an error:
+/// a deleted override must reveal the lower pack or procedural art. A path
+/// that escapes the pack folder, or a present-but-invalid/oversized image, is
+/// `Err(reason)`.
+pub fn decode_builtin_icon_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = asset::resolve_asset_path(dir, relative)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
+    let decoded = decode::decode_png_rgba_bytes(&bytes, relative)?;
+    validate_square_16_to_256(&decoded, "assets")?;
+    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
+}
+
+/// Require a square image between [`MIN_LAYER_SIDE`] and [`MAX_LAYER_SIDE`].
+///
+/// `noun` selects the exact startup wording: `layers` for fixed-name layers
+/// and `assets` for v2 pack assets.
+fn validate_square_16_to_256(decoded: &decode::DecodedPng, noun: &str) -> Result<(), String> {
     if decoded.width != decoded.height {
-        warnings.push(SettingsWarning {
-            field: file.to_string(),
-            reason: format!(
-                "image is {}x{}, layers must be square",
-                decoded.width, decoded.height
-            ),
-        });
-        return None;
+        return Err(format!(
+            "image is {}x{}, {noun} must be square",
+            decoded.width, decoded.height
+        ));
     }
 
     if decoded.width < MIN_LAYER_SIDE || decoded.width > MAX_LAYER_SIDE {
-        warnings.push(SettingsWarning {
-            field: file.to_string(),
-            reason: format!(
-                "image is {}x{}, layers must be between {} and {} pixels per side",
-                decoded.width, decoded.height, MIN_LAYER_SIDE, MAX_LAYER_SIDE
-            ),
-        });
-        return None;
+        return Err(format!(
+            "image is {}x{}, {noun} must be between {} and {} pixels per side",
+            decoded.width, decoded.height, MIN_LAYER_SIDE, MAX_LAYER_SIDE
+        ));
     }
 
-    Some(resample::resample_to_16(&decoded.rgba, decoded.width))
+    Ok(())
+}
+
+/// Decode one optional layer file into resampled 16x16 RGBA bytes.
+///
+/// A missing file is silent `None`; a present-but-invalid file is `None` plus
+/// one warning named after the bare file, matching v1 `apply_layer_files`.
+fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> Option<Vec<u8>> {
+    match decode_layer_file(dir, file) {
+        Ok(layer) => layer,
+        Err(reason) => {
+            warnings.push(SettingsWarning {
+                field: file.to_string(),
+                reason,
+            });
+            None
+        }
+    }
 }
 
 /// Decode the optional manifest logo at native size, warning on failure.
@@ -850,5 +893,85 @@ hardness = 1.0
         );
         assert_eq!(spec.warnings.len(), 1);
         assert!(spec.warnings[0].reason.contains("newer than 2"));
+    }
+
+    #[test]
+    fn decode_layer_file_distinguishes_missing_invalid_and_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "decode-layer");
+
+        assert_eq!(decode_layer_file(&dir, "stone.png").unwrap(), None);
+
+        fs::write(dir.join("stone.png"), b"not a png").unwrap();
+        assert!(decode_layer_file(&dir, "stone.png").is_err());
+
+        write_png(&dir.join("stone.png"), 8);
+        let err = decode_layer_file(&dir, "stone.png").unwrap_err();
+        assert!(err.contains("between 16 and 256"), "{err}");
+
+        write_png_sized(&dir.join("stone.png"), 32, 16);
+        let err = decode_layer_file(&dir, "stone.png").unwrap_err();
+        assert!(err.contains("layers must be square"), "{err}");
+
+        let authored = authored_layer(&dir, "stone.png", 32);
+        assert_eq!(
+            decode_layer_file(&dir, "stone.png").unwrap(),
+            Some(authored)
+        );
+    }
+
+    #[test]
+    fn decode_asset_file_matches_v2_asset_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "decode-asset");
+
+        let err = decode_asset_file(&dir, "missing.png").unwrap_err();
+        assert!(err.contains("failed to read asset"), "{err}");
+
+        let err = decode_asset_file(&dir, "../escape.png").unwrap_err();
+        assert!(err.contains("must not contain `..`"), "{err}");
+
+        fs::write(dir.join("ore.png"), b"not a png").unwrap();
+        assert!(decode_asset_file(&dir, "ore.png").is_err());
+
+        write_png(&dir.join("ore.png"), 8);
+        let err = decode_asset_file(&dir, "ore.png").unwrap_err();
+        assert!(err.contains("assets must be between 16 and 256"), "{err}");
+
+        write_png_sized(&dir.join("ore.png"), 32, 16);
+        let err = decode_asset_file(&dir, "ore.png").unwrap_err();
+        assert!(err.contains("assets must be square"), "{err}");
+
+        let expected = authored_layer(&dir, "ore.png", 32);
+        assert_eq!(decode_asset_file(&dir, "ore.png").unwrap(), expected);
+    }
+
+    #[test]
+    fn decode_builtin_icon_file_returns_none_for_missing_and_rejects_bad_art() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "decode-builtin-icon");
+
+        // Missing overrides are legal live edits: fall back without an error.
+        assert_eq!(decode_builtin_icon_file(&dir, "apple.png").unwrap(), None);
+
+        let err = decode_builtin_icon_file(&dir, "../escape.png").unwrap_err();
+        assert!(err.contains("must not contain `..`"), "{err}");
+
+        fs::write(dir.join("apple.png"), b"not a png").unwrap();
+        assert!(decode_builtin_icon_file(&dir, "apple.png").is_err());
+
+        write_png(&dir.join("apple.png"), 8);
+        let err = decode_builtin_icon_file(&dir, "apple.png").unwrap_err();
+        assert!(err.contains("assets must be between 16 and 256"), "{err}");
+
+        write_png_sized(&dir.join("apple.png"), 32, 16);
+        let err = decode_builtin_icon_file(&dir, "apple.png").unwrap_err();
+        assert!(err.contains("assets must be square"), "{err}");
+
+        let expected = authored_layer(&dir, "apple.png", 32);
+        assert_eq!(
+            decode_builtin_icon_file(&dir, "apple.png").unwrap(),
+            Some(expected)
+        );
     }
 }

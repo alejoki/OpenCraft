@@ -136,6 +136,21 @@ Entry rules:
 
 Pack content ids allocate deterministically: blocks take dense ids from 23 in sorted id order after the 23 built-in blocks, items and tools from 0, tiers after the three built-ins, and recipes after the 22 built-ins. Block face layers append from texture-array layer 48 (at most 160 pack layers) and item/tool icons from layer 32 (at most 192 icons), deduplicated per pack folder and authored path; patch entries allocate no ids. A registry digest (FNV-1a 64) covers pack identities and every definition field so a validation run and a game load agree, but it deliberately excludes image bytes: recolouring an existing PNG does not change content identity.
 
+### Built-in item sprite overrides
+
+A `format_version = 2` manifest can replace the built-in material and tool icons with its own art through one `[builtin_icons]` table. The table maps an unqualified built-in short name to a pack-relative PNG:
+
+```toml
+[builtin_icons]
+apple = "textures/apple.png"
+wood_pickaxe = "textures/pickaxe.png"
+wood_bow = "textures/bow.png"
+```
+
+Keys are the built-in item sprite names: the 11 materials (`stick`, `apple`, `wheat`, `wheat_seeds`, `bread`, `leather`, `raw_porkchop`, `raw_beef`, `rotten_flesh`, `bone`, `arrow`) and the 16 tools (`wood_`/`stone_`/`iron_` pickaxe, axe, shovel, hoe and sword, plus `wood_bow`). Blocks, namespaced ids, and unknown names are rejected with a `builtin_icon <name>` error. Values follow the same asset rules as every other PNG: relative to the pack folder with no absolute or `.`/`..` components, at most 1 MiB per file, and square at 16 to 256 pixels per side. One pack may author at most 256 entries.
+
+Overrides merge per name: a later pack's loaded image wins for that name, while earlier packs keep every other name. A missing or malformed PNG contributes nothing, so the lower pack's override — or the built-in procedural sprite when no pack authors one — stays visible. The table is presentation-only: it is excluded from the content digest, registry allocation, pack layer/icon counts, and restart identity. Adding, removing, or repointing an override is therefore a live visual edit, not a content change.
+
 ## Declarative worldgen
 
 `[[worldgen]]` entries in a `format_version = 2` pack turn authored blocks into real terrain in newly generated chunks. The fields are part of the Format v2 schema described above; this section describes what they do to a world.
@@ -210,7 +225,7 @@ bash scripts/modding_smoke.sh
 
 ## Content packs and saves
 
-Content definitions are not baked into a world file. A version 8 save stores every block, item and tool reference by name in a sorted, save-local table; built-in names are unqualified and pack content uses its namespaced id. Loading reads those names against the currently selected stack.
+Content definitions are not baked into a world file. A version 9 save stores every block, item and tool reference by name in a sorted, save-local table; built-in names are unqualified and pack content uses its namespaced id. Loading reads those names against the currently selected stack. The v9 config schema and effective-value digest tail is separate from this content identity: it describes the gameplay tuning that wrote the file, not the pack stack.
 
 When a saved name is well-formed but absent from the selected stack, the load succeeds and keeps the reference as a placeholder:
 
@@ -411,6 +426,15 @@ warning: pack.toml: content arrays require format_version = 2
 validate-pack: my-first-pack: 2 entries, 0 errors, 1 warnings
 ```
 
+An accepted built-in override prints its own `ok:` line and is counted in the summary. A missing override PNG fails validation with an `error: asset ...` line while still explaining the fallback:
+
+```text
+error: asset textures/missing.png: failed to read asset `textures/missing.png`: No such file or directory (os error 2)
+ok: builtin_icon apple
+warning: builtin_icon apple: icon `textures/missing.png` is not a loaded asset; the built-in sprite stays visible
+validate-pack: my-first-pack: 1 entries, 1 errors, 1 warnings
+```
+
 The exit code is `0` when there are no errors (warnings still pass) and `1` when an entry was rejected or the pack folder is missing. Validation builds the same registry a normal load builds over the built-in content, so references must name a built-in block/item or an entry in the same pack — cross-pack references are not supported.
 
 ## Selecting packs in game
@@ -423,6 +447,58 @@ The exit code is `0` when there are no errors (warnings still pass) and `1` when
 - Content definitions (blocks, items, tiers, tools, recipes, and worldgen) are loaded once when a world session starts. If a change moves the content digest, the Packs screen shows `content changes apply when the world is loaded again`; presentation still updates immediately and the message never blocks saving or shutdown.
 - If an enabled pack folder is deleted or renamed, the game keeps running with the remaining packs and shows a warning naming the missing pack. The missing row stays in the stack, so restoring the folder makes it apply again.
 - Settings only shows packs that are folders under `packs/`; loose files in that directory are ignored.
+
+## Live texture reload (dev builds)
+
+Development builds watch the active pack stack while the game is running, so you can tune artwork without relaunching. The watcher checks the files about every 100 ms (ten times per second) and applies an edit only after the file has stayed unchanged for 250 ms; an editor's atomic save or a burst of saves therefore becomes one apply. Release builds have no file watcher: a direct file edit appears on the next launch or after a Packs action.
+
+**Applies live**
+
+- The 25 block textures and 13 mob textures listed above. A fixed-name file that was missing from a loaded pack can be created later and immediately replaces that layer. When the edited pack is the visible author of the layer, only that one texture-array layer is re-uploaded.
+- The block-face images that a `format_version = 2` stack loaded and allocated when it was applied. Each image keeps its allocated layer index and only its bytes are replaced, so the live path can never move allocation.
+- Deleting one of the 38 fixed-name files is live too: the layer falls back to the next pack in the stack that authors it, or to the built-in procedural art when no pack does.
+- A corrupt, non-square, or out-of-range PNG (outside 16 to 256 pixels per side) is rejected. The layer keeps its last good image and the game shows one message naming the file and reason; a valid edit settling in the same poll still applies.
+- Built-in item sprites overridden by `[builtin_icons]`. Editing the authored PNG recomposes and re-uploads the single 256-layer item sprite atlas; only that name's pinned layer changes. The pinned layers are `apple` = 1, `wood_pickaxe` = 11 and `wood_bow` = 26; reserved layers 27–31 are never overridable, and pack-defined icons at layers 32 and above are untouched.
+- Adding, removing, or repointing a `[builtin_icons]` entry in `pack.toml` applies without a restart. A malformed PNG keeps the last good override, and deleting the authored file (or removing the entry) reveals the next lower pack's override or the procedural built-in sprite.
+
+**Applies when the world is loaded again**
+
+Editing `pack.toml` is compared against the content identity captured when the stack was applied. An edit that moves content sets a restart requirement whose reason names exactly what moved:
+
+- An edit confined to `[[recipes]]` or `[[recipe_patches]]` says `recipe changed`, for example `restart required: <folder>: recipe changed; restart to apply`.
+- An edit that touches blocks, items, tiers, tools, worldgen, or the pack block-face/icon allocation that follows from them — or a mixed edit that changes recipes alongside any of those — says `content changed`, for example `restart required: <folder>: content changed; restart to apply`.
+
+The same reason appears on the overlay's `packs:` line. When several packs need a restart, their reasons are joined in folder order, for example `a: recipe changed, b: content changed; restart to apply`. The Packs screen and a transient notice add `content changes apply when the world is loaded again`. `[builtin_icons]` edits are the exception: the table is presentation-only and reconciles live even when another field in the same manifest edit still requires a restart.
+
+The live registry, allocation, and texture path stays frozen while a restart is required. No live layer index moves, no layer is re-uploaded, and the current session keeps the content it loaded. Presentation still updates immediately, so texture and `[builtin_icons]` edits keep applying live while a content edit waits for the restart. Quit and relaunch the game, then load the same save, to use the new registry. That same-save load shows the one-time `content definitions changed` notice after the world is open and playable, and the edited recipe or definition then works normally on that save. Editing the manifest back to the installed content clears the requirement without a restart.
+
+The two-run `--demo-restart` seam proves that path headlessly in debug and release. With the `mymod-ruby` fixture installed as `packs/mymod-ruby`, its first run (with `--new`) writes a fixture save; after the recipe edit, a second run on the same save reports the content notice and the edited recipe's preview and craft counts:
+
+```text
+restart: leg=save recipe=mymod:ruby_stew count=1 day=3 tick=6000 saved=true
+restart: ok
+restart: leg=load recipe=mymod:ruby_stew count=2 preview=2 crafted=2 unresolved=0 day=3 tick=6000 notice=content definitions changed playable=true
+restart: ok
+```
+
+**Not live-texture-reloaded**
+
+- Icons declared by pack-defined `[[items]]` and `[[tools]]` entries are part of the world session's frozen content registry. The live watcher does not re-upload them; a Packs action captures new icon art for the next world session. Built-in overrides from `[builtin_icons]` are different: they are presentation-only and apply live.
+- A manifest's `logo` and `overlay_tint` apply when you toggle or reorder packs on the Packs screen (or relaunch), not from a direct manifest edit.
+- Sounds also apply on a Packs action, not from a watched file edit.
+
+In a development build, the F6 creator overlay reports the last pack outcome on its `packs:` line. Launching with `--creator-trace` prints one stable line for each applied texture, each rejected edit, and each manifest edit that raises a restart requirement:
+
+```text
+creator: texture applied path=packs/my-first-pack/stone.png layer=3 digest=0x0123456789abcdef
+creator: texture applied path=packs/my-first-pack/textures/apple.png layer=1 digest=0x0123456789abcdef
+creator: texture rejected path=packs/my-first-pack/stone.png reason=failed to decode PNG
+creator: restart-required reason=my-first-pack: content changed; restart to apply
+```
+
+A removed override is not an applied texture: the F6 `packs:` line reports `builtin icon <name> restored` instead, so a fallback to a lower pack or the procedural sprite is distinguishable from a successful PNG decode.
+
+Release builds contain no pack watcher, no creator overlay, and no trace output.
 
 ## Packs screen
 

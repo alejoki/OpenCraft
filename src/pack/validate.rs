@@ -108,7 +108,12 @@ pub fn validate_pack_lines(packs_root: &Path, name: &str) -> (Vec<String>, bool)
     }
 
     let mut lines: Vec<String> = rendered.into_iter().collect();
-    lines.push(summary(name, report.entries, errors, warnings));
+    lines.push(summary(
+        name,
+        report.entries + spec.content.builtin_icons.len(),
+        errors,
+        warnings,
+    ));
     (lines, errors == 0)
 }
 
@@ -150,6 +155,11 @@ fn content_entries(spec: &PackContentSpec) -> Vec<String> {
         spec.recipe_patches
             .iter()
             .map(|entry| format!("recipe_patch {}", entry.id)),
+    );
+    entries.extend(
+        spec.builtin_icons
+            .keys()
+            .map(|name| format!("builtin_icon {name}")),
     );
     entries
 }
@@ -406,5 +416,66 @@ hardness = 2.0
         let a_item = text.find("ok: item sorted:a_item").unwrap();
         let z_item = text.find("ok: item sorted:z_item").unwrap();
         assert!(block < a_item && a_item < z_item, "sorted output: {text}");
+    }
+
+    #[test]
+    fn builtin_icon_entry_prints_ok_and_counts_in_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "icons");
+        write_manifest(
+            &dir,
+            r#"
+format_version = 2
+name = "Icons"
+
+[builtin_icons]
+apple = "apple.png"
+wood_pickaxe = "pickaxe.png"
+"#,
+        );
+        write_png(&dir.join("apple.png"), 16);
+        write_png(&dir.join("pickaxe.png"), 16);
+
+        let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "icons");
+        let text = lines_joined(&lines);
+        assert!(ok, "valid overrides must validate: {text}");
+        assert!(text.contains("ok: builtin_icon apple"), "{text}");
+        assert!(text.contains("ok: builtin_icon wood_pickaxe"), "{text}");
+        assert!(
+            text.contains("validate-pack: icons: 2 entries, 0 errors, 0 warnings"),
+            "the accepted override count is included: {text}"
+        );
+    }
+
+    #[test]
+    fn builtin_icon_with_missing_asset_reports_error_and_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "badicon");
+        write_manifest(
+            &dir,
+            r#"
+format_version = 2
+
+[builtin_icons]
+apple = "missing.png"
+"#,
+        );
+
+        let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "badicon");
+        let text = lines_joined(&lines);
+        assert!(!ok, "a missing override file is an error: {text}");
+        assert!(text.contains("error: asset missing.png:"), "{text}");
+        assert!(
+            text.contains("warning: builtin_icon apple: icon `missing.png` is not a loaded asset"),
+            "the built-in fallback is explained: {text}"
+        );
+        assert!(
+            text.contains("ok: builtin_icon apple"),
+            "the override entry itself was accepted: {text}"
+        );
+        assert!(
+            text.contains("validate-pack: badicon: 1 entries, 1 errors, 1 warnings"),
+            "{text}"
+        );
     }
 }

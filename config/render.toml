@@ -1,0 +1,24 @@
+# OpenCraft creator configuration: fog, weather palette, and UI timing.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[fog]
+rain_factor = 0.75
+snow_factor = 0.85
+
+[palette]
+rain_grey_scale = 0.7
+snow_grey_scale = 1.18
+rain_sky_lerp = 0.45
+snow_sky_lerp = 0.55
+rain_day_factor = 0.78
+snow_day_factor = 0.92
+moonlit_floor = 0.34
+
+[ui]
+selected_name_secs = 2.0

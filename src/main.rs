@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,11 +14,17 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencraft::audio::{AudioEngine, SoundSlot};
+use opencraft::config::watch::{self, CreatorRuntime};
+use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle, SaveConfigMeta};
 use opencraft::content::names;
 use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
-use opencraft::content::{ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule};
+use opencraft::content::{
+    ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule, PACK_LAYER_BASE,
+};
 use opencraft::mesh::quad::ChunkMesh;
+use opencraft::pack::presentation::{ContentFingerprint, LayerInput, PackPresentation};
 use opencraft::pack::spec::PackSpec;
+use opencraft::pack::watch::{PackFileKind, PackWatch, PackWatchEntry};
 use opencraft::pack::{self, LoadedPack};
 use opencraft::player::bow::{BowState, BowTarget, BowTick};
 use opencraft::player::combat::DamageCause;
@@ -27,8 +34,8 @@ use opencraft::player::inventory::{
     ToolWear, HOTBAR_SLOTS, INVENTORY_SLOTS,
 };
 use opencraft::player::melee::{
-    attack_damage, attack_damage_with, MeleeHit, MeleeState, MeleeTarget, MeleeTick, MELEE_REACH,
-    SWORD_DAMAGE_WOOD,
+    attack_damage, attack_damage_with_rules, MeleeHit, MeleeState, MeleeTarget, MeleeTick,
+    MELEE_REACH, SWORD_DAMAGE_WOOD,
 };
 use opencraft::player::mining::{MiningState, MiningTarget, MiningTick};
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
@@ -38,7 +45,7 @@ use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER}
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
-use opencraft::render::pipeline::{SkyParams, UiPass, VoxelRenderer};
+use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
@@ -57,12 +64,13 @@ use opencraft::ui::hud::{
 };
 use opencraft::ui::inventory::{
     hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
-    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryScreen, InventoryTarget,
-    LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
+    tooltip_lines_with, tooltip_rect, InventoryMode, InventoryPanel, InventoryScreen,
+    InventoryTarget, LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
-    compose_item_sprite_layers, hotbar_icon_vertices_with, inventory_icon_vertices_with,
-    palette_icon_vertices_with, IconDrawList,
+    builtin_icon_layer, compose_item_sprite_layers, compose_item_sprite_layers_with_overrides,
+    hotbar_icon_vertices_with, inventory_icon_vertices_with, palette_icon_vertices_with,
+    IconDrawList,
 };
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
@@ -102,13 +110,14 @@ use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropRepor
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
 use opencraft::world::persistence::{
-    load_world_from_path, load_world_from_path_with, save_world_to_path_with, ChunkEditMap,
-    CliConfig, PersistenceError, SavedMob, SavedPlayerState, WorldSaveData,
-    DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    load_world_from_bytes_with, load_world_from_path, load_world_from_path_with,
+    save_world_to_path_with, save_world_to_path_with_config, ChunkEditMap, CliConfig,
+    PersistenceError, SavedMob, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
+    DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-use opencraft::world::season::{season_of, weather_of, Season, Weather};
+use opencraft::world::season::{season_of, weather_of_with, Season, Weather};
 use opencraft::world::session::{mob_drop_items, BowFireError, ChestCommandError};
 use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
@@ -123,6 +132,18 @@ use opencraft::{random_seed, WorldSession};
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
 const OVERLAY_TEXT_TOP: f32 = 8.0;
+
+/// F6 creator overlay text metrics (M014/S02-T06). 14/17 keeps all 85
+/// registry values, six file headers, and the header/legend/status lines
+/// inside ~35 wrapped lines at 720p. Human readability is judged in S10;
+/// this only guarantees the whole readout fits the viewport.
+const CREATOR_FONT_SIZE: f32 = 14.0;
+const CREATOR_LINE_HEIGHT: f32 = 17.0;
+
+/// Deferred-content wording shared by the Packs screen digest warning and the
+/// live manifest restart guard. One spelling keeps the creator surfaces and
+/// their tests from drifting.
+const PACK_RESTART_WORDING: &str = "content changes apply when the world is loaded again";
 
 /// Message-expiry tick interval: the loop runs in `ControlFlow::Poll`,
 /// potentially far above 60 fps, while `menu::MESSAGE_TICKS` is calibrated
@@ -147,6 +168,60 @@ fn load_startup_stack(
     }
     let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
     (Some(loaded), specs, warnings)
+}
+
+/// Build and baseline the dev-only live pack watch list for `presentation`.
+///
+/// `PackWatch::build` records the frozen `(folder, path, kind)` entries and
+/// their settle slots; the baseline observation loop runs at the same `now`
+/// so startup (or a stack apply) already resolved these bytes and an edit made
+/// before the first real poll is never re-applied as a change. Returns `None`
+/// in release builds or when the stack is the built-in Default pack.
+fn build_pack_watch(
+    presentation: Option<&PackPresentation>,
+    packs_root: &Path,
+    stack: &[String],
+    now: Instant,
+) -> Option<PackWatch> {
+    if !watch::CREATOR_TOOLS {
+        return None;
+    }
+    let presentation = presentation?;
+    let mut watch = PackWatch::build(presentation, packs_root, stack, now);
+    for index in 0..watch.entry_count() {
+        let snapshot = watch
+            .entry(index)
+            .and_then(|entry| watch::fingerprint_path(&entry.path))
+            .map(|snapshot| snapshot.0);
+        watch.observe(index, snapshot, now);
+    }
+    watch.mark_polled(now);
+    Some(watch)
+}
+
+/// Compose the UI-only item sprite atlas for one frozen pack-icon set,
+/// applying the live presentation-owned `[builtin_icons]` overrides when a
+/// pack stack is installed.
+///
+/// Inputs are explicit instead of `&self` so the `RedrawRequested` arm can
+/// compose while `gpu` holds a mutable borrow of `self.gpu` (P005); a
+/// whole-`self` method would conflict with that borrow.
+fn compose_item_sprite_layers_with_presentation(
+    presentation: Option<&PackPresentation>,
+    pack_icons: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    match presentation {
+        Some(presentation) => {
+            compose_item_sprite_layers_with_overrides(pack_icons, &presentation.builtin_icons)
+        }
+        None => compose_item_sprite_layers(pack_icons),
+    }
+}
+
+/// Collapse every run of whitespace so a pack status or trace reason is
+/// always one overlay line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Build the session's immutable content registry from the ordered pack specs.
@@ -291,11 +366,36 @@ fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError
         mobs: session.mobs().iter().map(SavedMob::from).collect(),
         chunk_edits: session.world.chunk_edits().clone(),
     };
-    let result = save_world_to_path_with(&session.save_path, &data, session.registry.as_ref());
+    // S04: the one production save site writes the session's validated
+    // effective config meta (schema + digest), never a re-derived or default
+    // one. The meta is captured at every startup/install/apply seam.
+    let result = save_world_to_path_with_config(
+        &session.save_path,
+        &data,
+        session.registry.as_ref(),
+        session.save_config(),
+    );
     if result.is_ok() {
         session.world.mark_saved();
     }
     result
+}
+
+/// Join the two one-shot session notices into the single transient gameplay
+/// message channel.
+///
+/// The content notice (changed pack stack) is ordered first and the config
+/// notice (changed tuning/schema) last, separated by the existing `"; "` used
+/// for stacked messages. Either side may be absent; both absent stays silent.
+/// Taking the notices is the caller's job (startup seeding and
+/// `on_session_installed`), so this helper is pure and never re-derives them.
+fn joined_session_notices(content: Option<String>, config: Option<String>) -> Option<String> {
+    match (content, config) {
+        (Some(content), Some(config)) => Some(format!("{content}; {config}")),
+        (Some(content), None) => Some(content),
+        (None, Some(config)) => Some(config),
+        (None, None) => None,
+    }
 }
 
 /// Why a mining break produced no world edit, and therefore no wear and no
@@ -637,8 +737,9 @@ fn right_click_interaction(session: &mut WorldSession) -> RightClickOutcome {
     if session.player.mode() == GameMode::Survival {
         if let Some(item) = session.player.selected_item() {
             if food_value_with(session.registry.as_ref(), item.id()).is_some() {
-                return match EatingTarget::new_with(
+                return match EatingTarget::new_with_rules(
                     session.registry.as_ref(),
+                    &session.rules().eating,
                     session.player.selected_slot(),
                     item,
                     session.player.survival.hunger(),
@@ -774,8 +875,9 @@ fn eating_candidate(
         return None;
     }
     let item = player.selected_item()?;
-    EatingTarget::new_with(
+    EatingTarget::new_with_rules(
         session.registry.as_ref(),
+        &session.rules().eating,
         player.selected_slot(),
         item,
         player.survival.hunger(),
@@ -834,7 +936,7 @@ fn release_bow(
     gameplay: bool,
     cursor_grabbed: bool,
 ) -> BowRelease {
-    let Some(charge) = bow.release() else {
+    let Some(charge) = bow.release_with(&session.rules().bow) else {
         return BowRelease::default();
     };
     if !(gameplay && cursor_grabbed) {
@@ -945,25 +1047,46 @@ fn reset_panel_holds(mining: &mut MiningState, eating: &mut EatingState, bow: &m
     bow.reset();
 }
 
+/// Mutable gameplay-input handles shared by every panel open/close boundary.
+///
+/// The helpers below stay free functions because `window_event` already holds
+/// disjoint `gpu`/`window` borrows (P005); bundling these handles keeps each
+/// signature focused without hiding the individual field borrows at the call
+/// site.
+struct PanelHolds<'a> {
+    input: &'a mut InputState,
+    left_mouse_held: &'a mut bool,
+    right_mouse_held: &'a mut bool,
+    drag: &'a mut Option<InventoryTarget>,
+    mining: &'a mut MiningState,
+    eating: &'a mut EatingState,
+    bow: &'a mut BowState,
+    cursor_grabbed: &'a mut bool,
+}
+
+impl PanelHolds<'_> {
+    /// Clear the shared hold state: queued keys, both mouse buttons, and the
+    /// three gameplay hold accumulators. Drag and cursor ownership differ per
+    /// panel boundary and stay explicit at each call site.
+    fn reset(&mut self) {
+        self.input.reset();
+        reset_panel_holds(self.mining, self.eating, self.bow);
+        *self.left_mouse_held = false;
+        *self.right_mouse_held = false;
+    }
+}
+
 /// Opens the inventory panel from either the E key (`via_table = false`) or a
 /// successful table interaction (`via_table = true`), releasing the cursor and
 /// dropping every gameplay hold so the panel owns the pointer.
 ///
 /// A free function because `window_event` already holds disjoint `gpu`/`window`
 /// borrows, making a `&mut self` method unusable there (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_inventory(
     screen: &mut InventoryScreen,
     table_open: Option<IVec3>,
     via_table: bool,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     if via_table {
@@ -971,40 +1094,26 @@ fn open_inventory(
     } else {
         screen.toggle(table_open);
     }
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = false;
     set_cursor_grab(window, false);
 }
 
 /// Closes the inventory panel from the E/Escape paths and restores gameplay
 /// input ownership: the cursor is re-grabbed, holds are cleared, and the
 /// session station is closed so the 4x4 grid cannot outlive the screen.
-#[allow(clippy::too_many_arguments)]
 fn close_inventory(
     screen: &mut InventoryScreen,
     session: &mut WorldSession,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     session.close_table();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -1014,27 +1123,17 @@ fn close_inventory(
 /// entry stock is cached once here rather than rebuilt per frame. Every
 /// gameplay hold is dropped so a held mouse button cannot mine behind the
 /// screen. A free function for the same disjoint-borrow reason (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_palette(
     screen: &mut PaletteScreen,
     registry: &Arc<ContentRegistry>,
     status: &mut Option<String>,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.open(registry);
     *status = None;
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.cursor_grabbed = false;
     set_cursor_grab(window, false);
 }
 
@@ -1043,26 +1142,16 @@ fn open_palette(
 /// Escape is the only close path while the palette is open; it re-grabs the
 /// cursor exactly like [`close_inventory`] and clears every hold so no stale
 /// press survives the screen boundary.
-#[allow(clippy::too_many_arguments)]
 fn close_palette(
     screen: &mut PaletteScreen,
     status: &mut Option<String>,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     *status = None;
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -1301,31 +1390,20 @@ fn revalidate_inventory_station(screen: &mut InventoryScreen, session: &mut Worl
 /// so two gameplay panels can never share the pointer. A free function
 /// because `window_event` already holds disjoint `gpu`/`window` borrows,
 /// making a `&mut self` method unusable there (P005).
-#[allow(clippy::too_many_arguments)]
 fn open_chest_screen(
     screen: &mut ChestScreen,
     session: &mut WorldSession,
     inventory: &mut InventoryScreen,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    drag: &mut Option<InventoryTarget>,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     status: &mut Option<String>,
     window: &Window,
 ) {
     inventory.close();
     session.close_table();
     screen.open();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *drag = None;
-    *cursor_grabbed = false;
+    holds.reset();
+    *holds.drag = None;
+    *holds.cursor_grabbed = false;
     *status = None;
     set_cursor_grab(window, false);
 }
@@ -1333,26 +1411,16 @@ fn open_chest_screen(
 /// Closes the chest screen from the E/Escape paths and restores gameplay
 /// input ownership: the cursor is re-grabbed, holds are cleared, and the
 /// session station is closed so the 27-slot view cannot outlive the screen.
-#[allow(clippy::too_many_arguments)]
 fn close_chest_screen(
     screen: &mut ChestScreen,
     session: &mut WorldSession,
-    input: &mut InputState,
-    left_mouse_held: &mut bool,
-    right_mouse_held: &mut bool,
-    mining: &mut MiningState,
-    eating: &mut EatingState,
-    bow: &mut BowState,
-    cursor_grabbed: &mut bool,
+    mut holds: PanelHolds<'_>,
     window: &Window,
 ) {
     screen.close();
     session.close_chest();
-    input.reset();
-    reset_panel_holds(mining, eating, bow);
-    *left_mouse_held = false;
-    *right_mouse_held = false;
-    *cursor_grabbed = true;
+    holds.reset();
+    *holds.cursor_grabbed = true;
     set_cursor_grab(window, true);
 }
 
@@ -1579,13 +1647,16 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summar
     lines.join("\n")
 }
 
-/// The live weather of a session, derived purely from its persisted calendar.
+/// The live weather of a session, derived purely from its persisted calendar
+/// and the live [`opencraft::world::season::WeatherRules`].
 ///
-/// `weather_of(season_of(day_index, season_length_days, seed), day_index,
-/// seed)` — the same three persisted scalars S05's season derivation reads,
-/// never the wall clock and never anything the player did. Deliberately *not*
-/// cached: the slice's anti-goal is that no `Weather` value lives outside the
-/// per-frame derivation, and the cost is one small FNV hash plus a match.
+/// `weather_of_with(season_of(day_index, season_length_days, seed), day_index,
+/// seed, &session.rules().weather)` — the same three persisted scalars S05's
+/// season derivation reads plus the live precipitation percentages, never the
+/// wall clock and never anything the player did. Deliberately *not* cached:
+/// the slice's anti-goal is that no `Weather` value lives outside the per-frame
+/// derivation, and the cost is one small FNV hash plus a match. Only this
+/// session seam is tunable; the menu/vista path keeps the default rules.
 ///
 /// A free function over `&WorldSession` rather than a `WorldSession` method:
 /// the Playing render arm runs with the `gpu` and `window` field borrows live
@@ -1593,10 +1664,58 @@ fn compose_menu_text(settings: &Settings, menu: &menu::SettingsMenu, pack_summar
 fn session_weather(session: &WorldSession) -> Weather {
     let day_index = session.clock.day_index;
     let seed = session.world.seed();
-    weather_of(
+    let rules = session.rules();
+    weather_of_with(
         season_of(day_index, session.season_length_days, seed),
         day_index,
         seed,
+        &rules.weather,
+    )
+}
+
+/// The live sky palette of a session: its clock's time of day, its live
+/// [`opencraft::world::daycycle::RenderRules`] (moonlit floor), and its
+/// calendar-derived weather palette.
+///
+/// The Playing render arm's single seam for palette tuning. The menu/vista
+/// arm deliberately keeps the default [`daycycle::sky_palette`] (its own
+/// persisted clock, no session rules), so a render.toml palette edit never
+/// repaints the panorama.
+fn session_sky_palette(session: &WorldSession, weather: Weather) -> daycycle::SkyPalette {
+    let rules = session.rules();
+    daycycle::weather_palette_with(
+        daycycle::sky_palette_with(session.clock.time_of_day, &rules.render),
+        weather,
+        &rules.render,
+    )
+}
+
+/// The live weather fog-range multiplier of a session.
+///
+/// Only the Playing arm uses this; the vista arm pins the Clear identity
+/// factor so the panorama never compresses fog for weather it never draws.
+fn session_fog_range_factor(session: &WorldSession, weather: Weather) -> f32 {
+    daycycle::weather_fog_range_factor_with(weather, &session.rules().render)
+}
+
+/// The live mining candidate under the crosshair.
+///
+/// Reads the session's own registry, selected item, and live
+/// [`opencraft::player::tools::ToolRules`], so a mining.toml reload changes
+/// the hold-to-mine duration on the very next frame. The bare
+/// [`MiningTarget::from_block_with`] call remains the default wrapper used by
+/// demo/diagnostic/scripted paths.
+fn session_mining_target(
+    session: &WorldSession,
+    pos: IVec3,
+    block: BlockId,
+) -> Option<MiningTarget> {
+    MiningTarget::from_block_with_rules(
+        &session.registry,
+        pos,
+        block,
+        session.player.selected_item(),
+        &session.rules().tools,
     )
 }
 
@@ -1780,7 +1899,11 @@ fn demo_owns_world_witness(cli: &CliConfig) -> bool {
 /// calls [`startup_session_with`] with its base registry.
 #[cfg(test)]
 fn startup_session(cli: &CliConfig) -> WorldSession {
-    startup_session_with(cli, &ContentRegistry::builtin_arc())
+    startup_session_with(
+        cli,
+        &ContentRegistry::builtin_arc(),
+        &ConfigRuntime::defaults(),
+    )
 }
 
 /// The startup world session resolved against `registry`.
@@ -1788,8 +1911,16 @@ fn startup_session(cli: &CliConfig) -> WorldSession {
 /// The load branch keeps the placeholder-augmented registry and the one-shot
 /// changed-stack notice; the fresh branch freezes the supplied registry on the
 /// new session. [`startup_session`] is the built-in wrapper every existing
-/// test and demo launch uses.
-fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> WorldSession {
+/// test and demo launch uses. `config` is the effective gameplay tuning loaded
+/// from `config/` (M014/S01); both branches record its rules and its validated
+/// save meta (M014/S04) so the next save and the one-shot notice agree.
+fn startup_session_with(
+    cli: &CliConfig,
+    registry: &Arc<ContentRegistry>,
+    config: &ConfigRuntime,
+) -> WorldSession {
+    let rules: RulesBundle = config.rules();
+    let meta: SaveConfigMeta = config.meta();
     if !cli.force_new_world && cli.save_path.exists() {
         if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
             let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
@@ -1810,6 +1941,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
                 // session must still start closed for the scripted run.
                 session.set_hostile_ai_enabled(false);
             }
+            session.apply_config(&rules, meta);
             return session;
         }
     }
@@ -1841,7 +1973,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
     // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v8 save tail must describe only what that
+    // digest and every bounded demo's v9 save tail must describe only what that
     // demo placed, so ambient spawning and daylight burning stay off for the
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {
@@ -1862,6 +1994,7 @@ fn startup_session_with(cli: &CliConfig, registry: &Arc<ContentRegistry>) -> Wor
             arm_swim_route(&mut session, route);
         }
     }
+    session.apply_config(&rules, meta);
     session
 }
 
@@ -2218,6 +2351,9 @@ struct Ready {
     vista_store: ChunkRenderStore,
     ui: UiRenderer,
     stats: StatsOverlay,
+    /// Read-only F6 creator overlay (M014/S02-T06): a change-gated buffer
+    /// with compact metrics, shaped only while the overlay is visible.
+    creator_text: StatsOverlay,
     /// Settings-menu text buffer (same change-gated pattern as `stats`):
     /// drawn in the same UI pass, after the stats text area.
     menu_text: StatsOverlay,
@@ -4391,17 +4527,17 @@ const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 /// stage earns the wood bow and its arrows, and the Save stage writes the two
 /// surviving hostile records.
 ///
-/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v8_save`)
+/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v9_save`)
 /// and reading the file back, never computed by hand: every earned stack changes
 /// the serialized inventory size. The same run measures the mob-count offset.
 /// Test-only pins: nothing in production reads the file length.
 #[cfg(test)]
-const COMBAT_SAVE_BYTES: usize = 307;
-/// Bytes of the v8 pack-identity + digest tail after the mob records: a `u32`
-/// pack count (zero here) plus the `u64` FNV-1a digest.
+const COMBAT_SAVE_BYTES: usize = 317;
+/// Bytes of the v8 pack-identity + digest tail (12) plus the v9 config tail
+/// (10) after the mob records.
 #[cfg(test)]
-const COMBAT_SAVE_TAIL_BYTES: usize = 12;
-/// Measured offset of the v8 mob-count word in that save: the 19-byte Zombie
+const COMBAT_SAVE_TAIL_BYTES: usize = 22;
+/// Measured offset of the v9 mob-count word in that save: the 19-byte Zombie
 /// record starts 4 bytes later and the Skeleton record follows it, so the tail
 /// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
 #[cfg(test)]
@@ -4451,7 +4587,7 @@ const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 /// to Creative rules — no target selection, no melee, no arrows, no damage —
 /// and then that one melee swing and one charge-0 arrow each one-shot a
 /// full-health Zombie with the pinned drop table intact. It consumes exactly
-/// the two rotten-flesh units its kills earned, so the measured 307-byte v8
+/// the two rotten-flesh units its kills earned, so the measured 317-byte v9
 /// witness and every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
 /// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
 /// Save -> Restore -> Done`.
@@ -6138,10 +6274,10 @@ fn combat_spot_feet_y(y: f32) -> f32 {
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
 /// * the player pose is restored afterwards, so the Shot stage and the Save
-///   witness start from the same pinned pose (the v8 layout itself is measured
+///   witness start from the same pinned pose (the v9 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
 ///
-/// The Skeleton is left where Drops left it: it is hostile and will chase, but
+/// The Skeleton is left where Drops left it is hostile and will chase, but
 /// it has no attack profile, so it can never add a damage event.
 fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> bool {
     let mobs = session.mobs().len();
@@ -7272,7 +7408,7 @@ fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
 ///    the real projectile sweep, granting exactly one more rotten flesh.
 /// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
 ///    again and the inventory total must return to its pre-stage value, which
-///    is what keeps the measured 307-byte v8 save byte-identical.
+///    is what keeps the measured 317-byte v9 save byte-identical.
 ///
 /// Documented demo pins, not gameplay rules: the two survivors are parked 20
 /// blocks behind the camera (position *and* leash anchor, so the synthetic
@@ -7595,7 +7731,7 @@ fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) -> b
         .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
 
     // 4. Conserve the save witness: both earned units are consumed again, so
-    //    the inventory section (and therefore the measured 307-byte v8 layout)
+    //    the inventory section (and therefore the measured 317-byte v9 layout)
     //    is byte-identical.
     if session.player.consume_item(flesh_id).is_none()
         || session.player.consume_item(flesh_id).is_none()
@@ -8064,6 +8200,18 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
     Some(Instant::now() + Duration::from_secs_f32(demo_secs + DEMO_SHUTDOWN_GRACE_SECS))
 }
 
+/// The earlier of the vsync frame deadline and the next creator poll.
+///
+/// Clamping the dev watcher into the existing vsync wait keeps the 10 Hz poll
+/// from spinning or stalling the event loop; `None` (release builds, headless
+/// tests) leaves the vsync deadline untouched.
+fn next_wait_deadline(vsync: Instant, watcher: Option<Instant>) -> Instant {
+    match watcher {
+        Some(watcher) => vsync.min(watcher),
+        None => vsync,
+    }
+}
+
 /// Everything the pack-aware startup path builds before `GameApp` exists.
 ///
 /// Production loads this ONCE in `main` and hands the same instance to both
@@ -8074,7 +8222,19 @@ fn demo_shutdown_deadline(time_scale: f32, demo_days: u32) -> Option<Instant> {
 struct StartupContent {
     settings: Settings,
     startup_warnings: Vec<SettingsWarning>,
+    /// Effective gameplay tuning from the checked-in `config/` tree (M014).
+    /// Loaded once at startup; `GameApp` keeps it so every later session
+    /// install re-applies the same rules and S02 can replace it on reload.
+    config: ConfigRuntime,
+    /// The directory `config` was loaded from (M014/S02). `None` in headless
+    /// tests, which load registry defaults; production keeps the real
+    /// `config/` path so the polling watcher can fingerprint and reload the
+    /// six curated files.
+    config_dir: Option<PathBuf>,
     current_pack: Option<LoadedPack>,
+    /// Authored specs that produced `current_pack`, retained so the app can
+    /// build a live [`PackPresentation`] with frozen layer provenance.
+    pack_specs: Vec<PackSpec>,
     available_packs: Vec<String>,
     audio: AudioEngine,
     /// The settings file this startup content was loaded from. `GameApp` keeps
@@ -8091,11 +8251,25 @@ struct StartupContent {
 impl StartupContent {
     /// Load settings, the persisted pack stack, sound overrides and the
     /// session content registry in the historical warning order.
-    fn load(settings_path: &Path, packs_root: PathBuf) -> StartupContent {
+    fn load(
+        settings_path: &Path,
+        packs_root: PathBuf,
+        config_dir: Option<&Path>,
+    ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
         // as menu text on the first open.
         let (settings, mut startup_warnings) = load_with_warnings(settings_path);
+        // Curated gameplay config (M014/S01): loaded once here, in the
+        // settings -> config -> packs -> sounds -> registry warning order.
+        // The loader never fails; only Error diagnostics become startup
+        // warnings. Headless tests inject `None` so the suite never reads the
+        // repository `config/` tree (F13 isolation).
+        let config = match config_dir {
+            Some(dir) => ConfigRuntime::load_dir(dir),
+            None => ConfigRuntime::defaults(),
+        };
+        startup_warnings.extend(opencraft::config::startup_warnings(&config));
         // Pack discovery and startup apply (M004/S03): the persisted choice
         // is re-applied on every launch. A missing/deleted pack folder still
         // yields a fully usable procedural pack plus one warning naming it,
@@ -8123,7 +8297,10 @@ impl StartupContent {
         StartupContent {
             settings,
             startup_warnings,
+            config,
+            config_dir: config_dir.map(Path::to_path_buf),
             current_pack,
+            pack_specs,
             available_packs,
             audio,
             settings_path: settings_path.to_path_buf(),
@@ -8149,7 +8326,7 @@ struct GameApp {
     /// Path the background scene loads from and edits save to. Injected so
     /// headless tests can point at a tempdir.
     background_path: PathBuf,
-    /// Construction epoch for the vista's procedural yaw drift: drift is
+    /// Construction epoch for the vista's procedural yaw drift is
     /// `elapsed()` from this single Instant, so it survives menu<->game
     /// transitions with no per-frame accumulation or reset bookkeeping.
     vista_epoch: Instant,
@@ -8311,20 +8488,65 @@ struct GameApp {
     /// walks this list; a pack authored while the game is running appears
     /// on the next launch (no filesystem polling in the menu).
     available_packs: Vec<String>,
-    /// The active pack's loaded layers and presentation data; `None` is
-    /// the built-in procedural Default pack (MEM113). Never holds a
-    /// half-loaded pack: `load_stack` always returns usable layers.
-    current_pack: Option<LoadedPack>,
+    /// The active pack presentation: the live source of truth for visible
+    /// layers and frozen `(pack, path)` provenance. `None` is the built-in
+    /// procedural Default pack (MEM113). Never holds a half-loaded pack:
+    /// `load_stack` always returns usable layers, and `build` recomputes the
+    /// visible base layers from the authored specs.
+    pack_presentation: Option<PackPresentation>,
+    /// Dev-only live texture watch list, rebuilt from the presentation on
+    /// every stack apply. Only present under `watch::CREATOR_TOOLS` with a
+    /// non-default stack.
+    pack_watch: Option<PackWatch>,
+    /// Texture-array layers a settled pack edit changed and the next
+    /// `RedrawRequested` must upload individually. Cleared by every full
+    /// compose, which already covers the whole array.
+    pack_layer_uploads: BTreeSet<u32>,
+    /// Whether the UI-only 256-layer item sprite atlas changed and the next
+    /// `RedrawRequested` must re-upload it through
+    /// `UiRenderer::set_item_sprite_layers`. Set by a stack apply (new override
+    /// set) and by a settled `[builtin_icons]` edit; block texture edits never
+    /// touch it.
+    pack_item_sprite_dirty: bool,
+    /// Pack folders whose settled `pack.toml` edit changes the content
+    /// fingerprint (digest or pack layer/icon counts) and therefore needs a
+    /// restart, keyed by folder and classified as recipe-only or broader
+    /// content. Sorted by folder name; never used to touch live allocation.
+    /// Cleared only by a user-initiated stack apply.
+    pack_restart_folders: BTreeMap<String, pack::watch::RestartKind>,
     /// The launch pack-stack registry: the base every new/loaded world is
     /// resolved against and the reference for a live pack-change digest
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
     /// `session_registry` (MEM512/D181).
     base_registry: Arc<ContentRegistry>,
-    /// The CURRENT session's immutable content registry. A loaded v8 world
+    /// The CURRENT session's immutable content registry. A loaded world
     /// carries the placeholder-augmented registry it was decoded with; a fresh
     /// world carries a clone of `base_registry`. Re-adopted by
     /// `on_session_installed`, never replaced while a session runs.
     session_registry: Arc<ContentRegistry>,
+    /// Effective gameplay tuning from startup `config/` loading (M014/S01).
+    /// App-wide, like the loaded settings: `new_with_content` applies it
+    /// before the first frame and `on_session_installed` re-applies it after
+    /// every world swap. S02 replaces this value on a live reload.
+    config: ConfigRuntime,
+    /// Directory the runtime config was loaded from, retained for the dev-only
+    /// live-reload watcher (M014/S02). `None` in headless tests, where the
+    /// watcher is disabled entirely.
+    config_dir: Option<PathBuf>,
+    /// Dev-only creator state (M014/S02): settle machine, overlay visibility,
+    /// last reload status/error, and the future restart requirement. Nothing
+    /// here is read unless `watch::CREATOR_TOOLS` is compiled in.
+    creator: CreatorRuntime,
+    /// Whether `--creator-trace` was requested on this launch. The state is
+    /// read only under `watch::CREATOR_TOOLS`, so release builds stay silent.
+    creator_trace: bool,
+    /// Change gate for the F6 overlay text (M014/S02-T06): set on toggle,
+    /// resize, a settled reload, and a pending-set change; cleared after one
+    /// recomposition so a hidden overlay costs nothing and a visible one is
+    /// not re-shaped every frame.
+    creator_overlay_dirty: bool,
+    /// Last composed F6 overlay text. Empty until the overlay is first shown.
+    creator_overlay_text: String,
     /// Set whenever the pack stack changes presentation, so the next
     /// `RedrawRequested` uploads the merged layers and logo once. Startup
     /// uploads directly in `resumed`, so this starts false.
@@ -8428,8 +8650,11 @@ impl GameApp {
         settings_path: PathBuf,
         background_path: PathBuf,
     ) -> Self {
-        let content =
-            StartupContent::load(&settings_path, Path::new(pack::PACKS_DIR).to_path_buf());
+        let content = StartupContent::load(
+            &settings_path,
+            Path::new(pack::PACKS_DIR).to_path_buf(),
+            None,
+        );
         Self::new_with_content(cli, session, content, background_path)
     }
 
@@ -8447,13 +8672,25 @@ impl GameApp {
         let StartupContent {
             settings,
             startup_warnings,
+            config,
+            config_dir,
             current_pack,
+            pack_specs,
             available_packs,
             audio,
             settings_path,
             packs_root,
             base_registry,
         } = content;
+        // Effective gameplay rules apply before the first frame and are
+        // re-applied on every session install (the S02 live-reload seam).
+        // Production already applied them in `startup_session_with`; doing it
+        // again here is idempotent and keeps injected sessions (tests) tuned
+        // by the same app-wide config. S04: the same call records the
+        // validated save meta, so the next save and the one-shot notice use
+        // exactly the effective values this app runs.
+        let config_meta: SaveConfigMeta = config.meta();
+        session.apply_config(&config.rules(), config_meta);
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8584,7 +8821,7 @@ impl GameApp {
         } else {
             None
         };
-        // The session registry is the load-time registry: a loaded v8 world
+        // The session registry is the load-time registry: a loaded world
         // keeps its placeholder-augmented registry, a fresh world the launch
         // base. Only `on_session_installed` re-adopts it on a swap (MEM512).
         let session_registry = Arc::clone(&session.registry);
@@ -8597,7 +8834,32 @@ impl GameApp {
         } else {
             None
         };
-        Self {
+        // S04: the config notice rides the same one-shot channel and is seeded
+        // once, under the same direct-to-gameplay rule (D193). The two notices
+        // are joined content-first into the single `game_message` slot.
+        let startup_config_notice = if startup_screen == LifecycleScreen::Playing {
+            session.take_config_notice(config_meta)
+        } else {
+            None
+        };
+        // Dev-only creator state (M014/S02-T05): the watcher starts at this
+        // instant, and the launch flag is captured before `cli` is consumed by
+        // the field initializers below.
+        let creator = CreatorRuntime::new(Instant::now());
+        let creator_trace = cli.creator_trace;
+        // Live pack presentation (M014/S03): the app owns one presentation as
+        // the visible source of truth, plus a dev-only watch list baselined at
+        // this instant so a launch-time edit is never re-applied.
+        let pack_presentation =
+            current_pack.map(|pack| PackPresentation::build(pack, pack_specs, &base_registry));
+        let pack_watch = build_pack_watch(
+            pack_presentation.as_ref(),
+            &packs_root,
+            &settings.pack_stack,
+            Instant::now(),
+        );
+        let selection_seconds = config.rules().selection.selected_name_secs;
+        let mut app = Self {
             window: None,
             gpu: None,
             session,
@@ -8621,11 +8883,12 @@ impl GameApp {
             chest_status: None,
             palette: PaletteScreen::new(),
             palette_status: None,
-            game_message: startup_content_notice.map(|text| MenuMessage {
-                text,
-                ticks_left: menu::MESSAGE_TICKS,
-            }),
-            selection_label: SelectionLabel::new(),
+            game_message: joined_session_notices(startup_content_notice, startup_config_notice)
+                .map(|text| MenuMessage {
+                    text,
+                    ticks_left: menu::MESSAGE_TICKS,
+                }),
+            selection_label: SelectionLabel::with_seconds(selection_seconds),
             last_frame: Instant::now(),
             title_timer: Instant::now(),
             last_saved_badge: None,
@@ -8648,8 +8911,18 @@ impl GameApp {
             settings_path,
             packs_root,
             available_packs,
-            current_pack,
+            pack_presentation,
+            pack_watch,
+            pack_layer_uploads: BTreeSet::new(),
+            pack_item_sprite_dirty: false,
+            pack_restart_folders: BTreeMap::new(),
             session_registry,
+            config,
+            config_dir,
+            creator,
+            creator_trace,
+            creator_overlay_dirty: true,
+            creator_overlay_text: String::new(),
             base_registry,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -8666,7 +8939,617 @@ impl GameApp {
             combat_demo,
             exit_failure: false,
             scripted_demo,
+        };
+        // Dev-only baseline poll (M014/S02-T05): startup already loaded the
+        // tree, so this first observation only records each file's fingerprint.
+        // Marking it polled immediately closes the startup-edit race: bytes
+        // changed during launch are already live, and the next real poll starts
+        // from a settled baseline instead of re-applying them as a change.
+        if watch::CREATOR_TOOLS && app.config_dir.is_some() {
+            let now = Instant::now();
+            app.poll_config_watcher(now);
+            app.creator.watch.mark_polled(now);
         }
+        app
+    }
+
+    /// The resolved presentation's loaded pack, or `None` for the built-in
+    /// procedural Default pack.
+    fn current_pack(&self) -> Option<&LoadedPack> {
+        self.pack_presentation
+            .as_ref()
+            .map(|presentation| &presentation.base)
+    }
+
+    /// Re-apply the current effective config rules to the live session.
+    ///
+    /// This is the one seam shared by the first-frame apply, every session
+    /// install, and a live reload. A live edit must never go through
+    /// `on_session_installed`: that would reset input, panels, demos, and
+    /// frame accounting for what is only a tuning change.
+    fn apply_config_rules(&mut self) {
+        let rules = self.config.rules();
+        let meta = self.config.meta();
+        self.session.apply_config(&rules, meta);
+        // render.toml's `ui.selected_name_secs` is app-owned UI timing, not
+        // session state: install it on the same seam so a live reload retunes
+        // the very next Playing frame's fade without reinstalling the session.
+        self.selection_label
+            .set_seconds(rules.selection.selected_name_secs);
+    }
+
+    /// One creator poll: observe every curated file, then reload the files
+    /// whose writes have settled.
+    ///
+    /// The watcher owns the settle policy; this seam owns the filesystem read,
+    /// the per-file last-good commit, rule re-application, and the user-visible
+    /// rejection notice. A rejected file never stops later files: each curated
+    /// file is an independent atomic unit.
+    fn poll_config_watcher(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS {
+            return;
+        }
+        let Some(dir) = self.config_dir.clone() else {
+            return;
+        };
+
+        let pending_before = self.creator.pending_files();
+        let mut settled = Vec::new();
+        for file in ConfigFile::ALL {
+            let snapshot = watch::fingerprint_path(&dir.join(file.name()));
+            if self.creator.watch.observe(file, snapshot, now) {
+                settled.push(file);
+                // The overlay's `last:`/`pending` lines changed; recompose in
+                // the render pass, never inside this poll.
+                self.creator_overlay_dirty = true;
+            }
+        }
+        // A write that is still settling changes the pending list even when
+        // nothing is due to reload yet, so the overlay must reflect it.
+        if self.creator.pending_files() != pending_before {
+            self.creator_overlay_dirty = true;
+        }
+
+        for file in settled {
+            let report = self.config.reload_file(&dir, file);
+            self.creator.record(&report);
+            self.emit_creator_trace(&report);
+            if report.applied {
+                self.apply_config_rules();
+            } else {
+                // Rejections are data, never logs (D006/MEM009): the creator
+                // sees the same reason the overlay shows. Keep processing
+                // any later settled files; one bad file cannot mask a good
+                // sibling's valid edit.
+                self.game_message = Some(MenuMessage {
+                    text: self.creator.last_error.clone().unwrap_or_default(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+        }
+    }
+
+    /// Poll only when the watch schedule is due, then advance it.
+    ///
+    /// `about_to_wait` calls this every loop turn; the 10 Hz clamp lives here
+    /// so the watcher can never spin the event loop.
+    fn poll_config_watcher_if_due(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.config_dir.is_none() {
+            return;
+        }
+        if self.creator.watch.is_due(now) {
+            self.poll_config_watcher(now);
+            self.creator.watch.mark_polled(now);
+        }
+    }
+
+    /// When `about_to_wait` must wake for the next creator poll.
+    ///
+    /// `None` disables the seam entirely (release builds or headless tests),
+    /// leaving the vsync wait untouched.
+    fn creator_next_poll_at(&self) -> Option<Instant> {
+        if !watch::CREATOR_TOOLS {
+            return None;
+        }
+        let config = if self.config_dir.is_some() {
+            Some(self.creator.watch.next_poll_at())
+        } else {
+            None
+        };
+        let pack = self.pack_watch.as_ref().map(PackWatch::next_poll_at);
+        match (config, pack) {
+            (Some(config), Some(pack)) => Some(config.min(pack)),
+            (config, pack) => config.or(pack),
+        }
+    }
+
+    /// Write one stable apply/reject line for `report` when the launch asked
+    /// for `--creator-trace` in a dev build.
+    ///
+    /// No timestamps and no absolute paths keep the lines diffable across runs.
+    /// A closed stdout pipe is ignored: tracing must never panic the game, and
+    /// a run without the flag stays log-free.
+    fn emit_creator_trace(&mut self, report: &FileReload) {
+        if !watch::CREATOR_TOOLS || !self.creator_trace {
+            return;
+        }
+        use std::io::Write as _;
+        let lines = watch::reload_trace_lines(report, self.config.digest());
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        }
+    }
+
+    /// Poll only when the pack watch schedule is due, then advance it.
+    ///
+    /// Mirrors [`Self::poll_config_watcher_if_due`]: the 10 Hz clamp lives in
+    /// this scheduling wrapper so `about_to_wait` can call it every loop
+    /// turn. Gated by the dev-only creator surface and by having a non-default
+    /// presentation (the built-in pack has no watch list).
+    fn poll_pack_watcher_if_due(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.pack_presentation.is_none() {
+            return;
+        }
+        let Some(watch) = self.pack_watch.as_ref() else {
+            return;
+        };
+        if !watch.is_due(now) {
+            return;
+        }
+        self.poll_pack_watcher(now);
+        if let Some(watch) = self.pack_watch.as_mut() {
+            watch.mark_polled(now);
+        }
+    }
+
+    /// One live pack poll: observe every frozen entry, then apply the edits
+    /// whose writes settled.
+    ///
+    /// This is the ONLY live texture path. It mutates the presentation at the
+    /// frozen layer indices the watch list recorded at build time and queues
+    /// one upload per changed layer. It never rebuilds the presentation,
+    /// never touches `session_registry`, either digest, or allocation, and
+    /// never calls `apply_pack_stack` (a settled texture can only rewrite
+    /// bytes). A rejected file keeps the last good layer and never blocks a
+    /// valid sibling in the same poll.
+    fn poll_pack_watcher(&mut self, now: Instant) {
+        if !watch::CREATOR_TOOLS || self.pack_presentation.is_none() {
+            return;
+        }
+        let Some(watch) = self.pack_watch.as_mut() else {
+            return;
+        };
+
+        let pending_before = watch.pending_indices();
+        let mut settled = Vec::new();
+        for index in 0..watch.entry_count() {
+            let snapshot = watch
+                .entry(index)
+                .and_then(|entry| watch::fingerprint_path(&entry.path))
+                .map(|snapshot| snapshot.0);
+            if watch.observe(index, snapshot, now) {
+                settled.push(index);
+                // A settled edit changes the overlay's `packs:` line; recompose
+                // in the render pass, never inside this poll.
+                self.creator_overlay_dirty = true;
+            }
+        }
+        if watch.pending_indices() != pending_before {
+            // A write that is still settling changes the pending set even
+            // when nothing is due to apply yet.
+            self.creator_overlay_dirty = true;
+        }
+
+        // Snapshot the settled entries before applying any of them: a
+        // manifest edit that changes the authored `[builtin_icons]` table
+        // rebuilds `pack_watch` from inside its handler, so later indices in
+        // this batch would otherwise name different files.
+        let settled_entries: Vec<PackWatchEntry> = settled
+            .iter()
+            .filter_map(|&index| {
+                self.pack_watch
+                    .as_ref()
+                    .and_then(|watch| watch.entry(index))
+                    .cloned()
+            })
+            .collect();
+        for entry in settled_entries {
+            self.apply_settled_pack_entry(entry, now);
+        }
+    }
+
+    /// Apply one settled watch entry to the live presentation.
+    ///
+    /// `now` is the injected poll clock; the manifest arm needs it to
+    /// baseline a rebuilt watch list without reading wall time.
+    fn apply_settled_pack_entry(&mut self, entry: PackWatchEntry, now: Instant) {
+        let pack_dir = self.packs_root.join(&entry.folder);
+        match entry.kind {
+            PackFileKind::Manifest => self.apply_settled_pack_manifest(&entry, now),
+            PackFileKind::BaseLayer(layer) => {
+                let Some(file) = entry.path.file_name() else {
+                    return;
+                };
+                let file = file.to_string_lossy().into_owned();
+                match pack::spec::decode_layer_file(&pack_dir, &file) {
+                    Ok(Some(bytes)) => {
+                        self.apply_base_layer_upload(&entry, layer, LayerInput::Bytes(bytes));
+                    }
+                    Ok(None) => {
+                        // A deleted file is a legal edit: reveal the stack
+                        // below it (or procedural art) at the same index.
+                        self.apply_base_layer_upload(&entry, layer, LayerInput::Absent);
+                    }
+                    Err(reason) => self.reject_pack_entry(&entry, &reason),
+                }
+            }
+            PackFileKind::Asset { slot } => {
+                let Ok(relative) = entry.path.strip_prefix(&pack_dir) else {
+                    return;
+                };
+                let relative = relative.to_string_lossy().into_owned();
+                match pack::spec::decode_asset_file(&pack_dir, &relative) {
+                    Ok(bytes) => {
+                        let changed = self
+                            .pack_presentation
+                            .as_mut()
+                            .map(|presentation| {
+                                presentation.apply_pack_asset(usize::from(slot), &bytes)
+                            })
+                            .unwrap_or(false);
+                        if changed {
+                            let layer = u32::from(PACK_LAYER_BASE) + u32::from(slot);
+                            self.pack_layer_uploads.insert(layer);
+                            self.record_pack_applied(&entry.display, layer);
+                        }
+                    }
+                    Err(reason) => self.reject_pack_entry(&entry, &reason),
+                }
+            }
+            PackFileKind::BuiltinIcon { name } => {
+                let Ok(relative) = entry.path.strip_prefix(&pack_dir) else {
+                    return;
+                };
+                let relative = relative.to_string_lossy().into_owned();
+                // A missing file is a legal edit (`Absent`): reveal the lower
+                // pack's override or the procedural sprite. A present but
+                // malformed file is a rejection that keeps the last good bytes.
+                let input = match pack::spec::decode_builtin_icon_file(&pack_dir, &relative) {
+                    Ok(Some(bytes)) => LayerInput::Bytes(bytes),
+                    Ok(None) => LayerInput::Absent,
+                    Err(reason) => {
+                        self.reject_pack_entry(&entry, &reason);
+                        return;
+                    }
+                };
+                let change = self.pack_presentation.as_mut().and_then(|presentation| {
+                    presentation.apply_builtin_icon(&entry.folder, name, input)
+                });
+                let Some(change) = change else {
+                    // Shadowed by a later pack or byte-identical: nothing to
+                    // upload, but the lower pack's bytes were still stored for
+                    // a later reveal.
+                    return;
+                };
+                // The UI sprite atlas is not the block texture array: queue no
+                // partial block upload, only one full atlas compose/upload.
+                self.pack_item_sprite_dirty = true;
+                match (&change.bytes, &change.source) {
+                    (Some(_), Some(source)) => {
+                        let display =
+                            format!("{}/{}/{}", pack::PACKS_DIR, source.folder, source.path);
+                        let Some(layer) = builtin_icon_layer(&change.name) else {
+                            debug_assert!(
+                                false,
+                                "`{}` must resolve to a pinned sprite layer",
+                                change.name
+                            );
+                            return;
+                        };
+                        self.record_pack_applied(&display, layer);
+                    }
+                    (None, _) => {
+                        self.creator
+                            .set_pack_status(Some(format!("builtin icon {name} restored")));
+                        self.creator.last_error = None;
+                        self.creator_overlay_dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Evaluate one settled `pack.toml` edit without touching live allocation.
+    ///
+    /// A missing or syntactically invalid manifest keeps the last good
+    /// presentation and reports one rejection line (no restart flag). A valid
+    /// manifest is re-read into a candidate spec stack that preserves the
+    /// installed stack order and every other installed spec, so only the
+    /// edited folder can change the content fingerprint. Equal fingerprints
+    /// clear this folder's restart requirement (a texture-only manifest edit,
+    /// or a revert); a different fingerprint records one. Neither branch
+    /// assigns either registry, replaces the presentation, or queues a block
+    /// upload.
+    ///
+    /// `[builtin_icons]` is presentation-only, so the edited folder's table is
+    /// reconciled for every valid manifest — including one whose content still
+    /// needs a restart. Newly authored paths join the watch list and removed
+    /// paths leave it; the list is rebaselined at the poll's `now` so the edit
+    /// that just applied is not re-applied.
+    fn apply_settled_pack_manifest(&mut self, entry: &PackWatchEntry, now: Instant) {
+        let Some(presentation) = self.pack_presentation.as_ref() else {
+            return;
+        };
+        let installed_fingerprint = presentation.fingerprint;
+        let installed_specs = presentation.specs.clone();
+        let text = match std::fs::read_to_string(&entry.path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.reject_pack_entry(entry, &format!("failed to read: {err}"));
+                return;
+            }
+        };
+        let (_manifest, root, warnings) = pack::manifest::parse_pack_file(&text);
+        if root.is_none() {
+            let reason = warnings
+                .first()
+                .map(|warning| warning.reason.clone())
+                .unwrap_or_else(|| "invalid TOML".to_string());
+            self.reject_pack_entry(entry, &reason);
+            return;
+        }
+
+        // Rebuild only the edited folder; every other stack entry reuses the
+        // installed spec so a folder that was missing at install cannot start
+        // contributing content just because it exists now. Order is the
+        // frozen stack order, which is what the registry digest encodes.
+        let mut candidate_specs = Vec::with_capacity(self.settings.pack_stack.len());
+        let mut found_target = false;
+        for folder in &self.settings.pack_stack {
+            if folder == &entry.folder {
+                candidate_specs.push(pack::spec::load_spec_from_dir(
+                    &self.packs_root.join(folder),
+                ));
+                found_target = true;
+            } else if let Some(spec) = installed_specs.iter().find(|spec| &spec.folder == folder) {
+                candidate_specs.push(spec.clone());
+            }
+        }
+        if !found_target {
+            // The watch entry outlived its stack slot; nothing to compare.
+            return;
+        }
+
+        let (candidate, _report) = build_session_registry(&candidate_specs);
+        let candidate_fingerprint = ContentFingerprint::from_registry(&candidate);
+        let changed = candidate_fingerprint != installed_fingerprint;
+        if changed {
+            // Classify against the installed spec, never the candidate alone:
+            // only an edit confined to recipes/recipe patches is `Recipe`.
+            // The map stays sorted by folder for a stable reason string.
+            let installed_content = installed_specs
+                .iter()
+                .find(|spec| spec.folder == entry.folder)
+                .map(|spec| &spec.content);
+            let candidate_content = candidate_specs
+                .iter()
+                .find(|spec| spec.folder == entry.folder)
+                .map(|spec| &spec.content)
+                .expect("the edited folder always has a candidate spec");
+            let kind = pack::watch::restart_kind(installed_content, candidate_content);
+            self.pack_restart_folders.insert(entry.folder.clone(), kind);
+        } else {
+            self.pack_restart_folders.remove(&entry.folder);
+        }
+
+        let restart = self.pack_restart_reason();
+        let restart_required = restart.is_some();
+        match restart {
+            Some(reason) => {
+                self.creator.set_restart_required(reason.clone());
+                self.creator.set_pack_status(Some(reason.clone()));
+                self.creator.last_error = None;
+                self.creator_overlay_dirty = true;
+                let notice =
+                    format!("{reason} | content changes apply when the world is loaded again");
+                self.packs_message = Some(MenuMessage {
+                    text: notice.clone(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                self.game_message = Some(MenuMessage {
+                    text: notice,
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+                // Exactly one stable line per edit that raises the flag; a
+                // revert or an identity-preserving manifest edit emits none.
+                if changed {
+                    self.emit_pack_trace(pack::watch::restart_line(&reason));
+                }
+            }
+            None => {
+                self.creator.clear_restart_required();
+                self.creator.set_pack_status(None);
+                self.creator.last_error = None;
+                self.creator_overlay_dirty = true;
+                // The pending restart notice is no longer true; any other
+                // Packs-screen warning stays untouched.
+                if self
+                    .packs_message
+                    .as_ref()
+                    .is_some_and(|message| message.text.contains(PACK_RESTART_WORDING))
+                {
+                    self.packs_message = None;
+                }
+            }
+        }
+
+        // Reconcile only the presentation-owned override table. This runs for
+        // every valid settled manifest, even when content still needs a
+        // restart: overrides never allocate, so they can apply live while the
+        // restart reason stays visible.
+        let target_content = candidate_specs
+            .iter()
+            .find(|spec| spec.folder == entry.folder)
+            .map(|spec| &spec.content);
+        let paths_changed = match target_content {
+            Some(content) => {
+                self.apply_settled_builtin_icon_table(entry, content, restart_required)
+            }
+            None => false,
+        };
+
+        // The authored path set changed, so new files (including ones still
+        // missing) must be watched and removed ones dropped. Rebaseline at the
+        // poll clock: the table update already consumed the current bytes, so
+        // the next real edit — not this manifest write — settles.
+        if paths_changed {
+            self.pack_watch = build_pack_watch(
+                self.pack_presentation.as_ref(),
+                &self.packs_root,
+                &self.settings.pack_stack,
+                now,
+            );
+        }
+    }
+
+    /// Reconcile one pack's presentation-owned `[builtin_icons]` table after a
+    /// settled manifest edit.
+    ///
+    /// The presentation borrow ends inside this helper, before any status or
+    /// message work, so the restart/apply surfaces are updated with disjoint
+    /// borrows. Returns whether the authored path table changed, which is the
+    /// caller's signal to rebuild the watch list. A restart-required edit still
+    /// queues the sprite atlas (`pack_item_sprite_dirty`) but never overwrites
+    /// the restart reason with an apply status.
+    fn apply_settled_builtin_icon_table(
+        &mut self,
+        entry: &PackWatchEntry,
+        content: &PackContentSpec,
+        restart_required: bool,
+    ) -> bool {
+        let Some(table) = self.pack_presentation.as_mut().map(|presentation| {
+            presentation.apply_builtin_icon_table(
+                &entry.folder,
+                &content.builtin_icons,
+                &content.assets,
+            )
+        }) else {
+            return false;
+        };
+        if table.changes.is_empty() {
+            return table.paths_changed;
+        }
+        // The sprite atlas is one full UI texture, never a block layer: queue
+        // exactly one compose/upload for the next frame.
+        self.pack_item_sprite_dirty = true;
+        if restart_required {
+            // The content restart is the authoritative status for this edit.
+            return table.paths_changed;
+        }
+        if let Some(change) = table.changes.last() {
+            match (&change.bytes, &change.source) {
+                (Some(_), Some(source)) => {
+                    let display = format!("{}/{}/{}", pack::PACKS_DIR, source.folder, source.path);
+                    let Some(layer) = builtin_icon_layer(&change.name) else {
+                        debug_assert!(
+                            false,
+                            "`{}` must resolve to a pinned sprite layer",
+                            change.name
+                        );
+                        return table.paths_changed;
+                    };
+                    self.record_pack_applied(&display, layer);
+                }
+                (None, _) => {
+                    // A removal reveals the lower pack or procedural art; there
+                    // is no authored path to report as applied.
+                    self.creator
+                        .set_pack_status(Some(format!("builtin icon {} restored", change.name)));
+                    self.creator.last_error = None;
+                    self.creator_overlay_dirty = true;
+                }
+                _ => {}
+            }
+        }
+        table.paths_changed
+    }
+
+    /// Current restart requirement built from the sorted folder map, or
+    /// `None` when every pending manifest edit matches the installed content.
+    fn pack_restart_reason(&self) -> Option<String> {
+        let entries = self
+            .pack_restart_folders
+            .iter()
+            .map(|(folder, kind)| (folder.clone(), *kind))
+            .collect::<Vec<_>>();
+        pack::watch::restart_reason(&entries)
+    }
+
+    /// Apply one decoded base-layer edit and queue its upload when visible.
+    fn apply_base_layer_upload(&mut self, entry: &PackWatchEntry, layer: u8, input: LayerInput) {
+        let change = self
+            .pack_presentation
+            .as_mut()
+            .and_then(|presentation| presentation.apply_base_layer(&entry.folder, layer, input));
+        if let Some(change) = change {
+            let layer = u32::from(change.layer);
+            self.pack_layer_uploads.insert(layer);
+            self.record_pack_applied(&entry.display, layer);
+        }
+    }
+
+    /// Record a visible live-texture apply on the creator surfaces and emit
+    /// the gated `--creator-trace` line.
+    fn record_pack_applied(&mut self, display: &str, layer: u32) {
+        self.creator
+            .set_pack_status(Some(format!("texture applied {display}")));
+        self.creator.last_error = None;
+        self.creator_overlay_dirty = true;
+        let digest = self
+            .pack_presentation
+            .as_ref()
+            .map(|presentation| presentation.fingerprint.digest)
+            .unwrap_or(0);
+        let line =
+            pack::watch::applied_line(display, u8::try_from(layer).unwrap_or(u8::MAX), digest);
+        self.emit_pack_trace(line);
+    }
+
+    /// Record one rejected texture edit: keep the last good layer (the
+    /// presentation is only mutated on success), surface one line on the
+    /// overlay and as a transient notice, and emit the gated trace line.
+    fn reject_pack_entry(&mut self, entry: &PackWatchEntry, reason: &str) {
+        let reason = one_line(reason);
+        let text = format!("{}: {reason}", entry.display);
+        self.creator.set_pack_status(Some(text.clone()));
+        self.creator.last_error = Some(text.clone());
+        self.game_message = Some(MenuMessage {
+            text,
+            ticks_left: menu::MESSAGE_TICKS,
+        });
+        self.creator_overlay_dirty = true;
+        let line = pack::watch::rejected_line(&entry.display, &reason);
+        self.emit_pack_trace(line);
+    }
+
+    /// Write one stable pack apply/reject line when the launch asked for
+    /// `--creator-trace` in a dev build.
+    ///
+    /// Same no-timestamp/no-absolute-path contract as
+    /// [`Self::emit_creator_trace`]; a closed stdout pipe is ignored so
+    /// tracing can never panic the game, and a run without the flag stays
+    /// log-free (D006/MEM009).
+    fn emit_pack_trace(&mut self, line: String) {
+        if !watch::CREATOR_TOOLS || !self.creator_trace {
+            return;
+        }
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
     }
 
     /// Route one mouse click while the menu is open: hit-test the row under
@@ -8833,8 +9716,28 @@ impl GameApp {
         warnings.extend(registry_warnings(&report));
         let changed = candidate.digest() != self.base_registry.digest();
 
-        self.current_pack = loaded;
+        // Rebuild the live presentation from the freshly loaded stack. Layer
+        // indices come from `candidate`, so allocation is frozen for the whole
+        // watch lifetime; live texture edits below only ever rewrite an index
+        // recorded here. A stack apply is the ONE presentation replacement
+        // path; no watcher code may call this function.
+        self.pack_presentation =
+            loaded.map(|pack| PackPresentation::build(pack, specs, &candidate));
+        self.pack_layer_uploads.clear();
+        self.pack_restart_folders.clear();
+        self.creator.clear_restart_required();
+        self.pack_watch = build_pack_watch(
+            self.pack_presentation.as_ref(),
+            &self.packs_root,
+            &self.settings.pack_stack,
+            Instant::now(),
+        );
+        self.creator.pack_status = None;
+        self.creator_overlay_dirty = true;
         self.pack_presentation_dirty = true;
+        // The new stack owns a new visible override set. Upload it in the
+        // next `RedrawRequested`; the menu path never touches the GPU.
+        self.pack_item_sprite_dirty = true;
         // The candidate becomes the base for the NEXT load. The live session
         // keeps its frozen registry untouched (MEM512/D181).
         self.base_registry = candidate;
@@ -8844,7 +9747,7 @@ impl GameApp {
         } else {
             let mut lines = menu::format_warnings(&warnings);
             if changed {
-                lines.push("content changes apply when the world is loaded again".to_string());
+                lines.push(PACK_RESTART_WORDING.to_string());
             }
             self.packs_message = Some(MenuMessage {
                 text: lines.join(" | "),
@@ -9096,6 +9999,18 @@ impl GameApp {
         self.on_session_installed();
     }
 
+    /// Compose the item sprite atlas for `pack_icons`, applying the
+    /// presentation-owned live `[builtin_icons]` overrides when present.
+    fn compose_item_sprite_layers_for(&self, pack_icons: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        compose_item_sprite_layers_with_presentation(self.pack_presentation.as_ref(), pack_icons)
+    }
+
+    /// Compose the current item sprite atlas from the frozen session registry
+    /// plus the presentation's live built-in overrides.
+    fn compose_current_item_sprite_layers(&self) -> Vec<Vec<u8>> {
+        self.compose_item_sprite_layers_for(self.session_registry.pack_icons())
+    }
+
     /// Shared reset boundary after `self.session` has been replaced.
     ///
     /// Called by [`GameApp::start_world_session`] for normal create/load swaps
@@ -9103,16 +10018,28 @@ impl GameApp {
     /// one copy means the background edit path cannot forget an input/mining/
     /// render-store reset that every other swap performs.
     fn on_session_installed(&mut self) {
+        // Config rules are app-wide tuning, not session state: every newly
+        // installed session adopts the current effective values. A live edit
+        // calls `apply_config_rules` directly instead, so it never resets
+        // input, panels, demos, or frame accounting.
+        self.apply_config_rules();
         // The installed session owns a frozen content registry. Its pack item
         // icons may differ from the launch registry (for example a loaded
         // world that carries a content pack), so rebuild the UI-only sprite
-        // atlas from the session's registry before the next frame. The
-        // built-in Default atlas is the same procedural set as startup.
-        let item_sprite_layers = compose_item_sprite_layers(self.session.registry.pack_icons());
+        // atlas from the session's registry (plus the live built-in overrides)
+        // before the next frame. The built-in Default atlas is the same
+        // procedural set as startup.
+        let item_sprite_layers =
+            self.compose_item_sprite_layers_for(self.session.registry.pack_icons());
+        let mut uploaded = false;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.render_store.clear();
             gpu.ui
                 .set_item_sprite_layers(&gpu.ctx.device, &gpu.ctx.queue, &item_sprite_layers);
+            uploaded = true;
+        }
+        if uploaded {
+            self.pack_item_sprite_dirty = false;
         }
         self.input.reset();
         self.left_mouse_held = false;
@@ -9133,14 +10060,18 @@ impl GameApp {
         // The installed session owns the registry every save names content
         // through: a loaded world keeps its placeholder-augmented registry, a
         // fresh world the base it was built from (MEM512/D181). Its one-shot
-        // changed-stack notice becomes the existing transient notice.
+        // changed-stack notice and its one-shot config notice share the single
+        // transient message channel; both are taken here (content first) and
+        // never re-derived per frame.
         self.session_registry = Arc::clone(&self.session.registry);
-        if let Some(text) = self.session.take_content_notice() {
-            self.game_message = Some(MenuMessage {
+        let config_meta = self.config.meta();
+        let content_notice = self.session.take_content_notice();
+        let config_notice = self.session.take_config_notice(config_meta);
+        self.game_message =
+            joined_session_notices(content_notice, config_notice).map(|text| MenuMessage {
                 text,
                 ticks_left: menu::MESSAGE_TICKS,
             });
-        }
         self.session.close_chest();
         // A new session owns a fresh frame-budget window (S08-T01): one
         // digest covers exactly one run, never a blend of two worlds.
@@ -9207,6 +10138,9 @@ impl GameApp {
             // edit session must not surface the changed-stack note either. The
             // placeholders still render, keeping the scene readable.
             session.take_content_notice();
+            // The config notice is likewise a playable-world channel only: a
+            // creator tuning change must never nag from the menu editor.
+            session.take_config_notice(self.config.meta());
             session
         } else {
             let position = self.background.anchor - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
@@ -9835,31 +10769,42 @@ impl ApplicationHandler for GameApp {
         // missing pack still carries usable procedural layers. The 256-layer
         // GPU array is always composed from the 48-layer base plus the
         // frozen session registry's pack faces; unused slots are checker.
-        let base = match &self.current_pack {
-            Some(pack) => pack.layers.clone(),
+        let base = match &self.pack_presentation {
+            Some(presentation) => presentation.base.layers.clone(),
             None => generate_all_texture_layers_rgba(),
         };
-        let pack_layers = self.base_registry.pack_layers().to_vec();
+        let pack_layers = match &self.pack_presentation {
+            Some(presentation) => presentation.pack_layers.clone(),
+            None => self.base_registry.pack_layers().to_vec(),
+        };
         renderer.write_block_layers(&ctx.queue, &compose_block_array_layers(&base, &pack_layers));
+        // A full compose covers every queued live layer.
+        self.pack_layer_uploads.clear();
         let render_store = ChunkRenderStore::new();
         let vista_store = ChunkRenderStore::new();
         let mut ui = UiRenderer::new(
             &ctx,
             &renderer.block_texture_view,
             &renderer.block_texture_sampler,
-            &compose_item_sprite_layers(self.session_registry.pack_icons()),
+            &self.compose_current_item_sprite_layers(),
         );
+        // The startup atlas already includes every presentation override, so
+        // no delayed sprite upload is pending once the renderer exists.
+        self.pack_item_sprite_dirty = false;
         // Startup logo upload (M004/S04): the texture is created exactly once
         // per pack selection, never on the render hot path. Default (`None`)
         // leaves the logo renderer empty so the text title shows instead.
         ui.set_logo(
             &ctx.device,
             &ctx.queue,
-            self.current_pack
-                .as_ref()
-                .and_then(|pack| pack.logo.as_ref()),
+            self.current_pack().and_then(|pack| pack.logo.as_ref()),
         );
         let stats = StatsOverlay::new(&mut ui.font_system);
+        // Read-only F6 creator overlay (M014/S02-T06): compact metrics keep
+        // the registry readout inside the viewport at 720p. Hidden by
+        // default; the buffer is only shaped while visible.
+        let creator_text =
+            StatsOverlay::with_metrics(&mut ui.font_system, CREATOR_FONT_SIZE, CREATOR_LINE_HEIGHT);
         let menu_text = StatsOverlay::new(&mut ui.font_system);
         let title_text = StatsOverlay::with_metrics(
             &mut ui.font_system,
@@ -9950,6 +10895,7 @@ impl ApplicationHandler for GameApp {
             vista_store,
             ui,
             stats,
+            creator_text,
             menu_text,
             title_text,
             load_play_text,
@@ -9996,6 +10942,9 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::Resized(new_size) => {
                 gpu.ctx.resize(new_size);
+                // The creator overlay wraps at the surface width, so a resize
+                // must recompose it even when its text is unchanged.
+                self.creator_overlay_dirty = true;
                 // Re-shape the stats overlay at the new size so text does not
                 // keep the old layout (wrapping) after a resize.
                 gpu.stats.update(
@@ -10115,14 +11064,16 @@ impl ApplicationHandler for GameApp {
                             close_inventory(
                                 &mut self.inventory,
                                 &mut self.session,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.inventory_drag,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -10142,13 +11093,16 @@ impl ApplicationHandler for GameApp {
                             close_chest_screen(
                                 &mut self.chest,
                                 &mut self.session,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -10173,13 +11127,16 @@ impl ApplicationHandler for GameApp {
                                 close_palette(
                                     &mut self.palette,
                                     &mut self.palette_status,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -10253,14 +11210,16 @@ impl ApplicationHandler for GameApp {
                                 &mut self.inventory,
                                 self.session.open_table_position(),
                                 false,
-                                &mut self.input,
-                                &mut self.left_mouse_held,
-                                &mut self.right_mouse_held,
-                                &mut self.inventory_drag,
-                                &mut self.mining,
-                                &mut self.eating,
-                                &mut self.bow,
-                                &mut self.cursor_grabbed,
+                                PanelHolds {
+                                    input: &mut self.input,
+                                    left_mouse_held: &mut self.left_mouse_held,
+                                    right_mouse_held: &mut self.right_mouse_held,
+                                    drag: &mut self.inventory_drag,
+                                    mining: &mut self.mining,
+                                    eating: &mut self.eating,
+                                    bow: &mut self.bow,
+                                    cursor_grabbed: &mut self.cursor_grabbed,
+                                },
                                 window,
                             );
                         }
@@ -10274,6 +11233,16 @@ impl ApplicationHandler for GameApp {
                         KeyCode::F5 if pressed && !event.repeat => {
                             if save_current_world(&mut self.session).is_ok() {
                                 self.last_saved_badge = Some(Instant::now());
+                            }
+                        }
+                        KeyCode::F6 if pressed && !event.repeat => {
+                            // Read-only creator overlay (M014/S02-T06): a
+                            // dev-only utility key consumed even in release
+                            // builds so it can never leak into gameplay.
+                            // Recomposition is deferred to the render pass.
+                            if watch::CREATOR_TOOLS {
+                                self.creator.toggle_overlay();
+                                self.creator_overlay_dirty = true;
                             }
                         }
                         KeyCode::Escape if pressed && !event.repeat => {
@@ -10314,7 +11283,7 @@ impl ApplicationHandler for GameApp {
                             self.session.player.select_slot(8);
                         }
                         // Creative palette (S07-T03): a documented,
-                        // non-rebindable utility key beside F/F5/digits.
+                        // non-rebindable utility key beside F/F5/F6/digits.
                         // Survival stays silent — no message, no empty panel
                         // — because the palette is a Creative capability.
                         KeyCode::KeyC if pressed && !event.repeat => {
@@ -10323,13 +11292,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.palette,
                                     &self.session_registry,
                                     &mut self.palette_status,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -10339,7 +11311,7 @@ impl ApplicationHandler for GameApp {
                         // transitions route through the loaded keybind map
                         // via the pure helper. The 7 rebindable routes sit
                         // AFTER the non-rebindable utility keys on purpose:
-                        // Escape must always toggle the menu and F/F5/
+                        // Escape must always toggle the menu and F/F5/F6/
                         // digits keep their hardcoded behavior even
                         // if a gameplay action is rebound onto one of them
                         // (Escape is a rebindable target, so the menu must
@@ -10809,14 +11781,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.chest,
                                     &mut self.session,
                                     &mut self.inventory,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.inventory_drag,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     &mut self.chest_status,
                                     window,
                                 );
@@ -10830,14 +11804,16 @@ impl ApplicationHandler for GameApp {
                                     &mut self.inventory,
                                     self.session.open_table_position(),
                                     true,
-                                    &mut self.input,
-                                    &mut self.left_mouse_held,
-                                    &mut self.right_mouse_held,
-                                    &mut self.inventory_drag,
-                                    &mut self.mining,
-                                    &mut self.eating,
-                                    &mut self.bow,
-                                    &mut self.cursor_grabbed,
+                                    PanelHolds {
+                                        input: &mut self.input,
+                                        left_mouse_held: &mut self.left_mouse_held,
+                                        right_mouse_held: &mut self.right_mouse_held,
+                                        drag: &mut self.inventory_drag,
+                                        mining: &mut self.mining,
+                                        eating: &mut self.eating,
+                                        bow: &mut self.bow,
+                                        cursor_grabbed: &mut self.cursor_grabbed,
+                                    },
                                     window,
                                 );
                             }
@@ -10888,20 +11864,73 @@ impl ApplicationHandler for GameApp {
                 // returns. Content definitions stay frozen in
                 // `session_registry` (MEM512).
                 if self.pack_presentation_dirty {
-                    let base = match &self.current_pack {
-                        Some(pack) => pack.layers.clone(),
+                    let base = match &self.pack_presentation {
+                        Some(presentation) => presentation.base.layers.clone(),
                         None => generate_all_texture_layers_rgba(),
                     };
-                    let pack_layers = self.base_registry.pack_layers().to_vec();
+                    let pack_layers = match &self.pack_presentation {
+                        Some(presentation) => presentation.pack_layers.clone(),
+                        None => self.base_registry.pack_layers().to_vec(),
+                    };
                     let logo = self
-                        .current_pack
+                        .pack_presentation
                         .as_ref()
-                        .and_then(|pack| pack.logo.clone());
+                        .and_then(|presentation| presentation.base.logo.clone());
                     let composed = compose_block_array_layers(&base, &pack_layers);
                     gpu.renderer.write_block_layers(&gpu.ctx.queue, &composed);
                     gpu.ui
                         .set_logo(&gpu.ctx.device, &gpu.ctx.queue, logo.as_ref());
+                    // The full compose already uploaded every layer, so any
+                    // pending single-layer upload is redundant.
+                    self.pack_layer_uploads.clear();
                     self.pack_presentation_dirty = false;
+                }
+
+                // Live pack texture uploads (M014/S03): a settled edit queued
+                // exactly the layers whose visible bytes changed. Clone the
+                // bytes BEFORE touching `gpu` (P005), then rewrite only those
+                // layers in the retained 256-layer array. This is the only
+                // partial-upload path; a bulk `write_block_layers` is never
+                // used for a single-file edit.
+                if !self.pack_layer_uploads.is_empty() {
+                    let mut uploads: Vec<(u32, Vec<u8>)> = Vec::new();
+                    if let Some(presentation) = self.pack_presentation.as_ref() {
+                        for &layer in &self.pack_layer_uploads {
+                            let bytes = if layer < u32::from(PACK_LAYER_BASE) {
+                                presentation.base.layers.get(layer as usize).cloned()
+                            } else {
+                                presentation
+                                    .pack_layers
+                                    .get((layer - u32::from(PACK_LAYER_BASE)) as usize)
+                                    .cloned()
+                            };
+                            if let Some(bytes) = bytes {
+                                uploads.push((layer, bytes));
+                            }
+                        }
+                    }
+                    for (layer, bytes) in uploads {
+                        gpu.renderer
+                            .write_block_layer(&gpu.ctx.queue, layer, &bytes);
+                    }
+                    self.pack_layer_uploads.clear();
+                }
+
+                // Live built-in item sprite overrides (M014/S07): a settled
+                // `[builtin_icons]` edit or a stack apply set the dirty flag.
+                // Compose the 256-layer UI-only atlas from the presentation's
+                // visible override set BEFORE touching `gpu` (P005). The
+                // helper takes explicit fields because `gpu` already holds a
+                // mutable borrow of `self.gpu` here; one upload per frame
+                // coalesces every edit that settled in the same poll.
+                if self.pack_item_sprite_dirty {
+                    let layers = compose_item_sprite_layers_with_presentation(
+                        self.pack_presentation.as_ref(),
+                        self.session_registry.pack_icons(),
+                    );
+                    gpu.ui
+                        .set_item_sprite_layers(&gpu.ctx.device, &gpu.ctx.queue, &layers);
+                    self.pack_item_sprite_dirty = false;
                 }
 
                 // Message expiry at a bounded ~60 ticks/s (see
@@ -11147,9 +12176,13 @@ impl ApplicationHandler for GameApp {
                     if let EatingTick::Ate { slot, item, .. } = self.eating.tick(dt, eating_target)
                     {
                         // Authored nutrition resolves through the frozen
-                        // session registry; built-in food answers unchanged.
-                        self.session.player.eat_selected_with(
+                        // session registry; built-in food answers from the
+                        // session's live eating rules, matching the target
+                        // that computed the displayed restore.
+                        let eating_rules = self.session.rules().eating;
+                        self.session.player.eat_selected_with_rules(
                             self.session.registry.as_ref(),
+                            &eating_rules,
                             slot,
                             item,
                         );
@@ -11167,7 +12200,8 @@ impl ApplicationHandler for GameApp {
                         gameplay,
                         self.cursor_grabbed,
                     );
-                    self.bow.tick(dt, bow_target);
+                    let bow_rules = self.session.rules().bow;
+                    self.bow.tick_with(dt, bow_target, &bow_rules);
                     // Table-loss close (S03-T03): an attached panel whose
                     // station disappeared closes itself and restores gameplay
                     // ownership. Field-by-field because `gpu`/`window` borrows
@@ -11284,11 +12318,12 @@ impl ApplicationHandler for GameApp {
                 // forward, never a borrow of the session, and the list can
                 // still change before the swing resolves (streaming, death),
                 // so every later step re-reads live state by index.
+                let melee_rules = self.session.rules().melee;
                 let attack_candidate = if gameplay && self.cursor_grabbed && self.left_mouse_held {
                     self.session.melee_candidate(
                         self.session.camera.position,
                         self.session.camera.forward(),
-                        MELEE_REACH,
+                        melee_rules.reach,
                     )
                 } else {
                     None
@@ -11308,12 +12343,7 @@ impl ApplicationHandler for GameApp {
                             h.block_pos.y,
                             h.block_pos.z,
                         );
-                        MiningTarget::from_block_with(
-                            &self.session.registry,
-                            h.block_pos,
-                            block,
-                            self.session.player.selected_item(),
-                        )
+                        session_mining_target(&self.session, h.block_pos, block)
                     })
                 } else {
                     None
@@ -11327,7 +12357,9 @@ impl ApplicationHandler for GameApp {
                     let health = self.session.mobs().get(hit.index)?.health;
                     MeleeTarget::new(hit.index, health)
                 });
-                if let MeleeTick::Swing { index } = self.melee.tick(dt, melee_target) {
+                if let MeleeTick::Swing { index } =
+                    self.melee.tick_with(dt, melee_target, &melee_rules)
+                {
                     // The swing itself is the only mutation site: damage is
                     // derived from the live item/mode/health, the session
                     // re-checks residency and the i-frame window, and only a
@@ -11335,8 +12367,9 @@ impl ApplicationHandler for GameApp {
                     // i-frame-blocked swing mutate nothing (MEM392).
                     let target_health = self.session.mobs().get(index).map(|mob| mob.health);
                     if let Some(target_health) = target_health {
-                        let damage = attack_damage_with(
+                        let damage = attack_damage_with_rules(
                             &self.session.registry,
+                            &melee_rules,
                             self.session.player.selected_item(),
                             self.session.player.mode(),
                             target_health,
@@ -11438,6 +12471,41 @@ impl ApplicationHandler for GameApp {
                     color: [0.0, 0.0, 0.0, 0.4],
                 }];
 
+                // Read-only creator overlay (M014/S02-T06): gated twice —
+                // `CREATOR_TOOLS` keeps release builds from shaping anything
+                // and the runtime flag controls visibility. Recompose only
+                // when dirty (toggle, resize, or a settled/pending reload);
+                // the text area is appended after the stats area below so the
+                // stats readout wins where the panels would overlap.
+                if watch::CREATOR_TOOLS && self.creator.overlay_visible {
+                    let surface_w = gpu.ctx.config.width as f32;
+                    let surface_h = gpu.ctx.config.height as f32;
+                    if self.creator_overlay_dirty {
+                        let max_chars = (((surface_w - OVERLAY_TEXT_LEFT * 2.0)
+                            / (CREATOR_FONT_SIZE * 0.62))
+                            .floor() as usize)
+                            .max(16);
+                        self.creator_overlay_text =
+                            watch::overlay_lines(&self.config, &self.creator, max_chars).join("\n");
+                        self.creator_overlay_dirty = false;
+                    }
+                    gpu.creator_text.update(
+                        &mut gpu.ui.font_system,
+                        surface_w,
+                        surface_h,
+                        &self.creator_overlay_text,
+                    );
+                    let line_count = self.creator_overlay_text.lines().count().max(1);
+                    let y = OVERLAY_TEXT_TOP + LINE_HEIGHT + 8.0;
+                    quads.push(Quad {
+                        x: OVERLAY_TEXT_LEFT - 6.0,
+                        y,
+                        w: (gpu.creator_text.measured_width() + 16.0).min(surface_w),
+                        h: (line_count as f32 * CREATOR_LINE_HEIGHT + 8.0).min(surface_h - y),
+                        color: [0.0, 0.0, 0.0, 0.4],
+                    });
+                }
+
                 // Vista branding (M004/S04), gated to the main-menu cluster:
                 // the pack's overlay tint darkens the panorama at the head of
                 // the quad list (all panels/text draw above it), the logo
@@ -11448,16 +12516,16 @@ impl ApplicationHandler for GameApp {
                 let (brand_w, brand_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                 if vista {
                     if let Some(tint) = self
-                        .current_pack
+                        .pack_presentation
                         .as_ref()
-                        .and_then(|pack| pack.overlay_tint)
+                        .and_then(|presentation| presentation.base.overlay_tint)
                     {
                         quads.insert(0, logo::tint_quad(brand_w, brand_h, tint));
                     }
                 }
                 let logo_rect = if vista {
-                    self.current_pack.as_ref().and_then(|pack| {
-                        pack.logo.as_ref().map(|pack_logo| {
+                    self.pack_presentation.as_ref().and_then(|presentation| {
+                        presentation.base.logo.as_ref().map(|pack_logo| {
                             logo::logo_rect(
                                 brand_w,
                                 pack_logo.width,
@@ -11698,9 +12766,10 @@ impl ApplicationHandler for GameApp {
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
                     ));
+                    let bow_rules = self.session.rules().bow;
                     if let Some(bar) = frame_progress_bar(
                         self.eating.progress(),
-                        self.bow.progress(),
+                        self.bow.progress_with(&bow_rules),
                         self.mining.progress(),
                         gpu.ctx.config.width,
                         gpu.ctx.config.height,
@@ -11722,11 +12791,13 @@ impl ApplicationHandler for GameApp {
                     let layout =
                         layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
                     quads.extend(screen_quads_with(
-                        inventory_mode,
-                        &layout,
-                        self.session.player.inventory(),
-                        self.session.player.player_grid(),
-                        self.session.player.table_grid(),
+                        InventoryPanel {
+                            mode: inventory_mode,
+                            layout: &layout,
+                            inventory: self.session.player.inventory(),
+                            player_grid: self.session.player.player_grid(),
+                            table_grid: self.session.player.table_grid(),
+                        },
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                         &self.session_registry,
@@ -11898,11 +12969,13 @@ impl ApplicationHandler for GameApp {
                 if let Some(layout) = inventory_layout.as_ref() {
                     icons.append(inventory_icon_vertices_with(
                         Some(&self.session_registry),
-                        inventory_mode,
-                        layout,
-                        self.session.player.inventory(),
-                        self.session.player.player_grid(),
-                        self.session.player.table_grid(),
+                        InventoryPanel {
+                            mode: inventory_mode,
+                            layout,
+                            inventory: self.session.player.inventory(),
+                            player_grid: self.session.player.player_grid(),
+                            table_grid: self.session.player.table_grid(),
+                        },
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
                         gpu.ctx.config.width,
@@ -12032,6 +13105,15 @@ impl ApplicationHandler for GameApp {
                 // no pipeline change (MEM014).
                 let stats_text_area = gpu.stats.text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP);
                 let mut areas = vec![stats_text_area];
+                // Read-only creator overlay (M014/S02-T06): pushed after the
+                // stats area so the compact readout never hides the stats
+                // line. A hidden overlay or a release build adds no area.
+                if watch::CREATOR_TOOLS && self.creator.overlay_visible {
+                    areas.push(
+                        gpu.creator_text
+                            .text_area(OVERLAY_TEXT_LEFT, OVERLAY_TEXT_TOP + LINE_HEIGHT + 12.0),
+                    );
+                }
                 // The vista title draws before (under) the screen text, so a
                 // panel containing the title still wins visually.
                 if let Some(title_text_area) = title_text_area {
@@ -12185,21 +13267,22 @@ impl ApplicationHandler for GameApp {
                         // draws them, so the vista path passes an empty slice
                         // and allocates no mob vertex buffer.
                         &[],
-                        vista_camera,
-                        self.background.world.render_distance(),
-                        None,
-                        self.session.player.selected_slot(),
-                        false,
-                        // Menu frames render the scene from its own world, whose
-                        // camera anchors over land (or wherever the player
-                        // chose): never submerged.
-                        vista_sky_params(palette, self.background.clock.time_of_day),
-                        ui_pass,
+                        FrameView {
+                            camera: vista_camera,
+                            render_distance: self.background.world.render_distance(),
+                            target_block: None,
+                            selected_slot: self.session.player.selected_slot(),
+                        },
+                        FramePresentation {
+                            show_overlays: false,
+                            // Menu frames render the scene from its own world,
+                            // whose camera anchors over land (or wherever the
+                            // player chose): never submerged.
+                            sky: vista_sky_params(palette, self.background.clock.time_of_day),
+                            ui_pass,
+                        },
                     )
                 } else {
-                    // Per-frame palette from the live session clock (pure math,
-                    // cheap — same rationale as the per-frame vista camera).
-                    let palette = daycycle::sky_palette(self.session.clock.time_of_day);
                     // Per-frame weather, derived from the persisted calendar
                     // only: no `Weather` value is cached anywhere, so the
                     // calendar remains the sole home of the weather state. A
@@ -12209,7 +13292,11 @@ impl ApplicationHandler for GameApp {
                     // The ambient-audio seam is exercised on every session
                     // frame and is a deliberate no-op in M007 (MEM227).
                     weather_ambient_hook(weather);
-                    let palette = daycycle::weather_palette(palette, weather);
+                    // Per-frame palette from the live session clock and the
+                    // live render rules (pure math, cheap — same rationale as
+                    // the per-frame vista camera). Only this Playing arm is
+                    // tunable; the menu arm keeps the default palette.
+                    let palette = session_sky_palette(&self.session, weather);
                     // Eye submersion (S04-T03): one bounded block lookup per
                     // session frame against the live eye position (synced from
                     // `player.eye_position()` above), never a scan. It flips the
@@ -12229,20 +13316,24 @@ impl ApplicationHandler for GameApp {
                         &gpu.ctx,
                         &gpu.render_store,
                         &mob_vertices,
-                        &self.session.camera,
-                        self.session.world.render_distance(),
-                        target_block,
-                        self.session.player.selected_slot(),
-                        playing,
-                        sky_params(
-                            palette,
-                            self.session.clock.time_of_day,
-                            underwater,
-                            weather,
-                            daycycle::weather_fog_range_factor(weather),
-                            self.session.clock.cycle_phase(),
-                        ),
-                        ui_pass,
+                        FrameView {
+                            camera: &self.session.camera,
+                            render_distance: self.session.world.render_distance(),
+                            target_block,
+                            selected_slot: self.session.player.selected_slot(),
+                        },
+                        FramePresentation {
+                            show_overlays: playing,
+                            sky: sky_params(
+                                palette,
+                                self.session.clock.time_of_day,
+                                underwater,
+                                weather,
+                                session_fog_range_factor(&self.session, weather),
+                                self.session.clock.cycle_phase(),
+                            ),
+                            ui_pass,
+                        },
                     )
                 };
                 match frame_result {
@@ -12453,7 +13544,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 307-byte v8 witness keep their exact bytes.
+            // measured 317-byte v9 witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -12463,7 +13554,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Shot stage's digest follows the Hostile line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` /
-            // `combat_hostile:` lines and the v8 witness keep their exact
+            // `combat_hostile:` lines and the v9 witness keep their exact
             // bytes.
             if let Some(line) = self
                 .combat_demo
@@ -12482,7 +13573,7 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             // The Creative stage's digest follows the Skeleton line for the
-            // same reason: every earlier line and the 307-byte v8 witness keep
+            // same reason: every earlier line and the 317-byte v9 witness keep
             // their exact bytes.
             if let Some(line) = self
                 .combat_demo
@@ -12508,6 +13599,17 @@ impl ApplicationHandler for GameApp {
             return;
         }
 
+        // Dev-only creator poll (M014/S02-T05): clamp the 10 Hz watcher into
+        // the event loop here, after the demo/death/deadline guards and before
+        // the `window` borrow, so a settled editor save becomes a gameplay
+        // change without touching the render path. The witness comments are
+        // pinned by tests: no polling may move into `RedrawRequested`.
+        self.poll_config_watcher_if_due(Instant::now());
+        // Dev-only live pack poll (M014/S03): same 10 Hz clamp and the same
+        // pre-render region. A settled texture edit only queues per-layer
+        // uploads for the next frame; it never rebuilds the stack.
+        self.poll_pack_watcher_if_due(Instant::now());
+
         let Some(window) = &self.window else {
             return;
         };
@@ -12521,7 +13623,8 @@ impl ApplicationHandler for GameApp {
         // still waking immediately for input events.
         if self.settings.vsync {
             if let Some(interval) = vsync_interval(window) {
-                let deadline = self.last_frame + interval;
+                let deadline =
+                    next_wait_deadline(self.last_frame + interval, self.creator_next_poll_at());
                 let now = Instant::now();
                 if now >= deadline {
                     window.request_redraw();
@@ -12634,7 +13737,7 @@ fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16) ->
 /// pinned line set is machine-independent. All content comes through the
 /// production seams: the frozen session registry, the CPU composers the real
 /// renderer uploads, `mesh_chunk_with`, `MiningTarget::from_block_with` +
-/// `MiningState::tick_with`, `break_mined_block`, and the v8 save/load codec.
+/// `MiningState::tick_with`, `break_mined_block`, and the save/load codec.
 ///
 /// Returns `(lines, ok)`. `ok` is false exactly when a leg recorded a
 /// `failed=<name>` token; the caller exits non-zero on that flag.
@@ -13212,7 +14315,7 @@ fn crafting_demo_break(
 /// Every leg runs through a production function: the frozen registry resolved
 /// from the launch stack, [`apply_inventory_click_button_with`], the mining
 /// accumulator + [`break_mined_block`], [`EatingTarget::new_with`] +
-/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the v8 save/load
+/// [`EatingState::tick`] + [`Player::eat_selected_with`], and the save/load
 /// codec. Each structural line is machine-independent (names, counts,
 /// booleans) and the caller exits non-zero when the latch is `crafting:
 /// failed`.
@@ -14212,8 +15315,259 @@ fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     (lines, true)
 }
 
+// ---------------------------------------------------------------------------
+// Headless v8-to-v9 save proof (`--demo-save-v9`, M014/S04-T05)
+// ---------------------------------------------------------------------------
+
+/// Build the deterministic `--demo-save-v9` proof.
+///
+/// Reads `input` as bytes (never writing it), decodes it through the production
+/// v8/v9 loader with the built-in registry, reports the load leg, then writes a
+/// v9 file next to the input through the one production save site and reloads
+/// that output under the same effective config. A missing input is reported as
+/// `missing-input`; every other read/decode failure is `load`. No settings
+/// file, pack stack, window, GPU, audio engine, or event loop is touched.
+fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let output = input.with_extension("v9.mcvx");
+
+    let bytes = match std::fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            lines.push("save_v9: failed reason=missing-input".to_string());
+            return (lines, false);
+        }
+        Err(_) => {
+            lines.push("save_v9: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+    let Some(version_bytes) = bytes.get(4..8) else {
+        lines.push("save_v9: failed reason=load".to_string());
+        return (lines, false);
+    };
+    let version = u32::from_le_bytes(version_bytes.try_into().expect("4-byte version slice"));
+    let loaded = match load_world_from_bytes_with(&bytes, ContentRegistry::builtin()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("save_v9: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+
+    let packs = loaded
+        .saved_content
+        .as_ref()
+        .map(|content| content.packs.len())
+        .unwrap_or(0);
+    let saved_config = loaded.saved_config.is_some();
+    let current = config.meta();
+    let mut session = WorldSession::from_loaded_world(loaded, output.clone());
+    let notice = session.take_config_notice(current);
+    let playable = !session.is_dead();
+    lines.push(format!(
+        "save_v9: leg=load version={version} packs={packs} saved_config={} notice={} playable={playable}",
+        if saved_config { "some" } else { "none" },
+        notice.as_deref().unwrap_or("none"),
+    ));
+
+    // Install the running effective config, then save through the one
+    // production save site: the session's `save_path` is the derived output.
+    session.apply_config(&config.rules(), current);
+    if save_current_world(&mut session).is_err() {
+        lines.push("save_v9: failed reason=save".to_string());
+        return (lines, false);
+    }
+    let saved_bytes = match std::fs::read(&output) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            lines.push("save_v9: failed reason=resave".to_string());
+            return (lines, false);
+        }
+    };
+    let resave_version = saved_bytes
+        .get(4..8)
+        .map(|raw| u32::from_le_bytes(raw.try_into().expect("4-byte version slice")))
+        .unwrap_or(0);
+    lines.push(format!(
+        "save_v9: leg=resave version={resave_version} config_schema={} config_digest=0x{:016x} bytes={}",
+        current.schema,
+        current.digest,
+        saved_bytes.len(),
+    ));
+
+    let reloaded = match load_world_from_path_with(&output, ContentRegistry::builtin()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("save_v9: failed reason=reload".to_string());
+            return (lines, false);
+        }
+    };
+    let mut reload_session = WorldSession::from_loaded_world(reloaded, output);
+    let match_notice = reload_session.take_config_notice(current);
+    let match_playable = !reload_session.is_dead();
+    lines.push(format!(
+        "save_v9: leg=match notice={} playable={match_playable}",
+        match_notice.as_deref().unwrap_or("none"),
+    ));
+
+    if resave_version != 9 || match_notice.is_some() || !playable || !match_playable {
+        lines.push("save_v9: failed reason=mismatch".to_string());
+        return (lines, false);
+    }
+    lines.push("save_v9: ok".to_string());
+    (lines, true)
+}
+
+// ---------------------------------------------------------------------------
+// Headless two-run recipe restart proof (`--demo-restart`, M014/S09-T02)
+// ---------------------------------------------------------------------------
+
+/// Build the deterministic `--demo-restart` same-save recipe proof.
+///
+/// A bare launch switch usable in release. Leg one (`--new`, or a missing
+/// fixture save) creates a session through the production startup seam, pins
+/// day 3 / tick 6000, and saves to the explicit `--save` path. Leg two (the
+/// fixture save exists and `--new` is absent) decodes that save directly with
+/// the freshly built registry, requires the persisted clock and zero
+/// unresolved names, then previews and crafts the edited `mymod:ruby_stew`
+/// recipe and requires the existing one-time content notice. The default save
+/// path is refused before any settings, pack, or world work, so the proof can
+/// never write into the repository. Never constructs `StartupContent`, a
+/// window, GPU, audio engine, or event loop.
+fn demo_restart_lines(cli: &CliConfig) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    if cli.save_path == Path::new(DEFAULT_SAVE_PATH) {
+        lines.push("restart: failed reason=save-path-required".to_string());
+        return (lines, false);
+    }
+
+    let (settings, _warnings) = load_with_warnings(Path::new(DEFAULT_SETTINGS_PATH));
+    let (_loaded, specs, _pack_warnings) =
+        load_startup_stack(Path::new(pack::PACKS_DIR), &settings.pack_stack);
+    let (registry, _report) = build_session_registry(&specs);
+    let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
+
+    let Some(recipe) = registry.recipe_by_name("mymod:ruby_stew") else {
+        lines.push("restart: failed reason=missing-recipe".to_string());
+        return (lines, false);
+    };
+    let count = recipe.count;
+
+    if cli.force_new_world || !cli.save_path.is_file() {
+        let mut session = startup_session_with(cli, &registry, &config);
+        session.clock.day_index = 3;
+        session.clock.time_of_day = 6_000;
+        if save_current_world(&mut session).is_err() {
+            lines.push("restart: failed reason=save".to_string());
+            return (lines, false);
+        }
+        lines.push(format!(
+            "restart: leg=save recipe=mymod:ruby_stew count={count} day=3 tick=6000 saved=true"
+        ));
+        lines.push("restart: ok".to_string());
+        return (lines, true);
+    }
+
+    let loaded = match load_world_from_path_with(&cli.save_path, registry.as_ref()) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            lines.push("restart: failed reason=load".to_string());
+            return (lines, false);
+        }
+    };
+    let unresolved = loaded.unresolved;
+    let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
+    if unresolved != 0 || session.clock.day_index != 3 || session.clock.time_of_day != 6_000 {
+        lines.push("restart: failed reason=load".to_string());
+        return (lines, false);
+    }
+
+    let Some(recipe) = session.registry.recipe_by_name("mymod:ruby_stew") else {
+        lines.push("restart: failed reason=missing-recipe".to_string());
+        return (lines, false);
+    };
+    let count = recipe.count;
+    let key: Vec<(char, ItemId)> = recipe
+        .key
+        .iter()
+        .map(|(character, reference)| {
+            let id = session
+                .registry
+                .resolve_item_ref(*reference)
+                .expect("the loaded recipe key resolves through its own registry");
+            (*character, id)
+        })
+        .collect();
+    let mut grid = crafting_demo_grid(&session.registry, GridKind::Player, &["RR", "WW"], &key);
+    let preview = grid
+        .preview_with(&session.registry)
+        .map(|preview| preview.output_count);
+    if preview != Some(count) {
+        lines.push("restart: failed reason=preview".to_string());
+        return (lines, false);
+    }
+    let crafted = grid
+        .take_result_with(&session.registry, &mut Inventory::empty())
+        .map(|item| item.count());
+    if crafted != Ok(count) {
+        lines.push("restart: failed reason=craft".to_string());
+        return (lines, false);
+    }
+    if session.take_content_notice().as_deref() != Some("content definitions changed") {
+        lines.push("restart: failed reason=notice".to_string());
+        return (lines, false);
+    }
+    if session.is_dead() {
+        lines.push("restart: failed reason=not-playable".to_string());
+        return (lines, false);
+    }
+    lines.push(format!(
+        "restart: leg=load recipe=mymod:ruby_stew count={count} preview={} crafted={} unresolved=0 day=3 tick=6000 notice=content definitions changed playable=true",
+        preview.expect("preview was validated above"),
+        crafted.expect("craft was validated above"),
+    ));
+    lines.push("restart: ok".to_string());
+    (lines, true)
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
+
+    // M014/S09 release gate: release builds expose no creator CLI. Reject the
+    // two dev-only switches before any other switch branch is evaluated, so a
+    // release launch cannot reach the config audit or a headless demo seam
+    // through a flag release does not implement. Debug builds compile this
+    // block out (`watch::CREATOR_TOOLS` is true).
+    if !watch::CREATOR_TOOLS {
+        if let Some(line) = watch::release_rejection_line(cli.check_config, cli.creator_trace) {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+            std::process::exit(1);
+        }
+    }
+
+    // `--check-config` is a headless, pre-startup audit: it prints stable
+    // file/key lines and exits 0/1 without settings, packs, a session, event
+    // loop, window, GPU, save, or world. This branch intentionally precedes
+    // all settings, pack-stack, and startup-content loading; S09 adds the
+    // release rejection of the switch.
+    if cli.check_config {
+        let (lines, ok) =
+            opencraft::config::check_config_lines(Path::new(opencraft::config::CONFIG_DIR));
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // `--validate-pack` is a headless, pre-startup short-circuit: it prints
     // stable per-entry lines and exits 0/1 without a session, event loop,
@@ -14254,7 +15608,7 @@ fn main() {
     // settings file and the persisted pack stack (read-only), builds the same
     // frozen registry a launch would, and prints structural facts about the
     // composed arrays, the authored content, the production mesh, the
-    // production break path, and the v8 save/load placeholder policy. It runs
+    // production break path, and the save/load placeholder policy. It runs
     // before `StartupContent::load`, so no window, GPU, audio engine, event
     // loop, or settings write happens here. The only write is the fixture save
     // (at the demo's `--save` path when given, otherwise a temp file).
@@ -14284,7 +15638,7 @@ fn main() {
     // `--demo-crafting` is the headless crafting digest: it reads the settings
     // file and the persisted pack stack (read-only), builds the same frozen
     // registry a launch would, and exercises crafting, mining, eating and the
-    // v8 save/load placeholder policy through production seams. It runs before
+    // save/load placeholder policy through production seams. It runs before
     // `StartupContent::load`, so no window, GPU, audio engine, event loop, or
     // settings write happens here. The only write is the fixture save (at the
     // demo's `--save` path when given, otherwise a temp file).
@@ -14360,6 +15714,49 @@ fn main() {
         return;
     }
 
+    // `--demo-save-v9` is the headless v8-to-v9 save proof: it loads the
+    // `--save` input through the production decoder, writes the derived v9
+    // file next to it through the one production save site, and reloads that
+    // output under the effective config. It runs after the palette digest and
+    // before `StartupContent::load`, so no window, GPU, audio engine, event
+    // loop, settings write, pack load, or world startup happens here.
+    if cli.demo_save_v9 {
+        let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
+        let (lines, ok) = demo_save_v9_lines(&cli.save_path, &config);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-restart` is the headless two-run recipe restart proof: leg one
+    // pins day 3 / tick 6000 and saves the explicit `--save` fixture; leg two
+    // loads that save in a fresh process against the edited registry and
+    // previews/crafts the new recipe count. It runs after the v9 proof and
+    // before the pack-aware startup content is built, so no window, GPU,
+    // audio engine, or event loop happens here. The default save path is
+    // refused inside the proof, and the switch is deliberately not
+    // release-gated: the release smoke proves the same recipe boundary.
+    if cli.demo_restart {
+        let (lines, ok) = demo_restart_lines(&cli);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Build the pack-aware startup content ONCE: the same base registry names
     // the fresh/loaded startup session and becomes the app's base registry.
     // `--validate-pack` and `--demo-ui` returned above, so no window, GPU,
@@ -14367,8 +15764,9 @@ fn main() {
     let content = StartupContent::load(
         Path::new(DEFAULT_SETTINGS_PATH),
         Path::new(pack::PACKS_DIR).to_path_buf(),
+        Some(Path::new(opencraft::config::CONFIG_DIR)),
     );
-    let session = startup_session_with(&cli, &content.base_registry);
+    let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -14392,6 +15790,8 @@ fn main() {
 mod tests {
     use super::*;
     use opencraft::audio::default_buffers;
+    use opencraft::config::watch::ReloadStatus;
+    use opencraft::config::{ConfigSeverity, ValueOrigin, CONFIG_SCHEMA_VERSION};
     use opencraft::player::inventory::{
         CraftError, CraftingGrid, GridKind, Inventory, InventoryError, ItemId, ItemStack, Material,
         RecipeId, HOTBAR_SLOTS, INVENTORY_SLOTS,
@@ -14400,7 +15800,7 @@ mod tests {
     use opencraft::ui::SettingsCaller;
     use opencraft::world::catalog::{ConfirmOutcome, DeleteConfirmation, RowProblem};
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
-    use opencraft::world::season::Season;
+    use opencraft::world::season::{weather_of, Season, WeatherRules};
     use opencraft::world::terrain::generate_chunk_seeded;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
@@ -14846,6 +16246,71 @@ mod tests {
     }
 
     #[test]
+    fn check_config_is_a_launch_switch_and_never_a_world_intent() {
+        // The audit is a headless one-shot: asking for it must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let check = CliConfig::parse_args(["--check-config"]);
+        assert!(check.check_config);
+        assert!(!cli_has_world_intent(&check));
+        assert_eq!(cli_has_world_intent(&check), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the audit switch is not
+        // turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--check-config", "--new"]);
+        assert!(with_new.check_config);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_check_config_short_circuit_precedes_world_startup() {
+        // The config audit must run before any world/session startup: no save,
+        // settings file, pack stack, window, or GPU work is allowed on this
+        // launch. Pin the ordering in the real binary source so a later
+        // refactor cannot silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let check_at = body
+            .find("cli.check_config")
+            .expect("fn main must branch on cli.check_config");
+        let lines_at = body
+            .find("check_config_lines")
+            .expect("fn main must call check_config_lines");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            check_at < validate_pack_at,
+            "the check-config branch must precede the validate-pack branch"
+        );
+        assert!(
+            lines_at < validate_pack_at,
+            "check_config_lines must precede the validate-pack branch"
+        );
+        assert!(
+            check_at < startup_at,
+            "cli.check_config must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "check_config_lines must precede startup"
+        );
+        for marker in ["load_with_warnings", "load_startup_stack"] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("fn main must call {marker}"));
+            assert!(check_at < at, "cli.check_config must precede {marker}");
+            assert!(lines_at < at, "check_config_lines must precede {marker}");
+        }
+    }
+
+    #[test]
     fn main_demo_ui_short_circuit_precedes_world_startup() {
         // The headless UI digest must run before any world/session startup:
         // no save, settings file, window, or GPU work is allowed on this
@@ -14955,6 +16420,107 @@ mod tests {
     }
 
     #[test]
+    fn main_demo_save_v9_short_circuit_precedes_world_startup() {
+        // The v8-to-v9 proof must run after the palette digest and before any
+        // world/session startup: no settings write, pack load, window, GPU,
+        // audio engine, event loop, or world startup is allowed here.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_palette_at = body
+            .find("cli.demo_palette")
+            .expect("fn main must branch on cli.demo_palette");
+        let demo_save_v9_at = body
+            .find("cli.demo_save_v9")
+            .expect("fn main must branch on cli.demo_save_v9");
+        let proof_at = body
+            .find("demo_save_v9_lines(")
+            .expect("fn main must call demo_save_v9_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_palette_at < demo_save_v9_at,
+            "the v9 proof must follow the palette branch"
+        );
+        assert!(
+            demo_save_v9_at < startup_at,
+            "cli.demo_save_v9 must precede startup"
+        );
+        assert!(
+            proof_at < startup_at,
+            "demo_save_v9_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_save_v9_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless proof,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let save_v9 = CliConfig::parse_args(["--demo-save-v9"]);
+        assert!(!cli_has_world_intent(&save_v9));
+        assert_eq!(cli_has_world_intent(&save_v9), cli_has_world_intent(&bare));
+        // A real world flag still grants intent; the proof flag is not
+        // persisted or turned into a world parameter.
+        let with_new = CliConfig::parse_args(["--new", "--demo-save-v9"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn demo_restart_is_a_launch_switch_and_never_a_world_intent() {
+        // The flag alone must not bypass the menus: it is a headless proof,
+        // not a world parameter.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let restart = CliConfig::parse_args(["--demo-restart"]);
+        assert!(!cli_has_world_intent(&restart));
+        assert_eq!(cli_has_world_intent(&restart), cli_has_world_intent(&bare));
+        // A real world flag still grants intent.
+        let with_new = CliConfig::parse_args(["--new", "--demo-restart"]);
+        assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_restart_short_circuit_precedes_world_startup() {
+        // The two-run restart proof must run after the v9 proof and before any
+        // world/session startup: no settings write, window, GPU, audio engine,
+        // event loop, or world startup is allowed on this launch. Pin the
+        // ordering in the real binary source so a later refactor cannot
+        // silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let demo_save_v9_at = body
+            .find("cli.demo_save_v9")
+            .expect("fn main must branch on cli.demo_save_v9");
+        let demo_restart_at = body
+            .find("cli.demo_restart")
+            .expect("fn main must branch on cli.demo_restart");
+        let proof_at = body
+            .find("demo_restart_lines(")
+            .expect("fn main must call demo_restart_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            demo_save_v9_at < demo_restart_at,
+            "the restart proof must follow the v9 proof"
+        );
+        assert!(
+            demo_restart_at < startup_at,
+            "cli.demo_restart must precede startup"
+        );
+        assert!(
+            proof_at < startup_at,
+            "demo_restart_lines must precede startup"
+        );
+    }
+
+    #[test]
     fn demo_palette_is_a_launch_switch_and_never_a_world_intent() {
         // The flag alone must not bypass the menus: it is a headless digest,
         // not a world parameter.
@@ -14983,6 +16549,47 @@ mod tests {
         // persisted or turned into a world parameter.
         let with_new = CliConfig::parse_args(["--new", "--demo-presentation"]);
         assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_release_gate_rejects_creator_flags_before_startup() {
+        // Release builds must reject the two creator switches before any other
+        // CLI branch or startup work can run. Pin both the gate text and its
+        // position in the real binary source so a refactor cannot silently
+        // move it behind a startup seam.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let gate_start = body
+            .find("if !watch::CREATOR_TOOLS {")
+            .expect("fn main must contain the release creator gate");
+        let exit = "std::process::exit(1);";
+        let gate_end = body.find(exit).expect("the release creator gate must exit") + exit.len();
+        let gate = &body[gate_start..gate_end];
+        assert!(
+            gate.contains("!watch::CREATOR_TOOLS"),
+            "the gate must be compile-time-dead in debug: {gate}"
+        );
+        assert!(
+            gate.contains("release_rejection_line"),
+            "the gate must use the pinned release line helper: {gate}"
+        );
+
+        let after_gate = &body[gate_end..];
+        for marker in [
+            "cli.check_config",
+            "check_config_lines",
+            "cli.validate_pack",
+            "cli.demo_save_v9",
+            "StartupContent::load",
+        ] {
+            assert!(
+                after_gate.contains(marker),
+                "the release creator gate must precede {marker} in fn main"
+            );
+        }
     }
 
     #[test]
@@ -15829,7 +17436,7 @@ stack = 64
 
     // ---- Scripted ocean-crossing seam (S08-T02) ----
 
-    /// The pinned route for the smoke seed: seed 12345 starts in an Ocean
+    /// The pinned route for the smoke seed 12345 starts in an Ocean
     /// column at the origin and the first land at or above SEA_LEVEL along +Z
     /// is the far shore S03 swims to.
     #[test]
@@ -16733,7 +18340,7 @@ stack = 64
         assert!(!session.player.can_fly());
         assert!(
             !session.ambient_spawning(),
-            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v8 save tail"
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v9 save tail"
         );
         assert!(
             session.spawn_settle_pending(),
@@ -18030,13 +19637,13 @@ stack = 64
         (session, demo)
     }
 
-    /// The fresh leg writes the v8 save through the production save site, and
+    /// The fresh leg writes the v9 save through the production save site, and
     /// the file itself carries the two surviving hostile records plus the earned
     /// inventory. The file length and the mob-count offset are MEASURED by
     /// running the fresh leg, never computed by hand: they depend on the exact
     /// serialized size of the inventory stacks the demo earns.
     #[test]
-    fn combat_demo_fresh_leg_writes_and_verifies_a_v8_save() {
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v9_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = 12345;
         let save_path = dir.path().join("combat-fresh-leg.mcvx");
@@ -18082,7 +19689,7 @@ stack = 64
             COMBAT_SAVE_MOB_COUNT_OFFSET,
             "pinned mob-count offset"
         );
-        assert_eq!(&bytes[4..8], &8u32.to_le_bytes(), "v8 version word");
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes(), "v9 version word");
         assert_eq!(
             &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
             &2u32.to_le_bytes(),
@@ -18091,7 +19698,7 @@ stack = 64
         assert_eq!(
             COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len() + COMBAT_SAVE_TAIL_BYTES,
             bytes.len(),
-            "the mob tail is followed only by the pack+digest tail"
+            "the mob tail is followed only by the pack-identity, digest, and config tail"
         );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
@@ -19444,7 +21051,12 @@ stack = 64
         app.packs_root = dir.join("packs");
         app.available_packs = pack::available_pack_names(&app.packs_root);
         app.settings.pack_stack.clear();
-        app.current_pack = None;
+        app.pack_presentation = None;
+        app.pack_watch = None;
+        app.pack_layer_uploads.clear();
+        app.pack_restart_folders.clear();
+        app.creator.pack_status = None;
+        app.creator.clear_restart_required();
         app
     }
 
@@ -19547,7 +21159,7 @@ stack = 64
 
         assert_eq!(app.settings.pack_stack, vec!["alpha", "beta"]);
         assert!(app.pack_presentation_dirty, "a toggle schedules an upload");
-        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let loaded = app.current_pack().expect("stack loaded");
         assert_eq!(
             loaded.display_name, "Beta Pack",
             "the later pack's name wins"
@@ -19676,7 +21288,7 @@ stack = 64
         app.settings.pack_stack = vec!["alpha".to_string(), "beta".to_string()];
         app.apply_pack_stack();
 
-        let loaded = app.current_pack.as_ref().expect("stack loaded");
+        let loaded = app.current_pack().expect("stack loaded");
         let procedural = generate_all_texture_layers_rgba();
         assert_eq!(
             &loaded.layers[0][..4],
@@ -19774,7 +21386,7 @@ stack = 64
         let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
         let save_path = saves.join("Modded.mcvx");
         save_world_to_path_with(&save_path, &modded_sample_save(31), registry.as_ref())
-            .expect("write v8 save with pack content");
+            .expect("write a save with pack content");
 
         // A temp settings path means an empty pack stack, so the launch base
         // is the built-in registry even if the developer's real packs exist.
@@ -19841,7 +21453,7 @@ stack = 64
         std::fs::create_dir_all(&matched_saves).expect("create saves dir");
         let matched_path = matched_saves.join("Modded.mcvx");
         save_world_to_path_with(&matched_path, &modded_sample_save(32), registry.as_ref())
-            .expect("write v8 save with matching content");
+            .expect("write a save with matching content");
         let mut matched = GameApp::new_with_paths(
             CliConfig::parse_args(Vec::<String>::new()),
             WorldSession::new_session(
@@ -20760,7 +22372,7 @@ stack = 64
             "leg=place: one ruby block is consumed"
         );
 
-        // (12) Save v8, reload against the same stack, and prove the writer is
+        // (12) Save v9, reload against the same stack, and prove the writer is
         // deterministic.
         save_current_world(&mut session).expect("leg=save: the session save writes");
         let bytes = std::fs::read(&save_path).expect("leg=save: the save file is readable");
@@ -20773,7 +22385,7 @@ stack = 64
                 .try_into()
                 .expect("leg=save: the version word is present"),
         );
-        assert_eq!(version, 8, "leg=save: the file is v8");
+        assert_eq!(version, 9, "leg=save: the file is v9");
         let loaded = load_world_from_path_with(&save_path, full_reg.as_ref())
             .expect("leg=reload: the save loads");
         assert_eq!(
@@ -20818,7 +22430,7 @@ stack = 64
         .expect("leg=reload: the loaded world re-saves");
         assert_eq!(
             resaved, bytes,
-            "leg=reload: a loaded v8 save re-saves byte-identically"
+            "leg=reload: a loaded v9 save re-saves byte-identically"
         );
     }
 
@@ -20927,7 +22539,7 @@ stack = 64
 
         let mut saved = Vec::new();
         save_world_to_bytes_with(&mut saved, &data, full.as_ref())
-            .expect("leg=derive: the six-reference v8 save writes");
+            .expect("leg=derive: the six-reference save writes");
 
         // (4) Removing the content pack keeps the world loadable: every
         // reference becomes a deterministic placeholder and the notice names
@@ -23042,11 +24654,13 @@ stack = 64
         );
 
         let pack_quads = screen_quads_with(
-            InventoryMode::Table,
-            &ui_layout,
-            player.inventory(),
-            player.player_grid(),
-            player.table_grid(),
+            InventoryPanel {
+                mode: InventoryMode::Table,
+                layout: &ui_layout,
+                inventory: player.inventory(),
+                player_grid: player.player_grid(),
+                table_grid: player.table_grid(),
+            },
             None,
             None,
             &registry,
@@ -26451,6 +28065,33 @@ stack = 64
         }
     }
 
+    /// S06-T03 (M014): the app seam reads the session's live weather rules, so
+    /// a reload that zeroes the percentages turns the seed-1 Spring day clear
+    /// without touching the persisted calendar.
+    #[test]
+    fn session_weather_reads_live_weather_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("live-weather-rules.mcvx");
+        let mut session = WorldSession::new_session(1, save_path, 1);
+
+        // Seed 1, day 0, Spring rolls 18 (< the default 30) -> Rain.
+        assert_eq!(session_weather(&session), Weather::Rain);
+
+        let rules = RulesBundle {
+            weather: WeatherRules {
+                winter_snow_percent: 0,
+                spring_rain_percent: 0,
+                summer_rain_percent: 0,
+                autumn_rain_percent: 0,
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.rules().weather, rules.weather);
+        assert_eq!(session_weather(&session), Weather::Clear);
+    }
+
     /// S06-T04: weather reaches the render inputs, and the vista arm is pinned
     /// to the Clear identity so the menu panorama stays byte-identical and
     /// never draws precipitation.
@@ -26516,8 +28157,12 @@ stack = 64
             "every session frame must exercise the audio seam"
         );
         assert!(
-            src.contains("let palette = daycycle::weather_palette(palette, weather);"),
-            "the session palette must be weather-tinted before upload"
+            src.contains("let palette = session_sky_palette(&self.session, weather);"),
+            "the session palette must be weather-tinted from live render rules before upload"
+        );
+        assert!(
+            src.contains("session_fog_range_factor(&self.session, weather),"),
+            "the session fog range must read the live render rules"
         );
         assert!(
             src.contains("self.session.clock.cycle_phase(),"),
@@ -26825,7 +28470,7 @@ stack = 64
     /// healed player draws the vitals alone and Creative draws nothing.
     #[test]
     fn playing_hud_quads_draws_the_damage_flash_only_while_hurt() {
-        use opencraft::player::combat::DamageCause;
+        use opencraft::player::combat::{DamageCause, HitRequest};
         use opencraft::ui::hud::{DAMAGE_FLASH_ALPHA, HEART_FILL_COLOR};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26850,11 +28495,13 @@ stack = 64
         let feet = session.player.position;
         let hit = session.player.combat.take_hit(
             &mut session.player.survival,
-            3,
+            HitRequest {
+                damage: 3,
+                cause: DamageCause::Zombie,
+                player_feet: feet,
+                from: feet + Vec3::Z,
+            },
             GameMode::Survival,
-            DamageCause::Zombie,
-            feet,
-            feet + Vec3::Z,
         );
         assert!(hit.is_some(), "a Survival hit must land");
 
@@ -26921,11 +28568,13 @@ stack = 64
                 .combat
                 .take_hit(
                     &mut creative.player.survival,
-                    3,
-                    GameMode::Creative,
-                    DamageCause::Zombie,
-                    feet,
-                    feet + Vec3::Z,
+                    HitRequest {
+                        damage: 3,
+                        cause: DamageCause::Zombie,
+                        player_feet: feet,
+                        from: feet + Vec3::Z
+                    },
+                    GameMode::Creative
                 )
                 .is_none(),
             "Creative can never be hurt"
@@ -31966,7 +33615,7 @@ stack = 64
         let ruby_ore = BlockId::Modded(opencraft::world::block::BUILTIN_BLOCK_COUNT);
 
         let cli = CliConfig::parse_args(["--save", path_str]);
-        let mut loaded = startup_session_with(&cli, &registry);
+        let mut loaded = startup_session_with(&cli, &registry, &ConfigRuntime::defaults());
         assert_eq!(
             loaded
                 .registry
@@ -31985,7 +33634,11 @@ stack = 64
 
         // The same save under the built-in registry still opens, with the saved
         // names as placeholders and a readable non-blocking notice.
-        let mut builtin = startup_session_with(&cli, &ContentRegistry::builtin_arc());
+        let mut builtin = startup_session_with(
+            &cli,
+            &ContentRegistry::builtin_arc(),
+            &ConfigRuntime::defaults(),
+        );
         assert_eq!(
             builtin
                 .registry
@@ -32008,7 +33661,3978 @@ stack = 64
         let fresh = startup_session_with(
             &CliConfig::parse_args(["--new", "--seed", "9", "--save", path_str]),
             &registry,
+            &ConfigRuntime::defaults(),
         );
         assert!(Arc::ptr_eq(&fresh.registry, &registry));
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S01-T07: startup config loading and app/session rules wiring
+    // -----------------------------------------------------------------------
+
+    /// Build a settings/packs/config temp tree with a custom player config.
+    fn startup_content_with_player_toml(dir: &Path, player_toml: &str) -> StartupContent {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join("player.toml"), player_toml).expect("write player.toml");
+        StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            Some(&config_dir),
+        )
+    }
+
+    fn config_warnings(content: &StartupContent) -> Vec<&SettingsWarning> {
+        content
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("config/"))
+            .collect()
+    }
+
+    fn one_second_walk_displacement(session: &mut WorldSession) -> f32 {
+        session.player.fly_mode = false;
+        session.player.yaw = 0.0;
+        let input = InputState {
+            forward: true,
+            ..Default::default()
+        };
+        let start = session.player.position;
+        for _ in 0..60 {
+            session
+                .player
+                .update(1.0 / 60.0, &input, |_, _, _| BlockId::Air);
+        }
+        Vec3::new(
+            session.player.position.x - start.x,
+            0.0,
+            session.player.position.z - start.z,
+        )
+        .length()
+    }
+
+    #[test]
+    fn startup_config_loads_from_injected_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+
+        assert_eq!(content.config.f32("movement.walk_speed"), 6.0);
+        assert_eq!(content.config.f32("camera.z_far"), 800.0);
+        assert!(
+            config_warnings(&content).is_empty(),
+            "a valid injected config must not surface a config warning: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn startup_config_rules_reach_startup_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("fresh.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+
+        let mut session = startup_session_with(&cli, &content.base_registry, &content.config);
+        assert_eq!(session.player.movement.walk_speed, 6.0);
+        assert_eq!(session.camera.z_far, 800.0);
+        let fast = one_second_walk_displacement(&mut session);
+        assert!(
+            (fast - 6.0).abs() < 0.2,
+            "walk_speed = 6.0 must move 6 blocks in 1 s, got {fast}"
+        );
+
+        // The same launch with default rules keeps today's 4.6 blocks/s.
+        let mut default_session =
+            startup_session_with(&cli, &content.base_registry, &ConfigRuntime::defaults());
+        let normal = one_second_walk_displacement(&mut default_session);
+        assert!(
+            (normal - 4.6).abs() < 0.2,
+            "default walk speed must move 4.6 blocks in 1 s, got {normal}"
+        );
+    }
+
+    #[test]
+    fn startup_config_invalid_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content =
+            startup_content_with_player_toml(dir.path(), "[movement]\nwalk_speed = 0.0\n");
+
+        assert_eq!(
+            content.config.rules(),
+            RulesBundle::default(),
+            "an invalid field falls back per field, leaving every other default"
+        );
+        assert!(
+            content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field == "config/player.toml: movement.walk_speed"),
+            "the invalid field surfaces as a startup warning: {:?}",
+            content.startup_warnings
+        );
+
+        // The world remains constructible with the fallback rules.
+        let save_path = dir.path().join("fallback.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        assert_eq!(session.player.movement.walk_speed, 4.6);
+    }
+
+    #[test]
+    fn startup_config_missing_dir_is_error_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            Some(&dir.path().join("absent-config")),
+        );
+
+        assert_eq!(content.config.rules(), RulesBundle::default());
+        assert_eq!(
+            content.config.digest(),
+            ConfigRuntime::defaults().digest(),
+            "a missing dir leaves every registry default in place"
+        );
+        assert!(
+            config_warnings(&content).is_empty(),
+            "missing files are warnings, never startup errors: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn game_app_applies_config_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("app.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        // Start from a default-rules session so the app's apply is observable.
+        let session =
+            startup_session_with(&cli, &content.base_registry, &ConfigRuntime::defaults());
+        assert_eq!(session.player.movement.walk_speed, 4.6);
+        let config_meta = content.config.meta();
+
+        let mut app = GameApp::new_with_content(
+            cli.clone(),
+            session,
+            content,
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(app.session.player.movement.walk_speed, 6.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(
+            app.session.save_config(),
+            config_meta,
+            "the app records the effective config meta for the next save"
+        );
+
+        // A session swap re-applies the app-wide rules and save meta (S02/S04).
+        let registry = Arc::clone(&app.base_registry);
+        let fresh = startup_session_with(&cli, &registry, &ConfigRuntime::defaults());
+        assert_eq!(fresh.player.movement.walk_speed, 4.6);
+        assert_eq!(fresh.save_config(), ConfigRuntime::defaults().meta());
+        app.session = fresh;
+        app.on_session_installed();
+        assert_eq!(app.session.player.movement.walk_speed, 6.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(app.session.save_config(), config_meta);
+    }
+
+    #[test]
+    fn joined_session_notices_orders_content_then_config() {
+        assert_eq!(
+            joined_session_notices(
+                Some("content changed".to_string()),
+                Some("config changed".to_string())
+            ),
+            Some("content changed; config changed".to_string()),
+            "content comes first, separated by the established `; `"
+        );
+        assert_eq!(
+            joined_session_notices(Some("content changed".to_string()), None),
+            Some("content changed".to_string()),
+            "a lone content notice is unchanged"
+        );
+        assert_eq!(
+            joined_session_notices(None, Some("config changed".to_string())),
+            Some("config changed".to_string()),
+            "a lone config notice is unchanged"
+        );
+        assert_eq!(
+            joined_session_notices(None, None),
+            None,
+            "silence stays silent"
+        );
+    }
+
+    #[test]
+    fn startup_config_notice_is_one_shot_and_non_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0xDEAD_BEEF_DEAD_BEEF,
+        };
+        assert_ne!(
+            saved.digest,
+            content.config.meta().digest,
+            "the fixture must describe a changed effective config"
+        );
+        let changed_path = dir.path().join("changed-config.mcvx");
+        save_world_to_path_with_config(
+            &changed_path,
+            &sample_save(41),
+            ContentRegistry::builtin(),
+            saved,
+        )
+        .expect("write the changed-config save");
+
+        let cli = CliConfig::parse_args(["--save", changed_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("a changed config must surface one notice");
+        assert_eq!(message.text, "config changed since this world was saved");
+        assert!(!app.session.is_dead(), "the world stays playable");
+
+        app.on_session_installed();
+        assert!(
+            app.game_message.is_none(),
+            "the startup notice is one-shot, not re-derived on install"
+        );
+
+        // A save written under the running effective config is silent.
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let matching_path = dir.path().join("matching-config.mcvx");
+        save_world_to_path_with_config(
+            &matching_path,
+            &sample_save(42),
+            ContentRegistry::builtin(),
+            content.config.meta(),
+        )
+        .expect("write the matching-config save");
+        let cli = CliConfig::parse_args(["--save", matching_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.game_message.is_none(),
+            "a save from the same effective config is silent"
+        );
+    }
+
+    #[test]
+    fn startup_v8_save_is_silent_about_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v8-baseline.mcvx");
+        std::fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/saves/v8-baseline.mcvx"),
+        )
+        .expect("write the frozen v8 fixture");
+
+        // A creator-config launch over the frozen v8 save must not invent a
+        // config notice: v1-v8 carry no config meta, so this is the silent
+        // migration leg of the slice acceptance.
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let cli = CliConfig::parse_args(["--save", path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert!(
+            app.game_message.is_none(),
+            "a v8 save carries no config meta and must stay silent"
+        );
+        assert!(
+            !app.session.is_dead(),
+            "the migrated v8 world remains playable"
+        );
+    }
+
+    #[test]
+    fn startup_notice_joins_content_and_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modded-config.mcvx");
+        let registry = main_ruby_registry();
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0x0123_4567_89AB_CDEF,
+        };
+        save_world_to_path_with_config(&path, &modded_sample_save(33), registry.as_ref(), saved)
+            .expect("write the modded save");
+
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        assert_ne!(saved.digest, content.config.meta().digest);
+        let cli = CliConfig::parse_args(["--save", path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("both one-shot notices must share one message");
+        assert!(
+            message.text.contains("missing pack `mymod-ruby`"),
+            "the content notice comes first: {}",
+            message.text
+        );
+        assert!(
+            message
+                .text
+                .ends_with("; config changed since this world was saved"),
+            "the config notice is joined last: {}",
+            message.text
+        );
+        assert_eq!(
+            message
+                .text
+                .matches("config changed since this world was saved")
+                .count(),
+            1,
+            "exactly one config notice: {}",
+            message.text
+        );
+    }
+
+    #[test]
+    fn background_edit_discards_config_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let background_path = dir.path().join("background/background.mcvx");
+        let saved = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0xDEAD_BEEF_DEAD_BEEF,
+        };
+        save_world_to_path_with_config(
+            &background_path,
+            &sample_save(777),
+            ContentRegistry::builtin(),
+            saved,
+        )
+        .expect("write the background save");
+
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        assert_ne!(saved.digest, content.config.meta().digest);
+        let session = WorldSession::new_session(
+            1,
+            PathBuf::from("/nonexistent/initial.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let mut app = GameApp::new_with_content(
+            CliConfig::parse_args(Vec::<String>::new()),
+            session,
+            content,
+            background_path,
+        );
+
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::MainMenu);
+        assert!(app.background.persisted);
+        assert!(app.main_menu_message.is_none());
+        assert!(app.begin_background_edit(), "enters the editor");
+        assert!(
+            app.game_message.is_none(),
+            "the background editor must discard the config notice (D179)"
+        );
+        assert!(
+            app.main_menu_message.is_none(),
+            "entering the editor must not nag on the menu either"
+        );
+    }
+
+    #[test]
+    fn save_current_world_writes_the_current_config_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = startup_content_with_player_toml(
+            dir.path(),
+            "[movement]\nwalk_speed = 6.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        let save_path = dir.path().join("current-meta.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        let expected = app.config.meta();
+        assert_eq!(app.session.save_config(), expected);
+
+        save_current_world(&mut app.session).expect("the production save site writes");
+
+        let bytes = std::fs::read(&save_path).expect("read the saved world");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("the version word")),
+            9,
+            "the production save site writes v9"
+        );
+        let loaded = load_world_from_path_with(&save_path, ContentRegistry::builtin())
+            .expect("the v9 save loads");
+        assert_eq!(
+            loaded.saved_config,
+            Some(expected),
+            "the save carries the running effective config meta"
+        );
+    }
+
+    #[test]
+    fn new_with_paths_does_not_load_repo_config() {
+        // F13 isolation: headless constructors inject `None`, so the suite can
+        // never read the developer's checked-in `config/` tree implicitly.
+        // Production `main` is the only path that passes the real directory.
+        let source = include_str!("main.rs");
+        let new_with_paths = source
+            .split("fn new_with_paths(")
+            .nth(1)
+            .expect("main.rs must define new_with_paths")
+            .split("fn new_with_content(")
+            .next()
+            .expect("new_with_content must follow new_with_paths");
+        let call_at = new_with_paths
+            .find("StartupContent::load(")
+            .expect("new_with_paths must build StartupContent");
+        let call = &new_with_paths[call_at..];
+        let call = &call[..call.find(");").expect("the load call must close")];
+        let normalized = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(", None"),
+            "new_with_paths must inject no config dir: {normalized}"
+        );
+
+        let main_body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let call_at = main_body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent");
+        let call = &main_body[call_at..];
+        let call = &call[..call.find(");").expect("the load call must close")];
+        let normalized = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("Some(") && normalized.contains("CONFIG_DIR"),
+            "production main must inject the real config dir: {normalized}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S02-T05: GameApp live-apply loop, watcher clamp, and creator trace
+    // -----------------------------------------------------------------------
+
+    fn write_config(dir: &Path, file: &str, contents: &str) {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join(file), contents).expect("write config file");
+    }
+
+    /// Build an app whose startup content came from `player_toml` in a temp
+    /// `config/` tree. `--new` keeps the test off any real save.
+    fn creator_app(dir: &Path, player_toml: &str) -> GameApp {
+        let content = startup_content_with_player_toml(dir, player_toml);
+        let save_path = dir.join("creator.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// [`creator_app`] variant whose fresh session is Survival, so survival
+    /// rules are observable through real hunger/air gameplay.
+    fn creator_survival_app(dir: &Path, player_toml: &str) -> GameApp {
+        let content = startup_content_with_player_toml(dir, player_toml);
+        let save_path = dir.join("creator-survival.mcvx");
+        let cli = CliConfig::parse_args([
+            "--survival",
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// First poll records the edit as pending; the second crosses the 250 ms
+    /// settle window. The injected clock means the tests never sleep.
+    fn settle_config(app: &mut GameApp, base: Instant) {
+        app.poll_config_watcher(base + Duration::from_millis(10));
+        app.poll_config_watcher(base + Duration::from_millis(400));
+    }
+
+    fn config_tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let config_dir = dir.join(opencraft::config::CONFIG_DIR);
+        let mut entries: Vec<(String, Vec<u8>)> = std::fs::read_dir(&config_dir)
+            .expect("read config dir")
+            .map(|entry| {
+                let path = entry.expect("dir entry").path();
+                let name = path
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned();
+                (name, std::fs::read(&path).expect("read config file"))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[test]
+    fn creator_live_player_edit_applies_and_reaches_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let digest_before = app.config.digest();
+        let t0 = Instant::now();
+        app.poll_config_watcher(t0);
+
+        write_config(
+            dir.path(),
+            "player.toml",
+            "[movement]\nwalk_speed = 8.0\n\n[camera]\nz_far = 800.0\n",
+        );
+        app.poll_config_watcher(t0 + Duration::from_millis(10));
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            4.6,
+            "an unsettled write is not applied"
+        );
+        app.poll_config_watcher(t0 + Duration::from_millis(400));
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(app.config.f32("camera.z_far"), 800.0);
+        assert_ne!(app.config.digest(), digest_before);
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+        assert_eq!(app.session.camera.z_far, 800.0);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 2,
+            }
+        );
+        assert!(app.game_message.is_none(), "a successful apply is silent");
+    }
+
+    /// Full tuned survival.toml: a 1 s hunger drain, 0.4 s apple meal, 7-point
+    /// apple, and a 6-block fall-safe window. Every other key is explicit so
+    /// the apply is a complete file, not a partial one that would re-default
+    /// its siblings.
+    const TUNED_SURVIVAL_TOML: &str = "\
+[survival]
+fall_safe_blocks = 6.0
+air_drain_per_sec = 20.0
+drown_interval_secs = 1.0
+drown_damage = 2
+hunger_drain_secs = 1.0
+starve_interval_secs = 4.0
+starve_damage = 1
+regen_hunger_threshold = 18
+regen_interval_secs = 4.0
+regen_hunger_cost = 1
+
+[eating]
+eat_duration_secs = 0.4
+apple_hunger = 7
+bread_hunger = 6
+raw_meat_hunger = 3
+rotten_flesh_hunger = 1
+";
+
+    /// Full tuned combat.toml: 6-block reach, 0.25 s swing, 0.5 s full bow
+    /// draw, and a 40 blocks/s fastest arrow.
+    const TUNED_COMBAT_TOML: &str = "\
+[melee]
+fist_damage = 1
+sword_damage_wood = 4
+sword_damage_stone = 5
+sword_damage_iron = 6
+reach = 6.0
+swing_cooldown_secs = 0.25
+
+[player]
+iframe_secs = 0.5
+hurt_flash_secs = 0.5
+knockback_speed = 6.0
+knockback_decay = 0.6
+
+[bow]
+min_charge_secs = 0.1
+full_charge_secs = 0.5
+
+[arrow]
+gravity = 20.0
+speed_min = 18.0
+speed_max = 40.0
+damage_min = 1
+damage_max = 4
+skeleton_speed = 28.0
+skeleton_damage = 2
+lifetime_secs = 20.0
+embed_secs = 2.0
+";
+
+    /// Full tuned world.toml: 600 s day, all weather percents zero, a tighter
+    /// spawn envelope, and a 30 s wheat stage. Every cross-field invariant
+    /// holds (safe < spawn_max < despawn, region cap < max total).
+    const TUNED_WORLD_TOML: &str = "\
+[clock]
+day_seconds = 600.0
+
+[weather]
+winter_snow_percent = 0
+spring_rain_percent = 0
+summer_rain_percent = 0
+autumn_rain_percent = 0
+
+[spawning]
+safe_radius_blocks = 16
+spawn_max_radius_blocks = 40
+despawn_radius_blocks = 80
+max_mobs_total = 24
+spawn_region_blocks = 16
+spawn_region_cap = 3
+spawn_attempt_secs = 0.1
+despawn_scan_secs = 0.5
+burn_interval_secs = 0.25
+spawn_min_separation = 1.5
+hostile_cave_light = 5
+passive_surface_light = 15
+max_spawn_attempts_per_call = 8
+
+[farming]
+wheat_stage_game_secs = 30.0
+";
+
+    /// Full tuned mining.toml: faster but still monotonic tiers and a 12-block
+    /// table reach.
+    const TUNED_MINING_TOML: &str = "\
+[tools]
+wood_speed_multiplier = 8
+stone_speed_multiplier = 12
+iron_speed_multiplier = 16
+
+[interaction]
+table_reach = 12.0
+";
+
+    /// Full tuned render.toml: tighter fog, stronger tints, a 0.2 midnight
+    /// floor, and a 0.5 s selected-name timer.
+    const TUNED_RENDER_TOML: &str = "\
+[fog]
+rain_factor = 0.5
+snow_factor = 0.6
+
+[palette]
+rain_grey_scale = 0.5
+snow_grey_scale = 1.4
+rain_sky_lerp = 0.6
+snow_sky_lerp = 0.7
+rain_day_factor = 0.6
+snow_day_factor = 0.8
+moonlit_floor = 0.2
+
+[ui]
+selected_name_secs = 0.5
+";
+
+    /// S06-T05: the whole live loop through the real watcher and the real
+    /// production frame helpers. world.toml, mining.toml, and render.toml
+    /// edits must change what the Playing frame sees (day rate, weather,
+    /// palette, fog, selection timer, mining duration), and a cross-field
+    /// spawn/tool violation must reject the whole file with last-good rules
+    /// and digest while naming both fields in the overlay.
+    #[test]
+    fn creator_live_world_mining_render_edits_reach_the_live_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert_eq!(app.session.rules(), RulesBundle::default());
+        assert_eq!(app.session.clock.time_of_day, daycycle::DEFAULT_TIME_OF_DAY);
+        let digest_before = app.config.digest();
+
+        let t0 = Instant::now();
+        write_config(dir.path(), "world.toml", TUNED_WORLD_TOML);
+        write_config(dir.path(), "mining.toml", TUNED_MINING_TOML);
+        write_config(dir.path(), "render.toml", TUNED_RENDER_TOML);
+        settle_config(&mut app, t0);
+
+        assert!(
+            matches!(app.creator.status, ReloadStatus::Applied { .. }),
+            "the three tuned files must apply: {:?}",
+            app.creator.status
+        );
+        assert_ne!(app.config.digest(), digest_before);
+
+        let rules = app.session.rules();
+        assert_eq!(rules.clock.day_seconds, 600.0);
+        assert_eq!(rules.weather.spring_rain_percent, 0);
+        assert_eq!(rules.spawning.spawn_max_radius_blocks, 40);
+        assert_eq!(rules.spawning.max_mobs_total, 24);
+        assert_eq!(rules.farming.wheat_stage_game_secs, 30.0);
+        assert_eq!(rules.tools.wood_speed_multiplier, 8);
+        assert_eq!(rules.interaction.table_reach, 12.0);
+        assert_eq!(rules.render.rain_fog_factor, 0.5);
+        assert_eq!(rules.render.moonlit_floor, 0.2);
+        assert_eq!(rules.selection.selected_name_secs, 0.5);
+
+        // Clock: 600 real seconds per day = 40 ticks per real second, so one
+        // second from noon lands exactly on tick 6,040.
+        assert_eq!(app.session.clock.day_seconds(), 600.0);
+        app.session.clock.advance_secs(1.0, 1.0);
+        assert_eq!(app.session.clock.time_of_day, 6_040);
+
+        // Weather palette/fog: the all-zero percentages make every day clear,
+        // and the tuned midnight floor plus rain fog factor reach the frame
+        // helpers.
+        assert_eq!(session_weather(&app.session), Weather::Clear);
+        app.session.clock.time_of_day = 18_000;
+        assert_eq!(
+            session_sky_palette(&app.session, Weather::Clear).day_factor,
+            0.2
+        );
+        assert_eq!(session_fog_range_factor(&app.session, Weather::Rain), 0.5);
+
+        // Selected-name timer: initialized from render.toml at startup, then
+        // retuned by the same live reload. Half-life behavior at 0.25 s.
+        assert_eq!(app.selection_label.seconds(), 0.5);
+        let wood_pickaxe = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood pickaxe");
+        assert!(app.selection_label.observe(1, Some(wood_pickaxe)));
+        assert_eq!(app.selection_label.remaining(), 0.5);
+        app.selection_label.tick(0.25);
+        assert!((app.selection_label.remaining() - 0.25).abs() < 1e-6);
+        assert!(app.selection_label.alpha() > 0.0);
+        app.selection_label.tick(0.25);
+        assert_eq!(app.selection_label.remaining(), 0.0);
+        assert_eq!(app.selection_label.alpha(), 0.0);
+
+        // Mining: the live tool rules cut the wooden tier's stone duration to
+        // 1.2 / 8 while the default wrapper stays at 1.2 / 2.
+        app.session
+            .player
+            .insert_items(&[wood_pickaxe])
+            .expect("the pickaxe fits");
+        let slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                app.session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(ItemId::Tool {
+                        kind: ToolKind::Pickaxe,
+                        tier: ToolTier::Wood,
+                    })
+            })
+            .expect("the pickaxe landed in a hotbar slot");
+        assert!(app.session.player.select_slot(slot));
+        let pos = IVec3::new(0, 64, 0);
+        let tuned =
+            session_mining_target(&app.session, pos, BlockId::Stone).expect("stone is breakable");
+        assert_eq!(tuned.duration(), 1.2 / 8.0);
+        assert_eq!(
+            MiningTarget::from_block_with(
+                &app.session.registry,
+                pos,
+                BlockId::Stone,
+                Some(wood_pickaxe),
+            )
+            .expect("the default wrapper still resolves stone")
+            .duration(),
+            1.2 / 2.0
+        );
+
+        // Cross-field rejection: a spawn_max below safe rejects the whole
+        // world file, keeps the last-good rules and digest, and names both
+        // fields in the single overlay error line.
+        let digest = app.config.digest();
+        let rules_before = app.session.rules();
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "world.toml",
+            &TUNED_WORLD_TOML.replace(
+                "spawn_max_radius_blocks = 40",
+                "spawn_max_radius_blocks = 10",
+            ),
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::World,
+                field: Some("spawning.spawn_max_radius_blocks".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+        let error = lines
+            .iter()
+            .find(|line| line.contains("error:"))
+            .expect("a rejection must show an error line");
+        assert!(
+            error.contains("spawning.safe_radius_blocks")
+                && error.contains("spawning.spawn_max_radius_blocks"),
+            "the cross-field error must name both radius keys: {error}"
+        );
+
+        // Restoring the tuned world file clears the diagnostic and applies.
+        let t2 = t1 + Duration::from_secs(1);
+        write_config(dir.path(), "world.toml", TUNED_WORLD_TOML);
+        settle_config(&mut app, t2);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::World,
+                ..
+            }
+        ));
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+
+        // The same whole-file guard on the mining cross-field invariant: a
+        // wood multiplier above stone is rejected and names both tool keys.
+        let t3 = t2 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "mining.toml",
+            &TUNED_MINING_TOML.replace("wood_speed_multiplier = 8", "wood_speed_multiplier = 20"),
+        );
+        settle_config(&mut app, t3);
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Mining,
+                field: Some("tools.stone_speed_multiplier".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+        let error = lines
+            .iter()
+            .find(|line| line.contains("error:"))
+            .expect("a rejection must show an error line");
+        assert!(
+            error.contains("tools.wood_speed_multiplier")
+                && error.contains("tools.stone_speed_multiplier"),
+            "the cross-field error must name both tool keys: {error}"
+        );
+
+        // Restoring the tuned mining file clears the error as well.
+        let t4 = t3 + Duration::from_secs(1);
+        write_config(dir.path(), "mining.toml", TUNED_MINING_TOML);
+        settle_config(&mut app, t4);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Mining,
+                ..
+            }
+        ));
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+    }
+
+    /// S06-T05: every new rule struct's Default is its module constant, and
+    /// every `_with` seam is byte-identical to its default wrapper under
+    /// default rules. This is the regression guard that keeps pre-tuning
+    /// rendering, weather, farming, and UI timing unchanged.
+    #[test]
+    fn default_world_mining_render_wrappers_preserve_pinned_numbers() {
+        use opencraft::player::tools::{
+            ToolRules, IRON_SPEED_MULTIPLIER, STONE_SPEED_MULTIPLIER, WOOD_SPEED_MULTIPLIER,
+        };
+        use opencraft::ui::selection::{SelectionRules, SELECTED_NAME_SECS};
+        use opencraft::world::daycycle::{
+            ClockRules, RenderRules, DAY_SECONDS, MOONLIT_FLOOR, RAIN_DAY_FACTOR,
+            RAIN_FOG_RANGE_FACTOR, RAIN_GREY_SCALE, RAIN_SKY_LERP, SNOW_DAY_FACTOR,
+            SNOW_FOG_RANGE_FACTOR, SNOW_GREY_SCALE, SNOW_SKY_LERP,
+        };
+        use opencraft::world::farming::{FarmingRules, WHEAT_STAGE_GAME_SECS};
+        use opencraft::world::season::{
+            weather_of, Season, WeatherRules, AUTUMN_RAIN_PERCENT, SPRING_RAIN_PERCENT,
+            SUMMER_RAIN_PERCENT, WINTER_SNOW_PERCENT,
+        };
+        use opencraft::world::session::{InteractionRules, TABLE_INTERACT_REACH};
+        use opencraft::world::spawning::{
+            SpawnRules, BURN_INTERVAL_SECS, DESPAWN_RADIUS_BLOCKS, DESPAWN_SCAN_SECS,
+            HOSTILE_CAVE_LIGHT, MAX_MOBS_TOTAL, MAX_SPAWN_ATTEMPTS_PER_CALL, PASSIVE_SURFACE_LIGHT,
+            SAFE_RADIUS_BLOCKS, SPAWN_ATTEMPT_SECS, SPAWN_MAX_RADIUS_BLOCKS, SPAWN_MIN_SEPARATION,
+            SPAWN_REGION_BLOCKS, SPAWN_REGION_CAP,
+        };
+
+        let rules = RulesBundle::default();
+        assert_eq!(
+            rules.clock,
+            ClockRules {
+                day_seconds: DAY_SECONDS
+            }
+        );
+        assert_eq!(
+            rules.weather,
+            WeatherRules {
+                winter_snow_percent: WINTER_SNOW_PERCENT,
+                spring_rain_percent: SPRING_RAIN_PERCENT,
+                summer_rain_percent: SUMMER_RAIN_PERCENT,
+                autumn_rain_percent: AUTUMN_RAIN_PERCENT,
+            }
+        );
+        assert_eq!(
+            rules.spawning,
+            SpawnRules {
+                safe_radius_blocks: SAFE_RADIUS_BLOCKS,
+                spawn_max_radius_blocks: SPAWN_MAX_RADIUS_BLOCKS,
+                despawn_radius_blocks: DESPAWN_RADIUS_BLOCKS,
+                max_mobs_total: MAX_MOBS_TOTAL,
+                spawn_region_blocks: SPAWN_REGION_BLOCKS,
+                spawn_region_cap: SPAWN_REGION_CAP,
+                spawn_attempt_secs: SPAWN_ATTEMPT_SECS,
+                despawn_scan_secs: DESPAWN_SCAN_SECS,
+                burn_interval_secs: BURN_INTERVAL_SECS,
+                spawn_min_separation: SPAWN_MIN_SEPARATION,
+                hostile_cave_light: HOSTILE_CAVE_LIGHT,
+                passive_surface_light: PASSIVE_SURFACE_LIGHT,
+                max_spawn_attempts_per_call: MAX_SPAWN_ATTEMPTS_PER_CALL,
+            }
+        );
+        assert_eq!(
+            rules.farming,
+            FarmingRules {
+                wheat_stage_game_secs: WHEAT_STAGE_GAME_SECS
+            }
+        );
+        assert_eq!(
+            rules.tools,
+            ToolRules {
+                wood_speed_multiplier: WOOD_SPEED_MULTIPLIER,
+                stone_speed_multiplier: STONE_SPEED_MULTIPLIER,
+                iron_speed_multiplier: IRON_SPEED_MULTIPLIER,
+            }
+        );
+        assert_eq!(
+            rules.interaction,
+            InteractionRules {
+                table_reach: TABLE_INTERACT_REACH
+            }
+        );
+        assert_eq!(
+            rules.render,
+            RenderRules {
+                rain_fog_factor: RAIN_FOG_RANGE_FACTOR,
+                snow_fog_factor: SNOW_FOG_RANGE_FACTOR,
+                rain_grey_scale: RAIN_GREY_SCALE,
+                snow_grey_scale: SNOW_GREY_SCALE,
+                rain_sky_lerp: RAIN_SKY_LERP,
+                snow_sky_lerp: SNOW_SKY_LERP,
+                rain_day_factor: RAIN_DAY_FACTOR,
+                snow_day_factor: SNOW_DAY_FACTOR,
+                moonlit_floor: MOONLIT_FLOOR,
+            }
+        );
+        assert_eq!(
+            rules.selection,
+            SelectionRules {
+                selected_name_secs: SELECTED_NAME_SECS
+            }
+        );
+
+        // Palettes: the default `_with` calls are bit-identical to the
+        // default wrappers at every keyframe boundary, and across weather.
+        for time_of_day in [0, daycycle::DEFAULT_TIME_OF_DAY, 12_000, 18_000] {
+            assert_eq!(
+                daycycle::sky_palette_with(time_of_day, &RenderRules::default()),
+                daycycle::sky_palette(time_of_day),
+                "sky palette at tick {time_of_day}"
+            );
+        }
+        let base = daycycle::sky_palette(daycycle::DEFAULT_TIME_OF_DAY);
+        for weather in [Weather::Clear, Weather::Rain, Weather::Snowfall] {
+            assert_eq!(
+                daycycle::weather_palette_with(base, weather, &RenderRules::default()),
+                daycycle::weather_palette(base, weather),
+                "weather palette for {weather:?}"
+            );
+            assert_eq!(
+                daycycle::weather_fog_range_factor_with(weather, &RenderRules::default()),
+                daycycle::weather_fog_range_factor(weather),
+                "weather fog factor for {weather:?}"
+            );
+        }
+
+        // Pinned seed-1 calendar cases: the live-rule seam defaults exactly
+        // to the pure derivation the session already used.
+        for day in [0u32, 1, 17, 1_000] {
+            for season in [
+                Season::Spring,
+                Season::Summer,
+                Season::Autumn,
+                Season::Winter,
+            ] {
+                assert_eq!(
+                    weather_of_with(season, day, 1, &WeatherRules::default()),
+                    weather_of(season, day, 1),
+                    "weather for {season:?} day {day}"
+                );
+            }
+        }
+
+        // Registry mining durations and the UI label timer also default to
+        // exactly the pre-tuning values.
+        let registry = ContentRegistry::builtin();
+        for block in [BlockId::Stone, BlockId::Dirt, BlockId::OakLog] {
+            assert_eq!(
+                registry.break_duration_with_rules(
+                    block,
+                    Some(wood_pickaxe()),
+                    &ToolRules::default()
+                ),
+                registry.break_duration(block, Some(wood_pickaxe())),
+                "break duration for {block:?}"
+            );
+        }
+        let mut fresh = SelectionLabel::new();
+        let mut explicit = SelectionLabel::with_seconds(SELECTED_NAME_SECS);
+        assert_eq!(fresh.seconds(), explicit.seconds());
+        let stone = Item::new(ItemId::Block(BlockId::Stone), 1).expect("stone");
+        assert_eq!(
+            fresh.observe(0, Some(stone)),
+            explicit.observe(0, Some(stone))
+        );
+        fresh.tick(0.5);
+        explicit.tick(0.5);
+        assert_eq!(fresh, explicit);
+        assert_eq!(fresh.alpha(), explicit.alpha());
+    }
+
+    fn wood_pickaxe() -> Item {
+        Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood pickaxe")
+    }
+
+    #[test]
+    fn creator_live_survival_and_combat_edits_change_gameplay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_survival_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert_eq!(
+            app.session.rules(),
+            RulesBundle::default(),
+            "a fresh session starts on the registry defaults"
+        );
+
+        let t0 = Instant::now();
+        write_config(dir.path(), "survival.toml", TUNED_SURVIVAL_TOML);
+        write_config(dir.path(), "combat.toml", TUNED_COMBAT_TOML);
+        settle_config(&mut app, t0);
+
+        let rules = app.session.rules();
+        assert_eq!(rules.survival.hunger_drain_secs, 1.0);
+        assert_eq!(rules.eating.apple_hunger, 7);
+        assert_eq!(rules.eating.eat_duration_secs, 0.4);
+        assert_eq!(rules.melee.reach, 6.0);
+        assert_eq!(rules.melee.swing_cooldown_secs, 0.25);
+        assert_eq!(rules.bow.full_charge_secs, 0.5);
+        assert_eq!(rules.arrow.speed_max, 40.0);
+        assert!(
+            matches!(app.creator.status, ReloadStatus::Applied { .. }),
+            "the tuned edit applies: {:?}",
+            app.creator.status
+        );
+
+        // 1. Hunger drain: one game second at the tuned 1 s interval.
+        assert_eq!(app.session.player.survival.hunger(), MAX_HUNGER);
+        app.session.tick_survival(0.1, 10.0, false);
+        assert_eq!(
+            app.session.player.survival.hunger(),
+            MAX_HUNGER - 1,
+            "the session consumes the tuned hunger drain"
+        );
+
+        // 2. Melee reach: a pig 5 blocks east is inside the tuned 6.0 reach
+        //    and outside the pinned default 3.0.
+        app.session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        app.session.camera.position = Vec3::new(0.5, 9.65, 0.5);
+        app.session.camera.yaw = 0.0;
+        app.session.camera.pitch = 0.0;
+        app.session.mobs_mut().clear();
+        app.session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(5.5, 9.0, 0.5), 0.0));
+        let tuned_hit = app.session.melee_candidate(
+            app.session.camera.position,
+            app.session.camera.forward(),
+            app.session.rules().melee.reach,
+        );
+        assert_eq!(
+            tuned_hit.map(|hit| hit.index),
+            Some(0),
+            "the tuned 6.0 reach selects the pig"
+        );
+        assert_eq!(
+            app.session.melee_candidate(
+                app.session.camera.position,
+                app.session.camera.forward(),
+                MELEE_REACH,
+            ),
+            None,
+            "the pinned default reach cannot select the same pig"
+        );
+
+        // 3. Bow charge: five 0.1 s ticks fill the tuned 0.5 s draw (one
+        //    tick integrates at most MAX_DT = 0.1 s).
+        let bow_item = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood bow");
+        let bow_target = BowTarget::new(0, bow_item).expect("bow in a hotbar slot");
+        let mut bow = BowState::new();
+        for tick in 0..4 {
+            assert!(
+                matches!(
+                    bow.tick_with(0.1, Some(bow_target), &rules.bow),
+                    BowTick::Charging { .. }
+                ),
+                "tick {tick} of the tuned 0.5 s draw is still charging"
+            );
+        }
+        assert_eq!(
+            bow.tick_with(0.1, Some(bow_target), &rules.bow),
+            BowTick::Full
+        );
+        assert_eq!(bow.progress_with(&rules.bow), Some(1.0));
+
+        // 4. Eating setup: the tuned apple target reaches the frame helper.
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("apple");
+        assert!(app.session.player.insert_items(&[apple]).is_ok());
+        let apple_slot = (0..HOTBAR_SLOTS)
+            .find(|&slot| {
+                app.session
+                    .player
+                    .inventory()
+                    .hotbar(slot)
+                    .map(|item| item.id())
+                    == Some(ItemId::Material(Material::Apple))
+            })
+            .expect("the apple landed in a hotbar slot");
+        assert!(app.session.player.select_slot(apple_slot));
+        let eating_target =
+            eating_candidate(&app.session, &InputState::default(), true, true, true)
+                .expect("Survival food while hungry");
+        assert_eq!(
+            eating_target.restore(),
+            7,
+            "the tuned apple value reaches eating_candidate"
+        );
+        assert!((eating_target.duration() - 0.4).abs() < 1e-6);
+
+        // 5. A range-invalid survival edit is rejected whole and keeps the
+        //    last good tuned values, digest, and behavior.
+        let digest = app.config.digest();
+        let rules_before = app.session.rules();
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "survival.toml",
+            "[survival]\nhunger_drain_secs = 0.5\n",
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("survival.hunger_drain_secs"),
+            1.0,
+            "a rejected file keeps its last good tuned value"
+        );
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Survival,
+                field: Some("survival.hunger_drain_secs".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+
+        // Restoring the tuned survival file clears its diagnostic before the
+        // next rejection scenario, so each rejection is measured on its own.
+        let t_recover = t1 + Duration::from_secs(1);
+        write_config(dir.path(), "survival.toml", TUNED_SURVIVAL_TOML);
+        settle_config(&mut app, t_recover);
+        assert!(matches!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Survival,
+                ..
+            }
+        ));
+        assert_eq!(app.config.digest(), digest);
+        assert_eq!(app.session.rules(), rules_before);
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            0,
+            "a recovered file clears its overlay error: {lines:?}"
+        );
+
+        // 6. A bow min>full cross-field edit is rejected whole as well.
+        let t2 = t_recover + Duration::from_secs(1);
+        write_config(
+            dir.path(),
+            "combat.toml",
+            &TUNED_COMBAT_TOML.replace("min_charge_secs = 0.1", "min_charge_secs = 0.9"),
+        );
+        settle_config(&mut app, t2);
+
+        assert_eq!(app.config.f32("bow.min_charge_secs"), 0.1);
+        assert_eq!(app.config.f32("bow.full_charge_secs"), 0.5);
+        assert_eq!(app.session.rules(), rules_before);
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Combat,
+                field: Some("bow.min_charge_secs".to_string()),
+            }
+        );
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("error:")).count(),
+            1,
+            "exactly one overlay error line: {lines:?}"
+        );
+
+        // The rejected edits leave the previously tuned drain active: one
+        // more game second still spends exactly one hunger point.
+        app.session.tick_survival(0.1, 10.0, false);
+        assert_eq!(app.session.player.survival.hunger(), 18);
+    }
+
+    #[test]
+    fn default_rule_wrappers_preserve_pinned_gameplay_numbers() {
+        use opencraft::player::bow::BowRules;
+        use opencraft::player::eating::{EatingRules, EAT_DURATION_SECS};
+        use opencraft::player::melee::{MeleeRules, SWING_COOLDOWN_SECS};
+
+        let rules = RulesBundle::default();
+        assert_eq!(rules.melee, MeleeRules::default());
+        assert_eq!(rules.bow, BowRules::default());
+        assert_eq!(rules.eating, EatingRules::default());
+        assert_eq!(rules.melee.reach, MELEE_REACH);
+        assert_eq!(rules.melee.swing_cooldown_secs, SWING_COOLDOWN_SECS);
+        assert_eq!(rules.eating.eat_duration_secs, EAT_DURATION_SECS);
+        assert_eq!(rules.eating.apple_hunger, 4);
+        assert_eq!(rules.survival.hunger_drain_secs, 30.0);
+        assert_eq!(rules.combat.iframe_secs, 0.5);
+        assert_eq!(rules.bow.min_charge_secs, 0.2);
+        assert_eq!(rules.bow.full_charge_secs, 1.0);
+        assert_eq!(rules.arrow.speed_max, 32.0);
+
+        // Default damage wrapper: fist 1, wood/stone/iron 4/5/6, Creative
+        // one-shots the target's remaining health.
+        let sword = |tier| {
+            Item::new(
+                ItemId::Tool {
+                    kind: ToolKind::Sword,
+                    tier,
+                },
+                1,
+            )
+            .expect("a sword")
+        };
+        assert_eq!(attack_damage(None, GameMode::Survival, 20), 1);
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Wood)), GameMode::Survival, 20),
+            4
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Stone)), GameMode::Survival, 20),
+            5
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Iron)), GameMode::Survival, 20),
+            6
+        );
+        assert_eq!(
+            attack_damage(Some(sword(ToolTier::Iron)), GameMode::Creative, 20),
+            20
+        );
+
+        // Default melee wrapper re-arms the pinned 0.6 s cooldown.
+        let mut melee = MeleeState::new();
+        let melee_target = MeleeTarget::new(0, 10).expect("a live target");
+        assert_eq!(
+            melee.tick(0.0, Some(melee_target)),
+            MeleeTick::Swing { index: 0 }
+        );
+        assert_eq!(melee.cooldown(), SWING_COOLDOWN_SECS);
+        assert!(matches!(
+            melee.tick(0.05, Some(melee_target)),
+            MeleeTick::Cooling { .. }
+        ));
+
+        // Default bow wrapper saturates after the pinned 1.0 s draw and
+        // refuses a tap shorter than the pinned 0.2 s threshold.
+        let bow_item = Item::new(
+            ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Wood,
+            },
+            1,
+        )
+        .expect("a wood bow");
+        let bow_target = BowTarget::new(0, bow_item).expect("bow in a hotbar slot");
+        let mut bow = BowState::new();
+        assert!(matches!(
+            bow.tick(0.1, Some(bow_target)),
+            BowTick::Charging { .. }
+        ));
+        assert_eq!(bow.release(), None, "a 0.1 s tap is below the threshold");
+        let mut bow = BowState::new();
+        for _ in 0..9 {
+            assert!(matches!(
+                bow.tick(0.1, Some(bow_target)),
+                BowTick::Charging { .. }
+            ));
+        }
+        assert_eq!(bow.tick(0.1, Some(bow_target)), BowTick::Full);
+        assert_eq!(bow.release(), Some(1.0));
+
+        // Default eating wrapper restores the pinned apple value over the
+        // pinned meal duration.
+        let registry = ContentRegistry::builtin_arc();
+        let apple = Item::new(ItemId::Material(Material::Apple), 1).expect("apple");
+        let target = EatingTarget::new_with(registry.as_ref(), 0, apple, 10)
+            .expect("an apple with room for more hunger");
+        assert_eq!(target.restore(), 4);
+        assert_eq!(target.duration(), EAT_DURATION_SECS);
+    }
+
+    #[test]
+    fn creator_live_edit_does_not_reinstall_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        app.game_message = Some(MenuMessage {
+            text: "keep".to_string(),
+            ticks_left: 10,
+        });
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("a live edit must not clear an unrelated notice");
+        assert_eq!(message.text, "keep");
+        assert_eq!(message.ticks_left, 10);
+    }
+
+    #[test]
+    fn creator_live_edit_applies_sprint_fly_jump() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+
+        write_config(
+            dir.path(),
+            "player.toml",
+            "[movement]\nwalk_speed = 4.6\nsprint_speed = 8.5\nfly_speed = 22.0\njump_velocity = 12.0\n",
+        );
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.session.player.movement.sprint_speed, 8.5);
+        assert_eq!(app.session.player.movement.fly_speed, 22.0);
+        assert_eq!(app.session.player.movement.jump_velocity, 12.0);
+    }
+
+    #[test]
+    fn creator_invalid_edit_keeps_last_good() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, t0);
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        let digest = app.config.digest();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            8.0,
+            "a rejected file keeps its last good values"
+        );
+        assert_eq!(
+            app.config.digest(),
+            digest,
+            "a rejection never moves the digest"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: Some("movement.walk_speed".to_string()),
+            }
+        );
+        let last_error = app
+            .creator
+            .last_error
+            .clone()
+            .expect("a rejection records its reason");
+        assert!(
+            last_error.starts_with("config/player.toml: movement.walk_speed:"),
+            "{last_error}"
+        );
+        let message = app
+            .game_message
+            .as_ref()
+            .expect("the reason is user-visible");
+        assert_eq!(message.text, last_error);
+
+        let lines = watch::overlay_lines(&app.config, &app.creator, 160);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error:"))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one overlay error line: {lines:?}");
+        assert!(errors[0].contains("movement.walk_speed"), "{lines:?}");
+    }
+
+    #[test]
+    fn creator_invalid_sibling_does_not_block_valid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        settle_config(&mut app, t0);
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        let mut expected = app.config.clone();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        write_config(
+            dir.path(),
+            "survival.toml",
+            "[survival]\nhunger_drain_secs = 12.0\n",
+        );
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            8.0,
+            "the rejected file keeps its last good value"
+        );
+        assert_eq!(app.config.f32("survival.hunger_drain_secs"), 12.0);
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        let survival_report = expected.reload_file(&config_dir, ConfigFile::Survival);
+        assert!(survival_report.applied);
+        assert_eq!(
+            app.config.digest(),
+            expected.digest(),
+            "the digest reflects only the valid sibling's apply"
+        );
+    }
+
+    #[test]
+    fn creator_atomic_rename_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        let temp_path = config_dir.join("player.toml.tmp");
+        std::fs::write(&temp_path, "[movement]\nwalk_speed = 7.5\n").expect("write temp file");
+        std::fs::rename(&temp_path, config_dir.join("player.toml")).expect("atomic rename");
+
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 7.5);
+        assert_eq!(app.session.player.movement.walk_speed, 7.5);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn creator_partial_write_rejects_then_complete_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed =");
+        settle_config(&mut app, t0);
+
+        assert_eq!(
+            app.config.f32("movement.walk_speed"),
+            4.6,
+            "a partial write keeps the last good value"
+        );
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: None,
+            }
+        );
+        let last_error = app.creator.last_error.as_deref().expect("reason");
+        assert!(last_error.contains("invalid TOML"), "{last_error}");
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 7.5\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 7.5);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn creator_empty_and_comment_only_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let t0 = Instant::now();
+        write_config(dir.path(), "player.toml", "");
+        settle_config(&mut app, t0);
+
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Rejected {
+                file: ConfigFile::Player,
+                field: None,
+            }
+        );
+        assert_eq!(
+            app.creator.last_error.as_deref(),
+            Some("config/player.toml: file is empty; keeping last good values")
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_config(dir.path(), "player.toml", "# comment\n");
+        settle_config(&mut app, t1);
+
+        assert_eq!(
+            app.creator.last_error.as_deref(),
+            Some("config/player.toml: file has no recognized keys; keeping last good values")
+        );
+    }
+
+    #[test]
+    fn creator_deleted_file_applies_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 8.0\n");
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(app.session.player.movement.walk_speed, 8.0);
+
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+        std::fs::remove_file(config_dir.join("player.toml")).expect("remove player.toml");
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 4.6);
+        assert_eq!(
+            app.config.origin("movement.walk_speed"),
+            ValueOrigin::Default
+        );
+        assert_eq!(app.session.player.movement.walk_speed, 4.6);
+        assert_eq!(
+            app.creator.status,
+            ReloadStatus::Applied {
+                file: ConfigFile::Player,
+                changed: 1,
+            }
+        );
+        assert!(
+            app.config.diagnostics().iter().any(|diagnostic| {
+                diagnostic.file == ConfigFile::Player
+                    && diagnostic.key.is_none()
+                    && diagnostic.severity == ConfigSeverity::Warning
+                    && diagnostic.reason == "file is missing; using defaults"
+            }),
+            "the missing-file warning is retained as data: {:?}",
+            app.config.diagnostics()
+        );
+    }
+
+    #[test]
+    fn creator_watcher_disabled_without_config_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("disabled.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(
+            &cli,
+            &ContentRegistry::builtin_arc(),
+            &ConfigRuntime::defaults(),
+        );
+        let mut app = GameApp::new_with_paths(
+            cli,
+            session,
+            dir.path().join("settings.toml"),
+            dir.path().join("background.mcvx"),
+        );
+
+        assert!(app.creator_next_poll_at().is_none());
+        app.poll_config_watcher_if_due(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.creator.status, ReloadStatus::Idle);
+    }
+
+    #[test]
+    fn creator_next_wait_deadline_prefers_earlier() {
+        let base = Instant::now();
+        let vsync = base + Duration::from_millis(16);
+        let watcher = base + Duration::from_millis(7);
+        assert_eq!(next_wait_deadline(vsync, Some(watcher)), watcher);
+        assert_eq!(next_wait_deadline(watcher, Some(vsync)), watcher);
+        assert_eq!(next_wait_deadline(vsync, None), vsync);
+
+        let source = include_str!("main.rs");
+        let about_to_wait = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("main.rs must define about_to_wait")
+            .split("// Headless presentation digest")
+            .next()
+            .expect("about_to_wait must end before the presentation digest");
+        assert!(
+            about_to_wait.contains("poll_config_watcher_if_due(Instant::now())"),
+            "about_to_wait must poll the creator watcher"
+        );
+        assert!(
+            about_to_wait.contains("next_wait_deadline("),
+            "the vsync wait must include the watcher deadline"
+        );
+        assert!(
+            about_to_wait.contains("ControlFlow::Poll"),
+            "the non-vsync path must stay Poll"
+        );
+    }
+
+    #[test]
+    fn creator_trace_is_not_a_world_intent() {
+        let cli = CliConfig::parse_args(["--creator-trace"]);
+        assert!(!cli_has_world_intent(&cli));
+        assert!(!scripted_demo_requested(&cli));
+    }
+
+    #[test]
+    fn creator_reload_never_writes_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        let initial = config_tree(dir.path());
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        let before_poll = config_tree(dir.path());
+        settle_config(&mut app, Instant::now());
+
+        assert_eq!(app.config.f32("movement.walk_speed"), 8.0);
+        assert_eq!(
+            initial.len(),
+            before_poll.len(),
+            "the test edit must not add or remove config files"
+        );
+        assert_eq!(
+            config_tree(dir.path()),
+            before_poll,
+            "a reload cycle must never rewrite, add, or remove config files"
+        );
+    }
+
+    #[test]
+    fn creator_trace_lines_are_gated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = creator_app(dir.path(), "[movement]\nwalk_speed = 4.6\n");
+        assert!(!app.creator_trace, "a bare launch does not emit traces");
+        let config_dir = dir.path().join(opencraft::config::CONFIG_DIR);
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 8.0\n");
+        let applied = app.config.reload_file(&config_dir, ConfigFile::Player);
+        let digest = app.config.digest();
+        let lines = watch::reload_trace_lines(&applied, digest);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            format!("creator: applied file=config/player.toml changed=1 digest={digest:#018x}")
+        );
+
+        write_config(dir.path(), "player.toml", "[movement]\nwalk_speed = 0.0\n");
+        let rejected = app.config.reload_file(&config_dir, ConfigFile::Player);
+        let lines = watch::reload_trace_lines(&rejected, app.config.digest());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(
+                "creator: rejected file=config/player.toml field=movement.walk_speed reason="
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains('\n'), "a trace line is always one line");
+
+        // The flag is the per-launch half of the emission gate; the other half
+        // is `watch::CREATOR_TOOLS`, pinned in the method source because a test
+        // cannot capture process stdout safely.
+        let save_path = dir.path().join("traced.mcvx");
+        let cli = CliConfig::parse_args([
+            "--creator-trace",
+            "--new",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            Some(&config_dir),
+        );
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let traced =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert!(
+            traced.creator_trace,
+            "--creator-trace must reach the emission gate"
+        );
+
+        let source = include_str!("main.rs");
+        let emit = source
+            .split("fn emit_creator_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_creator_trace");
+        let emit = &emit[..emit
+            .find("\n    }\n")
+            .expect("emit_creator_trace must close")];
+        assert!(emit.contains("!watch::CREATOR_TOOLS"));
+        assert!(emit.contains("!self.creator_trace"));
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S02-T06: F6 read-only creator overlay composition surface
+    // -----------------------------------------------------------------------
+
+    /// Bounded `RedrawRequested` arm source, shared by the draw-order tests.
+    fn creator_redraw_source() -> &'static str {
+        let source = include_str!("main.rs");
+        source
+            .split("WindowEvent::RedrawRequested =>")
+            .nth(1)
+            .expect("window_event must handle RedrawRequested")
+            .split("WindowEvent::CursorMoved")
+            .next()
+            .expect("the RedrawRequested arm must end before CursorMoved")
+    }
+
+    #[test]
+    fn creator_f6_is_a_gated_utility_key() {
+        let source = include_str!("main.rs");
+        let playing = source
+            .split("fn window_event(")
+            .nth(1)
+            .expect("main.rs must define window_event");
+        let f5_at = playing
+            .find("KeyCode::F5 if pressed && !event.repeat")
+            .expect("F5 must stay a utility key");
+        let escape_at = playing
+            .find("KeyCode::Escape if pressed && !event.repeat")
+            .expect("Escape must stay a utility key");
+        let f6_at = playing
+            .find("KeyCode::F6 if pressed && !event.repeat")
+            .expect("F6 must be handled in the Playing key match");
+        assert!(
+            f5_at < f6_at && f6_at < escape_at,
+            "F6 must sit beside F5 and before the Escape/Pause arm"
+        );
+
+        let f6 = &playing[f6_at..escape_at];
+        assert!(
+            f6.contains("watch::CREATOR_TOOLS"),
+            "F6 must be a dev-only utility key: {f6}"
+        );
+        assert!(
+            f6.contains("toggle_overlay"),
+            "F6 must toggle the creator overlay: {f6}"
+        );
+        assert!(
+            f6.contains("creator_overlay_dirty = true"),
+            "toggling must schedule a recompose: {f6}"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_draw_order() {
+        let redraw = creator_redraw_source();
+        let update_at = redraw
+            .find("gpu.creator_text.update(")
+            .expect("the overlay buffer must be updated in RedrawRequested");
+        let quads_at = redraw
+            .find("gpu.ui.set_quads(")
+            .expect("the UI pass must upload quads in RedrawRequested");
+        let area_at = redraw[quads_at..]
+            .find("gpu.creator_text")
+            .map(|offset| quads_at + offset)
+            .expect("the overlay text area must be built in RedrawRequested");
+        let area = &redraw[area_at..];
+        let area = &area[..area.find(')').expect("the text area call must close")];
+        assert!(
+            area.contains(".text_area("),
+            "the creator buffer must build a text area: {area}"
+        );
+        assert!(
+            update_at < quads_at,
+            "the creator buffer must be shaped before its panel quad upload"
+        );
+        assert!(
+            quads_at < area_at,
+            "the creator text area must be assembled after the quad upload"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_draw_is_gated() {
+        let redraw = creator_redraw_source();
+        assert!(
+            redraw.contains("if watch::CREATOR_TOOLS && self.creator.overlay_visible"),
+            "both the panel and the text area must share the dev+visibility gate"
+        );
+        let stats_area_at = redraw
+            .find("let stats_text_area = gpu.stats.text_area(")
+            .expect("the stats text area must stay the first area");
+        let push_at = redraw[stats_area_at..]
+            .find("areas.push(")
+            .map(|offset| stats_area_at + offset)
+            .expect("the creator text area must be pushed after the stats area");
+        let pushed = &redraw[push_at..];
+        let pushed = &pushed[..pushed.find(");").expect("the areas push must close")];
+        assert!(
+            pushed.contains("gpu.creator_text") && pushed.contains(".text_area("),
+            "the creator text area must be pushed after the stats area: {pushed}"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_uses_compact_metrics() {
+        let source = include_str!("main.rs");
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        let creator_at = resumed
+            .find("let creator_text")
+            .expect("resumed must build the creator buffer");
+        let creator = &resumed[creator_at..];
+        let creator = &creator[..creator.find(");").expect("the metrics call must close")];
+        assert!(
+            creator.contains("StatsOverlay::with_metrics(")
+                && creator.contains("CREATOR_FONT_SIZE")
+                && creator.contains("CREATOR_LINE_HEIGHT"),
+            "the creator overlay must use its compact metrics: {creator}"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_recomposes_on_resize_and_reload() {
+        let source = include_str!("main.rs");
+        let resized = source
+            .split("WindowEvent::Resized(new_size) =>")
+            .nth(1)
+            .expect("window_event must handle Resized")
+            .split("WindowEvent::KeyboardInput")
+            .next()
+            .expect("the Resized arm must end before KeyboardInput");
+        assert!(
+            resized.contains("self.creator_overlay_dirty = true"),
+            "a resize must recompose the wrapped creator text"
+        );
+
+        let poll = source
+            .split("fn poll_config_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_config_watcher")
+            .split("fn poll_config_watcher_if_due(")
+            .next()
+            .expect("poll_config_watcher must end before the scheduling wrapper");
+        assert!(
+            poll.contains("settled.push(file)"),
+            "the poll must still collect settled files"
+        );
+        assert!(
+            poll.contains("self.creator_overlay_dirty = true"),
+            "a settled or pending-change reload must recompose the overlay"
+        );
+    }
+
+    #[test]
+    fn creator_overlay_composes_only_when_dirty() {
+        let redraw = creator_redraw_source();
+        let gate_at = redraw
+            .find("if self.creator_overlay_dirty")
+            .expect("composition must be change-gated");
+        let after = &redraw[gate_at..];
+        assert!(
+            after.contains("watch::overlay_lines("),
+            "the dirty path must call the pure formatter"
+        );
+        assert!(
+            after.contains("self.creator_overlay_dirty = false"),
+            "the dirty flag must clear after one recomposition"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S03-T04: live block/mob texture reload wiring
+    // -----------------------------------------------------------------------
+
+    /// A headless GameApp whose settings, packs, and background live entirely
+    /// in `dir`, so these tests never read the repository `packs/` or
+    /// `settings.toml`.
+    fn pack_app(dir: &Path) -> GameApp {
+        std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
+        let content = StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None);
+        let save_path = dir.join("pack-app.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// Write a v1 manifest and return the pack folder.
+    fn write_pack_manifest(app: &GameApp, folder: &str) -> PathBuf {
+        let dir = app.packs_root.join(folder);
+        write_pack_fixture(&dir, folder);
+        dir
+    }
+
+    /// Apply an ordered stack through the production seam.
+    fn apply_pack_stack_of(app: &mut GameApp, stack: &[&str]) {
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+        app.settings.pack_stack = stack.iter().map(|name| (*name).to_string()).collect();
+        app.apply_pack_stack();
+    }
+
+    /// First poll records the edit as pending; the second crosses the 250 ms
+    /// settle window. The injected clock means the tests never sleep.
+    fn settle_pack(app: &mut GameApp, base: Instant) {
+        app.poll_pack_watcher(base + Duration::from_millis(10));
+        app.poll_pack_watcher(base + Duration::from_millis(400));
+    }
+
+    #[test]
+    fn pack_texture_live_edit_updates_stone_and_pig_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        write_solid_png(&pack.join("pig_body.png"), [40, 50, 60, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        assert!(app.pack_layer_uploads.is_empty());
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("pig_body.png"), [20, 200, 10, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32, 32u32]),
+            "only stone and pig_body queue uploads"
+        );
+        let presentation = app
+            .pack_presentation
+            .as_ref()
+            .expect("non-default stack has a presentation");
+        assert_eq!(&presentation.base.layers[3][..4], &[200, 10, 20, 255]);
+        assert_eq!(&presentation.base.layers[32][..4], &[20, 200, 10, 255]);
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/textures/"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_texture_corrupt_png_keeps_last_good_layer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        let last_good = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers[3]
+            .clone();
+        assert_eq!(&last_good[..4], &[200, 10, 20, 255]);
+        app.pack_layer_uploads.clear();
+
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::write(pack.join("stone.png"), b"not a png at all")
+            .expect("corrupt the authored PNG");
+        settle_pack(&mut app, t1);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            presentation.base.layers[3], last_good,
+            "a corrupt file keeps the last good layer"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a rejected edit must not queue an upload"
+        );
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("a rejection is visible");
+        assert!(status.starts_with("packs/textures/stone.png: "), "{status}");
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        let message = app.game_message.as_ref().expect("one transient notice");
+        assert_eq!(message.text, status);
+
+        let line = pack::watch::rejected_line("packs/textures/stone.png", "failed to decode PNG");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.starts_with(
+            "creator: texture rejected path=packs/textures/stone.png reason=failed to decode PNG"
+        ));
+
+        // A test cannot capture process stdout safely, so pin the emission
+        // gate in the source instead.
+        let source = include_str!("main.rs");
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(emit.contains("!watch::CREATOR_TOOLS"));
+        assert!(emit.contains("!self.creator_trace"));
+    }
+
+    #[test]
+    fn pack_texture_live_edit_sibling_isolation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        write_solid_png(&pack.join("dirt.png"), [40, 50, 60, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let stone_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers[3]
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("stone.png"), b"broken").expect("corrupt stone");
+        write_solid_png(&pack.join("dirt.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([2u32]),
+            "the valid sibling still applies"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.base.layers[2][..4], &[1, 2, 3, 255]);
+        assert_eq!(
+            presentation.base.layers[3], stone_before,
+            "the rejected file keeps its last good layer"
+        );
+        assert!(app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("status")
+            .starts_with("packs/textures/stone.png: "));
+    }
+
+    #[test]
+    fn pack_texture_shadowed_pack_edit_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        let beta = write_pack_manifest(&app, "beta");
+        write_solid_png(&alpha.join("stone.png"), [1, 2, 3, 255]);
+        write_solid_png(&beta.join("stone.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha", "beta"]);
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[4, 5, 6, 255],
+            "the later pack wins the visible layer"
+        );
+
+        let t0 = Instant::now();
+        write_solid_png(&alpha.join("stone.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a shadowed lower-pack edit uploads nothing"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[4, 5, 6, 255],
+            "the visible winner is unchanged"
+        );
+    }
+
+    #[test]
+    fn pack_texture_missing_at_launch_appears_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "late");
+        apply_pack_stack_of(&mut app, &["late"]);
+        let procedural = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .procedural[3]
+            .clone();
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.base.layers[3][..4], &[70, 80, 90, 255]);
+        assert_ne!(presentation.base.layers[3], procedural);
+    }
+
+    #[test]
+    fn pack_asset_live_edit_updates_frozen_pack_layer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "mod");
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("unused.png"), [1, 1, 1, 255]);
+        apply_pack_stack_of(&mut app, &["mod"]);
+
+        let watch = app.pack_watch.as_ref().expect("v2 stack has a watch list");
+        assert!(watch
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/mod/ruby.png"));
+        assert!(
+            watch
+                .entries()
+                .iter()
+                .all(|entry| !entry.display.contains("unused.png")),
+            "an authored-but-unreferenced asset is never watched"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .pack_layers[0][..4],
+            &[200, 10, 20, 255]
+        );
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("ruby.png"), [20, 200, 30, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([u32::from(PACK_LAYER_BASE)]),
+            "the frozen 48+slot index is the only upload"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(&presentation.pack_layers[0][..4], &[20, 200, 30, 255]);
+        assert_eq!(presentation.pack_layer_sources[0].path, "ruby.png");
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S07-T03: live built-in icon sprite overrides
+    // -----------------------------------------------------------------------
+
+    /// Write a v2 manifest whose only content is a `[builtin_icons]` table.
+    /// The paths are authored even when the PNGs do not exist yet.
+    fn write_v2_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
+        let mut text = String::from("format_version = 2\nname = \"icons\"\n\n[builtin_icons]\n");
+        for (name, path) in overrides {
+            text.push_str(&format!("{name} = \"{path}\"\n"));
+        }
+        std::fs::write(pack.join("pack.toml"), text).expect("write v2 builtin manifest");
+    }
+
+    /// Write a v2 manifest with no content arrays and no `[builtin_icons]`
+    /// table. Its pack identity matches [`write_v2_builtin_manifest`], so
+    /// switching between the two never changes the content fingerprint.
+    fn write_v2_empty_manifest(pack: &Path) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"icons\"\n",
+        )
+        .expect("write v2 empty manifest");
+    }
+
+    #[test]
+    fn pack_builtin_icon_live_edit_updates_sprite_atlas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(
+            &pack,
+            &[
+                ("apple", "apple.png"),
+                ("wood_pickaxe", "textures/pickaxe.png"),
+            ],
+        );
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        std::fs::create_dir_all(pack.join("textures")).expect("create textures dir");
+        write_solid_png(
+            &pack.join("textures").join("pickaxe.png"),
+            [40, 50, 60, 255],
+        );
+        apply_pack_stack_of(&mut app, &["icons"]);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[10, 20, 30, 255]
+        );
+        assert_eq!(
+            &presentation.builtin_icons["wood_pickaxe"][..4],
+            &[40, 50, 60, 255]
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a stack apply schedules one atlas upload"
+        );
+
+        let before = app.compose_current_item_sprite_layers();
+        assert_eq!(&before[1][..4], &[10, 20, 30, 255], "apple layer");
+        assert_eq!(&before[11][..4], &[40, 50, 60, 255], "wood_pickaxe layer");
+
+        app.pack_item_sprite_dirty = false;
+        app.pack_layer_uploads.clear();
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a visible sprite edit schedules one atlas upload"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a sprite edit must never queue a block texture layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[200, 10, 20, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+
+        let after = app.compose_current_item_sprite_layers();
+        assert_eq!(&after[1][..4], &[200, 10, 20, 255]);
+        for layer in 0..after.len() {
+            if layer == 1 {
+                continue;
+            }
+            assert_eq!(after[layer], before[layer], "layer {layer} must not move");
+        }
+    }
+
+    #[test]
+    fn pack_builtin_icon_malformed_keeps_last_good_or_procedural() {
+        // A valid override that is later corrupted keeps its last good bytes
+        // and queues no upload.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        let last_good = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons["apple"]
+            .clone();
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("apple.png"), b"not a png at all")
+            .expect("corrupt the authored override");
+        settle_pack(&mut app, t0);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.builtin_icons["apple"], last_good);
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a rejected sprite edit must not upload"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(status.starts_with("packs/icons/apple.png: "), "{status}");
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+
+        // An override that is already corrupt at apply keeps procedural art
+        // and is still watched so a fixed file appears live.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "bad");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        std::fs::write(pack.join("apple.png"), b"not a png").expect("corrupt at launch");
+        apply_pack_stack_of(&mut app, &["bad"]);
+
+        let procedural = compose_item_sprite_layers(&[]);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        assert_eq!(app.compose_current_item_sprite_layers()[1], procedural[1]);
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.kind == PackFileKind::BuiltinIcon { name: "apple" }));
+
+        app.pack_item_sprite_dirty = false;
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a fixed file applies live at the pinned layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[70, 80, 90, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_missing_at_launch_appears_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "late");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        apply_pack_stack_of(&mut app, &["late"]);
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        let watch = app.pack_watch.as_ref().expect("watch");
+        let entry = watch
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == PackFileKind::BuiltinIcon { name: "apple" })
+            .expect("a missing override is still watched");
+        assert_eq!(entry.display, "packs/late/apple.png");
+        assert!(!entry.path.exists());
+
+        app.pack_item_sprite_dirty = false;
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [70, 80, 90, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(app.pack_item_sprite_dirty);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[70, 80, 90, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("pack status");
+        assert!(
+            status.starts_with("texture applied packs/late/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_later_pack_wins_and_shadowed_edit_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        write_v2_builtin_manifest(&alpha, &[("apple", "apple.png")]);
+        write_solid_png(&alpha.join("apple.png"), [1, 2, 3, 255]);
+        let beta = write_pack_manifest(&app, "beta");
+        write_v2_builtin_manifest(&beta, &[("apple", "apple.png")]);
+        write_solid_png(&beta.join("apple.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha", "beta"]);
+
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[4, 5, 6, 255],
+            "the later pack wins the visible override"
+        );
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        write_solid_png(&alpha.join("apple.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a shadowed lower-pack edit uploads nothing"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[4, 5, 6, 255]
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::remove_file(beta.join("apple.png")).expect("delete the visible override");
+        settle_pack(&mut app, t1);
+
+        assert!(
+            app.pack_item_sprite_dirty,
+            "deleting the winner reveals the lower override live"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[9, 9, 9, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_edit_leaves_digests_and_registries_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["icons"]);
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let (fingerprint, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("apple.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert!(app.pack_item_sprite_dirty);
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a sprite edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[200, 10, 20, 255]
+        );
+    }
+
+    #[test]
+    fn pack_builtin_icon_manifest_add_and_remove_are_live_without_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        assert_eq!(app.creator.restart_required, None);
+
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let (fingerprint, base_layers, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_item_sprite_dirty = false;
+        let procedural = compose_item_sprite_layers(&[]);
+
+        // Adding the override table and its PNG is one manifest edit that
+        // must apply live: the table is presentation-only.
+        let t0 = Instant::now();
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_solid_png(&pack.join("apple.png"), [11, 22, 33, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator.restart_required, None,
+            "an identity-free override table must not require a restart"
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "a visible override queues the sprite atlas"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "an override must never queue a block layer"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(
+            &presentation.builtin_icons["apple"][..4],
+            &[11, 22, 33, 255]
+        );
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [11, 22, 33, 255],
+            "apple is pinned to sprite layer 1"
+        );
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(
+            watch.entries().iter().any(|entry| {
+                entry.kind == PackFileKind::BuiltinIcon { name: "apple" }
+                    && entry.display == "packs/icons/apple.png"
+            }),
+            "the newly authored path joins the watch list"
+        );
+        assert_eq!(watch.entry_count(), watch_count + 1);
+        let status = app.creator.pack_status.as_deref().expect("applied status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+
+        // Every frozen allocation/identity surface is untouched.
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(Arc::as_ptr(&app.session_registry), session_ptr);
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+
+        // Removing the table restores procedural art live and drops the path
+        // from the watch list.
+        app.pack_item_sprite_dirty = false;
+        let t1 = t0 + Duration::from_secs(1);
+        write_v2_empty_manifest(&pack);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_item_sprite_dirty);
+        assert!(app.pack_layer_uploads.is_empty());
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert!(!presentation.builtin_icons.contains_key("apple"));
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1],
+            procedural[1],
+            "removing the override reveals procedural apple art"
+        );
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(!watch
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/icons/apple.png"));
+        assert_eq!(
+            watch.entry_count(),
+            watch_count,
+            "the removed authored path leaves the watch list"
+        );
+        assert_eq!(
+            app.creator.pack_status.as_deref(),
+            Some("builtin icon apple restored")
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_manifest_add_with_missing_or_corrupt_art_is_watchable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "icons");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["icons"]);
+        app.pack_item_sprite_dirty = false;
+        let procedural = compose_item_sprite_layers(&[]);
+
+        // The manifest authors a path before the file exists: it must be
+        // watched so the later write applies live.
+        let t0 = Instant::now();
+        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a missing override changes no visible bytes"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        assert!(app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons
+            .is_empty());
+        let watch = app.pack_watch.as_ref().expect("watch");
+        let entry = watch
+            .entries()
+            .iter()
+            .find(|entry| entry.display == "packs/icons/apple.png")
+            .expect("a missing override is still watched");
+        assert_eq!(entry.kind, PackFileKind::BuiltinIcon { name: "apple" });
+        assert!(!entry.path.exists());
+        assert_eq!(app.compose_current_item_sprite_layers()[1], procedural[1]);
+
+        // A corrupt file is rejected: procedural art stays and the path stays
+        // watched for the fix.
+        let t1 = t0 + Duration::from_secs(1);
+        std::fs::write(pack.join("apple.png"), b"not a png").expect("write corrupt png");
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert!(!app.pack_item_sprite_dirty);
+        assert!(
+            app.creator
+                .pack_status
+                .as_deref()
+                .expect("rejection status")
+                .starts_with("packs/icons/apple.png: "),
+            "the rejection names the authored path"
+        );
+        assert!(app.creator.last_error.is_some());
+        assert!(!app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .builtin_icons
+            .contains_key("apple"));
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/icons/apple.png"));
+
+        // Fixing the same path applies live at the pinned apple layer.
+        let t2 = t1 + Duration::from_secs(1);
+        write_solid_png(&pack.join("apple.png"), [7, 8, 9, 255]);
+        settle_pack(&mut app, t2);
+
+        assert!(app.pack_item_sprite_dirty);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .builtin_icons["apple"][..4],
+            &[7, 8, 9, 255]
+        );
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [7, 8, 9, 255]
+        );
+        let status = app.creator.pack_status.as_deref().expect("applied status");
+        assert!(
+            status.starts_with("texture applied packs/icons/apple.png"),
+            "{status}"
+        );
+        assert!(app.creator.last_error.is_none());
+    }
+
+    #[test]
+    fn pack_builtin_icon_manifest_add_block_still_requires_restart_without_moving_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
+        app.pack_layer_uploads.clear();
+
+        let (fingerprint, base_layers, pack_layers, base_sources, pack_layer_sources) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.base_sources.clone(),
+                presentation.pack_layer_sources.clone(),
+            )
+        };
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+
+        // One edit adds both allocated content (a block) and an identity-free
+        // override. The block still needs a restart; the override may apply
+        // live without moving any layer.
+        let t0 = Instant::now();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
+        )
+        .expect("write combined manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        write_solid_png(&pack.join("apple.png"), [4, 5, 6, 255]);
+        settle_pack(&mut app, t0);
+
+        let reason = app
+            .creator
+            .restart_required
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
+            .expect("content changes still require a restart");
+        assert_eq!(reason, "textures: content changed; restart to apply");
+        assert_eq!(
+            app.creator.pack_status.as_deref(),
+            Some(reason),
+            "the restart reason wins over the live override status"
+        );
+        assert!(app.creator.last_error.is_none());
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "adding a block must never queue a live layer upload"
+        );
+        assert!(
+            app.pack_item_sprite_dirty,
+            "the identity-free override still applies live"
+        );
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.base_sources, base_sources);
+        assert_eq!(presentation.pack_layer_sources, pack_layer_sources);
+        assert_eq!(&presentation.builtin_icons["apple"][..4], &[4, 5, 6, 255]);
+        assert_eq!(
+            app.compose_current_item_sprite_layers()[1][..4],
+            [4, 5, 6, 255]
+        );
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.display == "packs/textures/apple.png"));
+        assert_eq!(Arc::as_ptr(&app.session_registry), session_ptr);
+        assert_eq!(app.session_registry.digest(), session_digest);
+    }
+
+    #[test]
+    fn pack_builtin_icon_source_pin_uploads_via_set_item_sprite_layers() {
+        let source = include_str!("main.rs");
+
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        assert!(resumed.contains("compose_current_item_sprite_layers"));
+        assert!(resumed.contains("self.pack_item_sprite_dirty = false"));
+
+        let installed = source
+            .split("fn on_session_installed(&mut self)")
+            .nth(1)
+            .expect("main.rs must define on_session_installed");
+        let installed = &installed[..installed.find("\n    fn ").unwrap_or(installed.len())];
+        assert!(installed
+            .contains("compose_item_sprite_layers_for(self.session.registry.pack_icons())"));
+        assert!(installed.contains("set_item_sprite_layers"));
+        assert!(installed.contains("self.pack_item_sprite_dirty = false"));
+
+        let redraw = creator_redraw_source();
+        assert!(redraw.contains("compose_item_sprite_layers_with_presentation"));
+        assert!(redraw.contains("self.pack_presentation.as_ref()"));
+        assert!(redraw.contains("self.session_registry.pack_icons()"));
+        assert!(redraw.contains("set_item_sprite_layers"));
+        assert!(redraw.contains("self.pack_item_sprite_dirty = false"));
+
+        let handler = source
+            .split("fn apply_settled_pack_entry(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_pack_entry")
+            .split("fn apply_settled_pack_manifest(")
+            .next()
+            .expect("the watcher dispatch must end before the manifest handler");
+        assert!(handler.contains("PackFileKind::BuiltinIcon { name }"));
+        assert!(handler.contains("decode_builtin_icon_file"));
+        assert!(handler.contains("apply_builtin_icon"));
+        let icon_arm = handler
+            .split("PackFileKind::BuiltinIcon { name }")
+            .nth(1)
+            .expect("the builtin icon arm must exist");
+        assert!(
+            !icon_arm.contains("pack_layer_uploads"),
+            "a sprite edit must never queue a block layer upload"
+        );
+
+        let poll = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_settled_pack_entry(")
+            .next()
+            .expect("poll_pack_watcher must end before the apply helper");
+        assert!(!poll.contains("apply_pack_stack("));
+    }
+
+    #[test]
+    fn pack_texture_edit_leaves_digests_and_session_registry_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let config_digest = app.config.digest();
+        let fingerprint = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .fingerprint;
+
+        let t0 = Instant::now();
+        write_solid_png(&pack.join("stone.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a texture edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(app.config.digest(), config_digest);
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(&presentation.base.layers[3][..4], &[200, 10, 20, 255]);
+    }
+
+    #[test]
+    fn pack_watch_rebaselines_on_stack_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let alpha = write_pack_manifest(&app, "alpha");
+        let beta = write_pack_manifest(&app, "beta");
+        write_solid_png(&alpha.join("stone.png"), [1, 2, 3, 255]);
+        write_solid_png(&beta.join("stone.png"), [4, 5, 6, 255]);
+        apply_pack_stack_of(&mut app, &["alpha"]);
+        assert!(app
+            .pack_watch
+            .as_ref()
+            .expect("watch")
+            .entries()
+            .iter()
+            .any(|entry| entry.folder == "alpha"));
+
+        let t0 = Instant::now();
+        apply_pack_stack_of(&mut app, &["beta"]);
+
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a stack apply queues no live uploads"
+        );
+        assert_eq!(app.creator.pack_status, None);
+        let watch = app.pack_watch.as_ref().expect("watch");
+        assert!(
+            watch.entries().iter().all(|entry| entry.folder == "beta"),
+            "the old stack's entries are gone"
+        );
+        assert!(app.creator_next_poll_at().is_some());
+
+        // The rebuilt watch is already baselined: a poll with no change emits
+        // nothing and queues no upload.
+        app.poll_pack_watcher(t0 + Duration::from_millis(400));
+        assert!(app.pack_layer_uploads.is_empty());
+
+        // The new baseline still tracks real edits at the frozen index.
+        write_solid_png(&beta.join("stone.png"), [9, 9, 9, 255]);
+        settle_pack(&mut app, t0 + Duration::from_secs(1));
+        assert_eq!(app.pack_layer_uploads, BTreeSet::from([3u32]));
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[9, 9, 9, 255]
+        );
+    }
+
+    #[test]
+    fn pack_watch_scheduling_and_trace_gates() {
+        let source = include_str!("main.rs");
+        let about_to_wait = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("main.rs must define about_to_wait")
+            .split("// Headless presentation digest")
+            .next()
+            .expect("about_to_wait must end before the presentation digest");
+        assert!(
+            about_to_wait.contains("poll_pack_watcher_if_due(Instant::now())"),
+            "about_to_wait must poll the live pack watcher"
+        );
+        assert!(
+            about_to_wait.contains("next_wait_deadline("),
+            "the vsync wait must include the earlier creator deadline"
+        );
+
+        // The partial-upload path is the only way a settled edit reaches the
+        // GPU; a full compose must clear the queue it covers.
+        let redraw = creator_redraw_source();
+        assert!(
+            redraw.contains("write_block_layer(&gpu.ctx.queue"),
+            "a settled edit must upload one layer: {redraw}"
+        );
+        assert!(
+            redraw.contains("self.pack_layer_uploads.clear()"),
+            "both the full compose and the partial upload must drain the queue"
+        );
+
+        let poll_due = source
+            .split("fn poll_pack_watcher_if_due(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher_if_due")
+            .split("fn poll_pack_watcher(")
+            .next()
+            .expect("the scheduling wrapper must end before the poll");
+        assert!(poll_due.contains("!watch::CREATOR_TOOLS"));
+        assert!(
+            poll_due.contains("self.pack_presentation.is_none()"),
+            "the pack poll must be presentation-gated"
+        );
+
+        let poll = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_settled_pack_entry(")
+            .next()
+            .expect("poll_pack_watcher must end before the apply helper");
+        assert!(
+            !poll.contains("apply_pack_stack("),
+            "a watch path must never rebuild the stack"
+        );
+        assert!(poll.contains("!watch::CREATOR_TOOLS"));
+
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(
+            emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
+            "pack traces need the dev build AND --creator-trace"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S03-T05: manifest content guard and restart-required
+    // -----------------------------------------------------------------------
+
+    /// Rewrite `pack.toml` as a v2 manifest whose one block references a new
+    /// PNG. This changes both the content digest and the pack-layer count, so
+    /// every frozen-fingerprint comparison must report a restart.
+    fn write_v2_block_manifest(pack: &Path) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+        )
+        .expect("write v2 manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+    }
+
+    /// Write a v2 manifest with one craftable item and one 1x1 recipe.
+    /// Changing `count` is a recipe-only edit: identity and allocation stay
+    /// identical, only the recipe definition moves.
+    fn write_v2_recipe_manifest(pack: &Path, count: u16) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            format!(
+                "format_version = 2\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
+            ),
+        )
+        .expect("write v2 recipe manifest");
+        write_solid_png(&pack.join("gem.png"), [40, 50, 60, 255]);
+    }
+
+    /// Write a v2 manifest whose only content is one built-in recipe patch.
+    fn write_v2_recipe_patch_manifest(pack: &Path, enabled: bool) {
+        std::fs::write(
+            pack.join("pack.toml"),
+            format!(
+                "format_version = 2\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
+            ),
+        )
+        .expect("write v2 recipe patch manifest");
+    }
+
+    /// Build a 1x1 stone grid through the production crafting seam so the
+    /// preview is evaluated by the same matcher a player uses.
+    fn recipe_preview_output_count(app: &GameApp) -> Option<u16> {
+        let grid = crafting_demo_grid(
+            &app.session_registry,
+            GridKind::Player,
+            &["S"],
+            &[('S', ItemId::Block(BlockId::Stone))],
+        );
+        grid.preview_with(&app.session_registry)
+            .map(|preview| preview.output_count)
+    }
+
+    /// Install one fresh live session resolved against the current
+    /// `base_registry`, the same path the New Game flow uses.
+    fn install_pack_session(app: &mut GameApp, save_path: &Path) {
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &app.base_registry, &app.config);
+        app.start_world_session(session);
+    }
+
+    #[test]
+    fn pack_recipe_edit_sets_restart_required_without_moving_the_live_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+        install_pack_session(&mut app, &dir.path().join("recipe-save.mcvx"));
+
+        let live_recipe = (0..app.session_registry.recipe_count())
+            .filter_map(|index| app.session_registry.recipe(index))
+            .find(|recipe| recipe.name == "mymod:gem_recipe")
+            .expect("the live session carries the installed pack recipe");
+        assert_eq!(live_recipe.count, 1);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the installed recipe is previewable before the edit"
+        );
+
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let (fingerprint, base_layers, pack_layers, pack_icons) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.fingerprint,
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.pack_icons.clone(),
+            )
+        };
+        app.pack_layer_uploads.clear();
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+
+        let reason = "demo: recipe changed; restart to apply";
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason)
+        );
+        assert_eq!(app.creator.pack_status.as_deref(), Some(reason));
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Recipe)
+        );
+        assert!(app.creator.last_error.is_none());
+
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(overlay.contains(&format!("packs: {reason}")), "{overlay}");
+        assert!(
+            overlay.contains(&format!("restart required: {reason}")),
+            "{overlay}"
+        );
+        let packs_message = app.packs_message.as_ref().expect("packs restart notice");
+        assert!(
+            packs_message.text.contains(reason),
+            "{}",
+            packs_message.text
+        );
+        assert!(packs_message.text.contains(PACK_RESTART_WORDING));
+        let game_message = app.game_message.as_ref().expect("game restart notice");
+        assert!(game_message.text.contains(reason), "{}", game_message.text);
+        assert!(game_message.text.contains(PACK_RESTART_WORDING));
+
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a recipe edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the live registry still previews the installed count"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a recipe edit never queues a texture upload"
+        );
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.pack_icons, pack_icons);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "the frozen watch list survives a recipe edit"
+        );
+    }
+
+    #[test]
+    fn pack_recipe_patch_edit_sets_recipe_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_empty_manifest(&pack);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_patch_manifest(&pack, false);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some("demo: recipe changed; restart to apply")
+        );
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Recipe)
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+    }
+
+    #[test]
+    fn pack_recipe_and_block_edit_says_content_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "format_version = 2\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
+        )
+        .expect("write mixed manifest");
+        write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
+        settle_pack(&mut app, t0);
+
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some("demo: content changed; restart to apply"),
+            "a mixed recipe + block edit keeps the broad reason"
+        );
+        assert_eq!(
+            app.pack_restart_folders.get("demo"),
+            Some(&pack::watch::RestartKind::Content)
+        );
+    }
+
+    #[test]
+    fn pack_recipe_revert_clears_restart_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_v2_recipe_manifest(&pack, 1);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert_eq!(app.creator.pack_status, None);
+        assert!(
+            app.pack_restart_folders.is_empty(),
+            "a revert deletes the folder entry"
+        );
+        assert!(app.pack_layer_uploads.is_empty());
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(!overlay.contains("restart required:"), "{overlay}");
+    }
+
+    #[test]
+    fn pack_recipe_edit_keeps_texture_edits_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+        let reason = app
+            .creator
+            .restart_required
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
+            .expect("recipe edit requires a restart")
+            .to_string();
+        assert_eq!(reason, "demo: recipe changed; restart to apply");
+        assert!(app.pack_layer_uploads.is_empty());
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_solid_png(&pack.join("stone.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32]),
+            "a texture edit still applies at the frozen layer"
+        );
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason.as_str()),
+            "a live texture edit never clears the recipe restart"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[1, 2, 3, 255]
+        );
+    }
+
+    /// End-to-end proof of the recipe restart boundary: the live process keeps
+    /// its frozen registry while a fresh process loads the same save against
+    /// the edited registry, resolves every saved name, previews and crafts the
+    /// new count, and surfaces the existing one-time changed-content notice.
+    #[test]
+    fn pack_recipe_same_save_restart_previews_and_crafts_new_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "demo");
+        write_v2_recipe_manifest(&pack, 1);
+        apply_pack_stack_of(&mut app, &["demo"]);
+
+        let save_path = dir.path().join("pack-app.mcvx");
+        install_pack_session(&mut app, &save_path);
+        app.session.clock.day_index = 3;
+        app.session.clock.time_of_day = 6_000;
+        save_current_world(&mut app.session).expect("the installed session saves");
+
+        let installed_recipe = app
+            .session_registry
+            .recipe_by_name("mymod:gem_recipe")
+            .expect("the live session carries the installed pack recipe");
+        assert_eq!(installed_recipe.count, 1);
+        assert!(installed_recipe.enabled);
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the installed recipe previews before the edit"
+        );
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+
+        let t0 = Instant::now();
+        write_v2_recipe_manifest(&pack, 2);
+        settle_pack(&mut app, t0);
+
+        let reason = "demo: recipe changed; restart to apply";
+        assert_eq!(
+            app.creator
+                .restart_required
+                .as_ref()
+                .map(watch::RestartRequired::as_str),
+            Some(reason)
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a settled recipe edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(
+            app.base_registry.digest(),
+            base_digest,
+            "a settled recipe edit never rebuilds the launch base registry"
+        );
+        assert_eq!(
+            recipe_preview_output_count(&app),
+            Some(1),
+            "the live matcher still crafts the installed count"
+        );
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a recipe edit never queues a texture upload"
+        );
+
+        // A same-process load against the stale in-memory base must not adopt
+        // the file edit: only a fresh process rebuilds the registry, and the
+        // pending restart flag stays raised across the session swap.
+        let stale_cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let stale = startup_session_with(&stale_cli, &app.base_registry, &app.config);
+        app.start_world_session(stale);
+        assert_eq!(
+            app.session_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(1),
+            "the stale base registry is not adopted by an in-process load"
+        );
+        assert_eq!(recipe_preview_output_count(&app), Some(1));
+        assert!(
+            app.creator.restart_required.is_some(),
+            "an in-process load never clears the pending file-edit restart"
+        );
+
+        // Fresh-process simulation: rebuild StartupContent from the on-disk
+        // settings/packs exactly like the next launch would.
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+        );
+        assert_eq!(
+            content
+                .base_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(2),
+            "a fresh process loads the edited recipe registry"
+        );
+        let loaded = load_world_from_path_with(&save_path, content.base_registry.as_ref())
+            .expect("the same save loads against the fresh registry");
+        assert_eq!(
+            loaded.unresolved, 0,
+            "a count-only recipe edit resolves every saved name"
+        );
+
+        let fresh_cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let mut fresh = startup_session_with(&fresh_cli, &content.base_registry, &content.config);
+        assert_eq!(fresh.clock.day_index, 3, "the same save reopens its day");
+        assert_eq!(
+            fresh.clock.time_of_day, 6_000,
+            "the same save reopens its time of day"
+        );
+        let fresh_recipe = fresh
+            .registry
+            .recipe_by_name("mymod:gem_recipe")
+            .expect("the fresh registry carries the edited recipe");
+        assert_eq!(fresh_recipe.count, 2);
+        assert!(fresh_recipe.enabled);
+
+        let mut grid = crafting_demo_grid(
+            &fresh.registry,
+            GridKind::Player,
+            &["S"],
+            &[('S', ItemId::Block(BlockId::Stone))],
+        );
+        assert_eq!(
+            grid.preview_with(&fresh.registry)
+                .map(|preview| preview.output_count),
+            Some(2),
+            "the production matcher previews the new count"
+        );
+        let mut inventory = Inventory::empty();
+        let crafted = grid
+            .take_result_with(&fresh.registry, &mut inventory)
+            .expect("the new count crafts through the production matcher");
+        assert_eq!(crafted.count(), 2);
+        assert_eq!(
+            fresh.take_content_notice().as_deref(),
+            Some("content definitions changed"),
+            "the existing one-time content notice is unchanged"
+        );
+
+        let fresh_app_cli =
+            CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let fresh_app = GameApp::new_with_content(
+            fresh_app_cli,
+            fresh,
+            content,
+            dir.path().join("background.mcvx"),
+        );
+        assert_eq!(
+            fresh_app.creator.restart_required, None,
+            "a fresh process starts with no pending restart"
+        );
+        assert_eq!(
+            fresh_app
+                .base_registry
+                .recipe_by_name("mymod:gem_recipe")
+                .map(|recipe| recipe.count),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn pack_manifest_add_block_sets_restart_required_without_moving_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        assert!(app.pack_layer_uploads.is_empty());
+        app.pack_item_sprite_dirty = false;
+
+        let (base_layers, pack_layers, base_sources, pack_layer_sources, fingerprint) = {
+            let presentation = app.pack_presentation.as_ref().expect("presentation");
+            (
+                presentation.base.layers.clone(),
+                presentation.pack_layers.clone(),
+                presentation.base_sources.clone(),
+                presentation.pack_layer_sources.clone(),
+                presentation.fingerprint,
+            )
+        };
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let session_ptr = Arc::as_ptr(&app.session_registry);
+        let session_digest = app.session_registry.digest();
+        let base_digest = app.base_registry.digest();
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+
+        let reason = app
+            .creator
+            .restart_required
+            .as_ref()
+            .map(watch::RestartRequired::as_str)
+            .expect("content change requires a restart");
+        assert_eq!(reason, "textures: content changed; restart to apply");
+        assert_eq!(app.creator.pack_status.as_deref(), Some(reason));
+        assert!(app.creator.last_error.is_none());
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a manifest change must never queue a live upload"
+        );
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a content manifest edit without builtin icons must not compose the sprite atlas"
+        );
+
+        let presentation = app.pack_presentation.as_ref().expect("presentation");
+        assert_eq!(presentation.base.layers, base_layers);
+        assert_eq!(presentation.pack_layers, pack_layers);
+        assert_eq!(presentation.base_sources, base_sources);
+        assert_eq!(presentation.pack_layer_sources, pack_layer_sources);
+        assert_eq!(presentation.fingerprint, fingerprint);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "the frozen watch list survives a manifest edit"
+        );
+        assert_eq!(
+            Arc::as_ptr(&app.session_registry),
+            session_ptr,
+            "a manifest edit never replaces the frozen session registry"
+        );
+        assert_eq!(app.session_registry.digest(), session_digest);
+        assert_eq!(app.base_registry.digest(), base_digest);
+
+        let message = app.packs_message.as_ref().expect("packs restart notice");
+        assert!(
+            message.text.contains(PACK_RESTART_WORDING),
+            "deferred content wording: {}",
+            message.text
+        );
+        assert!(app
+            .game_message
+            .as_ref()
+            .expect("one transient notice")
+            .text
+            .contains(PACK_RESTART_WORDING));
+
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(overlay.contains("packs: "), "{overlay}");
+        assert!(overlay.contains("restart required:"), "{overlay}");
+        assert!(overlay.contains(reason), "{overlay}");
+    }
+
+    #[test]
+    fn pack_manifest_revert_clears_restart_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
+        let watch_count = app.pack_watch.as_ref().expect("watch").entry_count();
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "a manifest edit without override paths keeps the frozen watch list"
+        );
+        assert!(!app.pack_item_sprite_dirty);
+
+        // Restoring the installed manifest content must satisfy the pending
+        // restart without touching the live layers it was already showing.
+        let t1 = t0 + Duration::from_secs(1);
+        write_pack_fixture(&pack, "textures");
+        settle_pack(&mut app, t1);
+
+        assert_eq!(app.creator.restart_required, None);
+        assert_eq!(app.creator.pack_status, None);
+        assert!(
+            app.pack_layer_uploads.is_empty(),
+            "a revert queues no uploads"
+        );
+        assert!(!app.pack_item_sprite_dirty);
+        assert_eq!(
+            app.pack_watch.as_ref().expect("watch").entry_count(),
+            watch_count,
+            "a revert rebuilds nothing"
+        );
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before
+        );
+        let overlay = watch::overlay_lines(&app.config, &app.creator, 140).join("\n");
+        assert!(!overlay.contains("restart required:"), "{overlay}");
+    }
+
+    #[test]
+    fn pack_manifest_invalid_toml_keeps_last_good_and_does_not_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::write(pack.join("pack.toml"), "format_version = 2\n[[blocks]\n")
+            .expect("write corrupt manifest");
+        settle_pack(&mut app, t0);
+
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(
+            status.starts_with("packs/textures/pack.toml: invalid TOML: "),
+            "{status}"
+        );
+        assert!(!status.contains('\n'));
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before,
+            "a corrupt manifest keeps the last good presentation"
+        );
+        assert!(app
+            .game_message
+            .as_ref()
+            .expect("one transient notice")
+            .text
+            .starts_with("packs/textures/pack.toml: "));
+    }
+
+    #[test]
+    fn pack_manifest_texture_edit_after_restart_flag_still_applies_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        app.pack_item_sprite_dirty = false;
+
+        let t0 = Instant::now();
+        write_v2_block_manifest(&pack);
+        settle_pack(&mut app, t0);
+        assert!(app.creator.restart_required.is_some());
+        assert!(
+            !app.pack_item_sprite_dirty,
+            "a content-only manifest edit leaves the sprite atlas alone"
+        );
+        app.pack_layer_uploads.clear();
+
+        let t1 = t0 + Duration::from_secs(1);
+        write_solid_png(&pack.join("stone.png"), [1, 2, 3, 255]);
+        settle_pack(&mut app, t1);
+
+        assert_eq!(
+            app.pack_layer_uploads,
+            BTreeSet::from([3u32]),
+            "a texture edit still applies at the frozen index"
+        );
+        assert_eq!(
+            &app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers[3][..4],
+            &[1, 2, 3, 255]
+        );
+        assert!(
+            app.creator.restart_required.is_some(),
+            "a live texture edit never clears a pending manifest restart"
+        );
+    }
+
+    #[test]
+    fn pack_manifest_missing_file_keeps_last_good_and_does_not_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = pack_app(dir.path());
+        let pack = write_pack_manifest(&app, "textures");
+        write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
+        apply_pack_stack_of(&mut app, &["textures"]);
+        let layers_before = app
+            .pack_presentation
+            .as_ref()
+            .expect("presentation")
+            .base
+            .layers
+            .clone();
+
+        let t0 = Instant::now();
+        std::fs::remove_file(pack.join("pack.toml")).expect("delete manifest");
+        settle_pack(&mut app, t0);
+
+        let status = app
+            .creator
+            .pack_status
+            .as_deref()
+            .expect("rejection status");
+        assert!(
+            status.starts_with("packs/textures/pack.toml: failed to read: "),
+            "{status}"
+        );
+        assert_eq!(app.creator.last_error.as_deref(), Some(status));
+        assert_eq!(app.creator.restart_required, None);
+        assert!(app.pack_layer_uploads.is_empty());
+        assert_eq!(
+            app.pack_presentation
+                .as_ref()
+                .expect("presentation")
+                .base
+                .layers,
+            layers_before,
+            "a missing manifest keeps the last good presentation"
+        );
+        assert!(app.game_message.is_some(), "one transient notice");
+    }
+
+    #[test]
+    fn pack_manifest_creator_overlay_shows_pack_status_and_restart_reason() {
+        let runtime = ConfigRuntime::defaults();
+        let mut creator = CreatorRuntime::new(Instant::now());
+
+        creator.set_pack_status(Some(
+            "textures: content changed; restart to apply".to_string(),
+        ));
+        creator.set_restart_required("textures: content changed; restart to apply");
+        let both = watch::overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(
+            both.contains("packs: textures: content changed; restart to apply"),
+            "{both}"
+        );
+        assert!(
+            both.contains("restart required: textures: content changed; restart to apply"),
+            "{both}"
+        );
+
+        creator.set_pack_status(None);
+        let cleared = watch::overlay_lines(&runtime, &creator, 140).join("\n");
+        assert!(!cleared.contains("packs:"), "{cleared}");
+        assert!(
+            cleared.contains("restart required: textures: content changed; restart to apply"),
+            "{cleared}"
+        );
+    }
+
+    #[test]
+    fn pack_manifest_watcher_never_rebuilds_the_stack_and_stays_gated() {
+        let source = include_str!("main.rs");
+        let watcher = source
+            .split("fn poll_pack_watcher(")
+            .nth(1)
+            .expect("main.rs must define poll_pack_watcher")
+            .split("fn apply_base_layer_upload(")
+            .next()
+            .expect("the watcher path must end before the per-layer apply");
+        assert!(
+            watcher.contains("fn apply_settled_pack_manifest("),
+            "the manifest arm must be handled in the watcher path"
+        );
+        assert!(
+            watcher.contains("PackFileKind::Manifest"),
+            "the manifest kind must be dispatched"
+        );
+        assert!(
+            !watcher.contains("apply_pack_stack("),
+            "no watch path may rebuild the stack"
+        );
+        assert!(watcher.contains("!watch::CREATOR_TOOLS"));
+
+        assert!(
+            watcher.contains("self.apply_settled_pack_entry(entry, now)"),
+            "the poll must thread its injected clock into the settler"
+        );
+        assert!(
+            !watcher.contains("Instant::now()"),
+            "the watcher path must use the poll clock, never wall time"
+        );
+
+        let handler = source
+            .split("fn apply_settled_pack_manifest(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_pack_manifest")
+            .split("fn pack_restart_reason(")
+            .next()
+            .expect("the manifest handler must end before the reason helper");
+        assert_eq!(
+            handler.matches("pack::watch::restart_line(").count(),
+            1,
+            "exactly one restart trace line per settled manifest edit"
+        );
+        // S07-T04 deliberately widens the guard: an identity-free
+        // `[builtin_icons]` edit may reconcile presentation overrides and
+        // rebuild the watch list, but never the stack or live allocation.
+        assert!(
+            handler.contains("apply_settled_builtin_icon_table("),
+            "a settled manifest must reconcile the override table"
+        );
+        assert!(
+            handler.contains("build_pack_watch("),
+            "a changed override path table must rebuild the watch list"
+        );
+        assert!(!handler.contains("apply_pack_stack("));
+        assert!(!handler.contains("self.base_registry ="));
+        assert!(!handler.contains("self.session_registry ="));
+        assert!(!handler.contains("self.pack_presentation ="));
+        assert!(!handler.contains("self.pack_layer_uploads.insert"));
+        assert!(
+            !handler.contains("icon_sources[") && !handler.contains("pack_icons["),
+            "a manifest edit must never assign icon layers"
+        );
+
+        let helper = source
+            .split("fn apply_settled_builtin_icon_table(")
+            .nth(1)
+            .expect("main.rs must define apply_settled_builtin_icon_table")
+            .split("fn apply_base_layer_upload(")
+            .next()
+            .expect("the reconcile helper must end before the per-layer apply");
+        assert!(helper.contains("apply_builtin_icon_table"));
+        assert!(helper.contains("self.pack_presentation.as_mut()"));
+        assert!(helper.contains("self.pack_item_sprite_dirty = true"));
+        assert!(!helper.contains("self.pack_presentation ="));
+        assert!(
+            !helper.contains("pack_layer_uploads.insert"),
+            "a builtin icon table edit must never queue a block layer"
+        );
+
+        let emit = source
+            .split("fn emit_pack_trace(")
+            .nth(1)
+            .expect("main.rs must define emit_pack_trace");
+        let emit = &emit[..emit.find("\n    }\n").expect("emit_pack_trace must close")];
+        assert!(
+            emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
+            "pack status/trace stays behind the dev build AND --creator-trace"
+        );
     }
 }

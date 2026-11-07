@@ -10,7 +10,8 @@ use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::mob::{create_mob_pipeline, MobVertex};
 use crate::render::sky;
 use crate::render::texture::{
-    block_array_layers_match_shape, create_block_texture_array, upload_block_layers,
+    block_array_layers_match_shape, create_block_texture_array, upload_block_layer_at,
+    upload_block_layers,
 };
 use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
@@ -731,6 +732,34 @@ pub struct VoxelRenderer {
     weather_stage: Option<WeatherStage>,
 }
 
+/// Camera framing for one [`Renderer::render_frame`] invocation.
+///
+/// Groups the view state that changes per frame (camera, distance, selection)
+/// so the frame entry point reads as data in, pixels out.
+pub struct FrameView<'a> {
+    /// Camera providing this frame's view-projection.
+    pub camera: &'a Camera,
+    /// Horizontal render distance in chunks.
+    pub render_distance: i32,
+    /// Block-face highlight target, if any.
+    pub target_block: Option<IVec3>,
+    /// Selected hotbar slot, drawn as the selection outline.
+    pub selected_slot: usize,
+}
+
+/// Presentation switches for one [`Renderer::render_frame`] invocation.
+///
+/// The overlay gate, the resolved sky palette, and the optional UI pass are
+/// independent of the world geometry, so they travel together.
+pub struct FramePresentation<'a> {
+    /// Draw the target/selection overlay lines.
+    pub show_overlays: bool,
+    /// Resolved sky/fog/weather palette for this frame.
+    pub sky: SkyParams,
+    /// Deferred UI pass, drawn after the overlay and before presentation.
+    pub ui_pass: Option<&'a dyn UiPass>,
+}
+
 impl VoxelRenderer {
     pub fn new(ctx: &RenderContext) -> Self {
         let (block_texture, tex_view, sampler) =
@@ -1053,30 +1082,44 @@ impl VoxelRenderer {
         upload_block_layers(&self.block_texture, queue, layers);
     }
 
-    // 11 args: the existing world-pass parameters, the T04 batched mob vertex
-    // slice (immediately after `store`), plus the T01 `ui_pass` hook, the T02
-    // `show_overlays` gate, and the S02-T03 grouped `sky` inputs (which since
-    // S03 also carry `time_of_day` for the sky pass). Kept flat rather than
-    // grouped further to avoid churn at the single call site in src/main.rs;
-    // this is the frame-draw entry point, not a general-purpose API.
-    //
+    /// Re-upload exactly one texture-array layer (base mip plus mip chain)
+    /// into the retained texture array.
+    ///
+    /// The dev-only live pack watcher feeds decoded PNGs here so an edited
+    /// block or mob texture touches only its own layer. Never recreates the
+    /// texture, its view, or the camera bind group (MEM111).
+    pub fn write_block_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
+        upload_block_layer_at(&self.block_texture, queue, layer, rgba);
+    }
+
+    /// Draw one frame: sky, world, overlays, then the optional UI pass.
+    ///
+    /// The view and presentation inputs are bundled ([`FrameView`],
+    /// [`FramePresentation`]) so the frame entry point stays a focused list of
+    /// the three geometry sources plus the two per-frame bundles.
+    ///
     // Pass order on the encoder: sky (clears color) -> world (loads color,
     // clears depth: opaque -> mobs -> water -> weather) -> overlay -> optional
     // UI (loads color).
-    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
         ctx: &RenderContext,
         store: &ChunkRenderStore,
         mob_vertices: &[MobVertex],
-        camera: &Camera,
-        render_distance: i32,
-        target_block: Option<IVec3>,
-        selected_slot: usize,
-        show_overlays: bool,
-        sky: SkyParams,
-        ui_pass: Option<&dyn UiPass>,
+        view: FrameView<'_>,
+        presentation: FramePresentation<'_>,
     ) -> Result<usize, wgpu::SurfaceError> {
+        let FrameView {
+            camera,
+            render_distance,
+            target_block,
+            selected_slot,
+        } = view;
+        let FramePresentation {
+            show_overlays,
+            sky,
+            ui_pass,
+        } = presentation;
         let output = ctx.surface.get_current_texture()?;
         let view = output
             .texture
@@ -1990,6 +2033,27 @@ mod tests {
         assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
         assert!(x0.is_finite() && y0.is_finite());
         assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
+    }
+
+    #[test]
+    fn write_block_layer_targets_the_retained_texture_array() {
+        let src = include_str!("pipeline.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
+        let production = &src[..tests_at];
+        let at = production
+            .find("pub fn write_block_layer(")
+            .expect("write_block_layer exists");
+        let body = &production[at..];
+        let body = &body[..body.find("\n    }\n").expect("function body ends") + 6];
+
+        assert!(
+            body.contains("upload_block_layer_at(&self.block_texture, queue, layer, rgba)"),
+            "single-layer uploads must write into the retained texture array"
+        );
+        assert!(
+            !body.contains("create_block_texture_array"),
+            "live uploads must never recreate the texture, view, or bind group"
+        );
     }
 
     #[test]

@@ -22,7 +22,9 @@ use crate::ui::hud::{
     hotbar_count_label_for, hotbar_icon_rect, hotbar_slot_rects, vitals_metrics, vitals_quads,
     AIR_FILL_COLOR, HEART_FILL_COLOR, HUNGER_FILL_COLOR,
 };
-use crate::ui::inventory::{layout, screen_quads, tooltip_lines, tooltip_rect, InventoryMode};
+use crate::ui::inventory::{
+    layout, screen_quads, tooltip_lines, tooltip_rect, InventoryMode, InventoryPanel,
+};
 use crate::ui::item_icon::{hotbar_icon_vertices, inventory_icon_vertices};
 use crate::ui::selection::{SelectionLabel, SELECTED_NAME_SECS};
 use crate::world::block::BlockId;
@@ -199,22 +201,26 @@ fn digest_line(
     let table_layout = layout(surface_w, surface_h, InventoryMode::Table);
 
     let player_icons = inventory_icon_vertices(
-        InventoryMode::Player,
-        &player_layout,
-        &fixture.inventory,
-        &fixture.player_grid,
-        &fixture.table_grid,
+        InventoryPanel {
+            mode: InventoryMode::Player,
+            layout: &player_layout,
+            inventory: &fixture.inventory,
+            player_grid: &fixture.player_grid,
+            table_grid: &fixture.table_grid,
+        },
         cursor_item,
         cursor_pos,
         surface_w,
         surface_h,
     );
     let table_icons = inventory_icon_vertices(
-        InventoryMode::Table,
-        &table_layout,
-        &fixture.inventory,
-        &fixture.player_grid,
-        &fixture.table_grid,
+        InventoryPanel {
+            mode: InventoryMode::Table,
+            layout: &table_layout,
+            inventory: &fixture.inventory,
+            player_grid: &fixture.player_grid,
+            table_grid: &fixture.table_grid,
+        },
         cursor_item,
         cursor_pos,
         surface_w,

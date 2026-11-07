@@ -20,11 +20,13 @@ use crate::settings::SettingsWarning;
 pub mod asset;
 pub mod decode;
 pub mod manifest;
+pub mod presentation;
 pub mod resample;
 pub mod sound;
 pub mod spec;
 pub mod v2;
 pub mod validate;
+pub mod watch;
 
 /// Load an ordered stack of pack folders under `packs_root`.
 pub use spec::load_stack;

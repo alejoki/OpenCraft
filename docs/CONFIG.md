@@ -1,0 +1,366 @@
+# OpenCraft configuration
+
+`config/` is the creator-facing tuning surface for OpenCraft. It is a plain
+directory of six TOML files that sits beside `settings.toml` at the repository
+root (or beside the executable when you run from a packaged directory). Edit
+these files by hand, run `opencraft --check-config`, then launch the game. The
+game never writes, creates, or rewrites anything under `config/`.
+
+Every row in the [registry table](#registry-reference) applies live: its
+`Apply` column says `live`. The values here are the same constants the engine
+uses by default, so an untouched tree is behavior-identical to a build with no
+config files at all.
+
+## The six files
+
+| File | Domain |
+| --- | --- |
+| `config/player.toml` | Movement, jumping, swimming, flying, and camera near/far planes. |
+| `config/survival.toml` | Fall safety, air/drowning, hunger drain, starvation, regeneration, and food values. |
+| `config/combat.toml` | Melee damage and reach, swing timing, player damage response, bow charge, and arrows. |
+| `config/world.toml` | Day length, seasonal weather chances, mob spawning rules, and wheat growth. |
+| `config/mining.toml` | Tool speed multipliers and crafting-table interaction reach. |
+| `config/render.toml` | Fog and sky palette response to rain/snow, and selected-item HUD timing. |
+
+Each file is grouped into the nested TOML tables shown in the registry table.
+For example, `movement.walk_speed` lives under `[movement]` in
+`config/player.toml` as:
+
+```toml
+[movement]
+walk_speed = 4.6
+```
+
+## Loading and validation
+
+All six files are read independently at startup, in this order: player,
+survival, combat, world, mining, render. Loading never blocks launch; every
+problem becomes a warning or an error that `--check-config` can report.
+
+- **Missing file** — that file's keys keep their registry defaults and produce
+  a warning. Missing is never fatal.
+- **Unknown key** — reported as a warning and ignored. A typo cannot change
+  behavior, but it will not silently disappear either.
+- **Wrong type, out-of-range value, or non-finite value** — only that field
+  falls back to its default and is reported as an error. Its valid siblings
+  still load.
+- **Cross-field invariant violation** — the whole owning file falls back to
+  defaults and is reported as an error. The error names both participating
+  keys. The invariants are:
+  - player: `camera.z_near` must be less than `camera.z_far`.
+  - combat: `bow.min_charge_secs` must be at most `bow.full_charge_secs`;
+    `arrow.speed_min` at most `arrow.speed_max`; `arrow.damage_min` at most
+    `arrow.damage_max`.
+  - world: `spawning.safe_radius_blocks` < `spawning.spawn_max_radius_blocks` <
+    `spawning.despawn_radius_blocks`, and
+    `spawning.spawn_region_cap` < `spawning.max_mobs_total`.
+  - mining: `tools.wood_speed_multiplier` <= `tools.stone_speed_multiplier` <=
+    `tools.iron_speed_multiplier`.
+- **File-level failure** — an unreadable file, a file larger than 1 MiB, or
+  invalid TOML rejects that whole file (all its keys revert to defaults) and is
+  reported as an error.
+
+Diagnostics are ordinary data: the game converts only errors into the warning
+notice shown when the settings menu first opens. Missing files and unknown
+keys stay silent in-game and appear only in `--check-config` output.
+
+### Live reload
+
+Live reload is a development-build tool. A debug build polls the six files
+about ten times per second and applies a change only after the file's contents
+have stayed unchanged for 250 ms. An editor's atomic temp+rename save, or a
+burst of rapid saves, therefore collapses into one apply instead of several
+partial ones.
+
+The settle window alone cannot make a paused mid-write save safe: the bytes
+can still be syntactically valid TOML. Reload therefore applies a whole file or
+nothing. Any error in a file — invalid TOML, a wrong type, an out-of-range or
+non-finite value, or a cross-field violation — rejects that entire file and
+keeps its last good values and origins. Other files still apply normally in
+the same window, so one bad file never blocks a sibling's valid edit.
+
+Startup and live reload deliberately differ:
+
+- Startup falls back per field, so one bad value does not erase the rest of
+  the file. Live reload rejects the whole owning file on any error.
+- `--check-config` treats an empty file as all defaults, because it audits what
+  startup would load. Live reload treats an empty file, a comment-only file,
+  or a file with no recognized keys as an incomplete write and rejects it with
+  `file is empty; keeping last good values` or
+  `file has no recognized keys; keeping last good values`.
+- A missing file is a valid reset, not an error: its keys return to registry
+  defaults and the usual missing-file warning appears.
+
+An unknown key is not an error in either path: it is reported as a warning and
+ignored while the rest of the file applies, so renaming a key to a typo quietly
+returns that value to its default. A file with no recognized keys at all is
+caught by the incomplete-write guard above.
+
+The digest moves only when a file is actually committed, and only when its
+effective values change. That makes common edits predictable:
+
+- Editing comments, whitespace, table order, or numeric formatting re-parses
+  the file and reports an apply with no changed values. Values, origins, and
+  the digest stay as they were.
+- Adding a key that was previously absent changes its origin from default to
+  file even when it spells out the default value. The overlay drops the `*`
+  marker, `changed` counts the provenance change, and the digest stays the
+  same when the effective value does.
+- Setting a key that is still present in the file back to its default leaves
+  its origin as file, so the overlay shows it unmarked; the digest moves only
+  if the effective value actually changes.
+- Deleting a file restores that file's defaults and origins; the digest moves
+  if the live values were not already the defaults.
+
+## Creator tools (dev builds)
+
+Debug builds add two tools on top of live reload. Release builds load
+`config/` at startup exactly like debug builds, but contain no watcher, no F6
+overlay, and no trace output, and they reject both creator switches before any
+startup work:
+
+- `--check-config` prints exactly `check-config: dev build only` and exits 1.
+- `--creator-trace` prints exactly `creator-trace: dev build only` and exits 1.
+- When both switches are present, the check-config line wins and is the only
+  line printed.
+
+A rejected release launch reads no settings file, pack stack, save, or config
+tree. The creator tools are not available in release. The headless demo and
+validation seams (`--demo-save-v9`, `--demo-restart`, `--validate-pack`) are
+separate from the creator tools and remain available.
+
+### F6 overlay
+
+F6 toggles a read-only overlay; it has no editing controls and is off by
+default. The overlay groups every curated key under its `config/<file>` header
+and shows the current value. A `*` marks a value whose origin is still the
+registry default; an unmarked value came from the file, even when it happens
+to equal the default. Each file header also shows that file's apply mode
+(`[live]`).
+
+The overlay header shows the live digest, schema version, file count, files
+with a write still settling, and warning and error counts, followed by the
+last reload status. When a settled pack edit has an outcome to report, a
+`packs: <status>` line follows the last reload status; it shows the last
+applied texture path or the rejected file and reason. When an active restart
+requirement exists, a `restart required:` line names the reason; besides a
+config reason, it can name a pack-content change such as
+`my-first-pack: content changed; restart to apply` or, for an edit confined to
+recipes, `my-first-pack: recipe changed; restart to apply`. A recipe-only edit
+(only `[[recipes]]` or `[[recipe_patches]]` differs from the installed
+manifest) says `recipe changed`; a mixed edit that also changes blocks, items,
+tiers, tools, worldgen, or allocation says `content changed`. For a file with
+errors, the overlay shows the first error and a count of any additional
+errors.
+
+A rejected edit also produces a transient in-game message shaped
+`config/<file>: <key>: <reason>`, for example
+`config/player.toml: movement.walk_speed: value 0 is below minimum 0.5`.
+File-level rejections omit the key.
+
+### `--creator-trace`
+
+Pass `--creator-trace` on the command line to print one stable,
+timestamp-free line to stdout for each reloaded file:
+
+```text
+creator: applied file=config/player.toml changed=2 digest=0x...
+creator: rejected file=config/player.toml field=movement.walk_speed reason=value 0 is below minimum 0.5
+```
+
+File-level rejections omit `field`. Within one poll, lines follow registry file
+order — player, survival, combat, world, mining, render — and a line appears
+when its file settles. A file that did not change in that poll produces no
+line, so the trace stays stable and timestamp-free and can be diffed across
+runs. The trace is an explicit opt-in even in a debug build: normal runs and
+`--demo-*` runs without the flag print nothing.
+
+## Checking a config tree
+
+`--check-config` is a debug-build audit. Run it from the directory containing
+`config/`. It is a headless check: it opens no window, GPU, save, pack stack,
+or settings file, and it never writes anything.
+
+A release build rejects the switch before any startup work. It prints exactly
+`check-config: dev build only`, exits 1, and reads no settings file, pack
+stack, save, or config tree; `--creator-trace` is rejected the same way with
+`creator-trace: dev build only`. The debug behavior, exit status, and line
+shapes below are unchanged.
+
+```text
+opencraft --check-config
+```
+
+Output is deterministic and line-oriented. The six expected files are reported
+in the order player, survival, combat, world, mining, render. Within a file,
+file-level diagnostics come first, then known-key diagnostics in registry key
+order, then unknown keys sorted alphabetically. Warnings for unexpected
+`*.toml` files in `config/` come after the six expected files, sorted by file
+name.
+
+The stable line shapes are:
+
+```text
+ok: config/<file>: <N> values
+warning: config/<file>: file is missing; using defaults
+warning: config/<file>: <dotted.key>: unknown key
+warning: config/<file-name>: not a config file
+error: config/<file>: <dotted.key>: <reason>
+error: config/<file>: <reason>
+config: files=6 missing=<n> warnings=<n> errors=<n> keys=85 schema=1 digest=0x<16 lowercase hex digits>
+```
+
+`<N>` is the number of curated values in that file: 16 player, 15 survival, 21
+combat, 19 world, 4 mining, 10 render. A file with any error prints its error
+lines and no `ok:` line. The final summary line is always last; `warnings` and
+`errors` count diagnostic lines, and missing-file and extra-file warnings are
+included.
+
+Exit status is honest: **0** when there are no errors, even if files are
+missing or keys are unknown; **1** when any error is present. Invalid TOML,
+wrong types, out-of-range or non-finite values, oversize files, and cross-field
+violations all exit 1.
+
+## Digest
+
+The summary ends with `digest=0x...`, a 64-bit FNV-1a hash over the config
+schema version and every effective value in lexicographic key order. It hashes
+values, not file bytes. Comments, whitespace, table order, and formatting
+changes do not move it; editing a value does. A value that fails validation is
+folded in as its default, so the digest describes what the game will actually
+use, not what the file intended. Save format v9 records this digest alongside
+the schema version so a save can notice that gameplay tuning changed.
+
+## Development and release
+
+Configuration loading works in both development and release builds. Debug
+builds also run the live loop described in [Live reload](#live-reload) and the
+[creator tools](#creator-tools-dev-builds). Release builds load `config/` at
+startup exactly like debug builds, but they contain no watcher, no F6 overlay,
+and no trace output. They also reject the two creator switches before any
+startup work:
+
+- `--check-config` prints exactly `check-config: dev build only` and exits 1.
+- `--creator-trace` prints exactly `creator-trace: dev build only` and exits 1.
+
+No release build is required to edit `config/`; validate a tree before
+launching with `--check-config` in a debug build. Normal config and pack
+loading, and the headless `--demo-save-v9`, `--demo-restart`, and
+`--validate-pack` seams, remain available in release.
+
+## Not in the curated registry
+
+Some values are deliberately excluded because they are persisted save bounds,
+performance contracts, or content definitions rather than live tuning:
+
+- Persisted bounds such as `MAX_HEALTH`, `MAX_HUNGER`, `FULL_AIR`, and
+  `MAX_AIR`.
+- Player dimensions and collision box.
+- `DAY_TICKS` and season length.
+- Terrain heights, sea level, caves, trees, ruins, worldgen salts, and chunk
+  size.
+- Ore bands and ore content.
+- Block ids, block hardness, and worldgen content definitions.
+- `ARROW_CAP` and `MOB_TICK_HZ`.
+- Per-kind mob stats.
+- Static sky/weather GPU buffers.
+- Fonts, HUD layout, and tooltip offsets.
+
+Changing behavior in those areas requires a code change, not a config edit.
+
+## Registry reference
+
+The table below is generated from the same static registry that drives loading,
+diagnostics, the digest, and `--check-config`. Do not hand-edit it; update the
+registry in code and regenerate the block. Rows are in file order, and each
+key's `Range` is the inclusive accepted range.
+
+<!-- BEGIN CONFIG REGISTRY -->
+| File | Key | Type | Default | Range | Unit | Apply | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| config/player.toml | movement.walk_speed | float | 4.6 | 0.5..=20.0 | blocks/s | live | Horizontal walking speed on land in blocks per second. |
+| config/player.toml | movement.sprint_speed | float | 7.2 | 0.5..=40.0 | blocks/s | live | Horizontal sprint speed in blocks per second, also used while crouching. |
+| config/player.toml | movement.fly_speed | float | 18.0 | 1.0..=64.0 | blocks/s | live | Flight speed in blocks per second while not sprinting. |
+| config/player.toml | movement.fly_sprint_speed | float | 48.0 | 1.0..=256.0 | blocks/s | live | Flight speed in blocks per second while sprinting. |
+| config/player.toml | movement.fly_vertical_factor | float | 0.75 | 0.05..=2.0 | multiplier | live | Fraction of flight speed applied to vertical movement. |
+| config/player.toml | movement.jump_velocity | float | 9.0 | 0.0..=32.0 | blocks/s | live | Upward launch speed of a standing jump in blocks per second. |
+| config/player.toml | movement.gravity | float | 28.0 | 0.1..=128.0 | blocks/s^2 | live | Downward gravity acceleration in blocks per second squared. |
+| config/player.toml | movement.terminal_velocity | float | 45.0 | 1.0..=256.0 | blocks/s | live | Maximum downward fall speed in blocks per second. |
+| config/player.toml | movement.swim_vertical_drag | float | 6.0 | 0.0..=32.0 | per second | live | Per-second exponential drag on vertical velocity while submerged. |
+| config/player.toml | movement.swim_rise_accel | float | 40.0 | 0.0..=256.0 | blocks/s^2 | live | Upward acceleration while jump is held underwater in blocks per second squared. |
+| config/player.toml | movement.swim_rise_speed | float | 4.0 | 0.0..=32.0 | blocks/s | live | Maximum upward swimming speed in blocks per second. |
+| config/player.toml | movement.swim_max_sink_speed | float | 6.0 | 0.0..=64.0 | blocks/s | live | Maximum downward swimming speed in blocks per second. |
+| config/player.toml | movement.swim_walk_speed_mult | float | 0.55 | 0.0..=2.0 | multiplier | live | Horizontal walk-speed multiplier applied while submerged. |
+| config/player.toml | movement.swim_sink_accel | float | 28.0 | 0.0..=256.0 | blocks/s^2 | live | Downward acceleration applied underwater in blocks per second squared. |
+| config/player.toml | camera.z_near | float | 0.1 | 0.001..=1.0 | blocks | live | Camera near clipping plane in blocks. |
+| config/player.toml | camera.z_far | float | 1200.0 | 64.0..=8192.0 | blocks | live | Camera far clipping plane in blocks. |
+| config/survival.toml | survival.fall_safe_blocks | float | 3.0 | 0.0..=64.0 | blocks | live | Fall distance that causes no damage in blocks. |
+| config/survival.toml | survival.air_drain_per_sec | float | 20.0 | 0.1..=1000.0 | air/s | live | Air supply drained per second while submerged. |
+| config/survival.toml | survival.drown_interval_secs | float | 1.0 | 0.05..=60.0 | s | live | Seconds between drowning damage ticks once air is exhausted. |
+| config/survival.toml | survival.drown_damage | int | 2 | 1..=20 | health | live | Health lost per drowning damage tick. |
+| config/survival.toml | survival.hunger_drain_secs | float | 30.0 | 1.0..=3600.0 | s | live | Seconds of gameplay before one hunger point is drained. |
+| config/survival.toml | survival.starve_interval_secs | float | 4.0 | 0.1..=600.0 | s | live | Seconds between starvation damage ticks at zero hunger. |
+| config/survival.toml | survival.starve_damage | int | 1 | 1..=20 | health | live | Health lost per starvation damage tick. |
+| config/survival.toml | survival.regen_hunger_threshold | int | 18 | 0..=20 | hunger | live | Minimum hunger required for natural health regeneration. |
+| config/survival.toml | survival.regen_interval_secs | float | 4.0 | 0.1..=600.0 | s | live | Seconds between natural health regeneration ticks. |
+| config/survival.toml | survival.regen_hunger_cost | int | 1 | 0..=20 | hunger | live | Hunger points consumed per natural regeneration tick. |
+| config/survival.toml | eating.eat_duration_secs | float | 1.6 | 0.1..=10.0 | s | live | Seconds required to finish eating one food item. |
+| config/survival.toml | eating.apple_hunger | int | 4 | 0..=20 | hunger | live | Hunger restored by eating an apple. |
+| config/survival.toml | eating.bread_hunger | int | 6 | 0..=20 | hunger | live | Hunger restored by eating bread. |
+| config/survival.toml | eating.raw_meat_hunger | int | 3 | 0..=20 | hunger | live | Hunger restored by eating raw meat. |
+| config/survival.toml | eating.rotten_flesh_hunger | int | 1 | 0..=20 | hunger | live | Hunger restored by eating rotten flesh. |
+| config/combat.toml | melee.fist_damage | int | 1 | 0..=20 | health | live | Melee damage dealt by an empty hand. |
+| config/combat.toml | melee.sword_damage_wood | int | 4 | 0..=20 | health | live | Melee damage dealt by a wooden sword. |
+| config/combat.toml | melee.sword_damage_stone | int | 5 | 0..=20 | health | live | Melee damage dealt by a stone sword. |
+| config/combat.toml | melee.sword_damage_iron | int | 6 | 0..=20 | health | live | Melee damage dealt by an iron sword. |
+| config/combat.toml | melee.reach | float | 3.0 | 0.5..=16.0 | blocks | live | Maximum melee attack distance in blocks. |
+| config/combat.toml | melee.swing_cooldown_secs | float | 0.6 | 0.0..=10.0 | s | live | Seconds between melee swings. |
+| config/combat.toml | player.iframe_secs | float | 0.5 | 0.0..=10.0 | s | live | Invulnerability window after the player takes damage in seconds. |
+| config/combat.toml | player.hurt_flash_secs | float | 0.5 | 0.0..=10.0 | s | live | Duration of the red hurt flash on the player in seconds. |
+| config/combat.toml | player.knockback_speed | float | 6.0 | 0.0..=64.0 | blocks/s | live | Initial knockback speed applied to the player in blocks per second. |
+| config/combat.toml | player.knockback_decay | float | 0.6 | 0.0..=32.0 | per second | live | Per-second decay rate of player knockback velocity. |
+| config/combat.toml | bow.min_charge_secs | float | 0.2 | 0.0..=10.0 | s | live | Minimum bow draw time before an arrow can be fired in seconds. |
+| config/combat.toml | bow.full_charge_secs | float | 1.0 | 0.01..=10.0 | s | live | Draw time for a fully charged bow shot in seconds. |
+| config/combat.toml | arrow.gravity | float | 20.0 | 0.0..=128.0 | blocks/s^2 | live | Downward arrow acceleration in blocks per second squared. |
+| config/combat.toml | arrow.speed_min | float | 18.0 | 0.0..=256.0 | blocks/s | live | Minimum arrow launch speed at partial bow charge in blocks per second. |
+| config/combat.toml | arrow.speed_max | float | 32.0 | 0.0..=256.0 | blocks/s | live | Arrow launch speed at full bow charge in blocks per second. |
+| config/combat.toml | arrow.damage_min | int | 1 | 0..=20 | health | live | Minimum arrow damage at partial bow charge. |
+| config/combat.toml | arrow.damage_max | int | 4 | 0..=20 | health | live | Arrow damage at full bow charge. |
+| config/combat.toml | arrow.skeleton_speed | float | 28.0 | 0.0..=256.0 | blocks/s | live | Skeleton arrow launch speed in blocks per second. |
+| config/combat.toml | arrow.skeleton_damage | int | 2 | 0..=20 | health | live | Damage dealt by a skeleton arrow. |
+| config/combat.toml | arrow.lifetime_secs | float | 20.0 | 0.1..=600.0 | s | live | Maximum arrow flight time before it despawns in seconds. |
+| config/combat.toml | arrow.embed_secs | float | 2.0 | 0.0..=60.0 | s | live | Seconds a stuck arrow remains embedded before despawning. |
+| config/world.toml | clock.day_seconds | float | 1200.0 | 60.0..=86400.0 | s | live | Real seconds in one full day cycle at normal time scale. |
+| config/world.toml | weather.winter_snow_percent | int | 40 | 0..=100 | % | live | Percent of winter days with snowfall. |
+| config/world.toml | weather.spring_rain_percent | int | 30 | 0..=100 | % | live | Percent of spring days with rain. |
+| config/world.toml | weather.summer_rain_percent | int | 20 | 0..=100 | % | live | Percent of summer days with rain. |
+| config/world.toml | weather.autumn_rain_percent | int | 35 | 0..=100 | % | live | Percent of autumn days with rain. |
+| config/world.toml | spawning.safe_radius_blocks | int | 24 | 1..=512 | blocks | live | Radius around the player where hostile mobs never spawn in blocks. |
+| config/world.toml | spawning.spawn_max_radius_blocks | int | 48 | 2..=1024 | blocks | live | Maximum distance from the player at which mobs spawn in blocks. |
+| config/world.toml | spawning.despawn_radius_blocks | int | 96 | 3..=127 | blocks | live | Distance beyond which mobs despawn in blocks. |
+| config/world.toml | spawning.max_mobs_total | int | 32 | 1..=512 | mobs | live | Maximum number of mobs allowed at once. |
+| config/world.toml | spawning.spawn_region_blocks | int | 32 | 4..=256 | blocks | live | Size of each spawn region cell in blocks. |
+| config/world.toml | spawning.spawn_region_cap | int | 4 | 1..=512 | mobs | live | Maximum mobs that count toward one spawn region. |
+| config/world.toml | spawning.spawn_attempt_secs | float | 0.25 | 0.01..=10.0 | s | live | Seconds between mob spawn attempts. |
+| config/world.toml | spawning.despawn_scan_secs | float | 1.0 | 0.01..=60.0 | s | live | Seconds between mob despawn scans. |
+| config/world.toml | spawning.burn_interval_secs | float | 0.5 | 0.01..=60.0 | s | live | Seconds between daylight burning checks for undead mobs. |
+| config/world.toml | spawning.spawn_min_separation | float | 1.0 | 0.0..=16.0 | blocks | live | Minimum distance between newly spawned mobs in blocks. |
+| config/world.toml | spawning.hostile_cave_light | int | 7 | 0..=15 | light | live | Maximum light level where hostile mobs may spawn in caves. |
+| config/world.toml | spawning.passive_surface_light | int | 15 | 0..=15 | light | live | Minimum light level where passive mobs may spawn on the surface. |
+| config/world.toml | spawning.max_spawn_attempts_per_call | int | 4 | 1..=64 | attempts | live | Maximum spawn positions tried per spawn attempt. |
+| config/world.toml | farming.wheat_stage_game_secs | float | 60.0 | 1.0..=3600.0 | s | live | Game seconds between wheat growth stages. |
+| config/mining.toml | tools.wood_speed_multiplier | int | 2 | 1..=32 | x | live | Mining speed multiplier for wooden tools. |
+| config/mining.toml | tools.stone_speed_multiplier | int | 4 | 1..=32 | x | live | Mining speed multiplier for stone tools. |
+| config/mining.toml | tools.iron_speed_multiplier | int | 6 | 1..=32 | x | live | Mining speed multiplier for iron tools. |
+| config/mining.toml | interaction.table_reach | float | 8.0 | 1.0..=32.0 | blocks | live | Maximum distance for interacting with a placed crafting table in blocks. |
+| config/render.toml | fog.rain_factor | float | 0.75 | 0.0..=4.0 | multiplier | live | Fog range multiplier applied during rain. |
+| config/render.toml | fog.snow_factor | float | 0.85 | 0.0..=4.0 | multiplier | live | Fog range multiplier applied during snowfall. |
+| config/render.toml | palette.rain_grey_scale | float | 0.7 | 0.0..=4.0 | scale | live | Brightness scale used for the rain sky and fog tint. |
+| config/render.toml | palette.snow_grey_scale | float | 1.18 | 0.0..=4.0 | scale | live | Brightness scale used for the snow sky and fog tint. |
+| config/render.toml | palette.rain_sky_lerp | float | 0.45 | 0.0..=1.0 | fraction | live | Blend fraction toward the rain grey palette. |
+| config/render.toml | palette.snow_sky_lerp | float | 0.55 | 0.0..=1.0 | fraction | live | Blend fraction toward the snow grey palette. |
+| config/render.toml | palette.rain_day_factor | float | 0.78 | 0.0..=2.0 | multiplier | live | Daylight multiplier applied during rain. |
+| config/render.toml | palette.snow_day_factor | float | 0.92 | 0.0..=2.0 | multiplier | live | Daylight multiplier applied during snowfall. |
+| config/render.toml | palette.moonlit_floor | float | 0.34 | 0.0..=1.0 | factor | live | Dimmest daylight factor reached at midnight. |
+| config/render.toml | ui.selected_name_secs | float | 2.0 | 0.0..=30.0 | s | live | Seconds the selected item name stays visible after a change. |
+<!-- END CONFIG REGISTRY -->

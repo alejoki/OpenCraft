@@ -14,11 +14,11 @@
 #         256-layer block array and item atlas (built-in and pack layers
 #         authored-match), the authored block/item definitions, a production
 #         mesh of the two authored blocks, a production mining break of ruby
-#         ore (61 ticks, authored drop, count, slot, limit), the v8 fixture
+#         ore (61 ticks, authored drop, count, slot, limit), the v9 fixture
 #         reload with zero unresolved names, and the reserved placeholder
 #         policy (face 25, icon 27, unbreakable, mesh layer 25).
 #     (d) the fixture save starts with `MCVX` and the little-endian version
-#         word 8.
+#         word 9.
 #
 #   Bounded launch leg A: `timeout 10 "$BIN" --save fixture.mcvx` (pack still
 #   selected) must exit 124 with no panic — the real renderer and event loop
@@ -247,7 +247,7 @@ done
 MAGIC_HEX="$(od -An -tx1 -N4 "$FIXTURE" | tr -d ' \n')"
 VERSION_HEX="$(od -An -tx1 -j4 -N4 "$FIXTURE" | tr -d ' \n')"
 [[ "$MAGIC_HEX" == "4d435658" ]] || fail "fixture magic is '$MAGIC_HEX' (expected 4d435658 = MCVX)"
-[[ "$VERSION_HEX" == "08000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 08000000 = little-endian 8)"
+[[ "$VERSION_HEX" == "09000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 09000000 = little-endian 9)"
 
 # --- Bounded launch leg A: authored world, pack still selected ------------
 set +e
@@ -303,7 +303,7 @@ cmp -s "$TEMP_DIR/packs-off/ruby_ore.png" "$EXPECTED_DIR/ruby_ore.png" || fail "
 cmp -s "$TEMP_DIR/packs-off/ruby_block.png" "$EXPECTED_DIR/ruby_block.png" || fail "ruby_block.png changed after being moved out of packs/"
 cmp -s "$TEMP_DIR/packs-off/ruby.png" "$EXPECTED_DIR/ruby.png" || fail "ruby.png changed after being moved out of packs/"
 
-echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed all pinned lines byte-for-byte (authored faces 48/49 via a 256-layer array, 61-tick break yielding mymod:ruby), wrote an MCVX v8 fixture, and both the authored world and the placeholder world (pack removed, stack cleared) survived a 10s launch with exit 124 and no panic"
+echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed all pinned lines byte-for-byte (authored faces 48/49 via a 256-layer array, 61-tick break yielding mymod:ruby), wrote an MCVX v9 fixture, and both the authored world and the placeholder world (pack removed, stack cleared) survived a 10s launch with exit 124 and no panic"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PRESENTATION SMOKE EVIDENCE: $line"
 done

@@ -9,8 +9,8 @@
 #         124 and is an explicit FAILURE here, never the expected outcome.
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 8.
-#     (d) the save is longer than the 169-byte edit-free v8 baseline, proving
+#         is 9.
+#     (d) the save is longer than the 179-byte edit-free v9 baseline, proving
 #         the demo's chunk edits were persisted.
 #     (e) stdout contains the `content_demo:` digest line with the ruin loot,
 #         chest-break, craft, farm, winter-pause, stage3, harvest, bread,
@@ -24,7 +24,7 @@
 # shifts the following bytes, so a fixed offset is meaningless here. This
 # script asserts magic/version and the digest's decoded reload facts
 # (`reload_chests=1`, `reload_stage=1`) instead. The survival smoke is the one
-# that pins the edit-free 169-byte layout (scripts/survival_smoke.sh).
+# that pins the edit-free 179-byte layout (scripts/survival_smoke.sh).
 #
 # The script builds the debug binary itself with `cargo build --locked` and
 # runs target/debug/opencraft. `SMOKE_PROFILE=release` is the opt-in
@@ -103,10 +103,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The edit-free v8 save ends exactly after the 12-byte package-identity +
-# digest tail (see persistence.rs V8_EMPTY_SAVE_LEN). Anything longer proves
-# the demo's chunk edits are present.
-EDIT_FREE_V8_LEN=169
+# The edit-free v9 save ends exactly after the 12-byte pack-identity + digest
+# tail and the 10-byte config tail (see persistence.rs V9_EMPTY_SAVE_LEN).
+# Anything longer proves the demo's chunk edits are present.
+EDIT_FREE_V9_LEN=179
 
 # The demo's own wall-clock deadline is 240 s; the outer timeout is only a
 # backstop for a hang, and a kill here is an explicit failure.
@@ -152,14 +152,14 @@ if [[ "$MAGIC" != "MCVX" ]]; then
 fi
 
 VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 8 ]]; then
-    echo "CONTENT SMOKE FAIL: save version is $VERSION (expected 8)"
+if [[ "$VERSION" -ne 9 ]]; then
+    echo "CONTENT SMOKE FAIL: save version is $VERSION (expected 9)"
     exit 1
 fi
 
 SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ "$SAVE_SIZE" -le "$EDIT_FREE_V8_LEN" ]]; then
-    echo "CONTENT SMOKE FAIL: save is $SAVE_SIZE bytes (expected more than the ${EDIT_FREE_V8_LEN}-byte edit-free baseline: the demo must persist chunk edits)"
+if [[ "$SAVE_SIZE" -le "$EDIT_FREE_V9_LEN" ]]; then
+    echo "CONTENT SMOKE FAIL: save is $SAVE_SIZE bytes (expected more than the ${EDIT_FREE_V9_LEN}-byte edit-free baseline: the demo must persist chunk edits)"
     exit 1
 fi
 
@@ -202,5 +202,5 @@ do
     require_token "$token"
 done
 
-echo "CONTENT SMOKE PASS [profile=$PROFILE]: seed 1 looted a ruin chest, broke it for 1 Chest, tilled/planted two crops through the Winter pause to stage 3, harvested 2 Wheat + 4 WheatSeeds, crafted Bread, placed and stored it in a chest, and reloaded a ${SAVE_SIZE}-byte v8 save with reload_chests=1 reload_stage=1"
+echo "CONTENT SMOKE PASS [profile=$PROFILE]: seed 1 looted a ruin chest, broke it for 1 Chest, tilled/planted two crops through the Winter pause to stage 3, harvested 2 Wheat + 4 WheatSeeds, crafted Bread, placed and stored it in a chest, and reloaded a ${SAVE_SIZE}-byte v9 save with reload_chests=1 reload_stage=1"
 echo "CONTENT SMOKE EVIDENCE: $CONTENT_LINE"

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use glam::IVec3;
 use rustc_hash::FxHashMap;
 
+use crate::config::{ConfigRuntime, SaveConfigMeta, CONFIG_SCHEMA_VERSION};
 use crate::content::{names, ContentRegistry, PackIdentity};
 use crate::player::container::Container;
 use crate::player::inventory::{
@@ -27,11 +28,16 @@ pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 /// appear in the Load Game screen or be deleted from it.
 pub const DEFAULT_BACKGROUND_SAVE_PATH: &str = "saves/background/background.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 8;
+pub const SAVE_VERSION: u32 = 9;
 /// First save version that carries the sorted save-local content string table,
 /// `u16` name indices for every persisted content reference, and the
 /// pack-identity + digest tail.
 pub const CONTENT_TABLE_VERSION: u32 = 8;
+/// First save version that carries the effective-config schema and digest
+/// tail after the content metadata.
+pub const CONFIG_TAIL_VERSION: u32 = 9;
+/// Fixed on-disk size of the v9 config tail: `u16` schema + `u64` digest.
+pub const CONFIG_TAIL_LEN: usize = 10;
 /// Version the frozen test-only legacy encoder emits.
 #[cfg(test)]
 const LEGACY_WRITE_VERSION: u32 = 7;
@@ -244,6 +250,25 @@ pub struct CliConfig {
     /// opens a window, GPU, audio engine, event loop or settings write, and
     /// never writes a save.
     pub demo_palette: bool,
+    /// Whether the headless v8-to-v9 save proof (`--demo-save-v9`,
+    /// M014/S04-T05) is requested. Same bare-switch contract as
+    /// `demo_palette`: it takes no value, is deliberately NOT a world intent
+    /// (so it never affects `cli_has_world_intent`), and is never persisted.
+    /// `main` consumes it before `StartupContent::load`, so the proof never
+    /// opens a window, GPU, audio engine, event loop, settings write, or pack
+    /// load. Its only writes are the derived v9 file next to `--save`; the
+    /// input is never overwritten.
+    pub demo_save_v9: bool,
+    /// Whether the headless two-run recipe restart proof (`--demo-restart`,
+    /// M014/S09-T02) is requested. A bare launch switch: it takes no value,
+    /// is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before the startup content is built, so the proof never opens a
+    /// window, GPU, audio engine, or event loop. Its only write is the
+    /// explicit `--save` fixture: the default save path is refused before any
+    /// world work, so the demo can never write into the repository. Unlike
+    /// `--check-config` and `--creator-trace`, it is usable in release.
+    pub demo_restart: bool,
     /// Pack folder requested by `--validate-pack <name>` (M010/S02-T04).
     /// `main` consumes it before `startup_session`, so validation never opens
     /// a window, GPU, world, save or settings file. A switch with no following
@@ -251,6 +276,24 @@ pub struct CliConfig {
     /// launching the game. Like `demo_ui` it is a launch switch, never a world
     /// intent (it never affects `cli_has_world_intent`) and is never persisted.
     pub validate_pack: Option<String>,
+    /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
+    /// requested. A bare launch switch: it takes no value, is deliberately NOT
+    /// a world intent (so it never affects `cli_has_world_intent`), and is
+    /// never persisted. `main` consumes it before settings, packs, and world
+    /// startup, so the audit never opens a window, GPU, audio engine, event
+    /// loop, or save. Release builds reject the switch at startup with
+    /// exactly `check-config: dev build only` on stdout and exit 1, before any
+    /// other switch or startup work runs (M014/S09).
+    pub check_config: bool,
+    /// Whether the dev-only creator trace (`--creator-trace`, M014/S02-T04) is
+    /// requested. A bare launch switch: it takes no value, is deliberately NOT
+    /// a world intent (so it never affects `cli_has_world_intent`), and is
+    /// never persisted. `main` prints apply/reject lines only in debug builds
+    /// (`watch::CREATOR_TOOLS`) and only when this flag is set. Release builds
+    /// reject the flag at startup with exactly `creator-trace: dev build only`
+    /// on stdout and exit 1, before any other switch or startup work runs
+    /// (M014/S09).
+    pub creator_trace: bool,
     /// Game mode requested by `--creative` / `--survival` (S08-T01 T05).
     /// Defaults to [`GameMode::Creative`] so every pre-M008 CLI demo, smoke,
     /// and physics test keeps its flying default. A fresh-world parameter like
@@ -281,7 +324,11 @@ impl CliConfig {
         let mut demo_crafting = false;
         let mut demo_worldgen = false;
         let mut demo_palette = false;
+        let mut demo_save_v9 = false;
+        let mut demo_restart = false;
         let mut validate_pack = None;
+        let mut check_config = false;
+        let mut creator_trace = false;
         let mut mode = GameMode::Creative;
 
         let mut iter = args.into_iter();
@@ -379,6 +426,20 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_palette = true;
                 }
+                "--demo-save-v9" => {
+                    // Same bare-switch rule as `--demo-palette`. `main`
+                    // short-circuits on this before `StartupContent::load`;
+                    // the next token stays available as an independent
+                    // argument (normally `--save <input>`).
+                    demo_save_v9 = true;
+                }
+                "--demo-restart" => {
+                    // Same bare-switch rule as `--demo-save-v9`. `main`
+                    // short-circuits on this before the startup content is
+                    // built; the next token stays available as an independent
+                    // argument (normally `--save <fixture>`).
+                    demo_restart = true;
+                }
                 "--validate-pack" => {
                     // Value switch: consume the next token. A missing value
                     // stores an empty name so the request fails closed in
@@ -388,6 +449,19 @@ impl CliConfig {
                             .map(|val| val.as_ref().to_string())
                             .unwrap_or_default(),
                     );
+                }
+                "--check-config" => {
+                    // Bare switch (no value to consume), mirroring `--new`:
+                    // a stray following token stays an independent argument.
+                    // `main` short-circuits on this before any world startup.
+                    check_config = true;
+                }
+                "--creator-trace" => {
+                    // Bare switch (no value to consume), mirroring
+                    // `--check-config`: a stray following token stays an
+                    // independent argument. Trace emission itself is gated by
+                    // `CREATOR_TOOLS` in `main`.
+                    creator_trace = true;
                 }
                 // Bare mode switches, last one wins (plain assignment order).
                 // They consume no value and are not world intents, so a
@@ -417,7 +491,11 @@ impl CliConfig {
             demo_crafting,
             demo_worldgen,
             demo_palette,
+            demo_save_v9,
+            demo_restart,
             validate_pack,
+            check_config,
+            creator_trace,
             mode,
         }
     }
@@ -541,12 +619,14 @@ pub struct SaveContentMeta {
 /// order) with a deterministic placeholder definition for every saved name the
 /// base could not resolve. `unresolved` counts exactly those appended
 /// placeholders. `saved_content` is `None` for v1-v7 payloads, which carry no
-/// pack identity or digest.
+/// pack identity or digest. `saved_config` is `None` for v1-v8 payloads, which
+/// carry no config schema or digest.
 #[derive(Clone, Debug)]
 pub struct LoadedWorld {
     pub data: WorldSaveData,
     pub registry: ContentRegistry,
     pub saved_content: Option<SaveContentMeta>,
+    pub saved_config: Option<SaveConfigMeta>,
     pub unresolved: usize,
 }
 
@@ -555,7 +635,7 @@ impl LoadedWorld {
     /// this world differs from the one that saved it.
     ///
     /// `None` for v1-v7 payloads (they carry no pack identity or digest) and
-    /// for a v8 save loaded against the exact same content stack.
+    /// for a v8/v9 save loaded against the exact same content stack.
     pub fn content_notice(&self) -> Option<String> {
         let saved = self.saved_content.as_ref()?;
         crate::content::content_mismatch_note(
@@ -621,6 +701,9 @@ pub enum PersistenceError {
     /// The v8 pack-identity + digest tail was malformed (unbounded pack
     /// count, oversized/duplicate folder, or trailing bytes).
     InvalidContentMeta,
+    /// The v9 config tail was malformed (zero schema, a writer schema other
+    /// than [`CONFIG_SCHEMA_VERSION`], or truncation/trailing bytes in v9).
+    InvalidConfigMeta,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -699,6 +782,9 @@ impl fmt::Display for PersistenceError {
             }
             PersistenceError::InvalidContentMeta => {
                 write!(f, "invalid content metadata in save")
+            }
+            PersistenceError::InvalidConfigMeta => {
+                write!(f, "invalid config metadata in save")
             }
         }
     }
@@ -959,11 +1045,11 @@ fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), Per
     Ok(())
 }
 
-/// Writes a v8 save using the built-in content registry.
+/// Writes a v9 save using the built-in content registry.
 ///
 /// Callers that loaded a world with a pack stack should use
 /// [`save_world_to_bytes_with`] so modded names round-trip instead of being
-/// rejected as unnameable.
+/// rejected as unnameable. The stored config meta is the registry defaults.
 pub fn save_world_to_bytes(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
@@ -1459,14 +1545,21 @@ fn write_pack_identity(out: &mut Vec<u8>, pack: &PackIdentity) -> Result<(), Per
     Ok(())
 }
 
-/// Writes the v8 format: a sorted save-local content table in the header, a
-/// `u16` name index for every content reference, and a pack-identity + digest
-/// tail.
-fn write_v8_world(
+/// Writes the current (v9) format: a sorted save-local content table in the
+/// header, a `u16` name index for every content reference, a
+/// pack-identity + digest content tail, and the config schema + digest tail.
+fn write_world(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
     registry: &ContentRegistry,
+    config: SaveConfigMeta,
 ) -> Result<(), PersistenceError> {
+    // A hand-built or stale meta must never reach the wire. This check runs
+    // before the content table scan so a rejected save emits no bytes.
+    if config.schema != CONFIG_SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidConfigMeta);
+    }
+
     // Every content reference, name bound, liquid edit and id lookup is
     // validated here, before the first output byte.
     let table = ContentNameTable::collect(data, registry)?;
@@ -1628,19 +1721,38 @@ fn write_v8_world(
     }
     out.extend_from_slice(&registry.digest().to_le_bytes());
 
+    // v9 config tail: the digest schema plus the effective-value digest.
+    out.extend_from_slice(&config.schema.to_le_bytes());
+    out.extend_from_slice(&config.digest.to_le_bytes());
+
     Ok(())
 }
 
-/// Writes a v8 save using `registry` to name every content reference.
+/// Writes a v9 save using `registry` to name every content reference.
 ///
-/// Rejects the whole payload before the first output byte if any reference is
-/// unnameable, any name exceeds the wire cap, or the pack metadata is invalid.
+/// Delegates with the registry-default config metadata so existing callers
+/// keep their signature; production save sites that hold a [`ConfigRuntime`]
+/// should use [`save_world_to_bytes_with_config`].
 pub fn save_world_to_bytes_with(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
     registry: &ContentRegistry,
 ) -> Result<(), PersistenceError> {
-    write_v8_world(out, data, registry)
+    save_world_to_bytes_with_config(out, data, registry, ConfigRuntime::defaults().meta())
+}
+
+/// Writes a v9 save using `registry` and an explicit config schema + digest.
+///
+/// Rejects the whole payload before the first output byte if any reference is
+/// unnameable, any name exceeds the wire cap, the pack metadata is invalid, or
+/// `config.schema` does not match [`CONFIG_SCHEMA_VERSION`].
+pub fn save_world_to_bytes_with_config(
+    out: &mut Vec<u8>,
+    data: &WorldSaveData,
+    registry: &ContentRegistry,
+    config: SaveConfigMeta,
+) -> Result<(), PersistenceError> {
+    write_world(out, data, registry, config)
 }
 
 fn read_u8<R: Read>(r: &mut R) -> Result<u8, PersistenceError> {
@@ -2214,7 +2326,8 @@ fn read_v8_inventory_extension<R: Read>(
     ))
 }
 
-/// Decodes the v8 format into a placeholder-augmented registry.
+/// Decodes the v8-v9 content-table format into a placeholder-augmented
+/// registry.
 ///
 /// The whole content table is validated before any reference is resolved, and
 /// every count/length/index is bounds-checked. A forged payload fails closed
@@ -2228,7 +2341,7 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
     }
 
     let version = read_u32(&mut cur)?;
-    if version != CONTENT_TABLE_VERSION {
+    if !(CONTENT_TABLE_VERSION..=SAVE_VERSION).contains(&version) {
         return Err(PersistenceError::UnsupportedVersion(version));
     }
 
@@ -2457,9 +2570,29 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
     }
     let digest = read_u64(&mut cur)?;
 
-    let end = u64::try_from(bytes.len()).map_err(|_| PersistenceError::InvalidContentMeta)?;
+    // v9 config tail: `u16` schema + `u64` effective-value digest. A zero
+    // schema is reserved (no writer emits it) and fails closed; a non-zero
+    // schema that differs from this build is a load notice, not an error.
+    let saved_config = if version >= CONFIG_TAIL_VERSION {
+        let schema = read_u16(&mut cur)?;
+        if schema == 0 {
+            return Err(PersistenceError::InvalidConfigMeta);
+        }
+        Some(SaveConfigMeta {
+            schema,
+            digest: read_u64(&mut cur)?,
+        })
+    } else {
+        None
+    };
+
+    let end = u64::try_from(bytes.len()).map_err(|_| PersistenceError::InvalidConfigMeta)?;
     if cur.position() != end {
-        return Err(PersistenceError::InvalidContentMeta);
+        return Err(if version >= CONFIG_TAIL_VERSION {
+            PersistenceError::InvalidConfigMeta
+        } else {
+            PersistenceError::InvalidContentMeta
+        });
     }
 
     let unresolved = resolver.unresolved;
@@ -2488,12 +2621,13 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
         },
         registry: resolver.registry,
         saved_content: Some(SaveContentMeta { packs, digest }),
+        saved_config,
         unresolved,
     })
 }
 
 /// Loads any supported save version, returning the placeholder-augmented
-/// registry and v8 content metadata alongside the world data.
+/// registry and v8/v9 content metadata alongside the world data.
 pub fn load_world_from_bytes_with(
     bytes: &[u8],
     registry: &ContentRegistry,
@@ -2509,6 +2643,7 @@ pub fn load_world_from_bytes_with(
             data: decode_legacy(bytes)?,
             registry: registry.clone(),
             saved_content: None,
+            saved_config: None,
             unresolved: 0,
         })
     }
@@ -2517,9 +2652,9 @@ pub fn load_world_from_bytes_with(
 /// Loads any supported save version with the built-in registry.
 ///
 /// v1-v7 payloads decode through the frozen legacy reader (no placeholders to
-/// create); v8 payloads resolve against [`ContentRegistry::builtin`] and drop
-/// the placeholder registry, since callers of this compatibility wrapper only
-/// need the world data.
+/// create); v8-v9 payloads resolve against [`ContentRegistry::builtin`] and
+/// drop the placeholder registry, since callers of this compatibility wrapper
+/// only need the world data.
 pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
     let version = peek_save_version(bytes)?;
     if !(1..=SAVE_VERSION).contains(&version) {
@@ -2734,19 +2869,33 @@ fn write_save_file(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
     Ok(())
 }
 
-/// Writes a v8 save using the built-in content registry, atomically.
+/// Writes a v9 save using the built-in content registry, atomically.
 pub fn save_world_to_path(path: &Path, data: &WorldSaveData) -> Result<(), PersistenceError> {
     save_world_to_path_with(path, data, ContentRegistry::builtin())
 }
 
-/// Writes a v8 save using `registry`, atomically.
+/// Writes a v9 save using `registry`, atomically.
+///
+/// Delegates with the registry-default config metadata; production save sites
+/// that hold a [`ConfigRuntime`] should use [`save_world_to_path_with_config`].
 pub fn save_world_to_path_with(
     path: &Path,
     data: &WorldSaveData,
     registry: &ContentRegistry,
 ) -> Result<(), PersistenceError> {
+    save_world_to_path_with_config(path, data, registry, ConfigRuntime::defaults().meta())
+}
+
+/// Writes a v9 save using `registry` and an explicit config schema + digest,
+/// atomically.
+pub fn save_world_to_path_with_config(
+    path: &Path,
+    data: &WorldSaveData,
+    registry: &ContentRegistry,
+    config: SaveConfigMeta,
+) -> Result<(), PersistenceError> {
     let mut bytes = Vec::with_capacity(1024);
-    save_world_to_bytes_with(&mut bytes, data, registry)?;
+    save_world_to_bytes_with_config(&mut bytes, data, registry, config)?;
     write_save_file(path, &bytes)
 }
 
@@ -2859,7 +3008,8 @@ mod tests {
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, CONTENT_TABLE_VERSION);
+        assert_eq!(SAVE_VERSION, CONFIG_TAIL_VERSION);
+        assert_eq!(CONFIG_TAIL_VERSION, CONTENT_TABLE_VERSION + 1);
         assert_eq!(CONTENT_TABLE_VERSION, MOB_VERSION + 1);
         assert_eq!(MOB_VERSION, SURVIVAL_VERSION + 1);
         assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
@@ -3317,6 +3467,9 @@ mod tests {
     const V8_CONTENT_TABLE_LEN: usize = 4;
     /// v8 tail after the mob section: `u32` pack count + `u64` FNV-1a digest.
     const V8_TAIL_LEN: usize = 12;
+    /// v9 tail after the mob section: the v8 content tail plus the `u16`
+    /// config schema + `u64` config digest.
+    const V9_TAIL_LEN: usize = V8_TAIL_LEN + CONFIG_TAIL_LEN;
     const V8_HOTBAR_OFFSET: usize = V2_HOTBAR_OFFSET + V8_CONTENT_TABLE_LEN;
     const V8_TIME_OFFSET: usize = V8_HOTBAR_OFFSET + HOTBAR_SLOTS * 3;
     const V8_CHUNK_COUNT_OFFSET: usize = V8_TIME_OFFSET + 4;
@@ -3331,9 +3484,9 @@ mod tests {
     /// empty-table, chest-free save (153).
     const V8_MOB_COUNT_OFFSET: usize = V8_CHEST_COUNT_OFFSET + 4;
     const V8_TAIL_OFFSET: usize = V8_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN;
-    /// Measured length of an edit-free, chest-free, mob-free v8 save with an
+    /// Measured length of an edit-free, chest-free, mob-free v9 save with an
     /// empty content table (36 header + 4 table + everything older + tail).
-    const V8_EMPTY_SAVE_LEN: usize = V8_TAIL_OFFSET + V8_TAIL_LEN;
+    const V9_EMPTY_SAVE_LEN: usize = V8_TAIL_OFFSET + V9_TAIL_LEN;
 
     /// Builds a byte-valid v4-v7 fixture with the frozen legacy encoder.
     ///
@@ -4151,7 +4304,7 @@ mod tests {
         let mut v8 = Vec::new();
         save_world_to_bytes(&mut v8, &data).expect("v8 mob save must succeed");
         assert_eq!(&v8[4..8], &SAVE_VERSION.to_le_bytes());
-        assert_eq!(v8.len(), V8_TAIL_OFFSET + 4 * SAVED_MOB_LEN + V8_TAIL_LEN);
+        assert_eq!(v8.len(), V8_TAIL_OFFSET + 4 * SAVED_MOB_LEN + V9_TAIL_LEN);
         assert_eq!(
             &v8[V8_MOB_COUNT_OFFSET..V8_TAIL_OFFSET],
             &4u32.to_le_bytes()
@@ -4481,7 +4634,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_empty_table_save_has_the_measured_169_byte_layout() {
+    fn v9_empty_table_save_has_the_measured_179_byte_layout() {
         let data = sample_data(sample_player());
         assert!(data.mobs.is_empty());
         assert!(data.chests.is_empty());
@@ -4489,10 +4642,10 @@ mod tests {
         assert_eq!(data.player.inventory, Inventory::empty());
 
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("edit-free v8 save must succeed");
+        save_world_to_bytes(&mut bytes, &data).expect("edit-free v9 save must succeed");
 
-        assert_eq!(bytes.len(), V8_EMPTY_SAVE_LEN);
-        assert_eq!(bytes.len(), 169);
+        assert_eq!(bytes.len(), V9_EMPTY_SAVE_LEN);
+        assert_eq!(bytes.len(), 179);
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
         assert_eq!(
             &bytes[V2_HOTBAR_OFFSET..V2_HOTBAR_OFFSET + 4],
@@ -4501,12 +4654,22 @@ mod tests {
         assert_eq!(
             &bytes[V8_MOB_COUNT_OFFSET..V8_TAIL_OFFSET],
             &0u32.to_le_bytes(),
-            "the v8 mob count sits at offset 153 for an empty table"
+            "the v9 mob count sits at offset 153 for an empty table"
         );
         assert_eq!(
             &bytes[V8_TAIL_OFFSET..V8_TAIL_OFFSET + 4],
             &0u32.to_le_bytes(),
             "no packs in the built-in stack"
+        );
+        assert_eq!(
+            &bytes[V8_TAIL_OFFSET + V8_TAIL_LEN..V8_TAIL_OFFSET + V8_TAIL_LEN + 2],
+            &CONFIG_SCHEMA_VERSION.to_le_bytes(),
+            "the config tail carries the current schema"
+        );
+        assert_eq!(
+            &bytes[V8_TAIL_OFFSET + V8_TAIL_LEN + 2..],
+            &ConfigRuntime::defaults().digest().to_le_bytes(),
+            "the config tail carries the effective-value digest"
         );
 
         let loaded = load_world_from_bytes(&bytes).expect("baseline must load");
@@ -4546,8 +4709,10 @@ mod tests {
 
     #[test]
     fn test_version_constants_are_coupled() {
-        assert_eq!(SAVE_VERSION, CONTENT_TABLE_VERSION);
+        assert_eq!(SAVE_VERSION, CONFIG_TAIL_VERSION);
+        assert_eq!(CONFIG_TAIL_VERSION, CONTENT_TABLE_VERSION + 1);
         assert_eq!(CONTENT_TABLE_VERSION, MOB_VERSION + 1);
+        assert_eq!(CONFIG_TAIL_LEN, 10);
         assert_eq!(MOB_VERSION, SURVIVAL_VERSION + 1);
         assert_eq!(SURVIVAL_VERSION, SEASON_VERSION + 1);
         assert_eq!(SEASON_VERSION, INVENTORY_EXTENSION_VERSION + 1);
@@ -5555,6 +5720,78 @@ mod tests {
     }
 
     #[test]
+    fn test_demo_save_v9_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_save_v9);
+        assert!(!bare.demo_palette);
+        assert!(!bare.demo_worldgen);
+        assert!(!bare.demo_crafting);
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let flag = CliConfig::parse_args(["--demo-save-v9"]);
+        assert!(flag.demo_save_v9);
+        assert!(!flag.demo_palette);
+        assert!(!flag.demo_worldgen);
+        assert!(!flag.demo_crafting);
+        assert!(!flag.demo_presentation);
+        assert!(!flag.demo_ui);
+        assert!(!flag.force_new_world);
+        assert_eq!(flag.seed_override, None);
+        assert_eq!(flag.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A following `--save fixture.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value.
+        let with_save = CliConfig::parse_args(["--demo-save-v9", "--save", "fixture.mcvx"]);
+        assert!(with_save.demo_save_v9);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-save-v9", "5"]);
+        assert!(stray.demo_save_v9);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_restart_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every sibling demo seam stays off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_restart);
+        assert!(!bare.demo_save_v9);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let flag = CliConfig::parse_args(["--demo-restart"]);
+        assert!(flag.demo_restart);
+        assert!(!flag.demo_save_v9);
+        assert!(!flag.force_new_world);
+        assert_eq!(flag.seed_override, None);
+        assert_eq!(flag.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-restart", "5"]);
+        assert!(stray.demo_restart);
+        assert_eq!(stray.seed_override, None);
+
+        // `--new` and `--save` keep parsing independently around it.
+        let with_new = CliConfig::parse_args(["--new", "--demo-restart"]);
+        assert!(with_new.demo_restart);
+        assert!(with_new.force_new_world);
+        let with_save = CliConfig::parse_args(["--demo-restart", "--save", "recipe.mcvx"]);
+        assert!(with_save.demo_restart);
+        assert_eq!(with_save.save_path, std::path::PathBuf::from("recipe.mcvx"));
+
+        // Repeating a bare switch is idempotent, not a value consumption.
+        let repeated = CliConfig::parse_args(["--demo-restart", "--demo-restart"]);
+        assert!(repeated.demo_restart);
+        assert_eq!(repeated.seed_override, None);
+    }
+
+    #[test]
     fn test_validate_pack_is_a_value_switch_and_launch_only() {
         // Absent keeps the seam off.
         let bare = CliConfig::parse_args(Vec::<String>::new());
@@ -5582,6 +5819,84 @@ mod tests {
         let world_flag = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
         assert!(world_flag.force_new_world);
         assert_eq!(world_flag.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn test_check_config_is_a_bare_launch_switch() {
+        // Absent keeps the seam off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.check_config);
+
+        // The switch alone turns the audit on and changes nothing else: it is
+        // a launch switch, not a world parameter.
+        let alone = CliConfig::parse_args(["--check-config"]);
+        assert!(alone.check_config);
+        assert!(!alone.force_new_world);
+        assert_eq!(alone.seed_override, None);
+        assert_eq!(alone.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A real world flag still parses independently and grants intent
+        // (which lives in main.rs via `cli_has_world_intent`).
+        let with_new = CliConfig::parse_args(["--check-config", "--new"]);
+        assert!(with_new.check_config);
+        assert!(with_new.force_new_world);
+
+        // A following independent flag is not consumed as a value.
+        let with_seed = CliConfig::parse_args(["--check-config", "--seed", "5"]);
+        assert!(with_seed.check_config);
+        assert_eq!(with_seed.seed_override, Some(5));
+    }
+
+    #[test]
+    fn test_creator_trace_is_a_bare_launch_switch() {
+        // Absent keeps the dev-only trace off.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.creator_trace);
+
+        // The switch alone turns the trace on and changes nothing else: it is
+        // a launch switch, not a world parameter.
+        let alone = CliConfig::parse_args(["--creator-trace"]);
+        assert!(alone.creator_trace);
+        assert!(!alone.force_new_world);
+        assert_eq!(alone.seed_override, None);
+        assert_eq!(alone.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+
+        // A real world flag still parses independently and grants intent
+        // (which lives in main.rs via `cli_has_world_intent`); the trace flag
+        // consumes no token, so `--new` is not swallowed.
+        let with_new = CliConfig::parse_args(["--creator-trace", "--new"]);
+        assert!(with_new.creator_trace);
+        assert!(with_new.force_new_world);
+
+        // A following independent value flag is not consumed as a value.
+        let with_save = CliConfig::parse_args(["--creator-trace", "--save", "fixture.mcvx"]);
+        assert!(with_save.creator_trace);
+        assert_eq!(
+            with_save.save_path,
+            std::path::PathBuf::from("fixture.mcvx")
+        );
+        assert_eq!(with_save.seed_override, None);
+        assert!(!with_save.force_new_world);
+
+        let with_seed = CliConfig::parse_args(["--creator-trace", "--seed", "5"]);
+        assert!(with_seed.creator_trace);
+        assert_eq!(with_seed.seed_override, Some(5));
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--creator-trace", "5"]);
+        assert!(stray.creator_trace);
+        assert_eq!(stray.seed_override, None);
+
+        // Repeated flags stay on (idempotent boolean, not a toggle).
+        let repeated =
+            CliConfig::parse_args(["--creator-trace", "--creator-trace", "--creator-trace"]);
+        assert!(repeated.creator_trace);
+        assert!(!repeated.force_new_world);
+        assert_eq!(repeated.seed_override, None);
+        assert_eq!(
+            repeated.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
     }
 
     #[test]
@@ -6352,7 +6667,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_rejects_truncated_and_trailing_tails() {
+    fn v8_and_v9_reject_truncated_and_trailing_tails() {
         let mut bytes = Vec::new();
         save_world_to_bytes_with(&mut bytes, &v8_data_with_ruby_content(), &ruby_registry())
             .unwrap();
@@ -6367,8 +6682,122 @@ mod tests {
         trailing.push(0);
         assert!(matches!(
             load_world_from_bytes_with(&trailing, ContentRegistry::builtin()),
+            Err(PersistenceError::InvalidConfigMeta)
+        ));
+
+        // A frozen v8 payload keeps the v8 error name for its trailing byte:
+        // the config tail was never part of that format.
+        let mut v8_trailing =
+            include_bytes!("../../tests/fixtures/saves/v8-baseline.mcvx").to_vec();
+        v8_trailing.push(0);
+        assert!(matches!(
+            load_world_from_bytes_with(&v8_trailing, ContentRegistry::builtin()),
             Err(PersistenceError::InvalidContentMeta)
         ));
+    }
+
+    #[test]
+    fn v9_writer_rejects_wrong_schema_before_first_byte() {
+        let data = sample_data(sample_player());
+        for schema in [0u16, CONFIG_SCHEMA_VERSION + 1] {
+            let mut out = Vec::new();
+            let result = save_world_to_bytes_with_config(
+                &mut out,
+                &data,
+                ContentRegistry::builtin(),
+                SaveConfigMeta { schema, digest: 7 },
+            );
+            assert!(
+                matches!(result, Err(PersistenceError::InvalidConfigMeta)),
+                "schema {schema} must be rejected"
+            );
+            assert!(out.is_empty(), "a rejected save emits no bytes");
+        }
+    }
+
+    #[test]
+    fn v9_roundtrip_preserves_config_meta() {
+        let data = sample_data(sample_player());
+        let meta = SaveConfigMeta {
+            schema: CONFIG_SCHEMA_VERSION,
+            digest: 0x0123_4567_89ab_cdef,
+        };
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with_config(&mut bytes, &data, ContentRegistry::builtin(), meta)
+            .expect("v9 save with explicit config meta must succeed");
+        let loaded = load_world_from_bytes_with(&bytes, ContentRegistry::builtin())
+            .expect("v9 save must load");
+
+        assert_eq!(loaded.saved_config, Some(meta));
+        assert_eq!(loaded.data, data);
+    }
+
+    #[test]
+    fn v9_rejects_zero_schema_and_truncated_tail() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with_config(
+            &mut bytes,
+            &data,
+            ContentRegistry::builtin(),
+            ConfigRuntime::defaults().meta(),
+        )
+        .expect("v9 save must succeed");
+        let schema_offset = V8_TAIL_OFFSET + V8_TAIL_LEN;
+
+        let mut zero = bytes.clone();
+        zero[schema_offset..schema_offset + 2].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&zero),
+            Err(PersistenceError::InvalidConfigMeta)
+        ));
+
+        let short = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            load_world_from_bytes(short),
+            Err(PersistenceError::Io(_))
+        ));
+
+        let no_tail = &bytes[..bytes.len() - CONFIG_TAIL_LEN];
+        assert!(matches!(
+            load_world_from_bytes(no_tail),
+            Err(PersistenceError::Io(_))
+        ));
+
+        // A v8 version word over a v9 body leaves the config tail as trailing
+        // bytes, which the v8 exact-length check still rejects.
+        let mut v8_word = bytes;
+        v8_word[4..8].copy_from_slice(&CONTENT_TABLE_VERSION.to_le_bytes());
+        assert!(matches!(
+            load_world_from_bytes(&v8_word),
+            Err(PersistenceError::InvalidContentMeta)
+        ));
+    }
+
+    #[test]
+    fn v9_accepts_future_schema_as_a_load_notice_input() {
+        let data = sample_data(sample_player());
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with_config(
+            &mut bytes,
+            &data,
+            ContentRegistry::builtin(),
+            ConfigRuntime::defaults().meta(),
+        )
+        .expect("v9 save must succeed");
+
+        let schema_offset = V8_TAIL_OFFSET + V8_TAIL_LEN;
+        bytes[schema_offset..schema_offset + 2]
+            .copy_from_slice(&(CONFIG_SCHEMA_VERSION + 1).to_le_bytes());
+        let loaded = load_world_from_bytes_with(&bytes, ContentRegistry::builtin())
+            .expect("a future schema is a notice, not a load failure");
+
+        assert_eq!(
+            loaded.saved_config.map(|meta| meta.schema),
+            Some(CONFIG_SCHEMA_VERSION + 1)
+        );
+        assert_eq!(loaded.data, data);
     }
 
     // ------------------------------------------------------------------
@@ -6400,6 +6829,76 @@ mod tests {
             data.mobs = pinned_mobs();
         }
         data
+    }
+
+    /// Deterministic v8 baseline payload for the frozen migration fixture:
+    /// rich inventory and both grids, chest, pinned mobs, Survival vitals,
+    /// calendar values, and a chunk edit.
+    fn v8_fixture_data() -> WorldSaveData {
+        migration_data(MOB_VERSION)
+    }
+
+    /// Writes `tests/fixtures/saves/v8-baseline.mcvx` once with the current v8
+    /// writer. The no-op-if-present guard is deliberate: after the save version
+    /// bumps to v9 this generator must never overwrite the frozen v8 bytes that
+    /// the migration test reads.
+    #[test]
+    #[ignore]
+    fn write_frozen_v8_fixture() {
+        let path = Path::new("tests/fixtures/saves/v8-baseline.mcvx");
+        if path.exists() {
+            return;
+        }
+        assert_eq!(SAVE_VERSION, 8, "freeze the v8 baseline before bumping");
+        assert_eq!(
+            CONTENT_TABLE_VERSION, 8,
+            "v8 baseline must carry the content table tail"
+        );
+
+        let mut bytes = Vec::new();
+        save_world_to_bytes_with(&mut bytes, &v8_fixture_data(), ContentRegistry::builtin())
+            .expect("frozen v8 fixture must encode");
+        assert_eq!(&bytes[4..8], &8u32.to_le_bytes());
+
+        let parent = path.parent().expect("fixture path has a parent");
+        std::fs::create_dir_all(parent).expect("create fixture directory");
+        std::fs::write(path, &bytes).expect("write frozen v8 fixture");
+    }
+
+    #[test]
+    fn frozen_v8_fixture_loads_without_config_metadata_and_resaves_as_v9() {
+        let bytes: &[u8] = include_bytes!("../../tests/fixtures/saves/v8-baseline.mcvx");
+        assert_eq!(
+            &bytes[4..8],
+            &8u32.to_le_bytes(),
+            "the frozen artifact must stay a v8 payload"
+        );
+
+        let loaded = load_world_from_bytes_with(bytes, ContentRegistry::builtin())
+            .expect("frozen v8 must load through the v9 path");
+        assert!(loaded.saved_content.is_some(), "v8 carries content meta");
+        assert!(
+            loaded.saved_config.is_none(),
+            "v8 carries no config metadata"
+        );
+        assert_eq!(loaded.unresolved, 0);
+        assert_eq!(loaded.data, v8_fixture_data());
+
+        let defaults = ConfigRuntime::defaults().meta();
+        let mut resaved = Vec::new();
+        save_world_to_bytes_with_config(&mut resaved, &loaded.data, &loaded.registry, defaults)
+            .expect("a frozen v8 world must re-save as v9");
+        assert_eq!(&resaved[4..8], &CONFIG_TAIL_VERSION.to_le_bytes());
+        assert_eq!(
+            resaved.len(),
+            bytes.len() + CONFIG_TAIL_LEN,
+            "v9 grows the v8 payload by exactly the config tail"
+        );
+
+        let reloaded = load_world_from_bytes_with(&resaved, ContentRegistry::builtin())
+            .expect("re-saved v9 must load");
+        assert_eq!(reloaded.saved_config, Some(defaults));
+        assert_eq!(reloaded.data, loaded.data);
     }
 
     /// Loads the fixture for one legacy version, then proves the public v8

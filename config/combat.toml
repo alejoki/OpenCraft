@@ -1,0 +1,37 @@
+# OpenCraft creator configuration: melee combat, player damage, bows, and arrows.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[melee]
+fist_damage = 1
+sword_damage_wood = 4
+sword_damage_stone = 5
+sword_damage_iron = 6
+reach = 3.0
+swing_cooldown_secs = 0.6
+
+[player]
+iframe_secs = 0.5
+hurt_flash_secs = 0.5
+knockback_speed = 6.0
+knockback_decay = 0.6
+
+[bow]
+min_charge_secs = 0.2
+full_charge_secs = 1.0
+
+[arrow]
+gravity = 20.0
+speed_min = 18.0
+speed_max = 32.0
+damage_min = 1
+damage_max = 4
+skeleton_speed = 28.0
+skeleton_damage = 2
+lifetime_secs = 20.0
+embed_secs = 2.0

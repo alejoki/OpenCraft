@@ -77,11 +77,65 @@ pub const REGEN_HUNGER_COST: u16 = 1;
 /// apply more than this many game seconds at once.
 pub const MAX_TICK_GAME_SECS: f32 = 10.0;
 
-/// Maximum drowning damage steps needed to reach zero health from full.
-const MAX_DROWN_STEPS: u16 = MAX_HEALTH.div_ceil(DROWN_DAMAGE);
+/// Tunable survival tuning consumed by [`SurvivalRuntime::tick_with`].
+///
+/// [`SurvivalRules::default`] is built from the constants above, so the
+/// default bundle reproduces [`SurvivalRuntime::tick`] exactly. The struct is
+/// a plain value type: it carries no TOML/config vocabulary, only the numbers
+/// the simulation consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurvivalRules {
+    /// Drops up to this many blocks are free.
+    pub fall_safe_blocks: f32,
+    /// Air points drained per game second while the head is submerged.
+    pub air_drain_per_sec: f32,
+    /// Game seconds between drowning damage ticks once the lungs are empty.
+    pub drown_interval_secs: f32,
+    /// Health lost per drowning tick.
+    pub drown_damage: u16,
+    /// Game seconds between hunger point drains.
+    pub hunger_drain_secs: f32,
+    /// Game seconds between starvation damage ticks at zero hunger.
+    pub starve_interval_secs: f32,
+    /// Health lost per starvation tick.
+    pub starve_damage: u16,
+    /// Regeneration only runs at or above this hunger value.
+    pub regen_hunger_threshold: u16,
+    /// Game seconds between regeneration heals.
+    pub regen_interval_secs: f32,
+    /// Hunger spent per regenerated health point.
+    pub regen_hunger_cost: u16,
+}
 
-/// Maximum starvation damage steps needed to reach zero health from full.
-const MAX_STARVE_STEPS: u16 = MAX_HEALTH.div_ceil(STARVE_DAMAGE);
+impl Default for SurvivalRules {
+    fn default() -> Self {
+        Self {
+            fall_safe_blocks: FALL_SAFE_BLOCKS,
+            air_drain_per_sec: AIR_DRAIN_PER_SEC,
+            drown_interval_secs: DROWN_INTERVAL_SECS,
+            drown_damage: DROWN_DAMAGE,
+            hunger_drain_secs: HUNGER_DRAIN_SECS,
+            starve_interval_secs: STARVE_INTERVAL_SECS,
+            starve_damage: STARVE_DAMAGE,
+            regen_hunger_threshold: REGEN_HUNGER_THRESHOLD,
+            regen_interval_secs: REGEN_INTERVAL_SECS,
+            regen_hunger_cost: REGEN_HUNGER_COST,
+        }
+    }
+}
+
+/// Per-tick step cap for a damage rule, derived from the live damage value.
+///
+/// A smaller configured damage needs more steps to reach lethal, so the cap
+/// must follow the rule rather than the default constant. Zero damage needs
+/// no steps at all and is handled by the caller as an inert rule.
+fn damage_step_cap(damage: u16) -> u32 {
+    if damage == 0 {
+        0
+    } else {
+        u32::from(MAX_HEALTH.div_ceil(damage))
+    }
+}
 
 /// The two supported game modes.
 ///
@@ -228,12 +282,21 @@ impl SurvivalState {
 /// Non-finite distances other than positive infinity and negative distances
 /// are treated as "no fall"; otherwise damage is
 /// `floor(distance - FALL_SAFE_BLOCKS)` clamped to [`MAX_HEALTH`], so a
-/// 3-block drop is safe, 4 blocks costs 1, and 5 blocks costs 2.
+/// 3-block drop is safe, 4 blocks costs 1, and 5 blocks costs 2. This is the
+/// default-rules wrapper over [`fall_damage_with`].
 pub fn fall_damage(distance_blocks: f32) -> u16 {
-    if distance_blocks.is_nan() || distance_blocks <= FALL_SAFE_BLOCKS {
+    fall_damage_with(distance_blocks, &SurvivalRules::default())
+}
+
+/// Health lost by a dry-land fall of `distance_blocks` blocks under `rules`.
+///
+/// Same fail-closed shape as [`fall_damage`], but the safe distance comes from
+/// the live rule value instead of [`FALL_SAFE_BLOCKS`].
+pub fn fall_damage_with(distance_blocks: f32, rules: &SurvivalRules) -> u16 {
+    if distance_blocks.is_nan() || distance_blocks <= rules.fall_safe_blocks {
         return 0;
     }
-    let raw = (distance_blocks - FALL_SAFE_BLOCKS).floor();
+    let raw = (distance_blocks - rules.fall_safe_blocks).floor();
     if raw >= f32::from(MAX_HEALTH) {
         MAX_HEALTH
     } else {
@@ -308,6 +371,28 @@ impl SurvivalRuntime {
         ctx: SurvivalContext,
         game_dt: f32,
     ) -> SurvivalTick {
+        self.tick_with(vitals, ctx, game_dt, &SurvivalRules::default())
+    }
+
+    /// Rules-aware [`SurvivalRuntime::tick`].
+    ///
+    /// Every constant-driven rule reads `rules` instead of the module constant;
+    /// the default bundle reproduces the old behavior exactly. Malformed rule
+    /// values fail closed rather than looping or dividing by zero:
+    ///
+    /// - non-finite or non-positive drain/interval values make that rule inert;
+    /// - zero damage makes drowning/starvation inert (their step cap would be
+    ///   zero anyway);
+    /// - the per-tick damage step cap follows the live damage value so a
+    ///   smaller configured hit still reaches lethal;
+    /// - regeneration never heals when a positive hunger cost is unaffordable.
+    pub fn tick_with(
+        &mut self,
+        vitals: &mut SurvivalState,
+        ctx: SurvivalContext,
+        game_dt: f32,
+        rules: &SurvivalRules,
+    ) -> SurvivalTick {
         let dt = if game_dt.is_nan() {
             0.0
         } else {
@@ -322,7 +407,7 @@ impl SurvivalRuntime {
         let mut report = SurvivalTick::default();
 
         // 1. One-shot fall damage from the physics latch.
-        let fall = fall_damage(ctx.fall_distance);
+        let fall = fall_damage_with(ctx.fall_distance, rules);
         if fall > 0 {
             let applied = vitals.damage(fall);
             report.damage = report.damage.saturating_add(applied);
@@ -340,32 +425,44 @@ impl SurvivalRuntime {
         if ctx.head_submerged {
             let air_was_empty = vitals.air == 0;
 
-            self.air_accum += AIR_DRAIN_PER_SEC * dt;
-            let whole_air = self.air_accum.floor();
-            if whole_air > 0.0 {
-                self.air_accum -= whole_air;
-                let drain = whole_air.min(f32::from(u16::MAX)) as u16;
-                vitals.drain_air(drain);
-                if vitals.air == 0 {
-                    self.air_accum = 0.0;
+            if rules.air_drain_per_sec.is_finite() && rules.air_drain_per_sec > 0.0 {
+                self.air_accum += rules.air_drain_per_sec * dt;
+                let whole_air = self.air_accum.floor();
+                if whole_air > 0.0 {
+                    self.air_accum -= whole_air;
+                    let drain = whole_air.min(f32::from(u16::MAX)) as u16;
+                    vitals.drain_air(drain);
+                    if vitals.air == 0 {
+                        self.air_accum = 0.0;
+                    }
                 }
+            } else {
+                self.air_accum = 0.0;
             }
 
             if air_was_empty {
-                self.drown_accum += dt;
-                let steps = (self.drown_accum / DROWN_INTERVAL_SECS).floor();
-                if steps > 0.0 {
-                    self.drown_accum -= steps * DROWN_INTERVAL_SECS;
-                    let steps = steps.min(f32::from(MAX_DROWN_STEPS)) as u16;
-                    let applied = vitals.damage(steps.saturating_mul(DROWN_DAMAGE));
-                    report.damage = report.damage.saturating_add(applied);
-                    if applied > 0 {
-                        report.cause = Some(DamageCause::Drowning);
+                let interval = rules.drown_interval_secs;
+                if rules.drown_damage > 0 && interval.is_finite() && interval > 0.0 {
+                    self.drown_accum += dt;
+                    let steps = (self.drown_accum / interval).floor();
+                    if steps > 0.0 {
+                        self.drown_accum -= steps * interval;
+                        let steps = steps.min(damage_step_cap(rules.drown_damage) as f32) as u32;
+                        let total =
+                            u16::try_from(steps.saturating_mul(u32::from(rules.drown_damage)))
+                                .unwrap_or(u16::MAX);
+                        let applied = vitals.damage(total);
+                        report.damage = report.damage.saturating_add(applied);
+                        if applied > 0 {
+                            report.cause = Some(DamageCause::Drowning);
+                        }
+                        if vitals.health == 0 {
+                            self.reset();
+                            return report;
+                        }
                     }
-                    if vitals.health == 0 {
-                        self.reset();
-                        return report;
-                    }
+                } else {
+                    self.drown_accum = 0.0;
                 }
             } else {
                 self.drown_accum = 0.0;
@@ -381,33 +478,42 @@ impl SurvivalRuntime {
         let hunger_was_empty = vitals.hunger == 0;
         if hunger_was_empty {
             self.hunger_accum = 0.0;
-        } else {
+        } else if rules.hunger_drain_secs.is_finite() && rules.hunger_drain_secs > 0.0 {
             self.hunger_accum += dt;
-            let steps = (self.hunger_accum / HUNGER_DRAIN_SECS).floor();
+            let steps = (self.hunger_accum / rules.hunger_drain_secs).floor();
             if steps > 0.0 {
-                self.hunger_accum -= steps * HUNGER_DRAIN_SECS;
+                self.hunger_accum -= steps * rules.hunger_drain_secs;
                 let steps = steps.min(f32::from(MAX_HUNGER)) as u16;
                 vitals.spend_hunger(steps);
             }
+        } else {
+            self.hunger_accum = 0.0;
         }
 
         // 4. Starvation. Only a tick that started at zero hunger accrues
         //    starvation time, mirroring the air/drowning rule.
         if hunger_was_empty {
-            self.starve_accum += dt;
-            let steps = (self.starve_accum / STARVE_INTERVAL_SECS).floor();
-            if steps > 0.0 {
-                self.starve_accum -= steps * STARVE_INTERVAL_SECS;
-                let steps = steps.min(f32::from(MAX_STARVE_STEPS)) as u16;
-                let applied = vitals.damage(steps.saturating_mul(STARVE_DAMAGE));
-                report.damage = report.damage.saturating_add(applied);
-                if applied > 0 {
-                    report.cause = Some(DamageCause::Starvation);
+            let interval = rules.starve_interval_secs;
+            if rules.starve_damage > 0 && interval.is_finite() && interval > 0.0 {
+                self.starve_accum += dt;
+                let steps = (self.starve_accum / interval).floor();
+                if steps > 0.0 {
+                    self.starve_accum -= steps * interval;
+                    let steps = steps.min(damage_step_cap(rules.starve_damage) as f32) as u32;
+                    let total = u16::try_from(steps.saturating_mul(u32::from(rules.starve_damage)))
+                        .unwrap_or(u16::MAX);
+                    let applied = vitals.damage(total);
+                    report.damage = report.damage.saturating_add(applied);
+                    if applied > 0 {
+                        report.cause = Some(DamageCause::Starvation);
+                    }
+                    if vitals.health == 0 {
+                        self.reset();
+                        return report;
+                    }
                 }
-                if vitals.health == 0 {
-                    self.reset();
-                    return report;
-                }
+            } else {
+                self.starve_accum = 0.0;
             }
         } else {
             self.starve_accum = 0.0;
@@ -415,28 +521,34 @@ impl SurvivalRuntime {
 
         // 5. Regeneration: one health per interval, one hunger per heal, only
         //    while hunger is at or above the threshold and health is missing.
-        //    Natural regeneration is suppressed while the head is submerged:
-        //    a drowning player cannot out-heal the one-second drown ticks, so
-        //    an empty lung always kills in DROWN_INTERVAL_SECS * MAX_DROWN_STEPS.
+        //    A positive hunger cost must be affordable, otherwise the heal is
+        //    skipped (cost zero is free regeneration). Natural regeneration is
+        //    suppressed while the head is submerged: a drowning player cannot
+        //    out-heal the drowning ticks, so an empty lung always kills.
         if !ctx.head_submerged
             && vitals.health < MAX_HEALTH
-            && vitals.hunger >= REGEN_HUNGER_THRESHOLD
+            && vitals.hunger >= rules.regen_hunger_threshold
+            && rules.regen_interval_secs.is_finite()
+            && rules.regen_interval_secs > 0.0
         {
             self.regen_accum += dt;
-            let steps = (self.regen_accum / REGEN_INTERVAL_SECS).floor();
+            let steps = (self.regen_accum / rules.regen_interval_secs).floor();
             if steps > 0.0 {
-                self.regen_accum -= steps * REGEN_INTERVAL_SECS;
+                self.regen_accum -= steps * rules.regen_interval_secs;
                 let mut remaining =
                     (steps.min(f32::from(MAX_HEALTH)) as u16).min(MAX_HEALTH - vitals.health);
                 while remaining > 0
                     && vitals.health < MAX_HEALTH
-                    && vitals.hunger >= REGEN_HUNGER_THRESHOLD
+                    && vitals.hunger >= rules.regen_hunger_threshold
                 {
+                    if rules.regen_hunger_cost > 0 && vitals.hunger < rules.regen_hunger_cost {
+                        break;
+                    }
                     let healed = vitals.heal(1);
                     if healed == 0 {
                         break;
                     }
-                    vitals.spend_hunger(REGEN_HUNGER_COST);
+                    vitals.spend_hunger(rules.regen_hunger_cost);
                     report.healed = report.healed.saturating_add(healed);
                     remaining -= 1;
                 }
@@ -1000,5 +1112,230 @@ mod tests {
             SurvivalTick::default()
         );
         assert_eq!(vitals, SurvivalState::full());
+    }
+
+    #[test]
+    fn survival_rules_default_matches_the_module_constants() {
+        let rules = SurvivalRules::default();
+        assert_eq!(rules.fall_safe_blocks, FALL_SAFE_BLOCKS);
+        assert_eq!(rules.air_drain_per_sec, AIR_DRAIN_PER_SEC);
+        assert_eq!(rules.drown_interval_secs, DROWN_INTERVAL_SECS);
+        assert_eq!(rules.drown_damage, DROWN_DAMAGE);
+        assert_eq!(rules.hunger_drain_secs, HUNGER_DRAIN_SECS);
+        assert_eq!(rules.starve_interval_secs, STARVE_INTERVAL_SECS);
+        assert_eq!(rules.starve_damage, STARVE_DAMAGE);
+        assert_eq!(rules.regen_hunger_threshold, REGEN_HUNGER_THRESHOLD);
+        assert_eq!(rules.regen_interval_secs, REGEN_INTERVAL_SECS);
+        assert_eq!(rules.regen_hunger_cost, REGEN_HUNGER_COST);
+    }
+
+    #[test]
+    fn default_rules_tick_with_reproduces_the_default_wrapper() {
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            fall_distance: 4.0,
+            ..survival_ctx()
+        };
+        let mut plain_runtime = SurvivalRuntime::default();
+        let mut plain_vitals = SurvivalState::new(MAX_HEALTH - 3, 17, 5).unwrap();
+        let mut rules_runtime = SurvivalRuntime::default();
+        let mut rules_vitals = plain_vitals;
+        let rules = SurvivalRules::default();
+
+        let plain = plain_runtime.tick(&mut plain_vitals, ctx, 3.0);
+        let tuned = rules_runtime.tick_with(&mut rules_vitals, ctx, 3.0, &rules);
+        assert_eq!(plain, tuned);
+        assert_eq!(plain_vitals, rules_vitals);
+    }
+
+    #[test]
+    fn tuned_hunger_drain_uses_the_live_interval() {
+        let rules = SurvivalRules {
+            hunger_drain_secs: 1.0,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::full();
+
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), 1.0, &rules);
+        assert_eq!(tick.damage, 0, "hunger drain is not damage");
+        assert_eq!(vitals.hunger(), MAX_HUNGER - 1);
+
+        // The default 30 s interval does not drain after one second.
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::full();
+        runtime.tick(&mut vitals, survival_ctx(), 1.0);
+        assert_eq!(vitals.hunger(), MAX_HUNGER);
+    }
+
+    #[test]
+    fn tuned_fall_safe_blocks_moves_the_damage_threshold() {
+        let rules = SurvivalRules {
+            fall_safe_blocks: 0.0,
+            ..SurvivalRules::default()
+        };
+        assert_eq!(fall_damage_with(0.9, &rules), 0);
+        assert_eq!(fall_damage_with(4.0, &rules), 4);
+
+        let rules = SurvivalRules {
+            fall_safe_blocks: 10.0,
+            ..SurvivalRules::default()
+        };
+        assert_eq!(fall_damage_with(9.0, &rules), 0);
+        assert_eq!(fall_damage_with(12.0, &rules), 2);
+
+        // The default wrapper keeps the 3-block threshold.
+        assert_eq!(fall_damage(4.0), 1);
+        assert_eq!(fall_damage(5.0), 2);
+    }
+
+    #[test]
+    fn tuned_drown_interval_and_damage_apply_per_tick() {
+        let rules = SurvivalRules {
+            drown_interval_secs: 0.5,
+            drown_damage: 3,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            ..survival_ctx()
+        };
+
+        let tick = runtime.tick_with(&mut vitals, ctx, 1.0, &rules);
+        assert_eq!(tick.damage, 6, "two 0.5 s ticks at 3 damage each");
+        assert_eq!(vitals.health(), MAX_HEALTH - 6);
+        assert_eq!(tick.cause, Some(DamageCause::Drowning));
+    }
+
+    #[test]
+    fn tuned_starve_interval_and_damage_apply_per_tick() {
+        let rules = SurvivalRules {
+            starve_interval_secs: 1.0,
+            starve_damage: 3,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, 0, FULL_AIR).unwrap();
+
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), 2.0, &rules);
+        assert_eq!(tick.damage, 6, "two 1 s ticks at 3 damage each");
+        assert_eq!(vitals.health(), MAX_HEALTH - 6);
+        assert_eq!(tick.cause, Some(DamageCause::Starvation));
+    }
+
+    #[test]
+    fn small_configured_damage_still_reaches_lethal_within_the_step_cap() {
+        // interval 0.5 s with the 10 s per-tick clamp is 20 steps; damage 1
+        // must apply all 20, i.e. the old default-derived cap of 10 would
+        // wrongly leave the player alive.
+        let rules = SurvivalRules {
+            drown_interval_secs: 0.5,
+            drown_damage: 1,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, MAX_HUNGER, 0).unwrap();
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            ..survival_ctx()
+        };
+        let tick = runtime.tick_with(&mut vitals, ctx, MAX_TICK_GAME_SECS, &rules);
+        assert_eq!(tick.damage, MAX_HEALTH);
+        assert_eq!(vitals.health(), 0);
+
+        // Starvation has the same live-cap behavior.
+        let rules = SurvivalRules {
+            starve_interval_secs: 0.5,
+            starve_damage: 1,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(MAX_HEALTH, 0, FULL_AIR).unwrap();
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), MAX_TICK_GAME_SECS, &rules);
+        assert_eq!(tick.damage, MAX_HEALTH);
+        assert_eq!(vitals.health(), 0);
+    }
+
+    #[test]
+    fn malformed_zero_damage_and_zero_intervals_fail_closed() {
+        let rules = SurvivalRules {
+            drown_damage: 0,
+            starve_damage: 0,
+            drown_interval_secs: 0.0,
+            starve_interval_secs: 0.0,
+            hunger_drain_secs: 0.0,
+            regen_interval_secs: 0.0,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, 0, 0).unwrap();
+        let ctx = SurvivalContext {
+            head_submerged: true,
+            ..survival_ctx()
+        };
+
+        let tick = runtime.tick_with(&mut vitals, ctx, MAX_TICK_GAME_SECS, &rules);
+        assert_eq!(tick, SurvivalTick::default());
+        assert_eq!(vitals, SurvivalState::new(10, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn tuned_regen_threshold_interval_and_cost_drive_healing() {
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 5,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 1,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, 5, FULL_AIR).unwrap();
+
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), 1.0, &rules);
+        assert_eq!(tick.healed, 1);
+        assert_eq!(vitals.health(), 11);
+        assert_eq!(vitals.hunger(), 4, "cost is paid after the heal");
+
+        // The default threshold of 18 refuses the same vitals.
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, 5, FULL_AIR).unwrap();
+        let tick = runtime.tick(&mut vitals, survival_ctx(), REGEN_INTERVAL_SECS);
+        assert_eq!(tick.healed, 0);
+        assert_eq!(vitals.health(), 10);
+    }
+
+    #[test]
+    fn zero_regen_cost_is_free_regeneration() {
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 0,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 0,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, 0, FULL_AIR).unwrap();
+
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), 1.0, &rules);
+        assert_eq!(tick.healed, 1);
+        assert_eq!(vitals.health(), 11);
+        assert_eq!(vitals.hunger(), 0);
+    }
+
+    #[test]
+    fn positive_regen_cost_is_not_healed_when_unaffordable() {
+        let rules = SurvivalRules {
+            regen_hunger_threshold: 3,
+            regen_interval_secs: 1.0,
+            regen_hunger_cost: 5,
+            ..SurvivalRules::default()
+        };
+        let mut runtime = SurvivalRuntime::default();
+        let mut vitals = SurvivalState::new(10, 4, FULL_AIR).unwrap();
+
+        let tick = runtime.tick_with(&mut vitals, survival_ctx(), 1.0, &rules);
+        assert_eq!(tick.healed, 0);
+        assert_eq!(vitals.health(), 10);
+        assert_eq!(vitals.hunger(), 4, "an unaffordable heal spends nothing");
     }
 }

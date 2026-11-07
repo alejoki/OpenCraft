@@ -137,12 +137,14 @@ impl UiRenderer {
         self.logo_renderer.set_logo(device, queue, logo);
     }
 
-    /// Replace the UI-only item sprite atlas after a session install.
+    /// Replace the UI-only item sprite atlas after a session install or a
+    /// live built-in icon override edit.
     ///
     /// The built-in Default atlas is the procedural set; a loaded world whose
     /// frozen registry carries pack item icons installs its composed atlas
-    /// here. The block texture array is re-uploaded separately through
-    /// `VoxelRenderer::write_block_layers`.
+    /// here, and the dev-only pack watcher re-uploads the atlas when a
+    /// `[builtin_icons]` PNG settles. The block texture array is re-uploaded
+    /// separately through `VoxelRenderer::write_block_layers`.
     pub fn set_item_sprite_layers(
         &mut self,
         device: &wgpu::Device,

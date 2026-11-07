@@ -1711,18 +1711,23 @@ mod tests {
         );
     }
 
+    /// One Summer/Winter disagreement: the world position and both block ids.
+    struct SeasonalWitnessPoint {
+        position: (i32, i32, i32),
+        summer: BlockId,
+        winter: BlockId,
+    }
+
+    /// The chunk holding the first two Summer/Winter disagreements for a seed.
+    struct SeasonalWitness {
+        chunk: ChunkPos,
+        first: SeasonalWitnessPoint,
+        second: SeasonalWitnessPoint,
+    }
+
     /// The first two block positions where Summer and Winter disagree inside one
     /// chunk, searched over T01's known-land witness region for seed 1.
-    /// Returns `(chunk, witness, second)` with both positions and their Summer
-    /// and Winter block ids.
-    #[allow(clippy::type_complexity)]
-    fn find_seasonal_witness(
-        seed: u32,
-    ) -> (
-        ChunkPos,
-        ((i32, i32, i32), BlockId, BlockId),
-        ((i32, i32, i32), BlockId, BlockId),
-    ) {
+    fn find_seasonal_witness(seed: u32) -> SeasonalWitness {
         for cx in -2..=2 {
             for cz in -2..=2 {
                 for cy in 0..=1 {
@@ -1741,9 +1746,19 @@ mod tests {
                                         cy * CHUNK_SIZE as i32 + ly as i32,
                                         cz * CHUNK_SIZE as i32 + lz as i32,
                                     );
-                                    found.push((world, s, w));
+                                    found.push(SeasonalWitnessPoint {
+                                        position: world,
+                                        summer: s,
+                                        winter: w,
+                                    });
                                     if found.len() == 2 {
-                                        return (pos, found[0], found[1]);
+                                        let second = found.pop().expect("two witnesses");
+                                        let first = found.pop().expect("two witnesses");
+                                        return SeasonalWitness {
+                                            chunk: pos,
+                                            first,
+                                            second,
+                                        };
                                     }
                                 }
                             }
@@ -1759,11 +1774,18 @@ mod tests {
     fn test_seasonal_swap_reapplies_edits_and_replaces_content_in_place() {
         let _heavy = lock_heavy_streaming();
         let seed = 1;
-        let (
-            witness_chunk,
-            (edit_pos, summer_at_edit, winter_at_edit),
-            (probe, summer_probe, winter_probe),
-        ) = find_seasonal_witness(seed);
+        let witness = find_seasonal_witness(seed);
+        let witness_chunk = witness.chunk;
+        let (edit_pos, summer_at_edit, winter_at_edit) = (
+            witness.first.position,
+            witness.first.summer,
+            witness.first.winter,
+        );
+        let (probe, summer_probe, winter_probe) = (
+            witness.second.position,
+            witness.second.summer,
+            witness.second.winter,
+        );
         assert_ne!(summer_at_edit, winter_at_edit);
         assert_ne!(summer_probe, winter_probe);
 

@@ -46,6 +46,13 @@ pub struct PackContentSpec {
     pub worldgen: Vec<WorldgenEntry>,
     pub block_patches: Vec<BlockPatch>,
     pub recipe_patches: Vec<RecipePatch>,
+    /// Built-in item sprite overrides: built-in material/tool short name to
+    /// pack-relative authored PNG path.
+    ///
+    /// Presentation-only. This table is deliberately excluded from registry
+    /// allocation and the content digest so adding or removing an override is
+    /// a live visual edit, never a restart.
+    pub builtin_icons: BTreeMap<String, String>,
     /// Resampled 16x16 RGBA assets keyed by pack-relative authored path.
     pub assets: BTreeMap<String, PackAsset>,
 }

@@ -12,11 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::{IVec3, Vec3};
 
+use crate::config::{ConfigRuntime, RulesBundle, SaveConfigMeta};
 use crate::content::faces::BlockFaces;
 use crate::content::{ContentRegistry, WorldgenRule};
 use crate::mesh::quad::ChunkMesh;
 use crate::player::camera::Camera;
-use crate::player::combat::DamageCause;
+use crate::player::combat::{DamageCause, HitRequest};
 use crate::player::container::Container;
 use crate::player::inventory::{
     ChestSlots, InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
@@ -50,6 +51,47 @@ use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_heigh
 /// reachable. Shared with the placement/mining ray length so every world
 /// interaction uses one reach budget.
 pub const TABLE_INTERACT_REACH: f32 = 8.0;
+
+/// Creator-tunable interaction reach.
+///
+/// Owned here beside [`TABLE_INTERACT_REACH`] so the mining.toml interaction
+/// row does not force `player::tools` to import `world::session`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InteractionRules {
+    /// Maximum eye-to-block distance for table interaction, in blocks.
+    pub table_reach: f32,
+}
+
+impl Default for InteractionRules {
+    fn default() -> Self {
+        Self {
+            table_reach: TABLE_INTERACT_REACH,
+        }
+    }
+}
+
+/// One-shot notice for a v9 world saved under the same config schema but a
+/// different effective-value digest.
+pub const CONFIG_CHANGED_NOTICE: &str = "config changed since this world was saved";
+
+/// One-shot notice for a v9 world whose config schema differs from the
+/// running one; every effective value may still look the same by name.
+pub const CONFIG_SCHEMA_CHANGED_NOTICE: &str = "config schema changed since this world was saved";
+
+/// Notice matrix for one saved-meta/current-meta pair.
+///
+/// A schema mismatch wins over a digest mismatch: the digest is only
+/// comparable within one schema version, so the caller must be told the more
+/// actionable fact first.
+fn config_notice_for(saved: SaveConfigMeta, current: SaveConfigMeta) -> Option<String> {
+    if saved.schema != current.schema {
+        Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+    } else if saved.digest != current.digest {
+        Some(CONFIG_CHANGED_NOTICE.to_string())
+    } else {
+        None
+    }
+}
 
 /// Why [`WorldSession::fire_bow`] refused a shot.
 ///
@@ -100,6 +142,12 @@ pub struct WorldSession {
     pub world: WorldManager,
     pub player: Player,
     pub camera: Camera,
+    /// The effective typed gameplay tuning this session simulates with.
+    ///
+    /// Installed by [`WorldSession::apply_rules`] at startup and after every
+    /// accepted live reload, then read by the session's gameplay seams.
+    /// Ephemeral: never serialized, so a save never pins a tuning value.
+    gameplay_rules: RulesBundle,
     /// The session-owned game clock. Every save/load boundary restores it
     /// from persisted game time, never from the wall clock.
     pub clock: GameClock,
@@ -121,6 +169,14 @@ pub struct WorldSession {
     /// the registry it resolved against here too. A live pack-stack change
     /// never replaces it (MEM512/D181); the next loaded world does.
     pub registry: Arc<ContentRegistry>,
+    /// Config metadata this session writes with. Fresh sessions write the
+    /// registry defaults; a loaded world inherits the running config after
+    /// [`WorldSession::apply_config`], and the next save names it.
+    save_config: SaveConfigMeta,
+    /// Config metadata the loaded world carried, or `None` for fresh sessions
+    /// and v1-v8 saves. Ephemeral: the pending notice and this record are
+    /// consumed together by [`WorldSession::take_config_notice`].
+    saved_config: Option<SaveConfigMeta>,
     /// Ephemeral changed-stack note computed once at load time and consumed by
     /// [`WorldSession::take_content_notice`]. Never persisted and never
     /// re-derived per frame.
@@ -261,12 +317,15 @@ impl WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player,
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock: GameClock::new(),
             season_length_days,
             save_mode: mode,
             chests: ChestMap::default(),
             save_path,
             registry,
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config: None,
             content_notice: None,
             open_table: None,
             open_chest: None,
@@ -343,6 +402,7 @@ impl WorldSession {
             world: WorldManager::with_seed_and_edits(16, seed, ChunkEditMap::default()),
             player: Player::new(position),
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock,
             season_length_days,
             // Edit Background is a Creative-rules editor; a stored world mode
@@ -351,6 +411,8 @@ impl WorldSession {
             chests: ChestMap::default(),
             save_path,
             registry,
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config: None,
             content_notice: None,
             open_table: None,
             open_chest: None,
@@ -389,7 +451,13 @@ impl WorldSession {
     /// selection or a grid stored under the wrong kind. `set_mode` runs after
     /// the raw fly assignment, so a Survival record cannot restore flight.
     pub fn session_from_save(data: WorldSaveData, save_path: PathBuf) -> WorldSession {
-        Self::session_from_save_with_registry(data, save_path, ContentRegistry::builtin_arc(), None)
+        Self::session_from_save_with_registry(
+            data,
+            save_path,
+            ContentRegistry::builtin_arc(),
+            None,
+            None,
+        )
     }
 
     /// Rebuild a session from a registry-aware load, preserving the placeholder
@@ -400,11 +468,13 @@ impl WorldSession {
     /// once by the UI and never persisted.
     pub fn from_loaded_world(loaded: LoadedWorld, save_path: PathBuf) -> WorldSession {
         let content_notice = loaded.content_notice();
+        let saved_config = loaded.saved_config;
         Self::session_from_save_with_registry(
             loaded.data,
             save_path,
             Arc::new(loaded.registry),
             content_notice,
+            saved_config,
         )
     }
 
@@ -421,6 +491,7 @@ impl WorldSession {
         save_path: PathBuf,
         registry: Arc<ContentRegistry>,
         content_notice: Option<String>,
+        saved_config: Option<SaveConfigMeta>,
     ) -> WorldSession {
         let WorldSaveData {
             seed,
@@ -485,12 +556,18 @@ impl WorldSession {
             ),
             player,
             camera: Camera::new(Vec3::ZERO),
+            gameplay_rules: RulesBundle::default(),
             clock,
             season_length_days,
             save_mode: mode,
             chests,
             save_path,
             registry,
+            // A loaded session first presents its saved config through the
+            // one-shot notice; `apply_config` then installs the running meta
+            // the next save writes.
+            save_config: ConfigRuntime::defaults().meta(),
+            saved_config,
             content_notice,
             open_table: None,
             open_chest: None,
@@ -586,9 +663,14 @@ impl WorldSession {
             head_submerged,
             fall_distance: self.player.take_landing_fall(),
         };
-        let tick = self
-            .survival_runtime
-            .tick(&mut self.player.survival, ctx, game_dt);
+        // Copy the Copy rule slice before the mutable vitals borrow.
+        let survival_rules = self.gameplay_rules.survival;
+        let tick = self.survival_runtime.tick_with(
+            &mut self.player.survival,
+            ctx,
+            game_dt,
+            &survival_rules,
+        );
         // The survival rules are the ONLY writers of the `Fall`/`Drowning`/
         // `Starvation` causes (the mob-melee seam is the only writer of
         // `Zombie`). A tick that applied no damage never touches the tag, so an
@@ -734,7 +816,8 @@ impl WorldSession {
         if !holding_bow {
             return Err(BowFireError::NotHoldingBow);
         }
-        let arrow = Arrow::player(origin, dir, charge).ok_or(BowFireError::InvalidShot)?;
+        let arrow = Arrow::player_with_rules(origin, dir, charge, &self.gameplay_rules.arrow)
+            .ok_or(BowFireError::InvalidShot)?;
         if self.arrows.len() >= ARROW_CAP {
             return Err(BowFireError::ArrowCapReached);
         }
@@ -824,6 +907,9 @@ impl WorldSession {
 
         let arrows = std::mem::take(&mut self.arrows);
         let mut kept = Vec::with_capacity(arrows.len());
+        // Copy the Copy rule slices before the split mutable borrows below.
+        let arrow_rules = self.gameplay_rules.arrow;
+        let combat_rules = self.gameplay_rules.combat;
         // Kills are buffered, not granted, while the mob list is mutably
         // borrowed; `resolve_mob_kill` needs `&mut self` for the drop grant.
         let mut pending_kills: Vec<(usize, MobHit)> = Vec::new();
@@ -847,13 +933,13 @@ impl WorldSession {
             }
             let mut consumed = false;
             match arrow.state {
-                ArrowState::Embedded => arrow.advance(game_dt),
+                ArrowState::Embedded => arrow.advance_with_rules(game_dt, &arrow_rules),
                 ArrowState::Flying => {
                     let substeps = arrow.substeps(game_dt);
                     let sub_dt = game_dt / substeps as f32;
                     for _ in 0..substeps {
                         let before = arrow.position;
-                        arrow.advance(sub_dt);
+                        arrow.advance_with_rules(sub_dt, &arrow_rules);
                         if !position_is_resident(world, arrow.position) {
                             // The next cell lives in a chunk that has not
                             // streamed in: restore the last known-good point
@@ -894,13 +980,16 @@ impl WorldSession {
                                 // disjoint mutable borrows below.
                                 let mode = player.mode();
                                 let feet = player.position;
-                                let applied = player.combat.take_hit(
+                                let applied = player.combat.take_hit_with_rules(
                                     &mut player.survival,
-                                    arrow.damage,
+                                    HitRequest {
+                                        damage: arrow.damage,
+                                        cause: DamageCause::SkeletonArrow,
+                                        player_feet: feet,
+                                        from: before,
+                                    },
                                     mode,
-                                    DamageCause::SkeletonArrow,
-                                    feet,
-                                    before,
+                                    &combat_rules,
                                 );
                                 if let Some(applied) = applied {
                                     self.last_damage_cause = Some(DamageCause::SkeletonArrow);
@@ -919,7 +1008,7 @@ impl WorldSession {
                         let cell = arrow.position.floor();
                         let block = world.get_block(cell.x as i32, cell.y as i32, cell.z as i32);
                         if block.is_solid() {
-                            arrow.embed();
+                            arrow.embed_with_rules(&arrow_rules);
                             report.block_hits += 1;
                             break;
                         }
@@ -1096,7 +1185,9 @@ impl WorldSession {
     /// uses. Exactly `0.0` when no flash is active.
     #[inline]
     pub fn player_hurt_intensity(&self) -> f32 {
-        self.player.combat.hurt_intensity()
+        self.player
+            .combat
+            .hurt_intensity_with_rules(&self.gameplay_rules.combat)
     }
 
     /// Whether the population layer may create mobs and burn them in daylight.
@@ -1231,7 +1322,9 @@ impl WorldSession {
         // spawn the arrows those steps decided -> spawn/cull. A zero-step or
         // paused frame returns above, so it can neither age the i-frame window,
         // damage the player, nor emit a shot.
-        self.player.combat.advance(report.ai_steps);
+        self.player
+            .combat
+            .advance_with_rules(report.ai_steps, &self.gameplay_rules.combat);
         self.apply_mob_attacks(&report.attacks);
         self.apply_mob_shots(&report.shots);
         {
@@ -1285,13 +1378,16 @@ impl WorldSession {
             // of `combat` and `survival` below.
             let mode = self.player.mode();
             let feet = self.player.position;
-            let applied = self.player.combat.take_hit(
+            let applied = self.player.combat.take_hit_with_rules(
                 &mut self.player.survival,
-                profile.damage,
+                HitRequest {
+                    damage: profile.damage,
+                    cause: DamageCause::Zombie,
+                    player_feet: feet,
+                    from: attack.from,
+                },
                 mode,
-                DamageCause::Zombie,
-                feet,
-                attack.from,
+                &self.gameplay_rules.combat,
             );
             if let Some(applied) = applied {
                 self.last_damage_cause = Some(DamageCause::Zombie);
@@ -1325,7 +1421,9 @@ impl WorldSession {
         }
         let mut spawned: u32 = 0;
         for shot in shots {
-            let Some(arrow) = Arrow::skeleton(shot.origin, shot.dir) else {
+            let Some(arrow) =
+                Arrow::skeleton_with_rules(shot.origin, shot.dir, &self.gameplay_rules.arrow)
+            else {
                 continue;
             };
             if self.spawn_arrow(arrow).is_some() {
@@ -1558,6 +1656,74 @@ impl WorldSession {
         self.camera.pitch = self.player.pitch;
     }
 
+    /// Applies effective gameplay tuning to this session.
+    ///
+    /// Movement rules go to the player, projection planes to the camera,
+    /// crop growth cadence to the crop runtime, and the live day length to the
+    /// session clock. The camera position/orientation, the world, and the
+    /// clock's calendar (`day_index`/`time_of_day`/sub-tick remainder) are
+    /// deliberately untouched, so a caller can re-apply rules mid-frame
+    /// without moving the view or jumping time. S01 calls this once at
+    /// startup; S02 re-applies after a live config reload.
+    pub fn apply_rules(&mut self, rules: &RulesBundle) {
+        self.gameplay_rules = *rules;
+        self.spawn_runtime.set_rules(rules.spawning);
+        self.crops.set_rules(rules.farming);
+        self.clock.set_day_seconds(rules.clock.day_seconds);
+        self.player.movement = rules.movement;
+        self.camera.z_near = rules.camera.z_near;
+        self.camera.z_far = rules.camera.z_far;
+    }
+
+    /// The effective gameplay tuning this session simulates with.
+    ///
+    /// `GameApp`-owned transient state (melee/bow/eating) reads the same
+    /// bundle the session's internal seams use, so one live reload changes
+    /// both halves of the frame at once.
+    #[inline]
+    pub fn rules(&self) -> RulesBundle {
+        self.gameplay_rules
+    }
+
+    /// Applies live tuning and records the config meta the next save writes.
+    ///
+    /// S02's live reload replaces `GameApp.config` and re-enters the session
+    /// install path, so this is the single writer that keeps the session's
+    /// save metadata in step with the running values. The saved-world notice
+    /// is deliberately unchanged here: it is load-scoped, not reload-scoped.
+    pub fn apply_config(&mut self, rules: &RulesBundle, meta: SaveConfigMeta) {
+        self.apply_rules(rules);
+        self.save_config = meta;
+    }
+
+    /// The config metadata this session will attach to its next save.
+    pub const fn save_config(&self) -> SaveConfigMeta {
+        self.save_config
+    }
+
+    /// The non-blocking note describing how this session's loaded config
+    /// differs from `current`, or `None` when they match or the world carries
+    /// no config record (v1-v8).
+    ///
+    /// Pure read: unlike [`Self::take_config_notice`] it does not consume the
+    /// record, so a caller that only wants to display the note must use
+    /// `take_config_notice` to preserve the one-shot contract.
+    pub fn config_notice(&self, current: SaveConfigMeta) -> Option<String> {
+        self.saved_config
+            .and_then(|saved| config_notice_for(saved, current))
+    }
+
+    /// Takes the pending config notice, if any.
+    ///
+    /// The loaded record is consumed even when the metas match, so a notice is
+    /// presented at most once per session and a later tuning edit can never
+    /// re-warn after the player has already been told (or told nothing
+    /// because the config matched).
+    pub fn take_config_notice(&mut self, current: SaveConfigMeta) -> Option<String> {
+        let saved = self.saved_config.take()?;
+        config_notice_for(saved, current)
+    }
+
     /// The position of the crafting table whose interface is open, if any.
     ///
     /// Read-only accessor: validity is re-established by
@@ -1616,8 +1782,8 @@ impl WorldSession {
     }
 
     /// Opens the crafting table at `pos` only when the *live* world block
-    /// there is a crafting table and the player's eye is within
-    /// [`TABLE_INTERACT_REACH`].
+    /// there is a crafting table and the player's eye is within the configured
+    /// [`InteractionRules::table_reach`] (default [`TABLE_INTERACT_REACH`]).
     ///
     /// `pos` is treated as untrusted (it comes from a raycast or any caller),
     /// so the world is re-read at interaction time. A missing/wrong/replaced/
@@ -1647,10 +1813,11 @@ impl WorldSession {
     /// through to its normal placement/interaction path, so a non-table click
     /// behaves exactly as it did before table stations existed.
     pub fn try_open_targeted_table(&mut self) -> Option<IVec3> {
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
         let hit = raycast_voxels(
             self.camera.position,
             self.camera.forward(),
-            TABLE_INTERACT_REACH,
+            reach,
             |x, y, z| self.world.get_block(x, y, z),
         )?;
         if self.open_table_at(hit.block_pos) {
@@ -1684,7 +1851,8 @@ impl WorldSession {
     }
 
     /// Opens the chest at `pos` only when the *live* world block there is a
-    /// container and the player's eye is within [`TABLE_INTERACT_REACH`].
+    /// container and the player's eye is within the configured
+    /// [`InteractionRules::table_reach`] (default [`TABLE_INTERACT_REACH`]).
     ///
     /// `pos` is untrusted, so the world is re-read at interaction time. A
     /// generated LootChest materializes its deterministic record on first
@@ -1718,10 +1886,11 @@ impl WorldSession {
     /// non-container block, or the hit is out of reach. The caller then falls
     /// through to its normal placement/interaction path.
     pub fn try_open_targeted_chest(&mut self) -> Option<IVec3> {
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
         let hit = raycast_voxels(
             self.camera.position,
             self.camera.forward(),
-            TABLE_INTERACT_REACH,
+            reach,
             |x, y, z| self.world.get_block(x, y, z),
         )?;
         if self.open_chest_at(hit.block_pos) {
@@ -1798,14 +1967,15 @@ impl WorldSession {
     }
 
     /// Reach check against the block's axis-aligned box: the player may
-    /// interact when the nearest point of the station block is within
-    /// [`TABLE_INTERACT_REACH`] of the eye. Shared by the table and chest
-    /// stations so both use one reach budget.
+    /// interact when the nearest point of the station block is within the
+    /// live [`InteractionRules::table_reach`] of the eye. Shared by the table
+    /// and chest stations so both use one reach budget.
     fn station_within_reach(&self, pos: IVec3) -> bool {
         let eye = self.player.eye_position();
         let min = pos.as_vec3();
         let closest = eye.clamp(min, min + Vec3::ONE);
-        eye.distance_squared(closest) <= TABLE_INTERACT_REACH * TABLE_INTERACT_REACH
+        let reach = self.gameplay_rules.interaction.table_reach.max(0.0);
+        eye.distance_squared(closest) <= reach * reach
     }
 
     /// Whether a block edit at `pos` can produce remesh work right now.
@@ -2020,18 +2190,34 @@ pub fn random_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::bow::BowRules;
+    use crate::player::camera::CameraRules;
+    use crate::player::combat::CombatRules;
     use crate::player::container::Container;
     use crate::player::inventory::{
         InventoryError, Item, ItemId, Material, ToolKind, ToolTier, CHEST_SLOTS,
     };
     use crate::player::melee::attack_damage;
-    use crate::player::physics::InputState;
+    use crate::player::melee::MeleeRules;
+    use crate::player::physics::{InputState, MovementRules};
+    use crate::player::survival::SurvivalRules;
     use crate::player::survival::{GameMode, SurvivalState, SurvivalTick, FULL_AIR};
+    use crate::world::arrow::ArrowRules;
     use crate::world::block::BlockId;
+    use crate::world::daycycle::{ClockRules, DEFAULT_TIME_OF_DAY};
+    use crate::world::farming::FarmingRules;
     use crate::world::mob::{MobAiState, MobKind, MOB_DEATH_SECS, MOB_TICK_SECS};
     use crate::world::persistence::SavedMob;
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
-    use crate::world::spawning::{DESPAWN_RADIUS, SAFE_RADIUS};
+    use crate::world::spawning::{SpawnRules, DESPAWN_RADIUS, SAFE_RADIUS};
+
+    #[test]
+    fn interaction_rules_default_matches_constants() {
+        assert_eq!(
+            InteractionRules::default().table_reach,
+            TABLE_INTERACT_REACH
+        );
+    }
 
     fn make_save(seed: u32) -> WorldSaveData {
         WorldSaveData {
@@ -2082,6 +2268,324 @@ mod tests {
         assert_eq!(session.player.mode(), GameMode::Creative);
         assert!(session.player.can_fly());
         assert!(session.chests.is_empty());
+    }
+
+    #[test]
+    fn apply_rules_sets_player_and_camera() {
+        let mut session = WorldSession::new_session(
+            21u32,
+            PathBuf::from("/tmp/apply-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let camera_position = session.camera.position;
+        let camera_yaw = session.camera.yaw;
+        let camera_pitch = session.camera.pitch;
+
+        let rules = RulesBundle {
+            movement: MovementRules {
+                walk_speed: 9.0,
+                jump_velocity: 12.0,
+                ..MovementRules::default()
+            },
+            camera: CameraRules {
+                z_near: 0.25,
+                z_far: 512.0,
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.player.movement, rules.movement);
+        assert_eq!(session.camera.z_near, 0.25);
+        assert_eq!(session.camera.z_far, 512.0);
+        assert_eq!(session.camera.position, camera_position);
+        assert_eq!(session.camera.yaw, camera_yaw);
+        assert_eq!(session.camera.pitch, camera_pitch);
+    }
+
+    fn config_meta(schema: u16, digest: u64) -> SaveConfigMeta {
+        SaveConfigMeta { schema, digest }
+    }
+
+    #[test]
+    fn config_notice_matrix_and_one_shot() {
+        let current = config_meta(1, 0xAAAA);
+        let mut session = WorldSession::new_session(
+            22u32,
+            PathBuf::from("/tmp/config-notice.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+
+        // Pin the exact player-facing strings, not just the enum of outcomes.
+        assert_eq!(
+            CONFIG_CHANGED_NOTICE,
+            "config changed since this world was saved"
+        );
+        assert_eq!(
+            CONFIG_SCHEMA_CHANGED_NOTICE,
+            "config schema changed since this world was saved"
+        );
+
+        // Row 1: saved None (fresh session or v1-v8 payload) is silent.
+        assert_eq!(session.config_notice(current), None);
+        assert_eq!(session.take_config_notice(current), None);
+
+        // Row 2: same schema and digest is silent, but `take` still consumes.
+        session.saved_config = Some(current);
+        assert_eq!(session.config_notice(current), None);
+        assert_eq!(session.take_config_notice(current), None);
+        assert!(session.saved_config.is_none());
+        // A silent matching take must not leave a record that a later tuning
+        // edit could turn into a warning.
+        assert_eq!(session.take_config_notice(config_meta(2, 0xBBBB)), None);
+
+        // Row 3: same schema, different digest -> changed-config notice once.
+        session.saved_config = Some(config_meta(1, 0xBBBB));
+        assert_eq!(
+            session.config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(
+            session.take_config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(current), None);
+
+        // Row 4: different schema (any digest) -> schema notice, and the
+        // schema mismatch wins even when the digest looks unchanged.
+        session.saved_config = Some(config_meta(0, 0xAAAA));
+        assert_eq!(
+            session.config_notice(config_meta(1, 0xAAAA)),
+            Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(
+            session.take_config_notice(config_meta(1, 0xAAAA)),
+            Some(CONFIG_SCHEMA_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(config_meta(1, 0xAAAA)), None);
+    }
+
+    #[test]
+    fn from_loaded_world_carries_saved_config() {
+        let saved = config_meta(1, 0x1234);
+        let current = config_meta(1, 0x5678);
+        let mut session = WorldSession::from_loaded_world(
+            LoadedWorld {
+                data: make_save(23u32),
+                registry: ContentRegistry::builtin().clone(),
+                saved_content: None,
+                saved_config: Some(saved),
+                unresolved: 0,
+            },
+            PathBuf::from("/tmp/v9-config.mcvx"),
+        );
+
+        assert_eq!(
+            session.config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        // The loaded world's record is a load-time fact, not the meta a fresh
+        // save would write; `apply_config` installs the running meta.
+        assert_eq!(session.save_config(), ConfigRuntime::defaults().meta());
+        assert_eq!(
+            session.take_config_notice(current),
+            Some(CONFIG_CHANGED_NOTICE.to_string())
+        );
+        assert_eq!(session.take_config_notice(current), None);
+    }
+
+    #[test]
+    fn apply_config_sets_rules_and_save_meta() {
+        let mut session = WorldSession::new_session(
+            24u32,
+            PathBuf::from("/tmp/apply-config.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let meta = config_meta(4, 0xDEAD_BEEF);
+        let rules = RulesBundle {
+            movement: MovementRules {
+                walk_speed: 9.0,
+                jump_velocity: 12.0,
+                ..MovementRules::default()
+            },
+            camera: CameraRules {
+                z_near: 0.25,
+                z_far: 512.0,
+            },
+            ..RulesBundle::default()
+        };
+
+        session.apply_config(&rules, meta);
+
+        assert_eq!(session.player.movement, rules.movement);
+        assert_eq!(session.camera.z_near, 0.25);
+        assert_eq!(session.camera.z_far, 512.0);
+        assert_eq!(session.save_config(), meta);
+    }
+
+    #[test]
+    fn apply_rules_installs_live_day_length_without_moving_the_calendar() {
+        let mut session = WorldSession::new_session(
+            30u32,
+            PathBuf::from("/tmp/live-day-length.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let rules = RulesBundle {
+            clock: ClockRules { day_seconds: 600.0 },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        assert_eq!(session.rules().clock.day_seconds, 600.0);
+        assert_eq!(session.clock.day_seconds(), 600.0);
+        // Installing the rate mid-day must not move the calendar.
+        assert_eq!(session.clock.day_index, 0);
+        assert_eq!(session.clock.time_of_day, DEFAULT_TIME_OF_DAY);
+
+        // 600 real seconds is one full 24,000-tick day at the tuned rate, so
+        // from noon the clock lands on noon one day later.
+        session.clock.advance_secs(600.0, 1.0);
+        assert_eq!(session.clock.day_index, 1);
+        assert_eq!(session.clock.time_of_day, DEFAULT_TIME_OF_DAY);
+    }
+
+    #[test]
+    fn fresh_session_reports_default_gameplay_rules() {
+        let session = WorldSession::new_session(
+            26u32,
+            PathBuf::from("/tmp/fresh-rules.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert_eq!(session.rules(), RulesBundle::default());
+    }
+
+    #[test]
+    fn apply_rules_drives_survival_and_combat_seams() {
+        let mut session = survival_session(27);
+        let rules = RulesBundle {
+            survival: SurvivalRules {
+                hunger_drain_secs: 1.0,
+                ..SurvivalRules::default()
+            },
+            combat: CombatRules {
+                iframe_secs: 0.0,
+                hurt_flash_secs: 2.0,
+                ..CombatRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules(), rules);
+        assert_eq!(session.rules().survival, rules.survival);
+        assert_eq!(session.rules().combat, rules.combat);
+
+        // One game second of the tuned 1 s drain costs exactly one hunger
+        // point; the 30 s default would cost none.
+        let hunger = session.player.survival.hunger();
+        tick_game_seconds(&mut session, 1, false);
+        assert_eq!(session.player.survival.hunger(), hunger - 1);
+
+        // A tuned zero i-frame lets the next hit land immediately; the default
+        // 0.5 s window would refuse it.
+        let feet = session.player.position;
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3
+        );
+        assert_eq!(
+            session.apply_mob_attacks(&[zombie_attack(feet + Vec3::Z)]),
+            3,
+            "the stored zero iframe must not refuse the second hit"
+        );
+        assert_eq!(session.player.survival.health(), 14);
+    }
+
+    #[test]
+    fn apply_rules_reach_selects_a_farther_melee_candidate() {
+        let mut session = survival_hostile_session(28, MobKind::Zombie);
+        let origin = Vec3::new(8.5, 5.2, 8.5);
+        let dir = Vec3::Z;
+        assert!(
+            session.melee_candidate(origin, dir, 1.0).is_none(),
+            "the mob is out of the default reach"
+        );
+
+        let rules = RulesBundle {
+            melee: MeleeRules {
+                reach: 3.0,
+                ..MeleeRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().melee.reach, 3.0);
+        assert!(
+            session
+                .melee_candidate(origin, dir, session.rules().melee.reach)
+                .is_some(),
+            "the stored tuned reach reaches the mob"
+        );
+    }
+
+    #[test]
+    fn apply_rules_drives_bow_and_arrow_spawn_stats() {
+        let mut session = arrow_session(29);
+        give_bow(&mut session);
+        give_arrows(&mut session, 1);
+        let rules = RulesBundle {
+            bow: BowRules {
+                min_charge_secs: 0.1,
+                full_charge_secs: 0.2,
+            },
+            arrow: ArrowRules {
+                speed_max: 64.0,
+                damage_max: 9,
+                lifetime_secs: 12.0,
+                ..ArrowRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+
+        let arrow = session
+            .fire_bow(shot_origin(), Vec3::new(0.0, 0.0, 1.0), 1.0)
+            .expect("a full-draw shot with ammo");
+        assert_eq!(arrow.damage, 9);
+        assert!(
+            (arrow.velocity.length() - 64.0).abs() < 1e-3,
+            "tuned full-draw speed was {}",
+            arrow.velocity.length()
+        );
+        assert!((arrow.life - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fresh_session_writes_defaults_meta() {
+        let defaults = ConfigRuntime::defaults().meta();
+        let registry = ContentRegistry::builtin_arc();
+
+        let session = WorldSession::new_session_with_mode_and_registry(
+            25u32,
+            PathBuf::from("/tmp/fresh-meta.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Creative,
+            Arc::clone(&registry),
+        );
+        assert_eq!(session.save_config(), defaults);
+        assert!(session.saved_config.is_none());
+        assert_eq!(session.config_notice(defaults), None);
+
+        let editor = WorldSession::new_at_with_registry(
+            25u32,
+            PathBuf::from("/tmp/editor-meta.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            Vec3::new(1.0, 20.0, 2.0),
+            GameClock::new(),
+            registry,
+        );
+        assert_eq!(editor.save_config(), defaults);
+        assert!(editor.saved_config.is_none());
+        assert_eq!(editor.config_notice(defaults), None);
     }
 
     #[test]
@@ -2809,6 +3313,75 @@ mod tests {
             "a table beyond the reach budget must not open"
         );
         assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_tuned_reach_finds_a_table_beyond_the_default_ray_length() {
+        use crate::world::block::BlockId;
+
+        let mut session = table_session();
+        let pos = IVec3::new(10, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::CraftingTable);
+        // Eye at y ~= 5.62, so a level yaw-0 ray crosses the table block at
+        // x = 10: eye-to-nearest-block-point is ~9.5 blocks.
+        session.player.position = Vec3::new(0.5, 4.0, 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+
+        assert_eq!(
+            session.try_open_targeted_table(),
+            None,
+            "the default 8-block ray must not reach a 9.5-block table"
+        );
+        assert_eq!(session.open_table_position(), None);
+
+        let rules = RulesBundle {
+            interaction: InteractionRules { table_reach: 12.0 },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().interaction.table_reach, 12.0);
+        assert_eq!(
+            session.try_open_targeted_table(),
+            Some(pos),
+            "the tuned 12-block reach and ray must find the same table"
+        );
+        assert_eq!(session.open_table_position(), Some(pos));
+
+        // Shrinking the reach live closes an already-open out-of-reach station.
+        session.apply_rules(&RulesBundle::default());
+        assert_eq!(session.sync_open_table(), None);
+        assert_eq!(session.open_table_position(), None);
+    }
+
+    #[test]
+    fn a_tuned_reach_finds_a_chest_beyond_the_default_ray_length() {
+        let mut session = chest_session();
+        let pos = IVec3::new(10, 5, 0);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Chest);
+        session.player.position = Vec3::new(0.5, 4.0, 0.5);
+        session.player.yaw = 0.0;
+        session.player.pitch = 0.0;
+        session.sync_camera();
+
+        assert_eq!(
+            session.try_open_targeted_chest(),
+            None,
+            "the default 8-block ray must not reach a 9.5-block chest"
+        );
+        assert_eq!(session.open_chest_position(), None);
+
+        session.apply_rules(&RulesBundle {
+            interaction: InteractionRules { table_reach: 12.0 },
+            ..RulesBundle::default()
+        });
+        assert_eq!(session.try_open_targeted_chest(), Some(pos));
+        assert_eq!(session.open_chest_position(), Some(pos));
     }
 
     #[test]
@@ -4361,6 +4934,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_rules_drives_crop_growth_cadence() {
+        let mut session = farm_session(1, DEFAULT_SEASON_LENGTH_DAYS);
+        assert_eq!(session.season(), Season::Spring);
+        let farmland = IVec3::new(5, 10, 5);
+        let crop = farmland + IVec3::Y;
+        session
+            .world
+            .set_block_immediate(farmland.x, farmland.y, farmland.z, BlockId::Farmland);
+        stand_above(&mut session, farmland);
+        session
+            .player
+            .insert_items(&[wheat_seeds(1)])
+            .expect("seeds fit");
+        assert!(session.player.select_slot(0));
+        assert!(session.plant_wheat_at(crop).is_some());
+
+        let rules = RulesBundle {
+            farming: FarmingRules {
+                wheat_stage_game_secs: 10.0,
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().farming, rules.farming);
+        assert_eq!(session.crops.rules(), rules.farming);
+
+        // 0.1 s clamped frame x 100 = exactly 10 game seconds. The default
+        // 60 s stage would still be at stage 0.
+        let remeshed = session.tick_crops(0.1, 100.0);
+        assert!(
+            !remeshed.is_empty(),
+            "the tuned stage must remesh the chunk"
+        );
+        assert_eq!(
+            session.world.get_block(crop.x, crop.y, crop.z),
+            BlockId::WheatStage1
+        );
+    }
+
+    #[test]
     fn tick_crops_pauses_in_winter_and_resumes_in_spring() {
         use crate::world::daycycle::{GameClock, DEFAULT_TIME_OF_DAY};
 
@@ -5441,6 +6054,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_rules_drives_the_spawn_cap_and_counts_blocks() {
+        let mut session = lit_grass_plain_session(55, 2);
+        session.clock = GameClock::from_time(NIGHT_TICK);
+        let rules = RulesBundle {
+            spawning: SpawnRules {
+                max_mobs_total: 1,
+                ..SpawnRules::default()
+            },
+            ..RulesBundle::default()
+        };
+        session.apply_rules(&rules);
+        assert_eq!(session.rules().spawning.max_mobs_total, 1);
+
+        // 30 s of night over a ready, lit plain: the tuned cap holds the list
+        // at one record and every later attempt is counted as blocked.
+        for _ in 0..300 {
+            session.tick_mobs(0.1, 1.0);
+        }
+
+        assert_eq!(
+            session.mobs().len(),
+            1,
+            "the tuned global cap must hold at one record: {:?}",
+            session.spawn_report()
+        );
+        assert!(
+            session.spawn_report().cap_blocked > 0,
+            "attempts past the tuned cap must be counted: {:?}",
+            session.spawn_report()
+        );
+
+        // A live re-apply of the same bundle is not a runtime reset.
+        let report = session.spawn_report();
+        let same = session.rules();
+        session.apply_rules(&same);
+        assert_eq!(session.spawn_report(), report);
+        assert_eq!(session.mobs().len(), 1);
+    }
+
+    #[test]
     fn tick_mobs_spawns_night_hostiles_outside_both_safe_radii() {
         let mut session = lit_grass_plain_session(53, 2);
         session.clock = GameClock::from_time(NIGHT_TICK);
@@ -5734,7 +6387,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_mob_save_keeps_the_169_byte_edit_free_length() {
+    fn empty_mob_save_keeps_the_179_byte_edit_free_length() {
         use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
 
         let data = make_save(9183u32);
@@ -5742,14 +6395,14 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("empty mob save encodes");
 
-        // Measured v8 shape: the empty content table adds four bytes before
-        // the hotbar, so the mob count moves from 149 to 153 and the pack +
-        // digest tail adds eight more bytes than the v7 mob-only tail.
-        assert_eq!(bytes.len(), 169);
+        // Measured v9 shape: the empty content table adds four bytes before
+        // the hotbar, so the mob count moves from 149 to 153, and the v8 pack
+        // + digest tail plus the 10-byte config tail complete the payload.
+        assert_eq!(bytes.len(), 179);
         assert_eq!(
             &bytes[153..157],
             &0u32.to_le_bytes(),
-            "the v8 mob count sits at offset 153"
+            "the v9 mob count sits at offset 153"
         );
         let loaded = load_world_from_bytes(&bytes).expect("empty mob save decodes");
         assert!(loaded.mobs.is_empty());
@@ -6914,12 +7567,12 @@ mod tests {
             "respawn forgets the projectile cause too"
         );
 
-        // Arrows have no wire representation: the v8 save stays the same
-        // 169-byte edit-free layout and a reload starts in flight-free air.
+        // Arrows have no wire representation: the v9 save stays the same
+        // 179-byte edit-free layout and a reload starts in flight-free air.
         let data = make_save(62);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save encodes");
-        assert_eq!(bytes.len(), 169, "arrows add no save bytes");
+        assert_eq!(bytes.len(), 179, "arrows add no save bytes");
         let restored = WorldSession::session_from_save(
             load_world_from_bytes(&bytes).expect("save decodes"),
             PathBuf::from("/tmp/arrow-reload.mcvx"),
@@ -7192,6 +7845,7 @@ mod tests {
                 }],
                 digest: 0x1234,
             }),
+            saved_config: None,
             unresolved: 1,
         };
 
@@ -7388,6 +8042,7 @@ mod tests {
             PathBuf::from("/tmp/save-rules.mcvx"),
             Arc::clone(&registry),
             None,
+            None,
         );
         assert_eq!(
             (*restored.world.worldgen_rules()).as_ref(),
@@ -7400,6 +8055,7 @@ mod tests {
                 data: make_save(7),
                 registry: (*registry).clone(),
                 saved_content: None,
+                saved_config: None,
                 unresolved: 0,
             },
             PathBuf::from("/tmp/loaded-rules.mcvx"),
@@ -7437,6 +8093,7 @@ mod tests {
             data: make_save(7),
             registry,
             saved_content: None,
+            saved_config: None,
             unresolved: 0,
         };
         let session =

@@ -4,7 +4,7 @@ use crate::content::ContentRegistry;
 
 use crate::player::combat::PlayerCombat;
 use crate::player::container::Container;
-use crate::player::eating::{food_value, food_value_with};
+use crate::player::eating::{food_value, food_value_with_registry_rules, EatingRules};
 use crate::player::inventory::{
     CollectBatchOutcome, CollectOutcome, CraftError, CraftingGrid, GridKind, Inventory,
     InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
@@ -60,6 +60,74 @@ pub const SWIM_MAX_SINK_SPEED: f32 = 6.0;
 /// Horizontal walk-speed multiplier while submerged: 4.6 * 0.55 = 2.53 m/s, so
 /// swimming is always slower than the 4.6 m/s land walk (and the 7.2 sprint).
 pub const SWIM_WALK_SPEED_MULT: f32 = 0.55;
+/// Downward acceleration applied while submerged, in blocks per second
+/// squared. The swim branch subtracts this so the idle sink keeps matching the
+/// dry-land gravity feel while drag bounds the terminal speed.
+pub const SWIM_SINK_ACCEL: f32 = 28.0;
+
+/// Horizontal walking speed on land, in blocks per second.
+pub const WALK_SPEED: f32 = 4.6;
+/// Horizontal sprint speed in blocks per second. Crouching deliberately uses
+/// the sprint speed too, matching the pre-config behavior.
+pub const SPRINT_SPEED: f32 = 7.2;
+/// Flight speed in blocks per second while not sprinting.
+pub const FLY_SPEED: f32 = 18.0;
+/// Flight speed in blocks per second while sprinting.
+pub const FLY_SPRINT_SPEED: f32 = 48.0;
+/// Fraction of flight speed applied to vertical movement.
+pub const FLY_VERTICAL_FACTOR: f32 = 0.75;
+/// Upward launch speed of a standing jump, in blocks per second.
+pub const JUMP_VELOCITY: f32 = 9.0;
+/// Downward gravity acceleration, in blocks per second squared.
+pub const GRAVITY: f32 = 28.0;
+/// Maximum downward fall speed, in blocks per second.
+pub const TERMINAL_VELOCITY: f32 = 45.0;
+
+/// Effective movement tuning for one player, in blocks and seconds.
+///
+/// The defaults reference the named constants above, so a fresh player is
+/// behavior-identical to the pre-config rules. Startup and live reload replace
+/// this wholesale through [`crate::world::session::WorldSession::apply_rules`];
+/// `Player::update` never reads the bare constants, so an applied rule set is
+/// the only thing that steers movement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MovementRules {
+    pub walk_speed: f32,
+    pub sprint_speed: f32,
+    pub fly_speed: f32,
+    pub fly_sprint_speed: f32,
+    pub fly_vertical_factor: f32,
+    pub jump_velocity: f32,
+    pub gravity: f32,
+    pub terminal_velocity: f32,
+    pub swim_vertical_drag: f32,
+    pub swim_rise_accel: f32,
+    pub swim_rise_speed: f32,
+    pub swim_max_sink_speed: f32,
+    pub swim_walk_speed_mult: f32,
+    pub swim_sink_accel: f32,
+}
+
+impl Default for MovementRules {
+    fn default() -> Self {
+        Self {
+            walk_speed: WALK_SPEED,
+            sprint_speed: SPRINT_SPEED,
+            fly_speed: FLY_SPEED,
+            fly_sprint_speed: FLY_SPRINT_SPEED,
+            fly_vertical_factor: FLY_VERTICAL_FACTOR,
+            jump_velocity: JUMP_VELOCITY,
+            gravity: GRAVITY,
+            terminal_velocity: TERMINAL_VELOCITY,
+            swim_vertical_drag: SWIM_VERTICAL_DRAG,
+            swim_rise_accel: SWIM_RISE_ACCEL,
+            swim_rise_speed: SWIM_RISE_SPEED,
+            swim_max_sink_speed: SWIM_MAX_SINK_SPEED,
+            swim_walk_speed_mult: SWIM_WALK_SPEED_MULT,
+            swim_sink_accel: SWIM_SINK_ACCEL,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Aabb {
@@ -168,6 +236,10 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub fly_mode: bool,
+    /// Effective movement tuning. Starts at [`MovementRules::default`] and is
+    /// replaced only through the config seam
+    /// ([`crate::world::session::WorldSession::apply_rules`]).
+    pub movement: MovementRules,
     /// Persisted vitals. Constructed only through checked `SurvivalState`
     /// constructors, so an out-of-range save record never reaches this field.
     pub survival: SurvivalState,
@@ -209,6 +281,7 @@ impl Player {
             pitch: -0.25,
             on_ground: false,
             fly_mode: true, // Start in fly mode so large worlds can be explored immediately; toggle with F
+            movement: MovementRules::default(),
             // Fresh players stay Creative so every pre-M008 CLI demo, smoke, and
             // physics test keeps its flying default. `new_with_mode` (and later
             // session restore) overwrites both fields explicitly.
@@ -508,7 +581,29 @@ impl Player {
         slot: usize,
         expected: ItemId,
     ) -> Option<u16> {
-        self.eat_selected_resolved(slot, expected, food_value_with(registry, expected)?)
+        self.eat_selected_with_rules(registry, &EatingRules::default(), slot, expected)
+    }
+
+    /// Rules-aware completion half of the hold-to-eat flow.
+    ///
+    /// Mirrors [`Player::eat_selected_with`] exactly, but built-in food
+    /// restores the tuned [`EatingRules`] amount. Pack-authored nutrition
+    /// still wins over the rules, matching [`EatingTarget::new_with_rules`],
+    /// so a meal can never restore a different amount than the target
+    /// displayed. Every guard still runs before any mutation, making a stale
+    /// completion a fail-closed `None`.
+    pub fn eat_selected_with_rules(
+        &mut self,
+        registry: &ContentRegistry,
+        rules: &EatingRules,
+        slot: usize,
+        expected: ItemId,
+    ) -> Option<u16> {
+        self.eat_selected_resolved(
+            slot,
+            expected,
+            food_value_with_registry_rules(registry, expected, rules)?,
+        )
     }
 
     /// Shared guarded consume used by both eating entry points.
@@ -849,13 +944,17 @@ impl Player {
         }
 
         if self.can_fly() {
-            let speed = if input.sprint { 48.0 } else { 18.0 };
+            let speed = if input.sprint {
+                self.movement.fly_sprint_speed
+            } else {
+                self.movement.fly_speed
+            };
             let mut vel = move_dir * speed;
             if input.jump_or_up {
-                vel.y += speed * 0.75;
+                vel.y += speed * self.movement.fly_vertical_factor;
             }
             if input.crouch_or_down {
-                vel.y -= speed * 0.75;
+                vel.y -= speed * self.movement.fly_vertical_factor;
             }
             self.velocity = vel;
             self.position += self.velocity * dt;
@@ -880,13 +979,15 @@ impl Player {
         let submerged = get_block(body_x, feet_block_y, body_z).is_liquid()
             || get_block(body_x, mid_block_y, body_z).is_liquid();
 
+        // Crouching deliberately uses the sprint speed too, matching the
+        // pre-config behavior.
         let mut walk_speed = if input.sprint || input.crouch_or_down {
-            7.2
+            self.movement.sprint_speed
         } else {
-            4.6
+            self.movement.walk_speed
         };
         if submerged {
-            walk_speed *= SWIM_WALK_SPEED_MULT;
+            walk_speed *= self.movement.swim_walk_speed_mult;
         }
         self.velocity.x = move_dir.x * walk_speed;
         self.velocity.z = move_dir.z * walk_speed;
@@ -909,26 +1010,29 @@ impl Player {
             // `jump_or_up` is released; holding it applies the rise acceleration
             // instead. Both directions clamp to their terminal swim speeds, so an
             // idle body sinks away from the surface and a held Jump rises back up.
-            let drag = (1.0 - SWIM_VERTICAL_DRAG * dt).clamp(0.0, 1.0);
+            let drag = (1.0 - self.movement.swim_vertical_drag * dt).clamp(0.0, 1.0);
             self.velocity.y *= drag;
             let vertical_accel = if input.jump_or_up {
-                SWIM_RISE_ACCEL
+                self.movement.swim_rise_accel
             } else {
-                -28.0
+                -self.movement.swim_sink_accel
             };
-            self.velocity.y = (self.velocity.y + vertical_accel * dt)
-                .clamp(-SWIM_MAX_SINK_SPEED, SWIM_RISE_SPEED);
+            self.velocity.y = (self.velocity.y + vertical_accel * dt).clamp(
+                -self.movement.swim_max_sink_speed,
+                self.movement.swim_rise_speed,
+            );
             // A body in water is never standing: no on-ground land jump of 9.0.
             // The sub-step Y resolution below may still turn this true, but only
             // on a solid block (the seabed), never on the liquid surface.
             self.on_ground = false;
         } else {
             if self.on_ground && input.jump_or_up {
-                self.velocity.y = 9.0;
+                self.velocity.y = self.movement.jump_velocity;
                 self.on_ground = false;
             }
 
-            self.velocity.y = (self.velocity.y - 28.0 * dt).max(-45.0);
+            self.velocity.y = (self.velocity.y - self.movement.gravity * dt)
+                .max(-self.movement.terminal_velocity);
         }
 
         // Sub-step physics dynamically so no single step exceeds 0.25 blocks
@@ -2983,6 +3087,50 @@ mod tests {
     }
 
     #[test]
+    fn eat_selected_with_rules_restores_the_tuned_builtin_amount() {
+        let registry = ContentRegistry::builtin();
+        let rules = EatingRules {
+            apple_hunger: 7,
+            ..EatingRules::default()
+        };
+        let mut player = food_player(apple_item(2), 10);
+
+        let applied =
+            player.eat_selected_with_rules(registry, &rules, 0, ItemId::Material(Material::Apple));
+
+        assert_eq!(applied, Some(7), "the tuned built-in restore applies");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), Some(1));
+
+        // The default wrapper still restores the frozen four.
+        let mut player = food_player(apple_item(1), 10);
+        assert_eq!(
+            player.eat_selected_with(registry, 0, ItemId::Material(Material::Apple)),
+            Some(4)
+        );
+        assert_eq!(player.survival.hunger(), 14);
+    }
+
+    #[test]
+    fn eat_selected_with_rules_keeps_pack_authored_nutrition() {
+        let registry = pack_food_registry();
+        let rules = EatingRules {
+            apple_hunger: 19,
+            bread_hunger: 19,
+            raw_meat_hunger: 19,
+            rotten_flesh_hunger: 19,
+            ..EatingRules::default()
+        };
+        let stew = ItemId::Item(pack_stew_index(&registry));
+        let mut player = food_player(pack_stew(&registry, 1), 10);
+
+        let applied = player.eat_selected_with_rules(&registry, &rules, 0, stew);
+        assert_eq!(applied, Some(7), "pack nutrition wins over tuned rules");
+        assert_eq!(player.survival.hunger(), 17);
+        assert_eq!(selected_count(&player), None, "one stew consumed");
+    }
+
+    #[test]
     fn eat_selected_with_refuses_full_hunger_without_mutation() {
         let registry = pack_food_registry();
         let mut player = food_player(pack_stew(&registry, 2), MAX_HUNGER);
@@ -3342,5 +3490,68 @@ mod tests {
             assert_eq!(player.inventory(), &before, "{id:?} mutated the inventory");
             assert_eq!(player.selected_slot(), 0, "{id:?} changed the selection");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M014/S01: config-driven movement rules
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_movement_rules_equal_today() {
+        let rules = MovementRules::default();
+        assert_eq!(rules.walk_speed, WALK_SPEED);
+        assert_eq!(rules.sprint_speed, SPRINT_SPEED);
+        assert_eq!(rules.fly_speed, FLY_SPEED);
+        assert_eq!(rules.fly_sprint_speed, FLY_SPRINT_SPEED);
+        assert_eq!(rules.fly_vertical_factor, FLY_VERTICAL_FACTOR);
+        assert_eq!(rules.jump_velocity, JUMP_VELOCITY);
+        assert_eq!(rules.gravity, GRAVITY);
+        assert_eq!(rules.terminal_velocity, TERMINAL_VELOCITY);
+        assert_eq!(rules.swim_vertical_drag, SWIM_VERTICAL_DRAG);
+        assert_eq!(rules.swim_rise_accel, SWIM_RISE_ACCEL);
+        assert_eq!(rules.swim_rise_speed, SWIM_RISE_SPEED);
+        assert_eq!(rules.swim_max_sink_speed, SWIM_MAX_SINK_SPEED);
+        assert_eq!(rules.swim_walk_speed_mult, SWIM_WALK_SPEED_MULT);
+        assert_eq!(rules.swim_sink_accel, SWIM_SINK_ACCEL);
+    }
+
+    #[test]
+    fn non_default_walk_speed_changes_displacement() {
+        fn one_second_displacement(movement: MovementRules) -> f32 {
+            let mut player = Player::new(Vec3::new(0.5, 100.0, 0.5));
+            player.fly_mode = false;
+            player.movement = movement;
+            player.yaw = 0.0;
+            let forward = InputState {
+                forward: true,
+                ..Default::default()
+            };
+            let start = player.position;
+            for _ in 0..60 {
+                player.update(1.0 / 60.0, &forward, |_, _, _| BlockId::Air);
+            }
+            Vec3::new(
+                player.position.x - start.x,
+                0.0,
+                player.position.z - start.z,
+            )
+            .length()
+        }
+
+        let default_distance = one_second_displacement(MovementRules::default());
+        assert!(
+            (default_distance - WALK_SPEED).abs() < 0.2,
+            "default walk speed must move {WALK_SPEED} blocks in 1 s, got {default_distance}"
+        );
+
+        let fast = MovementRules {
+            walk_speed: 9.0,
+            ..MovementRules::default()
+        };
+        let fast_distance = one_second_displacement(fast);
+        assert!(
+            (fast_distance - 9.0).abs() < 0.2,
+            "walk_speed = 9.0 must move 9 blocks in 1 s, got {fast_distance}"
+        );
     }
 }

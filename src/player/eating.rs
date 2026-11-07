@@ -45,17 +45,59 @@ pub const RAW_MEAT_HUNGER: u16 = 3;
 /// by tests.
 pub const ROTTEN_FLESH_HUNGER: u16 = 1;
 
-/// Hunger restored by eating one `id`, or `None` when `id` is not food.
+/// Tunable eating tuning consumed by [`EatingTarget::new_with_rules`] and the
+/// rules-aware completion path.
+///
+/// [`EatingRules::default`] is built from the constants above, so the default
+/// bundle reproduces the frozen built-in table exactly. Pack-authored
+/// [`FoodDef`](crate::content::FoodDef) values always win over these rules:
+/// a pack's explicit nutrition and duration are content, not tuning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EatingRules {
+    /// Seconds of continuous hold required to eat a built-in food item.
+    pub eat_duration_secs: f32,
+    /// Hunger restored by one apple.
+    pub apple_hunger: u16,
+    /// Hunger restored by one bread.
+    pub bread_hunger: u16,
+    /// Hunger restored by one raw meat item.
+    pub raw_meat_hunger: u16,
+    /// Hunger restored by rotten flesh.
+    pub rotten_flesh_hunger: u16,
+}
+
+impl Default for EatingRules {
+    fn default() -> Self {
+        Self {
+            eat_duration_secs: EAT_DURATION_SECS,
+            apple_hunger: APPLE_HUNGER,
+            bread_hunger: BREAD_HUNGER,
+            raw_meat_hunger: RAW_MEAT_HUNGER,
+            rotten_flesh_hunger: ROTTEN_FLESH_HUNGER,
+        }
+    }
+}
+
+/// Hunger restored by one `id`, or `None` when `id` is not food.
 ///
 /// This is the frozen built-in answer. Pack-authored food resolves through
 /// [`food_value_with`]; keeping this function registry-free preserves every
 /// built-in call site byte-for-byte.
 pub fn food_value(id: ItemId) -> Option<u16> {
+    food_value_with_rules(id, &EatingRules::default())
+}
+
+/// Built-in hunger restored by `id` under `rules`, or `None` when `id` is not
+/// a built-in food identity.
+///
+/// This resolves only the frozen material table; pack items go through
+/// [`food_value_with_registry_rules`] so authored nutrition always wins.
+pub fn food_value_with_rules(id: ItemId, rules: &EatingRules) -> Option<u16> {
     match id {
-        ItemId::Material(Material::Apple) => Some(APPLE_HUNGER),
-        ItemId::Material(Material::Bread) => Some(BREAD_HUNGER),
-        ItemId::Material(Material::RawPorkchop | Material::RawBeef) => Some(RAW_MEAT_HUNGER),
-        ItemId::Material(Material::RottenFlesh) => Some(ROTTEN_FLESH_HUNGER),
+        ItemId::Material(Material::Apple) => Some(rules.apple_hunger),
+        ItemId::Material(Material::Bread) => Some(rules.bread_hunger),
+        ItemId::Material(Material::RawPorkchop | Material::RawBeef) => Some(rules.raw_meat_hunger),
+        ItemId::Material(Material::RottenFlesh) => Some(rules.rotten_flesh_hunger),
         _ => None,
     }
 }
@@ -67,25 +109,49 @@ pub fn food_value(id: ItemId) -> Option<u16> {
 /// An unknown or placeholder item index is not food, so malformed content
 /// fails closed instead of eating for free. Pack tools are never food.
 pub fn food_value_with(registry: &ContentRegistry, id: ItemId) -> Option<u16> {
+    food_value_with_registry_rules(registry, id, &EatingRules::default())
+}
+
+/// Registry- and rules-aware hunger resolution.
+///
+/// Pack-authored [`FoodDef::nutrition`](crate::content::FoodDef) wins over
+/// `rules` for every registry item; built-in identities read `rules`.
+pub fn food_value_with_registry_rules(
+    registry: &ContentRegistry,
+    id: ItemId,
+    rules: &EatingRules,
+) -> Option<u16> {
     match id {
         ItemId::Item(index) => registry
             .item(index)
             .filter(|def| !def.placeholder)
             .and_then(|def| def.food)
             .map(|food| food.nutrition),
-        other => food_value(other),
+        other => food_value_with_rules(other, rules),
     }
 }
 
 /// Authored hold duration for `id`, or the built-in constant when unset.
 fn food_duration_with(registry: &ContentRegistry, id: ItemId) -> Option<f32> {
+    food_duration_with_rules(registry, id, &EatingRules::default())
+}
+
+/// Authored hold duration for `id`, or `rules.eat_duration_secs` when unset.
+///
+/// Pack-authored [`FoodDef::eat_seconds`](crate::content::FoodDef) always wins
+/// over the tuning rule.
+fn food_duration_with_rules(
+    registry: &ContentRegistry,
+    id: ItemId,
+    rules: &EatingRules,
+) -> Option<f32> {
     match id {
         ItemId::Item(index) => registry
             .item(index)
             .filter(|def| !def.placeholder)
             .and_then(|def| def.food)
             .map(|food| food.eat_seconds),
-        _ => Some(EAT_DURATION_SECS),
+        _ => Some(rules.eat_duration_secs),
     }
 }
 
@@ -131,6 +197,25 @@ impl EatingTarget {
         let id = item.id();
         let restore = food_value_with(registry, id)?;
         let duration = food_duration_with(registry, id)?;
+        Self::validated(slot, id, restore, duration, hunger)
+    }
+
+    /// Rules-aware [`EatingTarget::new_with`].
+    ///
+    /// Built-in food reads `rules` for both hunger and duration; pack-authored
+    /// [`FoodDef`](crate::content::FoodDef) values still win. The resolved
+    /// `restore` and `duration` are carried on the target, so the completion
+    /// caller can restore exactly the tuned amount it displayed.
+    pub fn new_with_rules(
+        registry: &ContentRegistry,
+        rules: &EatingRules,
+        slot: usize,
+        item: Item,
+        hunger: u16,
+    ) -> Option<Self> {
+        let id = item.id();
+        let restore = food_value_with_registry_rules(registry, id, rules)?;
+        let duration = food_duration_with_rules(registry, id, rules)?;
         Self::validated(slot, id, restore, duration, hunger)
     }
 
@@ -854,5 +939,126 @@ mod tests {
     fn default_is_empty() {
         let eating = EatingState::default();
         assert!(eating.progress().is_none());
+    }
+
+    #[test]
+    fn eating_rules_default_matches_the_module_constants() {
+        let rules = EatingRules::default();
+        assert_eq!(rules.eat_duration_secs, EAT_DURATION_SECS);
+        assert_eq!(rules.apple_hunger, APPLE_HUNGER);
+        assert_eq!(rules.bread_hunger, BREAD_HUNGER);
+        assert_eq!(rules.raw_meat_hunger, RAW_MEAT_HUNGER);
+        assert_eq!(rules.rotten_flesh_hunger, ROTTEN_FLESH_HUNGER);
+    }
+
+    #[test]
+    fn tuned_rules_change_builtin_restore_and_duration() {
+        let rules = EatingRules {
+            eat_duration_secs: 0.5,
+            apple_hunger: 7,
+            bread_hunger: 9,
+            raw_meat_hunger: 5,
+            rotten_flesh_hunger: 2,
+        };
+        assert_eq!(
+            food_value_with_rules(ItemId::Material(Material::Apple), &rules),
+            Some(7)
+        );
+        assert_eq!(
+            food_value_with_rules(ItemId::Material(Material::Bread), &rules),
+            Some(9)
+        );
+        assert_eq!(
+            food_value_with_rules(ItemId::Material(Material::RawBeef), &rules),
+            Some(5)
+        );
+        assert_eq!(
+            food_value_with_rules(ItemId::Material(Material::RottenFlesh), &rules),
+            Some(2)
+        );
+        assert_eq!(
+            food_value_with_rules(ItemId::Material(Material::Stick), &rules),
+            None
+        );
+
+        let registry = ContentRegistry::builtin();
+        let target = EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10)
+            .expect("tuned apple target");
+        assert_eq!(target.restore(), 7);
+        assert!((target.duration() - 0.5).abs() < 1e-6);
+
+        // The default wrapper keeps the frozen table and 1.6 s duration.
+        let default_target =
+            EatingTarget::new_with(registry, 0, apple(), 10).expect("default apple target");
+        assert_eq!(default_target.restore(), APPLE_HUNGER);
+        assert_eq!(default_target.duration(), EAT_DURATION_SECS);
+    }
+
+    #[test]
+    fn pack_authored_food_still_wins_over_tuned_rules() {
+        let registry = pack_food_registry();
+        let rules = EatingRules {
+            eat_duration_secs: 0.2,
+            apple_hunger: 19,
+            bread_hunger: 19,
+            raw_meat_hunger: 19,
+            rotten_flesh_hunger: 19,
+        };
+        let target = EatingTarget::new_with_rules(&registry, &rules, 2, pack_stew(&registry), 10)
+            .expect("pack stew target");
+        assert_eq!(target.restore(), 7, "pack nutrition is content, not tuning");
+        assert!(
+            (target.duration() - 0.8).abs() < 1e-6,
+            "pack eat_seconds is content, not tuning"
+        );
+        assert_eq!(
+            food_value_with_registry_rules(
+                &registry,
+                ItemId::Item(pack_stew_index(&registry)),
+                &rules
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn tuned_target_completes_at_the_tuned_duration() {
+        let rules = EatingRules {
+            eat_duration_secs: 0.3,
+            apple_hunger: 7,
+            ..EatingRules::default()
+        };
+        let registry = ContentRegistry::builtin();
+        let target =
+            EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10).expect("tuned target");
+        let mut eating = EatingState::new();
+
+        assert!(matches!(
+            eating.tick(0.1, Some(target)),
+            EatingTick::Eating { .. }
+        ));
+        assert!(matches!(
+            eating.tick(0.1, Some(target)),
+            EatingTick::Eating { .. }
+        ));
+        match eating.tick(0.1, Some(target)) {
+            EatingTick::Ate { restore, .. } => assert_eq!(restore, 7),
+            other => panic!("expected the tuned 0.3 s meal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_tuned_duration_is_refused_structurally() {
+        let registry = ContentRegistry::builtin();
+        for duration in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let rules = EatingRules {
+                eat_duration_secs: duration,
+                ..EatingRules::default()
+            };
+            assert!(
+                EatingTarget::new_with_rules(registry, &rules, 0, apple(), 10).is_none(),
+                "duration {duration} must not become a target"
+            );
+        }
     }
 }

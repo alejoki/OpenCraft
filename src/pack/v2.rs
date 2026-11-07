@@ -30,6 +30,9 @@ use crate::settings::SettingsWarning;
 /// Maximum accepted entries in one authored array.
 const MAX_ARRAY_ENTRIES: usize = 256;
 
+/// Presentation-only table of built-in item sprite overrides.
+const BUILTIN_ICON_TABLE: &str = "builtin_icons";
+
 /// Arrays that only exist in format version 2.
 const CONTENT_ARRAY_KEYS: [&str; 8] = [
     "blocks",
@@ -73,6 +76,13 @@ pub fn parse_content(
                 warnings.push(SettingsWarning {
                     field: "pack.toml".to_string(),
                     reason: "content arrays require format_version = 2".to_string(),
+                });
+            } else if root.get(BUILTIN_ICON_TABLE).is_some() {
+                // Separate text from the array warning so existing pinned
+                // messages stay byte-identical; a pack with both warns once.
+                warnings.push(SettingsWarning {
+                    field: "pack.toml".to_string(),
+                    reason: "builtin icon overrides require format_version = 2".to_string(),
                 });
             }
             return (PackContentSpec::default(), warnings, diagnostics);
@@ -166,6 +176,8 @@ pub fn parse_content(
             spec.recipe_patches.push(entry);
         }
     }
+
+    parse_builtin_icons(root, &mut spec, &mut diagnostics);
 
     validate_references(&mut spec, &mut diagnostics);
 
@@ -281,8 +293,78 @@ fn collect_asset_paths(spec: &PackContentSpec) -> BTreeSet<&str> {
     for tool in &spec.tools {
         paths.insert(tool.icon.as_str());
     }
+    paths.extend(spec.builtin_icons.values().map(String::as_str));
 
     paths
+}
+
+// ---------------------------------------------------------------------------
+// Built-in item sprite overrides
+// ---------------------------------------------------------------------------
+
+/// Parse the presentation-only `[builtin_icons]` table.
+///
+/// Every accepted entry is a built-in material/tool short name mapped to a
+/// pack-relative authored PNG path. The table never feeds registry allocation
+/// or the content digest: it is validated here, its paths join the normal v2
+/// asset pipeline, and presentation applies the loaded bytes later.
+fn parse_builtin_icons(
+    root: &toml::Value,
+    spec: &mut PackContentSpec,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) {
+    let Some(value) = root.get(BUILTIN_ICON_TABLE) else {
+        return;
+    };
+    let Some(table) = value.as_table() else {
+        err(
+            diagnostics,
+            BUILTIN_ICON_TABLE,
+            format!(
+                "expected `[{BUILTIN_ICON_TABLE}]` to be a table, found {}",
+                value.type_str()
+            ),
+        );
+        return;
+    };
+
+    // One cap diagnostic for the whole table. Rejecting the table wholesale
+    // keeps the message count bounded even for a hostile manifest.
+    if table.len() > MAX_ARRAY_ENTRIES {
+        err(
+            diagnostics,
+            BUILTIN_ICON_TABLE,
+            format!("table exceeds the {MAX_ARRAY_ENTRIES}-entry limit for [{BUILTIN_ICON_TABLE}]"),
+        );
+        return;
+    }
+
+    for (name, value) in table {
+        let entry = format!("builtin_icon {name}");
+        if names::builtin_item_sprite_id_by_name(name).is_none() {
+            let reason = if names::builtin_block_id_by_name(name).is_some() {
+                format!(
+                    "`{name}` is a block; builtin icon overrides target material and tool items"
+                )
+            } else {
+                format!("`{name}` is not a builtin material or tool")
+            };
+            err(diagnostics, entry, reason);
+            continue;
+        }
+        let Some(path) = value.as_str() else {
+            err(
+                diagnostics,
+                entry,
+                format!("expected `path` to be a string, found {}", value.type_str()),
+            );
+            continue;
+        };
+        if validate_asset_path(path, "path", &entry, diagnostics).is_err() {
+            continue;
+        }
+        spec.builtin_icons.insert(name.clone(), path.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,5 +2630,164 @@ icon = "huge.bin"
             }),
             "expected one pack-level total-cap error: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn builtin_icon_table_accepts_materials_and_tools() {
+        let text = r#"
+[builtin_icons]
+apple = "textures/apple.png"
+wood_pickaxe = "textures/pickaxe.png"
+wood_bow = "textures/bow.png"
+"#;
+        let (spec, warnings, diagnostics) = parse_v2(text);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(spec.builtin_icons.len(), 3);
+        assert_eq!(spec.builtin_icons["apple"], "textures/apple.png");
+        assert_eq!(spec.builtin_icons["wood_pickaxe"], "textures/pickaxe.png");
+        assert_eq!(spec.builtin_icons["wood_bow"], "textures/bow.png");
+        let names: Vec<&str> = spec.builtin_icons.keys().map(String::as_str).collect();
+        assert_eq!(names, ["apple", "wood_bow", "wood_pickaxe"]);
+    }
+
+    #[test]
+    fn builtin_icon_table_must_be_a_table() {
+        let (spec, _, diagnostics) = parse_v2("builtin_icons = 3\n");
+        assert!(spec.builtin_icons.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert_eq!(diagnostics[0].entry, "builtin_icons");
+        assert_has_reason(&diagnostics, "expected `[builtin_icons]` to be a table");
+    }
+
+    #[test]
+    fn builtin_icon_table_over_cap_is_one_error() {
+        let mut text = String::from("[builtin_icons]\n");
+        for index in 0..=MAX_ARRAY_ENTRIES {
+            text.push_str(&format!("key_{index} = \"p{index}.png\"\n"));
+        }
+        let (spec, _, diagnostics) = parse_v2(&text);
+        assert!(spec.builtin_icons.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "builtin_icons");
+        assert_has_reason(&diagnostics, "256-entry limit");
+    }
+
+    #[test]
+    fn builtin_icon_table_rejects_blocks_unknown_names_and_bad_values() {
+        let text = r#"
+[builtin_icons]
+stone = "stone.png"
+diamond = "diamond.png"
+apple = 3
+wood_axe = "../escaped.png"
+"#;
+        let (spec, warnings, diagnostics) = parse_v2(text);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(spec.builtin_icons.is_empty());
+        assert_eq!(
+            entries(&diagnostics),
+            vec![
+                "builtin_icon apple",
+                "builtin_icon diamond",
+                "builtin_icon stone",
+                "builtin_icon wood_axe",
+            ]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error),
+            "every rejection is an error: {diagnostics:?}"
+        );
+        assert_has_reason(&diagnostics, "is a block; builtin icon overrides target");
+        assert_has_reason(&diagnostics, "not a builtin material or tool");
+        assert_has_reason(&diagnostics, "expected `path` to be a string");
+        assert_has_reason(&diagnostics, "must not contain `..` components");
+    }
+
+    #[test]
+    fn v1_builtin_icon_table_warns_and_is_ignored() {
+        let text = "[builtin_icons]\napple = \"apple.png\"\n";
+        let (spec, warnings, diagnostics) = parse_format(text, PackFormat::V1);
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].field, "pack.toml");
+        assert_eq!(
+            warnings[0].reason,
+            "builtin icon overrides require format_version = 2"
+        );
+    }
+
+    #[test]
+    fn v1_content_arrays_win_over_the_builtin_icon_warning() {
+        let text = r#"
+[[blocks]]
+id = "mymod:ruby"
+textures = { all = "ruby.png" }
+hardness = 1.0
+
+[builtin_icons]
+apple = "apple.png"
+"#;
+        let (spec, warnings, diagnostics) = parse_format(text, PackFormat::V1);
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the array warning fires: {warnings:?}"
+        );
+        assert_eq!(
+            warnings[0].reason,
+            "content arrays require format_version = 2"
+        );
+    }
+
+    #[test]
+    fn future_format_ignores_builtin_icons_with_the_existing_warning() {
+        let text = "[builtin_icons]\napple = \"apple.png\"\n";
+        let (spec, warnings, diagnostics) = parse_format(text, PackFormat::Future(3));
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(diagnostics.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].reason.contains("newer than 2"));
+    }
+
+    #[test]
+    fn builtin_icon_assets_load_through_the_v2_asset_pipeline() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+        write_png(&dir.join("apple.png"), 32);
+
+        let text = "[builtin_icons]\napple = \"apple.png\"\n";
+        let (spec, diagnostics) = load_assets(text, &dir);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.builtin_icons["apple"], "apple.png");
+        let asset = spec
+            .assets
+            .get("apple.png")
+            .expect("override PNG loads like any other v2 asset");
+        assert_eq!(asset.source_side, 32);
+        assert_eq!(asset.rgba, resample::resample_to_16(&gradient(32, 32), 32));
+    }
+
+    #[test]
+    fn missing_builtin_icon_asset_uses_the_normal_asset_error() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+
+        let text = "[builtin_icons]\napple = \"missing.png\"\n";
+        let (spec, diagnostics) = load_assets(text, &dir);
+        assert_eq!(spec.builtin_icons["apple"], "missing.png");
+        assert!(spec.assets.is_empty());
+        assert_eq!(entries(&diagnostics), vec!["asset missing.png"]);
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert_has_reason(&diagnostics, "missing.png");
     }
 }

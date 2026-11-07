@@ -1,0 +1,28 @@
+# OpenCraft creator configuration: player movement and camera.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[movement]
+walk_speed = 4.6
+sprint_speed = 7.2
+fly_speed = 18.0
+fly_sprint_speed = 48.0
+fly_vertical_factor = 0.75
+jump_velocity = 9.0
+gravity = 28.0
+terminal_velocity = 45.0
+swim_vertical_drag = 6.0
+swim_rise_accel = 40.0
+swim_rise_speed = 4.0
+swim_max_sink_speed = 6.0
+swim_walk_speed_mult = 0.55
+swim_sink_accel = 28.0
+
+[camera]
+z_near = 0.1
+z_far = 1200.0

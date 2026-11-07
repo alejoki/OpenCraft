@@ -1,0 +1,35 @@
+# OpenCraft creator configuration: day cycle, weather, mob spawning, and farming.
+#
+# Every curated key in this domain lives here at its default value.
+# See docs/CONFIG.md for loading, validation, live reload, and
+# --check-config semantics.
+#
+# The game never writes these files; they are tracked TOML you edit
+# by hand.
+
+[clock]
+day_seconds = 1200.0
+
+[weather]
+winter_snow_percent = 40
+spring_rain_percent = 30
+summer_rain_percent = 20
+autumn_rain_percent = 35
+
+[spawning]
+safe_radius_blocks = 24
+spawn_max_radius_blocks = 48
+despawn_radius_blocks = 96
+max_mobs_total = 32
+spawn_region_blocks = 32
+spawn_region_cap = 4
+spawn_attempt_secs = 0.25
+despawn_scan_secs = 1.0
+burn_interval_secs = 0.5
+spawn_min_separation = 1.0
+hostile_cave_light = 7
+passive_surface_light = 15
+max_spawn_attempts_per_call = 4
+
+[farming]
+wheat_stage_game_secs = 60.0

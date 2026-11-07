@@ -672,45 +672,73 @@ pub fn compose_block_array_layers(base: &[Vec<u8>], pack_layers: &[Vec<u8>]) -> 
     layers
 }
 
+/// Upload one layer's base mip and its box-filtered mip chain into an
+/// existing texture array at `layer`.
+///
+/// `rgba` must be exactly [`TEX_SIZE`] × [`TEX_SIZE`] × 4 bytes and `layer`
+/// must be below [`BLOCK_ARRAY_LAYERS`]. Both are debug assertions so release
+/// builds never panic here; callers reject or fall back on bad art before
+/// reaching this seam. The texture, view, and bind group are never recreated
+/// (MEM111: only contents change).
+pub fn upload_block_layer_at(
+    texture: &wgpu::Texture,
+    queue: &wgpu::Queue,
+    layer: u32,
+    rgba: &[u8],
+) {
+    debug_assert!(
+        layer < BLOCK_ARRAY_LAYERS,
+        "layer {layer} is outside the {BLOCK_ARRAY_LAYERS}-layer block array"
+    );
+    debug_assert_eq!(
+        rgba.len(),
+        LAYER_BYTES,
+        "layer bytes must match {TEX_SIZE}x{TEX_SIZE} RGBA"
+    );
+
+    let mut current = rgba.to_vec();
+    let mut dim = TEX_SIZE;
+    for mip in 0..MIP_LEVELS {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &current,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * dim),
+                rows_per_image: Some(dim),
+            },
+            wgpu::Extent3d {
+                width: dim,
+                height: dim,
+                depth_or_array_layers: 1,
+            },
+        );
+        if mip + 1 < MIP_LEVELS {
+            current = downsample_rgba_2x(&current, dim);
+            dim = (dim / 2).max(1);
+        }
+    }
+}
+
 /// Upload every layer's base mip and its box-filtered mip chain into an
 /// existing texture array.
 ///
 /// Shared by the initial creation path and live pack re-uploads so both use
 /// exactly one upload rule (MEM111: the texture object itself is never
-/// recreated; only its contents change).
+/// recreated; only its contents change). Delegates to
+/// [`upload_block_layer_at`] so the bulk and single-layer paths cannot drift.
 pub fn upload_block_layers(texture: &wgpu::Texture, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
     for (layer_idx, base_rgba) in layers.iter().enumerate() {
-        let mut current = base_rgba.clone();
-        let mut dim = TEX_SIZE;
-        for mip in 0..MIP_LEVELS {
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture,
-                    mip_level: mip,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer_idx as u32,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &current,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * dim),
-                    rows_per_image: Some(dim),
-                },
-                wgpu::Extent3d {
-                    width: dim,
-                    height: dim,
-                    depth_or_array_layers: 1,
-                },
-            );
-            if mip + 1 < MIP_LEVELS {
-                current = downsample_rgba_2x(&current, dim);
-                dim = (dim / 2).max(1);
-            }
-        }
+        upload_block_layer_at(texture, queue, layer_idx as u32, base_rgba);
     }
 }
 
@@ -1064,6 +1092,82 @@ mod tests {
 
         assert_eq!(base, original);
         assert_eq!(base.len(), NUM_TEX_LAYERS as usize);
+    }
+
+    #[test]
+    fn single_layer_upload_keeps_the_existing_mip_rule_and_bounds() {
+        let src = include_str!("texture.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
+        let production = &src[..tests_at];
+        let at = production
+            .find("pub fn upload_block_layer_at(")
+            .expect("upload_block_layer_at exists");
+        let body = &production[at..];
+        let body = &body[..body.find("\n}\n").expect("function body ends") + 3];
+
+        assert!(
+            body.contains("debug_assert")
+                && body.contains("layer <")
+                && body.contains("BLOCK_ARRAY_LAYERS"),
+            "out-of-range layers must be caught in debug builds without panicking in release"
+        );
+        assert!(
+            body.contains("debug_assert_eq")
+                && body.contains("rgba.len()")
+                && body.contains("LAYER_BYTES"),
+            "wrong-sized layers must be caught in debug builds without panicking in release"
+        );
+        assert!(
+            body.contains("for mip in 0..MIP_LEVELS"),
+            "per-layer uploads must write the same mip chain as the initial upload"
+        );
+        assert!(
+            body.contains("downsample_rgba_2x(&current, dim)"),
+            "per-layer uploads must reuse the shared box-filter mip rule"
+        );
+        assert!(
+            body.contains("z: layer"),
+            "the upload must target the requested array layer"
+        );
+    }
+
+    #[test]
+    fn upload_block_layers_delegates_to_the_single_layer_rule() {
+        let src = include_str!("texture.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
+        let production = &src[..tests_at];
+        let at = production
+            .find("pub fn upload_block_layers(")
+            .expect("upload_block_layers exists");
+        let body = &production[at..];
+        let body = &body[..body.find("\n}\n").expect("function body ends") + 3];
+
+        assert!(
+            body.contains("upload_block_layer_at(texture, queue, layer_idx as u32, base_rgba)"),
+            "the bulk path must reuse the per-layer rule so the two paths cannot drift"
+        );
+        assert!(
+            !body.contains("queue.write_texture("),
+            "upload_block_layers must not keep a second copy of the upload loop"
+        );
+    }
+
+    #[test]
+    fn block_array_shape_rejects_boundary_off_by_one_sizes() {
+        let composed = compose_block_array_layers(&generate_all_texture_layers_rgba(), &[]);
+        assert!(block_array_layers_match_shape(&composed));
+
+        let mut one_short = composed.clone();
+        one_short.pop();
+        assert!(!block_array_layers_match_shape(&one_short));
+
+        let mut one_long = composed;
+        one_long.push(vec![0u8; LAYER_BYTES]);
+        assert!(!block_array_layers_match_shape(&one_long));
+
+        let mut short_layer = generate_all_texture_layers_rgba();
+        short_layer[0].pop();
+        assert!(!block_array_layers_match_shape(&short_layer));
     }
 
     #[test]

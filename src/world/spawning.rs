@@ -100,6 +100,60 @@ pub const PASSIVE_SURFACE_LIGHT: u8 = 15;
 /// long stall cannot spiral into an unbounded catch-up burst.
 pub const MAX_SPAWN_ATTEMPTS_PER_CALL: u32 = 4;
 
+/// Creator-tunable mob population rules.
+///
+/// Every default reads the existing module constant, so the constants stay
+/// authoritative until a live rules bundle overrides them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpawnRules {
+    /// Radius around anchors where hostile mobs never spawn, in blocks.
+    pub safe_radius_blocks: i32,
+    /// Outer horizontal radius of the spawn ring, in blocks.
+    pub spawn_max_radius_blocks: i32,
+    /// Distance past which a record is culled, in blocks.
+    pub despawn_radius_blocks: i32,
+    /// Hard cap on mob records in the session list.
+    pub max_mobs_total: usize,
+    /// Edge length of one spawn region cell, in blocks.
+    pub spawn_region_blocks: i32,
+    /// Per-region mob cap.
+    pub spawn_region_cap: usize,
+    /// Seconds of game time between spawn attempts.
+    pub spawn_attempt_secs: f32,
+    /// Seconds of game time between despawn scans.
+    pub despawn_scan_secs: f32,
+    /// Seconds of game time between daylight-burn ticks.
+    pub burn_interval_secs: f32,
+    /// Minimum horizontal distance between two mob feet, in blocks.
+    pub spawn_min_separation: f32,
+    /// At or below this sky light a column counts as cave-dark.
+    pub hostile_cave_light: u8,
+    /// Minimum sky light for the lit-surface passive rules.
+    pub passive_surface_light: u8,
+    /// Whole spawn attempts one tick may execute.
+    pub max_spawn_attempts_per_call: u32,
+}
+
+impl Default for SpawnRules {
+    fn default() -> Self {
+        Self {
+            safe_radius_blocks: SAFE_RADIUS_BLOCKS,
+            spawn_max_radius_blocks: SPAWN_MAX_RADIUS_BLOCKS,
+            despawn_radius_blocks: DESPAWN_RADIUS_BLOCKS,
+            max_mobs_total: MAX_MOBS_TOTAL,
+            spawn_region_blocks: SPAWN_REGION_BLOCKS,
+            spawn_region_cap: SPAWN_REGION_CAP,
+            spawn_attempt_secs: SPAWN_ATTEMPT_SECS,
+            despawn_scan_secs: DESPAWN_SCAN_SECS,
+            burn_interval_secs: BURN_INTERVAL_SECS,
+            spawn_min_separation: SPAWN_MIN_SEPARATION,
+            hostile_cave_light: HOSTILE_CAVE_LIGHT,
+            passive_surface_light: PASSIVE_SURFACE_LIGHT,
+            max_spawn_attempts_per_call: MAX_SPAWN_ATTEMPTS_PER_CALL,
+        }
+    }
+}
+
 /// Absorbs `f32` accumulation drift when many small frame deltas are summed.
 ///
 /// Without it, `50 x 0.01 s` can land at 0.2499997 and fire one attempt later
@@ -181,6 +235,20 @@ pub struct SpawnContext {
     pub world_spawn: Vec3,
 }
 
+/// One already-resolved placement candidate for [`try_spawn_at`].
+///
+/// Bundling the placement facts keeps the eligibility pipeline within the
+/// argument-count budget without changing the pipeline order.
+#[derive(Copy, Clone, Debug)]
+struct SpawnCandidate {
+    /// Candidate feet position, already snapped to the surface scan.
+    feet: Vec3,
+    /// Yaw the new mob record receives.
+    yaw: f32,
+    /// Session attempt index used by the deterministic kind roll.
+    attempt_index: u64,
+}
+
 /// What one population step did.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnReport {
@@ -225,6 +293,8 @@ pub struct SpawnRuntime {
     enabled: bool,
     /// Cumulative counters since construction or [`SpawnRuntime::reset_report`].
     report: SpawnReport,
+    /// Live population tuning installed by [`SpawnRuntime::set_rules`].
+    rules: SpawnRules,
 }
 
 impl SpawnRuntime {
@@ -237,7 +307,27 @@ impl SpawnRuntime {
             attempt_index: 0,
             enabled: true,
             report: SpawnReport::default(),
+            rules: SpawnRules::default(),
         }
+    }
+
+    /// The population rules currently installed.
+    #[inline]
+    pub fn rules(&self) -> SpawnRules {
+        self.rules
+    }
+
+    /// Replaces the population rules without touching runtime phase.
+    ///
+    /// A live config reload must not reset a deterministic window: unlike
+    /// [`SpawnRuntime::set_enabled`], this keeps `attempt_accum`,
+    /// `despawn_accum`, `burn_accum`, `attempt_index`, `enabled`, and
+    /// `report` exactly as they were, so the next attempt lands on the same
+    /// frame boundary it would have without the reload. Callers install a
+    /// whole last-good bundle ([`crate::world::session::WorldSession::apply_rules`]),
+    /// never a per-field patch.
+    pub fn set_rules(&mut self, rules: SpawnRules) {
+        self.rules = rules;
     }
 
     /// Whether spawning and burning are currently allowed.
@@ -302,30 +392,40 @@ impl SpawnRuntime {
             return delta;
         }
 
+        // Copy the live rules once so every cadence in this call sees one
+        // consistent bundle even if a future seam mutates the runtime
+        // mid-frame. Keeping the structural epsilon below means a creator
+        // cannot make the accumulation loops unbounded (the registry clamps
+        // intervals to >= 0.01 s, but `set_rules` accepts a hand-built rule).
+        let rules = self.rules;
+        let despawn_interval = rules.despawn_scan_secs.max(SPAWN_ACCUM_EPSILON);
+        let burn_interval = rules.burn_interval_secs.max(SPAWN_ACCUM_EPSILON);
+        let attempt_interval = rules.spawn_attempt_secs.max(SPAWN_ACCUM_EPSILON);
+
         // Ungated by design: a cull can only mark a record already outside
         // the radius, so it can never move a deterministic demo's mob list,
         // and leaving it ungated means the demo's despawn proof cannot be
         // silently disabled by the seam.
         self.despawn_accum += game_dt;
-        while self.despawn_accum + SPAWN_ACCUM_EPSILON >= DESPAWN_SCAN_SECS {
-            self.despawn_accum = (self.despawn_accum - DESPAWN_SCAN_SECS).max(0.0);
-            scan_despawn(ctx, mobs, &mut delta);
+        while self.despawn_accum + SPAWN_ACCUM_EPSILON >= despawn_interval {
+            self.despawn_accum = (self.despawn_accum - despawn_interval).max(0.0);
+            scan_despawn(ctx, mobs, &mut delta, &rules);
         }
 
         if self.enabled {
             self.burn_accum += game_dt;
-            while self.burn_accum + SPAWN_ACCUM_EPSILON >= BURN_INTERVAL_SECS {
-                self.burn_accum = (self.burn_accum - BURN_INTERVAL_SECS).max(0.0);
-                scan_burn(ctx, world, mobs, &mut delta);
+            while self.burn_accum + SPAWN_ACCUM_EPSILON >= burn_interval {
+                self.burn_accum = (self.burn_accum - burn_interval).max(0.0);
+                scan_burn(ctx, world, mobs, &mut delta, &rules);
             }
 
             self.attempt_accum += game_dt;
             let mut executed = 0;
-            while executed < MAX_SPAWN_ATTEMPTS_PER_CALL
-                && self.attempt_accum + SPAWN_ACCUM_EPSILON >= SPAWN_ATTEMPT_SECS
+            while executed < rules.max_spawn_attempts_per_call
+                && self.attempt_accum + SPAWN_ACCUM_EPSILON >= attempt_interval
             {
-                self.attempt_accum = (self.attempt_accum - SPAWN_ATTEMPT_SECS).max(0.0);
-                attempt_spawn(ctx, world, mobs, self.attempt_index, &mut delta);
+                self.attempt_accum = (self.attempt_accum - attempt_interval).max(0.0);
+                attempt_spawn(ctx, world, mobs, self.attempt_index, &mut delta, &rules);
                 self.attempt_index = self.attempt_index.wrapping_add(1);
                 executed += 1;
             }
@@ -333,8 +433,8 @@ impl SpawnRuntime {
             // intervals queued. Clamp that leftover to half an interval so
             // the next call cannot immediately fire, while a normal small
             // frame delta is carried untouched.
-            if self.attempt_accum + SPAWN_ACCUM_EPSILON >= SPAWN_ATTEMPT_SECS {
-                self.attempt_accum = SPAWN_ATTEMPT_SECS * 0.5;
+            if self.attempt_accum + SPAWN_ACCUM_EPSILON >= attempt_interval {
+                self.attempt_accum = attempt_interval * 0.5;
             }
         }
 
@@ -378,7 +478,7 @@ const SLOT_KIND: u32 = 1;
 /// The low 16 bits select the angle over a full turn, the high 16 bits select
 /// the radius inside `[SAFE_RADIUS, SPAWN_MAX_RADIUS]`. Both are derived from
 /// one draw so the ring is uniformly sampled.
-fn ring_sample(ctx: &SpawnContext, attempt_index: u64) -> (f32, f32) {
+fn ring_sample(ctx: &SpawnContext, attempt_index: u64, rules: &SpawnRules) -> (f32, f32) {
     let roll = spawn_roll(
         ctx.seed,
         ctx.day_index,
@@ -388,7 +488,9 @@ fn ring_sample(ctx: &SpawnContext, attempt_index: u64) -> (f32, f32) {
     );
     let angle = (roll & 0xFFFF) as f32 / 65_535.0 * std::f32::consts::TAU;
     let radius_fraction = ((roll >> 16) & 0xFFFF) as f32 / 65_535.0;
-    let radius = SAFE_RADIUS + radius_fraction * (SPAWN_MAX_RADIUS - SAFE_RADIUS);
+    let min_radius = rules.safe_radius_blocks as f32;
+    let max_radius = rules.spawn_max_radius_blocks as f32;
+    let radius = min_radius + radius_fraction * (max_radius - min_radius);
     (angle, radius)
 }
 
@@ -400,15 +502,16 @@ fn attempt_spawn(
     mobs: &mut Vec<Mob>,
     attempt_index: u64,
     report: &mut SpawnReport,
+    rules: &SpawnRules,
 ) {
     // The global cap is checked before any world work: a full list makes the
     // roll and the y scan pure waste.
-    if mobs.len() >= MAX_MOBS_TOTAL {
+    if mobs.len() >= rules.max_mobs_total {
         report.cap_blocked += 1;
         return;
     }
 
-    let (angle, radius) = ring_sample(ctx, attempt_index);
+    let (angle, radius) = ring_sample(ctx, attempt_index, rules);
     let (sin, cos) = angle.sin_cos();
     let feet_x = (ctx.player.x + sin * radius).floor() + 0.5;
     let feet_z = (ctx.player.z + cos * radius).floor() + 0.5;
@@ -434,10 +537,13 @@ fn attempt_spawn(
         ctx,
         world,
         mobs,
-        Vec3::new(feet_x, feet_y as f32, feet_z),
-        angle,
-        attempt_index,
+        SpawnCandidate {
+            feet: Vec3::new(feet_x, feet_y as f32, feet_z),
+            yaw: angle,
+            attempt_index,
+        },
         report,
+        rules,
     );
 }
 
@@ -494,18 +600,19 @@ fn passive_kind(ctx: &SpawnContext, attempt_index: u64) -> MobKind {
     }
 }
 
-/// The 32-block spawn region cell containing a horizontal position.
-fn region_bucket(x: f32, z: f32) -> (i32, i32) {
+/// The spawn region cell of `region_blocks` edge length containing a
+/// horizontal position.
+fn region_bucket(x: f32, z: f32, region_blocks: i32) -> (i32, i32) {
     (
-        (x.floor() as i32).div_euclid(SPAWN_REGION_BLOCKS),
-        (z.floor() as i32).div_euclid(SPAWN_REGION_BLOCKS),
+        (x.floor() as i32).div_euclid(region_blocks),
+        (z.floor() as i32).div_euclid(region_blocks),
     )
 }
 
 /// How many records already live in `bucket`, resident or not.
-fn region_count(mobs: &[Mob], bucket: (i32, i32)) -> usize {
+fn region_count(mobs: &[Mob], bucket: (i32, i32), region_blocks: i32) -> usize {
     mobs.iter()
-        .filter(|mob| region_bucket(mob.position.x, mob.position.z) == bucket)
+        .filter(|mob| region_bucket(mob.position.x, mob.position.z, region_blocks) == bucket)
         .count()
 }
 
@@ -529,8 +636,14 @@ fn horizontal_distance_sq(a: Vec3, b: Vec3) -> f32 {
 ///
 /// Already-marked records are skipped so [`SpawnReport::despawned`] counts
 /// marks, not observations, and a repeated scan cannot double-count.
-fn scan_despawn(ctx: &SpawnContext, mobs: &mut [Mob], report: &mut SpawnReport) {
-    let radius_sq = DESPAWN_RADIUS * DESPAWN_RADIUS;
+fn scan_despawn(
+    ctx: &SpawnContext,
+    mobs: &mut [Mob],
+    report: &mut SpawnReport,
+    rules: &SpawnRules,
+) {
+    let radius = rules.despawn_radius_blocks as f32;
+    let radius_sq = radius * radius;
     for mob in mobs.iter_mut() {
         if mob.despawn_pending {
             continue;
@@ -563,6 +676,7 @@ fn scan_burn(
     world: &impl SpawnWorld,
     mobs: &mut [Mob],
     report: &mut SpawnReport,
+    rules: &SpawnRules,
 ) {
     if daycycle::is_night(ctx.time_of_day) {
         return;
@@ -583,7 +697,7 @@ fn scan_burn(
         if !world.column_ready(cx, cz) {
             continue;
         }
-        if world.sky_light(feet) != PASSIVE_SURFACE_LIGHT {
+        if world.sky_light(feet) < rules.passive_surface_light {
             continue;
         }
         if world.block(feet) == BlockId::Water {
@@ -608,11 +722,15 @@ fn try_spawn_at(
     ctx: &SpawnContext,
     world: &impl SpawnWorld,
     mobs: &mut Vec<Mob>,
-    feet: Vec3,
-    yaw: f32,
-    attempt_index: u64,
+    candidate: SpawnCandidate,
     report: &mut SpawnReport,
+    rules: &SpawnRules,
 ) {
+    let SpawnCandidate {
+        feet,
+        yaw,
+        attempt_index,
+    } = candidate;
     let feet_block = IVec3::new(feet.x.floor() as i32, feet.y as i32, feet.z.floor() as i32);
     if world.block(feet_block) != BlockId::Air {
         return;
@@ -623,39 +741,37 @@ fn try_spawn_at(
     let below = world.block(feet_block - IVec3::Y);
 
     let light = world.sky_light(feet_block);
-    let kind = if light <= HOSTILE_CAVE_LIGHT {
+    let lit_surface = light >= rules.passive_surface_light;
+    let kind = if light <= rules.hostile_cave_light {
         // Cave-dark at any hour.
         hostile_kind(ctx, attempt_index)
-    } else if light == PASSIVE_SURFACE_LIGHT && daycycle::is_night(ctx.time_of_day) {
+    } else if lit_surface && daycycle::is_night(ctx.time_of_day) {
         // Night on the lit surface.
         hostile_kind(ctx, attempt_index)
-    } else if light == PASSIVE_SURFACE_LIGHT
-        && below == BlockId::Grass
-        && daycycle::is_day(ctx.time_of_day)
-    {
+    } else if lit_surface && below == BlockId::Grass && daycycle::is_day(ctx.time_of_day) {
         passive_kind(ctx, attempt_index)
     } else {
-        // Light 8..=14 (twilight band), unlit surfaces at day, and every
-        // non-grass floor are ineligible.
+        // The twilight band (between the two thresholds), unlit surfaces at
+        // day, and every non-grass floor are ineligible.
         return;
     };
 
     // The safe ring around the player is inclusive at both ends; the world
     // spawn is protected by its own radius so a wanderer cannot be ambushed
     // on the spawn pad.
+    let safe_radius = rules.safe_radius_blocks as f32;
+    let max_radius = rules.spawn_max_radius_blocks as f32;
     let player_distance_sq = horizontal_distance_sq(feet, ctx.player);
-    if !(SAFE_RADIUS * SAFE_RADIUS..=SPAWN_MAX_RADIUS * SPAWN_MAX_RADIUS)
-        .contains(&player_distance_sq)
-    {
+    if !(safe_radius * safe_radius..=max_radius * max_radius).contains(&player_distance_sq) {
         return;
     }
-    if horizontal_distance_sq(feet, ctx.world_spawn) < SAFE_RADIUS * SAFE_RADIUS {
+    if horizontal_distance_sq(feet, ctx.world_spawn) < safe_radius * safe_radius {
         return;
     }
 
     // Two records must never share a position: the v7 save fails closed on a
     // duplicate record, and a stacked pair would be indistinguishable.
-    let min_sep_sq = SPAWN_MIN_SEPARATION * SPAWN_MIN_SEPARATION;
+    let min_sep_sq = rules.spawn_min_separation * rules.spawn_min_separation;
     if mobs
         .iter()
         .any(|mob| horizontal_distance_sq(mob.position, feet) < min_sep_sq)
@@ -663,8 +779,8 @@ fn try_spawn_at(
         return;
     }
 
-    let bucket = region_bucket(feet.x, feet.z);
-    if region_count(mobs, bucket) >= SPAWN_REGION_CAP {
+    let bucket = region_bucket(feet.x, feet.z, rules.spawn_region_blocks);
+    if region_count(mobs, bucket, rules.spawn_region_blocks) >= rules.spawn_region_cap {
         report.cap_blocked += 1;
         return;
     }
@@ -682,6 +798,28 @@ mod tests {
     use crate::world::persistence::{ChunkEditMap, SavedMob};
     use crate::world::season::DEFAULT_SEASON_LENGTH_DAYS;
     use crate::world::session::WorldSession;
+
+    #[test]
+    fn spawn_rules_default_matches_constants() {
+        let rules = SpawnRules::default();
+        assert_eq!(SpawnRuntime::new().rules(), rules);
+        assert_eq!(rules.safe_radius_blocks, SAFE_RADIUS_BLOCKS);
+        assert_eq!(rules.spawn_max_radius_blocks, SPAWN_MAX_RADIUS_BLOCKS);
+        assert_eq!(rules.despawn_radius_blocks, DESPAWN_RADIUS_BLOCKS);
+        assert_eq!(rules.max_mobs_total, MAX_MOBS_TOTAL);
+        assert_eq!(rules.spawn_region_blocks, SPAWN_REGION_BLOCKS);
+        assert_eq!(rules.spawn_region_cap, SPAWN_REGION_CAP);
+        assert_eq!(rules.spawn_attempt_secs, SPAWN_ATTEMPT_SECS);
+        assert_eq!(rules.despawn_scan_secs, DESPAWN_SCAN_SECS);
+        assert_eq!(rules.burn_interval_secs, BURN_INTERVAL_SECS);
+        assert_eq!(rules.spawn_min_separation, SPAWN_MIN_SEPARATION);
+        assert_eq!(rules.hostile_cave_light, HOSTILE_CAVE_LIGHT);
+        assert_eq!(rules.passive_surface_light, PASSIVE_SURFACE_LIGHT);
+        assert_eq!(
+            rules.max_spawn_attempts_per_call,
+            MAX_SPAWN_ATTEMPTS_PER_CALL
+        );
+    }
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
@@ -835,7 +973,7 @@ mod tests {
     fn ring_sample_stays_inside_the_spawn_ring() {
         let ctx = flat_ctx(6_000);
         for attempt in 0..500u64 {
-            let (angle, radius) = ring_sample(&ctx, attempt);
+            let (angle, radius) = ring_sample(&ctx, attempt, &SpawnRules::default());
             assert!(angle.is_finite() && (0.0..std::f32::consts::TAU).contains(&angle));
             assert!(
                 (SAFE_RADIUS..=SPAWN_MAX_RADIUS).contains(&radius),
@@ -908,7 +1046,18 @@ mod tests {
 
         let mut mobs = Vec::new();
         let mut report = SpawnReport::default();
-        try_spawn_at(&ctx, &world, &mut mobs, candidate, 0.0, 0, &mut report);
+        try_spawn_at(
+            &ctx,
+            &world,
+            &mut mobs,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules::default(),
+        );
 
         assert_eq!(report.spawned, 1, "the shaded stand must spawn");
         assert!(mobs[0].kind.is_hostile());
@@ -935,10 +1084,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
 
         assert_eq!(report.spawned, 0, "feet must be exactly Air");
@@ -1046,7 +1198,10 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(region_count(&mobs, (0, 0)), SPAWN_REGION_CAP);
+        assert_eq!(
+            region_count(&mobs, (0, 0), SPAWN_REGION_BLOCKS),
+            SPAWN_REGION_CAP
+        );
 
         let mut report = SpawnReport::default();
         // 30 blocks from the player: inside the ring, same cell as the pigs.
@@ -1054,10 +1209,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(
             report.cap_blocked, 1,
@@ -1071,10 +1229,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 33.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 33.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 1);
         assert_eq!(report.cap_blocked, 1);
@@ -1096,7 +1257,18 @@ mod tests {
         let mut mobs = vec![Mob::new(MobKind::Pig, occupied, 0.0)];
         let mut report = SpawnReport::default();
 
-        try_spawn_at(&ctx, &world, &mut mobs, occupied, 0.0, 0, &mut report);
+        try_spawn_at(
+            &ctx,
+            &world,
+            &mut mobs,
+            SpawnCandidate {
+                feet: occupied,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules::default(),
+        );
         assert_eq!(report.spawned, 0, "an exact duplicate must be rejected");
         assert_eq!(mobs.len(), 1);
 
@@ -1104,10 +1276,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(31.6, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(31.6, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 1, "1.1 blocks apart is far enough");
     }
@@ -1130,10 +1305,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(20.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(20.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 0, "inside the 24-block safe radius");
 
@@ -1141,10 +1319,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(52.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(52.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 0, "beyond the 48-block spawn radius");
 
@@ -1158,10 +1339,13 @@ mod tests {
             &near_spawn,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 0, "inside the world-spawn safe radius");
 
@@ -1169,10 +1353,13 @@ mod tests {
             &ctx,
             &world,
             &mut mobs,
-            Vec3::new(30.5, feet.y, 0.5),
-            0.0,
-            0,
+            SpawnCandidate {
+                feet: Vec3::new(30.5, feet.y, 0.5),
+                yaw: 0.0,
+                attempt_index: 0,
+            },
             &mut report,
+            &SpawnRules::default(),
         );
         assert_eq!(report.spawned, 1, "a legal stand must spawn");
     }
@@ -1303,11 +1490,11 @@ mod tests {
 
     #[test]
     fn region_buckets_are_floor_cells_at_the_origin_boundary() {
-        assert_eq!(region_bucket(0.0, 0.0), (0, 0));
-        assert_eq!(region_bucket(31.9, 31.9), (0, 0));
-        assert_eq!(region_bucket(32.0, 32.0), (1, 1));
-        assert_eq!(region_bucket(-0.1, -0.1), (-1, -1));
-        assert_eq!(region_bucket(-32.0, -32.0), (-1, -1));
+        assert_eq!(region_bucket(0.0, 0.0, SPAWN_REGION_BLOCKS), (0, 0));
+        assert_eq!(region_bucket(31.9, 31.9, SPAWN_REGION_BLOCKS), (0, 0));
+        assert_eq!(region_bucket(32.0, 32.0, SPAWN_REGION_BLOCKS), (1, 1));
+        assert_eq!(region_bucket(-0.1, -0.1, SPAWN_REGION_BLOCKS), (-1, -1));
+        assert_eq!(region_bucket(-32.0, -32.0, SPAWN_REGION_BLOCKS), (-1, -1));
     }
 
     #[test]
@@ -1316,6 +1503,227 @@ mod tests {
         assert!(runtime.enabled());
         assert_eq!(runtime.report(), SpawnReport::default());
         assert_eq!(runtime.attempt_index, 0);
+    }
+
+    #[test]
+    fn tuned_spawn_cadence_and_cap_are_read_live() {
+        let world = FakeWorld::flat();
+        let ctx = flat_ctx(6_000);
+
+        let mut tuned = SpawnRuntime::new();
+        tuned.set_rules(SpawnRules {
+            spawn_attempt_secs: 0.05,
+            // Test-only sentinel: every attempt hits the global cap, so the
+            // counters prove how many cadences actually fired.
+            max_mobs_total: 0,
+            ..SpawnRules::default()
+        });
+        let mut mobs = Vec::new();
+        let delta = tuned.tick(0.1, &ctx, &world, &mut mobs);
+        assert_eq!(
+            delta.cap_blocked, 2,
+            "0.1 s at a 0.05 s cadence must fire two attempts"
+        );
+        assert_eq!(tuned.attempt_index, 2);
+
+        let mut default = SpawnRuntime::new();
+        let default_delta = default.tick(0.1, &ctx, &world, &mut mobs);
+        assert_eq!(
+            default_delta.cap_blocked, 0,
+            "the default 0.25 s cadence fires nothing in 0.1 s"
+        );
+        assert_eq!(default.attempt_index, 0);
+
+        // The per-call budget is also live: one attempt per tick even though
+        // 0.2 s at a 0.05 s cadence would otherwise fire four.
+        let mut limited = SpawnRuntime::new();
+        limited.set_rules(SpawnRules {
+            spawn_attempt_secs: 0.05,
+            max_mobs_total: 0,
+            max_spawn_attempts_per_call: 1,
+            ..SpawnRules::default()
+        });
+        let delta = limited.tick(0.2, &ctx, &world, &mut mobs);
+        assert_eq!(delta.cap_blocked, 1, "the tuned per-call budget is one");
+        assert_eq!(limited.attempt_index, 1);
+    }
+
+    #[test]
+    fn tuned_light_thresholds_are_read_live() {
+        let feet = Vec3::new(0.5, (SURFACE_Y + 1) as f32, 0.5);
+        let ctx = SpawnContext {
+            seed: 7,
+            day_index: 0,
+            time_of_day: 6_000,
+            player: feet,
+            world_spawn: feet,
+        };
+        let candidate = Vec3::new(30.5, feet.y, 0.5);
+
+        // Light 7 is cave-dark by default, so the same stand spawns a hostile.
+        let cave = FakeWorld::flat().with_default_light(HOSTILE_CAVE_LIGHT);
+        let mut mobs = Vec::new();
+        let mut report = SpawnReport::default();
+        try_spawn_at(
+            &ctx,
+            &cave,
+            &mut mobs,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules::default(),
+        );
+        assert_eq!(report.spawned, 1);
+        assert!(mobs[0].kind.is_hostile());
+
+        // Tuning the cave threshold below 7 makes the same stand ineligible.
+        let mut mobs = Vec::new();
+        let mut report = SpawnReport::default();
+        try_spawn_at(
+            &ctx,
+            &cave,
+            &mut mobs,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules {
+                hostile_cave_light: 0,
+                ..SpawnRules::default()
+            },
+        );
+        assert_eq!(report.spawned, 0, "light 7 must clear a 0 cave threshold");
+
+        // Light 10 sits in the default twilight band. Lowering the passive
+        // threshold to 10 makes the lit grass stand eligible at day.
+        let twilight = FakeWorld::flat().with_default_light(10);
+        let mut mobs = Vec::new();
+        let mut report = SpawnReport::default();
+        try_spawn_at(
+            &ctx,
+            &twilight,
+            &mut mobs,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules::default(),
+        );
+        assert_eq!(report.spawned, 0, "default twilight stays ineligible");
+
+        let mut mobs = Vec::new();
+        let mut report = SpawnReport::default();
+        try_spawn_at(
+            &ctx,
+            &twilight,
+            &mut mobs,
+            SpawnCandidate {
+                feet: candidate,
+                yaw: 0.0,
+                attempt_index: 0,
+            },
+            &mut report,
+            &SpawnRules {
+                passive_surface_light: 10,
+                ..SpawnRules::default()
+            },
+        );
+        assert_eq!(report.spawned, 1, "light 10 meets a 10 passive threshold");
+        assert!(mobs[0].kind.is_passive());
+    }
+
+    #[test]
+    fn tuned_despawn_radius_marks_a_nearer_record() {
+        // Light 10 isolates the cull from any spawn attempt.
+        let world = FakeWorld::flat().with_default_light(10);
+        let ctx = flat_ctx(6_000);
+
+        let mut tuned = SpawnRuntime::new();
+        tuned.set_enabled(false);
+        tuned.set_rules(SpawnRules {
+            despawn_radius_blocks: 8,
+            ..SpawnRules::default()
+        });
+        let mut mobs = vec![Mob::new(MobKind::Pig, feet_offset(10.0), 0.0)];
+        let delta = tuned.tick(DESPAWN_SCAN_SECS, &ctx, &world, &mut mobs);
+        assert_eq!(
+            delta.despawned, 1,
+            "10 blocks out is beyond an 8-block cull"
+        );
+        assert!(mobs[0].despawn_pending);
+
+        let mut default = SpawnRuntime::new();
+        default.set_enabled(false);
+        let mut kept = vec![Mob::new(MobKind::Pig, feet_offset(10.0), 0.0)];
+        let delta = default.tick(DESPAWN_SCAN_SECS, &ctx, &world, &mut kept);
+        assert_eq!(delta.despawned, 0, "the default 96-block radius keeps it");
+        assert!(!kept[0].despawn_pending);
+    }
+
+    #[test]
+    fn tuned_ring_and_region_geometry_are_read_live() {
+        let ctx = flat_ctx(6_000);
+        let rules = SpawnRules {
+            safe_radius_blocks: 8,
+            spawn_max_radius_blocks: 12,
+            spawn_region_blocks: 16,
+            ..SpawnRules::default()
+        };
+        for attempt in 0..500u64 {
+            let (_, radius) = ring_sample(&ctx, attempt, &rules);
+            assert!(
+                (8.0..=12.0).contains(&radius),
+                "tuned radius {radius} escaped [8, 12] at {attempt}"
+            );
+        }
+        let default = SpawnRules::default();
+        for attempt in 0..500u64 {
+            let (_, radius) = ring_sample(&ctx, attempt, &default);
+            assert!((SAFE_RADIUS..=SPAWN_MAX_RADIUS).contains(&radius));
+        }
+        assert_eq!(region_bucket(20.0, 0.0, rules.spawn_region_blocks), (1, 0));
+        assert_eq!(
+            region_bucket(20.0, 0.0, default.spawn_region_blocks),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn set_rules_preserves_the_running_accumulation_phase() {
+        let world = FakeWorld::flat();
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        runtime.set_rules(SpawnRules {
+            max_mobs_total: 0,
+            ..SpawnRules::default()
+        });
+        let mut mobs = Vec::new();
+
+        // Carry 0.2 s of the 0.25 s window with no attempt yet.
+        let first = runtime.tick(0.2, &ctx, &world, &mut mobs);
+        assert_eq!(runtime.attempt_index, 0);
+        assert_eq!(first.cap_blocked, 0);
+
+        // A same-rules reload mid-window must not reset the accumulator: the
+        // next 0.05 s reaches the retained 0.25 s boundary and fires.
+        let rules = runtime.rules();
+        runtime.set_rules(rules);
+        let second = runtime.tick(0.05, &ctx, &world, &mut mobs);
+        assert_eq!(runtime.attempt_index, 1, "the retained phase must fire now");
+        assert_eq!(second.cap_blocked, 1);
+        assert!(runtime.enabled(), "set_rules must not toggle the gate");
+        assert_eq!(
+            runtime.report(),
+            second,
+            "set_rules must not clear the report"
+        );
     }
 
     // ---- S05-T02: despawn marking and daylight burning ------------------
@@ -1725,7 +2133,7 @@ mod tests {
         let mut buckets: HashMap<(i32, i32), usize> = HashMap::new();
         for mob in session.mobs() {
             *buckets
-                .entry(region_bucket(mob.home.x, mob.home.z))
+                .entry(region_bucket(mob.home.x, mob.home.z, SPAWN_REGION_BLOCKS))
                 .or_default() += 1;
         }
         for (bucket, count) in buckets {
