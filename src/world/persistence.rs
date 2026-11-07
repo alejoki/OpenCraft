@@ -276,6 +276,15 @@ pub struct CliConfig {
     /// launching the game. Like `demo_ui` it is a launch switch, never a world
     /// intent (it never affects `cli_has_world_intent`) and is never persisted.
     pub validate_pack: Option<String>,
+    /// Root directory requested by `--validate-worldgen [dir]` (M015/S01-T03).
+    /// A release-facing launch switch: `main` consumes it before settings,
+    /// packs, save, window and GPU startup, so validation never opens a
+    /// window, GPU, audio engine, event loop or save. Never a world intent
+    /// (it never affects `cli_has_world_intent`) and never persisted. The
+    /// optional value is only consumed when the next token does not start
+    /// with `--`, so `--validate-worldgen --save x` keeps the default
+    /// [`crate::world::prefab::WORLDGEN_DIR`] root and still parses `--save`.
+    pub validate_worldgen: Option<PathBuf>,
     /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
     /// requested. A bare launch switch: it takes no value, is deliberately NOT
     /// a world intent (so it never affects `cli_has_world_intent`), and is
@@ -327,11 +336,12 @@ impl CliConfig {
         let mut demo_save_v9 = false;
         let mut demo_restart = false;
         let mut validate_pack = None;
+        let mut validate_worldgen = None;
         let mut check_config = false;
         let mut creator_trace = false;
         let mut mode = GameMode::Creative;
 
-        let mut iter = args.into_iter();
+        let mut iter = args.into_iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_ref() {
                 "--save" => {
@@ -450,6 +460,20 @@ impl CliConfig {
                             .unwrap_or_default(),
                     );
                 }
+                "--validate-worldgen" => {
+                    // Optional-value switch: consume the next token only when
+                    // it is not another switch. The `peek` guard is
+                    // load-bearing: `--validate-worldgen --save x` must keep
+                    // the default root and still let `--save` be parsed as a
+                    // save path.
+                    let root = match iter.peek() {
+                        Some(next) if !next.as_ref().starts_with("--") => {
+                            PathBuf::from(iter.next().unwrap().as_ref())
+                        }
+                        _ => PathBuf::from(crate::world::prefab::WORLDGEN_DIR),
+                    };
+                    validate_worldgen = Some(root);
+                }
                 "--check-config" => {
                     // Bare switch (no value to consume), mirroring `--new`:
                     // a stray following token stays an independent argument.
@@ -494,6 +518,7 @@ impl CliConfig {
             demo_save_v9,
             demo_restart,
             validate_pack,
+            validate_worldgen,
             check_config,
             creator_trace,
             mode,
@@ -5819,6 +5844,70 @@ mod tests {
         let world_flag = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
         assert!(world_flag.force_new_world);
         assert_eq!(world_flag.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn test_validate_worldgen_parses_bare_flag_as_worldgen_root() {
+        // A bare flag validates the default checked-in worldgen root and
+        // changes nothing else: it is a launch switch, not a world parameter.
+        let bare = CliConfig::parse_args(["--validate-worldgen"]);
+        assert_eq!(
+            bare.validate_worldgen,
+            Some(std::path::PathBuf::from("worldgen"))
+        );
+        assert!(!bare.force_new_world);
+        assert_eq!(bare.seed_override, None);
+        assert_eq!(bare.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+        assert_eq!(bare.validate_pack, None);
+        assert!(!bare.check_config);
+
+        // Absent keeps the seam off.
+        let off = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(off.validate_worldgen, None);
+    }
+
+    #[test]
+    fn test_validate_worldgen_takes_an_optional_directory() {
+        let custom = CliConfig::parse_args(["--validate-worldgen", "custom/gen"]);
+        assert_eq!(
+            custom.validate_worldgen,
+            Some(std::path::PathBuf::from("custom/gen"))
+        );
+        // The consumed path never leaks into unrelated seams.
+        assert!(!custom.force_new_world);
+        assert_eq!(
+            custom.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+    }
+
+    #[test]
+    fn test_validate_worldgen_does_not_consume_a_following_switch() {
+        // The `peek` guard is load-bearing: a following `--save` stays an
+        // independent switch and its value is not eaten as the worldgen root.
+        let cli = CliConfig::parse_args(["--validate-worldgen", "--save", "fixture.mcvx"]);
+        assert_eq!(
+            cli.validate_worldgen,
+            Some(std::path::PathBuf::from("worldgen"))
+        );
+        assert_eq!(cli.save_path, std::path::PathBuf::from("fixture.mcvx"));
+    }
+
+    #[test]
+    fn test_validate_worldgen_and_demo_worldgen_stay_distinct() {
+        // Two different seams share a stem: the validator must not arm the
+        // worldgen digest, and the digest must not arm the validator.
+        let validate = CliConfig::parse_args(["--validate-worldgen"]);
+        assert!(validate.validate_worldgen.is_some());
+        assert!(!validate.demo_worldgen);
+
+        let demo = CliConfig::parse_args(["--demo-worldgen"]);
+        assert!(demo.demo_worldgen);
+        assert_eq!(demo.validate_worldgen, None);
+
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.validate_worldgen, None);
+        assert!(!bare.demo_worldgen);
     }
 
     #[test]

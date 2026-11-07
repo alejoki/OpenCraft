@@ -15590,6 +15590,26 @@ fn main() {
         return;
     }
 
+    // `--validate-worldgen [dir]` is a headless, pre-startup short-circuit:
+    // it walks the optional worldgen root (default `worldgen`), prints one
+    // stable per-prefab line plus a summary, and exits 0/1 without a session,
+    // event loop, window, GPU, save, settings file or pack stack. It is a
+    // release-facing launch switch (D245): unlike `--check-config` and
+    // `--creator-trace` it is deliberately not release-gated.
+    if let Some(root) = cli.validate_worldgen.as_deref() {
+        let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if cli.demo_ui {
         let (lines, ok) = opencraft::ui::demo::ui_demo_digest_lines();
         use std::io::Write as _;
@@ -15759,8 +15779,9 @@ fn main() {
 
     // Build the pack-aware startup content ONCE: the same base registry names
     // the fresh/loaded startup session and becomes the app's base registry.
-    // `--validate-pack` and `--demo-ui` returned above, so no window, GPU,
-    // settings file or save is touched for those short-circuits.
+    // `--validate-pack`, `--validate-worldgen` and `--demo-ui` returned above,
+    // so no window, GPU, settings file or save is touched for those
+    // short-circuits.
     let content = StartupContent::load(
         Path::new(DEFAULT_SETTINGS_PATH),
         Path::new(pack::PACKS_DIR).to_path_buf(),
@@ -16242,6 +16263,67 @@ mod tests {
         assert!(
             validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
             "validate-pack must precede the demo-ui branch"
+        );
+    }
+
+    #[test]
+    fn validate_worldgen_is_a_launch_switch_and_never_a_world_intent() {
+        // Validation is a headless one-shot: asking for it must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let validate = CliConfig::parse_args(["--validate-worldgen"]);
+        assert!(!cli_has_world_intent(&validate));
+        assert_eq!(cli_has_world_intent(&validate), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the validation switch is not
+        // persisted or turned into a world parameter. The optional root is
+        // carried verbatim.
+        let with_new = CliConfig::parse_args(["--new", "--validate-worldgen", "custom"]);
+        assert!(cli_has_world_intent(&with_new));
+        assert_eq!(
+            with_new.validate_worldgen,
+            Some(std::path::PathBuf::from("custom"))
+        );
+    }
+
+    #[test]
+    fn main_validate_worldgen_short_circuit_precedes_world_startup() {
+        // Validation must run before any world/session startup: no save,
+        // settings file, pack stack, window, or GPU work is allowed on this
+        // launch. Pin the ordering in the real binary source so a later
+        // refactor cannot silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let lines_at = body
+            .find("validate_worldgen_lines")
+            .expect("fn main must call validate_worldgen_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        assert!(
+            validate_pack_at < validate_at,
+            "the validate-pack branch must stay first"
+        );
+        assert!(
+            validate_at < startup_at,
+            "cli.validate_worldgen must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "validate_worldgen_lines must precede startup"
+        );
+        assert!(
+            validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
+            "validate-worldgen must precede the demo-ui branch"
         );
     }
 
