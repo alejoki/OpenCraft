@@ -1,6 +1,6 @@
 # M014 human UAT runbook — creator tuning and live content reload
 
-**Status: NEEDS-HUMAN — no owner verdict recorded.**
+**Status: PASS — owner verdict recorded.**
 **UAT mode: human-experience** — automated PASS may coexist with human-only NEEDS-HUMAN checks.
 
 M014's remaining acceptance surface is human-sensory: whether live tuning feels responsive
@@ -8,7 +8,7 @@ across all five gameplay domains, whether block/mob/built-in item art is actuall
 whether warnings and the F6 overlay are readable, whether the digest notice is clear, and
 whether the restart boundary is understandable. Executable seams and smokes can prove the
 mechanics, but only an operator can record the experience (MEM140/MEM178/MEM294). This file
-is a runbook, not a verdict. S10 records the owner pass; **no agent evidence is promoted to a
+is the runbook and the owner verdict record. S10 records the owner pass; **no agent evidence is promoted to a
 human PASS**.
 
 ## What this runbook covers
@@ -465,23 +465,23 @@ per-item verdicts are filled, the M014 human UAT remains **NEEDS-HUMAN**.
 
 | Field | Value |
 | --- | --- |
-| Date | `<fill>` |
-| Operator | `<fill>` |
-| Build SHA-256 (debug) | `<fill>` |
-| Build SHA-256 (release) | `<fill>` |
-| Display / output / window size | `<fill>` |
-| Item 1 — debug startup and overlay | `<PASS/FAIL>` |
-| Item 2 — five-domain live responsiveness | `<PASS/FAIL>` |
-| Item 3 — invalid-edit warning clarity | `<PASS/FAIL>` |
-| Item 4 — block/mob/built-in item texture visibility | `<PASS/FAIL>` |
-| Item 5 — live texture edit and malformed-PNG rejection | `<PASS/FAIL>` |
-| Item 6 — F6 overlay readability 1280x720 | `<PASS/FAIL>` |
-| Item 7 — F6 overlay readability 1920x1080 | `<PASS/FAIL>` |
-| Item 8 — digest mismatch notice clarity | `<PASS/FAIL>` |
-| Item 9 — restart-required clarity | `<PASS/FAIL>` |
-| Item 10 — same-save recipe restart | `<PASS/FAIL>` |
-| Item 11 — release has no creator tools or test packs | `<PASS/FAIL>` |
-| Verbatim notes / surprises | `<fill>` |
+| Date | `2026-11-06` |
+| Operator | `aleksi` |
+| Build SHA-256 (debug) | `7ab1f9d7d8635325e48c13490e36c7a891ee4748a13035567511711de09a1b4d` |
+| Build SHA-256 (release) | `1cf99d9c4829236f8c86b50d8d1363ef460a46528b60d51062ada64dd8718bc6` |
+| Display / output / window size | `Wayland session; windows at 1280x720 and 1920x1080` |
+| Item 1 — debug startup and overlay | `PASS` |
+| Item 2 — five-domain live responsiveness | `PASS` |
+| Item 3 — invalid-edit warning clarity | `PASS` |
+| Item 4 — block/mob/built-in item texture visibility | `PASS` |
+| Item 5 — live texture edit and malformed-PNG rejection | `PASS` |
+| Item 6 — F6 overlay readability 1280x720 | `PASS` |
+| Item 7 — F6 overlay readability 1920x1080 | `PASS` |
+| Item 8 — digest mismatch notice clarity | `PASS` |
+| Item 9 — restart-required clarity | `PASS` |
+| Item 10 — same-save recipe restart | `PASS` |
+| Item 11 — release has no creator tools or test packs | `PASS` |
+| Verbatim notes / surprises | Overlay felt a bit crammed at first, with little spacing or line change, but it was legible and passed. The first attempt ran from repo defaults, so items 4/5/9/10 were initially untestable; after staging /tmp/m014-uat with the creator-uat pack, all passed. |
 
 ## Out of scope
 
