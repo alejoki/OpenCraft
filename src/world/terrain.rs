@@ -1398,6 +1398,18 @@ fn ruin_covering(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
     None
 }
 
+/// Whether any ruin footprint covers this column.
+///
+/// Public wrapper around the private [`ruin_covering`], added for the village
+/// planner's last-pass fit gate: a village footprint must not overlap a ruin
+/// shell for the same reason a spawn must not (the `surface + 4` wall top). It
+/// is conservative for the same documented reasons as `ruin_covering` — it
+/// cannot see the chunk-only Winter or surface suppressions — and performs no
+/// generation work of its own.
+pub fn ruin_covers(wx: i32, wz: i32, seed: u32) -> bool {
+    ruin_covering(wx, wz, seed).is_some()
+}
+
 /// Wall material for a footprint offset: Brick on the four corner pillars,
 /// Cobblestone on the wall runs between them. Both are already complete,
 /// legal-edit opaque blocks, so ruins add no block ids and no registry rows.

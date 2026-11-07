@@ -631,6 +631,22 @@ impl PrefabCatalog {
     pub fn is_empty(&self) -> bool {
         self.prefabs.is_empty()
     }
+
+    /// Build a catalog directly from parsed prefabs.
+    ///
+    /// Test-only: production content always enters through the sorted,
+    /// fail-soft filesystem walk. This constructor exists so village planner
+    /// tests can exercise synthetic non-square and hand-built geometries
+    /// without writing TOML fixtures. Later prefabs with a duplicate name win,
+    /// mirroring a `BTreeMap` insert.
+    #[cfg(test)]
+    pub(crate) fn from_prefabs(prefabs: Vec<Prefab>) -> Self {
+        let mut catalog = PrefabCatalog::default();
+        for prefab in prefabs {
+            catalog.prefabs.insert(prefab.name.clone(), prefab);
+        }
+        catalog
+    }
 }
 
 /// Run the sorted walk and render the stable `--validate-worldgen` report.
