@@ -99,23 +99,22 @@ fn reference_prefabs_match_the_pinned_geometry_contract() {
         // Header `name` equals the file stem (the file that carries it).
         assert_eq!(prefab.name, reference.name);
         assert!(
-            prefabs_dir.join(format!("{}.toml", reference.name)).is_file(),
+            prefabs_dir
+                .join(format!("{}.toml", reference.name))
+                .is_file(),
             "{} must live in worldgen/prefabs/{}.toml",
             reference.name,
             reference.name
         );
 
         assert_eq!(prefab.size, reference.size, "{} size", reference.name);
-        assert_eq!(
-            prefab.origin, reference.origin,
-            "{} origin",
-            reference.name
-        );
+        assert_eq!(prefab.origin, reference.origin, "{} origin", reference.name);
 
         // Every cell of the grid is present (air included), only built-ins are
         // used, and the prefab explicitly carries at least one air cell.
-        let expected_blocks =
-            (reference.size[0] as usize) * (reference.size[1] as usize) * (reference.size[2] as usize);
+        let expected_blocks = (reference.size[0] as usize)
+            * (reference.size[1] as usize)
+            * (reference.size[2] as usize);
         assert_eq!(
             prefab.blocks.len(),
             expected_blocks,
@@ -132,7 +131,10 @@ fn reference_prefabs_match_the_pinned_geometry_contract() {
             );
         }
         assert!(
-            prefab.blocks.iter().any(|block| block.block == BlockId::Air),
+            prefab
+                .blocks
+                .iter()
+                .any(|block| block.block == BlockId::Air),
             "{} must contain at least one air block",
             reference.name
         );
@@ -158,7 +160,7 @@ fn every_socket_is_in_bounds_unique_and_attached_to_air() {
 
         for socket in &prefab.sockets {
             let mut grid = [0u32; 3];
-            for axis in 0..3 {
+            for (axis, slot) in grid.iter_mut().enumerate() {
                 let cell = i64::from(prefab.origin[axis]) + i64::from(socket.position[axis]);
                 assert!(
                     (0..i64::from(reference.size[axis])).contains(&cell),
@@ -166,7 +168,7 @@ fn every_socket_is_in_bounds_unique_and_attached_to_air() {
                     reference.name,
                     socket.position
                 );
-                grid[axis] = cell as u32;
+                *slot = cell as u32;
             }
             assert!(
                 seen.insert(grid),
