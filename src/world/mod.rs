@@ -15,6 +15,7 @@ pub mod mob_ai;
 pub mod mob_audio;
 pub mod mob_loot;
 pub mod persistence;
+pub mod prefab;
 pub mod season;
 pub mod session;
 pub mod spawning;
