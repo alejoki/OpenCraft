@@ -294,6 +294,18 @@ pub struct CliConfig {
     /// with `--`, so `--validate-worldgen --save x` keeps the default
     /// [`crate::world::prefab::WORLDGEN_DIR`] root and still parses `--save`.
     pub validate_worldgen: Option<PathBuf>,
+    /// Root directory requested by `--demo-capture <dir>` (M015/S05-T05).
+    /// A release-facing launch switch: `main` consumes it before settings,
+    /// packs, save, window and GPU startup, so the demo never opens a window,
+    /// GPU, audio engine, event loop or save. It builds an isolated in-memory
+    /// world, drives the real [`crate::ui::capture::PrefabCapture`] state
+    /// machine, and writes exactly one prefab below `<dir>/prefabs/`. Never a
+    /// world intent (it never affects `cli_has_world_intent`) and never
+    /// persisted. The optional value is only consumed when the next token does
+    /// not start with `--`; a following switch (or the end of the arguments)
+    /// stores an empty path so `main` can fail closed with a readable error
+    /// instead of launching the game.
+    pub demo_capture: Option<PathBuf>,
     /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
     /// requested. A bare launch switch: it takes no value, is deliberately NOT
     /// a world intent (so it never affects `cli_has_world_intent`), and is
@@ -347,6 +359,7 @@ impl CliConfig {
         let mut demo_restart = false;
         let mut validate_pack = None;
         let mut validate_worldgen = None;
+        let mut demo_capture = None;
         let mut check_config = false;
         let mut creator_trace = false;
         let mut mode = GameMode::Creative;
@@ -491,6 +504,21 @@ impl CliConfig {
                     };
                     validate_worldgen = Some(root);
                 }
+                "--demo-capture" => {
+                    // Optional-value switch, exactly like `--validate-worldgen`:
+                    // consume the next token only when it is not another
+                    // switch. A missing value (or a following `--save x`)
+                    // stores an empty path so `main` fails closed with
+                    // `error: --demo-capture requires a directory` instead of
+                    // launching the game.
+                    let root = match iter.peek() {
+                        Some(next) if !next.as_ref().starts_with("--") => {
+                            PathBuf::from(iter.next().unwrap().as_ref())
+                        }
+                        _ => PathBuf::new(),
+                    };
+                    demo_capture = Some(root);
+                }
                 "--check-config" => {
                     // Bare switch (no value to consume), mirroring `--new`:
                     // a stray following token stays an independent argument.
@@ -537,6 +565,7 @@ impl CliConfig {
             demo_restart,
             validate_pack,
             validate_worldgen,
+            demo_capture,
             check_config,
             creator_trace,
             mode,
@@ -5995,6 +6024,38 @@ mod tests {
             cli.validate_worldgen,
             Some(std::path::PathBuf::from("worldgen"))
         );
+        assert_eq!(cli.save_path, std::path::PathBuf::from("fixture.mcvx"));
+    }
+
+    #[test]
+    fn test_demo_capture_takes_a_directory() {
+        // Absent keeps the seam off.
+        let off = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(off.demo_capture, None);
+
+        // The value is the demo root; nothing else is consumed.
+        let cli = CliConfig::parse_args(["--demo-capture", "out/demo"]);
+        assert_eq!(cli.demo_capture, Some(std::path::PathBuf::from("out/demo")));
+        assert_eq!(cli.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+        assert_eq!(cli.seed_override, None);
+        assert!(!cli.force_new_world);
+    }
+
+    #[test]
+    fn test_demo_capture_missing_value_fails_closed() {
+        // A bare switch at the end of the arguments stores an empty path so
+        // `main` can print `error: --demo-capture requires a directory` and
+        // exit 2 instead of launching the game.
+        let bare = CliConfig::parse_args(["--demo-capture"]);
+        assert_eq!(bare.demo_capture, Some(std::path::PathBuf::new()));
+    }
+
+    #[test]
+    fn test_demo_capture_does_not_consume_a_following_switch() {
+        // The `peek` guard is load-bearing: `--demo-capture --save x` must
+        // keep an empty demo path and still parse the save switch.
+        let cli = CliConfig::parse_args(["--demo-capture", "--save", "fixture.mcvx"]);
+        assert_eq!(cli.demo_capture, Some(std::path::PathBuf::new()));
         assert_eq!(cli.save_path, std::path::PathBuf::from("fixture.mcvx"));
     }
 

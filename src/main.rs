@@ -15284,6 +15284,17 @@ fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
 /// function of the checked-in `worldgen/` tree plus this seed.
 const VILLAGE_DEMO_SEED: u32 = 424_242;
 
+/// Seed pinned for the `--demo-capture` digest.
+///
+/// A plain constant (never a clock or `random_seed`). The demo builds its own
+/// uniform-air chunk and writes a fixed house into it, so the seed only pins
+/// the manager identity and never contributes terrain.
+const CAPTURE_DEMO_SEED: u32 = 4;
+
+/// The fixed inclusive world corners of the `--demo-capture` house.
+const CAPTURE_DEMO_MIN: IVec3 = IVec3::new(0, 40, 0);
+const CAPTURE_DEMO_MAX: IVec3 = IVec3::new(4, 43, 4);
+
 /// Seed pinned for the `--demo-village` **session** leg.
 ///
 /// Seed 14 is the pinned production seed whose village cell `(-1, 0)` lies
@@ -15898,6 +15909,159 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
     }
 }
 
+/// Build the deterministic `--demo-capture` digest.
+///
+/// This is the headless capture -> validate leg: it builds an isolated
+/// in-memory world (no save, settings, pack, window, GPU or audio), writes a
+/// fixed 5x4x5 house into one uniform-air chunk, drives the real
+/// [`PrefabCapture`] corner -> corner -> naming flow, and calls the production
+/// [`capture_to_file`] seam. It then re-parses the written file and runs the
+/// real [`opencraft::world::prefab::validate_worldgen_lines`] report over the
+/// demo root, so the digest proves the same bytes a player would write.
+///
+/// The only write is `<root>/prefabs/<name>.toml`; the caller owns the root and
+/// nothing is written anywhere else. The caller exits non-zero when a leg
+/// fails, so a broken capture or validator cannot pass silently.
+fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // A single uniform-air chunk covers the whole fixed house footprint
+    // (x 0..=4, y 40..=43, z 0..=4 all live in chunk (0, 1, 0)).
+    let mut world =
+        WorldManager::with_seed_and_edits(4, CAPTURE_DEMO_SEED, ChunkEditMap::default());
+    world.insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+
+    // Fixed house: oak-plank floor and roof, cobblestone perimeter walls, one
+    // loot chest and one immature wheat crop in the interior. Every other
+    // interior cell stays air, so the prefab round-trips every grid cell.
+    for x in CAPTURE_DEMO_MIN.x..=CAPTURE_DEMO_MAX.x {
+        for z in CAPTURE_DEMO_MIN.z..=CAPTURE_DEMO_MAX.z {
+            world.set_block_immediate(x, CAPTURE_DEMO_MIN.y, z, BlockId::OakPlanks);
+            world.set_block_immediate(x, CAPTURE_DEMO_MAX.y, z, BlockId::OakPlanks);
+            for y in (CAPTURE_DEMO_MIN.y + 1)..CAPTURE_DEMO_MAX.y {
+                let perimeter = x == CAPTURE_DEMO_MIN.x
+                    || x == CAPTURE_DEMO_MAX.x
+                    || z == CAPTURE_DEMO_MIN.z
+                    || z == CAPTURE_DEMO_MAX.z;
+                let block = if perimeter {
+                    BlockId::Cobblestone
+                } else {
+                    BlockId::Air
+                };
+                world.set_block_immediate(x, y, z, block);
+            }
+        }
+    }
+    world.set_block_immediate(1, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::LootChest);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::WheatStage1);
+
+    // Drive the real state machine: corner A, corner B, then the name prompt.
+    let mut capture = PrefabCapture::new();
+    let first = capture.press_corner(CAPTURE_DEMO_MIN);
+    let ready = capture.press_corner(CAPTURE_DEMO_MAX);
+    let region = match ready {
+        CornerOutcome::Ready(region) => region,
+        _ => {
+            lines.push(format!(
+                "capture_demo: leg=region error=corner sequence (first={first:?})"
+            ));
+            lines.push("capture_demo: ok=false failed=region".to_string());
+            return (lines, false);
+        }
+    };
+    let size = [
+        (region.max.x - region.min.x + 1) as u32,
+        (region.max.y - region.min.y + 1) as u32,
+        (region.max.z - region.min.z + 1) as u32,
+    ];
+    lines.push(format!(
+        "capture_demo: leg=region min={},{},{} max={},{},{} size={}x{}x{} cells={}",
+        region.min.x,
+        region.min.y,
+        region.min.z,
+        region.max.x,
+        region.max.y,
+        region.max.z,
+        size[0],
+        size[1],
+        size[2],
+        size[0] as usize * size[1] as usize * size[2] as usize,
+    ));
+
+    if !capture.begin_naming(Some(root)) {
+        lines.push("capture_demo: leg=write error=begin_naming rejected the region".to_string());
+        lines.push("capture_demo: ok=false failed=write".to_string());
+        return (lines, false);
+    }
+    let name = capture.naming_value().to_owned();
+
+    let (path, prefab) = match capture_to_file(root, &name, &world, region.min, region.max) {
+        Ok(written) => written,
+        Err(error) => {
+            lines.push(format!("capture_demo: leg=write error={error}"));
+            lines.push("capture_demo: ok=false failed=write".to_string());
+            return (lines, false);
+        }
+    };
+
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let bytes = std::fs::read(&path).map(|bytes| bytes.len()).unwrap_or(0);
+    lines.push(format!(
+        "capture_demo: leg=write name={name} path={relative} bytes={bytes}"
+    ));
+
+    // Re-parse the bytes that actually reached disk and compare them with the
+    // in-memory value the capture returned.
+    let roundtrip_identical = match std::fs::read_to_string(&path) {
+        Ok(text) => match opencraft::world::prefab::parse_prefab(&text) {
+            Ok(reparsed) => reparsed == prefab,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    lines.push(format!(
+        "capture_demo: leg=roundtrip identical={roundtrip_identical}"
+    ));
+    if !roundtrip_identical {
+        failed.get_or_insert("roundtrip");
+    }
+
+    // Run the real `--validate-worldgen` report over the demo root. Counting
+    // the accepted/error lines keeps the digest independent of the summary
+    // wording while still proving exactly one clean prefab.
+    let (validate_lines, validate_ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+    let prefabs = validate_lines
+        .iter()
+        .filter(|line| line.starts_with("ok: prefab "))
+        .count();
+    let errors = validate_lines
+        .iter()
+        .filter(|line| line.starts_with("error: "))
+        .count();
+    lines.push(format!(
+        "capture_demo: leg=validate ok={validate_ok} prefabs={prefabs} errors={errors}"
+    ));
+    if !validate_ok || prefabs != 1 || errors != 0 {
+        failed.get_or_insert("validate");
+    }
+
+    match failed {
+        Some(leg) => {
+            lines.push(format!("capture_demo: ok=false failed={leg}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("capture_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
 /// Resolve the palette's granted identity by stable name: blocks first, then
 /// generic items, then pack tools.
 fn palette_demo_item_id(registry: &ContentRegistry, name: &str) -> Option<ItemId> {
@@ -16474,6 +16638,35 @@ fn main() {
     // `--creator-trace` it is deliberately not release-gated.
     if let Some(root) = cli.validate_worldgen.as_deref() {
         let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-capture <dir>` is the headless capture -> validate leg: it builds
+    // an isolated in-memory world, writes one fixed house through the real
+    // `PrefabCapture` and `capture_to_file` seams, re-parses the bytes and runs
+    // the real `validate_worldgen_lines` report. It runs after worldgen
+    // validation and before every other demo/startup branch, so it never opens
+    // a window, GPU, audio engine, event loop, settings file, pack stack or
+    // save. The only write is `<dir>/prefabs/<name>.toml`; an empty path (a
+    // bare `--demo-capture` or a following switch) fails closed with exit 2.
+    if let Some(root) = cli.demo_capture.as_deref() {
+        if root.as_os_str().is_empty() {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: --demo-capture requires a directory");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        let (lines, ok) = capture_demo_lines(root);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -17607,6 +17800,109 @@ mod tests {
                 "village_demo: ok=true".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn main_demo_capture_short_circuit_precedes_world_startup() {
+        // The capture -> validate leg must run after worldgen validation and
+        // before the village digest and any startup content/session: no
+        // window, GPU, audio engine, event loop, settings file, pack stack or
+        // save is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_capture_at = body
+            .find("cli.demo_capture")
+            .expect("fn main must branch on cli.demo_capture");
+        let demo_village_at = body
+            .find("cli.demo_village")
+            .expect("fn main must branch on cli.demo_village");
+        let digest_at = body
+            .find("capture_demo_lines(")
+            .expect("fn main must call capture_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_at < demo_capture_at,
+            "the capture demo must follow the worldgen validation branch"
+        );
+        assert!(
+            demo_capture_at < demo_village_at,
+            "the capture demo must precede the village digest"
+        );
+        assert!(
+            demo_capture_at < startup_at,
+            "cli.demo_capture must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "capture_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn capture_demo_pins_the_fixed_house_line_set() {
+        // Measured from a real `--demo-capture <fresh-dir>` run. Never derive
+        // these strings from the code under test: the region, byte count and
+        // round-trip/validate booleans below are pinned independently.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("demo");
+        std::fs::create_dir_all(&root).expect("create demo root");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(ok, "the capture demo must pass: {lines:?}");
+        assert_eq!(
+            lines,
+            vec![
+                "capture_demo: leg=region min=0,40,0 max=4,43,4 size=5x4x5 cells=100".to_string(),
+                "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=368"
+                    .to_string(),
+                "capture_demo: leg=roundtrip identical=true".to_string(),
+                "capture_demo: leg=validate ok=true prefabs=1 errors=0".to_string(),
+                "capture_demo: ok=true".to_string(),
+            ]
+        );
+        let written = root.join("prefabs/capture.toml");
+        assert!(written.is_file(), "exactly one prefab file is written");
+        assert_eq!(
+            std::fs::read(&written).expect("read prefab").len(),
+            368,
+            "the pinned byte count must match the written file"
+        );
+    }
+
+    #[test]
+    fn capture_demo_reports_a_write_failure_without_writing() {
+        // A root that is a regular file cannot host `prefabs/`: the demo must
+        // post one readable reason and exit false, leaving the file untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"keep me").expect("write regular file");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(!ok);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error="))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one readable error: {lines:?}");
+        assert!(
+            errors[0].contains("not a directory"),
+            "the reason must name the filesystem failure: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("capture_demo: ok=false failed=write")
+        );
+        assert_eq!(std::fs::read(&root).expect("read file"), b"keep me");
     }
 
     #[test]
