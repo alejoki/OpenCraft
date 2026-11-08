@@ -838,9 +838,10 @@ impl std::error::Error for PersistenceError {}
 /// Rejects every block id the v1-v7 wire format cannot represent.
 ///
 /// Each block byte on disk is a `u8` and the decoder accepts only the frozen
-/// built-in ids `0..=22`, so a [`BlockId::Modded`] id would silently truncate
-/// into a different built-in id. This scan runs before the first output byte
-/// so such a save is rejected with an empty buffer instead.
+/// built-in ids `0..=23` (raw ids below [`BUILTIN_BLOCK_COUNT`]), so a
+/// [`BlockId::Modded`] id would silently truncate into a different built-in
+/// id. This scan runs before the first output byte so such a save is rejected
+/// with an empty buffer instead.
 #[cfg(test)]
 fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> {
     fn check_block(block: BlockId) -> Result<(), PersistenceError> {
@@ -909,7 +910,7 @@ fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> 
 #[cfg(test)]
 fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), PersistenceError> {
     // The v1-v7 wire vocabulary is built-in only (a block id is one `u8` and
-    // the decoder accepts 0..=22). Reject every unrepresentable block before
+    // the decoder accepts 0..=23). Reject every unrepresentable block before
     // writing a single byte so a modded id can never be truncated into a
     // different built-in id on disk, and a rejected save leaves `out`
     // untouched (atomic-rejection contract).
@@ -1935,10 +1936,14 @@ fn decode_legacy(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
             if block.is_liquid() {
                 return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
-            // Ids 16..=22 are v6 wire identities. A pre-v6 payload that
+            // Ids 16..=22 are v6 wire identities: a pre-v6 payload that
             // claims one is corrupt (or forged), so fail closed instead of
-            // inventing a block under a version that never could have
-            // written it. Water keeps its own unconditional rejection above.
+            // inventing a block under a version that never could have written
+            // it. Id 23 (SocketMarker) is a current built-in that this legacy
+            // u8 funnel decodes; no legitimate pre-M015 file can contain it,
+            // so it is accepted rather than version-gated (D244: no save
+            // version bump). Water keeps its own unconditional rejection
+            // above.
             if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
                 return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
@@ -3072,14 +3077,17 @@ mod tests {
     }
 
     #[test]
-    fn test_save_roundtrips_every_known_block_id_through_22() {
-        // v6 accepts every decodable id except water (worldgen-only, refused
-        // by the writer). Pin the full append-only span 0..=22 so a future
-        // palette addition cannot silently shift an existing id.
+    fn test_save_roundtrips_every_known_builtin_block_id() {
+        // v8+ names every referenced block through the save-local content
+        // table, so the full append-only built-in span must round-trip by
+        // name. Water is worldgen-only and refused by the writer. Expressed
+        // relative to BUILTIN_BLOCK_COUNT so the guard follows the palette
+        // instead of a stray literal: a future addition cannot silently shift
+        // an existing id.
         let mut chunk = rustc_hash::FxHashMap::default();
         let mut expected = Vec::new();
-        for raw in 0u8..=22 {
-            let block = BlockId::from_u8(raw).expect("id 0..=22 decodes");
+        for raw in 0u8..BUILTIN_BLOCK_COUNT as u8 {
+            let block = BlockId::from_u8(raw).expect("every built-in raw id decodes");
             if block == BlockId::Water {
                 continue;
             }
@@ -3087,15 +3095,26 @@ mod tests {
             chunk.insert(index, block);
             expected.push((index, block));
         }
-        assert_eq!(chunk.len(), 22, "ids 0..=22 minus water");
+        assert_eq!(
+            chunk.len(),
+            usize::from(BUILTIN_BLOCK_COUNT) - 1,
+            "every built-in raw id minus water"
+        );
+        assert_eq!(SAVE_VERSION, 9, "socket_marker ships inside v9");
 
         let mut edits = ChunkEditMap::default();
         edits.insert(ChunkPos::new(0, 0, 0), chunk);
         let mut data = sample_data(sample_player());
         data.chunk_edits = edits;
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v6 palette must save");
-        let loaded = load_world_from_bytes(&bytes).expect("v6 palette must load");
+        save_world_to_bytes(&mut bytes, &data).expect("built-in palette must save");
+        assert!(
+            bytes
+                .windows(b"socket_marker".len())
+                .any(|window| window == b"socket_marker"),
+            "the content table must name socket_marker"
+        );
+        let loaded = load_world_from_bytes(&bytes).expect("built-in palette must load");
         let loaded_chunk = loaded
             .chunk_edits
             .get(&ChunkPos::new(0, 0, 0))
@@ -3109,6 +3128,33 @@ mod tests {
                 block.to_raw() as u8
             );
         }
+        let marker_index = linear_index(BlockId::SocketMarker.to_raw() as usize, 1, 1) as u16;
+        assert_eq!(loaded_chunk[&marker_index], BlockId::SocketMarker);
+    }
+
+    #[test]
+    fn socket_marker_edit_round_trips_through_the_legacy_u8_funnel() {
+        // Id 23 is a current built-in, so the frozen v1-v7 u8 decoder accepts
+        // it: no legitimate pre-M015 file wrote that byte, and D244 keeps
+        // SAVE_VERSION at 9 rather than version-gating the new id. This pins
+        // the accepted legacy semantics executably instead of leaving them
+        // implicit in the guard comment.
+        let mut chunk = rustc_hash::FxHashMap::default();
+        let index = linear_index(0, 0, 0) as u16;
+        chunk.insert(index, BlockId::SocketMarker);
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(0, 0, 0), chunk);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = edits;
+
+        let bytes = legacy_world_bytes(&data, 7);
+        let loaded =
+            load_world_from_bytes(&bytes).expect("legacy funnel must decode socket_marker");
+        let loaded_chunk = loaded
+            .chunk_edits
+            .get(&ChunkPos::new(0, 0, 0))
+            .expect("edited chunk must round-trip");
+        assert_eq!(loaded_chunk[&index], BlockId::SocketMarker);
     }
 
     #[test]
