@@ -10266,6 +10266,38 @@ impl GameApp {
         }
     }
 
+    /// One `P` press of the prefab authoring flow (M015/S05).
+    ///
+    /// Creative selects the targeted block as corner A; the second press
+    /// completes the region and opens the bounded name prompt. Survival and a
+    /// ray miss are silent.
+    ///
+    /// Opening the prompt clears every live gameplay hold. The naming gate
+    /// only consumes *future* presses and releases, so a direction flag or
+    /// mouse button held at the instant the prompt opens would keep the player
+    /// moving, mining, eating, or drawing behind it — and its release would be
+    /// swallowed by the gate, leaving the hold stuck past Enter/Escape too.
+    /// The set below is the one every panel boundary clears (`PanelHolds`);
+    /// melee stays untouched by design, matching `reset_panel_holds` (a swing
+    /// cooldown is a timer, not a hold).
+    fn press_capture_corner(&mut self) {
+        let Some(corner) = try_capture_corner(&self.session) else {
+            return;
+        };
+        if let CornerOutcome::Ready(_) = self.capture.press_corner(corner) {
+            if self.capture.begin_naming(self.worldgen_root.as_deref()) {
+                // A stale transient notice must not accompany the fresh
+                // prompt; only a failed save adds one.
+                self.game_message = None;
+                self.input.reset();
+                self.left_mouse_held = false;
+                self.right_mouse_held = false;
+                reset_panel_holds(&mut self.mining, &mut self.eating, &mut self.bow);
+                self.inventory_drag = None;
+            }
+        }
+    }
+
     /// Enter the persisted menu background as the active edit session.
     ///
     /// The previous session is suspended, not discarded, and restored on a
@@ -11460,15 +11492,7 @@ impl ApplicationHandler for GameApp {
                         // press completes the region and opens the name
                         // prompt. Survival and a ray miss are silent.
                         KeyCode::KeyP if pressed && !event.repeat => {
-                            if let Some(corner) = try_capture_corner(&self.session) {
-                                if let CornerOutcome::Ready(_) = self.capture.press_corner(corner) {
-                                    if self.capture.begin_naming(self.worldgen_root.as_deref()) {
-                                        // A stale transient notice must not accompany
-                                        // the fresh prompt; only a failed save adds one.
-                                        self.game_message = None;
-                                    }
-                                }
-                            }
+                            self.press_capture_corner();
                         }
                         // Escape while a capture selection exists cancels the
                         // capture and writes nothing; it must not also pause.
@@ -25818,6 +25842,138 @@ stack = 64
         assert!(
             keyp < pause && escape_capture < pause,
             "KeyP and the capture Escape must precede the global Pause arm"
+        );
+    }
+
+    /// S05-T08: opening the name prompt clears every hold the player carried
+    /// into it. The naming gate only consumes *future* events, so a direction
+    /// flag or mouse button that stays live would keep moving/mining/eating
+    /// behind the prompt, and its release would be swallowed past it.
+    #[test]
+    fn capture_prompt_open_clears_every_live_gameplay_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+        app.session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut app.session);
+
+        // A live hold state the player can carry into the prompt: movement,
+        // both mouse buttons, a partial mine/meal/draw and an armed drag.
+        app.input.forward = true;
+        app.input.sprint = true;
+        app.left_mouse_held = true;
+        app.right_mouse_held = true;
+        app.mining.tick(
+            0.5,
+            MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None),
+        );
+        app.eating.tick(
+            0.5,
+            Some(EatingTarget::new(0, apple_item(1), 10).expect("apple target")),
+        );
+        app.bow.tick(
+            0.5,
+            Some(BowTarget::new(0, bow_item()).expect("bow target")),
+        );
+        app.inventory_drag = Some(InventoryTarget::Slot(0));
+        assert!(app.mining.progress().is_some());
+        assert!(app.eating.progress().is_some());
+        assert!(app.bow.progress().is_some());
+
+        // The real KeyP path: two raycast presses on the stone block below the
+        // camera. The first selects corner A, the second opens the prompt.
+        app.press_capture_corner();
+        assert!(!app.capture.is_naming(), "one corner leaves gameplay alone");
+        app.press_capture_corner();
+
+        assert!(
+            app.capture.is_naming(),
+            "the second corner opens the prompt"
+        );
+        assert!(
+            !app.input.is_moving(),
+            "no direction flag may survive the prompt"
+        );
+        assert!(!app.left_mouse_held, "the left button hold is cleared");
+        assert!(!app.right_mouse_held, "the right button hold is cleared");
+        assert_eq!(app.mining.progress(), None, "partial mining is cleared");
+        assert_eq!(app.eating.progress(), None, "a partial meal is cleared");
+        assert_eq!(app.bow.progress(), None, "a drawing bow is cleared");
+        assert_eq!(app.inventory_drag, None, "an armed drag is cleared");
+    }
+
+    /// S05-T08: the naming gate swallows the release of a direction key held at
+    /// prompt entry, so the flag must already be false when the prompt closes
+    /// via either exit (Cancel or a successful Submit).
+    #[test]
+    fn capture_prompt_leaves_no_stuck_direction_after_a_swallowed_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            75,
+            dir.path().join("capture-stuck.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        aim_placement_camera(&mut app.session);
+
+        app.input.forward = true;
+        app.press_capture_corner();
+        app.press_capture_corner();
+        assert!(app.capture.is_naming());
+
+        // The gate classifies the held key's release as Consumed and never
+        // routes it to `apply_gameplay_key` (the only writer of the flag), so
+        // the flag stays cleared from prompt entry.
+        assert_eq!(
+            app.capture.key_action(KeyCode::KeyW, None),
+            CaptureKey::Consumed
+        );
+        assert!(
+            !app.input.forward,
+            "the swallowed release must not re-arm the hold"
+        );
+        assert_eq!(
+            app.capture.key_action(KeyCode::Escape, None),
+            CaptureKey::Cancel
+        );
+        app.capture.reset();
+        assert!(!app.input.is_moving(), "Cancel leaves no stuck movement");
+
+        // The successful Submit exit is equally clean.
+        app.input.forward = true;
+        app.press_capture_corner();
+        app.press_capture_corner();
+        assert!(app.capture.is_naming());
+        assert!(
+            !app.input.forward,
+            "re-opening the prompt clears the hold again"
+        );
+        assert_eq!(
+            app.capture.key_action(KeyCode::Enter, None),
+            CaptureKey::Submit
+        );
+        app.submit_capture();
+        assert!(
+            !app.capture.is_active(),
+            "a successful save closes the prompt"
+        );
+        assert!(!app.input.is_moving(), "Submit leaves no stuck movement");
+        assert!(
+            root.join("prefabs").join("capture.toml").is_file(),
+            "the submit cycle still writes exactly one prefab"
         );
     }
 
