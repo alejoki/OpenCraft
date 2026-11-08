@@ -40,7 +40,9 @@ use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
-use crate::world::persistence::{ChestMap, ChunkEditMap, LoadedWorld, WorldSaveData};
+use crate::world::persistence::{
+    ChestMap, ChunkEditMap, LoadedWorld, SavedMob, SavedPlayerState, WorldSaveData,
+};
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
@@ -1722,6 +1724,45 @@ impl WorldSession {
     /// The config metadata this session will attach to its next save.
     pub const fn save_config(&self) -> SaveConfigMeta {
         self.save_config
+    }
+
+    /// Build the exact save payload this session writes.
+    ///
+    /// This is the one production projection from live session state to
+    /// [`WorldSaveData`]: `save_current_world` in the binary writes the result
+    /// unchanged, and integration tests exercise the same funnel instead of a
+    /// private re-implementation. Villages are generated content and are never
+    /// persisted — `chunk_edits` is the only world state a save carries — so
+    /// this projection stays independent of whether a catalog is installed and
+    /// cannot grow a prefab field.
+    pub fn to_save_data(&self) -> WorldSaveData {
+        WorldSaveData {
+            seed: self.world.seed(),
+            time_of_day: self.clock.time_of_day,
+            day_index: self.clock.day_index,
+            season_length_days: self.season_length_days,
+            // The stored mode, not the effective one: Edit Background may be
+            // running Creative rules over a Survival world without rewriting it.
+            mode: self.save_mode,
+            player: SavedPlayerState {
+                position: self.player.position.to_array(),
+                yaw: self.player.yaw,
+                pitch: self.player.pitch,
+                fly_mode: self.player.fly_mode,
+                selected_slot: self.player.selected_slot() as u8,
+                render_distance: self.world.render_distance() as u16,
+                inventory: self.player.inventory().clone(),
+                player_grid: self.player.player_grid().clone(),
+                table_grid: self.player.table_grid().clone(),
+                survival: self.player.survival,
+            },
+            chests: self.chests.clone(),
+            // Persist the live mob records here, at the one production save
+            // site. The codec sorts by (kind, position), so the session's list
+            // order never leaks into the file layout.
+            mobs: self.mobs.iter().map(SavedMob::from).collect(),
+            chunk_edits: self.world.chunk_edits().clone(),
+        }
     }
 
     /// The non-blocking note describing how this session's loaded config

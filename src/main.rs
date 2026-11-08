@@ -109,10 +109,12 @@ use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
+#[cfg(test)]
+use opencraft::world::persistence::SavedMob;
 use opencraft::world::persistence::{
     load_world_from_bytes_with, load_world_from_path, load_world_from_path_with,
     save_world_to_path_with, save_world_to_path_with_config, ChunkEditMap, CliConfig,
-    PersistenceError, SavedMob, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
+    PersistenceError, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
     DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
@@ -378,33 +380,9 @@ fn vsync_interval(window: &Window) -> Option<Duration> {
 /// surfaces the error where a message slot exists (no log by convention;
 /// D006/MEM009).
 fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError> {
-    let data = WorldSaveData {
-        seed: session.world.seed(),
-        time_of_day: session.clock.time_of_day,
-        day_index: session.clock.day_index,
-        season_length_days: session.season_length_days,
-        // The stored mode, not the effective one: Edit Background may be
-        // running Creative rules over a Survival world without rewriting it.
-        mode: session.save_mode,
-        player: SavedPlayerState {
-            position: session.player.position.to_array(),
-            yaw: session.player.yaw,
-            pitch: session.player.pitch,
-            fly_mode: session.player.fly_mode,
-            selected_slot: session.player.selected_slot() as u8,
-            render_distance: session.world.render_distance() as u16,
-            inventory: session.player.inventory().clone(),
-            player_grid: session.player.player_grid().clone(),
-            table_grid: session.player.table_grid().clone(),
-            survival: session.player.survival,
-        },
-        chests: session.chests.clone(),
-        // Persist the live mob records here, at the one production save site.
-        // The codec sorts by (kind, position), so the session's list order
-        // never leaks into the file layout.
-        mobs: session.mobs().iter().map(SavedMob::from).collect(),
-        chunk_edits: session.world.chunk_edits().clone(),
-    };
+    // The session owns the projection from live state to the save payload, so
+    // integration tests exercise the exact struct production writes.
+    let data = session.to_save_data();
     // S04: the one production save site writes the session's validated
     // effective config meta (schema + digest), never a re-derived or default
     // one. The meta is captured at every startup/install/apply seam.
