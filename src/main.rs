@@ -52,6 +52,7 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
+use opencraft::ui::capture::{CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
     hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
@@ -95,6 +96,7 @@ use opencraft::ui::{
 use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
+use opencraft::world::capture::capture_to_file;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{
@@ -733,6 +735,25 @@ fn try_place_socket_marker(session: &mut WorldSession) -> Option<Vec<(ChunkPos, 
         return None;
     }
     Some(remeshed)
+}
+
+/// One prefab-capture corner: the targeted block, not the adjacent cell.
+///
+/// Creative-only, exactly like the socket-marker authoring key; Survival and a
+/// ray miss are silent because there is no capture surface to advance. The
+/// returned position is the block the crosshair is on, so a selection cage
+/// encloses the built structure rather than the air in front of it.
+fn try_capture_corner(session: &WorldSession) -> Option<IVec3> {
+    if session.player.mode() != GameMode::Creative {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    Some(hit.block_pos)
 }
 
 /// Outcome of one production right-click world interaction.
@@ -8475,6 +8496,11 @@ struct GameApp {
     /// pure `screen_labels` footer reads the screen's own status slot, so the
     /// render pass syncs this field into it before building labels.
     palette_status: Option<String>,
+    /// Prefab capture authoring state (M015/S05): the pure two-corner region
+    /// selection and bounded name prompt from [`ui::capture`]. Reset by
+    /// `enter_screen` and `on_session_installed` so no selection or prompt
+    /// survives Pause, death, or a session swap.
+    capture: PrefabCapture,
     /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
     /// under the player is reported here while still Playing. Same tick-counter
     /// pattern as the screen messages, but it renders above the hotbar instead
@@ -8978,6 +9004,7 @@ impl GameApp {
             chest_status: None,
             palette: PaletteScreen::new(),
             palette_status: None,
+            capture: PrefabCapture::new(),
             game_message: joined_session_notices(startup_content_notice, startup_config_notice)
                 .map(|text| MenuMessage {
                     text,
@@ -9883,6 +9910,10 @@ impl GameApp {
             self.enter_playing();
             return;
         }
+        // A menu entry retires any prefab capture selection or name prompt
+        // (M015/S05): a selection belongs to the Playing frame that made it,
+        // and a prompt must never survive Pause or death into another screen.
+        self.capture.reset();
         // Leaving the main menu retires its transient message (the
         // S03-T03 Save-and-Quit failure note described the main-menu
         // state the player navigated away from); navigating to any other
@@ -10158,6 +10189,9 @@ impl GameApp {
         self.chest_status = None;
         self.palette.close();
         self.palette_status = None;
+        // A capture selection and its prompt belong to the installed session;
+        // a swap must never leave a cage or typed name pointing at old blocks.
+        self.capture.reset();
         self.game_message = None;
         // The installed session owns the registry every save names content
         // through: a loaded world keeps its placeholder-augmented registry, a
@@ -10187,6 +10221,49 @@ impl GameApp {
         self.survival_demo = None;
         self.content_demo = None;
         self.combat_demo = None;
+    }
+
+    /// Save the prompt's current region as one prefab under `worldgen/`.
+    ///
+    /// The region and name are cloned out of the pure capture state before the
+    /// write, so a rejected save keeps the selection on screen and the typed
+    /// text in the prompt for a retry. A session without a worldgen root can
+    /// never guess a repository path: it posts the one readable unavailable
+    /// message and leaves the prompt active without touching the filesystem.
+    /// Only a successful write resets the capture state and posts the saved
+    /// path; nothing here saves the world, settings, background or config.
+    fn submit_capture(&mut self) {
+        if !self.capture.is_naming() {
+            return;
+        }
+        let Some((min, max)) = self.capture.selection_box() else {
+            return;
+        };
+        let name = self.capture.naming_value().to_owned();
+        let Some(root) = self.worldgen_root.clone() else {
+            self.game_message = Some(MenuMessage {
+                text: "capture unavailable: no worldgen directory configured".to_string(),
+                ticks_left: menu::MESSAGE_TICKS,
+            });
+            return;
+        };
+        match capture_to_file(&root, &name, &self.session.world, min, max) {
+            Ok((_path, _prefab)) => {
+                self.capture.reset();
+                self.game_message = Some(MenuMessage {
+                    text: format!("saved prefab '{name}' to worldgen/prefabs/{name}.toml"),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+            Err(error) => {
+                // Keep the prompt intact: the player can fix an oversize
+                // selection, a bad name, or a collision and press Enter again.
+                self.game_message = Some(MenuMessage {
+                    text: error.to_string(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+        }
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -11168,6 +11245,22 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Prefab capture prompt owns the keyboard while naming
+                    // (M015/S05): every press and release is consumed so no
+                    // inventory, chest, palette, digit, movement, or Escape
+                    // binding can fire through the typed name. This gate sits
+                    // before the panel gates so a panel can never swallow it.
+                    if self.capture.is_naming() {
+                        if pressed {
+                            match self.capture.key_action(code, event.text.as_deref()) {
+                                CaptureKey::Submit => self.submit_capture(),
+                                CaptureKey::Cancel => self.capture.reset(),
+                                CaptureKey::Consumed | CaptureKey::PassThrough => {}
+                            }
+                        }
+                        return;
+                    }
+
                     // Inventory panel owns the keyboard while open (S03-T03):
                     // every key and release is consumed, so no digit, movement,
                     // fly, save, or Escape-to-pause binding can fire through
@@ -11360,6 +11453,25 @@ impl ApplicationHandler for GameApp {
                                 self.creator.toggle_overlay();
                                 self.creator_overlay_dirty = true;
                             }
+                        }
+                        // Prefab capture authoring (M015/S05): a documented,
+                        // non-rebindable utility key like C/M/F5/F6. Creative
+                        // selects the targeted block as corner A; the second
+                        // press completes the region and opens the name
+                        // prompt. Survival and a ray miss are silent.
+                        KeyCode::KeyP if pressed && !event.repeat => {
+                            if let Some(corner) = try_capture_corner(&self.session) {
+                                if let CornerOutcome::Ready(_) = self.capture.press_corner(corner) {
+                                    self.capture.begin_naming(self.worldgen_root.as_deref());
+                                }
+                            }
+                        }
+                        // Escape while a capture selection exists cancels the
+                        // capture and writes nothing; it must not also pause.
+                        KeyCode::Escape
+                            if pressed && !event.repeat && self.capture.has_corners() =>
+                        {
+                            self.capture.reset();
                         }
                         KeyCode::Escape if pressed && !event.repeat => {
                             // Escape in-game opens the Pause screen (S02-T02:
@@ -12855,13 +12967,22 @@ impl ApplicationHandler for GameApp {
                 // through the existing menu text buffer and the same UI pass —
                 // no new pipeline and no logging (D006/MEM009).
                 if active_screen == LifecycleScreen::Playing {
-                    if let Some(message) = self.game_message.as_ref() {
+                    // Prefab capture prompt (M015/S05) takes precedence over
+                    // the transient notice: the editable name line must never
+                    // be hidden by an unrelated message while the prompt owns
+                    // the keyboard. Both share the one measured line.
+                    let notice_text = self.capture.prompt_line().or_else(|| {
+                        self.game_message
+                            .as_ref()
+                            .map(|message| message.text.clone())
+                    });
+                    if let Some(text) = notice_text {
                         let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                         gpu.menu_text.update(
                             &mut gpu.ui.font_system,
                             surface_w as f32,
                             surface_h as f32,
-                            &message.text,
+                            &text,
                         );
                         let measured = gpu.menu_text.measured_width();
                         // When the selected-name strip is on screen, sit the
@@ -13454,7 +13575,7 @@ impl ApplicationHandler for GameApp {
                             camera: &self.session.camera,
                             render_distance: self.session.world.render_distance(),
                             target_block,
-                            selection_box: None,
+                            selection_box: self.capture.selection_box(),
                             selected_slot: self.session.player.selected_slot(),
                         },
                         FramePresentation {
@@ -25168,6 +25289,171 @@ stack = 64
         assert!(
             keym + call < rebindable,
             "KeyM must sit before the rebindable fall-through as a fixed utility key"
+        );
+    }
+
+    #[test]
+    fn capture_corner_is_creative_only_and_returns_the_targeted_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut creative = WorldSession::new_session(
+            71,
+            dir.path().join("capture-corner.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut creative, BlockId::Air);
+        creative.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut creative);
+
+        assert_eq!(
+            try_capture_corner(&creative),
+            Some(IVec3::new(0, 5, 0)),
+            "the corner is the targeted block, not the adjacent placement cell"
+        );
+
+        // A ray that hits nothing has no corner to record.
+        creative.camera.pitch = std::f32::consts::FRAC_PI_2;
+        assert_eq!(try_capture_corner(&creative), None);
+
+        let mut survival = WorldSession::new_session_with_mode(
+            72,
+            dir.path().join("capture-corner-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_test_chunk_with_face_neighbors(&mut survival, BlockId::Air);
+        survival.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut survival);
+        assert_eq!(
+            try_capture_corner(&survival),
+            None,
+            "Survival capture is silent"
+        );
+    }
+
+    #[test]
+    fn capture_reset_follows_screen_and_session_boundaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+
+        assert_eq!(
+            app.capture.press_corner(IVec3::new(0, 40, 0)),
+            CornerOutcome::First
+        );
+        app.enter_screen(LifecycleScreen::Pause);
+        assert!(
+            !app.capture.is_active(),
+            "Pause retires the two-corner selection"
+        );
+
+        assert_eq!(
+            app.capture.press_corner(IVec3::new(0, 40, 0)),
+            CornerOutcome::First
+        );
+        let _ = app.capture.press_corner(IVec3::new(1, 41, 1));
+        assert!(app.capture.begin_naming(None));
+        app.on_session_installed();
+        assert!(
+            !app.capture.is_active(),
+            "a session install retires the prompt and its stale region"
+        );
+    }
+
+    #[test]
+    fn capture_without_worldgen_root_posts_unavailable_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        assert!(app.worldgen_root.is_none());
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(None));
+        let name_before = app.capture.naming_value().to_owned();
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), name_before);
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("capture unavailable: no worldgen directory configured")
+        );
+        assert!(
+            !dir.path().join("worldgen").exists(),
+            "no root must never create a worldgen tree"
+        );
+    }
+
+    #[test]
+    fn capture_writes_one_prefab_and_posts_the_saved_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            73,
+            dir.path().join("capture-write.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        app.submit_capture();
+
+        let written = root.join("prefabs").join("capture.toml");
+        assert!(written.is_file(), "exactly one prefab file is written");
+        let text = std::fs::read_to_string(&written).expect("read written prefab");
+        let parsed =
+            opencraft::world::prefab::parse_prefab(&text).expect("the written prefab parses");
+        assert_eq!(parsed.name, "capture");
+        assert_eq!(parsed.size, [2, 2, 2]);
+        assert!(!app.capture.is_active(), "a successful save resets capture");
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("saved prefab 'capture' to worldgen/prefabs/capture.toml")
+        );
+    }
+
+    #[test]
+    fn capture_prompt_gate_and_key_arms_precede_gameplay_routing() {
+        let src = include_str!("main.rs");
+        let prompt_gate = src
+            .find("if self.capture.is_naming()")
+            .expect("the capture prompt gate is present");
+        let inventory_gate = src
+            .find("// Inventory panel owns the keyboard while open (S03-T03)")
+            .expect("the inventory gate is present");
+        assert!(
+            prompt_gate < inventory_gate,
+            "the naming prompt gate must precede every panel and gameplay gate"
+        );
+
+        let keyp = src
+            .find("KeyCode::KeyP if pressed && !event.repeat =>")
+            .expect("the KeyP capture-corner arm is present");
+        let escape_capture = src
+            .find("self.capture.has_corners() =>")
+            .expect("the capture Escape arm is present");
+        let pause = src[keyp..]
+            .find("KeyCode::Escape if pressed && !event.repeat =>")
+            .map(|offset| keyp + offset)
+            .expect("the gameplay Escape arm is present");
+        assert!(
+            keyp < pause && escape_capture < pause,
+            "KeyP and the capture Escape must precede the global Pause arm"
         );
     }
 

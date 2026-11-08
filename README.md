@@ -181,6 +181,7 @@ SMOKE_PROFILE=release bash scripts/creator_smoke.sh
 | **1-9** | Select hotbar slot. |
 | **C** (Creative) | Open the searchable Creative palette. Type to filter by name, id or namespace; click an entry to put a full authored stack in the hotbar. Escape closes. |
 | **M** (Creative) | Place a socket marker on the targeted block face (prefab authoring aid; places no item and drops nothing). |
+| **P** (Creative) | Select a prefab capture corner on the targeted block: the first press marks corner A, the second marks corner B and opens the name prompt. Type a name, **Enter** saves `worldgen/prefabs/<name>.toml`, **Esc** cancels. Fixed, non-rebindable authoring key. |
 | **Escape** | Open the pause menu (settings are available from there). |
 
 ### Survival
