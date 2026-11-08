@@ -1371,6 +1371,13 @@ fn plan_road_cells(
         return None;
     }
     let heights = interpolate_road_heights(start_y, end_y, columns.len());
+    // The road must actually reach the child socket's grade. Interpolation is
+    // clamped to a walkable ±1 step per cell, so a tall start/end delta lands
+    // short of `end_y`; reject the whole connection instead of committing a
+    // floating or buried surface (the caller then tries another shape/prefab).
+    if heights.last().copied()?.abs_diff(end_y) > 1 {
+        return None;
+    }
     let radius_min_x = site.anchor[0] - VILLAGE_MAX_RADIUS;
     let radius_max_x = site.anchor[0] + VILLAGE_MAX_RADIUS;
     let radius_min_z = site.anchor[1] - VILLAGE_MAX_RADIUS;
@@ -1546,7 +1553,15 @@ fn fit_placement<'a>(
     for socket in &prefab.sockets {
         let (dx, dz) = rotation.apply_offset((socket.position[0], socket.position[2]));
         sockets.push(PlacedSocket {
-            position: [origin_x + dx, base_y + socket.position[1], origin_z + dz],
+            // Socket positions are stored origin-relative (`grid - origin`),
+            // exactly like `PrefabSocket::position`. Block emission places grid
+            // row `g` at world `base_y + g`, so the socket must map through the
+            // same origin convention: `base_y + origin[1] + position[1]`.
+            position: [
+                origin_x + dx,
+                base_y + prefab.origin[1] as i32 + socket.position[1],
+                origin_z + dz,
+            ],
             direction: rotation.apply_direction(socket.direction),
             linked: false,
         });
@@ -2553,6 +2568,67 @@ junction = ["test_hub"]
     }
 
     #[test]
+    fn socket_position_uses_the_block_origin_convention() {
+        // A prefab whose origin row is not 0 must still place its authored
+        // grid-y-1 socket at world `base_y + 1`, exactly where emission writes
+        // the grid-y-1 block. `origin[1] + position[1] == 1` holds for both
+        // prefabs below, so the road-alignment invariant keeps them valid.
+        let catalog = reference_catalog();
+        let plan = pinned_plan_fixture(&catalog);
+        let definition = catalog.get("plains").expect("plains definition");
+        let site = FitSite {
+            anchor: plan.anchor,
+            cell_min: [
+                PINNED_DEMO_CELL.x * VILLAGE_CELL_SIZE,
+                PINNED_DEMO_CELL.z * VILLAGE_CELL_SIZE,
+            ],
+            seed: PINNED_DEMO_SEED,
+            definition,
+        };
+        let socket_at_origin_row_zero = synthetic_prefab(
+            "origin_row_zero",
+            [1, 3, 1],
+            [0, 0, 0],
+            &[([0, 1, 0], Direction::North)],
+        );
+        let socket_at_origin_row_one = synthetic_prefab(
+            "origin_row_one",
+            [1, 3, 1],
+            [0, 1, 0],
+            &[([0, 0, 0], Direction::North)],
+        );
+        let zero = fit_placement(
+            &socket_at_origin_row_zero,
+            Rotation::None,
+            plan.anchor[0],
+            plan.anchor[1],
+            &site,
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("a one-column prefab must fit the site anchor");
+        let one = fit_placement(
+            &socket_at_origin_row_one,
+            Rotation::None,
+            plan.anchor[0],
+            plan.anchor[1],
+            &site,
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("a one-column prefab must fit the site anchor");
+        assert_eq!(
+            zero.sockets[0].position[1],
+            zero.base_y + 1,
+            "a grid-y-1 socket sits one block above the placement base"
+        );
+        assert_eq!(
+            one.sockets[0].position[1], zero.sockets[0].position[1],
+            "the origin row must not shift the socket's world height"
+        );
+    }
+
+    #[test]
     fn for_socket_direction_is_a_total_bijection() {
         let directions = [
             Direction::North,
@@ -3477,6 +3553,57 @@ junction = ["test_hub"]
     }
 
     #[test]
+    fn road_path_rejects_a_grade_that_misses_end_y() {
+        let catalog = reference_catalog();
+        let plan = pinned_plan_fixture(&catalog);
+        let definition = catalog.get("plains").expect("plains definition");
+        let site = FitSite {
+            anchor: plan.anchor,
+            cell_min: [
+                PINNED_DEMO_CELL.x * VILLAGE_CELL_SIZE,
+                PINNED_DEMO_CELL.z * VILLAGE_CELL_SIZE,
+            ],
+            seed: PINNED_DEMO_SEED,
+            definition,
+        };
+        let road = plan.road_cells[0];
+        let key = (road.world[0], road.world[2]);
+
+        // One cell cannot climb 10 blocks under the ±1 per-step clamp: the
+        // interpolated surface lands short of `end_y`, so the connection is
+        // rejected instead of committing a floating/buried road.
+        let missed = plan_road_cells(
+            road.world[1],
+            road.world[1] + 10,
+            &[key],
+            &site,
+            &[],
+            None,
+            &BTreeMap::new(),
+        );
+        assert!(
+            missed.is_none(),
+            "a surface missing end_y by >1 must reject"
+        );
+
+        // A landing exactly one block short of `end_y` is a walkable endpoint
+        // and stays accepted (the ±1 step tolerance is intentional).
+        let near = plan_road_cells(
+            road.world[1],
+            road.world[1] + 1,
+            &[key],
+            &site,
+            &[],
+            None,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            near.expect("a ±1 endpoint tolerance must stay accepted")[0].world[1],
+            road.world[1]
+        );
+    }
+
+    #[test]
     fn buried_road_and_out_of_radius_cells_are_rejected() {
         let catalog = reference_catalog();
         let plan = pinned_plan_fixture(&catalog);
@@ -3548,6 +3675,39 @@ junction = ["test_hub"]
             path.is_none(),
             "a path with one bad cell must reject entirely, never truncate"
         );
+    }
+
+    #[test]
+    fn link_endpoints_stay_within_one_vertical_step_of_their_grade() {
+        let catalog = reference_catalog();
+        let plan = pinned_plan_fixture(&catalog);
+        for link in &plan.socket_links {
+            let parent = &plan.placements[link.parent];
+            let child = &plan.placements[link.child];
+            let parent_socket = parent.sockets[link.parent_socket].position;
+            let child_socket = child.sockets[link.child_socket].position;
+            // The socket marks the authored block at grid y 1, while the road
+            // surface is the prefab's grid y 0 foundation layer: the expected
+            // grade is exactly one block below the socket's world Y.
+            assert_eq!(
+                parent_socket[1],
+                parent.base_y + 1,
+                "socket must stay at the grid-y-1 world height"
+            );
+            assert_eq!(child_socket[1], child.base_y + 1);
+            let first = plan.road_cells[*link.road.first().expect("non-empty road")].world;
+            let last = plan.road_cells[*link.road.last().expect("non-empty road")].world;
+            assert!(
+                (first[1] - (parent_socket[1] - 1)).abs() <= 1,
+                "parent road endpoint {:?} does not meet the grade below socket {parent_socket:?}",
+                first
+            );
+            assert!(
+                (last[1] - (child_socket[1] - 1)).abs() <= 1,
+                "child road endpoint {:?} does not meet the grade below socket {child_socket:?}",
+                last
+            );
+        }
     }
 
     #[test]

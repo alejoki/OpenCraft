@@ -16,7 +16,8 @@ use opencraft::world::terrain::{
     find_spawn_column, generate_chunk_seeded_with, generate_chunk_with_context, WorldGenContext,
 };
 use opencraft::world::village::{
-    village_plan, village_plan_with_spawn, VillageBounds, VillageCatalog, VillageCell, VillagePlan,
+    village_cell_at, village_plan, village_plan_with_spawn, VillageBounds, VillageCatalog,
+    VillageCell, VillagePlan,
 };
 
 /// Pinned digest seed shared with `src/main.rs`'s `--demo-village`.
@@ -300,6 +301,17 @@ fn outside_bounds_matches_legacy() {
         if pos.x >= cx_min && pos.x <= cx_max && pos.z >= cz_min && pos.z <= cz_max {
             continue;
         }
+        // An adjacent cell can hold its own legitimate village in the border
+        // chunks. Only compare chunks the chosen plan can never touch: our own
+        // cell (outside the plan's chunk AABB) or chunks the catalog gate
+        // rejects outright.
+        let world_x = pos.x * CHUNK_SIZE as i32;
+        let world_z = pos.z * CHUNK_SIZE as i32;
+        if village_cell_at(world_x, world_z) != plan.cell
+            && catalog.chunk_may_hold_village(pos, PINNED_SEED)
+        {
+            continue;
+        }
         let legacy = generate_chunk_seeded_with(pos, PINNED_SEED, Season::Summer, &[]);
         let with_village = generate(pos, &catalog, spawn);
         assert_eq!(
@@ -310,6 +322,62 @@ fn outside_bounds_matches_legacy() {
         checked += 1;
     }
     assert!(checked > 0, "the window must contain outside-border chunks");
+}
+
+/// A border chunk that belongs to an adjacent cell with its own legitimate
+/// village must be skipped, not compared against legacy terrain.
+///
+/// This pins the S02 closeout defect: at `seed = 18`, plan cell (6, -12), the
+/// one-chunk border chunk (53, 1, -88) belongs to cell (6, -11), whose village
+/// emits blocks there. The unfiltered `outside` leg reported a false failure.
+#[test]
+fn outside_leg_skips_adjacent_cell_border_chunks() {
+    const SEED: u32 = 18;
+    let catalog = load();
+    let spawn = find_spawn_column(SEED);
+    let plan = village_plan_with_spawn(VillageCell { x: 6, z: -12 }, SEED, &catalog, spawn)
+        .expect("the reviewed cell must plan");
+
+    let pos = ChunkPos::new(53, 1, -88);
+    let world_x = pos.x * CHUNK_SIZE as i32;
+    let world_z = pos.z * CHUNK_SIZE as i32;
+    let adjacent = village_cell_at(world_x, world_z);
+    assert_eq!(
+        adjacent,
+        VillageCell { x: 6, z: -11 },
+        "the border chunk must belong to the adjacent cell"
+    );
+    assert_ne!(adjacent, plan.cell);
+    assert!(
+        catalog.chunk_may_hold_village(pos, SEED),
+        "the adjacent cell must have a real village here"
+    );
+
+    // The defect was reachable: this chunk's village output really differs from
+    // legacy terrain, so comparing it would fail a correct generator.
+    let legacy = generate_chunk_seeded_with(pos, SEED, Season::Summer, &[]);
+    let village = generate_chunk_with_context(
+        pos,
+        SEED,
+        Season::Summer,
+        &WorldGenContext {
+            rules: &[],
+            villages: Some(&catalog),
+            spawn_column: Some(spawn),
+        },
+    );
+    assert!(
+        !chunks_equal(&legacy, &village),
+        "the adjacent cell must emit village blocks in this chunk"
+    );
+
+    // The corrected filter excludes it: it is neither in the plan's cell nor
+    // gated out, so the outside leg never compares it.
+    let included = adjacent == plan.cell || !catalog.chunk_may_hold_village(pos, SEED);
+    assert!(
+        !included,
+        "an adjacent-cell border chunk must be excluded from the outside leg"
+    );
 }
 
 /// An absent catalog and an empty catalog must both reproduce

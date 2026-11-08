@@ -128,7 +128,8 @@ use opencraft::world::terrain::{
     Biome, WorldGenContext, DEFAULT_WORLD_SEED, SEA_LEVEL,
 };
 use opencraft::world::village::{
-    village_plan_with_spawn, VillageBounds, VillageCatalog, VillageCell, VillagePlan,
+    village_cell_at, village_plan_with_spawn, VillageBounds, VillageCatalog, VillageCell,
+    VillagePlan,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -15370,6 +15371,16 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         outside_identical = window
             .iter()
             .filter(|pos| pos.x < cx_min || pos.x > cx_max || pos.z < cz_min || pos.z > cz_max)
+            // A border chunk can belong to an adjacent cell that has its own
+            // legitimate village. Only compare chunks the chosen plan could
+            // never touch: our own cell (outside the plan's chunk AABB, so no
+            // cells are emitted) or chunks the catalog gate rejects outright.
+            .filter(|pos| {
+                let world_x = pos.x * CHUNK_SIZE as i32;
+                let world_z = pos.z * CHUNK_SIZE as i32;
+                village_cell_at(world_x, world_z) == plan.cell
+                    || !catalog.chunk_may_hold_village(**pos, VILLAGE_DEMO_SEED)
+            })
             .all(|&pos| {
                 let legacy =
                     generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
@@ -15478,7 +15489,15 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                     + (first[2] - parent_socket.position[2]).abs();
                 let near_child = (last[0] - child_socket.position[0]).abs()
                     + (last[2] - child_socket.position[2]).abs();
-                if near_parent != 1 || near_child != 1 {
+                // The endpoint must be walkably adjacent in 3D, not just in
+                // XZ: a road that drifts vertically away from the socket is a
+                // floating or buried connection even when the columns line up.
+                // A socket marks the authored block at grid y 1; the road
+                // surface is the prefab's grid y 0 foundation layer, one below
+                // the socket's world Y, so that is the grade to meet.
+                let grade_parent = (first[1] - (parent_socket.position[1] - 1)).abs() <= 1;
+                let grade_child = (last[1] - (child_socket.position[1] - 1)).abs() <= 1;
+                if near_parent != 1 || near_child != 1 || !grade_parent || !grade_child {
                     path_ok = false;
                 }
             }
