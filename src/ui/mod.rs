@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod chest;
 pub mod demo;
 pub mod hud;
