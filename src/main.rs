@@ -703,6 +703,38 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
     Some(remeshed)
 }
 
+/// Places one socket marker on the looked-at block face as a Creative-only
+/// authoring action.
+///
+/// The marker is deliberately non-carryable, so this never reads or consumes
+/// the selected stack: it raycasts 8 blocks from the camera, refuses a cell
+/// that overlaps the player AABB, and writes [`BlockId::SocketMarker`] through
+/// `set_block_immediate`. Returns the remeshed chunks for the caller to
+/// upload, or `None` when the mode is not Creative, the ray misses, the cell
+/// overlaps the player, or the edit did not apply (unloaded/out-of-range).
+fn try_place_socket_marker(session: &mut WorldSession) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+    if session.player.mode() != GameMode::Creative {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    let ap = hit.adjacent_pos;
+    if session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
+        return None;
+    }
+    let remeshed = session
+        .world
+        .set_block_immediate(ap.x, ap.y, ap.z, BlockId::SocketMarker);
+    if remeshed.is_empty() {
+        return None;
+    }
+    Some(remeshed)
+}
+
 /// Outcome of one production right-click world interaction.
 ///
 /// The full precedence is chest/table -> held bow -> Survival food -> hoe/seed
@@ -11388,6 +11420,23 @@ impl ApplicationHandler for GameApp {
                                     },
                                     window,
                                 );
+                            }
+                        }
+                        // Socket-marker authoring (S04-T04): a documented,
+                        // non-rebindable utility key like C/F5/F6. Creative
+                        // places one marker on the looked-at face without
+                        // touching the selected stack; Survival stays silent.
+                        KeyCode::KeyM if pressed && !event.repeat => {
+                            if let Some(remeshed) = try_place_socket_marker(&mut self.session) {
+                                self.audio.play(SoundSlot::Place, self.settings.volume);
+                                for (cpos, mesh) in remeshed {
+                                    gpu.render_store.upload_mesh(
+                                        &gpu.ctx.device,
+                                        &gpu.renderer.chunk_bind_group_layout,
+                                        cpos,
+                                        &mesh,
+                                    );
+                                }
                             }
                         }
                         // Rebindable gameplay keys (S04-T03): press sets the
@@ -24919,6 +24968,204 @@ stack = 64
                 count: 2,
             }),
             "rejected placement does not consume"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_is_creative_only_and_consumes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            30,
+            dir.path().join("socket-marker-place.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let remeshed = try_place_socket_marker(&mut session).expect("Creative placement applies");
+
+        assert!(!remeshed.is_empty(), "placement remeshes its chunk");
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::SocketMarker,
+            "the marker lands in the hit cell's adjacent cell"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "socket placement never reads or consumes the selected stack"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_is_inert_in_survival() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            31,
+            dir.path().join("socket-marker-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        assert!(
+            try_place_socket_marker(&mut session).is_none(),
+            "socket placement is a Creative-only action"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "Survival placement edits nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_refuses_the_player_cell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("socket-marker-overlap.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        // The camera stays at y=10 looking down, so the destination is
+        // (0,6,0); placing the player's AABB there must refuse the edit.
+        aim_placement_camera(&mut session);
+        session.player.position = Vec3::new(0.5, 6.0, 0.5);
+
+        assert!(
+            try_place_socket_marker(&mut session).is_none(),
+            "a marker overlapping the player AABB is rejected"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "a refused placement edits nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_breaks_to_air_with_no_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("socket-marker-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 10, 0, BlockId::SocketMarker);
+
+        let def = session
+            .registry
+            .block(BlockId::SocketMarker)
+            .expect("the frozen registry owns the marker definition");
+        assert_eq!(def.hardness, Some(0.3), "the marker breaks in ~0.3 s");
+        assert!(def.drop.is_none(), "the marker is non-carryable");
+
+        let before = inventory_units(&session.player);
+        let (remeshed, _wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            BlockId::SocketMarker,
+        ));
+
+        assert!(!remeshed.is_empty(), "an applied break remeshes");
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        assert_eq!(
+            inventory_units(&session.player),
+            before,
+            "breaking the marker drops nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_meshes_opaque_quads_on_layer_25() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            34,
+            dir.path().join("socket-marker-mesh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 10, 0, BlockId::SocketMarker);
+
+        let padded = session
+            .world
+            .build_padded_chunk(ChunkPos::new(0, 0, 0))
+            .expect("the resident halo meshes");
+        let mesh = opencraft::mesh::greedy::mesh_chunk_with(&padded, session.world.block_faces());
+
+        assert_eq!(mesh.total_quads(), 6, "one floating cube exposes six faces");
+        assert!(
+            mesh.water_quads.is_empty(),
+            "the marker is opaque terrain, never a liquid surface"
+        );
+        for quad in mesh.buckets.iter().flat_map(|bucket| bucket.iter()) {
+            assert_eq!(
+                quad.unpack().6,
+                25,
+                "every marker face samples the built-in layer-25 art"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_marker_never_enters_the_creative_palette() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = WorldSession::new_session(
+            35,
+            dir.path().join("socket-marker-palette.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let entries = palette::entries(&session.registry);
+
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.id == ItemId::Block(BlockId::SocketMarker)),
+            "a non-carryable marker must never appear in the palette"
+        );
+        let builtin_blocks = entries
+            .iter()
+            .filter(|entry| matches!(entry.id, ItemId::Block(block) if block.is_builtin()))
+            .count();
+        assert_eq!(
+            builtin_blocks, 14,
+            "the built-in carryable count is unchanged"
+        );
+    }
+
+    #[test]
+    fn socket_marker_key_m_is_a_non_rebindable_utility_key() {
+        let src = include_str!("main.rs");
+        let keym = src
+            .find("KeyCode::KeyM if pressed && !event.repeat =>")
+            .expect("the KeyM arm is present");
+        let call = src[keym..]
+            .find("try_place_socket_marker(&mut self.session)")
+            .expect("the KeyM arm calls the pure placement helper");
+        let rebindable = src
+            .find("// Rebindable gameplay keys (S04-T03)")
+            .expect("the rebindable gameplay arm is present");
+        assert!(
+            keym + call < rebindable,
+            "KeyM must sit before the rebindable fall-through as a fixed utility key"
         );
     }
 

@@ -180,6 +180,7 @@ SMOKE_PROFILE=release bash scripts/creator_smoke.sh
 | **Mouse Wheel** | Cycle through hotbar slots. |
 | **1-9** | Select hotbar slot. |
 | **C** (Creative) | Open the searchable Creative palette. Type to filter by name, id or namespace; click an entry to put a full authored stack in the hotbar. Escape closes. |
+| **M** (Creative) | Place a socket marker on the targeted block face (prefab authoring aid; places no item and drops nothing). |
 | **Escape** | Open the pause menu (settings are available from there). |
 
 ### Survival
