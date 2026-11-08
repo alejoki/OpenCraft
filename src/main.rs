@@ -17710,19 +17710,19 @@ stack = 64
 
         // Literals measured from a real run, never derived from the fixture.
         let expected = vec![
-            "presentation_demo: leg=registry blocks=25 items=1 pack_layers=2 pack_icons=1"
+            "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
             "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
                 .to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_ore id=24 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_block id=23 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
             "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64".to_string(),
             "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49".to_string(),
             "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
             "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
-            "presentation_demo: leg=placeholder unresolved=3 face=25 icon=27 break=none mesh=25".to_string(),
+            "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -17741,7 +17741,7 @@ stack = 64
             "the built-in launch is a valid presentation: {lines:#?}"
         );
         let expected = vec![
-            "presentation_demo: leg=registry blocks=23 items=0 pack_layers=0 pack_icons=0"
+            "presentation_demo: leg=registry blocks=24 items=0 pack_layers=0 pack_icons=0"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
@@ -17749,7 +17749,7 @@ stack = 64
                 .to_string(),
             "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
                 .to_string(),
-            "presentation_demo: leg=placeholder unresolved=0 face=25 icon=27 break=none mesh=25"
+            "presentation_demo: leg=placeholder unresolved=0 face=26 icon=27 break=none mesh=26"
                 .to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
@@ -17840,9 +17840,9 @@ stack = 64
         let expected = vec![
             "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
             "worldgen_demo: leg=session rules=2 matches=true".to_string(),
-            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2476 min_y=4 max_y=40 in_band=true"
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
                 .to_string(),
-            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=334 biomes=plains,forest biomes_ok=true"
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
                 .to_string(),
             "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
             "worldgen_demo: leg=empty_rules identical=true".to_string(),

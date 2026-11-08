@@ -121,8 +121,8 @@ fail() {
 EXPECTED_LINES=(
     "worldgen_demo: leg=registry rules=2 ore=1 patch=1"
     "worldgen_demo: leg=session rules=2 matches=true"
-    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2476 min_y=4 max_y=40 in_band=true"
-    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=334 biomes=plains,forest biomes_ok=true"
+    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
+    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
     "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true"
     "worldgen_demo: leg=empty_rules identical=true"
     "worldgen_demo: ok=true"
@@ -256,7 +256,7 @@ if grep -q "panicked" "$LAUNCH_B_OUT" || grep -q "RUST_BACKTRACE" "$LAUNCH_B_OUT
 fi
 cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED_DIR/settings-cleared.toml" || fail "the cleared settings.toml was rewritten during the pack-removed leg"
 
-echo "WORLDGEN SMOKE PASS [profile=$PROFILE]: --demo-worldgen resolved the reference pack's 2 authored rules (1 ore, 1 patch), generated mymod:ruby_ore in 2476 underground cells strictly inside y 4..40, placed 334 patch cells only in plains/forest, kept coal=4248 and iron=3875 identical to an empty-rule regeneration, and reproduced pre-M010 chunks byte-for-byte with no rules; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic), and packs/ plus settings.toml stayed byte-identical while present"
+echo "WORLDGEN SMOKE PASS [profile=$PROFILE]: --demo-worldgen resolved the reference pack's 2 authored rules (1 ore, 1 patch), generated mymod:ruby_ore in 2463 underground cells strictly inside y 4..40, placed 351 patch cells only in plains/forest, kept coal=4248 and iron=3875 identical to an empty-rule regeneration, and reproduced pre-M010 chunks byte-for-byte with no rules; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic), and packs/ plus settings.toml stayed byte-identical while present"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "WORLDGEN SMOKE EVIDENCE: $line"
 done

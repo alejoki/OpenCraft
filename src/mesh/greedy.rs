@@ -812,7 +812,10 @@ mod tests {
         let builtin_mesh = mesh_chunk(&padded);
         assert_eq!(builtin_mesh.total_quads(), 6);
         for bucket in &builtin_mesh.buckets {
-            assert_eq!(bucket[0].unpack().6, 25);
+            assert_eq!(
+                bucket[0].unpack().6,
+                crate::content::PLACEHOLDER_BLOCK_LAYER
+            );
         }
     }
 

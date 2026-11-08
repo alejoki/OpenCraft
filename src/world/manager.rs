@@ -2870,7 +2870,7 @@ mod tests {
     /// built-in placeholder.
     #[test]
     fn test_set_block_immediate_uses_the_installed_face_table() {
-        use crate::content::PACK_LAYER_BASE;
+        use crate::content::{PACK_LAYER_BASE, PLACEHOLDER_BLOCK_LAYER};
         use crate::world::block::BUILTIN_BLOCK_COUNT;
 
         let center = ChunkPos::new(0, 0, 0);
@@ -2892,7 +2892,7 @@ mod tests {
         assert_eq!(
             mgr.block_faces()
                 .layer(BlockId::Modded(BUILTIN_BLOCK_COUNT), 0),
-            25
+            PLACEHOLDER_BLOCK_LAYER
         );
 
         let faces = pack_faces();

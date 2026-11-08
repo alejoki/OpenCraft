@@ -16,7 +16,7 @@
 #         mesh of the two authored blocks, a production mining break of ruby
 #         ore (61 ticks, authored drop, count, slot, limit), the v9 fixture
 #         reload with zero unresolved names, and the reserved placeholder
-#         policy (face 25, icon 27, unbreakable, mesh layer 25).
+#         policy (face 26, icon 27, unbreakable, mesh layer 26).
 #     (d) the fixture save starts with `MCVX` and the little-endian version
 #         word 9.
 #
@@ -122,16 +122,16 @@ fail() {
 # The contractual digest lines, in their required order. Keep byte-for-byte
 # identical to src/main.rs::presentation_demo_pins_the_authored_line_set.
 EXPECTED_LINES=(
-    "presentation_demo: leg=registry blocks=25 items=1 pack_layers=2 pack_icons=1"
+    "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
     "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
     "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
-    "presentation_demo: leg=block name=mymod:ruby_ore id=24 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64"
-    "presentation_demo: leg=block name=mymod:ruby_block id=23 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64"
+    "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64"
+    "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64"
     "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64"
     "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49"
     "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64"
     "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true"
-    "presentation_demo: leg=placeholder unresolved=3 face=25 icon=27 break=none mesh=25"
+    "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26"
     "presentation_demo: ok=true"
 )
 
