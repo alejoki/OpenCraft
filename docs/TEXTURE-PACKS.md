@@ -269,7 +269,7 @@ Save each block texture directly inside the pack folder, using these exact file 
 24. `crafting_table_top.png`
 25. `crafting_table_side.png`
 
-The texture array has 48 layers. Layers 0 to 24 are the twenty-five block names above, in the order listed. Layers 25 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_25.png` or any other name that is not in one of the two lists is ignored.
+The texture array has 48 layers. Layers 0 to 24 are the twenty-five block names above, in the order listed. Layer 25 is built-in socket-marker art that a pack cannot override (there is no file name for it). Layers 26 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_26.png` or any other name that is not in one of the two lists is ignored.
 
 A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. The same is true for packs that shipped only the original 23 block names — `crafting_table_top.png` (layer 23) and `crafting_table_side.png` (layer 24) are optional additions, so such packs remain valid unchanged. Partial packs may add one texture or all twenty-five.
 
@@ -309,7 +309,7 @@ The committed `tests/fixtures/packs/uat-sound/` folder is the per-file layout ex
 - A missing file silently keeps the built-in procedural art for that part.
 - A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
 - A pack may add one mob file or all thirteen. Mob files and block files are independent.
-- Layers 25 to 31 and 45 to 47 are reserved and cannot be overridden. Files named after them, such as `reserved_45.png`, are ignored silently.
+- Layers 26 to 31 and 45 to 47 are reserved and cannot be overridden, and layer 25 is built-in socket-marker art that a pack cannot override. Files named after reserved layers, such as `reserved_45.png`, are ignored silently.
 
 ## Title logo and menu tint
 

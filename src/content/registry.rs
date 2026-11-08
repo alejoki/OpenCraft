@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn block_layers_append_from_48_and_cap_at_208_with_fallback_25() {
+    fn block_layers_append_from_48_and_cap_at_208_with_fallback_26() {
         let mut spec = PackContentSpec::default();
         for index in 0..161 {
             let texture = format!("layer_{index:03}.png");

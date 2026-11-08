@@ -730,8 +730,15 @@ mod tests {
     fn reserved_layers_have_no_source() {
         let presentation = presentation(vec![spec_with_layer("p", 3, &bytes(1))]);
 
+        // Layer 25 is built-in socket-marker art: no pack may override it.
+        assert_eq!(presentation.base_sources[25], None, "layer 25");
+        assert_eq!(
+            presentation.base.layers[25], presentation.procedural[25],
+            "layer 25 must stay the built-in marker art"
+        );
+
         for layer in 0..presentation.base_sources.len() {
-            let reserved = (25..MOB_LAYER_BASE as usize).contains(&layer)
+            let reserved = (26..MOB_LAYER_BASE as usize).contains(&layer)
                 || layer >= MOB_LAYER_BASE as usize + MOB_AUTHORABLE_TEX_LAYERS;
             if reserved {
                 assert_eq!(presentation.base_sources[layer], None, "layer {layer}");

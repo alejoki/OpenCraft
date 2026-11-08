@@ -4,8 +4,9 @@ pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
 ///
 /// Layers 0..=24 are authored block art (25 layers, see
-/// [`crate::pack::LAYER_FILES`]); 25..=31 are reserved block placeholders no
-/// pack can override. Layers 32..=44 are the 13 authorable mob part layers
+/// [`crate::pack::LAYER_FILES`]); 25 is built-in socket-marker art that packs
+/// cannot override; 26..=31 are reserved block placeholders no pack can
+/// override. Layers 32..=44 are the 13 authorable mob part layers
 /// (see [`crate::pack::MOB_LAYER_FILES`]) and 45..=47 are reserved spares.
 /// The WGSL `w1 & 255` wire format still holds because all 48 layers fit in
 /// a byte with room to spare.
@@ -433,12 +434,50 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 ]
             }
         }),
+        // 25: Socket Marker - dark slate frame around a cyan inset arrow, so an
+        // authoring socket reads as a scanning point instead of the magenta
+        // checker. Built-in art only: no pack file name maps to this layer.
+        make_layer(34, |x, y, j| {
+            let outer = x < 2 || y < 2 || x > 13 || y > 13;
+            let inner = x == 3 || y == 3 || x == 12 || y == 12;
+            let head = (y == 5 && (6..=9).contains(&x))
+                || (y == 6 && (5..=10).contains(&x))
+                || (y == 7 && (4..=11).contains(&x));
+            let shaft = (7..=8).contains(&x) && (8..=12).contains(&y);
+            if outer {
+                [
+                    clamp_u8(38 + j / 3),
+                    clamp_u8(46 + j / 3),
+                    clamp_u8(58 + j / 3),
+                ]
+            } else if inner {
+                [
+                    clamp_u8(74 + j / 3),
+                    clamp_u8(86 + j / 3),
+                    clamp_u8(104 + j / 3),
+                ]
+            } else if head || shaft {
+                [
+                    clamp_u8(44 + j / 3),
+                    clamp_u8(214 + j / 2),
+                    clamp_u8(222 + j / 2),
+                ]
+            } else {
+                let scan = (x + y) % 4 == 0;
+                let d = if scan { 10 } else { 0 };
+                [
+                    clamp_u8(22 + d + j / 2),
+                    clamp_u8(30 + d + j / 2),
+                    clamp_u8(40 + d + j / 2),
+                ]
+            }
+        }),
     ];
 
-    // 25..32: reserved block layers. They are not authorable (no pack file
+    // 26..32: reserved block layers. They are not authorable (no pack file
     // name maps to them). A deterministic magenta checker, offset per layer,
     // keeps each one opaque and visibly distinct from every authored layer.
-    layers.extend((25..MOB_LAYER_BASE).map(reserved_checker));
+    layers.extend((26..MOB_LAYER_BASE).map(reserved_checker));
 
     // 32..=44: the 13 authorable mob part layers, in `MOB_LAYER_FILES` order.
     // Each is deterministic, opaque (make_layer forces alpha 255), and
@@ -581,7 +620,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         }),
     ]);
 
-    // 45..48: reserved spare layers, same magenta checker rule as 25..32.
+    // 45..48: reserved spare layers, same magenta checker rule as 26..32.
     layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(reserved_checker));
 
     debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
@@ -836,7 +875,7 @@ mod tests {
     #[test]
     fn test_new_block_texture_layers_are_distinct() {
         let layers = generate_all_texture_layers_rgba();
-        let authored_new = [16usize, 17, 18, 19, 20, 21, 22, 23, 24];
+        let authored_new = [16usize, 17, 18, 19, 20, 21, 22, 23, 24, 25];
 
         // Every new layer differs from every other new layer.
         for (offset, a) in authored_new.iter().enumerate() {
@@ -858,6 +897,20 @@ mod tests {
         assert_ne!(layers[23], layers[9], "table top must differ from planks");
         assert_ne!(layers[24], layers[9], "table side must differ from planks");
         assert_ne!(layers[23], layers[24], "table top and side must differ");
+        // Layer 25 is built-in socket-marker art, not reserved checker art.
+        for existing in 0..=24usize {
+            assert_ne!(
+                layers[25], layers[existing],
+                "socket marker must differ from built-in layer {existing}"
+            );
+        }
+        assert_ne!(layers[25], layers[23], "socket marker vs table top");
+        assert_ne!(layers[25], layers[24], "socket marker vs table side");
+        assert_ne!(
+            layers[25],
+            reserved_checker(25),
+            "socket marker must not be the reserved checker"
+        );
 
         // Every new layer is real art, not a flat color.
         for index in authored_new {
@@ -877,19 +930,22 @@ mod tests {
     #[test]
     fn test_reserved_texture_layers_are_distinct_opaque_placeholders() {
         let layers = generate_all_texture_layers_rgba();
-        let authorable = 25usize;
-        assert_eq!(authorable, 25, "authored block art coverage is 25 layers");
+        let builtin = 26usize;
+        assert_eq!(
+            builtin, 26,
+            "built-in procedural coverage is 26 layers (25 authored + marker)"
+        );
         assert_eq!(NUM_TEX_LAYERS as usize, 48);
 
-        // Block-reserved 25..32 and spare 45..48 both use the reserved rule;
-        // neither range may alias authored art or mob art.
-        let reserved: Vec<usize> = (authorable..MOB_LAYER_BASE as usize)
+        // Block-reserved 26..32 and spare 45..48 both use the reserved rule;
+        // neither range may alias built-in art (including layer 25) or mob art.
+        let reserved: Vec<usize> = (builtin..MOB_LAYER_BASE as usize)
             .chain(MOB_SPARE_LAYER_BASE as usize..NUM_TEX_LAYERS as usize)
             .collect();
-        assert_eq!(reserved.len(), 7 + 3);
+        assert_eq!(reserved.len(), 6 + 3);
 
         for &index in &reserved {
-            for authored in 0..authorable {
+            for authored in 0..builtin {
                 assert_ne!(
                     layers[index], layers[authored],
                     "reserved layer {index} must differ from authored layer {authored}"
@@ -953,7 +1009,7 @@ mod tests {
                 pixels.iter().any(|px| px != first),
                 "mob layer {index} must not be a flat color"
             );
-            for authored in 0..25usize {
+            for authored in 0..26usize {
                 assert_ne!(
                     layers[index], layers[authored],
                     "mob layer {index} must differ from authored layer {authored}"

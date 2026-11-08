@@ -351,14 +351,12 @@ impl BlockId {
             BlockId::WheatStage3 => 20,
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
-            // Socket-marker art is its own procedural layer (M015/T03 lands
-            // the pixels). `Modded` still falls back to layer 25 until T03
-            // moves the reserved checker range to 26.
+            // Socket-marker art is its own built-in procedural layer (25).
             BlockId::SocketMarker => 25,
-            // First reserved block placeholder layer (25..=31 are reserved,
+            // First reserved block placeholder layer (26..=31 are reserved,
             // see `src/render/texture.rs`). Modded content gets real art when
             // the registry owns the texture vocabulary.
-            BlockId::Modded(_) => 25,
+            BlockId::Modded(_) => 26,
         }
     }
 
@@ -1039,7 +1037,7 @@ mod tests {
         // Fail-closed behavior: reserved placeholder art, generic name, no
         // break timing, self drop, and no station interaction.
         for face_dir in 0u8..6 {
-            assert_eq!(modded.face_tex_layer(face_dir), 25);
+            assert_eq!(modded.face_tex_layer(face_dir), 26);
         }
         assert_eq!(modded.name(), "Modded Block");
         assert_eq!(modded.break_duration_secs(), None);

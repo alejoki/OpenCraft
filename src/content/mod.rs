@@ -40,7 +40,10 @@ pub const PACK_LAYER_CAP: u8 = 208;
 
 /// First reserved block face layer used when a pack asset is missing or the
 /// layer space overflows: the built-in checker placeholder.
-pub const PLACEHOLDER_BLOCK_LAYER: u8 = 25;
+///
+/// Starts at 26 so a fallback never aliases layer 25, the built-in
+/// socket-marker art that packs cannot override.
+pub const PLACEHOLDER_BLOCK_LAYER: u8 = 26;
 
 /// First icon layer reserved for pack-authored item/tool icons.
 pub const PACK_ICON_BASE: u8 = 32;
