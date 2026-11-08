@@ -623,6 +623,10 @@ fn block_color(block: BlockId) -> [f32; 4] {
         BlockId::WheatStage3 => [0.75, 0.66, 0.20, 1.0],
         BlockId::Chest => [0.70, 0.44, 0.15, 1.0],
         BlockId::LootChest => [0.86, 0.70, 0.16, 1.0],
+        // Authored socket marker: violet so the authoring pass is visually
+        // distinct from every carryable block tint. Unreachable through the
+        // item UI because the marker is non-carryable.
+        BlockId::SocketMarker => [0.55, 0.20, 0.62, 1.0],
         // Neutral checker grey until the registry owns modded block tinting.
         BlockId::Modded(_) => [0.62, 0.62, 0.66, 1.0],
         BlockId::Air | BlockId::Bedrock => [0.16, 0.16, 0.18, 1.0],
@@ -1800,6 +1804,7 @@ mod tests {
             BlockId::WheatStage2,
             BlockId::WheatStage3,
             BlockId::LootChest,
+            BlockId::SocketMarker,
         ];
         for (index, block) in uncarryable.iter().copied().enumerate() {
             let color = block_color(block);

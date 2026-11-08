@@ -6,7 +6,7 @@
 //! names are frozen here before any pack data exists.
 //!
 //! Every table is index-aligned to the declaration order of its Rust enum
-//! (or, for blocks, the frozen raw id order `0..=22`). Built-in names are
+//! (or, for blocks, the frozen raw id order `0..=23`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
 use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolTier};
@@ -19,8 +19,8 @@ use crate::world::block::BlockId;
 /// vice versa. Bytes, not chars: the save table stores UTF-8 length.
 pub const MAX_CONTENT_NAME_LEN: usize = 255;
 
-/// Built-in block id names, index-aligned to raw ids `0..=22`.
-pub const BLOCK_ID_NAMES: [&str; 23] = [
+/// Built-in block id names, index-aligned to raw ids `0..=23`.
+pub const BLOCK_ID_NAMES: [&str; 24] = [
     "air",
     "grass",
     "dirt",
@@ -44,6 +44,7 @@ pub const BLOCK_ID_NAMES: [&str; 23] = [
     "wheat_stage_3",
     "chest",
     "loot_chest",
+    "socket_marker",
 ];
 
 /// Material names in `Material` declaration order.
@@ -430,6 +431,7 @@ mod tests {
             "wheat_stage_3",
             "chest",
             "loot_chest",
+            "socket_marker",
         ];
         assert_eq!(expected, BLOCK_ID_NAMES);
         for name in BLOCK_ID_NAMES {

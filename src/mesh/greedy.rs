@@ -715,16 +715,32 @@ mod tests {
     fn padded_chunk_stores_raw_u16_and_round_trips() {
         let mut padded = PaddedChunk::new_empty();
         assert_eq!(padded.get(1, 1, 1), BlockId::Air);
-        padded.set(1, 1, 1, BlockId::Modded(23));
-        assert_eq!(padded.get(1, 1, 1), BlockId::Modded(23));
+        padded.set(
+            1,
+            1,
+            1,
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
+        );
+        assert_eq!(
+            padded.get(1, 1, 1),
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT)
+        );
         assert!(padded.has_any_solid, "modded solid id keeps the solid flag");
         assert!(!padded.has_any_liquid);
         assert_eq!(std::mem::size_of_val(&*padded.voxels), PADDED_VOLUME * 2);
 
         let mut chunk = Chunk::new_uniform(BlockId::Air);
-        chunk.set(3, 4, 5, BlockId::Modded(23));
+        chunk.set(
+            3,
+            4,
+            5,
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
+        );
         let copied = PaddedChunk::from_center_only(&chunk);
-        assert_eq!(copied.get(4, 5, 6), BlockId::Modded(23));
+        assert_eq!(
+            copied.get(4, 5, 6),
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT)
+        );
         assert!(copied.has_any_solid);
     }
 

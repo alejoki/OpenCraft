@@ -180,7 +180,7 @@ mod tests {
         }
         // Sampled built-in plus modded ids round-trip through dense storage,
         // and promotion never touches the neighbouring cell.
-        for raw in (0..=22u16).chain([23, 24, 1000, u16::MAX]) {
+        for raw in (0..=crate::world::block::BUILTIN_BLOCK_COUNT).chain([1000, u16::MAX]) {
             let mut chunk = Chunk::new_uniform(BlockId::Air);
             chunk.set(1, 2, 3, BlockId::from_raw(raw));
             assert_eq!(chunk.get(1, 2, 3), BlockId::from_raw(raw));
@@ -208,14 +208,15 @@ mod tests {
 
     #[test]
     fn uniform_promotion_and_compression_use_raw_ids() {
-        let mut chunk = Chunk::new_uniform(BlockId::Modded(23));
-        assert_eq!(chunk.is_uniform(), Some(BlockId::Modded(23)));
+        let modded = BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT);
+        let mut chunk = Chunk::new_uniform(modded);
+        assert_eq!(chunk.is_uniform(), Some(modded));
         chunk.set(4, 5, 6, BlockId::Stone);
         assert_eq!(chunk.is_uniform(), None);
         assert_eq!(chunk.get(4, 5, 6), BlockId::Stone);
-        assert_eq!(chunk.get(0, 0, 0), BlockId::Modded(23));
-        chunk.set(4, 5, 6, BlockId::Modded(23));
+        assert_eq!(chunk.get(0, 0, 0), modded);
+        chunk.set(4, 5, 6, modded);
         assert!(chunk.try_compress());
-        assert_eq!(chunk.is_uniform(), Some(BlockId::Modded(23)));
+        assert_eq!(chunk.is_uniform(), Some(modded));
     }
 }

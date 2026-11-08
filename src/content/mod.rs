@@ -194,7 +194,7 @@ pub struct ToolDef {
 /// A resolved shaped recipe definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecipeDef {
-    /// Dense registry index; built-ins occupy `0..22`.
+    /// Dense registry index; built-ins occupy `0..=23`.
     pub index: u16,
     /// Stable name (`planks` for a built-in, a namespaced id for a pack).
     pub name: String,
