@@ -1,5 +1,9 @@
 //! Real-binary acceptance matrix for `opencraft --demo-village` (M015/S02-T06).
 //!
+//! The digest's final legs prove a real `WorldSession` streams the pinned
+//! seed-14 village through `WorldManager::update_streaming` (M015/S03-T03), so
+//! the pinned line set includes the session line immediately before `ok=true`.
+//!
 //! Each leg spawns the actual compiled binary in an isolated temporary working
 //! directory with the graphical environment removed, so the pinned digest is
 //! proven at the process boundary: exact stdout, exit codes, fail-soft
@@ -23,7 +27,7 @@ const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 /// Measured from a real `cargo run -- --demo-village` and independently pinned
 /// in `src/main.rs`'s `village_demo_pins_the_checked_in_reference_village_line_set`.
 /// Never derive these from the code under test.
-const CLEAN_LINES: [&str; 11] = [
+const CLEAN_LINES: [&str; 12] = [
     "village_demo: leg=catalog prefabs=3 villages=1 diagnostics=0 fingerprint=0x5c2b550240d34cfb",
     "village_demo: leg=context rules=0 villages=1",
     "village_demo: leg=site cell=6,-6 anchor=1654,-1383 definition=plains prefabs=13 socket_links=12 roads=48 unmatched=22",
@@ -34,6 +38,7 @@ const CLEAN_LINES: [&str; 11] = [
     "village_demo: leg=empty_catalog identical=true",
     "village_demo: leg=outside identical=true",
     "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true",
+    "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true",
     "village_demo: ok=true",
 ];
 

@@ -15134,6 +15134,14 @@ fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
 /// function of the checked-in `worldgen/` tree plus this seed.
 const VILLAGE_DEMO_SEED: u32 = 424_242;
 
+/// Seed pinned for the `--demo-village` **session** leg.
+///
+/// Seed 14 is the pinned production seed whose village cell `(-1, 0)` lies
+/// inside the default spawn ring, so a real `WorldSession` streams it without
+/// teleporting or changing the render distance. Plain constant, never a clock
+/// or `random_seed`, so the session line stays deterministic.
+const VILLAGE_SESSION_SEED: u32 = 14;
+
 /// Inclusive placement-count band a demo village must satisfy.
 const VILLAGE_DEMO_MIN_PREFABS: usize = 10;
 const VILLAGE_DEMO_MAX_PREFABS: usize = 20;
@@ -15628,6 +15636,104 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         lines.push(format!(
             "village_demo: leg=fit foundations={foundations} no_overlap={no_overlap} no_orphan_road={no_orphan_road} sockets_linked={sockets_linked}"
         ));
+    }
+
+    // (k) Session leg: a real `WorldSession` on the pinned production seed must
+    // stream the village through `WorldManager::update_streaming` (the same
+    // dispatch a playing client uses) and reproduce the plan block for block.
+    // The session is never saved, so no file or directory is created.
+    let (session_spawn_x, session_spawn_z) = find_spawn_column(VILLAGE_SESSION_SEED);
+    let session_plan = village_plan_with_spawn(
+        VillageCell { x: -1, z: 0 },
+        VILLAGE_SESSION_SEED,
+        &catalog,
+        (session_spawn_x, session_spawn_z),
+    );
+    let mut session_chunks: Vec<ChunkPos> = Vec::new();
+    let mut session_cells = 0usize;
+    let session_identical = match &session_plan {
+        Some(plan) => {
+            let size = CHUNK_SIZE as i32;
+            for cz in plan.bounds.min_z.div_euclid(size)..=plan.bounds.max_z.div_euclid(size) {
+                for cy in plan.bounds.min_y.div_euclid(size)..=plan.bounds.max_y.div_euclid(size) {
+                    for cx in
+                        plan.bounds.min_x.div_euclid(size)..=plan.bounds.max_x.div_euclid(size)
+                    {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        let cells = plan.cells_for_chunk(pos);
+                        if !cells.is_empty() {
+                            session_cells += cells.len();
+                            session_chunks.push(pos);
+                        }
+                    }
+                }
+            }
+
+            let mut session = WorldSession::new_session_with_mode_and_registry(
+                VILLAGE_SESSION_SEED,
+                PathBuf::from("village-demo-session.mcvx"),
+                opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+                GameMode::Creative,
+                ContentRegistry::builtin_arc(),
+            );
+            session.set_village_catalog(Arc::new(catalog.clone()));
+            // rd=6 means gen radius 8, which covers the whole village cell
+            // while keeping the leg short.
+            session.world.set_render_distance(6);
+            // Centre the stream on the village's own chunk AABB. The village
+            // plan itself is anchored to the world spawn column (installed
+            // above), never to this centre; centring here only means the six
+            // target chunks are the first ones the spiral dispatches instead
+            // of the furthest ones, which keeps the debug-build digest fast
+            // while exercising the same production dispatch.
+            let center_x = (session_chunks.iter().map(|pos| pos.x).min().unwrap_or(0)
+                + session_chunks.iter().map(|pos| pos.x).max().unwrap_or(0))
+                / 2;
+            let center_z = (session_chunks.iter().map(|pos| pos.z).min().unwrap_or(0)
+                + session_chunks.iter().map(|pos| pos.z).max().unwrap_or(0))
+                / 2;
+            let center = ChunkPos::new(center_x, 0, center_z);
+            for _ in 0..1200 {
+                session.world.update_streaming(center, Season::Summer);
+                if session_chunks
+                    .iter()
+                    .all(|&pos| session.world.is_resident(pos))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            session_chunks.iter().all(|&pos| {
+                session.world.is_resident(pos)
+                    && plan.cells_for_chunk(pos).iter().all(|cell| {
+                        session
+                            .world
+                            .get_block(cell.world[0], cell.world[1], cell.world[2])
+                            == cell.block
+                    })
+            })
+        }
+        None => false,
+    };
+    match &session_plan {
+        Some(plan) => lines.push(format!(
+            "village_demo: leg=session cell={},{} spawn={},{} chunks={} cells={} identical={}",
+            plan.cell.x,
+            plan.cell.z,
+            session_spawn_x,
+            session_spawn_z,
+            session_chunks.len(),
+            session_cells,
+            session_identical,
+        )),
+        None => lines.push(format!(
+            "village_demo: leg=session cell=none spawn={},{} chunks=0 cells=0 identical=false",
+            session_spawn_x, session_spawn_z,
+        )),
+    }
+    if !session_identical {
+        failed.get_or_insert("session");
     }
 
     match failed {
@@ -17345,6 +17451,8 @@ mod tests {
                 "village_demo: leg=empty_catalog identical=true".to_string(),
                 "village_demo: leg=outside identical=true".to_string(),
                 "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true"
+                    .to_string(),
+                "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true"
                     .to_string(),
                 "village_demo: ok=true".to_string(),
             ]
