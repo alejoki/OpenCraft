@@ -242,6 +242,15 @@ pub struct CliConfig {
     /// before `StartupContent::load`, so the digest never opens a window, GPU,
     /// audio engine, event loop or settings write, and never writes a save.
     pub demo_worldgen: bool,
+    /// Whether the headless village digest (`--demo-village`, M015/S02-T05)
+    /// is requested. Same bare-switch contract as `demo_worldgen`: it takes no
+    /// value, is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before `StartupContent::load`, so the digest never opens a window, GPU,
+    /// audio engine, event loop or settings write, reads only `worldgen/`, and
+    /// never writes a save. It is a release-facing launch switch and is
+    /// deliberately not release-gated.
+    pub demo_village: bool,
     /// Whether the headless Creative palette digest (`--demo-palette`,
     /// M010/S07-T04) is requested. Same bare-switch contract as
     /// `demo_worldgen`: it takes no value, is deliberately NOT a world intent
@@ -332,6 +341,7 @@ impl CliConfig {
         let mut demo_presentation = false;
         let mut demo_crafting = false;
         let mut demo_worldgen = false;
+        let mut demo_village = false;
         let mut demo_palette = false;
         let mut demo_save_v9 = false;
         let mut demo_restart = false;
@@ -431,6 +441,13 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_worldgen = true;
                 }
+                "--demo-village" => {
+                    // Same bare-switch rule as `--demo-worldgen`. `main`
+                    // short-circuits on this before `StartupContent::load`, so
+                    // a following token (normally `--save x`) stays an
+                    // independent argument.
+                    demo_village = true;
+                }
                 "--demo-palette" => {
                     // Same bare-switch rule as `--demo-worldgen`. `main`
                     // short-circuits on this before `StartupContent::load`.
@@ -514,6 +531,7 @@ impl CliConfig {
             demo_presentation,
             demo_crafting,
             demo_worldgen,
+            demo_village,
             demo_palette,
             demo_save_v9,
             demo_restart,
@@ -5702,6 +5720,47 @@ mod tests {
         // A stray non-flag token after the switch never becomes the seed.
         let stray = CliConfig::parse_args(["--demo-worldgen", "5"]);
         assert!(stray.demo_worldgen);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
+    fn test_demo_village_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_village);
+        assert!(!bare.demo_worldgen);
+        assert!(!bare.demo_crafting);
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let village = CliConfig::parse_args(["--demo-village"]);
+        assert!(village.demo_village);
+        assert!(!village.demo_worldgen);
+        assert!(!village.demo_crafting);
+        assert!(!village.demo_presentation);
+        assert!(!village.demo_ui);
+        assert!(!village.force_new_world);
+        assert_eq!(village.seed_override, None);
+        assert_eq!(
+            village.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--save custom.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value.
+        let with_save = CliConfig::parse_args(["--demo-village", "--save", "custom.mcvx"]);
+        assert!(with_save.demo_village);
+        assert_eq!(with_save.save_path, std::path::PathBuf::from("custom.mcvx"));
+
+        // A following `--new` still parses as the fresh-world intent.
+        let with_new = CliConfig::parse_args(["--demo-village", "--new"]);
+        assert!(with_new.demo_village);
+        assert!(with_new.force_new_world);
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-village", "5"]);
+        assert!(stray.demo_village);
         assert_eq!(stray.seed_override, None);
     }
 

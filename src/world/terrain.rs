@@ -1680,21 +1680,11 @@ pub fn generate_chunk_seeded_with(
 /// pre-M015 generator byte-for-byte) and `spawn_column` lets a caller that
 /// already knows the spawn skip the bounded [`find_spawn_column`] search when
 /// the village planner needs it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct WorldGenContext<'a> {
     pub rules: &'a [WorldgenRule],
     pub villages: Option<&'a VillageCatalog>,
     pub spawn_column: Option<(i32, i32)>,
-}
-
-impl Default for WorldGenContext<'_> {
-    fn default() -> Self {
-        Self {
-            rules: &[],
-            villages: None,
-            spawn_column: None,
-        }
-    }
 }
 
 /// Whether a chunk whose base starts at `base_wy` is entirely above every

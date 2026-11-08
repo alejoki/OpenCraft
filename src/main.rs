@@ -123,8 +123,12 @@ use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
 };
 use opencraft::world::terrain::{
-    biome_at_seeded, generate_chunk_seeded, generate_chunk_seeded_with, ruin_at_seeded,
-    ruin_loot_chest_at, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
+    biome_at_seeded, find_spawn_column, generate_chunk_seeded, generate_chunk_seeded_with,
+    generate_chunk_with_context, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded,
+    Biome, WorldGenContext, DEFAULT_WORLD_SEED, SEA_LEVEL,
+};
+use opencraft::world::village::{
+    village_plan_with_spawn, VillageBounds, VillageCatalog, VillageCell, VillagePlan,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -15022,6 +15026,502 @@ fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     }
 }
 
+/// Seed pinned for the `--demo-village` digest.
+///
+/// A plain constant (never a clock or `random_seed`) so the digest is a pure
+/// function of the checked-in `worldgen/` tree plus this seed.
+const VILLAGE_DEMO_SEED: u32 = 424_242;
+
+/// Inclusive placement-count band a demo village must satisfy.
+const VILLAGE_DEMO_MIN_PREFABS: usize = 10;
+const VILLAGE_DEMO_MAX_PREFABS: usize = 20;
+
+/// FNV-1a 64 offset basis, matching the catalog fingerprint.
+const VILLAGE_DEMO_FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a 64 step.
+fn village_demo_fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Fixed integer order hash for the `order` leg.
+///
+/// The demo only needs a fixed permutation; the hash is never a correctness
+/// input, so a plain FNV chain over the chunk triple is enough.
+fn village_demo_order_hash(pos: ChunkPos) -> u64 {
+    let mut hash = VILLAGE_DEMO_FNV_OFFSET_BASIS;
+    for value in [pos.x, pos.y, pos.z] {
+        hash = village_demo_fnv1a(hash, &(value as i64).to_le_bytes());
+    }
+    hash
+}
+
+/// Whether two chunks hold the same block in every cell.
+fn village_demo_chunks_equal(a: &Chunk, b: &Chunk) -> bool {
+    (0..CHUNK_SIZE)
+        .all(|y| (0..CHUNK_SIZE).all(|z| (0..CHUNK_SIZE).all(|x| a.get(x, y, z) == b.get(x, y, z))))
+}
+
+/// FNV-1a 64 over the plan's layout: placements, socket links and road cells.
+///
+/// Integer-only and field-ordered, so it is machine-independent. Prefab names
+/// use their bytes; every integer uses little-endian bytes.
+fn village_demo_layout_digest(plan: &VillagePlan<'_>) -> u64 {
+    let mut hash = VILLAGE_DEMO_FNV_OFFSET_BASIS;
+    for placement in &plan.placements {
+        hash = village_demo_fnv1a(hash, placement.prefab.name.as_bytes());
+        hash = village_demo_fnv1a(hash, &[placement.rotation.quarter_turns()]);
+        hash = village_demo_fnv1a(hash, &placement.origin_x.to_le_bytes());
+        hash = village_demo_fnv1a(hash, &placement.origin_z.to_le_bytes());
+        hash = village_demo_fnv1a(hash, &placement.base_y.to_le_bytes());
+    }
+    for link in &plan.socket_links {
+        for value in [
+            link.parent,
+            link.parent_socket,
+            link.child,
+            link.child_socket,
+        ] {
+            hash = village_demo_fnv1a(hash, &(value as u32).to_le_bytes());
+        }
+    }
+    for road in &plan.road_cells {
+        for value in road.world {
+            hash = village_demo_fnv1a(hash, &value.to_le_bytes());
+        }
+    }
+    hash
+}
+
+/// Chunk window of a plan: the plan's exact chunk AABB expanded by one chunk in
+/// x and z, over every chunk layer its y range touches.
+///
+/// The one-chunk border is what the `outside` leg generates: those chunks hold
+/// no village cell by construction, so they must stay byte-identical to the
+/// legacy generator.
+fn village_demo_window(bounds: &VillageBounds) -> Vec<ChunkPos> {
+    let size = CHUNK_SIZE as i32;
+    let cx_min = bounds.min_x.div_euclid(size) - 1;
+    let cx_max = bounds.max_x.div_euclid(size) + 1;
+    let cz_min = bounds.min_z.div_euclid(size) - 1;
+    let cz_max = bounds.max_z.div_euclid(size) + 1;
+    let cy_min = bounds.min_y.div_euclid(size);
+    let cy_max = bounds.max_y.div_euclid(size);
+    let mut positions = Vec::new();
+    for cz in cz_min..=cz_max {
+        for cx in cx_min..=cx_max {
+            for cy in cy_min..=cy_max {
+                positions.push(ChunkPos::new(cx, cy, cz));
+            }
+        }
+    }
+    positions
+}
+
+/// The production generation seam with the accepted catalog and a known spawn.
+fn village_demo_generate(pos: ChunkPos, catalog: &VillageCatalog, spawn: (i32, i32)) -> Chunk {
+    generate_chunk_with_context(
+        pos,
+        VILLAGE_DEMO_SEED,
+        Season::Summer,
+        &WorldGenContext {
+            rules: &[],
+            villages: Some(catalog),
+            spawn_column: Some(spawn),
+        },
+    )
+}
+
+/// Read one world cell out of a generated-chunk map.
+fn village_demo_cell(
+    chunks: &BTreeMap<(i32, i32, i32), Chunk>,
+    world: [i32; 3],
+) -> Option<BlockId> {
+    let (pos, (lx, ly, lz)) = world_to_chunk_and_local(world[0], world[1], world[2]);
+    chunks
+        .get(&(pos.x, pos.y, pos.z))
+        .map(|chunk| chunk.get(lx, ly, lz))
+}
+
+/// Build the deterministic `--demo-village` digest.
+///
+/// Loads only `worldgen/` (fail-soft, exactly like `--validate-worldgen`) and
+/// exercises the production plan/assembly seams over a pinned cell window. It
+/// never reads settings, packs, a registry, a save, a window, the GPU or the
+/// audio engine, and it writes nothing. The caller exits non-zero when a leg
+/// fails.
+fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // (a) Catalog leg: a second load must be byte-identical (fail-soft loader
+    // determinism) and the accepted counts must stay internally consistent.
+    let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+    for diagnostic in &diagnostics {
+        lines.push(format!("village_demo: warning {diagnostic}"));
+    }
+    let (reloaded, reloaded_diagnostics) = VillageCatalog::load_sorted(root);
+    let prefab_count = catalog.prefabs().names().count();
+    let catalog_consistent = catalog.len() == catalog.names().count()
+        && prefab_count == reloaded.prefabs().names().count()
+        && catalog.len() == reloaded.len()
+        && catalog.fingerprint() == reloaded.fingerprint()
+        && diagnostics == reloaded_diagnostics;
+    lines.push(format!(
+        "village_demo: leg=catalog prefabs={} villages={} diagnostics={} fingerprint=0x{:016x}",
+        prefab_count,
+        catalog.len(),
+        diagnostics.len(),
+        catalog.fingerprint(),
+    ));
+    if !catalog_consistent {
+        failed.get_or_insert("catalog");
+    }
+
+    // The spawn column is computed once and reused by every context, so a
+    // plan generated here matches production exactly.
+    let spawn = find_spawn_column(VILLAGE_DEMO_SEED);
+
+    // (b) Context leg: the empty-rule context must be the faithful legacy
+    // wrapper (`generate_chunk_seeded`), so `generate_chunk_with_context` is a
+    // pure superset of the pre-M015 seam for one representative chunk.
+    let sample = ChunkPos::new(0, 1, 0);
+    let legacy_sample = generate_chunk_seeded(sample, VILLAGE_DEMO_SEED, Season::Summer);
+    let default_sample = generate_chunk_with_context(
+        sample,
+        VILLAGE_DEMO_SEED,
+        Season::Summer,
+        &WorldGenContext {
+            rules: &[],
+            villages: None,
+            spawn_column: Some(spawn),
+        },
+    );
+    let context_ok = village_demo_chunks_equal(&legacy_sample, &default_sample);
+    lines.push(format!(
+        "village_demo: leg=context rules=0 villages={}",
+        catalog.len(),
+    ));
+    if !context_ok {
+        failed.get_or_insert("context");
+    }
+
+    // (c) Site leg: scan the fixed window in row-major order and take the first
+    // cell whose plan fits the 10..=20 band.
+    let mut chosen: Option<VillagePlan<'_>> = None;
+    'scan: for cz in -6..=6 {
+        for cx in -6..=6 {
+            let cell = VillageCell { x: cx, z: cz };
+            if let Some(plan) = village_plan_with_spawn(cell, VILLAGE_DEMO_SEED, &catalog, spawn) {
+                if (VILLAGE_DEMO_MIN_PREFABS..=VILLAGE_DEMO_MAX_PREFABS)
+                    .contains(&plan.placement_count())
+                {
+                    chosen = Some(plan);
+                    break 'scan;
+                }
+            }
+        }
+    }
+    match &chosen {
+        Some(plan) => lines.push(format!(
+            "village_demo: leg=site cell={},{} anchor={},{} definition={} prefabs={} socket_links={} roads={} unmatched={}",
+            plan.cell.x,
+            plan.cell.z,
+            plan.anchor[0],
+            plan.anchor[1],
+            plan.definition,
+            plan.placement_count(),
+            plan.socket_link_count(),
+            plan.road_cell_count(),
+            plan.unmatched_socket_count(),
+        )),
+        None => lines.push(
+            "village_demo: leg=site cell=none anchor=none definition=none prefabs=0 socket_links=0 roads=0 unmatched=0"
+                .to_string(),
+        ),
+    }
+    if chosen.is_none() {
+        failed.get_or_insert("site");
+    }
+
+    // (d) Counts leg: the chosen plan stays inside the authored band.
+    let in_range = chosen.as_ref().is_some_and(|plan| {
+        (VILLAGE_DEMO_MIN_PREFABS..=VILLAGE_DEMO_MAX_PREFABS).contains(&plan.placement_count())
+    });
+    lines.push(format!(
+        "village_demo: leg=counts in_range={} min={} max={}",
+        in_range, VILLAGE_DEMO_MIN_PREFABS, VILLAGE_DEMO_MAX_PREFABS,
+    ));
+    if !in_range {
+        failed.get_or_insert("counts");
+    }
+
+    // (e) Layout leg: pinned integer digest of the plan itself.
+    let layout_digest = chosen
+        .as_ref()
+        .map_or(0, |plan| village_demo_layout_digest(plan));
+    lines.push(format!(
+        "village_demo: leg=layout digest=0x{layout_digest:016x}",
+    ));
+    if chosen.is_none() {
+        failed.get_or_insert("layout");
+    }
+
+    // The remaining legs need a plan's exact bounds. On a broken tree they
+    // report false while `failed` keeps the first real failure (`site`).
+    let mut order_identical = false;
+    let mut single_chunk_identical = false;
+    let mut empty_catalog_identical = false;
+    let mut outside_identical = false;
+    let mut foundations = false;
+    let mut no_overlap = false;
+    let mut no_orphan_road = false;
+    let mut sockets_linked = false;
+
+    if let Some(plan) = &chosen {
+        let window = village_demo_window(&plan.bounds);
+        let baseline: BTreeMap<(i32, i32, i32), Chunk> = window
+            .iter()
+            .map(|&pos| {
+                (
+                    (pos.x, pos.y, pos.z),
+                    village_demo_generate(pos, &catalog, spawn),
+                )
+            })
+            .collect();
+        let baseline_chunk = |pos: ChunkPos| baseline.get(&(pos.x, pos.y, pos.z));
+
+        // (f) Order leg: hash-sorted generation must reproduce the row-major
+        // region result chunk for chunk.
+        let mut shuffled = window.clone();
+        shuffled.sort_by_key(|pos| (village_demo_order_hash(*pos), pos.y, pos.x, pos.z));
+        order_identical = shuffled.iter().all(|&pos| {
+            let chunk = village_demo_generate(pos, &catalog, spawn);
+            baseline_chunk(pos)
+                .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
+        });
+        lines.push(format!(
+            "village_demo: leg=order identical={order_identical}"
+        ));
+        if !order_identical {
+            failed.get_or_insert("order");
+        }
+
+        // (g) Single-chunk leg: each chunk generated alone in a fresh call must
+        // match the region result (no cross-chunk state).
+        single_chunk_identical = window.iter().all(|&pos| {
+            let chunk = village_demo_generate(pos, &catalog, spawn);
+            baseline_chunk(pos)
+                .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
+        });
+        lines.push(format!(
+            "village_demo: leg=single_chunk identical={single_chunk_identical}"
+        ));
+        if !single_chunk_identical {
+            failed.get_or_insert("single_chunk");
+        }
+
+        // (h) Empty-catalog leg: both `Some(empty)` and `None` must reproduce
+        // `generate_chunk_seeded_with(..., &[])` byte for byte.
+        let empty_catalog = VillageCatalog::default();
+        empty_catalog_identical = window.iter().all(|&pos| {
+            let legacy = generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
+            let via_empty = generate_chunk_with_context(
+                pos,
+                VILLAGE_DEMO_SEED,
+                Season::Summer,
+                &WorldGenContext {
+                    rules: &[],
+                    villages: Some(&empty_catalog),
+                    spawn_column: Some(spawn),
+                },
+            );
+            let via_none = generate_chunk_with_context(
+                pos,
+                VILLAGE_DEMO_SEED,
+                Season::Summer,
+                &WorldGenContext {
+                    rules: &[],
+                    villages: None,
+                    spawn_column: Some(spawn),
+                },
+            );
+            village_demo_chunks_equal(&legacy, &via_empty)
+                && village_demo_chunks_equal(&legacy, &via_none)
+        });
+        lines.push(format!(
+            "village_demo: leg=empty_catalog identical={empty_catalog_identical}"
+        ));
+        if !empty_catalog_identical {
+            failed.get_or_insert("empty_catalog");
+        }
+
+        // (i) Outside leg: chunks on the one-chunk border of the plan's chunk
+        // AABB hold no village cell and must stay byte-identical to legacy.
+        let size = CHUNK_SIZE as i32;
+        let cx_min = plan.bounds.min_x.div_euclid(size);
+        let cx_max = plan.bounds.max_x.div_euclid(size);
+        let cz_min = plan.bounds.min_z.div_euclid(size);
+        let cz_max = plan.bounds.max_z.div_euclid(size);
+        outside_identical = window
+            .iter()
+            .filter(|pos| pos.x < cx_min || pos.x > cx_max || pos.z < cz_min || pos.z > cz_max)
+            .all(|&pos| {
+                let legacy =
+                    generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
+                let chunk = village_demo_generate(pos, &catalog, spawn);
+                village_demo_chunks_equal(&legacy, &chunk)
+            });
+        lines.push(format!(
+            "village_demo: leg=outside identical={outside_identical}"
+        ));
+        if !outside_identical {
+            failed.get_or_insert("outside");
+        }
+
+        // (j) Fit leg: foundations, AABB disjointness, road/link ownership and
+        // socket-to-road geometry, all against the generated region.
+        foundations = true;
+        for placement in &plan.placements {
+            for column in &placement.columns {
+                for y in (column.terrain_y + 1)..placement.base_y {
+                    let cell = village_demo_cell(&baseline, [column.world_x, y, column.world_z]);
+                    if cell != Some(BlockId::Dirt) {
+                        foundations = false;
+                    }
+                }
+            }
+        }
+
+        no_overlap = true;
+        for (index, left) in plan.placements.iter().enumerate() {
+            for right in plan.placements.iter().skip(index + 1) {
+                let overlaps = left.footprint[0] <= right.footprint[1]
+                    && left.footprint[1] >= right.footprint[0]
+                    && left.footprint[2] <= right.footprint[3]
+                    && left.footprint[3] >= right.footprint[2];
+                if overlaps {
+                    no_overlap = false;
+                }
+            }
+        }
+
+        let mut road_hits = vec![0u32; plan.road_cells.len()];
+        no_orphan_road = true;
+        for link in &plan.socket_links {
+            if link.road.is_empty() {
+                no_orphan_road = false;
+            }
+            if link.parent >= plan.placements.len()
+                || link.child >= plan.placements.len()
+                || link.parent_socket >= plan.placements[link.parent].sockets.len()
+                || link.child_socket >= plan.placements[link.child].sockets.len()
+            {
+                no_orphan_road = false;
+                continue;
+            }
+            for &index in &link.road {
+                match road_hits.get_mut(index) {
+                    Some(hits) => *hits += 1,
+                    None => no_orphan_road = false,
+                }
+            }
+        }
+        if road_hits.iter().any(|&hits| hits != 1) {
+            no_orphan_road = false;
+        }
+
+        sockets_linked = true;
+        for link in &plan.socket_links {
+            let (Some(parent), Some(child)) = (
+                plan.placements.get(link.parent),
+                plan.placements.get(link.child),
+            ) else {
+                sockets_linked = false;
+                continue;
+            };
+            let (Some(parent_socket), Some(child_socket)) = (
+                parent.sockets.get(link.parent_socket),
+                child.sockets.get(link.child_socket),
+            ) else {
+                sockets_linked = false;
+                continue;
+            };
+            if !parent_socket.linked || !child_socket.linked {
+                sockets_linked = false;
+            }
+            let dx = (parent_socket.position[0] - child_socket.position[0]).abs();
+            let dz = (parent_socket.position[2] - child_socket.position[2]).abs();
+            let manhattan = dx + dz;
+            // A road excludes both socket cells, so it is exactly one cell
+            // shorter than the Manhattan socket separation.
+            if manhattan < 1 || link.road.len() as i32 != manhattan - 1 {
+                sockets_linked = false;
+            }
+            let mut path_ok = true;
+            for pair in link.road.windows(2) {
+                let a = plan.road_cells[pair[0]].world;
+                let b = plan.road_cells[pair[1]].world;
+                let step = (a[0] - b[0]).abs() + (a[2] - b[2]).abs();
+                if step != 1 {
+                    path_ok = false;
+                }
+            }
+            if let (Some(&first), Some(&last)) = (link.road.first(), link.road.last()) {
+                let first = plan.road_cells[first].world;
+                let last = plan.road_cells[last].world;
+                let near_parent = (first[0] - parent_socket.position[0]).abs()
+                    + (first[2] - parent_socket.position[2]).abs();
+                let near_child = (last[0] - child_socket.position[0]).abs()
+                    + (last[2] - child_socket.position[2]).abs();
+                if near_parent != 1 || near_child != 1 {
+                    path_ok = false;
+                }
+            }
+            if !path_ok {
+                sockets_linked = false;
+            }
+        }
+        lines.push(format!(
+            "village_demo: leg=fit foundations={foundations} no_overlap={no_overlap} no_orphan_road={no_orphan_road} sockets_linked={sockets_linked}"
+        ));
+        if !foundations || !no_overlap || !no_orphan_road || !sockets_linked {
+            failed.get_or_insert("fit");
+        }
+    } else {
+        lines.push(format!(
+            "village_demo: leg=order identical={order_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=single_chunk identical={single_chunk_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=empty_catalog identical={empty_catalog_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=outside identical={outside_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=fit foundations={foundations} no_overlap={no_overlap} no_orphan_road={no_orphan_road} sockets_linked={sockets_linked}"
+        ));
+    }
+
+    match failed {
+        Some(leg) => {
+            lines.push(format!("village_demo: ok=false failed={leg}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("village_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
 /// Resolve the palette's granted identity by stable name: blocks first, then
 /// generic items, then pack tools.
 fn palette_demo_item_id(registry: &ContentRegistry, name: &str) -> Option<ItemId> {
@@ -15598,6 +16098,26 @@ fn main() {
     // `--creator-trace` it is deliberately not release-gated.
     if let Some(root) = cli.validate_worldgen.as_deref() {
         let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-village` is the headless village digest: it loads only
+    // `worldgen/` (fail-soft, exactly like `--validate-worldgen`) and exercises
+    // the production plan/assembly seams over a pinned cell window. It runs
+    // after the worldgen validation branch and before `--demo-ui` and
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop,
+    // settings file, pack stack or save is touched, and it writes nothing.
+    if cli.demo_village {
+        let (lines, ok) = village_demo_lines(Path::new(opencraft::world::prefab::WORLDGEN_DIR));
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -16631,6 +17151,174 @@ mod tests {
         // persisted or turned into a world parameter.
         let with_new = CliConfig::parse_args(["--new", "--demo-presentation"]);
         assert!(cli_has_world_intent(&with_new));
+    }
+
+    #[test]
+    fn main_demo_village_short_circuit_precedes_world_startup() {
+        // The village digest must run after worldgen validation and before the
+        // UI digest and any startup content/session: no window, GPU, audio
+        // engine, event loop, settings file, pack stack or save is allowed.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_village_at = body
+            .find("cli.demo_village")
+            .expect("fn main must branch on cli.demo_village");
+        let digest_at = body
+            .find("village_demo_lines(")
+            .expect("fn main must call village_demo_lines");
+        let demo_ui_at = body
+            .find("cli.demo_ui")
+            .expect("fn main must branch on cli.demo_ui");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_at < demo_village_at,
+            "the village digest must follow the worldgen validation branch"
+        );
+        assert!(
+            demo_village_at < demo_ui_at,
+            "cli.demo_village must precede the demo-ui branch"
+        );
+        assert!(
+            demo_village_at < startup_at,
+            "cli.demo_village must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "village_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn village_demo_pins_the_checked_in_reference_village_line_set() {
+        // Measured from a real run against this repository's `worldgen/` root.
+        // Never derive the expected strings from the code under test: every
+        // count, cell, link and digest below is pinned independently.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("worldgen");
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(
+            ok,
+            "the village demo must pass against the checked-in tree: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "village_demo: leg=catalog prefabs=3 villages=1 diagnostics=0 fingerprint=0x5c2b550240d34cfb"
+                    .to_string(),
+                "village_demo: leg=context rules=0 villages=1".to_string(),
+                "village_demo: leg=site cell=6,-6 anchor=1654,-1383 definition=plains prefabs=13 socket_links=12 roads=48 unmatched=22"
+                    .to_string(),
+                "village_demo: leg=counts in_range=true min=10 max=20".to_string(),
+                "village_demo: leg=layout digest=0x79663be18a213bab".to_string(),
+                "village_demo: leg=order identical=true".to_string(),
+                "village_demo: leg=single_chunk identical=true".to_string(),
+                "village_demo: leg=empty_catalog identical=true".to_string(),
+                "village_demo: leg=outside identical=true".to_string(),
+                "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true"
+                    .to_string(),
+                "village_demo: ok=true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn village_demo_degrades_to_warning_plus_failed_site_on_a_broken_tree() {
+        // A broken village file must degrade fail-soft: the loader reports one
+        // warning, the digest still prints its whole pinned line set, and the
+        // run exits non-zero with `failed=site` (no panic, no partial output).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        std::fs::create_dir_all(root.join("villages")).expect("create villages dir");
+        std::fs::write(root.join("villages").join("broken.toml"), "format = 1\n")
+            .expect("write broken village");
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    .starts_with("village_demo: warning worldgen/villages/broken.toml: ")),
+            "expected a prefixed loader warning: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("village_demo: leg=catalog ")
+                    && line.contains("villages=0")
+                    && line.contains("diagnostics=1")
+            }),
+            "expected the empty catalog to be reported: {lines:?}"
+        );
+
+        // A missing root is valid empty content, not a diagnostic, and still
+        // fails at the site leg instead of panicking.
+        let (lines, ok) = village_demo_lines(&dir.path().join("absent"));
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("leg=catalog prefabs=0 villages=0 diagnostics=0")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.starts_with("village_demo: warning ")));
+    }
+
+    #[test]
+    fn village_demo_treats_a_missing_hub_as_failed_site() {
+        // A definition whose hub prefab does not exist is rejected by the
+        // fail-soft loader with a diagnostic, so the demo reports zero
+        // definitions and degrades to `failed=site` instead of panicking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("worldgen");
+        std::fs::create_dir_all(root.join("prefabs")).expect("create prefabs dir");
+        std::fs::create_dir_all(root.join("villages")).expect("create villages dir");
+        for name in ["plains_hub.toml", "small_house.toml", "wheat_farm.toml"] {
+            std::fs::copy(
+                source.join("prefabs").join(name),
+                root.join("prefabs").join(name),
+            )
+            .expect("copy prefab fixture");
+        }
+        let plains = std::fs::read_to_string(source.join("villages/plains.toml"))
+            .expect("read reference definition");
+        let broken = plains.replace("hub = \"plains_hub\"", "hub = \"missing_hub\"");
+        assert_ne!(broken, plains, "fixture must rename the hub");
+        std::fs::write(root.join("villages/plains.toml"), broken)
+            .expect("write broken hub definition");
+
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("leg=catalog prefabs=3 villages=0 diagnostics=1") }),
+            "the broken hub must be reported as a diagnostic: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("village_demo: warning worldgen/villages/plains.toml: ")
+                    && line.contains("hub prefab 'missing_hub'")
+            }),
+            "expected the missing-hub warning: {lines:?}"
+        );
     }
 
     #[test]
