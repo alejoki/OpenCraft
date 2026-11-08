@@ -13404,6 +13404,7 @@ impl ApplicationHandler for GameApp {
                             camera: vista_camera,
                             render_distance: self.background.world.render_distance(),
                             target_block: None,
+                            selection_box: None,
                             selected_slot: self.session.player.selected_slot(),
                         },
                         FramePresentation {
@@ -13453,6 +13454,7 @@ impl ApplicationHandler for GameApp {
                             camera: &self.session.camera,
                             render_distance: self.session.world.render_distance(),
                             target_block,
+                            selection_box: None,
                             selected_slot: self.session.player.selected_slot(),
                         },
                         FramePresentation {
