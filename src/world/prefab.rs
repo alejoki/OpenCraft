@@ -770,7 +770,7 @@ fn read_prefab_file(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| PrefabError::InvalidToml.to_string())
 }
 
-fn validate_prefab_name(name: &str) -> Result<(), PrefabError> {
+pub(crate) fn validate_prefab_name(name: &str) -> Result<(), PrefabError> {
     if name.len() > 64 {
         return Err(PrefabError::NameTooLong);
     }

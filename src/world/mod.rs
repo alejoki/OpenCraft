@@ -1,6 +1,7 @@
 pub mod arrow;
 pub mod background;
 pub mod block;
+pub mod capture;
 pub mod catalog;
 pub mod catalog_fs;
 pub mod chunk;
