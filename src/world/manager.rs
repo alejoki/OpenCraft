@@ -3566,6 +3566,11 @@ mod tests {
         use crate::settings::DEFAULT_RENDER_DISTANCE;
         use std::time::{Duration, Instant};
 
+        // Serialise against the village-enabled twin below: both measure the
+        // main-thread dispatch cost while the shared rayon pool runs light and
+        // mesh jobs, and a concurrent tenant would poison both distributions.
+        let _guard = lock_heavy_streaming();
+
         // More than the 32-chunk minimum crossing in the slice plan.
         const STEPS: usize = 40;
         const P95_BUDGET: Duration = Duration::from_millis(8);
@@ -3698,6 +3703,241 @@ mod tests {
         assert!(
             max <= MAX_BUDGET,
             "max update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: {sorted:?}",
+            max.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// Village-enabled twin of [`streaming_budget`] (M015/S03-T05).
+    ///
+    /// The M007 dispatch harness measures a catalog-less manager. This one
+    /// installs the accepted checked-in village catalog and the cached seed-14
+    /// spawn column, then crosses the same 40 chunks at the same release
+    /// profile, so any per-chunk cost the village plan adds to the frame-thread
+    /// dispatch path shows up in the distribution. The negative control counts
+    /// plan cells that actually landed in resident chunks, so a village-free
+    /// measurement cannot green the budget claim.
+    ///
+    /// Release-only and ignored: run it two or three times on an idle machine
+    /// and record the whole distribution, not one lucky retry.
+    ///
+    /// ```text
+    /// cargo test --locked --release --lib -- --ignored streaming_budget_villages --nocapture
+    /// ```
+    #[test]
+    #[ignore = "release-only village frame-time harness: cargo test --locked --release --lib -- --ignored streaming_budget_villages"]
+    fn streaming_budget_villages() {
+        use crate::settings::DEFAULT_RENDER_DISTANCE;
+        use std::time::{Duration, Instant};
+
+        // Same crossing length as the catalog-less harness: more than the
+        // 32-chunk minimum crossing in the slice plan.
+        const STEPS: usize = 40;
+        const P95_BUDGET: Duration = Duration::from_millis(8);
+        const MAX_BUDGET: Duration = Duration::from_millis(16);
+        const SEED: u32 = VILLAGE_MANAGER_SEED;
+        const CELLS_FLOOR: usize = 1000;
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "streaming_budget_villages measures release timings: rerun with \
+                 `cargo test --locked --release --lib -- --ignored streaming_budget_villages`"
+            );
+        }
+
+        // Serialise against `streaming_budget` and the other heavy harnesses:
+        // light jobs saturate the global rayon pool.
+        let _guard = lock_heavy_streaming();
+
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(Path::new(WORLDGEN_DIR));
+        assert!(
+            diagnostics.is_empty(),
+            "village diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(catalog.len(), 1, "the checked-in catalog has one village");
+        let catalog = Arc::new(catalog);
+        let spawn = find_spawn_column(SEED);
+
+        // Seed 14, not `WorldManager::new`'s 1337 default: the installed plan
+        // and the generated terrain must share one seed for the negative
+        // control to see real village cells.
+        let mut mgr = WorldManager::with_seed_and_edits(
+            DEFAULT_RENDER_DISTANCE,
+            SEED,
+            ChunkEditMap::default(),
+        );
+        mgr.set_village_catalog(Arc::clone(&catalog), spawn);
+
+        // Warm up away from the village (cx -6..-4), so the initial ring is
+        // paid before measurement and the pinned village is not preloaded.
+        let warmup_center = ChunkPos::new(20, 0, 0);
+        let warmup_start = Instant::now();
+        let mut warmup_calls = 0usize;
+        let mut idle_polls = 0usize;
+        for _ in 0..2000 {
+            mgr.update_streaming(warmup_center, Season::Summer);
+            warmup_calls += 1;
+            if mgr.pending_gen.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+            {
+                idle_polls += 1;
+                if idle_polls >= 4 {
+                    break;
+                }
+            } else {
+                idle_polls = 0;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let warmup_elapsed = warmup_start.elapsed();
+
+        let mut samples: Vec<Duration> = Vec::with_capacity(STEPS);
+        let mut meshes_completed = 0usize;
+        for step in 1..=STEPS {
+            let center = ChunkPos::new(warmup_center.x - step as i32, 0, 0);
+            let t0 = Instant::now();
+            let (meshes, _unloaded) = mgr.update_streaming(center, Season::Summer);
+            samples.push(t0.elapsed());
+            meshes_completed += meshes.len();
+            // Roughly one frame of slack so background workers keep feeding
+            // the channels; only the main-thread call is timed.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Untimed settle pump: the crossing ends at x=-20 with the village
+        // (cx -6..-4) inside the render radius, so these frames stream the
+        // plan chunks the measured crossing merely dispatched.
+        let settle_center = ChunkPos::new(warmup_center.x - STEPS as i32, 0, 0);
+        for _ in 0..400 {
+            let (meshes, _) = mgr.update_streaming(settle_center, Season::Summer);
+            meshes_completed += meshes.len();
+            // `pending_gen` is part of the settle predicate here (unlike the
+            // catalog-less harness): the village chunks dispatched late in the
+            // crossing must be resident before the negative control counts
+            // plan cells. Light/mesh can be momentarily empty while a
+            // generation job is still in flight on the shared pool.
+            if mgr.pending_gen.is_empty()
+                && mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.dirty_mesh_queue.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Negative control: every plan cell resident in the manager must match
+        // the plan's block. A village-free run (missing catalog, dropped spawn
+        // column, wrong seed) would see plain terrain here and count ~0.
+        let plan = village_plan_with_spawn(VILLAGE_MANAGER_CELL, SEED, &catalog, spawn)
+            .expect("the pinned seed-14 village cell must plan");
+        let cs = CHUNK_SIZE as i32;
+        let plan_chunks: Vec<ChunkPos> = {
+            let mut positions = Vec::new();
+            for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+                for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                    for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        if !plan.cells_for_chunk(pos).is_empty() {
+                            positions.push(pos);
+                        }
+                    }
+                }
+            }
+            positions
+        };
+
+        // A slower machine can still be mid-ring after the fixed settle pump.
+        // Wait (untimed, bounded by wall clock) until every plan chunk is
+        // resident, so the count below describes the whole pinned village
+        // instead of whichever chunk happened to arrive first.
+        let plan_deadline = Instant::now() + Duration::from_secs(120);
+        while plan_chunks.iter().any(|pos| !mgr.chunks.contains_key(pos))
+            && Instant::now() < plan_deadline
+        {
+            let (meshes, _) = mgr.update_streaming(settle_center, Season::Summer);
+            meshes_completed += meshes.len();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let loaded_chunks = mgr.loaded_chunk_count();
+        let plan_chunk_count = plan_chunks.len();
+        let resident_plan_chunks = plan_chunks
+            .iter()
+            .filter(|pos| mgr.chunks.contains_key(*pos))
+            .count();
+        let mut village_cells = 0usize;
+        for &pos in &plan_chunks {
+            for cell in plan.cells_for_chunk(pos) {
+                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2]) == cell.block {
+                    village_cells += 1;
+                }
+            }
+        }
+
+        let mut sorted = samples.clone();
+        sorted.sort();
+        let pct = |p: f64| -> Duration {
+            let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+            sorted[idx]
+        };
+        let p50 = pct(0.50);
+        let p95 = pct(0.95);
+        let max = *sorted.last().expect("at least one measured step");
+        let mean_ms =
+            samples.iter().map(|d| d.as_secs_f64()).sum::<f64>() / samples.len() as f64 * 1000.0;
+
+        eprintln!(
+            "streaming_budget_villages: samples={} warmup_calls={} warmup={:.2}s \
+             p50={:.3}ms p95={:.3}ms max={:.3}ms mean={:.3}ms \
+             meshes={} loaded={} village_cells={} plan_chunks={} resident_plan_chunks={} \
+             targets: p95<={:.0}ms max<={:.0}ms (release, rd={})",
+            samples.len(),
+            warmup_calls,
+            warmup_elapsed.as_secs_f64(),
+            p50.as_secs_f64() * 1000.0,
+            p95.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            mean_ms,
+            meshes_completed,
+            loaded_chunks,
+            village_cells,
+            plan_chunk_count,
+            resident_plan_chunks,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
+            DEFAULT_RENDER_DISTANCE,
+        );
+
+        assert_eq!(samples.len(), STEPS, "every step must be timed");
+        assert!(
+            meshes_completed >= STEPS,
+            "only {meshes_completed} completed meshes over {STEPS} steps: the streaming \
+             pipeline did not run"
+        );
+        assert!(
+            loaded_chunks >= 1024,
+            "only {loaded_chunks} chunks resident after settling a {STEPS}-chunk crossing at \
+             rd={DEFAULT_RENDER_DISTANCE}: the harness did not exercise real streaming"
+        );
+        assert!(
+            village_cells >= CELLS_FLOOR,
+            "only {village_cells} resident cells match the pinned village plan (expected ~2962): \
+             this run measured village-free terrain, so its budget says nothing about villages"
+        );
+        assert!(
+            p95 <= P95_BUDGET,
+            "village-enabled p95 update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: \
+             {sorted:?}",
+            p95.as_secs_f64() * 1000.0,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            max <= MAX_BUDGET,
+            "village-enabled max update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: \
+             {sorted:?}",
             max.as_secs_f64() * 1000.0,
             MAX_BUDGET.as_secs_f64() * 1000.0,
         );
