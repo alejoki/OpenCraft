@@ -3,7 +3,8 @@
 //! Same purity contract as the other `src/ui` models: no winit event loop,
 //! GPU, `WorldManager`, session, clock, or write. The only outside read is the
 //! sorted scan of `root/prefabs/*.toml` used to pick a non-colliding default
-//! name in [`suggest_name`] — it never looks outside that directory.
+//! name in [`suggest_name`] (it reads stems plus header-declared names) — it
+//! never looks outside that directory.
 //!
 //! The state machine is deliberately separate from the in-game key handling
 //! (named `capture` so it cannot be confused with the settings menu's key
@@ -13,7 +14,6 @@
 //! The world write itself stays in `world::capture`.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 
 use glam::IVec3;
@@ -21,7 +21,7 @@ use winit::keyboard::KeyCode;
 
 use crate::ui::text_input::{TextInput, TextInputAction};
 use crate::world::capture::{region_from_corners, CaptureRegion};
-use crate::world::prefab::PREFABS_SUBDIR;
+use crate::world::prefab::prefab_identities;
 
 /// Maximum prefab name length accepted by the shared name rule.
 pub const CAPTURE_NAME_MAX_CHARS: usize = 64;
@@ -273,11 +273,31 @@ pub fn capture_key_action(
     }
 }
 
+/// Compose the one measured gameplay notice line.
+///
+/// The editable prompt keeps precedence over the transient message, but when
+/// both are present the message is appended after ` | ` instead of being
+/// suppressed. That is what keeps a failed capture's [`CaptureError`] reason
+/// readable while the prompt stays on screen for a retry. `None` means this
+/// frame draws no notice at all.
+///
+/// [`CaptureError`]: crate::world::capture::CaptureError
+pub fn capture_notice_line(prompt: Option<&str>, message: Option<&str>) -> Option<String> {
+    match (prompt, message) {
+        (Some(prompt), Some(message)) => Some(format!("{prompt} | {message}")),
+        (Some(prompt), None) => Some(prompt.to_owned()),
+        (None, Some(message)) => Some(message.to_owned()),
+        (None, None) => None,
+    }
+}
+
 /// Pick the first free deterministic prefab name.
 ///
 /// Reads only `root/prefabs`; a missing or unreadable tree (and a `None`
-/// root) falls back to [`DEFAULT_CAPTURE_NAME`]. Existing `*.toml` stems are
-/// collected sorted, then `capture`, `capture_2`, `capture_3`, ... is returned.
+/// root) falls back to [`DEFAULT_CAPTURE_NAME`]. Every claimed stem and every
+/// header-declared name is collected, then `capture`, `capture_2`,
+/// `capture_3`, ... is returned — so a renamed file that declares `capture`
+/// can never be suggested as a fresh target.
 pub fn suggest_name(root: Option<&Path>) -> String {
     let Some(root) = root else {
         return DEFAULT_CAPTURE_NAME.to_owned();
@@ -297,20 +317,13 @@ pub fn suggest_name(root: Option<&Path>) -> String {
     }
 }
 
-/// Collect the stems of every `*.toml` entry in `root/prefabs`.
+/// Collect every stem and declared name claimed in `root/prefabs`.
 fn existing_prefab_names(root: &Path) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    let Ok(entries) = fs::read_dir(root.join(PREFABS_SUBDIR)) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let path = Path::new(&file_name);
-        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-            names.insert(stem.to_owned());
+    for identity in prefab_identities(root) {
+        names.insert(identity.stem);
+        if let Some(declared) = identity.declared_name {
+            names.insert(declared);
         }
     }
     names
@@ -329,6 +342,8 @@ fn capture_character(character: char) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use crate::world::prefab::PREFABS_SUBDIR;
 
     use super::*;
 
@@ -670,5 +685,74 @@ mod tests {
         assert_eq!(capture.naming_value(), "my_house-2");
         assert_eq!(capture.key_action(KeyCode::Enter, None), CaptureKey::Submit);
         assert_eq!(capture.naming_value(), "my_house-2");
+    }
+
+    #[test]
+    fn notice_composition_keeps_the_prompt_and_adds_the_reason() {
+        use crate::world::capture::CaptureError;
+
+        // Prompt only: the measured line is byte-identical to prompt_line.
+        let prompt = "Name prefab: capture  [Enter] save  [Esc] cancel";
+        assert_eq!(
+            capture_notice_line(Some(prompt), None).as_deref(),
+            Some(prompt)
+        );
+
+        // Message only: a plain transient notice passes through untouched.
+        assert_eq!(
+            capture_notice_line(None, Some("Chest closed")).as_deref(),
+            Some("Chest closed")
+        );
+
+        // Prompt + captured failure: the prompt stays the editable prefix and
+        // the CaptureError Display reason is appended (never suppressed).
+        let error = CaptureError::UnloadedChunk {
+            pos: crate::world::chunk::ChunkPos::new(-1, 2, 3),
+        };
+        let composed = capture_notice_line(Some(prompt), Some(&error.to_string()))
+            .expect("prompt and reason compose");
+        assert!(composed.starts_with(prompt), "{composed}");
+        assert!(
+            composed.contains(&error.to_string()),
+            "the CaptureError Display reason must be readable: {composed}"
+        );
+        assert_eq!(composed, format!("{prompt} | {error}"));
+
+        // Success reset: the prompt is gone, so the saved line stands alone.
+        let saved = "saved prefab 'capture' to worldgen/prefabs/capture.toml";
+        assert_eq!(
+            capture_notice_line(None, Some(saved)).as_deref(),
+            Some(saved)
+        );
+
+        // Neither line: no notice is drawn.
+        assert_eq!(capture_notice_line(None, None), None);
+    }
+
+    #[test]
+    fn suggest_name_never_proposes_a_declared_name_collision() {
+        let temp = temp_root();
+        let prefabs = temp.path().join(PREFABS_SUBDIR);
+        fs::create_dir_all(&prefabs).expect("prefabs dir");
+        // A renamed file whose header claims the default name: its stem is
+        // free, but `capture` is already taken by declaration.
+        fs::write(
+            prefabs.join("renamed.toml"),
+            br###"format = 1
+name = "capture"
+origin = [0, 0, 0]
+size = [2, 1, 1]
+
+layers = [
+  [ "##" ],
+]
+
+[palette]
+"#" = "stone"
+"###,
+        )
+        .expect("write renamed prefab");
+
+        assert_eq!(suggest_name(Some(temp.path())), "capture_2");
     }
 }

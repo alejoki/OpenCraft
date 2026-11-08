@@ -568,6 +568,75 @@ struct PrefabFile {
     outcome: Result<Prefab, String>,
 }
 
+/// One identity claimed by an existing `root/prefabs/*.toml` entry.
+///
+/// A capture must not overwrite either the target stem or a name declared in
+/// another file's header; the two are reported separately so a refusal can
+/// name the file that actually owns the claimed name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefabIdentity {
+    /// Raw file name including the `.toml` extension.
+    pub file_name: String,
+    /// File stem (`capture` for `capture.toml`); always present.
+    pub stem: String,
+    /// Whether the entry is a regular file. A directory named like a prefab
+    /// still claims a prefill stem but must not be treated as a colliding
+    /// file by the write path, which reports `is a directory` instead.
+    pub is_regular_file: bool,
+    /// Header-declared `name` when the file parses as a valid prefab.
+    pub declared_name: Option<String>,
+}
+
+/// Scan `root/prefabs` for every identity a new capture could collide with.
+///
+/// Read-only and fail-soft: a missing/unreadable directory yields no
+/// identities, every `.toml` entry contributes its stem (including a
+/// directory whose name looks like a prefab, preserving the prefill policy),
+/// and a regular file that parses also contributes its declared header name.
+/// Entries are returned in raw file-name order so any first-match refusal is
+/// deterministic.
+pub fn prefab_identities(root: &Path) -> Vec<PrefabIdentity> {
+    let dir = root.join(PREFABS_SUBDIR);
+    let Ok(read_dir) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<_> = read_dir.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut identities = Vec::new();
+    for entry in entries {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let path = Path::new(&file_name);
+        if path.extension().and_then(OsStr::to_str) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
+            continue;
+        };
+        let metadata = entry.path().metadata().ok();
+        let is_regular_file = metadata
+            .as_ref()
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        let declared_name = if is_regular_file {
+            read_prefab_file(&entry.path())
+                .ok()
+                .and_then(|text| parse_prefab(&text).ok())
+                .map(|prefab| prefab.name)
+        } else {
+            None
+        };
+        identities.push(PrefabIdentity {
+            file_name,
+            stem,
+            is_regular_file,
+            declared_name,
+        });
+    }
+    identities
+}
+
 /// A name-sorted, fail-soft collection of prefabs loaded from disk.
 ///
 /// [`PrefabCatalog::load_sorted`] never fails: every unreadable, oversize or

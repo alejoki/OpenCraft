@@ -309,6 +309,73 @@ fn two_clean_runs_are_byte_identical() {
     );
 }
 
+#[test]
+fn second_run_in_the_same_directory_prefills_capture_2_and_keeps_the_tree_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let first = run_in(dir.path(), &["--demo-capture", "."]);
+    assert_eq!(first.status.code(), Some(0), "{}", report(&first));
+    assert_eq!(stdout_lines(&first), CLEAN_LINES, "{}", report(&first));
+    let first_bytes = std::fs::read(dir.path().join("prefabs/capture.toml")).expect("first prefab");
+
+    // A reused directory is idempotent at the tree level: the next free name
+    // is `capture_2`, the original file stays byte-identical, and the leg
+    // still passes because the tree has zero errors and accepts the captured
+    // name. `prefabs` is therefore intentionally not pinned to one.
+    let second = run_in(dir.path(), &["--demo-capture", "."]);
+    assert_eq!(second.status.code(), Some(0), "{}", report(&second));
+    let lines = stdout_lines(&second);
+    let write = write_line(&lines);
+    assert_eq!(field(write, "name="), "capture_2");
+    assert_eq!(field(write, "path="), "prefabs/capture_2.toml");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "capture_demo: leg=validate ok=true prefabs=2 errors=0"),
+        "the second run must validate both prefabs: {}",
+        report(&second)
+    );
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("capture_demo: ok=true")
+    );
+
+    let second_path = dir.path().join("prefabs/capture_2.toml");
+    assert_eq!(
+        field(write, "bytes="),
+        std::fs::read(&second_path)
+            .expect("second prefab")
+            .len()
+            .to_string(),
+        "the digest byte count must describe the file that was written"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("prefabs/capture.toml")).expect("first prefab"),
+        first_bytes,
+        "a reused directory must never rewrite the first prefab"
+    );
+
+    let parsed = opencraft::world::prefab::parse_prefab(
+        &std::fs::read_to_string(&second_path).expect("read second prefab"),
+    )
+    .expect("capture_2 parses");
+    assert_eq!(parsed.name, "capture_2");
+    assert_eq!(parsed.size, [5, 4, 5]);
+
+    let validate = run_in(dir.path(), &["--validate-worldgen", "."]);
+    assert_eq!(validate.status.code(), Some(0), "{}", report(&validate));
+    assert_eq!(
+        stdout_lines(&validate),
+        vec![
+            "ok: prefab capture".to_owned(),
+            "ok: prefab capture_2".to_owned(),
+            "validate-worldgen: 2 prefabs, 0 errors, 0 warnings".to_owned(),
+        ],
+        "{}",
+        report(&validate)
+    );
+}
+
 /// Guard against an accidentally relative binary path in future refactors.
 #[allow(dead_code)]
 fn _binary_is_absolute() {

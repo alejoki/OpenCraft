@@ -29,8 +29,8 @@ use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos, CHUNK_SIZE};
 use crate::world::manager::{WorldManager, MAX_CHUNK_Y, MIN_CHUNK_Y};
 use crate::world::prefab::{
-    parse_prefab, validate_prefab_name, Prefab, PrefabBlock, PrefabError, PREFABS_SUBDIR,
-    PREFAB_CAPS, WORLDGEN_DIR,
+    parse_prefab, prefab_identities, validate_prefab_name, Prefab, PrefabBlock, PrefabError,
+    PREFABS_SUBDIR, PREFAB_CAPS, WORLDGEN_DIR,
 };
 
 /// Lowest valid world block row (`MIN_CHUNK_Y * CHUNK_SIZE`).
@@ -254,6 +254,11 @@ pub fn write_prefab(root: &Path, prefab: &Prefab) -> Result<PathBuf, CaptureErro
 /// first unloaded chunk, name rule, collision, extraction, serialization
 /// self-check, `create_dir_all`, one `fs::write`. Every failure returns before
 /// any write; a collision leaves the existing file byte-identical.
+///
+/// The collision preflight covers both the target file stem and every header
+/// `name` declared by an existing valid prefab, so a renamed file such as
+/// `renamed.toml` declaring `name = "capture"` can never be silently shadowed
+/// or duplicated by a new `capture.toml`.
 pub fn capture_to_file(
     root: &Path,
     name: &str,
@@ -265,12 +270,13 @@ pub fn capture_to_file(
     validate_region(world, &region)?;
     validate_prefab_name(name).map_err(CaptureError::InvalidName)?;
 
-    let file = logical_file(name);
-    let target = root.join(PREFABS_SUBDIR).join(format!("{name}.toml"));
-    if target.is_file() {
+    if let Some(identity) = prefab_identities(root).into_iter().find(|identity| {
+        identity.is_regular_file
+            && (identity.stem == name || identity.declared_name.as_deref() == Some(name))
+    }) {
         return Err(CaptureError::AlreadyExists {
             name: name.to_owned(),
-            file,
+            file: format!("{WORLDGEN_DIR}/{PREFABS_SUBDIR}/{}", identity.file_name),
         });
     }
 
@@ -636,6 +642,85 @@ mod tests {
         assert_eq!(
             fs::read(&existing).expect("existing file readable"),
             b"format = 1\nname = \"capture\"\n"
+        );
+    }
+
+    #[test]
+    fn declared_name_collision_refuses_and_leaves_the_tree_untouched() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefabs = temp.path().join(PREFABS_SUBDIR);
+        fs::create_dir_all(&prefabs).expect("create prefabs");
+        // `renamed.toml` has a free stem but its header claims `capture`.
+        let declared = Prefab {
+            name: "capture".to_owned(),
+            origin: [0, 0, 0],
+            size: [1, 1, 1],
+            blocks: vec![PrefabBlock {
+                position: [0, 0, 0],
+                block: BlockId::Stone,
+            }],
+            sockets: Vec::new(),
+        };
+        let existing = prefabs.join("renamed.toml");
+        fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
+        let before = snapshot(temp.path());
+
+        let world = resident_world(&house_region(), BlockId::Stone);
+        let error = capture_to_file(
+            temp.path(),
+            "capture",
+            &world,
+            IVec3::new(0, 40, 0),
+            IVec3::new(4, 43, 4),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CaptureError::AlreadyExists {
+                name: "capture".to_owned(),
+                file: "worldgen/prefabs/renamed.toml".to_owned(),
+            }
+        );
+        assert_eq!(snapshot(temp.path()), before, "nothing may be written");
+        assert!(!prefabs.join("capture.toml").exists());
+    }
+
+    #[test]
+    fn declared_name_scan_still_allows_a_distinct_name_and_keeps_the_tree_valid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefabs = temp.path().join(PREFABS_SUBDIR);
+        fs::create_dir_all(&prefabs).expect("create prefabs");
+        let declared = Prefab {
+            name: "capture".to_owned(),
+            origin: [0, 0, 0],
+            size: [1, 1, 1],
+            blocks: vec![PrefabBlock {
+                position: [0, 0, 0],
+                block: BlockId::Stone,
+            }],
+            sockets: Vec::new(),
+        };
+        fs::write(prefabs.join("renamed.toml"), declared.to_toml_string())
+            .expect("write renamed prefab");
+
+        let world = resident_world(&house_region(), BlockId::Stone);
+        let (path, _) = capture_to_file(
+            temp.path(),
+            "capture_2",
+            &world,
+            IVec3::new(0, 40, 0),
+            IVec3::new(4, 43, 4),
+        )
+        .expect("a distinct name is still free");
+        assert_eq!(path, prefabs.join("capture_2.toml"));
+
+        let (lines, ok) = validate_worldgen_lines(temp.path());
+        assert!(ok, "the tree must keep validating: {lines:?}");
+        assert!(lines.contains(&"ok: prefab capture_2".to_owned()));
+        assert!(lines.contains(&"ok: prefab capture".to_owned()));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("validate-worldgen: 2 prefabs, 0 errors, 0 warnings")
         );
     }
 

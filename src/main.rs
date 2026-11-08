@@ -52,7 +52,7 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
-use opencraft::ui::capture::{CaptureKey, CornerOutcome, PrefabCapture};
+use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
     hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
@@ -11462,7 +11462,11 @@ impl ApplicationHandler for GameApp {
                         KeyCode::KeyP if pressed && !event.repeat => {
                             if let Some(corner) = try_capture_corner(&self.session) {
                                 if let CornerOutcome::Ready(_) = self.capture.press_corner(corner) {
-                                    self.capture.begin_naming(self.worldgen_root.as_deref());
+                                    if self.capture.begin_naming(self.worldgen_root.as_deref()) {
+                                        // A stale transient notice must not accompany
+                                        // the fresh prompt; only a failed save adds one.
+                                        self.game_message = None;
+                                    }
                                 }
                             }
                         }
@@ -11573,6 +11577,11 @@ impl ApplicationHandler for GameApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Prefab capture prompt owns the wheel while naming (M015/S05):
+                // no hotbar or palette scroll may change the pending region.
+                if self.capture.is_naming() {
+                    return;
+                }
                 // Route-before-gameplay: while a screen is open the wheel is
                 // consumed — the hotbar is gameplay state and no screen has
                 // a scroll action in this slice. Both gameplay panels consume
@@ -11618,6 +11627,20 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05): clear all pointer holds and partial progress so
+                // no release can finish a mining, eating, bow or drag gesture
+                // that started before the prompt.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Palette release (S07-T03): the screen never transfers a
                 // stack on release, but clearing every hold keeps a press
                 // that started outside from surviving the close.
@@ -11726,6 +11749,19 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Right,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05): a release must not fire a charged bow, finish a
+                // meal, or leave a hold live behind the prompt.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Palette release (S07-T03): consume before `release_bow`, so
                 // a right press that never armed a draw cannot fire an arrow
                 // out of the palette.
@@ -11773,6 +11809,21 @@ impl ApplicationHandler for GameApp {
                 button,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05). This gate precedes the screen, palette, inventory,
+                // chest and gameplay press routing, so no click can mine, place,
+                // eat, draw a bow, open a station, or edit the world behind the
+                // prompt; holds and drag state are cleared like a panel gate.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Route-before-gameplay (S02-T02): while any screen is open
                 // the cursor is released and every click belongs to that
                 // screen — the settings screen through its existing
@@ -12971,11 +13022,12 @@ impl ApplicationHandler for GameApp {
                     // the transient notice: the editable name line must never
                     // be hidden by an unrelated message while the prompt owns
                     // the keyboard. Both share the one measured line.
-                    let notice_text = self.capture.prompt_line().or_else(|| {
+                    let notice_text = capture_notice_line(
+                        self.capture.prompt_line().as_deref(),
                         self.game_message
                             .as_ref()
-                            .map(|message| message.text.clone())
-                    });
+                            .map(|message| message.text.as_str()),
+                    );
                     if let Some(text) = notice_text {
                         let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                         gpu.menu_text.update(
@@ -13677,6 +13729,12 @@ impl ApplicationHandler for GameApp {
             // physical-pixel cursor position, or None once it leaves the
             // window. winit 0.30 delivers PhysicalPosition<f64>.
             WindowEvent::CursorMoved { position, .. } => {
+                // Prefab capture prompt freezes pointer movement (M015/S05):
+                // looking or clicking must not alter the pending region. The
+                // actual camera look is gated in `device_event`.
+                if self.capture.is_naming() {
+                    return;
+                }
                 self.cursor_pos = Some((position.x as f32, position.y as f32));
             }
             WindowEvent::CursorLeft { .. } => {
@@ -13693,6 +13751,11 @@ impl ApplicationHandler for GameApp {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
+            // Prefab capture prompt owns the mouse while naming (M015/S05):
+            // camera look cannot continue behind the prompt.
+            if self.capture.is_naming() {
+                return;
+            }
             if self.cursor_grabbed {
                 // Settings-driven sensitivity (S04-T04): the loaded value,
                 // already clamped at load; menu adjustments clamp via the
@@ -16033,12 +16096,17 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
 
     // Run the real `--validate-worldgen` report over the demo root. Counting
     // the accepted/error lines keeps the digest independent of the summary
-    // wording while still proving exactly one clean prefab.
+    // wording; the leg passes when the tree is error-free and the validator
+    // accepted the name actually captured (a reused directory legitimately
+    // holds more than one prefab).
     let (validate_lines, validate_ok) = opencraft::world::prefab::validate_worldgen_lines(root);
     let prefabs = validate_lines
         .iter()
         .filter(|line| line.starts_with("ok: prefab "))
         .count();
+    let captured_ok = validate_lines
+        .iter()
+        .any(|line| line == &format!("ok: prefab {name}"));
     let errors = validate_lines
         .iter()
         .filter(|line| line.starts_with("error: "))
@@ -16046,7 +16114,7 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
     lines.push(format!(
         "capture_demo: leg=validate ok={validate_ok} prefabs={prefabs} errors={errors}"
     ));
-    if !validate_ok || prefabs != 1 || errors != 0 {
+    if !validate_ok || !captured_ok || errors != 0 {
         failed.get_or_insert("validate");
     }
 
@@ -25750,6 +25818,141 @@ stack = 64
         assert!(
             keyp < pause && escape_capture < pause,
             "KeyP and the capture Escape must precede the global Pause arm"
+        );
+    }
+
+    #[test]
+    fn capture_failure_keeps_the_prompt_and_composes_the_error_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            74,
+            dir.path().join("capture-failure.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+
+        // Force the collision after the prefill chose the name: the refusal
+        // must keep the prompt and expose the real CaptureError reason.
+        let prefabs = root.join("prefabs");
+        std::fs::create_dir_all(&prefabs).expect("create prefabs");
+        let existing = prefabs.join("capture.toml");
+        std::fs::write(&existing, b"format = 1\nname = \"capture\"\n").expect("write existing");
+        let before = std::fs::read(&existing).expect("read existing");
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), "capture");
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        let error = opencraft::world::capture::CaptureError::AlreadyExists {
+            name: "capture".to_owned(),
+            file: "worldgen/prefabs/capture.toml".to_owned(),
+        };
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains(&error.to_string()),
+            "the composed line must carry the CaptureError Display reason: {composed}"
+        );
+        assert_eq!(
+            std::fs::read(&existing).expect("read existing"),
+            before,
+            "a refused capture leaves the colliding file byte-identical"
+        );
+        assert!(
+            !prefabs.join("capture_2.toml").exists(),
+            "a refused capture writes nothing"
+        );
+    }
+
+    #[test]
+    fn capture_naming_gate_precedes_gameplay_mouse_handling() {
+        let src = include_str!("main.rs");
+        let naming_gate = "if self.capture.is_naming() {";
+
+        // Wheel: the gate sits inside the arm before the hotbar/palette scroll.
+        let wheel_arm = src
+            .find("WindowEvent::MouseWheel { delta, .. } =>")
+            .expect("the wheel arm is present");
+        let wheel_gate = src[wheel_arm..]
+            .find(naming_gate)
+            .map(|offset| wheel_arm + offset)
+            .expect("the wheel arm must gate naming first");
+        let wheel_scroll = src
+            .find("self.session.player.select_relative(step)")
+            .expect("the hotbar scroll is present");
+        assert!(
+            wheel_gate < wheel_scroll,
+            "the naming gate must precede hotbar scrolling"
+        );
+
+        // Press: the gate sits inside the Pressed arm before gameplay routing.
+        let press_arm = src
+            .find("WindowEvent::MouseInput {\n                state: ElementState::Pressed,")
+            .expect("the press arm is present");
+        let press_gate = src[press_arm..]
+            .find(naming_gate)
+            .map(|offset| press_arm + offset)
+            .expect("the press arm must gate naming first");
+        let right_click = src
+            .find("right_click_interaction(&mut self.session)")
+            .expect("the gameplay right-click path is present");
+        assert!(
+            press_gate > press_arm && press_gate < right_click,
+            "the naming gate must precede mining/placing/station interaction"
+        );
+
+        // Look: the device-event gate sits before the yaw/pitch update.
+        let device = src
+            .find("fn device_event(")
+            .expect("main.rs must define device_event");
+        let look_gate = src[device..]
+            .find(naming_gate)
+            .map(|offset| device + offset)
+            .expect("device_event must gate naming look");
+        let yaw = src
+            .find("self.session.player.yaw +=")
+            .expect("the mouse-look yaw update is present");
+        assert!(
+            look_gate < yaw,
+            "the naming gate must precede camera mouse-look"
+        );
+
+        // Cursor plumbing: the gate sits before the position update so the
+        // pointer cannot drive the world UI while naming.
+        let cursor_arm = src
+            .find("WindowEvent::CursorMoved { position, .. } =>")
+            .expect("the cursor arm is present");
+        let cursor_gate = src[cursor_arm..]
+            .find(naming_gate)
+            .map(|offset| cursor_arm + offset)
+            .expect("the cursor arm must gate naming first");
+        let cursor_store = src
+            .find("self.cursor_pos = Some((position.x as f32, position.y as f32));")
+            .expect("the cursor store is present");
+        assert!(
+            cursor_gate < cursor_store,
+            "the naming gate must precede cursor position handling"
         );
     }
 
