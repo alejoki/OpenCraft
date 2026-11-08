@@ -37,7 +37,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::world::block::BlockId;
-use crate::world::chunk::{ChunkPos, CHUNK_SIZE};
+use crate::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 use crate::world::prefab::{Direction, Prefab, PrefabCatalog, MAX_PREFAB_FILE_BYTES, WORLDGEN_DIR};
 use crate::world::terrain::{
     biome_at_seeded, find_spawn_column, ruin_covers, terrain_height_at_seeded, Biome, BEACH_BAND,
@@ -844,14 +844,82 @@ impl VillageCatalog {
         let Some(site) = self.site(cell, seed) else {
             return false;
         };
-        let chunk_min_x = pos.x * CHUNK_SIZE as i32;
-        let chunk_max_x = chunk_min_x + CHUNK_SIZE as i32 - 1;
-        let chunk_min_z = pos.z * CHUNK_SIZE as i32;
-        let chunk_max_z = chunk_min_z + CHUNK_SIZE as i32 - 1;
-        chunk_max_x >= site.anchor[0] - VILLAGE_MAX_RADIUS
-            && chunk_min_x <= site.anchor[0] + VILLAGE_MAX_RADIUS
-            && chunk_max_z >= site.anchor[1] - VILLAGE_MAX_RADIUS
-            && chunk_min_z <= site.anchor[1] + VILLAGE_MAX_RADIUS
+        chunk_intersects_anchor_radius(pos, site.anchor)
+    }
+}
+
+/// Whether a chunk's x/z span intersects the `VILLAGE_MAX_RADIUS` box around
+/// `anchor`.
+///
+/// Shared by [`VillageCatalog::chunk_may_hold_village`] (the affordable pre-
+/// plan gate) and [`place_village_cells`] (the emission-time early return), so
+/// the two cannot disagree about which chunks are worth a plan.
+fn chunk_intersects_anchor_radius(pos: ChunkPos, anchor: [i32; 2]) -> bool {
+    let chunk_min_x = pos.x * CHUNK_SIZE as i32;
+    let chunk_max_x = chunk_min_x + CHUNK_SIZE as i32 - 1;
+    let chunk_min_z = pos.z * CHUNK_SIZE as i32;
+    let chunk_max_z = chunk_min_z + CHUNK_SIZE as i32 - 1;
+    chunk_max_x >= anchor[0] - VILLAGE_MAX_RADIUS
+        && chunk_min_x <= anchor[0] + VILLAGE_MAX_RADIUS
+        && chunk_max_z >= anchor[1] - VILLAGE_MAX_RADIUS
+        && chunk_min_z <= anchor[1] + VILLAGE_MAX_RADIUS
+}
+
+/// Write this chunk's share of the village plan into `chunk`.
+///
+/// Called by `terrain::generate_chunk_with_context` as the final generation
+/// pass. Pure in `(pos, seed, catalog, spawn_column)`: it never reads a
+/// neighbour chunk, keeps no state and ignores the season.
+///
+/// The early returns are deliberately conservative and cheap, in this order:
+/// 1. the chunk's own cell has no site;
+/// 2. the chunk does not intersect the anchor radius box;
+/// 3. the whole cell has no plan (gated out, unfit root, or too close to
+///    spawn);
+/// 4. the plan's exact bounds miss this chunk.
+///
+/// Only then is the plan materialized for this chunk. Every emitted cell is
+/// asserted to belong to `pos` in debug builds.
+pub(crate) fn place_village_cells(
+    chunk: &mut Chunk,
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn_column: Option<(i32, i32)>,
+) {
+    let cell = village_cell_at(pos.x * CHUNK_SIZE as i32, pos.z * CHUNK_SIZE as i32);
+    let Some(site) = catalog.site(cell, seed) else {
+        return;
+    };
+    if !chunk_intersects_anchor_radius(pos, site.anchor) {
+        return;
+    }
+    let spawn = spawn_column.unwrap_or_else(|| find_spawn_column(seed));
+    let Some(plan) = village_plan_with_spawn(site.cell, seed, catalog, spawn) else {
+        return;
+    };
+    if !plan.bounds.intersects_chunk(pos) {
+        return;
+    }
+
+    let chunk_size = CHUNK_SIZE as i32;
+    for block in plan.cells_for_chunk(pos) {
+        let [wx, wy, wz] = block.world;
+        debug_assert_eq!(
+            ChunkPos::new(
+                wx.div_euclid(chunk_size),
+                wy.div_euclid(chunk_size),
+                wz.div_euclid(chunk_size),
+            ),
+            pos,
+            "village plan emitted a cell outside the chunk being generated"
+        );
+        chunk.set(
+            wx.rem_euclid(chunk_size) as usize,
+            wy.rem_euclid(chunk_size) as usize,
+            wz.rem_euclid(chunk_size) as usize,
+            block.block,
+        );
     }
 }
 
