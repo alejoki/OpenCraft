@@ -13,7 +13,8 @@ use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPo
 use crate::world::light::{self, LightGrid};
 use crate::world::persistence::ChunkEditMap;
 use crate::world::season::Season;
-use crate::world::terrain::{generate_chunk_seeded_with, DEFAULT_WORLD_SEED};
+use crate::world::terrain::{generate_chunk_with_context, WorldGenContext, DEFAULT_WORLD_SEED};
+use crate::world::village::VillageCatalog;
 
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
@@ -82,6 +83,21 @@ pub struct WorldManager {
     /// an empty slice, which makes generation byte-identical to the built-in
     /// `generate_chunk_seeded` path.
     worldgen_rules: Arc<[WorldgenRule]>,
+    /// Accepted village catalog generation plans against, when the session
+    /// installed one. Shared behind `Arc` for the same reason as `block_faces`
+    /// and `worldgen_rules`: every generation job clones a pointer, never the
+    /// catalog. `None` reproduces the pre-M015 generator exactly.
+    village_catalog: Option<Arc<VillageCatalog>>,
+    /// World column of the projected spawn, cached once by the session.
+    ///
+    /// The village planner needs it to reject plans inside
+    /// `VILLAGE_SPAWN_EXCLUSION`, and deriving it runs the bounded 512-ring
+    /// `find_spawn_column` land search. That search must never run on a rayon
+    /// worker (or once per chunk), so this is supplied at install time and
+    /// only copied per job. `None` together with a catalog makes generation
+    /// fall back to the planner's own bounded search, which is what a caller
+    /// that never installed a spawn column asked for.
+    village_spawn_column: Option<(i32, i32)>,
 }
 
 /// Result of one rayon sky-light job. Produced entirely off the frame thread;
@@ -153,6 +169,23 @@ const PENDING_GEN_CAP: usize = 96;
 /// remeshing the whole world in one frame.
 const SEASON_ROLLOVER_BUDGET: usize = 32;
 
+/// Build the one [`WorldGenContext`] both production dispatch sites use.
+///
+/// Extracted so the initial-load and season-rollover closures cannot drift
+/// apart: a rollover missing the catalog would silently erase villages on the
+/// first season change.
+fn gen_context<'a>(
+    rules: &'a [WorldgenRule],
+    villages: Option<&'a VillageCatalog>,
+    spawn_column: Option<(i32, i32)>,
+) -> WorldGenContext<'a> {
+    WorldGenContext {
+        rules,
+        villages,
+        spawn_column,
+    }
+}
+
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     // One extra ring beyond render_distance supplied the 6 face neighbours for
     // meshing. Meshing now also needs sky light in the 3x3 column neighborhood
@@ -217,6 +250,8 @@ impl WorldManager {
             season_rollover_inflight: FxHashSet::default(),
             block_faces: BlockFaces::builtin(),
             worldgen_rules: Arc::from([]),
+            village_catalog: None,
+            village_spawn_column: None,
         }
     }
 
@@ -249,6 +284,37 @@ impl WorldManager {
     #[inline]
     pub fn worldgen_rules(&self) -> &Arc<[WorldgenRule]> {
         &self.worldgen_rules
+    }
+
+    /// Replaces the accepted village catalog used by every subsequent
+    /// generation, together with the world spawn column it plans against.
+    ///
+    /// Installed once at session construction, alongside
+    /// [`Self::set_block_faces`] and [`Self::set_worldgen_rules`], before any
+    /// chunk is generated; the session boundary is the only supported swap.
+    /// The same installation must be repeated at every create/load swap, or the
+    /// first season rollover would regenerate village chunks without the
+    /// catalog and silently erase every village.
+    ///
+    /// `spawn_column` is the cached projected spawn (the session derives it
+    /// once); it is never recomputed per chunk or on a rayon worker. Without a
+    /// catalog it is inert. A `None` catalog reproduces the pre-M015 generator
+    /// exactly.
+    pub fn set_village_catalog(&mut self, catalog: Arc<VillageCatalog>, spawn_column: (i32, i32)) {
+        self.village_catalog = Some(catalog);
+        self.village_spawn_column = Some(spawn_column);
+    }
+
+    /// The village catalog this manager generates against, if one was installed.
+    #[inline]
+    pub fn village_catalog(&self) -> Option<&Arc<VillageCatalog>> {
+        self.village_catalog.as_ref()
+    }
+
+    /// The cached world spawn column generation plans villages against.
+    #[inline]
+    pub fn village_spawn_column(&self) -> Option<(i32, i32)> {
+        self.village_spawn_column
     }
 
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
@@ -1079,11 +1145,19 @@ impl WorldManager {
             self.pending_gen.insert(pos);
             self.season_rollover_inflight.insert(pos);
             let tx = self.gen_tx.clone();
-            // The seasonal replacement must use the same pack rules as the
-            // first generation, or winter would silently erase authored ore.
+            // The seasonal replacement must use the same pack rules and the
+            // same village catalog as the first generation, or winter would
+            // silently erase authored ore and every village.
             let rules = Arc::clone(&self.worldgen_rules);
+            let catalog = self.village_catalog.clone();
+            let spawn = self.village_spawn_column;
             rayon::spawn(move || {
-                let chunk = generate_chunk_seeded_with(pos, seed, target, &rules);
+                let chunk = generate_chunk_with_context(
+                    pos,
+                    seed,
+                    target,
+                    &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                );
                 let _ = tx.send((pos, chunk));
             });
             dispatched += 1;
@@ -1301,6 +1375,13 @@ impl WorldManager {
         // Chunks generated while a wave is in flight must land in the target
         // season, or they would be stale the moment the wave drains.
         let gen_season = self.current_gen_season();
+        // Same context as the rollover dispatch: the rules and catalog are
+        // cloned once for the loop and once more per job (each job owns its
+        // inputs). A world that never installed a catalog simply carries
+        // `None` and an empty rule slice, matching the legacy seam.
+        let rules = Arc::clone(&self.worldgen_rules);
+        let catalog = self.village_catalog.clone();
+        let spawn = self.village_spawn_column;
         'spiral: for &(dx, dz) in &self.spiral_offsets {
             if self.pending_gen.len() >= PENDING_GEN_CAP || dispatched_gen >= 32 {
                 break;
@@ -1312,9 +1393,15 @@ impl WorldManager {
                 if !self.chunks.contains_key(&pos) && !self.pending_gen.contains(&pos) {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
-                    let rules = Arc::clone(&self.worldgen_rules);
+                    let rules = Arc::clone(&rules);
+                    let catalog = catalog.clone();
                     rayon::spawn(move || {
-                        let chunk = generate_chunk_seeded_with(pos, seed, gen_season, &rules);
+                        let chunk = generate_chunk_with_context(
+                            pos,
+                            seed,
+                            gen_season,
+                            &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                        );
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -1399,7 +1486,10 @@ impl WorldManager {
 mod tests {
     use super::*;
     use crate::world::block::BlockId;
-    use crate::world::terrain::generate_chunk_seeded;
+    use crate::world::prefab::WORLDGEN_DIR;
+    use crate::world::terrain::{find_spawn_column, generate_chunk_seeded};
+    use crate::world::village::{village_plan_with_spawn, VillageCell, VillagePlan};
+    use std::path::Path;
 
     /// Serialises the tests that depend on the shared global rayon pool. The
     /// ocean-crossing acceptance test deliberately saturates that pool (a full
@@ -3714,5 +3804,270 @@ mod tests {
             placed > 0,
             "the streamed chunks contain no cell authored by the installed ore rule"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M015/S03-T01: village context plumbing, spawn column cache and rollover
+    // -----------------------------------------------------------------------
+
+    const VILLAGE_MANAGER_SEED: u32 = 14;
+    const VILLAGE_MANAGER_CELL: VillageCell = VillageCell { x: -1, z: 0 };
+
+    /// The accepted checked-in catalog, guaranteed to load without diagnostics.
+    fn checked_in_village_catalog() -> VillageCatalog {
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(Path::new(WORLDGEN_DIR));
+        assert!(
+            diagnostics.is_empty(),
+            "village diagnostics: {diagnostics:?}"
+        );
+        assert!(!catalog.is_empty(), "checked-in village catalog must load");
+        catalog
+    }
+
+    /// The seed-14 village plan this slice pins. The spawn column is expected
+    /// to be `(0, 0)`; the assertion proves the cache matches the real search.
+    fn seed_14_village<'a>(catalog: &'a VillageCatalog) -> VillagePlan<'a> {
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        assert_eq!(spawn, (0, 0), "seed-14 spawn column is pinned");
+        village_plan_with_spawn(VILLAGE_MANAGER_CELL, VILLAGE_MANAGER_SEED, catalog, spawn)
+            .expect("the pinned seed-14 village cell must plan")
+    }
+
+    /// A chunk inside `plan`'s bounds that actually receives village cells.
+    fn first_village_chunk(plan: &VillagePlan<'_>) -> ChunkPos {
+        let cs = CHUNK_SIZE as i32;
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    if !plan.cells_for_chunk(pos).is_empty() {
+                        return pos;
+                    }
+                }
+            }
+        }
+        panic!("the pinned village plan has no emitting chunk");
+    }
+
+    fn local_cell(world: [i32; 3]) -> (usize, usize, usize) {
+        let cs = CHUNK_SIZE as i32;
+        (
+            world[0].rem_euclid(cs) as usize,
+            world[1].rem_euclid(cs) as usize,
+            world[2].rem_euclid(cs) as usize,
+        )
+    }
+
+    fn assert_chunks_identical(a: &Chunk, b: &Chunk, context: &str) {
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        a.get(lx, ly, lz),
+                        b.get(lx, ly, lz),
+                        "{context}: block differs at ({lx}, {ly}, {lz})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The helper both dispatch sites share must carry all three context fields
+    /// unchanged (and the empty context must be genuinely empty).
+    #[test]
+    fn gen_context_carries_catalog_spawn_and_rules() {
+        let catalog = checked_in_village_catalog();
+        let rules = [WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: 4,
+            max_y: 40,
+            vein: 4,
+            attempts: 8,
+        }];
+        let spawn = (12, -34);
+
+        let ctx = gen_context(&rules, Some(&catalog), Some(spawn));
+        assert_eq!(ctx.rules.len(), 1);
+        assert!(
+            matches!(ctx.villages, Some(installed) if std::ptr::eq(installed, &catalog)),
+            "the catalog pointer must be carried, not a copy"
+        );
+        assert_eq!(ctx.spawn_column, Some(spawn));
+
+        let empty = gen_context(&[], None, None);
+        assert!(empty.rules.is_empty());
+        assert!(empty.villages.is_none());
+        assert_eq!(empty.spawn_column, None);
+    }
+
+    /// With the catalog installed, every plan cell this chunk owns must land in
+    /// the generated chunk (the last-pass village assembly actually ran).
+    #[test]
+    fn village_cells_land_in_a_generated_chunk() {
+        let catalog = checked_in_village_catalog();
+        let plan = seed_14_village(&catalog);
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let ctx = gen_context(&[], Some(&catalog), Some(spawn));
+        let cs = CHUNK_SIZE as i32;
+        let mut measured_chunks = 0usize;
+        let mut measured_cells = 0usize;
+
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let cells = plan.cells_for_chunk(pos);
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let chunk = generate_chunk_with_context(
+                        pos,
+                        VILLAGE_MANAGER_SEED,
+                        Season::Summer,
+                        &ctx,
+                    );
+                    for cell in &cells {
+                        let (lx, ly, lz) = local_cell(cell.world);
+                        assert_eq!(
+                            chunk.get(lx, ly, lz),
+                            cell.block,
+                            "village cell {:?} missing from generated chunk {pos:?}",
+                            cell.world
+                        );
+                        measured_cells += 1;
+                    }
+                    measured_chunks += 1;
+                }
+            }
+        }
+
+        assert!(
+            measured_chunks > 0,
+            "no chunk in the plan bounds holds cells"
+        );
+        assert!(measured_cells > 0, "the plan emitted no village cells");
+    }
+
+    /// A spawn column inside the plan bounds trips the 64-block exclusion, so
+    /// the plan is rejected and generation is byte-identical to the legacy
+    /// seam (the negative half of the spawn-column cache).
+    #[test]
+    fn spawn_column_inside_the_plan_bounds_suppresses_village_cells() {
+        let catalog = checked_in_village_catalog();
+        let plan = seed_14_village(&catalog);
+        let pos = first_village_chunk(&plan);
+        let plan_cells = plan.cells_for_chunk(pos);
+        assert!(!plan_cells.is_empty());
+
+        let real_spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let suppressed = gen_context(&[], Some(&catalog), Some((plan.anchor[0], plan.anchor[1])));
+        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn));
+        let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Summer);
+        let rejected =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &suppressed);
+        let assembled =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &with_village);
+
+        assert_chunks_identical(
+            &rejected,
+            &legacy,
+            "spawn-excluded generation must equal the legacy seam byte-for-byte",
+        );
+        let differing = plan_cells
+            .iter()
+            .filter(|cell| {
+                let (lx, ly, lz) = local_cell(cell.world);
+                assembled.get(lx, ly, lz) != legacy.get(lx, ly, lz)
+            })
+            .count();
+        assert!(
+            differing > 0,
+            "the negative case is only meaningful if the accepted plan rewrites cells"
+        );
+    }
+
+    /// The rollover dispatch site must reuse the installed catalog: a manager
+    /// with a Summer village chunk keeps every plan cell after the wave. If the
+    /// rollover forgot the catalog, winter would regenerate plain terrain and
+    /// the cells would vanish.
+    #[test]
+    fn season_rollover_regenerates_village_cells() {
+        let _heavy = lock_heavy_streaming();
+        const WEEK: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let catalog = Arc::new(checked_in_village_catalog());
+        let plan = seed_14_village(&catalog);
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let pos = first_village_chunk(&plan);
+        let plan_cells = plan.cells_for_chunk(pos);
+        assert!(!plan_cells.is_empty());
+
+        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn));
+        let summer_chunk =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
+        for cell in &plan_cells {
+            let (lx, ly, lz) = local_cell(cell.world);
+            assert_eq!(summer_chunk.get(lx, ly, lz), cell.block);
+        }
+
+        let mut mgr =
+            WorldManager::with_seed_and_edits(2, VILLAGE_MANAGER_SEED, ChunkEditMap::default());
+        mgr.set_village_catalog(Arc::clone(&catalog), spawn);
+        mgr.insert_chunk_for_test(pos, summer_chunk);
+
+        let mut calls = 0usize;
+        while mgr.generation_season() != Season::Winter && calls < 256 {
+            mgr.update_streaming(pos, Season::Winter);
+            calls += 1;
+            std::thread::sleep(WEEK);
+        }
+        assert_eq!(
+            mgr.generation_season(),
+            Season::Winter,
+            "the rollover wave must settle on Winter ({calls} calls)"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while mgr.pending_gen.contains(&pos) && std::time::Instant::now() < deadline {
+            mgr.update_streaming(pos, Season::Winter);
+            std::thread::sleep(WEEK);
+        }
+        assert!(
+            !mgr.pending_gen.contains(&pos),
+            "the seasonal replacement for {pos:?} never arrived"
+        );
+
+        let swapped = mgr
+            .chunks
+            .get(&pos)
+            .expect("the seasonal replacement must stay resident");
+        for cell in &plan_cells {
+            let (lx, ly, lz) = local_cell(cell.world);
+            assert_eq!(
+                swapped.get(lx, ly, lz),
+                cell.block,
+                "season rollover erased village cell {:?}",
+                cell.world
+            );
+        }
+    }
+
+    /// A catalog-less context (even with a spawn column) must reproduce the
+    /// legacy generator exactly, so pre-M015 worlds keep their pinned bytes.
+    #[test]
+    fn none_catalog_generation_is_byte_identical_to_the_legacy_seam() {
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let ctx = gen_context(&[], None, Some(spawn));
+        for pos in [
+            ChunkPos::new(-6, 0, 3),
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(2, -1, 4),
+        ] {
+            let via_ctx =
+                generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Winter, &ctx);
+            let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Winter);
+            assert_chunks_identical(&via_ctx, &legacy, "catalog-less context");
+        }
     }
 }
