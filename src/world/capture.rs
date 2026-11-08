@@ -29,8 +29,8 @@ use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos, CHUNK_SIZE};
 use crate::world::manager::{WorldManager, MAX_CHUNK_Y, MIN_CHUNK_Y};
 use crate::world::prefab::{
-    parse_prefab, prefab_identities, validate_prefab_name, Prefab, PrefabBlock, PrefabError,
-    PREFABS_SUBDIR, PREFAB_CAPS, WORLDGEN_DIR,
+    parse_prefab, prefab_identities, validate_prefab_name, Direction, Prefab, PrefabBlock,
+    PrefabError, PrefabSocket, PREFABS_SUBDIR, PREFAB_CAPS, WORLDGEN_DIR,
 };
 
 /// Lowest valid world block row (`MIN_CHUNK_Y * CHUNK_SIZE`).
@@ -71,8 +71,8 @@ pub enum CaptureError {
     UnloadedChunk { pos: ChunkPos },
     /// The name failed the shared prefab name rule.
     InvalidName(PrefabError),
-    /// A socket marker is present; direction authoring arrives in S06.
-    SocketMarker { pos: IVec3 },
+    /// A socket marker whose horizontal neighbours do not pick exactly one axis.
+    AmbiguousSocket { pos: IVec3 },
     /// A non-built-in (modded) block would silently serialize as air.
     UnsupportedBlock { pos: IVec3, block: BlockId },
     /// A regular file already exists at the target path and is left untouched.
@@ -98,10 +98,10 @@ impl fmt::Display for CaptureError {
                 write!(f, "chunk ({}, {}, {}) is not loaded", pos.x, pos.y, pos.z)
             }
             CaptureError::InvalidName(error) => write!(f, "invalid prefab name: {error}"),
-            CaptureError::SocketMarker { pos } => {
+            CaptureError::AmbiguousSocket { pos } => {
                 write!(
                     f,
-                    "socket marker at [{}, {}, {}] is not supported",
+                    "socket marker at [{}, {}, {}] is ambiguous",
                     pos.x, pos.y, pos.z
                 )
             }
@@ -165,13 +165,85 @@ pub fn validate_region(
     Ok([size[0] as u32, size[1] as u32, size[2] as u32])
 }
 
+/// Resolve a marker's facing from its four horizontal in-region neighbours.
+///
+/// Neighbour order is pinned as `[west, east, north, south]`, at the marker's
+/// own `y`: west/east are `x -/+ 1`, north/south are `z -/+ 1`.
+///
+/// An axis qualifies only when exactly one side is solid; the direction is the
+/// open side (`+x` → [`Direction::East`], `-x` → [`Direction::West`], `+z` →
+/// [`Direction::South`], `-z` → [`Direction::North`]). Exactly one qualifying
+/// axis yields the direction; zero or two are ambiguous and fail the capture
+/// with the marker coordinate.
+///
+/// A neighbour coordinate outside `region` counts as non-solid and its
+/// `world.get_block` is never called, so an edge marker cannot read an
+/// unloaded neighbouring chunk.
+pub fn direction_from_marker_neighbours(
+    world: &WorldManager,
+    region: &CaptureRegion,
+    pos: IVec3,
+) -> Result<Direction, CaptureError> {
+    let offsets = [
+        IVec3::new(-1, 0, 0),
+        IVec3::new(1, 0, 0),
+        IVec3::new(0, 0, -1),
+        IVec3::new(0, 0, 1),
+    ];
+    let mut solid = [false; 4];
+    for (index, offset) in offsets.iter().enumerate() {
+        let neighbour = pos + *offset;
+        let inside = neighbour.x >= region.min.x
+            && neighbour.x <= region.max.x
+            && neighbour.y >= region.min.y
+            && neighbour.y <= region.max.y
+            && neighbour.z >= region.min.z
+            && neighbour.z <= region.max.z;
+        if inside {
+            solid[index] = world
+                .get_block(neighbour.x, neighbour.y, neighbour.z)
+                .is_solid();
+        }
+    }
+    direction_from_solid_neighbours(solid, pos)
+}
+
+/// Pure core of [`direction_from_marker_neighbours`].
+///
+/// `solid` is ordered `[west, east, north, south]`. Solid includes
+/// [`BlockId::SocketMarker`] and `Modded(_)` (non-air, non-water), so an
+/// adjacent marker counts as solid; `Air` and `Water` do not.
+pub(crate) fn direction_from_solid_neighbours(
+    solid: [bool; 4],
+    pos: IVec3,
+) -> Result<Direction, CaptureError> {
+    let [west, east, north, south] = solid;
+    let mut open: Option<Direction> = None;
+
+    if west != east {
+        open = Some(if east { Direction::West } else { Direction::East });
+    }
+    if north != south {
+        if open.is_some() {
+            return Err(CaptureError::AmbiguousSocket { pos });
+        }
+        open = Some(if south { Direction::North } else { Direction::South });
+    }
+
+    open.ok_or(CaptureError::AmbiguousSocket { pos })
+}
+
 /// Extract one prefab from a validated region.
 ///
 /// Every grid cell is emitted in `(y, z, x)` order, air included, so
 /// `parse_prefab(&prefab.to_toml_string()) == Ok(prefab)`. `LootChest`
 /// normalizes to an empty `Chest`, wheat stages 1..=3 normalize to stage 0,
 /// and air, water, bedrock, farmland and every other built-in block keep their
-/// identity. A socket marker or modded block fails with its world coordinate.
+/// identity. A socket marker becomes one [`PrefabSocket`] (origin-relative,
+/// facing derived from its four horizontal neighbour cells) and the marker
+/// cell is emitted as air; an ambiguous marker fails before anything is
+/// written, naming its world coordinate. A modded block fails with its own
+/// world coordinate. The first failure in `(y, z, x)` order wins.
 ///
 /// The origin is `[size_x / 2, 0, size_z / 2]`; `origin[1] == 0` keeps the
 /// prefab's bottom layer aligned to the selection's bottom row for the S06
@@ -186,13 +258,33 @@ pub fn extract_prefab(
 
     let cell_count = size[0] as usize * size[1] as usize * size[2] as usize;
     let mut blocks = Vec::with_capacity(cell_count);
+    let mut sockets: Vec<PrefabSocket> = Vec::new();
+    let origin = [size[0] / 2, 0, size[2] / 2];
+    let socket_origin = [origin[0] as i32, origin[1] as i32, origin[2] as i32];
     for y in region.min.y..=region.max.y {
         for z in region.min.z..=region.max.z {
             for x in region.min.x..=region.max.x {
                 let block = world.get_block(x, y, z);
                 let pos = IVec3::new(x, y, z);
                 if block == BlockId::SocketMarker {
-                    return Err(CaptureError::SocketMarker { pos });
+                    let direction = direction_from_marker_neighbours(world, &region, pos)?;
+                    sockets.push(PrefabSocket {
+                        position: [
+                            x - region.min.x - socket_origin[0],
+                            y - region.min.y - socket_origin[1],
+                            z - region.min.z - socket_origin[2],
+                        ],
+                        direction,
+                    });
+                    blocks.push(PrefabBlock {
+                        position: [
+                            (x - region.min.x) as u32,
+                            (y - region.min.y) as u32,
+                            (z - region.min.z) as u32,
+                        ],
+                        block: BlockId::Air,
+                    });
+                    continue;
                 }
                 if !block.is_builtin() {
                     return Err(CaptureError::UnsupportedBlock { pos, block });
@@ -211,10 +303,10 @@ pub fn extract_prefab(
 
     Ok(Prefab {
         name: name.to_owned(),
-        origin: [size[0] / 2, 0, size[2] / 2],
+        origin,
         size,
         blocks,
-        sockets: Vec::new(),
+        sockets,
     })
 }
 
@@ -554,15 +646,270 @@ mod tests {
         );
     }
 
+    fn doorway_world() -> WorldManager {
+        let region = house_region();
+        let mut world = resident_world(&region, BlockId::Stone);
+        // Hollow the interior above the stone floor.
+        for y in 41..=43 {
+            for z in 1..=3 {
+                for x in 1..=3 {
+                    set(&mut world, IVec3::new(x, y, z), BlockId::Air);
+                }
+            }
+        }
+        // Two-tall doorway in the min-z wall at x = 2.
+        set(&mut world, IVec3::new(2, 41, 0), BlockId::Air);
+        set(&mut world, IVec3::new(2, 42, 0), BlockId::Air);
+        // Cobblestone step one cell inside the doorway, at the lower opening.
+        set(&mut world, IVec3::new(2, 41, 1), BlockId::Cobblestone);
+        // Marker in the only doorway opening.
+        set(&mut world, IVec3::new(2, 41, 0), BlockId::SocketMarker);
+        world
+    }
+
+    fn two_doorway_world() -> WorldManager {
+        let region = house_region();
+        let mut world = resident_world(&region, BlockId::Stone);
+        for y in 41..=43 {
+            for z in 1..=3 {
+                for x in 1..=3 {
+                    set(&mut world, IVec3::new(x, y, z), BlockId::Air);
+                }
+            }
+        }
+        // A min-z doorway opening north and a max-z doorway opening south.
+        set(&mut world, IVec3::new(2, 41, 0), BlockId::Air);
+        set(&mut world, IVec3::new(2, 42, 0), BlockId::Air);
+        set(&mut world, IVec3::new(2, 41, 1), BlockId::Cobblestone);
+        set(&mut world, IVec3::new(2, 41, 0), BlockId::SocketMarker);
+
+        set(&mut world, IVec3::new(2, 41, 4), BlockId::Air);
+        set(&mut world, IVec3::new(2, 42, 4), BlockId::Air);
+        set(&mut world, IVec3::new(2, 41, 3), BlockId::Cobblestone);
+        set(&mut world, IVec3::new(2, 41, 4), BlockId::SocketMarker);
+        world
+    }
+
+    fn solid_pattern(positions: &[usize]) -> [bool; 4] {
+        let mut solid = [false; 4];
+        for &index in positions {
+            solid[index] = true;
+        }
+        solid
+    }
+
+    #[test]
+    fn solid_neighbour_matrix_picks_the_single_open_axis() {
+        let pos = IVec3::new(10, 40, 10);
+        let ambiguous = || Err(CaptureError::AmbiguousSocket { pos });
+
+        // 0 solids: neither axis opens.
+        assert_eq!(direction_from_solid_neighbours([false; 4], pos), ambiguous());
+
+        // 1 solid: the only opening is the opposite side.
+        for (index, expected) in [
+            (0, Direction::East),
+            (1, Direction::West),
+            (2, Direction::South),
+            (3, Direction::North),
+        ] {
+            assert_eq!(
+                direction_from_solid_neighbours(solid_pattern(&[index]), pos),
+                Ok(expected),
+                "single solid at index {index}"
+            );
+        }
+
+        // 2 solids on the same axis: both sides equal, the axis stays silent.
+        for pair in [[0, 1], [2, 3]] {
+            assert_eq!(
+                direction_from_solid_neighbours(solid_pattern(&pair), pos),
+                ambiguous(),
+                "paired axis {pair:?}"
+            );
+        }
+
+        // 2 solids on different axes: both axes qualify.
+        for pair in [[0, 2], [0, 3], [1, 2], [1, 3]] {
+            assert_eq!(
+                direction_from_solid_neighbours(solid_pattern(&pair), pos),
+                ambiguous(),
+                "crossed axes {pair:?}"
+            );
+        }
+
+        // 3 solids: only the missing side is open.
+        for (missing, expected) in [
+            (0, Direction::West),
+            (1, Direction::East),
+            (2, Direction::North),
+            (3, Direction::South),
+        ] {
+            let solid = solid_pattern(&(0..4).filter(|&index| index != missing).collect::<Vec<_>>());
+            assert_eq!(
+                direction_from_solid_neighbours(solid, pos),
+                Ok(expected),
+                "missing index {missing}"
+            );
+        }
+
+        // 4 solids: fully enclosed.
+        assert_eq!(
+            direction_from_solid_neighbours([true; 4], pos),
+            ambiguous()
+        );
+    }
+
+    #[test]
+    fn neighbour_reads_respect_region_bounds_and_block_solidity() {
+        let region = house_region();
+        let marker = IVec3::new(2, 41, 2);
+        let neighbour_world = |marker: IVec3, solid: [bool; 4]| {
+            let mut world = resident_world(&region, BlockId::Air);
+            let offsets = [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ];
+            for (index, offset) in offsets.iter().enumerate() {
+                if solid[index] {
+                    set(&mut world, marker + *offset, BlockId::Stone);
+                }
+            }
+            world
+        };
+
+        // The residency-checked path must agree with the pure core on the
+        // whole matrix, including its pinned `[west, east, north, south]`
+        // order.
+        for solid in [
+            [false, false, false, false],
+            [true, false, false, false],
+            [false, true, false, false],
+            [false, false, true, false],
+            [false, false, false, true],
+            [true, true, false, false],
+            [false, false, true, true],
+            [true, false, true, false],
+            [true, false, false, true],
+            [false, true, true, false],
+            [false, true, false, true],
+            [true, true, true, true],
+        ] {
+            assert_eq!(
+                direction_from_marker_neighbours(&neighbour_world(marker, solid), &region, marker),
+                direction_from_solid_neighbours(solid, marker),
+                "real path must match the pure core for {solid:?}"
+            );
+        }
+
+        // A marker on each region edge derives the direction of the side that
+        // opens out of the region; the outside neighbour is never read.
+        for (edge, inside_side, expected) in [
+            (IVec3::new(0, 41, 2), 1, Direction::West),
+            (IVec3::new(4, 41, 2), 0, Direction::East),
+            (IVec3::new(2, 41, 0), 3, Direction::North),
+            (IVec3::new(2, 41, 4), 2, Direction::South),
+        ] {
+            let mut solid = [false; 4];
+            solid[inside_side] = true;
+            assert_eq!(
+                direction_from_marker_neighbours(&neighbour_world(edge, solid), &region, edge),
+                Ok(expected),
+                "edge marker {edge:?}"
+            );
+        }
+
+        // Water is non-solid: Stone west + Water east still leaves exactly one
+        // opening (east). If water counted as solid this would be ambiguous.
+        let mut world = resident_world(&region, BlockId::Air);
+        set(&mut world, marker + IVec3::new(-1, 0, 0), BlockId::Stone);
+        set(&mut world, marker + IVec3::new(1, 0, 0), BlockId::Water);
+        assert_eq!(
+            direction_from_marker_neighbours(&world, &region, marker),
+            Ok(Direction::East)
+        );
+
+        // SocketMarker and Modded neighbours are solid, so they close a side.
+        for block in [BlockId::SocketMarker, BlockId::Modded(24)] {
+            let mut world = resident_world(&region, BlockId::Air);
+            set(&mut world, marker + IVec3::new(0, 0, 1), block);
+            assert_eq!(
+                direction_from_marker_neighbours(&world, &region, marker),
+                Ok(Direction::North),
+                "{block:?} neighbour is solid"
+            );
+        }
+    }
+
+    #[test]
+    fn doorway_marker_becomes_one_north_socket_and_an_air_cell() {
+        let prefab = extract_prefab("doorway_house", &doorway_world(), house_region())
+            .expect("doorway house captures");
+
+        assert_eq!(prefab.sockets.len(), 1);
+        assert_eq!(
+            prefab.sockets[0],
+            PrefabSocket {
+                position: [0, 1, -2],
+                direction: Direction::North,
+            }
+        );
+        assert!(!prefab
+            .blocks
+            .iter()
+            .any(|block| block.block == BlockId::SocketMarker));
+
+        let marker_cell = prefab
+            .blocks
+            .iter()
+            .find(|block| block.position == [2, 1, 0])
+            .expect("the marker grid cell is preserved");
+        assert_eq!(marker_cell.block, BlockId::Air);
+
+        let text = prefab.to_toml_string();
+        assert!(!text.contains("socket_marker"));
+        assert_eq!(parse_prefab(&text), Ok(prefab));
+    }
+
+    #[test]
+    fn multiple_markers_become_sorted_round_tripping_sockets() {
+        let prefab = extract_prefab("two_doors", &two_doorway_world(), house_region())
+            .expect("two-door house captures");
+
+        let sockets: Vec<([i32; 3], Direction)> = prefab
+            .sockets
+            .iter()
+            .map(|socket| (socket.position, socket.direction))
+            .collect();
+        assert_eq!(
+            sockets,
+            vec![
+                ([0, 1, -2], Direction::North),
+                ([0, 1, 2], Direction::South),
+            ]
+        );
+
+        let text = prefab.to_toml_string();
+        assert_eq!(parse_prefab(&text), Ok(prefab));
+
+        // A marker-free house still yields an empty socket list.
+        let plain = extract_prefab("house", &stone_house_world(), house_region())
+            .expect("marker-free house captures");
+        assert!(plain.sockets.is_empty());
+    }
+
     #[test]
     fn socket_marker_and_modded_blocks_fail_with_their_coordinates() {
         let region = house_region();
 
+        // Every neighbour is Stone, so all four sides are solid: no axis opens.
         let mut world = resident_world(&region, BlockId::Stone);
         set(&mut world, IVec3::new(1, 41, 1), BlockId::SocketMarker);
         assert_eq!(
             extract_prefab("house", &world, region),
-            Err(CaptureError::SocketMarker {
+            Err(CaptureError::AmbiguousSocket {
                 pos: IVec3::new(1, 41, 1)
             })
         );
@@ -793,6 +1140,8 @@ mod tests {
         set(&mut world, IVec3::new(0, 40, 0), BlockId::SocketMarker);
         let before = snapshot(temp.path());
 
+        // The min corner is open on both axes (west and north are outside the
+        // region), so the whole capture fails before any byte is written.
         let error = capture_to_file(
             temp.path(),
             "house",
@@ -803,9 +1152,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            CaptureError::SocketMarker {
+            CaptureError::AmbiguousSocket {
                 pos: IVec3::new(0, 40, 0)
             }
+        );
+        assert_eq!(
+            error.to_string(),
+            "socket marker at [0, 40, 0] is ambiguous"
         );
         assert_eq!(snapshot(temp.path()), before);
     }
@@ -832,10 +1185,10 @@ mod tests {
                 "invalid prefab name: name is longer than 64 bytes",
             ),
             (
-                CaptureError::SocketMarker {
+                CaptureError::AmbiguousSocket {
                     pos: IVec3::new(1, 41, -2),
                 },
-                "socket marker at [1, 41, -2] is not supported",
+                "socket marker at [1, 41, -2] is ambiguous",
             ),
             (
                 CaptureError::UnsupportedBlock {
