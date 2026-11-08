@@ -175,12 +175,7 @@ fn clean_tree_prints_the_pinned_digest_and_writes_nothing() {
     let output = run_in(dir.path(), &["--demo-village"]);
 
     assert_eq!(output.status.code(), Some(0), "{}", report(&output));
-    assert_eq!(
-        stdout_lines(&output),
-        CLEAN_LINES,
-        "{}",
-        report(&output)
-    );
+    assert_eq!(stdout_lines(&output), CLEAN_LINES, "{}", report(&output));
     assert_no_startup_state(dir.path());
     assert_eq!(
         snapshot_tree(&worldgen),
@@ -304,10 +299,7 @@ fn following_save_switch_is_not_consumed_and_no_save_is_written() {
     let worldgen = copy_worldgen(dir.path());
     let before = snapshot_tree(&worldgen);
 
-    let output = run_in(
-        dir.path(),
-        &["--demo-village", "--save", "custom.mcvx"],
-    );
+    let output = run_in(dir.path(), &["--demo-village", "--save", "custom.mcvx"]);
 
     assert_eq!(output.status.code(), Some(0), "{}", report(&output));
     assert_eq!(

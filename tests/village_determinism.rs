@@ -10,9 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use opencraft::world::chunk::{
-    local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE, CHUNK_VOLUME,
-};
+use opencraft::world::chunk::{local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE, CHUNK_VOLUME};
 use opencraft::world::season::Season;
 use opencraft::world::terrain::{
     find_spawn_column, generate_chunk_seeded_with, generate_chunk_with_context, WorldGenContext,
@@ -100,8 +98,7 @@ fn chunk_fingerprint(chunk: &Chunk) -> u64 {
 
 fn chunks_equal(left: &Chunk, right: &Chunk) -> bool {
     (0..CHUNK_SIZE).all(|y| {
-        (0..CHUNK_SIZE)
-            .all(|z| (0..CHUNK_SIZE).all(|x| left.get(x, y, z) == right.get(x, y, z)))
+        (0..CHUNK_SIZE).all(|z| (0..CHUNK_SIZE).all(|x| left.get(x, y, z) == right.get(x, y, z)))
     })
 }
 
@@ -250,7 +247,12 @@ fn chunk_order_single_and_region_agree() {
 
     let baseline: BTreeMap<(i32, i32, i32), u64> = positions
         .iter()
-        .map(|&pos| ((pos.x, pos.y, pos.z), chunk_fingerprint(&generate(pos, &catalog, spawn))))
+        .map(|&pos| {
+            (
+                (pos.x, pos.y, pos.z),
+                chunk_fingerprint(&generate(pos, &catalog, spawn)),
+            )
+        })
         .collect();
 
     let mut reversed = positions.clone();
@@ -431,7 +433,9 @@ fn loader_is_fail_soft() {
         diagnostics,
         vec!["worldgen/villages/b.toml: duplicate village name 'subset'".to_owned()]
     );
-    let kept = catalog.get("subset").expect("sorted-first definition survives");
+    let kept = catalog
+        .get("subset")
+        .expect("sorted-first definition survives");
     assert_eq!(kept.spacing, 4, "the sorted-first file must win");
 
     // (c) Unknown pool prefab: dropped with one diagnostic, definition survives
@@ -443,17 +447,12 @@ fn loader_is_fail_soft() {
     write_village(
         &root,
         "subset.toml",
-        &definition(
-            4,
-            "house = [\"leaf\", \"ghost\"]\njunction = [\"hub\"]\n",
-        ),
+        &definition(4, "house = [\"leaf\", \"ghost\"]\njunction = [\"hub\"]\n"),
     );
     let (catalog, diagnostics) = VillageCatalog::load_sorted(&root);
     assert_eq!(
         diagnostics,
-        vec![
-            "worldgen/villages/subset.toml: pool 'house' names unknown prefab 'ghost'".to_owned()
-        ]
+        vec!["worldgen/villages/subset.toml: pool 'house' names unknown prefab 'ghost'".to_owned()]
     );
     assert!(catalog.get("subset").is_some(), "definition must survive");
 
@@ -473,11 +472,7 @@ fn subset_plan_is_returned() {
     let root = temp.path().join("worldgen");
     write_prefab(&root, "hub.toml", HUB);
     write_prefab(&root, "leaf.toml", LEAF);
-    write_village(
-        &root,
-        "subset.toml",
-        &definition(4, "house = [\"leaf\"]\n"),
-    );
+    write_village(&root, "subset.toml", &definition(4, "house = [\"leaf\"]\n"));
     let (catalog, diagnostics) = VillageCatalog::load_sorted(&root);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
@@ -510,14 +505,9 @@ fn spawn_aware_and_default_plan_agree() {
         x: PINNED_SITE.0,
         z: PINNED_SITE.1,
     };
-    let with_spawn = village_plan_with_spawn(
-        cell,
-        PINNED_SEED,
-        &catalog,
-        find_spawn_column(PINNED_SEED),
-    );
+    let with_spawn =
+        village_plan_with_spawn(cell, PINNED_SEED, &catalog, find_spawn_column(PINNED_SEED));
     let default_plan = village_plan(cell, PINNED_SEED, &catalog);
     assert_eq!(with_spawn, default_plan);
     assert!(default_plan.is_some());
 }
-
