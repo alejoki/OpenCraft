@@ -269,6 +269,40 @@ fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
         .collect()
 }
 
+/// Render village/prefab catalog diagnostics as the same field/reason warning
+/// shape every other startup problem uses.
+///
+/// Every diagnostic is a logical `worldgen/<area>/<file>: <reason>` label, so
+/// the first `": "` separates the offending file (the warning's `field`) from
+/// the reason. A diagnostic that carries no separator still surfaces verbatim
+/// under the generic `worldgen` field rather than being dropped.
+fn village_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| match diagnostic.split_once(": ") {
+            Some((file, reason)) => SettingsWarning {
+                field: file.to_string(),
+                reason: reason.to_string(),
+            },
+            None => SettingsWarning {
+                field: "worldgen".to_string(),
+                reason: diagnostic.clone(),
+            },
+        })
+        .collect()
+}
+
+/// Re-read the authored village/prefab catalog from `root`.
+///
+/// Wraps [`VillageCatalog::load_sorted`] so `attempt_create` can pick up
+/// content edits without an app restart and tests can exercise the reload in
+/// isolation. Deliberately uncached: each call re-walks the tree, which is the
+/// point of the reload seam.
+fn reload_village_catalog(root: &Path) -> (Arc<VillageCatalog>, Vec<String>) {
+    let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+    (Arc::new(catalog), diagnostics)
+}
+
 /// Build the app's sound engine. Production opens the default output device
 /// and degrades to a silent no-op engine on any construction failure (launch
 /// is never blocked by audio). Test builds use the explicit silent
@@ -8251,15 +8285,29 @@ struct StartupContent {
     /// and every newly created world is resolved against. It is replaced only
     /// by a pack-stack change, and then only for the NEXT load (MEM512).
     base_registry: Arc<ContentRegistry>,
+    /// The accepted village/prefab catalog (M015/S03). Loaded once from the
+    /// opt-in `worldgen/` root; an empty catalog is generation-neutral, so a
+    /// headless test that passes no root stays byte-identical.
+    village_catalog: Arc<VillageCatalog>,
+    /// The `worldgen/` root `village_catalog` was loaded from. `None` in
+    /// headless tests (never read the repository tree); production keeps the
+    /// real path so `attempt_create` can reload authored content without an
+    /// app restart.
+    worldgen_root: Option<PathBuf>,
 }
 
 impl StartupContent {
     /// Load settings, the persisted pack stack, sound overrides and the
     /// session content registry in the historical warning order.
+    ///
+    /// `worldgen_root: None` loads the empty village catalog and reads no
+    /// `worldgen/` tree, the same isolation rule as `config_dir: None`: a
+    /// headless `GameApp` test must never consume repository content.
     fn load(
         settings_path: &Path,
         packs_root: PathBuf,
         config_dir: Option<&Path>,
+        worldgen_root: Option<&Path>,
     ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
@@ -8299,6 +8347,19 @@ impl StartupContent {
         // Registry diagnostics join the same one-time warning path.
         let (base_registry, registry_report) = build_session_registry(&pack_specs);
         startup_warnings.extend(registry_warnings(&registry_report));
+        // Authored village/prefab catalog (M015/S03): fail-soft behind an
+        // explicit opt-in root. A missing or broken tree degrades to an empty
+        // catalog plus data warnings, never a launch failure; diagnostics join
+        // the one-time warning path last, keeping the settings -> config ->
+        // packs -> sounds -> registry -> worldgen order.
+        let (village_catalog, village_diagnostics) = match worldgen_root {
+            Some(root) => {
+                let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+                (Arc::new(catalog), diagnostics)
+            }
+            None => (Arc::new(VillageCatalog::default()), Vec::new()),
+        };
+        startup_warnings.extend(village_warnings(&village_diagnostics));
         StartupContent {
             settings,
             startup_warnings,
@@ -8311,6 +8372,8 @@ impl StartupContent {
             settings_path: settings_path.to_path_buf(),
             packs_root,
             base_registry,
+            village_catalog,
+            worldgen_root: worldgen_root.map(Path::to_path_buf),
         }
     }
 }
@@ -8524,6 +8587,16 @@ struct GameApp {
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
     /// `session_registry` (MEM512/D181).
     base_registry: Arc<ContentRegistry>,
+    /// The accepted village/prefab catalog (M015/S03): installed on the
+    /// startup session and on every create/load swap. An empty catalog is
+    /// generation-neutral, so a headless test that loads no `worldgen/` root
+    /// keeps its pre-M015 witness bytes.
+    village_catalog: Arc<VillageCatalog>,
+    /// The `worldgen/` root `village_catalog` was loaded from. `None` in
+    /// headless tests (never read the repository tree); production keeps the
+    /// real path so `attempt_create` can re-read authored content without an
+    /// app restart.
+    worldgen_root: Option<PathBuf>,
     /// The CURRENT session's immutable content registry. A loaded world
     /// carries the placeholder-augmented registry it was decoded with; a fresh
     /// world carries a clone of `base_registry`. Re-adopted by
@@ -8659,6 +8732,7 @@ impl GameApp {
             &settings_path,
             Path::new(pack::PACKS_DIR).to_path_buf(),
             None,
+            None,
         );
         Self::new_with_content(cli, session, content, background_path)
     }
@@ -8686,6 +8760,8 @@ impl GameApp {
             settings_path,
             packs_root,
             base_registry,
+            village_catalog,
+            worldgen_root,
         } = content;
         // Effective gameplay rules apply before the first frame and are
         // re-applied on every session install (the S02 live-reload seam).
@@ -8696,6 +8772,10 @@ impl GameApp {
         // exactly the effective values this app runs.
         let config_meta: SaveConfigMeta = config.meta();
         session.apply_config(&config.rules(), config_meta);
+        // M015/S03: the launch catalog rides the startup session. Only the
+        // playable session gets it; the menu background is scenery and keeps
+        // none. An empty catalog (headless tests) is generation-neutral.
+        session.set_village_catalog(Arc::clone(&village_catalog));
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8929,6 +9009,8 @@ impl GameApp {
             creator_overlay_dirty: true,
             creator_overlay_text: String::new(),
             base_registry,
+            village_catalog,
+            worldgen_root,
             pack_presentation_dirty: false,
             packs_message: None,
             time_scale: cli.time_scale,
@@ -10000,6 +10082,11 @@ impl GameApp {
         session
             .world
             .set_render_distance(self.settings.render_distance);
+        // M015/S03: every create/load swap installs the app's catalog on the
+        // incoming session. Edit Background must NOT get villages, and it
+        // routes through the shared reset without this call, so installing
+        // here (not in `on_session_installed`) keeps it village-free.
+        session.set_village_catalog(Arc::clone(&self.village_catalog));
         self.session = session;
         self.on_session_installed();
     }
@@ -10464,6 +10551,20 @@ impl GameApp {
                 return;
             }
         };
+        // M015/S03: authored content is re-read on every create when
+        // production installed a `worldgen/` root, so a content edit lands
+        // without an app restart. A `None` root (headless tests) skips the
+        // reload entirely, keeping the suite isolated from the repository
+        // tree. Broken content degrades to one inline warning plus an empty
+        // catalog; it never blocks world creation.
+        if let Some(root) = self.worldgen_root.as_deref() {
+            let (catalog, diagnostics) = reload_village_catalog(root);
+            self.village_catalog = catalog;
+            if !diagnostics.is_empty() {
+                self.new_game
+                    .set_message(format!("worldgen: {}", diagnostics.join("; ")));
+            }
+        }
         // The New Game row owns the season length (S02-T04) and the game mode
         // (S08-T01 T05): the screen's cycler values, defaulting to one game
         // day per season and Survival.
@@ -16325,6 +16426,9 @@ fn main() {
         Path::new(DEFAULT_SETTINGS_PATH),
         Path::new(pack::PACKS_DIR).to_path_buf(),
         Some(Path::new(opencraft::config::CONFIG_DIR)),
+        // Production is the one opt-in `worldgen/` reader: keep this literal
+        // shape (several source pins locate `StartupContent::load(` here).
+        Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
     );
     let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
@@ -34468,6 +34572,7 @@ stack = 64
             &dir.join("settings.toml"),
             dir.join("packs"),
             Some(&config_dir),
+            None,
         )
     }
 
@@ -34582,6 +34687,7 @@ stack = 64
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
             Some(&dir.path().join("absent-config")),
+            None,
         );
 
         assert_eq!(content.config.rules(), RulesBundle::default());
@@ -34594,6 +34700,214 @@ stack = 64
             config_warnings(&content).is_empty(),
             "missing files are warnings, never startup errors: {:?}",
             content.startup_warnings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M015/S03-T02: village catalog lifecycle (startup content, app installs)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn startup_content_without_a_worldgen_root_loads_an_empty_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            None,
+        );
+
+        assert!(
+            content.village_catalog.is_empty(),
+            "no opt-in root means no worldgen read"
+        );
+        assert!(
+            content.worldgen_root.is_none(),
+            "a headless load must not retain a reload root"
+        );
+        assert!(
+            !content.startup_warnings.iter().any(
+                |warning| warning.field == "worldgen" || warning.field.starts_with("worldgen/")
+            ),
+            "headless loading must not emit worldgen diagnostics: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn startup_content_with_the_checked_in_root_loads_the_reference_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Path::new(opencraft::world::prefab::WORLDGEN_DIR);
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(root),
+        );
+
+        assert_eq!(content.village_catalog.len(), 1);
+        assert_eq!(content.village_catalog.prefabs().len(), 3);
+        assert_eq!(content.worldgen_root.as_deref(), Some(root));
+        assert!(
+            !content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field.starts_with("worldgen")),
+            "the checked-in tree is diagnostic-free: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn village_warnings_split_the_file_from_the_reason() {
+        let warnings = village_warnings(&[
+            "worldgen/villages/plains.toml: could not read file: boom".to_string(),
+            "unlabelled diagnostic".to_string(),
+        ]);
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].field, "worldgen/villages/plains.toml");
+        assert_eq!(warnings[0].reason, "could not read file: boom");
+        assert_eq!(warnings[1].field, "worldgen");
+        assert_eq!(warnings[1].reason, "unlabelled diagnostic");
+    }
+
+    #[test]
+    fn new_with_content_installs_the_catalog_on_the_startup_session_and_leaves_the_background_alone(
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("village.mcvx");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        );
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "14",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = WorldSession::new_session(14, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        assert!(
+            session.world.village_catalog().is_none(),
+            "constructors must stay catalog-free; the app installs at the boundary"
+        );
+
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(
+            app.session
+                .world
+                .village_catalog()
+                .map(|catalog| catalog.len()),
+            Some(1),
+            "the startup session must hold the launch catalog"
+        );
+        assert!(
+            app.background.world.village_catalog().is_none(),
+            "the menu background is scenery and must never gain villages"
+        );
+    }
+
+    #[test]
+    fn start_world_session_installs_the_catalog_on_a_swapped_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swap.mcvx");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        );
+        let cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let startup = WorldSession::new_session(3, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let mut app =
+            GameApp::new_with_content(cli, startup, content, dir.path().join("background.mcvx"));
+
+        let swapped = WorldSession::new_session(14, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        assert!(
+            swapped.world.village_catalog().is_none(),
+            "a freshly constructed session carries no catalog"
+        );
+
+        app.start_world_session(swapped);
+
+        assert_eq!(
+            app.session
+                .world
+                .village_catalog()
+                .map(|catalog| catalog.len()),
+            Some(1),
+            "every create/load swap must install the app catalog"
+        );
+    }
+
+    #[test]
+    fn reload_village_catalog_reads_the_tree_each_call_and_never_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Missing tree: valid empty content, no diagnostics.
+        let (catalog, diagnostics) = reload_village_catalog(root);
+        assert!(catalog.is_empty());
+        assert!(diagnostics.is_empty(), "missing tree: {diagnostics:?}");
+
+        // One broken definition appears on disk: the next call sees it, which
+        // proves the reload is uncached and never blocks on bad content.
+        let villages = root.join("villages");
+        std::fs::create_dir_all(&villages).expect("create villages dir");
+        std::fs::write(
+            villages.join("broken.toml"),
+            "format = 1\nname = \"broken\"\nbiomes = [\"plains\"]\nhub = \"missing_prefab\"\n",
+        )
+        .expect("write broken village");
+
+        let (catalog, diagnostics) = reload_village_catalog(root);
+        assert!(
+            catalog.is_empty(),
+            "broken content degrades to an empty catalog"
+        );
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert!(
+            diagnostics[0].starts_with("worldgen/villages/broken.toml: "),
+            "diagnostic keeps its logical label: {}",
+            diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn attempt_create_reloads_the_catalog_before_building_the_session() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn attempt_create(&mut self)")
+            .nth(1)
+            .expect("main.rs must define attempt_create");
+        let body = body
+            .split("fn confirm_pending_delete")
+            .next()
+            .expect("attempt_create must precede confirm_pending_delete");
+
+        let reload = body
+            .find("reload_village_catalog(")
+            .expect("attempt_create must reload authored content");
+        let build = body
+            .find("WorldSession::new_session_with_mode_and_registry(")
+            .expect("attempt_create must build the new session");
+        assert!(
+            reload < build,
+            "the reload must assign self.village_catalog before the session is built"
+        );
+        assert!(
+            body.contains("self.village_catalog = catalog;"),
+            "the reload must replace the app catalog, not a local copy"
+        );
+        assert!(
+            body.contains("self.worldgen_root.as_deref()"),
+            "the reload must be gated on the opt-in root"
         );
     }
 
@@ -36265,6 +36579,7 @@ selected_name_secs = 0.5
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
             Some(&config_dir),
+            None,
         );
         let session = startup_session_with(&cli, &content.base_registry, &content.config);
         let traced =
@@ -36470,7 +36785,8 @@ selected_name_secs = 0.5
     /// `settings.toml`.
     fn pack_app(dir: &Path) -> GameApp {
         std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
-        let content = StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None);
+        let content =
+            StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None, None);
         let save_path = dir.join("pack-app.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
@@ -37951,6 +38267,7 @@ selected_name_secs = 0.5
         let content = StartupContent::load(
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
+            None,
             None,
         );
         assert_eq!(

@@ -46,6 +46,7 @@ use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
 };
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
+use crate::world::village::VillageCatalog;
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
 /// reachable. Shared with the placement/mining ray length so every world
@@ -1137,6 +1138,28 @@ impl WorldSession {
     #[inline]
     pub fn world_spawn(&self) -> Vec3 {
         self.world_spawn
+    }
+
+    /// Install the accepted village catalog on this session's world.
+    ///
+    /// The manager needs the world-spawn column to enforce the village spawn
+    /// exclusion, and deriving it runs the bounded 512-ring
+    /// [`find_spawn_column`] land search. The session already cached that
+    /// position at construction ([`Self::world_spawn`]), so this setter derives
+    /// the column from the cache instead of paying a second search.
+    ///
+    /// A post-construction setter is safe: no chunk is generated before the
+    /// first `update_streaming`, so every constructor can stay signature- and
+    /// behaviour-identical and the caller installs the catalog at the session
+    /// boundary (startup, create, and load swaps). An empty catalog is a
+    /// no-op for generation: the manager keeps its byte-identical legacy
+    /// path.
+    pub fn set_village_catalog(&mut self, catalog: Arc<VillageCatalog>) {
+        let column = (
+            self.world_spawn.x.floor() as i32,
+            self.world_spawn.z.floor() as i32,
+        );
+        self.world.set_village_catalog(catalog, column);
     }
 
     /// Whether every chunk column that could hold a spawn candidate is
@@ -6017,6 +6040,36 @@ mod tests {
             WorldSession::spawn_position(session.world.seed())
         );
         assert!(session.world_spawn().is_finite());
+    }
+
+    #[test]
+    fn set_village_catalog_derives_the_spawn_column_from_world_spawn() {
+        let mut session = WorldSession::new_session(
+            14,
+            PathBuf::from("/nonexistent/village.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        // The derivation input is the cached spawn, and the seed-14 land search
+        // resolves to (0, 0); the derived village exclusion column must match.
+        let spawn = session.world_spawn();
+        let expected = (spawn.x.floor() as i32, spawn.z.floor() as i32);
+        assert_eq!(expected, (0, 0), "seed-14 spawn column is pinned");
+        assert!(session.world.village_catalog().is_none());
+
+        session.set_village_catalog(Arc::new(VillageCatalog::default()));
+
+        assert_eq!(
+            session.world.village_spawn_column(),
+            Some(expected),
+            "the setter must floor the cached world spawn, not run a second search"
+        );
+        assert!(
+            session
+                .world
+                .village_catalog()
+                .is_some_and(|catalog| catalog.is_empty()),
+            "the installed catalog is the one the caller passed"
+        );
     }
 
     #[test]
