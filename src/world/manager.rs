@@ -39,8 +39,12 @@ pub struct WorldManager {
     light_grids: FxHashMap<ChunkPos, Arc<LightGrid>>,
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
-    mesh_tx: Sender<(ChunkPos, ChunkMesh)>,
-    mesh_rx: Receiver<(ChunkPos, ChunkMesh)>,
+    /// `None` is a completed job that produced no geometry (a volume with no
+    /// solid or liquid cells): it still marks the chunk meshed, but uploads no
+    /// GPU mesh. This is the worker-side equivalent of the old frame-thread
+    /// fast skip.
+    mesh_tx: Sender<(ChunkPos, Option<ChunkMesh>)>,
+    mesh_rx: Receiver<(ChunkPos, Option<ChunkMesh>)>,
     /// Completed columns waiting for a worker slot. `queued_light` is the
     /// de-dupe companion; the deque is FIFO so a column triggered later can
     /// never be dispatched (and therefore snapshotted) before an earlier one.
@@ -159,8 +163,11 @@ fn compute_light_region_snapshot(
 /// Per-frame ceilings for the light pipeline. Grid application is cheap (map
 /// inserts plus mesh-queue dirt) but result payloads are large; dispatch is
 /// limited because snapshotting still touches up to 54 map entries on the frame
-/// thread (the block arrays themselves are `Arc`-shared, so this is a handle
-/// clone, not a deep copy). Both are well below the MEM229 8 ms p95 budget.
+/// thread (the block arrays themselves are `Arc`-shared, so each is a handle
+/// clone, not a deep copy). The mesh path follows the same rule after MEM243/
+/// D072: the frame thread only snapshots `Arc`s and dispatches, while the 34^3
+/// padded assembly and greedy mesh both run on the rayon worker. Both budgets
+/// are well below the MEM229 8 ms p95 budget.
 const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
 const LIGHT_DISPATCH_BUDGET: usize = 4;
 
@@ -214,6 +221,305 @@ fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     }
     offsets.sort_by_key(|&(dx, dz)| dx * dx + dz * dz);
     offsets
+}
+
+/// Immutable `Arc` view of everything a mesh job reads for one chunk.
+///
+/// The frame thread builds this with O(1) handle clones; the rayon worker then
+/// assembles the padded volume without ever touching `WorldManager` state.
+///
+/// Sufficiency proof for the 3x3x3 window (`pos +/- 1` on x, y and z): the six
+/// face halos use `+/-1` on exactly one axis, and the 12 edge strips span chunk
+/// offsets `-1..=+1` on the third axis while the other two axes stay on `+/-1`.
+/// Every read `build_padded_from_snapshot` performs therefore lands inside the
+/// 27 collected positions.
+struct MeshSnapshot {
+    pos: ChunkPos,
+    chunks: FxHashMap<ChunkPos, Arc<Chunk>>,
+    light: FxHashMap<ChunkPos, Arc<LightGrid>>,
+}
+
+impl MeshSnapshot {
+    /// Mirrors `WorldManager::get_block`: below the world is bedrock, above is
+    /// air, and an absent chunk reads as air.
+    #[inline]
+    fn get_block(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
+        if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+            return BlockId::Bedrock;
+        }
+        if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+            return BlockId::Air;
+        }
+        let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+        self.chunks
+            .get(&cpos)
+            .map_or(BlockId::Air, |chunk| chunk.get(lx, ly, lz))
+    }
+
+    /// Mirrors `WorldManager::light_at_world`: below the world is dark, above is
+    /// full sky light, and an absent grid falls back to full sky light.
+    #[inline]
+    fn light_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+            return 0;
+        }
+        if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+            return light::MAX_SKY_LIGHT;
+        }
+        let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+        self.light
+            .get(&cpos)
+            .map_or(light::MAX_SKY_LIGHT, |grid| grid.get(lx, ly, lz))
+    }
+
+    /// Mirrors `WorldManager::has_all_face_neighbors`: same six directions and
+    /// the same skip for a y neighbour outside `MIN_CHUNK_Y..=MAX_CHUNK_Y`.
+    fn has_all_face_neighbors(&self, pos: ChunkPos) -> bool {
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let ny = pos.y + dy;
+            if !(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny) {
+                continue;
+            }
+            let npos = ChunkPos::new(pos.x + dx, ny, pos.z + dz);
+            if !self.chunks.contains_key(&npos) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Assemble the 34^3 padded volume for `snapshot.pos` entirely from the
+/// snapshotted `Arc` handles.
+///
+/// Extracted from `WorldManager::build_padded_chunk` so the heavy work runs on
+/// the rayon mesh worker (MEM243/D072) instead of the frame thread, where the
+/// S08 profile measured it at ~63% of dispatch time.
+fn build_padded_from_snapshot(snapshot: &MeshSnapshot) -> PaddedChunk {
+    let pos = snapshot.pos;
+    let center = snapshot
+        .chunks
+        .get(&pos)
+        .expect("mesh snapshot always contains its center chunk");
+
+    // Fast path: uniform air chunk produces zero faces
+    if center.is_uniform() == Some(BlockId::Air) {
+        return PaddedChunk::new_empty();
+    }
+
+    let mut padded = PaddedChunk::from_center_only(center);
+
+    // Copy 6 face halos directly from neighbor chunks
+    let cs = CHUNK_SIZE;
+    // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
+    if let Some(nx_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+        if nx_pos.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set(cs + 1, ly + 1, lz + 1, nx_pos.get(0, ly, lz));
+                }
+            }
+        }
+    }
+    if let Some(nx_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+        if nx_neg.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set(0, ly + 1, lz + 1, nx_neg.get(cs - 1, ly, lz));
+                }
+            }
+        }
+    }
+
+    // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
+    if pos.y < MAX_CHUNK_Y {
+        if let Some(ny_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+            if ny_pos.is_uniform() != Some(BlockId::Air) {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set(lx + 1, cs + 1, lz + 1, ny_pos.get(lx, 0, lz));
+                    }
+                }
+            }
+        }
+    }
+    if pos.y > MIN_CHUNK_Y {
+        if let Some(ny_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+            if ny_neg.is_uniform() != Some(BlockId::Air) {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set(lx + 1, 0, lz + 1, ny_neg.get(lx, cs - 1, lz));
+                    }
+                }
+            }
+        }
+    } else {
+        // Below MIN_CHUNK_Y is solid bedrock
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set(lx + 1, 0, lz + 1, BlockId::Bedrock);
+            }
+        }
+    }
+
+    // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
+    if let Some(nz_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+        if nz_pos.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set(lx + 1, ly + 1, cs + 1, nz_pos.get(lx, ly, 0));
+                }
+            }
+        }
+    }
+    if let Some(nz_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+        if nz_neg.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set(lx + 1, ly + 1, 0, nz_neg.get(lx, ly, cs - 1));
+                }
+            }
+        }
+    }
+
+    // Sky light mirrors the voxel halo geometry exactly: the center grid
+    // fills the inner 32^3, the 6 face halos come from the neighbour chunk
+    // grids, and the 12 edge strips use the world-space light accessor.
+    if let Some(grid) = snapshot.light.get(&pos) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, ly + 1, lz + 1, grid.get(lx, ly, lz));
+                }
+            }
+        }
+    }
+
+    // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
+            }
+        }
+    }
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
+            }
+        }
+    }
+
+    // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
+            }
+        }
+    }
+    if pos.y > MIN_CHUNK_Y {
+        if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
+                }
+            }
+        }
+    } else {
+        // Below MIN_CHUNK_Y is opaque bedrock, so no sky light reaches it.
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, 0, lz + 1, 0);
+            }
+        }
+    }
+
+    // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+        for ly in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
+            }
+        }
+    }
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+        for ly in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
+            }
+        }
+    }
+
+    // Populate 12 edge strips for seamless corner AO across chunk borders
+    let base_wx = pos.x * cs as i32;
+    let base_wy = pos.y * cs as i32;
+    let base_wz = pos.z * cs as i32;
+    for i in 0..=cs + 1 {
+        for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + px as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + i as i32 - 1,
+            );
+            padded.set(px, py, i, b);
+        }
+        for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + px as i32 - 1,
+                base_wy + i as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set(px, i, pz, b);
+        }
+        for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + i as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set(i, py, pz, b);
+        }
+    }
+
+    // ... and the matching light edge strips, through the grid map. Missing
+    // grids fall back to full light (see `light_at_world`).
+    for i in 0..=cs + 1 {
+        for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + px as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + i as i32 - 1,
+            );
+            padded.set_light(px, py, i, l);
+        }
+        for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + px as i32 - 1,
+                base_wy + i as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set_light(px, i, pz, l);
+        }
+        for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + i as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set_light(i, py, pz, l);
+        }
+    }
+
+    padded
 }
 
 impl WorldManager {
@@ -780,241 +1086,46 @@ impl WorldManager {
         self.apply_light_region(grids, cx0, cx1, cz0, cz1);
     }
 
+    /// Build the padded volume for `pos` from a 3x3x3 `Arc` snapshot taken on
+    /// the calling (frame) thread.
+    ///
+    /// The heavy 34^3 assembly is *not* done here: streaming dispatches this
+    /// function onto the rayon mesh worker through [`build_padded_from_snapshot`],
+    /// so the frame thread only clones map handles (the S08 profile measured
+    /// the old frame-thread build at ~63% of dispatch time). Synchronous
+    /// callers (`set_block_immediate`, the presentation demo and tests) still
+    /// get the same result.
     pub fn build_padded_chunk(&self, pos: ChunkPos) -> Option<PaddedChunk> {
-        let center = self.chunks.get(&pos)?;
-        if !self.has_all_face_neighbors(pos) {
-            return None;
-        }
+        Some(build_padded_from_snapshot(&self.mesh_snapshot(pos)?))
+    }
 
-        // Fast path: uniform air chunk produces zero faces
-        if center.is_uniform() == Some(BlockId::Air) {
-            return Some(PaddedChunk::new_empty());
-        }
-
-        let mut padded = PaddedChunk::from_center_only(center);
-
-        // Copy 6 face halos directly from neighbor chunks
-        let cs = CHUNK_SIZE;
-        // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
-        if let Some(nx_pos) = self.chunks.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
-            if nx_pos.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lz in 0..cs {
-                        padded.set(cs + 1, ly + 1, lz + 1, nx_pos.get(0, ly, lz));
+    /// Snapshot every resident chunk and light grid a mesh job for `pos` may
+    /// read, as `Arc` handles.
+    ///
+    /// Returns `None` under the same early-outs as the old frame-thread build:
+    /// the center must be resident and all six in-range face neighbours must be
+    /// present. Absent diagonal or vertical-out-of-range entries are simply not
+    /// collected; the padded builder reads them as air / full sky light, which
+    /// matches `get_block`/`light_at_world`.
+    fn mesh_snapshot(&self, pos: ChunkPos) -> Option<MeshSnapshot> {
+        self.chunks.get(&pos)?;
+        let mut chunks = FxHashMap::default();
+        let mut light = FxHashMap::default();
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+                    if let Some(chunk) = self.chunks.get(&npos) {
+                        chunks.insert(npos, Arc::clone(chunk));
+                    }
+                    if let Some(grid) = self.light_grids.get(&npos) {
+                        light.insert(npos, Arc::clone(grid));
                     }
                 }
             }
         }
-        if let Some(nx_neg) = self.chunks.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
-            if nx_neg.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lz in 0..cs {
-                        padded.set(0, ly + 1, lz + 1, nx_neg.get(cs - 1, ly, lz));
-                    }
-                }
-            }
-        }
-
-        // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
-        if pos.y < MAX_CHUNK_Y {
-            if let Some(ny_pos) = self.chunks.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
-                if ny_pos.is_uniform() != Some(BlockId::Air) {
-                    for lz in 0..cs {
-                        for lx in 0..cs {
-                            padded.set(lx + 1, cs + 1, lz + 1, ny_pos.get(lx, 0, lz));
-                        }
-                    }
-                }
-            }
-        }
-        if pos.y > MIN_CHUNK_Y {
-            if let Some(ny_neg) = self.chunks.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
-                if ny_neg.is_uniform() != Some(BlockId::Air) {
-                    for lz in 0..cs {
-                        for lx in 0..cs {
-                            padded.set(lx + 1, 0, lz + 1, ny_neg.get(lx, cs - 1, lz));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Below MIN_CHUNK_Y is solid bedrock
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set(lx + 1, 0, lz + 1, BlockId::Bedrock);
-                }
-            }
-        }
-
-        // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
-        if let Some(nz_pos) = self.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
-            if nz_pos.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lx in 0..cs {
-                        padded.set(lx + 1, ly + 1, cs + 1, nz_pos.get(lx, ly, 0));
-                    }
-                }
-            }
-        }
-        if let Some(nz_neg) = self.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
-            if nz_neg.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lx in 0..cs {
-                        padded.set(lx + 1, ly + 1, 0, nz_neg.get(lx, ly, cs - 1));
-                    }
-                }
-            }
-        }
-
-        // Sky light mirrors the voxel halo geometry exactly: the center grid
-        // fills the inner 32^3, the 6 face halos come from the neighbour chunk
-        // grids, and the 12 edge strips use the world-space light accessor.
-        if let Some(grid) = self.light_grids.get(&pos) {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    for lx in 0..cs {
-                        padded.set_light(lx + 1, ly + 1, lz + 1, grid.get(lx, ly, lz));
-                    }
-                }
-            }
-        }
-
-        // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x + 1, pos.y, pos.z))
-        {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
-                }
-            }
-        }
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x - 1, pos.y, pos.z))
-        {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
-                }
-            }
-        }
-
-        // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y + 1, pos.z))
-        {
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
-                }
-            }
-        }
-        if pos.y > MIN_CHUNK_Y {
-            if let Some(grid) = self
-                .light_grids
-                .get(&ChunkPos::new(pos.x, pos.y - 1, pos.z))
-            {
-                for lz in 0..cs {
-                    for lx in 0..cs {
-                        padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
-                    }
-                }
-            }
-        } else {
-            // Below MIN_CHUNK_Y is opaque bedrock, so no sky light reaches it.
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, 0, lz + 1, 0);
-                }
-            }
-        }
-
-        // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y, pos.z + 1))
-        {
-            for ly in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
-                }
-            }
-        }
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y, pos.z - 1))
-        {
-            for ly in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
-                }
-            }
-        }
-
-        // Populate 12 edge strips for seamless corner AO across chunk borders
-        let base_wx = pos.x * cs as i32;
-        let base_wy = pos.y * cs as i32;
-        let base_wz = pos.z * cs as i32;
-        for i in 0..=cs + 1 {
-            for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + px as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + i as i32 - 1,
-                );
-                padded.set(px, py, i, b);
-            }
-            for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + px as i32 - 1,
-                    base_wy + i as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set(px, i, pz, b);
-            }
-            for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + i as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set(i, py, pz, b);
-            }
-        }
-
-        // ... and the matching light edge strips, through the grid map. Missing
-        // grids fall back to full light (see `light_at_world`).
-        for i in 0..=cs + 1 {
-            for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + px as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + i as i32 - 1,
-                );
-                padded.set_light(px, py, i, l);
-            }
-            for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + px as i32 - 1,
-                    base_wy + i as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set_light(px, i, pz, l);
-            }
-            for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + i as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set_light(i, py, pz, l);
-            }
-        }
-
-        Some(padded)
+        let snapshot = MeshSnapshot { pos, chunks, light };
+        snapshot.has_all_face_neighbors(pos).then_some(snapshot)
     }
 
     pub fn set_block_immediate(
@@ -1315,7 +1426,11 @@ impl WorldManager {
             };
             if self.pending_mesh.remove(&pos) && self.chunks.contains_key(&pos) {
                 self.meshed_chunks.insert(pos);
-                completed_meshes.push((pos, mesh));
+                // `None` is the worker's "no solid or liquid cells" outcome,
+                // matching the old frame-thread skip: mark meshed, no upload.
+                if let Some(mesh) = mesh {
+                    completed_meshes.push((pos, mesh));
+                }
             }
         }
 
@@ -1465,31 +1580,36 @@ impl WorldManager {
                 break;
             }
             self.dirty_mesh_queue.remove(&pos);
-            let Some(padded) = self.build_padded_chunk(pos) else {
+            // Clone the handle set on the frame thread, then do all heavy work
+            // on rayon (MEM243/D072). `None` is the same early-out the old
+            // synchronous build had: not ready to mesh yet.
+            let Some(snapshot) = self.mesh_snapshot(pos) else {
                 continue;
             };
-            // Fast path on main thread: if padded chunk has no solid and no
-            // liquid voxels, skip worker dispatch. Water must be included so a
-            // water-bearing (or water-only) chunk is still meshed.
-            if !padded.has_any_solid && !padded.has_any_liquid {
-                self.meshed_chunks.insert(pos);
-                continue;
-            }
             self.pending_mesh.insert(pos);
             let tx = self.mesh_tx.clone();
             // Clone the shared table before the `move` closure: the worker
             // owns a pointer, not a borrow of the manager.
             let faces = Arc::clone(&self.block_faces);
             rayon::spawn(move || {
-                let mesh = mesh_chunk_with(&padded, &faces);
+                let padded = build_padded_from_snapshot(&snapshot);
+                // Water must be included so a water-bearing (or water-only)
+                // chunk is still meshed; only a fully empty volume skips.
+                let mesh = if !padded.has_any_solid && !padded.has_any_liquid {
+                    None
+                } else {
+                    Some(mesh_chunk_with(&padded, &faces))
+                };
                 let _ = tx.send((pos, mesh));
             });
         }
 
         // 8. Hand queued columns to rayon last, so snapshotting (up to 54
         //    `Arc` handle clones, not block-array copies) never delays this
-        //    frame's mesh dispatch. The worker results are applied by step 2
-        //    of a later frame.
+        //    frame's mesh dispatch. Both the 34^3 padded assembly and the
+        //    greedy mesh run on rayon; the frame thread only snapshots and
+        //    dispatches (MEM243/D072). Worker results are applied by step 2 of
+        //    a later frame.
         self.dispatch_light_jobs();
 
         (completed_meshes, unloaded)
@@ -1565,7 +1685,7 @@ mod tests {
 
         // Simulate an older in-flight background mesh that completes after a synchronous block edit
         mgr.pending_mesh.insert(cpos);
-        let _ = mgr.mesh_tx.send((cpos, ChunkMesh::new()));
+        let _ = mgr.mesh_tx.send((cpos, Some(ChunkMesh::new())));
 
         let remeshed = mgr.set_block_immediate(5, 5, 5, BlockId::Air);
         assert_eq!(remeshed.len(), 1);
@@ -1601,9 +1721,69 @@ mod tests {
 
         assert_eq!(snapshot.get(5, 5, 5), BlockId::Stone);
         assert_eq!(
-            mgr.chunks.get(&cpos).expect("center stays resident").get(5, 5, 5),
+            mgr.chunks
+                .get(&cpos)
+                .expect("center stays resident")
+                .get(5, 5, 5),
             BlockId::Air
         );
+    }
+
+    #[test]
+    fn padded_snapshot_matches_world_accessors() {
+        use crate::mesh::greedy::{padded_index, PADDED_SIZE};
+
+        let mut mgr = WorldManager::new(4);
+        // Full 3x3 column ring across the whole loaded Y range: exactly the
+        // window the padded builder reads (face halos plus the 12 edge strips).
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    mgr.insert_chunk_for_test(
+                        pos,
+                        generate_chunk_seeded(pos, 1337, Season::Summer),
+                    );
+                }
+            }
+        }
+        mgr.recompute_light_for_test();
+
+        // Bottom, middle and top centers exercise the bedrock floor, ordinary
+        // interior halos and the open-sky ceiling. `is_solid()` is false only
+        // for Air and Water, so the raw-id comparison below is exact.
+        for center in [
+            ChunkPos::new(0, MIN_CHUNK_Y, 0),
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, MAX_CHUNK_Y, 0),
+        ] {
+            let padded = mgr
+                .build_padded_chunk(center)
+                .expect("full halo ring is resident and lit");
+            let base_wx = center.x * CHUNK_SIZE as i32;
+            let base_wy = center.y * CHUNK_SIZE as i32;
+            let base_wz = center.z * CHUNK_SIZE as i32;
+            for py in 0..PADDED_SIZE {
+                for pz in 0..PADDED_SIZE {
+                    for px in 0..PADDED_SIZE {
+                        let wx = base_wx + px as i32 - 1;
+                        let wy = base_wy + py as i32 - 1;
+                        let wz = base_wz + pz as i32 - 1;
+                        let idx = padded_index(px, py, pz);
+                        assert_eq!(
+                            padded.voxels[idx],
+                            mgr.get_block(wx, wy, wz).to_raw(),
+                            "voxel mismatch at padded ({px},{py},{pz}) for {center:?}"
+                        );
+                        assert_eq!(
+                            padded.light[idx],
+                            mgr.light_at_world(wx, wy, wz),
+                            "light mismatch at padded ({px},{py},{pz}) for {center:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
