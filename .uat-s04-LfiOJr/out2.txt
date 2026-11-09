@@ -1,2 +1,0 @@
-frame_budget: samples=1 p50=134.579ms p95=134.579ms max=134.579ms target: p95<=16.6ms
-combat_demo: seed=1 stage=restored mobs=2 health=11/14 yaw=true positions=true items=4 ok=true
