@@ -227,8 +227,7 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
         definition_text.contains("hub = \"capture\""),
         "the demo definition must name the captured prefab: {definition_text}"
     );
-    let (catalog, diagnostics) =
-        opencraft::world::village::VillageCatalog::load_sorted(dir.path());
+    let (catalog, diagnostics) = opencraft::world::village::VillageCatalog::load_sorted(dir.path());
     assert_eq!(diagnostics, Vec::<String>::new());
     assert!(catalog.get("capture_demo").is_some());
     assert!(catalog.prefabs().get("capture").is_some());

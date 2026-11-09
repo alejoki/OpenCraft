@@ -221,13 +221,21 @@ pub(crate) fn direction_from_solid_neighbours(
     let mut open: Option<Direction> = None;
 
     if west != east {
-        open = Some(if east { Direction::West } else { Direction::East });
+        open = Some(if east {
+            Direction::West
+        } else {
+            Direction::East
+        });
     }
     if north != south {
         if open.is_some() {
             return Err(CaptureError::AmbiguousSocket { pos });
         }
-        open = Some(if south { Direction::North } else { Direction::South });
+        open = Some(if south {
+            Direction::North
+        } else {
+            Direction::South
+        });
     }
 
     open.ok_or(CaptureError::AmbiguousSocket { pos })
@@ -704,7 +712,10 @@ mod tests {
         let ambiguous = || Err(CaptureError::AmbiguousSocket { pos });
 
         // 0 solids: neither axis opens.
-        assert_eq!(direction_from_solid_neighbours([false; 4], pos), ambiguous());
+        assert_eq!(
+            direction_from_solid_neighbours([false; 4], pos),
+            ambiguous()
+        );
 
         // 1 solid: the only opening is the opposite side.
         for (index, expected) in [
@@ -745,7 +756,8 @@ mod tests {
             (2, Direction::North),
             (3, Direction::South),
         ] {
-            let solid = solid_pattern(&(0..4).filter(|&index| index != missing).collect::<Vec<_>>());
+            let solid =
+                solid_pattern(&(0..4).filter(|&index| index != missing).collect::<Vec<_>>());
             assert_eq!(
                 direction_from_solid_neighbours(solid, pos),
                 Ok(expected),
@@ -754,10 +766,7 @@ mod tests {
         }
 
         // 4 solids: fully enclosed.
-        assert_eq!(
-            direction_from_solid_neighbours([true; 4], pos),
-            ambiguous()
-        );
+        assert_eq!(direction_from_solid_neighbours([true; 4], pos), ambiguous());
     }
 
     #[test]
