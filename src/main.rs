@@ -16367,21 +16367,15 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
             let mut road_ok = false;
             if let Some(found) = &plan {
                 total = found.road_cell_count();
-                let chunks: BTreeMap<(i32, i32, i32), Chunk> =
-                    village_demo_window(&found.bounds)
-                        .into_iter()
-                        .map(|pos| {
-                            (
-                                (pos.x, pos.y, pos.z),
-                                village_demo_generate(
-                                    pos,
-                                    CAPTURE_DEMO_VILLAGE_SEED,
-                                    &catalog,
-                                    spawn,
-                                ),
-                            )
-                        })
-                        .collect();
+                let chunks: BTreeMap<(i32, i32, i32), Chunk> = village_demo_window(&found.bounds)
+                    .into_iter()
+                    .map(|pos| {
+                        (
+                            (pos.x, pos.y, pos.z),
+                            village_demo_generate(pos, CAPTURE_DEMO_VILLAGE_SEED, &catalog, spawn),
+                        )
+                    })
+                    .collect();
                 hits = found
                     .road_cells
                     .iter()
@@ -18270,8 +18264,7 @@ mod tests {
             definition.is_file(),
             "exactly one demo village definition is written"
         );
-        let definition_text =
-            std::fs::read_to_string(&definition).expect("read demo definition");
+        let definition_text = std::fs::read_to_string(&definition).expect("read demo definition");
         assert!(
             definition_text.contains("hub = \"capture\""),
             "the demo definition must name the captured prefab: {definition_text}"
@@ -18336,7 +18329,10 @@ mod tests {
             root.join("prefabs/capture.toml").is_file(),
             "the successful prefab write must survive a definition failure"
         );
-        assert_eq!(std::fs::read(root.join("villages")).expect("read file"), b"keep me");
+        assert_eq!(
+            std::fs::read(root.join("villages")).expect("read file"),
+            b"keep me"
+        );
     }
 
     #[test]
@@ -26154,6 +26150,197 @@ stack = 64
                 .as_ref()
                 .map(|message| message.text.as_str()),
             Some("saved prefab 'capture' to worldgen/prefabs/capture.toml")
+        );
+    }
+
+    /// Every regular file below `root`, sorted: proves a refused capture wrote
+    /// nothing anywhere under the worldgen root.
+    fn capture_test_files_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Build the S06 doorway fixture used by the two interactive capture tests:
+    /// a 5x3x5 region with an oak-plank floor at y=5, cobblestone perimeter at
+    /// y=6..=7, a two-tall doorway in the min-z wall at x=2, a cobblestone
+    /// threshold step one cell inside, and every other interior cell air.
+    /// `remove_east_jamb` opens the cell beside the doorway so a second axis
+    /// qualifies and the marker becomes ambiguous.
+    fn insert_capture_doorway_fixture(session: &mut WorldSession, remove_east_jamb: bool) {
+        insert_test_chunk_with_face_neighbors(session, BlockId::Air);
+        for x in 0..=4 {
+            for z in 0..=4 {
+                session
+                    .world
+                    .set_block_immediate(x, 5, z, BlockId::OakPlanks);
+                for y in 6..=7 {
+                    let perimeter = x == 0 || x == 4 || z == 0 || z == 4;
+                    if perimeter {
+                        session
+                            .world
+                            .set_block_immediate(x, y, z, BlockId::Cobblestone);
+                    }
+                }
+            }
+        }
+        // Two-tall doorway in the min-z wall; the north neighbour sits outside
+        // the region, so it never reads a chunk.
+        session.world.set_block_immediate(2, 6, 0, BlockId::Air);
+        session.world.set_block_immediate(2, 7, 0, BlockId::Air);
+        // Threshold step one cell inside keeps the south side of the marker
+        // solid, leaving exactly one open axis (north).
+        session
+            .world
+            .set_block_immediate(2, 6, 1, BlockId::Cobblestone);
+        if remove_east_jamb {
+            session.world.set_block_immediate(3, 6, 0, BlockId::Air);
+        }
+        session
+            .world
+            .set_block_immediate(2, 6, 0, BlockId::SocketMarker);
+    }
+
+    fn capture_doorway_app(dir: &Path, root: &Path, seed: u32, remove_east_jamb: bool) -> GameApp {
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            None,
+            Some(root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.join("capture-doorway.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_capture_doorway_fixture(&mut session, remove_east_jamb);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// S06-T04: the player path proves a valid doorway marker becomes exactly
+    /// one origin-relative socket and the marker cell is never serialized.
+    #[test]
+    fn capture_socket_marker_becomes_one_socket_and_resets_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let mut app = capture_doorway_app(dir.path(), &root, 81, false);
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(4, 7, 4));
+        assert!(app.capture.begin_naming(Some(&root)));
+        app.submit_capture();
+
+        assert!(!app.capture.is_active(), "a successful save resets capture");
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("saved prefab 'capture' to worldgen/prefabs/capture.toml")
+        );
+
+        let files = capture_test_files_under(&root);
+        assert_eq!(files.len(), 1, "exactly one prefab file is written");
+        assert_eq!(
+            files[0],
+            root.join("prefabs").join("capture.toml"),
+            "the one file is the prefilled name under prefabs/"
+        );
+        let text = std::fs::read_to_string(&files[0]).expect("read written prefab");
+        let parsed =
+            opencraft::world::prefab::parse_prefab(&text).expect("the written prefab parses");
+        assert_eq!(parsed.name, "capture");
+        assert_eq!(parsed.size, [5, 3, 5]);
+        assert_eq!(
+            parsed.sockets,
+            vec![opencraft::world::prefab::PrefabSocket {
+                position: [0, 1, -2],
+                direction: opencraft::world::prefab::Direction::North,
+            }],
+            "the doorway marker becomes exactly one origin-relative north socket"
+        );
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .all(|block| block.block != BlockId::SocketMarker),
+            "no prefab cell may serialize the socket marker"
+        );
+        let marker_cell = parsed
+            .blocks
+            .iter()
+            .find(|block| block.position == [2, 1, 0])
+            .expect("the marker cell is emitted");
+        assert_eq!(marker_cell.block, BlockId::Air, "the marker cell is air");
+    }
+
+    /// S06-T04: an ambiguous marker names its real coordinate on the one
+    /// composed notice row, keeps the prompt and typed name alive, and writes
+    /// nothing under the worldgen root.
+    #[test]
+    fn capture_ambiguous_marker_keeps_prompt_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let mut app = capture_doorway_app(dir.path(), &root, 82, true);
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let before = capture_test_files_under(&root);
+        assert!(before.is_empty(), "the fixture starts with no prefab files");
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(4, 7, 4));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(
+            app.capture.naming_value(),
+            "capture",
+            "the typed name is unchanged"
+        );
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("socket marker at [2, 6, 0] is ambiguous"),
+            "the refusal names the real marker coordinate"
+        );
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains("socket marker at [2, 6, 0] is ambiguous"),
+            "the one notice row carries the reason: {composed}"
+        );
+
+        assert_eq!(
+            capture_test_files_under(&root),
+            before,
+            "an ambiguous marker writes no file"
+        );
+        assert!(
+            !root.join("prefabs").exists(),
+            "no prefabs directory is created by a refused capture"
         );
     }
 
