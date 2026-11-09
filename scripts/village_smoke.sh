@@ -30,6 +30,14 @@
 #     warning lines and reduced counts; a missing worldgen/ tree exits 1 with
 #     failed=site.
 #
+#   Dispatch budget (opt-in): with SMOKE_PROFILE=release SMOKE_BUDGET=1 the
+#     ignored release harness `streaming_budget_villages` runs and the whole
+#     smoke FAILS on a non-zero exit, a missing/duplicate measurement line, or
+#     any unmet control (samples=40, village_cells=2962, plan_chunks=6,
+#     resident_plan_chunks=6, p95<=8ms, max<=16ms). It is skipped by default
+#     and prints an evidence line saying so. SMOKE_BUDGET=1 with the debug
+#     profile fails closed before any build.
+#
 #   Isolation: the repository's tracked worldgen/ tree, packs/ and config/ are
 #     byte-identical after every leg, and no launch cwd gains settings.toml,
 #     saves/ or packs/. Only target/ (git-ignored) is written inside the repo.
@@ -44,7 +52,8 @@
 # touched. Every leg runs in its own temp cwd; content legs run against a copy
 # of worldgen/ so the tracked tree cannot be mutated.
 #
-# Dependencies: bash, cargo, cmp, mktemp, cp, grep, diff, mkdir, sed, awk, find.
+# Dependencies: bash, cargo, cmp, mktemp, cp, grep, diff, mkdir, sed, awk, find,
+# timeout.
 
 set -u
 
@@ -58,6 +67,22 @@ case "$PROFILE" in
         exit 1
         ;;
 esac
+
+# Dispatch-budget switch (default off). The release harness measures release
+# timings, so requesting it under the debug profile fails closed before any
+# build instead of gating meaningless numbers.
+BUDGET="${SMOKE_BUDGET:-0}"
+case "$BUDGET" in
+    0|1) ;;
+    *)
+        echo "VILLAGE SMOKE FAIL: invalid SMOKE_BUDGET='$BUDGET' (expected 0 or 1)"
+        exit 1
+        ;;
+esac
+if [[ "$BUDGET" == "1" && "$PROFILE" != "release" ]]; then
+    echo "VILLAGE SMOKE FAIL: SMOKE_BUDGET=1 requires SMOKE_PROFILE=release (debug timings are meaningless)"
+    exit 1
+fi
 
 if [[ "$PROFILE" == "release" ]]; then
     BUILD_ARGS=(build --locked --release)
@@ -87,7 +112,7 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
-for tool in cmp mktemp cp grep diff mkdir sed awk find; do
+for tool in cmp mktemp cp grep diff mkdir sed awk find timeout; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "VILLAGE SMOKE FAIL: required tool '$tool' not found on PATH"
         exit 1
@@ -478,7 +503,57 @@ pinned_lines "$TEMP_DIR/generate-absent.log" "generate-absent" \
     "village_demo: leg=session cell=none spawn=0,0 chunks=0 cells=0 identical=false" \
     "village_demo: ok=false failed=site"
 
-# --- Leg 12: no repository writes / no player state ----------------------
+# --- Leg 12: streaming dispatch budget (opt-in) --------------------------
+if [[ "$BUDGET" == "1" ]]; then
+    # Run from the crate root: the harness loads worldgen/ relative to cwd and
+    # writes only target/, which the isolation diff below does not inspect.
+    if ! ( cd "$CRATE_ROOT" && timeout 900 cargo test --locked --release --lib \
+            -- --ignored streaming_budget_villages --nocapture ) >"$TEMP_DIR/budget.log" 2>&1; then
+        echo "VILLAGE SMOKE FAIL: release streaming_budget_villages harness failed"
+        echo "--- captured budget output (tail) ---"
+        tail -n 60 "$TEMP_DIR/budget.log" >&2
+        exit 1
+    fi
+
+    budget_count="$(grep -c '^streaming_budget_villages:' "$TEMP_DIR/budget.log" || true)"
+    [[ "$budget_count" -eq 1 ]] \
+        || fail "expected exactly one 'streaming_budget_villages:' line, found $budget_count"
+    budget_line="$(grep '^streaming_budget_villages:' "$TEMP_DIR/budget.log")"
+
+    # Tokenise on spaces and match exact 'key=' tokens so `plan_chunks` cannot
+    # be satisfied by the `resident_plan_chunks=` token.
+    budget_tokens="$(printf '%s\n' "$budget_line" | tr ' ' '\n')"
+    budget_field() {
+        printf '%s\n' "$budget_tokens" | sed -n "s/^$1=//p" | head -n1
+    }
+    samples="$(budget_field samples)"
+    village_cells="$(budget_field village_cells)"
+    plan_chunks="$(budget_field plan_chunks)"
+    resident_plan_chunks="$(budget_field resident_plan_chunks)"
+    p95="$(budget_field p95 | sed 's/ms$//')"
+    max="$(budget_field max | sed 's/ms$//')"
+
+    for pair in "samples=$samples" "village_cells=$village_cells" \
+        "plan_chunks=$plan_chunks" "resident_plan_chunks=$resident_plan_chunks" \
+        "p95=$p95" "max=$max"; do
+        [[ -n "${pair#*=}" ]] || fail "budget line is missing ${pair%%=*}"
+    done
+    [[ "$samples" == "40" ]] || fail "budget samples=$samples (expected 40)"
+    [[ "$village_cells" == "2962" ]] || fail "budget village_cells=$village_cells (expected 2962)"
+    [[ "$plan_chunks" == "6" ]] || fail "budget plan_chunks=$plan_chunks (expected 6)"
+    [[ "$resident_plan_chunks" == "6" ]] \
+        || fail "budget resident_plan_chunks=$resident_plan_chunks (expected 6)"
+    awk -v v="$p95" 'BEGIN { exit !(v <= 8.0) }' \
+        || fail "budget p95=${p95}ms exceeds 8ms"
+    awk -v v="$max" 'BEGIN { exit !(v <= 16.0) }' \
+        || fail "budget max=${max}ms exceeds 16ms"
+
+    echo "VILLAGE SMOKE EVIDENCE: dispatch budget p95=${p95}ms max=${max}ms samples=${samples} village_cells=${village_cells} plan_chunks=${plan_chunks}/${resident_plan_chunks}"
+else
+    echo "VILLAGE SMOKE EVIDENCE: dispatch budget leg skipped (set SMOKE_PROFILE=release SMOKE_BUDGET=1 to gate it)"
+fi
+
+# --- Leg 13: no repository writes / no player state ----------------------
 diff -r "$TEMP_DIR/before-worldgen" "$CRATE_ROOT/worldgen" >"$TEMP_DIR/worldgen-diff.txt" 2>&1 \
     || {
         echo "VILLAGE SMOKE FAIL: the tracked worldgen/ tree changed during the smoke"
@@ -512,7 +587,7 @@ for dir in "${LAUNCH_DIRS[@]}"; do
     [[ ! -e "$dir/packs" ]] || fail "launch cwd $dir gained a packs/ directory"
 done
 
-# --- Leg 13: PASS + one evidence line per pinned digest group -------------
+# --- Leg 14: PASS + one evidence line per pinned digest group -------------
 echo "VILLAGE SMOKE PASS [profile=$PROFILE]"
 echo "VILLAGE SMOKE EVIDENCE: validator matrix clean=0/broken=1/oversize=1/duplicate=1/missing=0 pinned whole-line"
 echo "VILLAGE SMOKE EVIDENCE: capture success bytes=423 sockets=1 markers=0 ambiguous-write=false catalog+village+road ok"

@@ -377,6 +377,48 @@ cargo test --locked --release --lib -- --ignored streaming_budget_villages --noc
 cargo test --locked --release --test village_frame_budget -- --ignored --nocapture
 ```
 
+The headless dispatch budget is gated by the smoke behind an explicit opt-in.
+It requires the release profile and fails the whole run on a non-zero harness
+exit, a missing or duplicate measurement line, or any unmet control instead of
+skipping the ignored test silently:
+
+```bash
+SMOKE_PROFILE=release SMOKE_BUDGET=1 bash scripts/village_smoke.sh
+```
+
+The default smoke does not pay for the release harness and prints a
+`dispatch budget leg skipped` evidence line instead. The windowed
+`village_frame_budget` stays a manual desktop-session run (D261) because it
+needs a real window; the opt-in gate above never launches one.
+
+### Streaming budget: profile and fix
+
+Village-enabled streaming was measured over a 40-step crossing with one
+resident village. The root cause was on the frame thread: `build_padded_chunk`
+(the 34^3 padded volume copied for greedy meshing) consumed 83-102 ms of the
+148-161 ms dispatch time across 40 calls, about 63%, with up to 24 builds in a
+single frame.
+
+The fix keeps resident data shared instead of copied: `WorldManager` stores
+`Arc<Chunk>` and `Arc<LightGrid>` at the map level, the frame thread only
+snapshots the 3x3x3 neighbourhood as `Arc` handles, and the padded assembly plus
+greedy mesh run on the existing rayon mesh worker. An empty padded volume is
+carried as an explicit `None` outcome in the mesh channel.
+
+Post-fix, three consecutive release runs of
+`streaming_budget_villages` (samples=40, village_cells=2962, plan_chunks=6,
+resident_plan_chunks=6) each printed p50/p95/max in milliseconds:
+
+| Run | p50 | p95 | max |
+| --- | --- | --- | --- |
+| 1 | 0.340 | 2.833 | 3.276 |
+| 2 | 0.322 | 1.223 | 2.820 |
+| 3 | 0.343 | 0.884 | 2.724 |
+
+The frame-budget harness p95 in the same measurement round was 6.668 ms. The
+accepted controls stay p95<=8 ms and max<=16 ms; the smoke gate above never
+relaxes them.
+
 The reference content is:
 
 - `worldgen/prefabs/plains_hub.toml` — 7x4x7 hub with four sockets.
