@@ -819,6 +819,76 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M014/S01, M014/S02, M014/S03, M014/S04, M014/S05, M014/S06, M014/S07, M014/S08, M014/S10
 - Validation: bash scripts/creator_smoke.sh; SMOKE_PROFILE=release bash scripts/creator_smoke.sh; cargo test --locked; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; recorded human tuning pass in docs/UAT-M014.md
 
+### R082 — Prefab TOML schema, fail-soft catalog, and windowless --validate-worldgen
+- Class: core-capability
+- Status: active
+- Description: Prefab content uses a `format = 1` TOML schema with a shared 32x32x32 `PREFAB_CAPS` and a 1 MiB file cap, a byte-stable serializer, and a sorted fail-soft catalog whose duplicate names resolve first-wins. The same surface is exposed to release builds as a windowless `--validate-worldgen [dir]`: one `ok: prefab <name>` line per accepted file, exactly one stable `worldgen/prefabs/<file>: <reason>` line per rejected file, a `N prefabs, E errors, W warnings` summary, exit 0/1, a missing tree accepted as valid empty content, and no window, GPU, settings, or save touched.
+- Why it matters: Authored prefab content needs one schema and one deterministic validation seam that behave identically in release and never open the game.
+- Source: M015 / S01 prefab schema and validation CLI
+- Primary owning slice: M015/S01
+- Supporting slices: M015/S02, M015/S05, M015/S06
+- Validation: cargo test --locked --test worldgen_cli; cargo test --locked --test worldgen_refs; cargo run --locked --quiet -- --validate-worldgen; bash scripts/village_smoke.sh
+
+### R083 — Village definition schema and pure chunk-local planner
+- Class: core-capability
+- Status: active
+- Description: A village definition names biomes, hub, spacing 1..=16, min/max_prefabs 10..=20, max_slope 0..=16, and house/farm/well/junction prefab pools, and every used prefab must have at least one socket at grid y=1. The pure chunk-local planner applies a salted 1/4 cell gate, excludes ocean/beach/mountain cells, rejects ruin anchors and the 64-block spawn radius, grades a footprint-sampled base with foundations, rejects a slot whose sampled slope exceeds the tolerance, stops a branch at an unmatched socket, rejects roads rather than orphaning them, places 10-20 prefabs, and emits only during the last pass over a chunk. An empty or absent catalog is byte-identical to pre-M015 output.
+- Why it matters: Villages are generated content, so their layout must be deterministic, seed-stable, and byte-identical when no catalog is installed.
+- Source: M015 / S02 village schema and planner
+- Primary owning slice: M015/S02
+- Supporting slices: M015/S03, M015/S06
+- Validation: cargo test --locked --test village_determinism; cargo run --locked --quiet -- --demo-village
+
+### R084 — Village lifecycle continuity and dispatch budget
+- Class: continuity
+- Status: active
+- Description: Production village state lives behind an `Arc<VillageCatalog>` with a cached spawn column, dispatches from both worldgen call sites, carries across a season rollover, installs only at new-world or session boundaries, and surfaces diagnostics as warnings. Player edits win so existing cells never re-place, `SAVE_VERSION` stays 9, and no prefab name appears in save bytes or the content table. With villages enabled the measured release dispatch budget is p95 <= 8 ms and max <= 16 ms, with frame p95 <= 16.6 ms.
+- Why it matters: Adding content to worldgen must not disturb saves or the frame budget, and refilling must never overwrite what the player built.
+- Source: M015 / S03 lifecycle and budgets
+- Primary owning slice: M015/S03
+- Supporting slices: M015/S05, M015/S06
+- Validation: cargo test --locked --test village_session; cargo test --locked --test village_continuity; cargo test --release --locked --lib -- --ignored streaming_budget_villages; cargo test --release --locked --test village_frame_budget -- --ignored
+
+### R085 — BlockId::SocketMarker as the 24th built-in with layer 25 reserved for sockets
+- Class: core-capability
+- Status: active
+- Description: `BlockId::SocketMarker` is the 24th built-in block (raw 23, frozen name `socket_marker`) with six faces on layer 25, solid and light-blocking, ~0.3 s to break, no drop, and non-carryable. Placement is Creative-only through a fixed key and a pure helper. Layers 26..=31 stay reserved, `PLACEHOLDER_BLOCK_LAYER` and the modded face fallback move to 26, and v8 fixtures still load by name. Layer 25 is the single recorded D244 amendment to R065's built-in layer-identity clause; layers 0..=24, 26..=31, and 32..=47 are unchanged.
+- Why it matters: The marker is the authoring primitive, so its block identity and layer budget must be explicit and bounded.
+- Source: M015 / S04 socket marker block
+- Primary owning slice: M015/S04
+- Supporting slices: M015/S05, M015/S06
+- Validation: cargo test --locked --lib -- world::block; cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v9_cli; bash scripts/presentation_smoke.sh; bash scripts/palette_smoke.sh
+
+### R086 — Creative two-corner prefab capture
+- Class: primary-user-loop
+- Status: active
+- Description: In Creative, a two-corner selection draws a cyan LineList cage and opens a bounded prefilled name prompt; Enter writes exactly one `worldgen/prefabs/<name>.toml` and Escape writes nothing. Air and static water are preserved, chests are emptied, crops reset to stage 0, and `origin = [size_x/2, 0, size_z/2]`. Every failure (oversize, out of height, first unloaded chunk, invalid name, collision, unwritable root, unsupported block) posts one readable composed reason, writes nothing, and keeps the session alive. Writes stay confined under `worldgen/prefabs/`, never touch saves or config, and the pinned `--demo-capture` digest proves the serialized bytes.
+- Why it matters: In-game authoring is the only path from a build in the world to a reusable prefab, so failure must be visible and must never corrupt state.
+- Source: M015 / S05 Creative capture
+- Primary owning slice: M015/S05
+- Supporting slices: M015/S06, M015/S07
+- Validation: cargo test --locked --lib -- world::capture; cargo test --locked --bin opencraft -- capture; cargo test --locked --test capture_cli; bash scripts/village_smoke.sh
+
+### R087 — Marker-to-socket geometry and end-to-end placement
+- Class: integration
+- Status: active
+- Description: Capture derives sockets from markers: out-of-region neighbours count as non-solid and are never read, exactly one qualifying horizontal axis is required, the open side gives the direction, and ambiguity fails the whole capture at the first marker in (y,z,x) order with `socket marker at [x, y, z] is ambiguous` and no write. The resulting socket is origin-relative and rotation-aware, the marker cell is emitted as Air, and the end-to-end proof runs capture -> validate -> production catalog reload -> socket placement in a plains village, yielding a cobblestone road whose road cells are Cobblestone, linked sockets Air, and placement origins OakPlanks.
+- Why it matters: A socket that cannot be derived deterministically or connected in the real village would make authored prefabs unusable.
+- Source: M015 / S06 marker-to-socket integration
+- Primary owning slice: M015/S06
+- Supporting slices: M015/S07
+- Validation: cargo test --locked --lib -- world::capture; cargo test --locked --bin opencraft -- capture; cargo test --locked --test capture_cli; bash scripts/village_smoke.sh
+
+### R088 — M015 closure surface: docs, real-binary smoke, requirements trace, and human UAT
+- Class: launchability
+- Status: active
+- Description: M015 closes with a tracked `docs/WORLDGEN.md` reviewer path, a local `docs/UAT-M015.md` human runbook kept separate from agent evidence, and a `scripts/village_smoke.sh` that covers debug and release in isolated temp cwds with no repository writes. The registry and checker carry R082-R088 plus a 10-row M015 criterion trace, with the checker and its selftest updated in lockstep.
+- Why it matters: Closure must be reproducible on the assembled tree with real binaries, and the human judgments must be recorded rather than inferred.
+- Source: M015 / S07 closure surface
+- Primary owning slice: M015/S07
+- Supporting slices: M015/S01, M015/S02, M015/S03, M015/S04, M015/S05, M015/S06
+- Validation: bash scripts/village_smoke.sh; SMOKE_PROFILE=release bash scripts/village_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo test --locked; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -938,3 +1008,18 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 10 | R081, R069 | S09 | bash scripts/creator_smoke.sh; SMOKE_PROFILE=release bash scripts/creator_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh |
 | 11 | R081 | S10 | recorded human tuning pass in docs/UAT-M014.md |
 | 12 | R081 | S09, S10 | cargo test --locked; M014 out-of-scope guardrail recorded in docs and decisions |
+
+## M015 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R086, R087 | S05, S06 | cargo test --locked --lib -- world::capture; cargo test --locked --test capture_cli; bash scripts/village_smoke.sh |
+| 2 | R082, R063 | S01 | cargo test --locked --test worldgen_cli; cargo run --locked --quiet -- --validate-worldgen; bash scripts/village_smoke.sh |
+| 3 | R083 | S02 | cargo test --locked --test village_determinism; cargo run --locked --quiet -- --demo-village |
+| 4 | R083 | S02 | cargo test --locked --lib -- world::village; cargo run --locked --quiet -- --demo-village |
+| 5 | R083, R084 | S02, S03 | cargo test --locked --lib -- world::village; cargo test --locked --test village_session |
+| 6 | R084, R064 | S03 | cargo test --locked --test village_continuity; cargo test --locked --test save_v9_cli |
+| 7 | R084 | S03 | cargo test --release --locked --lib -- --ignored streaming_budget_villages; cargo test --release --locked --test village_frame_budget -- --ignored |
+| 8 | R085, R087, R065 | S04, S06 | cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v9_cli; bash scripts/village_smoke.sh |
+| 9 | R088, R069 | S01, S02, S07 | bash scripts/village_smoke.sh; SMOKE_PROFILE=release bash scripts/village_smoke.sh; bash scripts/requirements_check.sh |
+| 10 | R082, R083 | S01, S02, S03, S05 | cargo test --locked --test worldgen_cli; cargo test --locked --test village_cli; cargo test --locked --test capture_cli |
