@@ -16041,7 +16041,15 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
         }
     }
     world.set_block_immediate(1, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::LootChest);
-    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::WheatStage1);
+    // Threshold-step doorway in the min-z wall at x = 2: the two-tall opening
+    // leaves exactly one horizontal axis open (north, outside the region) while
+    // the cobblestone step inside it keeps the south side solid. The marker
+    // goes in last, after the opening and step exist.
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::Air);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 2, 0, BlockId::Air);
+    world.set_block_immediate(3, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::WheatStage1);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::Cobblestone);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::SocketMarker);
 
     // Drive the real state machine: corner A, corner B, then the name prompt.
     let mut capture = PrefabCapture::new();
@@ -16102,15 +16110,14 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
         "capture_demo: leg=write name={name} path={relative} bytes={bytes}"
     ));
 
-    // Re-parse the bytes that actually reached disk and compare them with the
-    // in-memory value the capture returned.
-    let roundtrip_identical = match std::fs::read_to_string(&path) {
-        Ok(text) => match opencraft::world::prefab::parse_prefab(&text) {
-            Ok(reparsed) => reparsed == prefab,
-            Err(_) => false,
-        },
-        Err(_) => false,
-    };
+    // Re-parse the bytes that actually reached disk. This value drives both the
+    // round-trip check and the socket leg, so the socket proof describes the
+    // serialized file rather than the in-memory capture result.
+    let reparsed_text = std::fs::read_to_string(&path).ok();
+    let reparsed = reparsed_text
+        .as_deref()
+        .and_then(|text| opencraft::world::prefab::parse_prefab(text).ok());
+    let roundtrip_identical = reparsed.as_ref() == Some(&prefab);
     lines.push(format!(
         "capture_demo: leg=roundtrip identical={roundtrip_identical}"
     ));
@@ -16140,6 +16147,105 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
     ));
     if !validate_ok || !captured_ok || errors != 0 {
         failed.get_or_insert("validate");
+    }
+
+    // Socket leg: the marker cell must have become exactly one origin-relative
+    // socket facing the only open horizontal axis, the marker cell itself must
+    // be air, and the serialized text must carry no marker block.
+    let socket = reparsed.as_ref().and_then(|parsed| parsed.sockets.first());
+    let socket_position = socket.map(|socket| socket.position);
+    let socket_direction = socket.map(|socket| socket.direction);
+    let socket_count = reparsed
+        .as_ref()
+        .map(|parsed| parsed.sockets.len())
+        .unwrap_or(0);
+    let marker_count = reparsed
+        .as_ref()
+        .map(|parsed| {
+            parsed
+                .blocks
+                .iter()
+                .filter(|block| block.block == BlockId::SocketMarker)
+                .count()
+        })
+        .unwrap_or(0);
+    let socket_cell_block = match (reparsed.as_ref(), socket_position) {
+        (Some(parsed), Some([x, y, z])) => {
+            let cell = [
+                parsed.origin[0] as i32 + x,
+                parsed.origin[1] as i32 + y,
+                parsed.origin[2] as i32 + z,
+            ];
+            parsed
+                .blocks
+                .iter()
+                .find(|block| block.position == [cell[0] as u32, cell[1] as u32, cell[2] as u32])
+                .map(|block| block.block)
+        }
+        _ => None,
+    };
+    let socket_text_has_marker = reparsed_text
+        .as_deref()
+        .map(|text| text.contains("socket_marker"))
+        .unwrap_or(false);
+    let socket_ok = socket_position == Some([0, 1, -2])
+        && socket_direction == Some(opencraft::world::prefab::Direction::North)
+        && socket_count == 1
+        && marker_count == 0
+        && socket_cell_block == Some(BlockId::Air)
+        && !socket_text_has_marker;
+    if socket_ok {
+        lines.push(
+            "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0"
+                .to_string(),
+        );
+    } else {
+        let position_text = match socket_position {
+            Some([x, y, z]) => format!("{x},{y},{z}"),
+            None => "none".to_string(),
+        };
+        let direction_text = match socket_direction {
+            Some(direction) => direction.as_str().to_string(),
+            None => "none".to_string(),
+        };
+        let cell_text = match socket_cell_block {
+            Some(block) => format!("{block:?}"),
+            None => "none".to_string(),
+        };
+        lines.push(format!(
+            "capture_demo: leg=socket position={position_text} direction={direction_text} sockets={socket_count} markers={marker_count} cell={cell_text} text_marker={socket_text_has_marker}"
+        ));
+        failed.get_or_insert("socket");
+    }
+
+    // Ambiguous marker: opening the west jamb gives the marker two qualifying
+    // axes (open west and open north). The whole capture must fail at the
+    // marker's world coordinate and write nothing.
+    world.set_block_immediate(1, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::Air);
+    let ambiguous_path = root.join("prefabs").join("ambiguous.toml");
+    let ambiguous = capture_to_file(
+        root,
+        "ambiguous",
+        &world,
+        CAPTURE_DEMO_MIN,
+        CAPTURE_DEMO_MAX,
+    );
+    let ambiguous_reason = match &ambiguous {
+        Ok(_) => "none".to_string(),
+        Err(error) => error.to_string(),
+    };
+    let ambiguous_ok = matches!(
+        &ambiguous,
+        Err(opencraft::world::capture::CaptureError::AmbiguousSocket { pos })
+            if *pos == IVec3::new(2, CAPTURE_DEMO_MIN.y + 1, 0)
+    ) && ambiguous_reason == "socket marker at [2, 41, 0] is ambiguous"
+        && !ambiguous_path.exists();
+    lines.push(format!(
+        "capture_demo: leg=ambiguous pos=2,41,0 wrote={} reason={ambiguous_reason}",
+        ambiguous_path.exists(),
+    ));
+    if !ambiguous_ok {
+        failed.get_or_insert("ambiguous");
     }
 
     match failed {
@@ -17942,7 +18048,8 @@ mod tests {
     fn capture_demo_pins_the_fixed_house_line_set() {
         // Measured from a real `--demo-capture <fresh-dir>` run. Never derive
         // these strings from the code under test: the region, byte count and
-        // round-trip/validate booleans below are pinned independently.
+        // round-trip/validate/socket/ambiguous values below are pinned
+        // independently.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("demo");
         std::fs::create_dir_all(&root).expect("create demo root");
@@ -17954,10 +18061,14 @@ mod tests {
             lines,
             vec![
                 "capture_demo: leg=region min=0,40,0 max=4,43,4 size=5x4x5 cells=100".to_string(),
-                "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=368"
+                "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=423"
                     .to_string(),
                 "capture_demo: leg=roundtrip identical=true".to_string(),
                 "capture_demo: leg=validate ok=true prefabs=1 errors=0".to_string(),
+                "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0"
+                    .to_string(),
+                "capture_demo: leg=ambiguous pos=2,41,0 wrote=false reason=socket marker at [2, 41, 0] is ambiguous"
+                    .to_string(),
                 "capture_demo: ok=true".to_string(),
             ]
         );
@@ -17965,8 +18076,12 @@ mod tests {
         assert!(written.is_file(), "exactly one prefab file is written");
         assert_eq!(
             std::fs::read(&written).expect("read prefab").len(),
-            368,
+            423,
             "the pinned byte count must match the written file"
+        );
+        assert!(
+            !root.join("prefabs/ambiguous.toml").exists(),
+            "the ambiguous capture must write nothing"
         );
     }
 

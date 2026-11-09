@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use opencraft::world::block::BlockId;
+use opencraft::world::prefab::{Direction, PrefabSocket};
+
 /// The binary Cargo built for this integration test.
 const BIN: &str = env!("CARGO_BIN_EXE_opencraft");
 
@@ -27,11 +30,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_opencraft");
 /// `capture_demo_pins_the_fixed_house_line_set`. Never derive these from the
 /// code under test: the region, byte count and round-trip/validate booleans
 /// below are pinned independently.
-const CLEAN_LINES: [&str; 5] = [
+const CLEAN_LINES: [&str; 7] = [
     "capture_demo: leg=region min=0,40,0 max=4,43,4 size=5x4x5 cells=100",
-    "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=368",
+    "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=423",
     "capture_demo: leg=roundtrip identical=true",
     "capture_demo: leg=validate ok=true prefabs=1 errors=0",
+    "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0",
+    "capture_demo: leg=ambiguous pos=2,41,0 wrote=false reason=socket marker at [2, 41, 0] is ambiguous",
     "capture_demo: ok=true",
 ];
 
@@ -168,6 +173,47 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
     assert_eq!(parsed.name, name);
     assert_eq!(parsed.size, [5, 4, 5]);
     assert_eq!(parsed.blocks.len(), 100);
+
+    // The doorway marker became one origin-relative socket, and the marker
+    // block itself is gone: the doorway floor and header cells are air, the
+    // threshold step is cobblestone, and no serialized cell is a marker.
+    assert_eq!(
+        parsed.sockets,
+        vec![PrefabSocket {
+            position: [0, 1, -2],
+            direction: Direction::North,
+        }],
+        "the doorway marker must become exactly one north-facing socket"
+    );
+    assert!(
+        parsed
+            .blocks
+            .iter()
+            .all(|block| block.block != BlockId::SocketMarker),
+        "no prefab cell may serialize a socket marker"
+    );
+    let block_at = |x: u32, y: u32, z: u32| {
+        parsed
+            .blocks
+            .iter()
+            .find(|block| block.position == [x, y, z])
+            .map(|block| block.block)
+    };
+    assert_eq!(block_at(2, 1, 0), Some(BlockId::Air), "marker cell is air");
+    assert_eq!(
+        block_at(2, 2, 0),
+        Some(BlockId::Air),
+        "doorway header is air"
+    );
+    assert_eq!(
+        block_at(2, 1, 1),
+        Some(BlockId::Cobblestone),
+        "threshold step survives capture"
+    );
+    assert!(
+        !text.contains("socket_marker"),
+        "the serialized prefab must not mention the marker block"
+    );
 
     // The real validator accepts the demo root and reports the same name.
     let validate = run_in(dir.path(), &["--validate-worldgen", "."]);
