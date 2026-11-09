@@ -15382,6 +15382,13 @@ const CAPTURE_DEMO_SEED: u32 = 4;
 const CAPTURE_DEMO_MIN: IVec3 = IVec3::new(0, 40, 0);
 const CAPTURE_DEMO_MAX: IVec3 = IVec3::new(4, 43, 4);
 
+/// Seed pinned for the `--demo-capture` **village placement** leg.
+///
+/// Reuses the exact `--demo-village` seed so known-good plains sites exist for
+/// the captured prefab. Plain constant, never a clock or `random_seed`, so the
+/// placement cell and the road digest are a pure function of the fixture.
+const CAPTURE_DEMO_VILLAGE_SEED: u32 = VILLAGE_DEMO_SEED;
+
 /// Seed pinned for the `--demo-village` **session** leg.
 ///
 /// Seed 14 is the pinned production seed whose village cell `(-1, 0)` lies
@@ -15481,10 +15488,15 @@ fn village_demo_window(bounds: &VillageBounds) -> Vec<ChunkPos> {
 }
 
 /// The production generation seam with the accepted catalog and a known spawn.
-fn village_demo_generate(pos: ChunkPos, catalog: &VillageCatalog, spawn: (i32, i32)) -> Chunk {
+fn village_demo_generate(
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn: (i32, i32),
+) -> Chunk {
     generate_chunk_with_context(
         pos,
-        VILLAGE_DEMO_SEED,
+        seed,
         Season::Summer,
         &WorldGenContext {
             rules: &[],
@@ -15503,6 +15515,36 @@ fn village_demo_cell(
     chunks
         .get(&(pos.x, pos.y, pos.z))
         .map(|chunk| chunk.get(lx, ly, lz))
+}
+
+/// First `--demo-capture` village plan in a fixed cell window.
+///
+/// Scans row-major (`cz` outer, `cx` inner) so the selected cell is a pure
+/// function of `(seed, catalog)`. A plan qualifies only when it is the captured
+/// demo definition with at least two placements and one committed socket link,
+/// which is exactly what the road leg needs to prove placement *and* linkage.
+fn capture_demo_village_plan<'a>(
+    range: std::ops::RangeInclusive<i32>,
+    catalog: &'a VillageCatalog,
+    spawn: (i32, i32),
+) -> Option<VillagePlan<'a>> {
+    for cz in range.clone() {
+        for cx in range.clone() {
+            let cell = VillageCell { x: cx, z: cz };
+            let Some(plan) =
+                village_plan_with_spawn(cell, CAPTURE_DEMO_VILLAGE_SEED, catalog, spawn)
+            else {
+                continue;
+            };
+            if plan.definition == "capture_demo"
+                && plan.placement_count() >= 2
+                && plan.socket_link_count() >= 1
+            {
+                return Some(plan);
+            }
+        }
+    }
+    None
 }
 
 /// Build the deterministic `--demo-village` digest.
@@ -15647,7 +15689,7 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
             .map(|&pos| {
                 (
                     (pos.x, pos.y, pos.z),
-                    village_demo_generate(pos, &catalog, spawn),
+                    village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn),
                 )
             })
             .collect();
@@ -15658,7 +15700,7 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         let mut shuffled = window.clone();
         shuffled.sort_by_key(|pos| (village_demo_order_hash(*pos), pos.y, pos.x, pos.z));
         order_identical = shuffled.iter().all(|&pos| {
-            let chunk = village_demo_generate(pos, &catalog, spawn);
+            let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
             baseline_chunk(pos)
                 .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
         });
@@ -15672,7 +15714,7 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         // (g) Single-chunk leg: each chunk generated alone in a fresh call must
         // match the region result (no cross-chunk state).
         single_chunk_identical = window.iter().all(|&pos| {
-            let chunk = village_demo_generate(pos, &catalog, spawn);
+            let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
             baseline_chunk(pos)
                 .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
         });
@@ -15741,7 +15783,7 @@ fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
             .all(|&pos| {
                 let legacy =
                     generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
-                let chunk = village_demo_generate(pos, &catalog, spawn);
+                let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
                 village_demo_chunks_equal(&legacy, &chunk)
             });
         lines.push(format!(
@@ -16246,6 +16288,141 @@ fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
     ));
     if !ambiguous_ok {
         failed.get_or_insert("ambiguous");
+    }
+
+    // Catalog leg: author exactly one demo village definition pointing at the
+    // freshly captured prefab and reload it through the production catalog
+    // seam. The file name is fixed and overwritten every run, so a reused demo
+    // directory can never leave a stale definition naming an old prefab.
+    let definition_text = format!(
+        "format = 1\nname = \"capture_demo\"\nbiomes = [\"plains\"]\nhub = \"{name}\"\nspacing = 2\nmin_prefabs = 10\nmax_prefabs = 20\nmax_slope = 16\n\n[pool]\nhouse = [\"{name}\"]\njunction = [\"{name}\"]\n"
+    );
+    let definition_dir = root.join("villages");
+    let definition_path = definition_dir.join("capture_demo.toml");
+    let definition_write = std::fs::create_dir_all(&definition_dir)
+        .and_then(|()| std::fs::write(&definition_path, definition_text.as_bytes()));
+    match definition_write {
+        Ok(()) => {
+            let (catalog, diagnostics) = reload_village_catalog(root);
+            let captured_present = catalog.prefabs().get(&name).is_some();
+            let definition_present = catalog.get("capture_demo").is_some();
+            lines.push(format!(
+                "capture_demo: leg=catalog captured={captured_present} definition={definition_present} diagnostics={}",
+                diagnostics.len()
+            ));
+            if !captured_present || !definition_present || !diagnostics.is_empty() {
+                failed.get_or_insert("catalog");
+            }
+
+            // Village leg: find the first cell whose captured-prefab plan has
+            // two placements joined by one socket link. Widen the search only
+            // when the normal 13x13 window holds no qualifying site.
+            let spawn = find_spawn_column(CAPTURE_DEMO_VILLAGE_SEED);
+            let plan = capture_demo_village_plan(-6..=6, &catalog, spawn)
+                .or_else(|| capture_demo_village_plan(-16..=16, &catalog, spawn));
+            let mut village_ok = false;
+            match &plan {
+                Some(found) => {
+                    let biome_ok = biome_at_seeded(
+                        found.anchor[0],
+                        found.anchor[1],
+                        CAPTURE_DEMO_VILLAGE_SEED,
+                    ) == Biome::Plains;
+                    let names_ok = found
+                        .placements
+                        .iter()
+                        .all(|placement| placement.prefab.name == name);
+                    village_ok = biome_ok && names_ok;
+                    lines.push(format!(
+                        "capture_demo: leg=village definition={} biome={} cell={},{} anchor={},{} prefabs={} socket_links={} roads={} prefab={}",
+                        found.definition,
+                        if biome_ok { "plains" } else { "other" },
+                        found.cell.x,
+                        found.cell.z,
+                        found.anchor[0],
+                        found.anchor[1],
+                        found.placement_count(),
+                        found.socket_link_count(),
+                        found.road_cell_count(),
+                        name,
+                    ));
+                }
+                None => lines.push(
+                    "capture_demo: leg=village definition=none biome=none cell=none anchor=none prefabs=0 socket_links=0 roads=0 prefab=none"
+                        .to_string(),
+                ),
+            }
+            if !village_ok {
+                failed.get_or_insert("village");
+            }
+
+            // Road leg: generate the plan's exact chunk window through the
+            // production seam and read world cells back. Every road surface
+            // must be cobblestone, every linked socket cell must be air, and
+            // every placement origin must carry the captured oak-plank floor.
+            let mut hits = 0usize;
+            let mut total = 0usize;
+            let mut socket_clear = false;
+            let mut prefab_block = false;
+            let mut road_ok = false;
+            if let Some(found) = &plan {
+                total = found.road_cell_count();
+                let chunks: BTreeMap<(i32, i32, i32), Chunk> =
+                    village_demo_window(&found.bounds)
+                        .into_iter()
+                        .map(|pos| {
+                            (
+                                (pos.x, pos.y, pos.z),
+                                village_demo_generate(
+                                    pos,
+                                    CAPTURE_DEMO_VILLAGE_SEED,
+                                    &catalog,
+                                    spawn,
+                                ),
+                            )
+                        })
+                        .collect();
+                hits = found
+                    .road_cells
+                    .iter()
+                    .filter(|road| {
+                        village_demo_cell(&chunks, road.world) == Some(BlockId::Cobblestone)
+                    })
+                    .count();
+                socket_clear = found.socket_links.iter().all(|link| {
+                    let parent = found
+                        .placements
+                        .get(link.parent)
+                        .and_then(|placement| placement.sockets.get(link.parent_socket));
+                    let child = found
+                        .placements
+                        .get(link.child)
+                        .and_then(|placement| placement.sockets.get(link.child_socket));
+                    parent.is_some_and(|socket| {
+                        village_demo_cell(&chunks, socket.position) == Some(BlockId::Air)
+                    }) && child.is_some_and(|socket| {
+                        village_demo_cell(&chunks, socket.position) == Some(BlockId::Air)
+                    })
+                });
+                prefab_block = found.placements.iter().all(|placement| {
+                    village_demo_cell(
+                        &chunks,
+                        [placement.origin_x, placement.base_y, placement.origin_z],
+                    ) == Some(BlockId::OakPlanks)
+                });
+                road_ok = total >= 1 && hits == total && socket_clear && prefab_block;
+            }
+            lines.push(format!(
+                "capture_demo: leg=road cobblestone={hits}/{total} socket_clear={socket_clear} prefab_block={prefab_block} roads={total}"
+            ));
+            if !road_ok {
+                failed.get_or_insert("road");
+            }
+        }
+        Err(error) => {
+            lines.push(format!("capture_demo: leg=catalog error={error}"));
+            failed.get_or_insert("catalog");
+        }
     }
 
     match failed {
@@ -18069,6 +18246,11 @@ mod tests {
                     .to_string(),
                 "capture_demo: leg=ambiguous pos=2,41,0 wrote=false reason=socket marker at [2, 41, 0] is ambiguous"
                     .to_string(),
+                "capture_demo: leg=catalog captured=true definition=true diagnostics=0".to_string(),
+                "capture_demo: leg=village definition=capture_demo biome=plains cell=6,-6 anchor=1654,-1383 prefabs=2 socket_links=1 roads=2 prefab=capture"
+                    .to_string(),
+                "capture_demo: leg=road cobblestone=2/2 socket_clear=true prefab_block=true roads=2"
+                    .to_string(),
                 "capture_demo: ok=true".to_string(),
             ]
         );
@@ -18082,6 +18264,17 @@ mod tests {
         assert!(
             !root.join("prefabs/ambiguous.toml").exists(),
             "the ambiguous capture must write nothing"
+        );
+        let definition = root.join("villages/capture_demo.toml");
+        assert!(
+            definition.is_file(),
+            "exactly one demo village definition is written"
+        );
+        let definition_text =
+            std::fs::read_to_string(&definition).expect("read demo definition");
+        assert!(
+            definition_text.contains("hub = \"capture\""),
+            "the demo definition must name the captured prefab: {definition_text}"
         );
     }
 
@@ -18110,6 +18303,40 @@ mod tests {
             Some("capture_demo: ok=false failed=write")
         );
         assert_eq!(std::fs::read(&root).expect("read file"), b"keep me");
+    }
+
+    #[test]
+    fn capture_demo_reports_a_catalog_write_failure_without_panicking() {
+        // The prefab leg succeeds, but `villages` is a regular file so the
+        // demo definition cannot be created: the demo must post one readable
+        // catalog error, keep the successfully captured prefab, and exit
+        // false without panicking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("demo");
+        std::fs::create_dir_all(&root).expect("create demo root");
+        std::fs::write(root.join("villages"), b"keep me").expect("write villages file");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(!ok);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error="))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one readable error: {lines:?}");
+        assert!(
+            errors[0].starts_with("capture_demo: leg=catalog error="),
+            "the reason must name the catalog leg: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("capture_demo: ok=false failed=catalog")
+        );
+        assert!(
+            root.join("prefabs/capture.toml").is_file(),
+            "the successful prefab write must survive a definition failure"
+        );
+        assert_eq!(std::fs::read(root.join("villages")).expect("read file"), b"keep me");
     }
 
     #[test]

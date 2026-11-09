@@ -28,15 +28,18 @@ const BIN: &str = env!("CARGO_BIN_EXE_opencraft");
 /// Measured from a real `cargo run -- --demo-capture <fresh-dir>` and
 /// independently pinned in `src/main.rs`'s
 /// `capture_demo_pins_the_fixed_house_line_set`. Never derive these from the
-/// code under test: the region, byte count and round-trip/validate booleans
-/// below are pinned independently.
-const CLEAN_LINES: [&str; 7] = [
+/// code under test: the region, byte count and round-trip/validate/socket/
+/// catalog/village/road values below are pinned independently.
+const CLEAN_LINES: [&str; 10] = [
     "capture_demo: leg=region min=0,40,0 max=4,43,4 size=5x4x5 cells=100",
     "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=423",
     "capture_demo: leg=roundtrip identical=true",
     "capture_demo: leg=validate ok=true prefabs=1 errors=0",
     "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0",
     "capture_demo: leg=ambiguous pos=2,41,0 wrote=false reason=socket marker at [2, 41, 0] is ambiguous",
+    "capture_demo: leg=catalog captured=true definition=true diagnostics=0",
+    "capture_demo: leg=village definition=capture_demo biome=plains cell=6,-6 anchor=1654,-1383 prefabs=2 socket_links=1 roads=2 prefab=capture",
+    "capture_demo: leg=road cobblestone=2/2 socket_clear=true prefab_block=true roads=2",
     "capture_demo: ok=true",
 ];
 
@@ -150,8 +153,8 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
     let tree = snapshot_tree(dir.path());
     assert_eq!(
         tree.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["prefabs/capture.toml"],
-        "exactly one prefab file and no stray files\n{}",
+        vec!["prefabs/capture.toml", "villages/capture_demo.toml"],
+        "exactly one prefab, one village definition and no stray files\n{}",
         report(&output)
     );
 
@@ -214,6 +217,21 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
         !text.contains("socket_marker"),
         "the serialized prefab must not mention the marker block"
     );
+
+    // The one demo definition names the captured prefab and loads through the
+    // same production loader the binary uses: zero diagnostics, and both the
+    // definition and the captured prefab are present.
+    let definition_text = std::fs::read_to_string(dir.path().join("villages/capture_demo.toml"))
+        .expect("read demo definition");
+    assert!(
+        definition_text.contains("hub = \"capture\""),
+        "the demo definition must name the captured prefab: {definition_text}"
+    );
+    let (catalog, diagnostics) =
+        opencraft::world::village::VillageCatalog::load_sorted(dir.path());
+    assert_eq!(diagnostics, Vec::<String>::new());
+    assert!(catalog.get("capture_demo").is_some());
+    assert!(catalog.prefabs().get("capture").is_some());
 
     // The real validator accepts the demo root and reports the same name.
     let validate = run_in(dir.path(), &["--validate-worldgen", "."]);
@@ -353,6 +371,14 @@ fn two_clean_runs_are_byte_identical() {
         first_bytes, second_bytes,
         "two clean runs must write byte-identical prefabs"
     );
+    let first_definition =
+        std::fs::read(first.path().join("villages/capture_demo.toml")).expect("first definition");
+    let second_definition =
+        std::fs::read(second.path().join("villages/capture_demo.toml")).expect("second definition");
+    assert_eq!(
+        first_definition, second_definition,
+        "two clean runs must write byte-identical village definitions"
+    );
 }
 
 #[test]
@@ -399,6 +425,32 @@ fn second_run_in_the_same_directory_prefills_capture_2_and_keeps_the_tree_valid(
         std::fs::read(dir.path().join("prefabs/capture.toml")).expect("first prefab"),
         first_bytes,
         "a reused directory must never rewrite the first prefab"
+    );
+    assert_eq!(
+        snapshot_tree(dir.path())
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "prefabs/capture.toml",
+            "prefabs/capture_2.toml",
+            "villages/capture_demo.toml",
+        ],
+        "the reused directory holds both prefabs and the fixed definition\n{}",
+        report(&second)
+    );
+    // The fixed definition file is overwritten in place to name the prefab the
+    // second run actually captured, so the catalog never points at a name that
+    // does not exist.
+    let definition_text = std::fs::read_to_string(dir.path().join("villages/capture_demo.toml"))
+        .expect("read demo definition");
+    assert!(
+        definition_text.contains("hub = \"capture_2\""),
+        "the second run must rewrite the definition: {definition_text}"
+    );
+    assert!(
+        !definition_text.contains("hub = \"capture\"\n"),
+        "the stale first-run hub must be gone: {definition_text}"
     );
 
     let parsed = opencraft::world::prefab::parse_prefab(
