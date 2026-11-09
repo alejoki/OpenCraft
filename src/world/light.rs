@@ -334,6 +334,28 @@ mod tests {
     }
 
     #[test]
+    fn socket_marker_roof_blocks_sky_light() {
+        // Ground plane plus a y == 4 roof over x <= 15 built from the socket
+        // marker: the production opacity rule must treat it as solid and stop
+        // the sky shaft, proving collision/meshing/light share one predicate.
+        let get_block = |x: i32, y: i32, _z: i32| {
+            if y <= 0 || (y == 4 && x <= 15) {
+                BlockId::SocketMarker
+            } else {
+                BlockId::Air
+            }
+        };
+        let grids = compute_region_light(get_block, 0, 0, 0, 0);
+        let grid = chunk_grid(&grids, 0, 0, 0);
+
+        assert_eq!(grid.get(8, 4, 8), 0, "the marker roof stays opaque");
+        assert!(
+            grid.get(8, 3, 8) < MAX_SKY_LIGHT,
+            "the cell under the marker roof must be dimmed"
+        );
+    }
+
+    #[test]
     fn sealed_cave_is_completely_dark() {
         // Ground, plus a 5x5x5 solid cube holding one enclosed air cell.
         let get_block = world(|x, y, z| {

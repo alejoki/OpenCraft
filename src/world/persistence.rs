@@ -242,6 +242,15 @@ pub struct CliConfig {
     /// before `StartupContent::load`, so the digest never opens a window, GPU,
     /// audio engine, event loop or settings write, and never writes a save.
     pub demo_worldgen: bool,
+    /// Whether the headless village digest (`--demo-village`, M015/S02-T05)
+    /// is requested. Same bare-switch contract as `demo_worldgen`: it takes no
+    /// value, is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before `StartupContent::load`, so the digest never opens a window, GPU,
+    /// audio engine, event loop or settings write, reads only `worldgen/`, and
+    /// never writes a save. It is a release-facing launch switch and is
+    /// deliberately not release-gated.
+    pub demo_village: bool,
     /// Whether the headless Creative palette digest (`--demo-palette`,
     /// M010/S07-T04) is requested. Same bare-switch contract as
     /// `demo_worldgen`: it takes no value, is deliberately NOT a world intent
@@ -276,6 +285,27 @@ pub struct CliConfig {
     /// launching the game. Like `demo_ui` it is a launch switch, never a world
     /// intent (it never affects `cli_has_world_intent`) and is never persisted.
     pub validate_pack: Option<String>,
+    /// Root directory requested by `--validate-worldgen [dir]` (M015/S01-T03).
+    /// A release-facing launch switch: `main` consumes it before settings,
+    /// packs, save, window and GPU startup, so validation never opens a
+    /// window, GPU, audio engine, event loop or save. Never a world intent
+    /// (it never affects `cli_has_world_intent`) and never persisted. The
+    /// optional value is only consumed when the next token does not start
+    /// with `--`, so `--validate-worldgen --save x` keeps the default
+    /// [`crate::world::prefab::WORLDGEN_DIR`] root and still parses `--save`.
+    pub validate_worldgen: Option<PathBuf>,
+    /// Root directory requested by `--demo-capture <dir>` (M015/S05-T05).
+    /// A release-facing launch switch: `main` consumes it before settings,
+    /// packs, save, window and GPU startup, so the demo never opens a window,
+    /// GPU, audio engine, event loop or save. It builds an isolated in-memory
+    /// world, drives the real [`crate::ui::capture::PrefabCapture`] state
+    /// machine, and writes exactly one prefab below `<dir>/prefabs/`. Never a
+    /// world intent (it never affects `cli_has_world_intent`) and never
+    /// persisted. The optional value is only consumed when the next token does
+    /// not start with `--`; a following switch (or the end of the arguments)
+    /// stores an empty path so `main` can fail closed with a readable error
+    /// instead of launching the game.
+    pub demo_capture: Option<PathBuf>,
     /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
     /// requested. A bare launch switch: it takes no value, is deliberately NOT
     /// a world intent (so it never affects `cli_has_world_intent`), and is
@@ -323,15 +353,18 @@ impl CliConfig {
         let mut demo_presentation = false;
         let mut demo_crafting = false;
         let mut demo_worldgen = false;
+        let mut demo_village = false;
         let mut demo_palette = false;
         let mut demo_save_v9 = false;
         let mut demo_restart = false;
         let mut validate_pack = None;
+        let mut validate_worldgen = None;
+        let mut demo_capture = None;
         let mut check_config = false;
         let mut creator_trace = false;
         let mut mode = GameMode::Creative;
 
-        let mut iter = args.into_iter();
+        let mut iter = args.into_iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_ref() {
                 "--save" => {
@@ -421,6 +454,13 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_worldgen = true;
                 }
+                "--demo-village" => {
+                    // Same bare-switch rule as `--demo-worldgen`. `main`
+                    // short-circuits on this before `StartupContent::load`, so
+                    // a following token (normally `--save x`) stays an
+                    // independent argument.
+                    demo_village = true;
+                }
                 "--demo-palette" => {
                     // Same bare-switch rule as `--demo-worldgen`. `main`
                     // short-circuits on this before `StartupContent::load`.
@@ -449,6 +489,35 @@ impl CliConfig {
                             .map(|val| val.as_ref().to_string())
                             .unwrap_or_default(),
                     );
+                }
+                "--validate-worldgen" => {
+                    // Optional-value switch: consume the next token only when
+                    // it is not another switch. The `peek` guard is
+                    // load-bearing: `--validate-worldgen --save x` must keep
+                    // the default root and still let `--save` be parsed as a
+                    // save path.
+                    let root = match iter.peek() {
+                        Some(next) if !next.as_ref().starts_with("--") => {
+                            PathBuf::from(iter.next().unwrap().as_ref())
+                        }
+                        _ => PathBuf::from(crate::world::prefab::WORLDGEN_DIR),
+                    };
+                    validate_worldgen = Some(root);
+                }
+                "--demo-capture" => {
+                    // Optional-value switch, exactly like `--validate-worldgen`:
+                    // consume the next token only when it is not another
+                    // switch. A missing value (or a following `--save x`)
+                    // stores an empty path so `main` fails closed with
+                    // `error: --demo-capture requires a directory` instead of
+                    // launching the game.
+                    let root = match iter.peek() {
+                        Some(next) if !next.as_ref().starts_with("--") => {
+                            PathBuf::from(iter.next().unwrap().as_ref())
+                        }
+                        _ => PathBuf::new(),
+                    };
+                    demo_capture = Some(root);
                 }
                 "--check-config" => {
                     // Bare switch (no value to consume), mirroring `--new`:
@@ -490,10 +559,13 @@ impl CliConfig {
             demo_presentation,
             demo_crafting,
             demo_worldgen,
+            demo_village,
             demo_palette,
             demo_save_v9,
             demo_restart,
             validate_pack,
+            validate_worldgen,
+            demo_capture,
             check_config,
             creator_trace,
             mode,
@@ -795,9 +867,10 @@ impl std::error::Error for PersistenceError {}
 /// Rejects every block id the v1-v7 wire format cannot represent.
 ///
 /// Each block byte on disk is a `u8` and the decoder accepts only the frozen
-/// built-in ids `0..=22`, so a [`BlockId::Modded`] id would silently truncate
-/// into a different built-in id. This scan runs before the first output byte
-/// so such a save is rejected with an empty buffer instead.
+/// built-in ids `0..=23` (raw ids below [`BUILTIN_BLOCK_COUNT`]), so a
+/// [`BlockId::Modded`] id would silently truncate into a different built-in
+/// id. This scan runs before the first output byte so such a save is rejected
+/// with an empty buffer instead.
 #[cfg(test)]
 fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> {
     fn check_block(block: BlockId) -> Result<(), PersistenceError> {
@@ -866,7 +939,7 @@ fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> 
 #[cfg(test)]
 fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), PersistenceError> {
     // The v1-v7 wire vocabulary is built-in only (a block id is one `u8` and
-    // the decoder accepts 0..=22). Reject every unrepresentable block before
+    // the decoder accepts 0..=23). Reject every unrepresentable block before
     // writing a single byte so a modded id can never be truncated into a
     // different built-in id on disk, and a rejected save leaves `out`
     // untouched (atomic-rejection contract).
@@ -1892,10 +1965,14 @@ fn decode_legacy(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
             if block.is_liquid() {
                 return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
-            // Ids 16..=22 are v6 wire identities. A pre-v6 payload that
+            // Ids 16..=22 are v6 wire identities: a pre-v6 payload that
             // claims one is corrupt (or forged), so fail closed instead of
-            // inventing a block under a version that never could have
-            // written it. Water keeps its own unconditional rejection above.
+            // inventing a block under a version that never could have written
+            // it. Id 23 (SocketMarker) is a current built-in that this legacy
+            // u8 funnel decodes; no legitimate pre-M015 file can contain it,
+            // so it is accepted rather than version-gated (D244: no save
+            // version bump). Water keeps its own unconditional rejection
+            // above.
             if version < SURVIVAL_VERSION && is_survival_only_block_id(block) {
                 return Err(PersistenceError::InvalidBlockId(u16::from(block_raw)));
             }
@@ -3029,14 +3106,17 @@ mod tests {
     }
 
     #[test]
-    fn test_save_roundtrips_every_known_block_id_through_22() {
-        // v6 accepts every decodable id except water (worldgen-only, refused
-        // by the writer). Pin the full append-only span 0..=22 so a future
-        // palette addition cannot silently shift an existing id.
+    fn test_save_roundtrips_every_known_builtin_block_id() {
+        // v8+ names every referenced block through the save-local content
+        // table, so the full append-only built-in span must round-trip by
+        // name. Water is worldgen-only and refused by the writer. Expressed
+        // relative to BUILTIN_BLOCK_COUNT so the guard follows the palette
+        // instead of a stray literal: a future addition cannot silently shift
+        // an existing id.
         let mut chunk = rustc_hash::FxHashMap::default();
         let mut expected = Vec::new();
-        for raw in 0u8..=22 {
-            let block = BlockId::from_u8(raw).expect("id 0..=22 decodes");
+        for raw in 0u8..BUILTIN_BLOCK_COUNT as u8 {
+            let block = BlockId::from_u8(raw).expect("every built-in raw id decodes");
             if block == BlockId::Water {
                 continue;
             }
@@ -3044,15 +3124,26 @@ mod tests {
             chunk.insert(index, block);
             expected.push((index, block));
         }
-        assert_eq!(chunk.len(), 22, "ids 0..=22 minus water");
+        assert_eq!(
+            chunk.len(),
+            usize::from(BUILTIN_BLOCK_COUNT) - 1,
+            "every built-in raw id minus water"
+        );
+        assert_eq!(SAVE_VERSION, 9, "socket_marker ships inside v9");
 
         let mut edits = ChunkEditMap::default();
         edits.insert(ChunkPos::new(0, 0, 0), chunk);
         let mut data = sample_data(sample_player());
         data.chunk_edits = edits;
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v6 palette must save");
-        let loaded = load_world_from_bytes(&bytes).expect("v6 palette must load");
+        save_world_to_bytes(&mut bytes, &data).expect("built-in palette must save");
+        assert!(
+            bytes
+                .windows(b"socket_marker".len())
+                .any(|window| window == b"socket_marker"),
+            "the content table must name socket_marker"
+        );
+        let loaded = load_world_from_bytes(&bytes).expect("built-in palette must load");
         let loaded_chunk = loaded
             .chunk_edits
             .get(&ChunkPos::new(0, 0, 0))
@@ -3066,6 +3157,33 @@ mod tests {
                 block.to_raw() as u8
             );
         }
+        let marker_index = linear_index(BlockId::SocketMarker.to_raw() as usize, 1, 1) as u16;
+        assert_eq!(loaded_chunk[&marker_index], BlockId::SocketMarker);
+    }
+
+    #[test]
+    fn socket_marker_edit_round_trips_through_the_legacy_u8_funnel() {
+        // Id 23 is a current built-in, so the frozen v1-v7 u8 decoder accepts
+        // it: no legitimate pre-M015 file wrote that byte, and D244 keeps
+        // SAVE_VERSION at 9 rather than version-gating the new id. This pins
+        // the accepted legacy semantics executably instead of leaving them
+        // implicit in the guard comment.
+        let mut chunk = rustc_hash::FxHashMap::default();
+        let index = linear_index(0, 0, 0) as u16;
+        chunk.insert(index, BlockId::SocketMarker);
+        let mut edits = ChunkEditMap::default();
+        edits.insert(ChunkPos::new(0, 0, 0), chunk);
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = edits;
+
+        let bytes = legacy_world_bytes(&data, 7);
+        let loaded =
+            load_world_from_bytes(&bytes).expect("legacy funnel must decode socket_marker");
+        let loaded_chunk = loaded
+            .chunk_edits
+            .get(&ChunkPos::new(0, 0, 0))
+            .expect("edited chunk must round-trip");
+        assert_eq!(loaded_chunk[&index], BlockId::SocketMarker);
     }
 
     #[test]
@@ -5681,6 +5799,47 @@ mod tests {
     }
 
     #[test]
+    fn test_demo_village_parses_as_a_bare_switch() {
+        // Absent keeps the seam off, and every other demo seam stays off too.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert!(!bare.demo_village);
+        assert!(!bare.demo_worldgen);
+        assert!(!bare.demo_crafting);
+        assert!(!bare.demo_presentation);
+        assert!(!bare.demo_ui);
+
+        // The flag alone sets exactly its own seam and consumes no value.
+        let village = CliConfig::parse_args(["--demo-village"]);
+        assert!(village.demo_village);
+        assert!(!village.demo_worldgen);
+        assert!(!village.demo_crafting);
+        assert!(!village.demo_presentation);
+        assert!(!village.demo_ui);
+        assert!(!village.force_new_world);
+        assert_eq!(village.seed_override, None);
+        assert_eq!(
+            village.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+
+        // A following `--save custom.mcvx` is parsed as the save path, not
+        // swallowed as the switch's value.
+        let with_save = CliConfig::parse_args(["--demo-village", "--save", "custom.mcvx"]);
+        assert!(with_save.demo_village);
+        assert_eq!(with_save.save_path, std::path::PathBuf::from("custom.mcvx"));
+
+        // A following `--new` still parses as the fresh-world intent.
+        let with_new = CliConfig::parse_args(["--demo-village", "--new"]);
+        assert!(with_new.demo_village);
+        assert!(with_new.force_new_world);
+
+        // A stray non-flag token after the switch never becomes the seed.
+        let stray = CliConfig::parse_args(["--demo-village", "5"]);
+        assert!(stray.demo_village);
+        assert_eq!(stray.seed_override, None);
+    }
+
+    #[test]
     fn test_demo_palette_parses_as_a_bare_switch() {
         // Absent keeps the seam off, and every other demo seam stays off too.
         let bare = CliConfig::parse_args(Vec::<String>::new());
@@ -5819,6 +5978,102 @@ mod tests {
         let world_flag = CliConfig::parse_args(["--new", "--validate-pack", "demo"]);
         assert!(world_flag.force_new_world);
         assert_eq!(world_flag.validate_pack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn test_validate_worldgen_parses_bare_flag_as_worldgen_root() {
+        // A bare flag validates the default checked-in worldgen root and
+        // changes nothing else: it is a launch switch, not a world parameter.
+        let bare = CliConfig::parse_args(["--validate-worldgen"]);
+        assert_eq!(
+            bare.validate_worldgen,
+            Some(std::path::PathBuf::from("worldgen"))
+        );
+        assert!(!bare.force_new_world);
+        assert_eq!(bare.seed_override, None);
+        assert_eq!(bare.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+        assert_eq!(bare.validate_pack, None);
+        assert!(!bare.check_config);
+
+        // Absent keeps the seam off.
+        let off = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(off.validate_worldgen, None);
+    }
+
+    #[test]
+    fn test_validate_worldgen_takes_an_optional_directory() {
+        let custom = CliConfig::parse_args(["--validate-worldgen", "custom/gen"]);
+        assert_eq!(
+            custom.validate_worldgen,
+            Some(std::path::PathBuf::from("custom/gen"))
+        );
+        // The consumed path never leaks into unrelated seams.
+        assert!(!custom.force_new_world);
+        assert_eq!(
+            custom.save_path,
+            std::path::PathBuf::from(DEFAULT_SAVE_PATH)
+        );
+    }
+
+    #[test]
+    fn test_validate_worldgen_does_not_consume_a_following_switch() {
+        // The `peek` guard is load-bearing: a following `--save` stays an
+        // independent switch and its value is not eaten as the worldgen root.
+        let cli = CliConfig::parse_args(["--validate-worldgen", "--save", "fixture.mcvx"]);
+        assert_eq!(
+            cli.validate_worldgen,
+            Some(std::path::PathBuf::from("worldgen"))
+        );
+        assert_eq!(cli.save_path, std::path::PathBuf::from("fixture.mcvx"));
+    }
+
+    #[test]
+    fn test_demo_capture_takes_a_directory() {
+        // Absent keeps the seam off.
+        let off = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(off.demo_capture, None);
+
+        // The value is the demo root; nothing else is consumed.
+        let cli = CliConfig::parse_args(["--demo-capture", "out/demo"]);
+        assert_eq!(cli.demo_capture, Some(std::path::PathBuf::from("out/demo")));
+        assert_eq!(cli.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
+        assert_eq!(cli.seed_override, None);
+        assert!(!cli.force_new_world);
+    }
+
+    #[test]
+    fn test_demo_capture_missing_value_fails_closed() {
+        // A bare switch at the end of the arguments stores an empty path so
+        // `main` can print `error: --demo-capture requires a directory` and
+        // exit 2 instead of launching the game.
+        let bare = CliConfig::parse_args(["--demo-capture"]);
+        assert_eq!(bare.demo_capture, Some(std::path::PathBuf::new()));
+    }
+
+    #[test]
+    fn test_demo_capture_does_not_consume_a_following_switch() {
+        // The `peek` guard is load-bearing: `--demo-capture --save x` must
+        // keep an empty demo path and still parse the save switch.
+        let cli = CliConfig::parse_args(["--demo-capture", "--save", "fixture.mcvx"]);
+        assert_eq!(cli.demo_capture, Some(std::path::PathBuf::new()));
+        assert_eq!(cli.save_path, std::path::PathBuf::from("fixture.mcvx"));
+    }
+
+    #[test]
+    fn test_validate_worldgen_and_demo_worldgen_stay_distinct() {
+        // Two different seams share a stem: the validator must not arm the
+        // worldgen digest, and the digest must not arm the validator.
+        let validate = CliConfig::parse_args(["--validate-worldgen"]);
+        assert!(validate.validate_worldgen.is_some());
+        assert!(!validate.demo_worldgen);
+
+        let demo = CliConfig::parse_args(["--demo-worldgen"]);
+        assert!(demo.demo_worldgen);
+        assert_eq!(demo.validate_worldgen, None);
+
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        assert_eq!(bare.validate_worldgen, None);
+        assert!(!bare.demo_worldgen);
     }
 
     #[test]

@@ -2,7 +2,9 @@ use crate::content::WorldgenRule;
 use crate::world::block::BlockId;
 use crate::world::chunk::{linear_index, local_coords_from_index, Chunk, ChunkPos, CHUNK_SIZE};
 use crate::world::loot::LootEntry;
+use crate::world::prefab::PREFAB_CAPS;
 use crate::world::season::Season;
+use crate::world::village::{place_village_cells, VillageCatalog};
 use glam::IVec3;
 
 #[inline]
@@ -1398,6 +1400,18 @@ fn ruin_covering(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
     None
 }
 
+/// Whether any ruin footprint covers this column.
+///
+/// Public wrapper around the private [`ruin_covering`], added for the village
+/// planner's last-pass fit gate: a village footprint must not overlap a ruin
+/// shell for the same reason a spawn must not (the `surface + 4` wall top). It
+/// is conservative for the same documented reasons as `ruin_covering` — it
+/// cannot see the chunk-only Winter or surface suppressions — and performs no
+/// generation work of its own.
+pub fn ruin_covers(wx: i32, wz: i32, seed: u32) -> bool {
+    ruin_covering(wx, wz, seed).is_some()
+}
+
 /// Wall material for a footprint offset: Brick on the four corner pillars,
 /// Cobblestone on the wall runs between them. Both are already complete,
 /// legal-edit opaque blocks, so ruins add no block ids and no registry rows.
@@ -1647,14 +1661,90 @@ pub fn generate_chunk_seeded_with(
     season: Season,
     rules: &[WorldgenRule],
 ) -> Chunk {
+    generate_chunk_with_context(
+        pos,
+        seed,
+        season,
+        &WorldGenContext {
+            rules,
+            villages: None,
+            spawn_column: None,
+        },
+    )
+}
+
+/// Everything generation depends on besides `(pos, seed, season)`.
+///
+/// `rules` is the pack worldgen stack (empty for vanilla worlds), `villages`
+/// is the optional accepted village catalog (empty/N`one` reproduces the
+/// pre-M015 generator byte-for-byte) and `spawn_column` lets a caller that
+/// already knows the spawn skip the bounded [`find_spawn_column`] search when
+/// the village planner needs it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorldGenContext<'a> {
+    pub rules: &'a [WorldgenRule],
+    pub villages: Option<&'a VillageCatalog>,
+    pub spawn_column: Option<(i32, i32)>,
+}
+
+/// Whether a chunk whose base starts at `base_wy` is entirely above every
+/// possible cell: terrain, trees and (when the chunk may hold a village) the
+/// full prefab height cap above the highest legal village surface.
+///
+/// Extracted so the tests can pin the exact formulas instead of re-deriving
+/// them. With `village_candidate = false` this is exactly the pre-M015 sky
+/// shortcut, so empty-catalog identity and the pinned `--demo-worldgen`
+/// digests hold by construction.
+#[inline]
+fn sky_is_air(base_wy: i32, village_candidate: bool) -> bool {
+    let headroom = if village_candidate {
+        PREFAB_CAPS.max_y as i32
+    } else {
+        TREE_CANOPY_HEADROOM
+    };
+    base_wy > MAX_TERRAIN_HEIGHT + headroom
+}
+
+/// Whether a chunk is entirely above its own locally sampled terrain plus tree
+/// headroom.
+///
+/// Never applies to a village-candidate chunk: a village footprint may span
+/// chunks and `base_y` is the maximum over the whole footprint, so a chunk's
+/// local `max_h` can sit below a village cell that lives in this chunk (the
+/// prefab's base is the footprint maximum, not this chunk's maximum). Skipping
+/// the shortcut there is what prevents silent clipping.
+#[inline]
+fn above_local_terrain_is_air(base_wy: i32, max_h: i32, village_candidate: bool) -> bool {
+    !village_candidate && base_wy > max_h + TREE_CANOPY_HEADROOM
+}
+
+/// The single generation body: terrain, caves, trees, ores, ruins, pack
+/// patches and — when a catalog is supplied — the last-pass village assembly.
+///
+/// [`generate_chunk_seeded_with`] is the no-village wrapper, so an empty rule
+/// slice and an absent catalog stay byte-identical to the pre-M015 generator.
+pub fn generate_chunk_with_context(
+    pos: ChunkPos,
+    seed: u32,
+    season: Season,
+    ctx: &WorldGenContext<'_>,
+) -> Chunk {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
 
+    // Conservative gate computed before either early return: a chunk can only
+    // skip the block loop when it provably holds no village cell either.
+    let village_candidate = ctx
+        .villages
+        .is_some_and(|catalog| !catalog.is_empty() && catalog.chunk_may_hold_village(pos, seed));
+
     // Fast path for high sky chunks. Derived from MAX_TERRAIN_HEIGHT so the
     // envelope and this shortcut cannot silently desync: everything above all
-    // possible terrain plus tree headroom is Air.
-    if base_wy > MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM {
+    // possible terrain plus tree headroom is Air. Village candidates raise the
+    // bound to the prefab height cap because a village can stand on the
+    // highest legal surface height.
+    if sky_is_air(base_wy, village_candidate) {
         return Chunk::new_uniform(BlockId::Air);
     }
 
@@ -1674,8 +1764,11 @@ pub fn generate_chunk_seeded_with(
         }
     }
 
-    // If the entire chunk is well above max terrain height + tree headroom
-    if base_wy > max_h + TREE_CANOPY_HEADROOM {
+    // If the entire chunk is well above max terrain height + tree headroom.
+    // Skipped for village candidates: a footprint can span chunks and `base_y`
+    // is the maximum over the whole footprint, so this chunk's local `max_h`
+    // can be below a village cell that belongs here.
+    if above_local_terrain_is_air(base_wy, max_h, village_candidate) {
         return Chunk::new_uniform(BlockId::Air);
     }
     // Deep chunks must still flow through the block loop so caves (and,
@@ -1838,14 +1931,21 @@ pub fn generate_chunk_seeded_with(
     place_ore_veins(&mut chunk, &heights, pos, seed);
     // Pack ore runs after built-in coal/iron and before ruins, each rule on
     // its own stream; the built-in ore cells are therefore untouched.
-    place_pack_ore_veins(&mut chunk, &heights, pos, seed, rules);
+    place_pack_ore_veins(&mut chunk, &heights, pos, seed, ctx.rules);
     // Third structure pass (S07): after ores, so a ruin can never be carved by
     // the ore pass, and after trees, so the tree-overlap policy can see the
     // actual OakLog cells it refuses to overwrite.
     place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed);
     // Pack patches run last and only touch `wy == h`, so no structure or
     // canopy cell can ever be rewritten.
-    place_pack_surface_patches(&mut chunk, &heights, &biomes, pos, seed, rules);
+    place_pack_surface_patches(&mut chunk, &heights, &biomes, pos, seed, ctx.rules);
+    // Village assembly is the true last pass: it overwrites pack patches,
+    // ruin shells, trees and the raw terrain surface with the plan's cells, so
+    // a village is never clipped by an earlier pass or the uniform-Air
+    // shortcuts above. Season-independent by construction.
+    if let Some(catalog) = ctx.villages {
+        place_village_cells(&mut chunk, pos, seed, catalog, ctx.spawn_column);
+    }
     chunk.try_compress();
     chunk
 }
@@ -5795,5 +5895,522 @@ mod tests {
             cleared_cells > 0,
             "Air-as-output ore rule must clear at least one Stone cell"
         );
+    }
+
+    // ---- M015/S02-T04: context seam and last-pass village assembly ----------
+
+    use crate::world::prefab::{Prefab, PrefabBlock, WORLDGEN_DIR};
+    use crate::world::village::{
+        catalog_for_tests, village_cell_at, village_plan_with_spawn, VillageCatalog, VillageCell,
+        VillageDefinition, VillagePlan,
+    };
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    const VILLAGE_TEST_SEED: u32 = 424_242;
+    const VILLAGE_TEST_CELL: VillageCell = VillageCell { x: 3, z: 5 };
+
+    fn checked_in_village_catalog() -> VillageCatalog {
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(Path::new(WORLDGEN_DIR));
+        assert!(
+            diagnostics.is_empty(),
+            "village diagnostics: {diagnostics:?}"
+        );
+        assert!(!catalog.is_empty(), "checked-in village catalog must load");
+        catalog
+    }
+
+    fn pinned_village_plan(catalog: &VillageCatalog) -> VillagePlan<'_> {
+        let spawn = find_spawn_column(VILLAGE_TEST_SEED);
+        village_plan_with_spawn(VILLAGE_TEST_CELL, VILLAGE_TEST_SEED, catalog, spawn)
+            .expect("pinned village cell must plan")
+    }
+
+    fn village_context(catalog: &VillageCatalog) -> WorldGenContext<'_> {
+        WorldGenContext {
+            rules: &[],
+            villages: Some(catalog),
+            spawn_column: Some(find_spawn_column(VILLAGE_TEST_SEED)),
+        }
+    }
+
+    fn local_cell(world: [i32; 3]) -> (usize, usize, usize) {
+        let cs = CHUNK_SIZE as i32;
+        (
+            world[0].rem_euclid(cs) as usize,
+            world[1].rem_euclid(cs) as usize,
+            world[2].rem_euclid(cs) as usize,
+        )
+    }
+
+    fn chunk_max_height(pos: ChunkPos, seed: u32) -> i32 {
+        let base_wx = pos.x * CHUNK_SIZE as i32;
+        let base_wz = pos.z * CHUNK_SIZE as i32;
+        let mut max_h = i32::MIN;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                max_h = max_h.max(terrain_height_at_seeded(
+                    base_wx + lx as i32,
+                    base_wz + lz as i32,
+                    seed,
+                ));
+            }
+        }
+        max_h
+    }
+
+    /// A 32-tall hub whose cells reach `base_y + 31`, so a plan can place cells
+    /// above `MAX_TERRAIN_HEIGHT`-free chunks and trip the legacy shortcuts.
+    fn tall_hub_catalog() -> VillageCatalog {
+        let mut blocks = Vec::new();
+        for y in 0..32u32 {
+            blocks.push(PrefabBlock {
+                position: [2, y, 2],
+                block: BlockId::Stone,
+            });
+        }
+        let prefab = Prefab {
+            name: "tall_hub".to_owned(),
+            origin: [2, 0, 2],
+            size: [5, 32, 5],
+            blocks,
+            sockets: Vec::new(),
+        };
+        let definition = VillageDefinition {
+            name: "tall".to_owned(),
+            biomes: vec![Biome::Plains, Biome::Forest],
+            hub: "tall_hub".to_owned(),
+            spacing: 4,
+            min_prefabs: 10,
+            max_prefabs: 20,
+            max_slope: 6,
+            house: Vec::new(),
+            farm: Vec::new(),
+            well: Vec::new(),
+            junction: Vec::new(),
+        };
+        catalog_for_tests(vec![prefab], vec![definition])
+    }
+
+    /// The empty-catalog contract: `villages: None` and an empty catalog must
+    /// both reproduce `generate_chunk_seeded_with(..., &[])` exactly, including
+    /// uniform-Air layers and genuine village-candidate chunks.
+    #[test]
+    fn empty_catalog_identity() {
+        let seed = VILLAGE_TEST_SEED;
+        let empty = VillageCatalog::default();
+        let catalog = checked_in_village_catalog();
+        let mut positions = Vec::new();
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                positions.push(ChunkPos::new(cx, 1, cz));
+            }
+        }
+        // The uniform-Air sky layer must keep taking the legacy shortcut.
+        positions.push(ChunkPos::new(0, 4, 0));
+
+        // A real candidate chunk from the checked-in plan, so empty-catalog
+        // identity is proven where a village *would* have been written.
+        let plan = pinned_village_plan(&catalog);
+        let cs = CHUNK_SIZE as i32;
+        let mut candidates = 0usize;
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    if catalog.chunk_may_hold_village(pos, seed) {
+                        positions.push(pos);
+                        candidates += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            candidates > 0,
+            "checked-in plan must expose candidate chunks"
+        );
+
+        for season in [Season::Spring, Season::Summer, Season::Winter] {
+            for pos in &positions {
+                let legacy = generate_chunk_seeded(*pos, seed, season);
+                let baseline = generate_chunk_seeded_with(*pos, seed, season, &[]);
+                assert_chunks_equal(
+                    &baseline,
+                    &legacy,
+                    &format!("empty rule slice drifted at {pos:?}, {season:?}"),
+                );
+                let no_village =
+                    generate_chunk_with_context(*pos, seed, season, &WorldGenContext::default());
+                assert_chunks_equal(
+                    &no_village,
+                    &legacy,
+                    &format!("villages: None drifted at {pos:?}, {season:?}"),
+                );
+                let empty_village = generate_chunk_with_context(
+                    *pos,
+                    seed,
+                    season,
+                    &WorldGenContext {
+                        villages: Some(&empty),
+                        ..WorldGenContext::default()
+                    },
+                );
+                assert_chunks_equal(
+                    &empty_village,
+                    &legacy,
+                    &format!("empty catalog drifted at {pos:?}, {season:?}"),
+                );
+            }
+        }
+    }
+
+    /// The village pass may only write plan cells: every plan cell materializes
+    /// verbatim, every difference from the legacy chunk is one of those cells,
+    /// and chunks outside the plan bounds stay byte-identical.
+    #[test]
+    fn village_pass_writes_only_plan_cells() {
+        let seed = VILLAGE_TEST_SEED;
+        let catalog = checked_in_village_catalog();
+        let plan = pinned_village_plan(&catalog);
+        let context = village_context(&catalog);
+        let season = Season::Summer;
+        let cs = CHUNK_SIZE as i32;
+
+        let mut changed_total = 0usize;
+        let mut plan_cells_total = 0usize;
+        let x_chunks = plan.bounds.min_x.div_euclid(cs) - 1..=plan.bounds.max_x.div_euclid(cs) + 1;
+        let z_chunks = plan.bounds.min_z.div_euclid(cs) - 1..=plan.bounds.max_z.div_euclid(cs) + 1;
+        let y_chunks = plan.bounds.min_y.div_euclid(cs) - 1..=plan.bounds.max_y.div_euclid(cs) + 1;
+
+        for cy in y_chunks {
+            for cx in x_chunks.clone() {
+                for cz in z_chunks.clone() {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let legacy = generate_chunk_seeded(pos, seed, season);
+                    let generated = generate_chunk_with_context(pos, seed, season, &context);
+                    let plan_cells = plan.cells_for_chunk(pos);
+
+                    if plan_cells.is_empty() {
+                        // Only same-cell chunks have a provable identity here:
+                        // a neighbouring cell may legitimately own its own
+                        // village in the same checked-in catalog.
+                        if village_cell_at(pos.x * cs, pos.z * cs) == plan.cell {
+                            assert_chunks_equal(
+                                &generated,
+                                &legacy,
+                                &format!("chunk {pos:?} is outside the plan but changed"),
+                            );
+                        }
+                        continue;
+                    }
+
+                    let expected: HashSet<(usize, usize, usize)> = plan_cells
+                        .iter()
+                        .map(|cell| local_cell(cell.world))
+                        .collect();
+                    for cell in &plan_cells {
+                        let local = local_cell(cell.world);
+                        assert_eq!(
+                            generated.get(local.0, local.1, local.2),
+                            cell.block,
+                            "village cell {:?} was not materialized in {pos:?}",
+                            cell.world
+                        );
+                    }
+                    let changed = changed_cells(&generated, &legacy);
+                    for local in &changed {
+                        assert!(
+                            expected.contains(local),
+                            "chunk {pos:?} changed non-plan cell {local:?}"
+                        );
+                    }
+                    changed_total += changed.len();
+                    plan_cells_total += plan_cells.len();
+                }
+            }
+        }
+
+        assert!(
+            plan_cells_total > 0,
+            "the pinned plan emitted no cells in its own bounds"
+        );
+        assert!(
+            changed_total > 0,
+            "the pinned plan changed nothing, so the pass was never exercised"
+        );
+    }
+
+    /// The village pass is the true last pass: a chance-1.0 pack patch that
+    /// would rewrite a village surface cell to Cobblestone must lose to the
+    /// village block.
+    #[test]
+    fn pack_patch_cannot_overwrite_village() {
+        let seed = VILLAGE_TEST_SEED;
+        let catalog = checked_in_village_catalog();
+        let plan = pinned_village_plan(&catalog);
+        let spawn = find_spawn_column(seed);
+        let season = Season::Summer;
+        let cs = CHUNK_SIZE as i32;
+        let rules = [WorldgenRule::Patch {
+            block: BlockId::Cobblestone,
+            replace: BlockId::Grass,
+            biomes: vec![Biome::Plains, Biome::Forest],
+            min_y: 0,
+            max_y: 200,
+            chance: 1.0,
+        }];
+        let patch_only = WorldGenContext {
+            rules: &rules,
+            villages: None,
+            spawn_column: Some(spawn),
+        };
+        let with_village = WorldGenContext {
+            rules: &rules,
+            villages: Some(&catalog),
+            spawn_column: Some(spawn),
+        };
+
+        let mut found = false;
+        'chunks: for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let legacy = generate_chunk_seeded(pos, seed, season);
+                    for cell in plan.cells_for_chunk(pos) {
+                        // Only a non-Cobblestone surface cell can prove the
+                        // ordering: a Cobblestone village cell is
+                        // indistinguishable from the patch block.
+                        if cell.block == BlockId::Cobblestone {
+                            continue;
+                        }
+                        let [wx, wy, wz] = cell.world;
+                        if wy != terrain_height_at_seeded(wx, wz, seed) {
+                            continue;
+                        }
+                        let local = local_cell(cell.world);
+                        if legacy.get(local.0, local.1, local.2) != BlockId::Grass {
+                            continue;
+                        }
+
+                        let patched = generate_chunk_with_context(pos, seed, season, &patch_only);
+                        let assembled =
+                            generate_chunk_with_context(pos, seed, season, &with_village);
+                        assert_eq!(
+                            patched.get(local.0, local.1, local.2),
+                            BlockId::Cobblestone,
+                            "patch rule did not rewrite the surface cell {:?}",
+                            cell.world
+                        );
+                        assert_eq!(
+                            assembled.get(local.0, local.1, local.2),
+                            cell.block,
+                            "pack patch beat the village pass at {:?}",
+                            cell.world
+                        );
+                        found = true;
+                        break 'chunks;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "no village surface cell was available to prove patch ordering"
+        );
+    }
+
+    /// Season independence: the same plan cells materialize byte-for-byte in
+    /// every season. Only the terrain surface skin and oak leaves are seasonal.
+    #[test]
+    fn village_pass_is_season_independent() {
+        let seed = VILLAGE_TEST_SEED;
+        let catalog = checked_in_village_catalog();
+        let plan = pinned_village_plan(&catalog);
+        let spawn = find_spawn_column(seed);
+        let cs = CHUNK_SIZE as i32;
+        let mut checked = 0usize;
+
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let cells = plan.cells_for_chunk(pos);
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    for season in [Season::Spring, Season::Summer, Season::Winter] {
+                        let chunk = generate_chunk_with_context(
+                            pos,
+                            seed,
+                            season,
+                            &WorldGenContext {
+                                rules: &[],
+                                villages: Some(&catalog),
+                                spawn_column: Some(spawn),
+                            },
+                        );
+                        for cell in &cells {
+                            let local = local_cell(cell.world);
+                            assert_eq!(
+                                chunk.get(local.0, local.1, local.2),
+                                cell.block,
+                                "village cell {:?} changed in {season:?}",
+                                cell.world
+                            );
+                        }
+                    }
+                    checked += cells.len();
+                }
+            }
+        }
+        assert!(checked > 0, "the pinned plan emitted no cells to check");
+    }
+
+    /// The corrected shortcuts must not clip a village whose cells sit above a
+    /// chunk's local terrain bound (the old second return used `max_h`).
+    #[test]
+    fn fast_paths_do_not_clip_villages() {
+        // Formula pins: the candidate bound is wider, and the local shortcut is
+        // disabled only for candidates.
+        assert!(!sky_is_air(128, true), "candidate sky chunk was clipped");
+        assert!(sky_is_air(128, false), "legacy sky bound must not move");
+        assert!(!sky_is_air(
+            MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM + 1,
+            true
+        ));
+        assert!(sky_is_air(
+            MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM + 1,
+            false
+        ));
+        assert!(!above_local_terrain_is_air(64, 40, true));
+        assert!(above_local_terrain_is_air(64, 40, false));
+
+        let seed = VILLAGE_TEST_SEED;
+        let catalog = tall_hub_catalog();
+        let spawn = find_spawn_column(seed);
+        let cs = CHUNK_SIZE as i32;
+        let mut found = false;
+
+        'cells: for cz in -12..=12 {
+            for cx in -12..=12 {
+                let cell = VillageCell { x: cx, z: cz };
+                let Some(plan) = village_plan_with_spawn(cell, seed, &catalog, spawn) else {
+                    continue;
+                };
+                if plan.bounds.max_y < 64 {
+                    continue;
+                }
+                for chunk_x in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+                    for chunk_z in
+                        plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs)
+                    {
+                        for chunk_y in
+                            plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs)
+                        {
+                            let pos = ChunkPos::new(chunk_x, chunk_y, chunk_z);
+                            let cells = plan.cells_for_chunk(pos);
+                            if cells.is_empty() {
+                                continue;
+                            }
+                            let base_wy = chunk_y * cs;
+                            let max_h = chunk_max_height(pos, seed);
+                            if !above_local_terrain_is_air(base_wy, max_h, false) {
+                                continue;
+                            }
+                            assert!(
+                                catalog.chunk_may_hold_village(pos, seed),
+                                "repro chunk {pos:?} must be a village candidate"
+                            );
+
+                            // The legacy shortcut returns uniform Air here and
+                            // would silently drop every village cell.
+                            let legacy = generate_chunk_seeded(pos, seed, Season::Summer);
+                            assert_eq!(
+                                legacy.is_uniform(),
+                                Some(BlockId::Air),
+                                "repro chunk {pos:?} does not trip the legacy fast path"
+                            );
+
+                            let generated = generate_chunk_with_context(
+                                pos,
+                                seed,
+                                Season::Summer,
+                                &WorldGenContext {
+                                    rules: &[],
+                                    villages: Some(&catalog),
+                                    spawn_column: Some(spawn),
+                                },
+                            );
+                            for cell in &cells {
+                                let local = local_cell(cell.world);
+                                assert_eq!(
+                                    generated.get(local.0, local.1, local.2),
+                                    cell.block,
+                                    "fast path clipped village cell {:?} in {pos:?}",
+                                    cell.world
+                                );
+                            }
+                            found = true;
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "no tall-village chunk above the local terrain bound was found"
+        );
+    }
+
+    /// `ruin_covers` is exactly the public footprint-coverage query: true for
+    /// every column inside a scanned anchor's shell and false for a nearby-ish
+    /// ruin-free column.
+    #[test]
+    fn ruin_covers_matches_anchor_coverage() {
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(2, seed);
+        let spec = anchors
+            .first()
+            .expect("scan region must contain a ruin anchor");
+
+        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                assert!(
+                    ruin_covers(spec.anchor_x + dx, spec.anchor_z + dz, seed),
+                    "ruin_covers missed footprint cell ({dx}, {dz}) of ({}, {})",
+                    spec.anchor_x,
+                    spec.anchor_z
+                );
+            }
+        }
+
+        // Pick a far column whose own 5x5 anchor window is ruin-free, so the
+        // negative assertion cannot flake on a legal far-away ruin.
+        let mut far = None;
+        'search: for dz in 0..128 {
+            for dx in 0..128 {
+                let wx = spec.anchor_x + 4096 + dx;
+                let wz = spec.anchor_z + 4096 + dz;
+                let mut covered = false;
+                for oz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                    for ox in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                        if ruin_at_seeded(wx + ox, wz + oz, seed).is_some() {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if covered {
+                        break;
+                    }
+                }
+                if !covered {
+                    far = Some((wx, wz));
+                    break 'search;
+                }
+            }
+        }
+        let (far_x, far_z) = far.expect("no ruin-free far column in the search window");
+        assert!(!ruin_covers(far_x, far_z, seed));
     }
 }

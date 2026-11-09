@@ -6,8 +6,9 @@
 //! The [`LoadedPack`] contract is the boundary later slices consume: it always
 //! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
 //! RGBA layers plus optional presentation data. The first
-//! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layers
-//! 25..=31 are reserved block placeholders, layers 32..=44 are mob part art
+//! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layer
+//! 25 is built-in socket-marker art packs cannot override, layers 26..=31 are
+//! reserved block placeholders, layers 32..=44 are mob part art
 //! from [`MOB_LAYER_FILES`], and layers 45..=47 are reserved spares. Loading
 //! never fails and never panics on bad input; every fallback is reported as a
 //! structured [`SettingsWarning`].
@@ -34,9 +35,10 @@ pub use spec::load_stack;
 /// Number of block texture layers a pack may author.
 ///
 /// Index-aligned with the first [`AUTHORABLE_TEX_LAYERS`] entries of
-/// `BlockId::face_tex_layer`/the procedural layer set. Layers
-/// [`AUTHORABLE_TEX_LAYERS`]..[`crate::render::texture::MOB_LAYER_BASE`] are
-/// reserved block placeholders that cannot be overridden.
+/// `BlockId::face_tex_layer`/the procedural layer set. Layer 25 is built-in
+/// socket-marker art packs cannot override, and
+/// 26..[`crate::render::texture::MOB_LAYER_BASE`] are reserved block
+/// placeholders that cannot be overridden either.
 pub const AUTHORABLE_TEX_LAYERS: usize = 25;
 
 /// File names for the 25 authorable block texture layers, index-aligned with
@@ -106,7 +108,8 @@ pub struct PackLogo {
 /// `layers` is always exactly [`crate::render::texture::NUM_TEX_LAYERS`]
 /// entries of 16x16 RGBA bytes (1024 bytes each), the same format
 /// [`crate::render::texture::create_block_texture_array`] consumes. Layers
-/// 0..24 come from [`LAYER_FILES`], 25..31 are reserved block placeholders,
+/// 0..24 come from [`LAYER_FILES`], layer 25 is built-in socket-marker art
+/// that packs cannot override, 26..31 are reserved block placeholders,
 /// 32..44 come from [`MOB_LAYER_FILES`], and 45..47 are reserved spares.
 /// Missing, invalid, and out-of-range files fall back per layer to the
 /// procedural texture and appear in `warnings`.
@@ -127,9 +130,10 @@ pub struct LoadedPack {
 /// layer file that does not exist is silently replaced by its procedural
 /// layer; a file that exists but fails to decode, is non-square, or is outside
 /// 16..=256 pixels falls back the same way and emits one warning naming the
-/// bare file. Reserved layers 25..=31 and 45..=47 have no file name and are
-/// never overridable, so a legacy pack that ships only the original 16 block
-/// files simply keeps the built-in art for layers 16..24 and all mob art. The
+/// bare file. Layer 25 (built-in socket-marker art) and the reserved layers
+/// 26..=31 and 45..=47 have no file name and are never overridable, so a
+/// legacy pack that ships only the original 16 block files simply keeps the
+/// built-in art for layers 16..25 and all mob art. The
 /// optional logo is decoded at native size (failure -> `None` plus a warning).
 /// Unknown files and unknown manifest keys are ignored. Never panics, never
 /// returns `Err`.
@@ -559,8 +563,8 @@ whatever = true
             assert_ne!(*layer, procedural[index]);
         }
 
-        // Layers 16..25 (new authored names), the reserved ranges, and all
-        // mob art keep the built-in pixels: a legacy pack needs no changes.
+        // Built-in marker art (25), the reserved ranges, and all mob art keep
+        // the built-in pixels: a legacy pack needs no changes.
         for index in 16..AUTHORABLE_TEX_LAYERS {
             assert_procedural_layer(&pack, &procedural, index);
         }
@@ -627,7 +631,7 @@ whatever = true
         read_pack_toml(&dir, "name = \"Reserved\"\n");
         // Neither the first nor the last reserved layer can be overridden,
         // and the spare block range stays non-authorable too.
-        for file in ["reserved_25.png", "reserved_31.png", "reserved_45.png"] {
+        for file in ["reserved_26.png", "reserved_31.png", "reserved_45.png"] {
             write_png(&dir.join(file), 16);
         }
 
@@ -760,10 +764,10 @@ whatever = true
         assert_eq!(MOB_LAYER_FILES[0], "pig_body.png");
         assert_eq!(MOB_LAYER_FILES[12], "arrow.png");
 
-        // 25 block + 7 reserved + 13 mob + 3 spare = 48.
+        // 25 block + 1 built-in marker + 6 reserved + 13 mob + 3 spare = 48.
         assert_eq!(
             NUM_TEX_LAYERS as usize,
-            AUTHORABLE_TEX_LAYERS + 7 + MOB_AUTHORABLE_TEX_LAYERS + 3
+            AUTHORABLE_TEX_LAYERS + 1 + 6 + MOB_AUTHORABLE_TEX_LAYERS + 3
         );
     }
 

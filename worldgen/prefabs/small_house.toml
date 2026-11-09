@@ -1,0 +1,21 @@
+format = 1
+name = "small_house"
+origin = [2, 0, 2]
+size = [5, 4, 5]
+
+layers = [
+  [ "ccccc", "ccccc", "ccccc", "ccccc", "ccccc" ],
+  [ "L#.#L", "L...L", "L.$.L", "L...L", "L###L" ],
+  [ "L#.#L", "L...L", "L...L", "L...L", "L###L" ],
+  [ "L###L", "L###L", "L###L", "L###L", "L###L" ],
+]
+
+[palette]
+"c" = "cobblestone"
+"#" = "oak_planks"
+"L" = "oak_log"
+"$" = "chest"
+
+[[sockets]]
+position = [0, 1, -2]
+direction = "north"

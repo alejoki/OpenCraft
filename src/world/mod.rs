@@ -1,6 +1,7 @@
 pub mod arrow;
 pub mod background;
 pub mod block;
+pub mod capture;
 pub mod catalog;
 pub mod catalog_fs;
 pub mod chunk;
@@ -15,8 +16,10 @@ pub mod mob_ai;
 pub mod mob_audio;
 pub mod mob_loot;
 pub mod persistence;
+pub mod prefab;
 pub mod season;
 pub mod session;
 pub mod spawning;
 pub mod terrain;
+pub mod village;
 pub mod vista;

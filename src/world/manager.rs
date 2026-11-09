@@ -13,24 +13,38 @@ use crate::world::chunk::{linear_index, world_to_chunk_and_local, Chunk, ChunkPo
 use crate::world::light::{self, LightGrid};
 use crate::world::persistence::ChunkEditMap;
 use crate::world::season::Season;
-use crate::world::terrain::{generate_chunk_seeded_with, DEFAULT_WORLD_SEED};
+use crate::world::terrain::{generate_chunk_with_context, WorldGenContext, DEFAULT_WORLD_SEED};
+use crate::world::village::VillageCatalog;
 
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
 
 pub struct WorldManager {
-    chunks: FxHashMap<ChunkPos, Chunk>,
+    /// Resident chunks, shared behind `Arc` so a light or mesh job can take a
+    /// consistent snapshot of the block data with an O(1) handle clone instead
+    /// of deep-cloning up to 54 block arrays on the frame thread.
+    ///
+    /// Ownership rule: mutation goes through `Arc::make_mut`, so a snapshot
+    /// held by an in-flight job keeps its pre-edit blocks (copy-on-write). Do
+    /// not put the `Arc` inside `Chunk`/`ChunkStorage`; that would add an
+    /// atomic uniqueness check to every generated block and every light BFS
+    /// cell.
+    chunks: FxHashMap<ChunkPos, Arc<Chunk>>,
     pending_gen: FxHashSet<ChunkPos>,
     pending_mesh: FxHashSet<ChunkPos>,
     meshed_chunks: FxHashSet<ChunkPos>,
     dirty_mesh_queue: FxHashSet<ChunkPos>,
     /// Per-chunk sky-light grids (D038/D044). Derived data only: never
     /// persisted, recomputed deterministically from chunks + edits.
-    light_grids: FxHashMap<ChunkPos, LightGrid>,
+    light_grids: FxHashMap<ChunkPos, Arc<LightGrid>>,
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
-    mesh_tx: Sender<(ChunkPos, ChunkMesh)>,
-    mesh_rx: Receiver<(ChunkPos, ChunkMesh)>,
+    /// `None` is a completed job that produced no geometry (a volume with no
+    /// solid or liquid cells): it still marks the chunk meshed, but uploads no
+    /// GPU mesh. This is the worker-side equivalent of the old frame-thread
+    /// fast skip.
+    mesh_tx: Sender<(ChunkPos, Option<ChunkMesh>)>,
+    mesh_rx: Receiver<(ChunkPos, Option<ChunkMesh>)>,
     /// Completed columns waiting for a worker slot. `queued_light` is the
     /// de-dupe companion; the deque is FIFO so a column triggered later can
     /// never be dispatched (and therefore snapshotted) before an earlier one.
@@ -82,6 +96,21 @@ pub struct WorldManager {
     /// an empty slice, which makes generation byte-identical to the built-in
     /// `generate_chunk_seeded` path.
     worldgen_rules: Arc<[WorldgenRule]>,
+    /// Accepted village catalog generation plans against, when the session
+    /// installed one. Shared behind `Arc` for the same reason as `block_faces`
+    /// and `worldgen_rules`: every generation job clones a pointer, never the
+    /// catalog. `None` reproduces the pre-M015 generator exactly.
+    village_catalog: Option<Arc<VillageCatalog>>,
+    /// World column of the projected spawn, cached once by the session.
+    ///
+    /// The village planner needs it to reject plans inside
+    /// `VILLAGE_SPAWN_EXCLUSION`, and deriving it runs the bounded 512-ring
+    /// `find_spawn_column` land search. That search must never run on a rayon
+    /// worker (or once per chunk), so this is supplied at install time and
+    /// only copied per job. `None` together with a catalog makes generation
+    /// fall back to the planner's own bounded search, which is what a caller
+    /// that never installed a spawn column asked for.
+    village_spawn_column: Option<(i32, i32)>,
 }
 
 /// Result of one rayon sky-light job. Produced entirely off the frame thread;
@@ -105,7 +134,7 @@ struct LightJobResult {
 /// exactly; the only difference is that the block source is the detached map
 /// the frame thread handed to rayon, so the worker never touches manager state.
 fn compute_light_region_snapshot(
-    chunks: &FxHashMap<ChunkPos, Chunk>,
+    chunks: &FxHashMap<ChunkPos, Arc<Chunk>>,
     cx0: i32,
     cx1: i32,
     cz0: i32,
@@ -133,8 +162,12 @@ fn compute_light_region_snapshot(
 
 /// Per-frame ceilings for the light pipeline. Grid application is cheap (map
 /// inserts plus mesh-queue dirt) but result payloads are large; dispatch is
-/// limited because snapshotting clones up to 54 chunk block arrays on the frame
-/// thread. Both are well below the MEM229 8 ms p95 budget.
+/// limited because snapshotting still touches up to 54 map entries on the frame
+/// thread (the block arrays themselves are `Arc`-shared, so each is a handle
+/// clone, not a deep copy). The mesh path follows the same rule after MEM243/
+/// D072: the frame thread only snapshots `Arc`s and dispatches, while the 34^3
+/// padded assembly and greedy mesh both run on the rayon worker. Both budgets
+/// are well below the MEM229 8 ms p95 budget.
 const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
 const LIGHT_DISPATCH_BUDGET: usize = 4;
 
@@ -152,6 +185,23 @@ const PENDING_GEN_CAP: usize = 96;
 /// season change is spread over at least ceil(resident / 32) frames instead of
 /// remeshing the whole world in one frame.
 const SEASON_ROLLOVER_BUDGET: usize = 32;
+
+/// Build the one [`WorldGenContext`] both production dispatch sites use.
+///
+/// Extracted so the initial-load and season-rollover closures cannot drift
+/// apart: a rollover missing the catalog would silently erase villages on the
+/// first season change.
+fn gen_context<'a>(
+    rules: &'a [WorldgenRule],
+    villages: Option<&'a VillageCatalog>,
+    spawn_column: Option<(i32, i32)>,
+) -> WorldGenContext<'a> {
+    WorldGenContext {
+        rules,
+        villages,
+        spawn_column,
+    }
+}
 
 fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     // One extra ring beyond render_distance supplied the 6 face neighbours for
@@ -171,6 +221,305 @@ fn build_spiral_offsets(radius: i32) -> Vec<(i32, i32)> {
     }
     offsets.sort_by_key(|&(dx, dz)| dx * dx + dz * dz);
     offsets
+}
+
+/// Immutable `Arc` view of everything a mesh job reads for one chunk.
+///
+/// The frame thread builds this with O(1) handle clones; the rayon worker then
+/// assembles the padded volume without ever touching `WorldManager` state.
+///
+/// Sufficiency proof for the 3x3x3 window (`pos +/- 1` on x, y and z): the six
+/// face halos use `+/-1` on exactly one axis, and the 12 edge strips span chunk
+/// offsets `-1..=+1` on the third axis while the other two axes stay on `+/-1`.
+/// Every read `build_padded_from_snapshot` performs therefore lands inside the
+/// 27 collected positions.
+struct MeshSnapshot {
+    pos: ChunkPos,
+    chunks: FxHashMap<ChunkPos, Arc<Chunk>>,
+    light: FxHashMap<ChunkPos, Arc<LightGrid>>,
+}
+
+impl MeshSnapshot {
+    /// Mirrors `WorldManager::get_block`: below the world is bedrock, above is
+    /// air, and an absent chunk reads as air.
+    #[inline]
+    fn get_block(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
+        if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+            return BlockId::Bedrock;
+        }
+        if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+            return BlockId::Air;
+        }
+        let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+        self.chunks
+            .get(&cpos)
+            .map_or(BlockId::Air, |chunk| chunk.get(lx, ly, lz))
+    }
+
+    /// Mirrors `WorldManager::light_at_world`: below the world is dark, above is
+    /// full sky light, and an absent grid falls back to full sky light.
+    #[inline]
+    fn light_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        if wy < MIN_CHUNK_Y * CHUNK_SIZE as i32 {
+            return 0;
+        }
+        if wy >= (MAX_CHUNK_Y + 1) * CHUNK_SIZE as i32 {
+            return light::MAX_SKY_LIGHT;
+        }
+        let (cpos, (lx, ly, lz)) = world_to_chunk_and_local(wx, wy, wz);
+        self.light
+            .get(&cpos)
+            .map_or(light::MAX_SKY_LIGHT, |grid| grid.get(lx, ly, lz))
+    }
+
+    /// Mirrors `WorldManager::has_all_face_neighbors`: same six directions and
+    /// the same skip for a y neighbour outside `MIN_CHUNK_Y..=MAX_CHUNK_Y`.
+    fn has_all_face_neighbors(&self, pos: ChunkPos) -> bool {
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let ny = pos.y + dy;
+            if !(MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&ny) {
+                continue;
+            }
+            let npos = ChunkPos::new(pos.x + dx, ny, pos.z + dz);
+            if !self.chunks.contains_key(&npos) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Assemble the 34^3 padded volume for `snapshot.pos` entirely from the
+/// snapshotted `Arc` handles.
+///
+/// Extracted from `WorldManager::build_padded_chunk` so the heavy work runs on
+/// the rayon mesh worker (MEM243/D072) instead of the frame thread, where the
+/// S08 profile measured it at ~63% of dispatch time.
+fn build_padded_from_snapshot(snapshot: &MeshSnapshot) -> PaddedChunk {
+    let pos = snapshot.pos;
+    let center = snapshot
+        .chunks
+        .get(&pos)
+        .expect("mesh snapshot always contains its center chunk");
+
+    // Fast path: uniform air chunk produces zero faces
+    if center.is_uniform() == Some(BlockId::Air) {
+        return PaddedChunk::new_empty();
+    }
+
+    let mut padded = PaddedChunk::from_center_only(center);
+
+    // Copy 6 face halos directly from neighbor chunks
+    let cs = CHUNK_SIZE;
+    // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
+    if let Some(nx_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+        if nx_pos.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set(cs + 1, ly + 1, lz + 1, nx_pos.get(0, ly, lz));
+                }
+            }
+        }
+    }
+    if let Some(nx_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+        if nx_neg.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lz in 0..cs {
+                    padded.set(0, ly + 1, lz + 1, nx_neg.get(cs - 1, ly, lz));
+                }
+            }
+        }
+    }
+
+    // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
+    if pos.y < MAX_CHUNK_Y {
+        if let Some(ny_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+            if ny_pos.is_uniform() != Some(BlockId::Air) {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set(lx + 1, cs + 1, lz + 1, ny_pos.get(lx, 0, lz));
+                    }
+                }
+            }
+        }
+    }
+    if pos.y > MIN_CHUNK_Y {
+        if let Some(ny_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+            if ny_neg.is_uniform() != Some(BlockId::Air) {
+                for lz in 0..cs {
+                    for lx in 0..cs {
+                        padded.set(lx + 1, 0, lz + 1, ny_neg.get(lx, cs - 1, lz));
+                    }
+                }
+            }
+        }
+    } else {
+        // Below MIN_CHUNK_Y is solid bedrock
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set(lx + 1, 0, lz + 1, BlockId::Bedrock);
+            }
+        }
+    }
+
+    // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
+    if let Some(nz_pos) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+        if nz_pos.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set(lx + 1, ly + 1, cs + 1, nz_pos.get(lx, ly, 0));
+                }
+            }
+        }
+    }
+    if let Some(nz_neg) = snapshot.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+        if nz_neg.is_uniform() != Some(BlockId::Air) {
+            for ly in 0..cs {
+                for lx in 0..cs {
+                    padded.set(lx + 1, ly + 1, 0, nz_neg.get(lx, ly, cs - 1));
+                }
+            }
+        }
+    }
+
+    // Sky light mirrors the voxel halo geometry exactly: the center grid
+    // fills the inner 32^3, the 6 face halos come from the neighbour chunk
+    // grids, and the 12 edge strips use the world-space light accessor.
+    if let Some(grid) = snapshot.light.get(&pos) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, ly + 1, lz + 1, grid.get(lx, ly, lz));
+                }
+            }
+        }
+    }
+
+    // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
+            }
+        }
+    }
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
+        for ly in 0..cs {
+            for lz in 0..cs {
+                padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
+            }
+        }
+    }
+
+    // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
+            }
+        }
+    }
+    if pos.y > MIN_CHUNK_Y {
+        if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
+            for lz in 0..cs {
+                for lx in 0..cs {
+                    padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
+                }
+            }
+        }
+    } else {
+        // Below MIN_CHUNK_Y is opaque bedrock, so no sky light reaches it.
+        for lz in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, 0, lz + 1, 0);
+            }
+        }
+    }
+
+    // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
+        for ly in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
+            }
+        }
+    }
+    if let Some(grid) = snapshot.light.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
+        for ly in 0..cs {
+            for lx in 0..cs {
+                padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
+            }
+        }
+    }
+
+    // Populate 12 edge strips for seamless corner AO across chunk borders
+    let base_wx = pos.x * cs as i32;
+    let base_wy = pos.y * cs as i32;
+    let base_wz = pos.z * cs as i32;
+    for i in 0..=cs + 1 {
+        for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + px as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + i as i32 - 1,
+            );
+            padded.set(px, py, i, b);
+        }
+        for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + px as i32 - 1,
+                base_wy + i as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set(px, i, pz, b);
+        }
+        for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let b = snapshot.get_block(
+                base_wx + i as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set(i, py, pz, b);
+        }
+    }
+
+    // ... and the matching light edge strips, through the grid map. Missing
+    // grids fall back to full light (see `light_at_world`).
+    for i in 0..=cs + 1 {
+        for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + px as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + i as i32 - 1,
+            );
+            padded.set_light(px, py, i, l);
+        }
+        for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + px as i32 - 1,
+                base_wy + i as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set_light(px, i, pz, l);
+        }
+        for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
+            let l = snapshot.light_at_world(
+                base_wx + i as i32 - 1,
+                base_wy + py as i32 - 1,
+                base_wz + pz as i32 - 1,
+            );
+            padded.set_light(i, py, pz, l);
+        }
+    }
+
+    padded
 }
 
 impl WorldManager {
@@ -217,6 +566,8 @@ impl WorldManager {
             season_rollover_inflight: FxHashSet::default(),
             block_faces: BlockFaces::builtin(),
             worldgen_rules: Arc::from([]),
+            village_catalog: None,
+            village_spawn_column: None,
         }
     }
 
@@ -251,8 +602,39 @@ impl WorldManager {
         &self.worldgen_rules
     }
 
+    /// Replaces the accepted village catalog used by every subsequent
+    /// generation, together with the world spawn column it plans against.
+    ///
+    /// Installed once at session construction, alongside
+    /// [`Self::set_block_faces`] and [`Self::set_worldgen_rules`], before any
+    /// chunk is generated; the session boundary is the only supported swap.
+    /// The same installation must be repeated at every create/load swap, or the
+    /// first season rollover would regenerate village chunks without the
+    /// catalog and silently erase every village.
+    ///
+    /// `spawn_column` is the cached projected spawn (the session derives it
+    /// once); it is never recomputed per chunk or on a rayon worker. Without a
+    /// catalog it is inert. A `None` catalog reproduces the pre-M015 generator
+    /// exactly.
+    pub fn set_village_catalog(&mut self, catalog: Arc<VillageCatalog>, spawn_column: (i32, i32)) {
+        self.village_catalog = Some(catalog);
+        self.village_spawn_column = Some(spawn_column);
+    }
+
+    /// The village catalog this manager generates against, if one was installed.
+    #[inline]
+    pub fn village_catalog(&self) -> Option<&Arc<VillageCatalog>> {
+        self.village_catalog.as_ref()
+    }
+
+    /// The cached world spawn column generation plans villages against.
+    #[inline]
+    pub fn village_spawn_column(&self) -> Option<(i32, i32)> {
+        self.village_spawn_column
+    }
+
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
-        self.chunks.insert(pos, chunk);
+        self.chunks.insert(pos, Arc::new(chunk));
     }
 
     #[inline]
@@ -472,7 +854,7 @@ impl WorldManager {
             if !changed {
                 continue;
             }
-            self.light_grids.insert(pos, grid);
+            self.light_grids.insert(pos, Arc::new(grid));
             changed_any = true;
             changed_positions.push(pos);
             if self.meshed_chunks.contains(&pos) || self.pending_mesh.contains(&pos) {
@@ -574,7 +956,7 @@ impl WorldManager {
                 continue;
             }
 
-            let mut chunks: FxHashMap<ChunkPos, Chunk> = FxHashMap::default();
+            let mut chunks: FxHashMap<ChunkPos, Arc<Chunk>> = FxHashMap::default();
             let mut complete_columns: FxHashSet<(i32, i32)> = FxHashSet::default();
             for dx in -1..=1 {
                 for dz in -1..=1 {
@@ -586,7 +968,7 @@ impl WorldManager {
                     for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
                         let pos = ChunkPos::new(ccx, cy, ccz);
                         if let Some(chunk) = self.chunks.get(&pos) {
-                            chunks.insert(pos, chunk.clone());
+                            chunks.insert(pos, Arc::clone(chunk));
                         }
                     }
                 }
@@ -704,241 +1086,46 @@ impl WorldManager {
         self.apply_light_region(grids, cx0, cx1, cz0, cz1);
     }
 
+    /// Build the padded volume for `pos` from a 3x3x3 `Arc` snapshot taken on
+    /// the calling (frame) thread.
+    ///
+    /// The heavy 34^3 assembly is *not* done here: streaming dispatches this
+    /// function onto the rayon mesh worker through [`build_padded_from_snapshot`],
+    /// so the frame thread only clones map handles (the S08 profile measured
+    /// the old frame-thread build at ~63% of dispatch time). Synchronous
+    /// callers (`set_block_immediate`, the presentation demo and tests) still
+    /// get the same result.
     pub fn build_padded_chunk(&self, pos: ChunkPos) -> Option<PaddedChunk> {
-        let center = self.chunks.get(&pos)?;
-        if !self.has_all_face_neighbors(pos) {
-            return None;
-        }
+        Some(build_padded_from_snapshot(&self.mesh_snapshot(pos)?))
+    }
 
-        // Fast path: uniform air chunk produces zero faces
-        if center.is_uniform() == Some(BlockId::Air) {
-            return Some(PaddedChunk::new_empty());
-        }
-
-        let mut padded = PaddedChunk::from_center_only(center);
-
-        // Copy 6 face halos directly from neighbor chunks
-        let cs = CHUNK_SIZE;
-        // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
-        if let Some(nx_pos) = self.chunks.get(&ChunkPos::new(pos.x + 1, pos.y, pos.z)) {
-            if nx_pos.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lz in 0..cs {
-                        padded.set(cs + 1, ly + 1, lz + 1, nx_pos.get(0, ly, lz));
+    /// Snapshot every resident chunk and light grid a mesh job for `pos` may
+    /// read, as `Arc` handles.
+    ///
+    /// Returns `None` under the same early-outs as the old frame-thread build:
+    /// the center must be resident and all six in-range face neighbours must be
+    /// present. Absent diagonal or vertical-out-of-range entries are simply not
+    /// collected; the padded builder reads them as air / full sky light, which
+    /// matches `get_block`/`light_at_world`.
+    fn mesh_snapshot(&self, pos: ChunkPos) -> Option<MeshSnapshot> {
+        self.chunks.get(&pos)?;
+        let mut chunks = FxHashMap::default();
+        let mut light = FxHashMap::default();
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+                    if let Some(chunk) = self.chunks.get(&npos) {
+                        chunks.insert(npos, Arc::clone(chunk));
+                    }
+                    if let Some(grid) = self.light_grids.get(&npos) {
+                        light.insert(npos, Arc::clone(grid));
                     }
                 }
             }
         }
-        if let Some(nx_neg) = self.chunks.get(&ChunkPos::new(pos.x - 1, pos.y, pos.z)) {
-            if nx_neg.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lz in 0..cs {
-                        padded.set(0, ly + 1, lz + 1, nx_neg.get(cs - 1, ly, lz));
-                    }
-                }
-            }
-        }
-
-        // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
-        if pos.y < MAX_CHUNK_Y {
-            if let Some(ny_pos) = self.chunks.get(&ChunkPos::new(pos.x, pos.y + 1, pos.z)) {
-                if ny_pos.is_uniform() != Some(BlockId::Air) {
-                    for lz in 0..cs {
-                        for lx in 0..cs {
-                            padded.set(lx + 1, cs + 1, lz + 1, ny_pos.get(lx, 0, lz));
-                        }
-                    }
-                }
-            }
-        }
-        if pos.y > MIN_CHUNK_Y {
-            if let Some(ny_neg) = self.chunks.get(&ChunkPos::new(pos.x, pos.y - 1, pos.z)) {
-                if ny_neg.is_uniform() != Some(BlockId::Air) {
-                    for lz in 0..cs {
-                        for lx in 0..cs {
-                            padded.set(lx + 1, 0, lz + 1, ny_neg.get(lx, cs - 1, lz));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Below MIN_CHUNK_Y is solid bedrock
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set(lx + 1, 0, lz + 1, BlockId::Bedrock);
-                }
-            }
-        }
-
-        // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
-        if let Some(nz_pos) = self.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z + 1)) {
-            if nz_pos.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lx in 0..cs {
-                        padded.set(lx + 1, ly + 1, cs + 1, nz_pos.get(lx, ly, 0));
-                    }
-                }
-            }
-        }
-        if let Some(nz_neg) = self.chunks.get(&ChunkPos::new(pos.x, pos.y, pos.z - 1)) {
-            if nz_neg.is_uniform() != Some(BlockId::Air) {
-                for ly in 0..cs {
-                    for lx in 0..cs {
-                        padded.set(lx + 1, ly + 1, 0, nz_neg.get(lx, ly, cs - 1));
-                    }
-                }
-            }
-        }
-
-        // Sky light mirrors the voxel halo geometry exactly: the center grid
-        // fills the inner 32^3, the 6 face halos come from the neighbour chunk
-        // grids, and the 12 edge strips use the world-space light accessor.
-        if let Some(grid) = self.light_grids.get(&pos) {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    for lx in 0..cs {
-                        padded.set_light(lx + 1, ly + 1, lz + 1, grid.get(lx, ly, lz));
-                    }
-                }
-            }
-        }
-
-        // +X (px = 33, lx = 0) and -X (px = 0, lx = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x + 1, pos.y, pos.z))
-        {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    padded.set_light(cs + 1, ly + 1, lz + 1, grid.get(0, ly, lz));
-                }
-            }
-        }
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x - 1, pos.y, pos.z))
-        {
-            for ly in 0..cs {
-                for lz in 0..cs {
-                    padded.set_light(0, ly + 1, lz + 1, grid.get(cs - 1, ly, lz));
-                }
-            }
-        }
-
-        // +Y (py = 33, ly = 0) and -Y (py = 0, ly = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y + 1, pos.z))
-        {
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, cs + 1, lz + 1, grid.get(lx, 0, lz));
-                }
-            }
-        }
-        if pos.y > MIN_CHUNK_Y {
-            if let Some(grid) = self
-                .light_grids
-                .get(&ChunkPos::new(pos.x, pos.y - 1, pos.z))
-            {
-                for lz in 0..cs {
-                    for lx in 0..cs {
-                        padded.set_light(lx + 1, 0, lz + 1, grid.get(lx, cs - 1, lz));
-                    }
-                }
-            }
-        } else {
-            // Below MIN_CHUNK_Y is opaque bedrock, so no sky light reaches it.
-            for lz in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, 0, lz + 1, 0);
-                }
-            }
-        }
-
-        // +Z (pz = 33, lz = 0) and -Z (pz = 0, lz = 31)
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y, pos.z + 1))
-        {
-            for ly in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, ly + 1, cs + 1, grid.get(lx, ly, 0));
-                }
-            }
-        }
-        if let Some(grid) = self
-            .light_grids
-            .get(&ChunkPos::new(pos.x, pos.y, pos.z - 1))
-        {
-            for ly in 0..cs {
-                for lx in 0..cs {
-                    padded.set_light(lx + 1, ly + 1, 0, grid.get(lx, ly, cs - 1));
-                }
-            }
-        }
-
-        // Populate 12 edge strips for seamless corner AO across chunk borders
-        let base_wx = pos.x * cs as i32;
-        let base_wy = pos.y * cs as i32;
-        let base_wz = pos.z * cs as i32;
-        for i in 0..=cs + 1 {
-            for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + px as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + i as i32 - 1,
-                );
-                padded.set(px, py, i, b);
-            }
-            for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + px as i32 - 1,
-                    base_wy + i as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set(px, i, pz, b);
-            }
-            for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let b = self.get_block(
-                    base_wx + i as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set(i, py, pz, b);
-            }
-        }
-
-        // ... and the matching light edge strips, through the grid map. Missing
-        // grids fall back to full light (see `light_at_world`).
-        for i in 0..=cs + 1 {
-            for &(px, py) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + px as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + i as i32 - 1,
-                );
-                padded.set_light(px, py, i, l);
-            }
-            for &(px, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + px as i32 - 1,
-                    base_wy + i as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set_light(px, i, pz, l);
-            }
-            for &(py, pz) in &[(0, 0), (cs + 1, 0), (0, cs + 1), (cs + 1, cs + 1)] {
-                let l = self.light_at_world(
-                    base_wx + i as i32 - 1,
-                    base_wy + py as i32 - 1,
-                    base_wz + pz as i32 - 1,
-                );
-                padded.set_light(i, py, pz, l);
-            }
-        }
-
-        Some(padded)
+        let snapshot = MeshSnapshot { pos, chunks, light };
+        snapshot.has_all_face_neighbors(pos).then_some(snapshot)
     }
 
     pub fn set_block_immediate(
@@ -955,6 +1142,9 @@ impl WorldManager {
         let Some(chunk) = self.chunks.get_mut(&cpos) else {
             return Vec::new();
         };
+        // Copy-on-write: an in-flight light/mesh job may still hold the old
+        // handle, and it must keep reading the pre-edit blocks.
+        let chunk = Arc::make_mut(chunk);
         chunk.set(lx, ly, lz, block);
         chunk.try_compress();
 
@@ -1079,11 +1269,19 @@ impl WorldManager {
             self.pending_gen.insert(pos);
             self.season_rollover_inflight.insert(pos);
             let tx = self.gen_tx.clone();
-            // The seasonal replacement must use the same pack rules as the
-            // first generation, or winter would silently erase authored ore.
+            // The seasonal replacement must use the same pack rules and the
+            // same village catalog as the first generation, or winter would
+            // silently erase authored ore and every village.
             let rules = Arc::clone(&self.worldgen_rules);
+            let catalog = self.village_catalog.clone();
+            let spawn = self.village_spawn_column;
             rayon::spawn(move || {
-                let chunk = generate_chunk_seeded_with(pos, seed, target, &rules);
+                let chunk = generate_chunk_with_context(
+                    pos,
+                    seed,
+                    target,
+                    &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                );
                 let _ = tx.send((pos, chunk));
             });
             dispatched += 1;
@@ -1107,7 +1305,7 @@ impl WorldManager {
     /// The caller has already re-applied `chunk_edits`, so edits always win:
     /// mined blocks stay mined while the surroundings turn white.
     fn swap_resident_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
-        self.chunks.insert(pos, chunk);
+        self.chunks.insert(pos, Arc::new(chunk));
 
         // Sky light is derived from these blocks. Drop the whole (x, z)
         // column BEFORE asking for light: `propagate_light_for_completed_column`
@@ -1185,7 +1383,7 @@ impl WorldManager {
             if replacement {
                 self.swap_resident_chunk(pos, chunk);
             } else {
-                self.chunks.insert(pos, chunk);
+                self.chunks.insert(pos, Arc::new(chunk));
 
                 // Column-ready trigger: this chunk may be the last piece of a
                 // full 192-block column. Only enqueue here; the light BFS runs
@@ -1228,7 +1426,11 @@ impl WorldManager {
             };
             if self.pending_mesh.remove(&pos) && self.chunks.contains_key(&pos) {
                 self.meshed_chunks.insert(pos);
-                completed_meshes.push((pos, mesh));
+                // `None` is the worker's "no solid or liquid cells" outcome,
+                // matching the old frame-thread skip: mark meshed, no upload.
+                if let Some(mesh) = mesh {
+                    completed_meshes.push((pos, mesh));
+                }
             }
         }
 
@@ -1301,6 +1503,13 @@ impl WorldManager {
         // Chunks generated while a wave is in flight must land in the target
         // season, or they would be stale the moment the wave drains.
         let gen_season = self.current_gen_season();
+        // Same context as the rollover dispatch: the rules and catalog are
+        // cloned once for the loop and once more per job (each job owns its
+        // inputs). A world that never installed a catalog simply carries
+        // `None` and an empty rule slice, matching the legacy seam.
+        let rules = Arc::clone(&self.worldgen_rules);
+        let catalog = self.village_catalog.clone();
+        let spawn = self.village_spawn_column;
         'spiral: for &(dx, dz) in &self.spiral_offsets {
             if self.pending_gen.len() >= PENDING_GEN_CAP || dispatched_gen >= 32 {
                 break;
@@ -1312,9 +1521,15 @@ impl WorldManager {
                 if !self.chunks.contains_key(&pos) && !self.pending_gen.contains(&pos) {
                     self.pending_gen.insert(pos);
                     let tx = self.gen_tx.clone();
-                    let rules = Arc::clone(&self.worldgen_rules);
+                    let rules = Arc::clone(&rules);
+                    let catalog = catalog.clone();
                     rayon::spawn(move || {
-                        let chunk = generate_chunk_seeded_with(pos, seed, gen_season, &rules);
+                        let chunk = generate_chunk_with_context(
+                            pos,
+                            seed,
+                            gen_season,
+                            &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                        );
                         let _ = tx.send((pos, chunk));
                     });
                     dispatched_gen += 1;
@@ -1365,30 +1580,36 @@ impl WorldManager {
                 break;
             }
             self.dirty_mesh_queue.remove(&pos);
-            let Some(padded) = self.build_padded_chunk(pos) else {
+            // Clone the handle set on the frame thread, then do all heavy work
+            // on rayon (MEM243/D072). `None` is the same early-out the old
+            // synchronous build had: not ready to mesh yet.
+            let Some(snapshot) = self.mesh_snapshot(pos) else {
                 continue;
             };
-            // Fast path on main thread: if padded chunk has no solid and no
-            // liquid voxels, skip worker dispatch. Water must be included so a
-            // water-bearing (or water-only) chunk is still meshed.
-            if !padded.has_any_solid && !padded.has_any_liquid {
-                self.meshed_chunks.insert(pos);
-                continue;
-            }
             self.pending_mesh.insert(pos);
             let tx = self.mesh_tx.clone();
             // Clone the shared table before the `move` closure: the worker
             // owns a pointer, not a borrow of the manager.
             let faces = Arc::clone(&self.block_faces);
             rayon::spawn(move || {
-                let mesh = mesh_chunk_with(&padded, &faces);
+                let padded = build_padded_from_snapshot(&snapshot);
+                // Water must be included so a water-bearing (or water-only)
+                // chunk is still meshed; only a fully empty volume skips.
+                let mesh = if !padded.has_any_solid && !padded.has_any_liquid {
+                    None
+                } else {
+                    Some(mesh_chunk_with(&padded, &faces))
+                };
                 let _ = tx.send((pos, mesh));
             });
         }
 
-        // 8. Hand queued columns to rayon last, so snapshot cloning (up to 54
-        //    chunks of block data) never delays this frame's mesh dispatch. The
-        //    worker results are applied by step 2 of a later frame.
+        // 8. Hand queued columns to rayon last, so snapshotting (up to 54
+        //    `Arc` handle clones, not block-array copies) never delays this
+        //    frame's mesh dispatch. Both the 34^3 padded assembly and the
+        //    greedy mesh run on rayon; the frame thread only snapshots and
+        //    dispatches (MEM243/D072). Worker results are applied by step 2 of
+        //    a later frame.
         self.dispatch_light_jobs();
 
         (completed_meshes, unloaded)
@@ -1399,7 +1620,10 @@ impl WorldManager {
 mod tests {
     use super::*;
     use crate::world::block::BlockId;
-    use crate::world::terrain::generate_chunk_seeded;
+    use crate::world::prefab::WORLDGEN_DIR;
+    use crate::world::terrain::{find_spawn_column, generate_chunk_seeded};
+    use crate::world::village::{village_plan_with_spawn, VillageCell, VillagePlan};
+    use std::path::Path;
 
     /// Serialises the tests that depend on the shared global rayon pool. The
     /// ocean-crossing acceptance test deliberately saturates that pool (a full
@@ -1461,7 +1685,7 @@ mod tests {
 
         // Simulate an older in-flight background mesh that completes after a synchronous block edit
         mgr.pending_mesh.insert(cpos);
-        let _ = mgr.mesh_tx.send((cpos, ChunkMesh::new()));
+        let _ = mgr.mesh_tx.send((cpos, Some(ChunkMesh::new())));
 
         let remeshed = mgr.set_block_immediate(5, 5, 5, BlockId::Air);
         assert_eq!(remeshed.len(), 1);
@@ -1472,6 +1696,94 @@ mod tests {
             !completed.iter().any(|(p, _)| *p == cpos),
             "stale in-flight mesh must be ignored after set_block_immediate"
         );
+    }
+
+    #[test]
+    fn arc_snapshot_is_isolated_from_later_edits() {
+        let mut mgr = WorldManager::new(4);
+        let cpos = ChunkPos::new(0, 0, 0);
+        mgr.insert_chunk_for_test(cpos, Chunk::new_uniform(BlockId::Stone));
+        for dir in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            mgr.insert_chunk_for_test(dir, Chunk::new_uniform(BlockId::Air));
+        }
+
+        // Stand in for an in-flight mesh/light job: keep the handle it would
+        // have snapshotted before the edit.
+        let snapshot = Arc::clone(mgr.chunks.get(&cpos).expect("center is resident"));
+        let _ = mgr.set_block_immediate(5, 5, 5, BlockId::Air);
+
+        assert_eq!(snapshot.get(5, 5, 5), BlockId::Stone);
+        assert_eq!(
+            mgr.chunks
+                .get(&cpos)
+                .expect("center stays resident")
+                .get(5, 5, 5),
+            BlockId::Air
+        );
+    }
+
+    #[test]
+    fn padded_snapshot_matches_world_accessors() {
+        use crate::mesh::greedy::{padded_index, PADDED_SIZE};
+
+        let mut mgr = WorldManager::new(4);
+        // Full 3x3 column ring across the whole loaded Y range: exactly the
+        // window the padded builder reads (face halos plus the 12 edge strips).
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+                    let pos = ChunkPos::new(dx, cy, dz);
+                    mgr.insert_chunk_for_test(
+                        pos,
+                        generate_chunk_seeded(pos, 1337, Season::Summer),
+                    );
+                }
+            }
+        }
+        mgr.recompute_light_for_test();
+
+        // Bottom, middle and top centers exercise the bedrock floor, ordinary
+        // interior halos and the open-sky ceiling. `is_solid()` is false only
+        // for Air and Water, so the raw-id comparison below is exact.
+        for center in [
+            ChunkPos::new(0, MIN_CHUNK_Y, 0),
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, MAX_CHUNK_Y, 0),
+        ] {
+            let padded = mgr
+                .build_padded_chunk(center)
+                .expect("full halo ring is resident and lit");
+            let base_wx = center.x * CHUNK_SIZE as i32;
+            let base_wy = center.y * CHUNK_SIZE as i32;
+            let base_wz = center.z * CHUNK_SIZE as i32;
+            for py in 0..PADDED_SIZE {
+                for pz in 0..PADDED_SIZE {
+                    for px in 0..PADDED_SIZE {
+                        let wx = base_wx + px as i32 - 1;
+                        let wy = base_wy + py as i32 - 1;
+                        let wz = base_wz + pz as i32 - 1;
+                        let idx = padded_index(px, py, pz);
+                        assert_eq!(
+                            padded.voxels[idx],
+                            mgr.get_block(wx, wy, wz).to_raw(),
+                            "voxel mismatch at padded ({px},{py},{pz}) for {center:?}"
+                        );
+                        assert_eq!(
+                            padded.light[idx],
+                            mgr.light_at_world(wx, wy, wz),
+                            "light mismatch at padded ({px},{py},{pz}) for {center:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2703,7 +3015,7 @@ mod tests {
 
         // Uniform-light baseline: same geometry, every corner lit 15.
         for grid in mgr.light_grids.values_mut() {
-            *grid = light::full_light_grid();
+            *grid = Arc::new(light::full_light_grid());
         }
         let uniform = mesh_total(&mgr);
 
@@ -2780,7 +3092,7 @@ mod tests {
     /// built-in placeholder.
     #[test]
     fn test_set_block_immediate_uses_the_installed_face_table() {
-        use crate::content::PACK_LAYER_BASE;
+        use crate::content::{PACK_LAYER_BASE, PLACEHOLDER_BLOCK_LAYER};
         use crate::world::block::BUILTIN_BLOCK_COUNT;
 
         let center = ChunkPos::new(0, 0, 0);
@@ -2802,7 +3114,7 @@ mod tests {
         assert_eq!(
             mgr.block_faces()
                 .layer(BlockId::Modded(BUILTIN_BLOCK_COUNT), 0),
-            25
+            PLACEHOLDER_BLOCK_LAYER
         );
 
         let faces = pack_faces();
@@ -3476,6 +3788,11 @@ mod tests {
         use crate::settings::DEFAULT_RENDER_DISTANCE;
         use std::time::{Duration, Instant};
 
+        // Serialise against the village-enabled twin below: both measure the
+        // main-thread dispatch cost while the shared rayon pool runs light and
+        // mesh jobs, and a concurrent tenant would poison both distributions.
+        let _guard = lock_heavy_streaming();
+
         // More than the 32-chunk minimum crossing in the slice plan.
         const STEPS: usize = 40;
         const P95_BUDGET: Duration = Duration::from_millis(8);
@@ -3613,6 +3930,241 @@ mod tests {
         );
     }
 
+    /// Village-enabled twin of [`streaming_budget`] (M015/S03-T05).
+    ///
+    /// The M007 dispatch harness measures a catalog-less manager. This one
+    /// installs the accepted checked-in village catalog and the cached seed-14
+    /// spawn column, then crosses the same 40 chunks at the same release
+    /// profile, so any per-chunk cost the village plan adds to the frame-thread
+    /// dispatch path shows up in the distribution. The negative control counts
+    /// plan cells that actually landed in resident chunks, so a village-free
+    /// measurement cannot green the budget claim.
+    ///
+    /// Release-only and ignored: run it two or three times on an idle machine
+    /// and record the whole distribution, not one lucky retry.
+    ///
+    /// ```text
+    /// cargo test --locked --release --lib -- --ignored streaming_budget_villages --nocapture
+    /// ```
+    #[test]
+    #[ignore = "release-only village frame-time harness: cargo test --locked --release --lib -- --ignored streaming_budget_villages"]
+    fn streaming_budget_villages() {
+        use crate::settings::DEFAULT_RENDER_DISTANCE;
+        use std::time::{Duration, Instant};
+
+        // Same crossing length as the catalog-less harness: more than the
+        // 32-chunk minimum crossing in the slice plan.
+        const STEPS: usize = 40;
+        const P95_BUDGET: Duration = Duration::from_millis(8);
+        const MAX_BUDGET: Duration = Duration::from_millis(16);
+        const SEED: u32 = VILLAGE_MANAGER_SEED;
+        const CELLS_FLOOR: usize = 1000;
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "streaming_budget_villages measures release timings: rerun with \
+                 `cargo test --locked --release --lib -- --ignored streaming_budget_villages`"
+            );
+        }
+
+        // Serialise against `streaming_budget` and the other heavy harnesses:
+        // light jobs saturate the global rayon pool.
+        let _guard = lock_heavy_streaming();
+
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(Path::new(WORLDGEN_DIR));
+        assert!(
+            diagnostics.is_empty(),
+            "village diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(catalog.len(), 1, "the checked-in catalog has one village");
+        let catalog = Arc::new(catalog);
+        let spawn = find_spawn_column(SEED);
+
+        // Seed 14, not `WorldManager::new`'s 1337 default: the installed plan
+        // and the generated terrain must share one seed for the negative
+        // control to see real village cells.
+        let mut mgr = WorldManager::with_seed_and_edits(
+            DEFAULT_RENDER_DISTANCE,
+            SEED,
+            ChunkEditMap::default(),
+        );
+        mgr.set_village_catalog(Arc::clone(&catalog), spawn);
+
+        // Warm up away from the village (cx -6..-4), so the initial ring is
+        // paid before measurement and the pinned village is not preloaded.
+        let warmup_center = ChunkPos::new(20, 0, 0);
+        let warmup_start = Instant::now();
+        let mut warmup_calls = 0usize;
+        let mut idle_polls = 0usize;
+        for _ in 0..2000 {
+            mgr.update_streaming(warmup_center, Season::Summer);
+            warmup_calls += 1;
+            if mgr.pending_gen.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+            {
+                idle_polls += 1;
+                if idle_polls >= 4 {
+                    break;
+                }
+            } else {
+                idle_polls = 0;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let warmup_elapsed = warmup_start.elapsed();
+
+        let mut samples: Vec<Duration> = Vec::with_capacity(STEPS);
+        let mut meshes_completed = 0usize;
+        for step in 1..=STEPS {
+            let center = ChunkPos::new(warmup_center.x - step as i32, 0, 0);
+            let t0 = Instant::now();
+            let (meshes, _unloaded) = mgr.update_streaming(center, Season::Summer);
+            samples.push(t0.elapsed());
+            meshes_completed += meshes.len();
+            // Roughly one frame of slack so background workers keep feeding
+            // the channels; only the main-thread call is timed.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Untimed settle pump: the crossing ends at x=-20 with the village
+        // (cx -6..-4) inside the render radius, so these frames stream the
+        // plan chunks the measured crossing merely dispatched.
+        let settle_center = ChunkPos::new(warmup_center.x - STEPS as i32, 0, 0);
+        for _ in 0..400 {
+            let (meshes, _) = mgr.update_streaming(settle_center, Season::Summer);
+            meshes_completed += meshes.len();
+            // `pending_gen` is part of the settle predicate here (unlike the
+            // catalog-less harness): the village chunks dispatched late in the
+            // crossing must be resident before the negative control counts
+            // plan cells. Light/mesh can be momentarily empty while a
+            // generation job is still in flight on the shared pool.
+            if mgr.pending_gen.is_empty()
+                && mgr.pending_light.is_empty()
+                && mgr.light_inflight.is_empty()
+                && mgr.light_rx.is_empty()
+                && mgr.pending_mesh.is_empty()
+                && mgr.dirty_mesh_queue.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Negative control: every plan cell resident in the manager must match
+        // the plan's block. A village-free run (missing catalog, dropped spawn
+        // column, wrong seed) would see plain terrain here and count ~0.
+        let plan = village_plan_with_spawn(VILLAGE_MANAGER_CELL, SEED, &catalog, spawn)
+            .expect("the pinned seed-14 village cell must plan");
+        let cs = CHUNK_SIZE as i32;
+        let plan_chunks: Vec<ChunkPos> = {
+            let mut positions = Vec::new();
+            for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+                for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                    for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        if !plan.cells_for_chunk(pos).is_empty() {
+                            positions.push(pos);
+                        }
+                    }
+                }
+            }
+            positions
+        };
+
+        // A slower machine can still be mid-ring after the fixed settle pump.
+        // Wait (untimed, bounded by wall clock) until every plan chunk is
+        // resident, so the count below describes the whole pinned village
+        // instead of whichever chunk happened to arrive first.
+        let plan_deadline = Instant::now() + Duration::from_secs(120);
+        while plan_chunks.iter().any(|pos| !mgr.chunks.contains_key(pos))
+            && Instant::now() < plan_deadline
+        {
+            let (meshes, _) = mgr.update_streaming(settle_center, Season::Summer);
+            meshes_completed += meshes.len();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let loaded_chunks = mgr.loaded_chunk_count();
+        let plan_chunk_count = plan_chunks.len();
+        let resident_plan_chunks = plan_chunks
+            .iter()
+            .filter(|pos| mgr.chunks.contains_key(*pos))
+            .count();
+        let mut village_cells = 0usize;
+        for &pos in &plan_chunks {
+            for cell in plan.cells_for_chunk(pos) {
+                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2]) == cell.block {
+                    village_cells += 1;
+                }
+            }
+        }
+
+        let mut sorted = samples.clone();
+        sorted.sort();
+        let pct = |p: f64| -> Duration {
+            let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+            sorted[idx]
+        };
+        let p50 = pct(0.50);
+        let p95 = pct(0.95);
+        let max = *sorted.last().expect("at least one measured step");
+        let mean_ms =
+            samples.iter().map(|d| d.as_secs_f64()).sum::<f64>() / samples.len() as f64 * 1000.0;
+
+        eprintln!(
+            "streaming_budget_villages: samples={} warmup_calls={} warmup={:.2}s \
+             p50={:.3}ms p95={:.3}ms max={:.3}ms mean={:.3}ms \
+             meshes={} loaded={} village_cells={} plan_chunks={} resident_plan_chunks={} \
+             targets: p95<={:.0}ms max<={:.0}ms (release, rd={})",
+            samples.len(),
+            warmup_calls,
+            warmup_elapsed.as_secs_f64(),
+            p50.as_secs_f64() * 1000.0,
+            p95.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            mean_ms,
+            meshes_completed,
+            loaded_chunks,
+            village_cells,
+            plan_chunk_count,
+            resident_plan_chunks,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
+            DEFAULT_RENDER_DISTANCE,
+        );
+
+        assert_eq!(samples.len(), STEPS, "every step must be timed");
+        assert!(
+            meshes_completed >= STEPS,
+            "only {meshes_completed} completed meshes over {STEPS} steps: the streaming \
+             pipeline did not run"
+        );
+        assert!(
+            loaded_chunks >= 1024,
+            "only {loaded_chunks} chunks resident after settling a {STEPS}-chunk crossing at \
+             rd={DEFAULT_RENDER_DISTANCE}: the harness did not exercise real streaming"
+        );
+        assert!(
+            village_cells >= CELLS_FLOOR,
+            "only {village_cells} resident cells match the pinned village plan (expected ~2962): \
+             this run measured village-free terrain, so its budget says nothing about villages"
+        );
+        assert!(
+            p95 <= P95_BUDGET,
+            "village-enabled p95 update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: \
+             {sorted:?}",
+            p95.as_secs_f64() * 1000.0,
+            P95_BUDGET.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            max <= MAX_BUDGET,
+            "village-enabled max update_streaming cost {:.3}ms exceeds the {:.0}ms MEM229 budget: \
+             {sorted:?}",
+            max.as_secs_f64() * 1000.0,
+            MAX_BUDGET.as_secs_f64() * 1000.0,
+        );
+    }
+
     /// T02: the default generation path carries no pack rules, and the
     /// installed `Arc` is the exact one read back by `worldgen_rules`.
     #[test]
@@ -3714,5 +4266,270 @@ mod tests {
             placed > 0,
             "the streamed chunks contain no cell authored by the installed ore rule"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M015/S03-T01: village context plumbing, spawn column cache and rollover
+    // -----------------------------------------------------------------------
+
+    const VILLAGE_MANAGER_SEED: u32 = 14;
+    const VILLAGE_MANAGER_CELL: VillageCell = VillageCell { x: -1, z: 0 };
+
+    /// The accepted checked-in catalog, guaranteed to load without diagnostics.
+    fn checked_in_village_catalog() -> VillageCatalog {
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(Path::new(WORLDGEN_DIR));
+        assert!(
+            diagnostics.is_empty(),
+            "village diagnostics: {diagnostics:?}"
+        );
+        assert!(!catalog.is_empty(), "checked-in village catalog must load");
+        catalog
+    }
+
+    /// The seed-14 village plan this slice pins. The spawn column is expected
+    /// to be `(0, 0)`; the assertion proves the cache matches the real search.
+    fn seed_14_village<'a>(catalog: &'a VillageCatalog) -> VillagePlan<'a> {
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        assert_eq!(spawn, (0, 0), "seed-14 spawn column is pinned");
+        village_plan_with_spawn(VILLAGE_MANAGER_CELL, VILLAGE_MANAGER_SEED, catalog, spawn)
+            .expect("the pinned seed-14 village cell must plan")
+    }
+
+    /// A chunk inside `plan`'s bounds that actually receives village cells.
+    fn first_village_chunk(plan: &VillagePlan<'_>) -> ChunkPos {
+        let cs = CHUNK_SIZE as i32;
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    if !plan.cells_for_chunk(pos).is_empty() {
+                        return pos;
+                    }
+                }
+            }
+        }
+        panic!("the pinned village plan has no emitting chunk");
+    }
+
+    fn local_cell(world: [i32; 3]) -> (usize, usize, usize) {
+        let cs = CHUNK_SIZE as i32;
+        (
+            world[0].rem_euclid(cs) as usize,
+            world[1].rem_euclid(cs) as usize,
+            world[2].rem_euclid(cs) as usize,
+        )
+    }
+
+    fn assert_chunks_identical(a: &Chunk, b: &Chunk, context: &str) {
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        a.get(lx, ly, lz),
+                        b.get(lx, ly, lz),
+                        "{context}: block differs at ({lx}, {ly}, {lz})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The helper both dispatch sites share must carry all three context fields
+    /// unchanged (and the empty context must be genuinely empty).
+    #[test]
+    fn gen_context_carries_catalog_spawn_and_rules() {
+        let catalog = checked_in_village_catalog();
+        let rules = [WorldgenRule::Ore {
+            block: BlockId::Brick,
+            replace: BlockId::Stone,
+            min_y: 4,
+            max_y: 40,
+            vein: 4,
+            attempts: 8,
+        }];
+        let spawn = (12, -34);
+
+        let ctx = gen_context(&rules, Some(&catalog), Some(spawn));
+        assert_eq!(ctx.rules.len(), 1);
+        assert!(
+            matches!(ctx.villages, Some(installed) if std::ptr::eq(installed, &catalog)),
+            "the catalog pointer must be carried, not a copy"
+        );
+        assert_eq!(ctx.spawn_column, Some(spawn));
+
+        let empty = gen_context(&[], None, None);
+        assert!(empty.rules.is_empty());
+        assert!(empty.villages.is_none());
+        assert_eq!(empty.spawn_column, None);
+    }
+
+    /// With the catalog installed, every plan cell this chunk owns must land in
+    /// the generated chunk (the last-pass village assembly actually ran).
+    #[test]
+    fn village_cells_land_in_a_generated_chunk() {
+        let catalog = checked_in_village_catalog();
+        let plan = seed_14_village(&catalog);
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let ctx = gen_context(&[], Some(&catalog), Some(spawn));
+        let cs = CHUNK_SIZE as i32;
+        let mut measured_chunks = 0usize;
+        let mut measured_cells = 0usize;
+
+        for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let cells = plan.cells_for_chunk(pos);
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let chunk = generate_chunk_with_context(
+                        pos,
+                        VILLAGE_MANAGER_SEED,
+                        Season::Summer,
+                        &ctx,
+                    );
+                    for cell in &cells {
+                        let (lx, ly, lz) = local_cell(cell.world);
+                        assert_eq!(
+                            chunk.get(lx, ly, lz),
+                            cell.block,
+                            "village cell {:?} missing from generated chunk {pos:?}",
+                            cell.world
+                        );
+                        measured_cells += 1;
+                    }
+                    measured_chunks += 1;
+                }
+            }
+        }
+
+        assert!(
+            measured_chunks > 0,
+            "no chunk in the plan bounds holds cells"
+        );
+        assert!(measured_cells > 0, "the plan emitted no village cells");
+    }
+
+    /// A spawn column inside the plan bounds trips the 64-block exclusion, so
+    /// the plan is rejected and generation is byte-identical to the legacy
+    /// seam (the negative half of the spawn-column cache).
+    #[test]
+    fn spawn_column_inside_the_plan_bounds_suppresses_village_cells() {
+        let catalog = checked_in_village_catalog();
+        let plan = seed_14_village(&catalog);
+        let pos = first_village_chunk(&plan);
+        let plan_cells = plan.cells_for_chunk(pos);
+        assert!(!plan_cells.is_empty());
+
+        let real_spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let suppressed = gen_context(&[], Some(&catalog), Some((plan.anchor[0], plan.anchor[1])));
+        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn));
+        let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Summer);
+        let rejected =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &suppressed);
+        let assembled =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &with_village);
+
+        assert_chunks_identical(
+            &rejected,
+            &legacy,
+            "spawn-excluded generation must equal the legacy seam byte-for-byte",
+        );
+        let differing = plan_cells
+            .iter()
+            .filter(|cell| {
+                let (lx, ly, lz) = local_cell(cell.world);
+                assembled.get(lx, ly, lz) != legacy.get(lx, ly, lz)
+            })
+            .count();
+        assert!(
+            differing > 0,
+            "the negative case is only meaningful if the accepted plan rewrites cells"
+        );
+    }
+
+    /// The rollover dispatch site must reuse the installed catalog: a manager
+    /// with a Summer village chunk keeps every plan cell after the wave. If the
+    /// rollover forgot the catalog, winter would regenerate plain terrain and
+    /// the cells would vanish.
+    #[test]
+    fn season_rollover_regenerates_village_cells() {
+        let _heavy = lock_heavy_streaming();
+        const WEEK: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let catalog = Arc::new(checked_in_village_catalog());
+        let plan = seed_14_village(&catalog);
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let pos = first_village_chunk(&plan);
+        let plan_cells = plan.cells_for_chunk(pos);
+        assert!(!plan_cells.is_empty());
+
+        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn));
+        let summer_chunk =
+            generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
+        for cell in &plan_cells {
+            let (lx, ly, lz) = local_cell(cell.world);
+            assert_eq!(summer_chunk.get(lx, ly, lz), cell.block);
+        }
+
+        let mut mgr =
+            WorldManager::with_seed_and_edits(2, VILLAGE_MANAGER_SEED, ChunkEditMap::default());
+        mgr.set_village_catalog(Arc::clone(&catalog), spawn);
+        mgr.insert_chunk_for_test(pos, summer_chunk);
+
+        let mut calls = 0usize;
+        while mgr.generation_season() != Season::Winter && calls < 256 {
+            mgr.update_streaming(pos, Season::Winter);
+            calls += 1;
+            std::thread::sleep(WEEK);
+        }
+        assert_eq!(
+            mgr.generation_season(),
+            Season::Winter,
+            "the rollover wave must settle on Winter ({calls} calls)"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while mgr.pending_gen.contains(&pos) && std::time::Instant::now() < deadline {
+            mgr.update_streaming(pos, Season::Winter);
+            std::thread::sleep(WEEK);
+        }
+        assert!(
+            !mgr.pending_gen.contains(&pos),
+            "the seasonal replacement for {pos:?} never arrived"
+        );
+
+        let swapped = mgr
+            .chunks
+            .get(&pos)
+            .expect("the seasonal replacement must stay resident");
+        for cell in &plan_cells {
+            let (lx, ly, lz) = local_cell(cell.world);
+            assert_eq!(
+                swapped.get(lx, ly, lz),
+                cell.block,
+                "season rollover erased village cell {:?}",
+                cell.world
+            );
+        }
+    }
+
+    /// A catalog-less context (even with a spawn column) must reproduce the
+    /// legacy generator exactly, so pre-M015 worlds keep their pinned bytes.
+    #[test]
+    fn none_catalog_generation_is_byte_identical_to_the_legacy_seam() {
+        let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
+        let ctx = gen_context(&[], None, Some(spawn));
+        for pos in [
+            ChunkPos::new(-6, 0, 3),
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(2, -1, 4),
+        ] {
+            let via_ctx =
+                generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Winter, &ctx);
+            let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Winter);
+            assert_chunks_identical(&via_ctx, &legacy, "catalog-less context");
+        }
     }
 }

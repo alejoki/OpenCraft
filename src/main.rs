@@ -52,6 +52,7 @@ use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
 };
+use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
     hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
     screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
@@ -95,6 +96,7 @@ use opencraft::ui::{
 use opencraft::world::arrow::{Arrow, ArrowOwner, ArrowState, ARROW_DAMAGE_SKELETON};
 use opencraft::world::background::{BackgroundLoad, BackgroundScene};
 use opencraft::world::block::BlockId;
+use opencraft::world::capture::capture_to_file;
 use opencraft::world::catalog::{resolve_seed_or, CatalogRow, PendingDelete};
 use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{
@@ -109,10 +111,12 @@ use opencraft::world::mob_audio::{MobAudioFrame, MobIdleGate};
 use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropReport, MobKillCause};
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
+#[cfg(test)]
+use opencraft::world::persistence::SavedMob;
 use opencraft::world::persistence::{
     load_world_from_bytes_with, load_world_from_path, load_world_from_path_with,
     save_world_to_path_with, save_world_to_path_with_config, ChunkEditMap, CliConfig,
-    PersistenceError, SavedMob, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
+    PersistenceError, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
     DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
@@ -123,8 +127,13 @@ use opencraft::world::spawning::{
     SpawnReport, SpawnWorld, DESPAWN_RADIUS, MAX_MOBS_TOTAL, PASSIVE_SURFACE_LIGHT, SAFE_RADIUS,
 };
 use opencraft::world::terrain::{
-    biome_at_seeded, generate_chunk_seeded, generate_chunk_seeded_with, ruin_at_seeded,
-    ruin_loot_chest_at, terrain_height_at_seeded, Biome, DEFAULT_WORLD_SEED, SEA_LEVEL,
+    biome_at_seeded, find_spawn_column, generate_chunk_seeded, generate_chunk_seeded_with,
+    generate_chunk_with_context, ruin_at_seeded, ruin_loot_chest_at, terrain_height_at_seeded,
+    Biome, WorldGenContext, DEFAULT_WORLD_SEED, SEA_LEVEL,
+};
+use opencraft::world::village::{
+    village_cell_at, village_plan_with_spawn, VillageBounds, VillageCatalog, VillageCell,
+    VillagePlan,
 };
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -264,6 +273,40 @@ fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
         .collect()
 }
 
+/// Render village/prefab catalog diagnostics as the same field/reason warning
+/// shape every other startup problem uses.
+///
+/// Every diagnostic is a logical `worldgen/<area>/<file>: <reason>` label, so
+/// the first `": "` separates the offending file (the warning's `field`) from
+/// the reason. A diagnostic that carries no separator still surfaces verbatim
+/// under the generic `worldgen` field rather than being dropped.
+fn village_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| match diagnostic.split_once(": ") {
+            Some((file, reason)) => SettingsWarning {
+                field: file.to_string(),
+                reason: reason.to_string(),
+            },
+            None => SettingsWarning {
+                field: "worldgen".to_string(),
+                reason: diagnostic.clone(),
+            },
+        })
+        .collect()
+}
+
+/// Re-read the authored village/prefab catalog from `root`.
+///
+/// Wraps [`VillageCatalog::load_sorted`] so `attempt_create` can pick up
+/// content edits without an app restart and tests can exercise the reload in
+/// isolation. Deliberately uncached: each call re-walks the tree, which is the
+/// point of the reload seam.
+fn reload_village_catalog(root: &Path) -> (Arc<VillageCatalog>, Vec<String>) {
+    let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+    (Arc::new(catalog), diagnostics)
+}
+
 /// Build the app's sound engine. Production opens the default output device
 /// and degrades to a silent no-op engine on any construction failure (launch
 /// is never blocked by audio). Test builds use the explicit silent
@@ -339,33 +382,9 @@ fn vsync_interval(window: &Window) -> Option<Duration> {
 /// surfaces the error where a message slot exists (no log by convention;
 /// D006/MEM009).
 fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError> {
-    let data = WorldSaveData {
-        seed: session.world.seed(),
-        time_of_day: session.clock.time_of_day,
-        day_index: session.clock.day_index,
-        season_length_days: session.season_length_days,
-        // The stored mode, not the effective one: Edit Background may be
-        // running Creative rules over a Survival world without rewriting it.
-        mode: session.save_mode,
-        player: SavedPlayerState {
-            position: session.player.position.to_array(),
-            yaw: session.player.yaw,
-            pitch: session.player.pitch,
-            fly_mode: session.player.fly_mode,
-            selected_slot: session.player.selected_slot() as u8,
-            render_distance: session.world.render_distance() as u16,
-            inventory: session.player.inventory().clone(),
-            player_grid: session.player.player_grid().clone(),
-            table_grid: session.player.table_grid().clone(),
-            survival: session.player.survival,
-        },
-        chests: session.chests.clone(),
-        // Persist the live mob records here, at the one production save site.
-        // The codec sorts by (kind, position), so the session's list order
-        // never leaks into the file layout.
-        mobs: session.mobs().iter().map(SavedMob::from).collect(),
-        chunk_edits: session.world.chunk_edits().clone(),
-    };
+    // The session owns the projection from live state to the save payload, so
+    // integration tests exercise the exact struct production writes.
+    let data = session.to_save_data();
     // S04: the one production save site writes the session's validated
     // effective config meta (schema + digest), never a re-derived or default
     // one. The meta is captured at every startup/install/apply seam.
@@ -684,6 +703,57 @@ fn try_place_selected_block(session: &mut WorldSession) -> Option<Vec<(ChunkPos,
     }
     session.player.consume_selected();
     Some(remeshed)
+}
+
+/// Places one socket marker on the looked-at block face as a Creative-only
+/// authoring action.
+///
+/// The marker is deliberately non-carryable, so this never reads or consumes
+/// the selected stack: it raycasts 8 blocks from the camera, refuses a cell
+/// that overlaps the player AABB, and writes [`BlockId::SocketMarker`] through
+/// `set_block_immediate`. Returns the remeshed chunks for the caller to
+/// upload, or `None` when the mode is not Creative, the ray misses, the cell
+/// overlaps the player, or the edit did not apply (unloaded/out-of-range).
+fn try_place_socket_marker(session: &mut WorldSession) -> Option<Vec<(ChunkPos, ChunkMesh)>> {
+    if session.player.mode() != GameMode::Creative {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    let ap = hit.adjacent_pos;
+    if session.player.aabb().intersects_block(ap.x, ap.y, ap.z) {
+        return None;
+    }
+    let remeshed = session
+        .world
+        .set_block_immediate(ap.x, ap.y, ap.z, BlockId::SocketMarker);
+    if remeshed.is_empty() {
+        return None;
+    }
+    Some(remeshed)
+}
+
+/// One prefab-capture corner: the targeted block, not the adjacent cell.
+///
+/// Creative-only, exactly like the socket-marker authoring key; Survival and a
+/// ray miss are silent because there is no capture surface to advance. The
+/// returned position is the block the crosshair is on, so a selection cage
+/// encloses the built structure rather than the air in front of it.
+fn try_capture_corner(session: &WorldSession) -> Option<IVec3> {
+    if session.player.mode() != GameMode::Creative {
+        return None;
+    }
+    let hit = raycast_voxels(
+        session.camera.position,
+        session.camera.forward(),
+        8.0,
+        |x, y, z| session.world.get_block(x, y, z),
+    )?;
+    Some(hit.block_pos)
 }
 
 /// Outcome of one production right-click world interaction.
@@ -8246,15 +8316,29 @@ struct StartupContent {
     /// and every newly created world is resolved against. It is replaced only
     /// by a pack-stack change, and then only for the NEXT load (MEM512).
     base_registry: Arc<ContentRegistry>,
+    /// The accepted village/prefab catalog (M015/S03). Loaded once from the
+    /// opt-in `worldgen/` root; an empty catalog is generation-neutral, so a
+    /// headless test that passes no root stays byte-identical.
+    village_catalog: Arc<VillageCatalog>,
+    /// The `worldgen/` root `village_catalog` was loaded from. `None` in
+    /// headless tests (never read the repository tree); production keeps the
+    /// real path so `attempt_create` can reload authored content without an
+    /// app restart.
+    worldgen_root: Option<PathBuf>,
 }
 
 impl StartupContent {
     /// Load settings, the persisted pack stack, sound overrides and the
     /// session content registry in the historical warning order.
+    ///
+    /// `worldgen_root: None` loads the empty village catalog and reads no
+    /// `worldgen/` tree, the same isolation rule as `config_dir: None`: a
+    /// headless `GameApp` test must never consume repository content.
     fn load(
         settings_path: &Path,
         packs_root: PathBuf,
         config_dir: Option<&Path>,
+        worldgen_root: Option<&Path>,
     ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
@@ -8294,6 +8378,19 @@ impl StartupContent {
         // Registry diagnostics join the same one-time warning path.
         let (base_registry, registry_report) = build_session_registry(&pack_specs);
         startup_warnings.extend(registry_warnings(&registry_report));
+        // Authored village/prefab catalog (M015/S03): fail-soft behind an
+        // explicit opt-in root. A missing or broken tree degrades to an empty
+        // catalog plus data warnings, never a launch failure; diagnostics join
+        // the one-time warning path last, keeping the settings -> config ->
+        // packs -> sounds -> registry -> worldgen order.
+        let (village_catalog, village_diagnostics) = match worldgen_root {
+            Some(root) => {
+                let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+                (Arc::new(catalog), diagnostics)
+            }
+            None => (Arc::new(VillageCatalog::default()), Vec::new()),
+        };
+        startup_warnings.extend(village_warnings(&village_diagnostics));
         StartupContent {
             settings,
             startup_warnings,
@@ -8306,6 +8403,8 @@ impl StartupContent {
             settings_path: settings_path.to_path_buf(),
             packs_root,
             base_registry,
+            village_catalog,
+            worldgen_root: worldgen_root.map(Path::to_path_buf),
         }
     }
 }
@@ -8397,6 +8496,11 @@ struct GameApp {
     /// pure `screen_labels` footer reads the screen's own status slot, so the
     /// render pass syncs this field into it before building labels.
     palette_status: Option<String>,
+    /// Prefab capture authoring state (M015/S05): the pure two-corner region
+    /// selection and bounded name prompt from [`ui::capture`]. Reset by
+    /// `enter_screen` and `on_session_installed` so no selection or prompt
+    /// survives Pause, death, or a session swap.
+    capture: PrefabCapture,
     /// Gameplay-wide transient notice (S03-T05): a chest station that vanished
     /// under the player is reported here while still Playing. Same tick-counter
     /// pattern as the screen messages, but it renders above the hotbar instead
@@ -8519,6 +8623,16 @@ struct GameApp {
     /// comparison. A Packs toggle replaces this (for the NEXT load) but never
     /// `session_registry` (MEM512/D181).
     base_registry: Arc<ContentRegistry>,
+    /// The accepted village/prefab catalog (M015/S03): installed on the
+    /// startup session and on every create/load swap. An empty catalog is
+    /// generation-neutral, so a headless test that loads no `worldgen/` root
+    /// keeps its pre-M015 witness bytes.
+    village_catalog: Arc<VillageCatalog>,
+    /// The `worldgen/` root `village_catalog` was loaded from. `None` in
+    /// headless tests (never read the repository tree); production keeps the
+    /// real path so `attempt_create` can re-read authored content without an
+    /// app restart.
+    worldgen_root: Option<PathBuf>,
     /// The CURRENT session's immutable content registry. A loaded world
     /// carries the placeholder-augmented registry it was decoded with; a fresh
     /// world carries a clone of `base_registry`. Re-adopted by
@@ -8654,6 +8768,7 @@ impl GameApp {
             &settings_path,
             Path::new(pack::PACKS_DIR).to_path_buf(),
             None,
+            None,
         );
         Self::new_with_content(cli, session, content, background_path)
     }
@@ -8681,6 +8796,8 @@ impl GameApp {
             settings_path,
             packs_root,
             base_registry,
+            village_catalog,
+            worldgen_root,
         } = content;
         // Effective gameplay rules apply before the first frame and are
         // re-applied on every session install (the S02 live-reload seam).
@@ -8691,6 +8808,10 @@ impl GameApp {
         // exactly the effective values this app runs.
         let config_meta: SaveConfigMeta = config.meta();
         session.apply_config(&config.rules(), config_meta);
+        // M015/S03: the launch catalog rides the startup session. Only the
+        // playable session gets it; the menu background is scenery and keeps
+        // none. An empty catalog (headless tests) is generation-neutral.
+        session.set_village_catalog(Arc::clone(&village_catalog));
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -8883,6 +9004,7 @@ impl GameApp {
             chest_status: None,
             palette: PaletteScreen::new(),
             palette_status: None,
+            capture: PrefabCapture::new(),
             game_message: joined_session_notices(startup_content_notice, startup_config_notice)
                 .map(|text| MenuMessage {
                     text,
@@ -8924,6 +9046,8 @@ impl GameApp {
             creator_overlay_dirty: true,
             creator_overlay_text: String::new(),
             base_registry,
+            village_catalog,
+            worldgen_root,
             pack_presentation_dirty: false,
             packs_message: None,
             time_scale: cli.time_scale,
@@ -9786,6 +9910,10 @@ impl GameApp {
             self.enter_playing();
             return;
         }
+        // A menu entry retires any prefab capture selection or name prompt
+        // (M015/S05): a selection belongs to the Playing frame that made it,
+        // and a prompt must never survive Pause or death into another screen.
+        self.capture.reset();
         // Leaving the main menu retires its transient message (the
         // S03-T03 Save-and-Quit failure note described the main-menu
         // state the player navigated away from); navigating to any other
@@ -9995,6 +10123,11 @@ impl GameApp {
         session
             .world
             .set_render_distance(self.settings.render_distance);
+        // M015/S03: every create/load swap installs the app's catalog on the
+        // incoming session. Edit Background must NOT get villages, and it
+        // routes through the shared reset without this call, so installing
+        // here (not in `on_session_installed`) keeps it village-free.
+        session.set_village_catalog(Arc::clone(&self.village_catalog));
         self.session = session;
         self.on_session_installed();
     }
@@ -10056,6 +10189,9 @@ impl GameApp {
         self.chest_status = None;
         self.palette.close();
         self.palette_status = None;
+        // A capture selection and its prompt belong to the installed session;
+        // a swap must never leave a cage or typed name pointing at old blocks.
+        self.capture.reset();
         self.game_message = None;
         // The installed session owns the registry every save names content
         // through: a loaded world keeps its placeholder-augmented registry, a
@@ -10085,6 +10221,81 @@ impl GameApp {
         self.survival_demo = None;
         self.content_demo = None;
         self.combat_demo = None;
+    }
+
+    /// Save the prompt's current region as one prefab under `worldgen/`.
+    ///
+    /// The region and name are cloned out of the pure capture state before the
+    /// write, so a rejected save keeps the selection on screen and the typed
+    /// text in the prompt for a retry. A session without a worldgen root can
+    /// never guess a repository path: it posts the one readable unavailable
+    /// message and leaves the prompt active without touching the filesystem.
+    /// Only a successful write resets the capture state and posts the saved
+    /// path; nothing here saves the world, settings, background or config.
+    fn submit_capture(&mut self) {
+        if !self.capture.is_naming() {
+            return;
+        }
+        let Some((min, max)) = self.capture.selection_box() else {
+            return;
+        };
+        let name = self.capture.naming_value().to_owned();
+        let Some(root) = self.worldgen_root.clone() else {
+            self.game_message = Some(MenuMessage {
+                text: "capture unavailable: no worldgen directory configured".to_string(),
+                ticks_left: menu::MESSAGE_TICKS,
+            });
+            return;
+        };
+        match capture_to_file(&root, &name, &self.session.world, min, max) {
+            Ok((_path, _prefab)) => {
+                self.capture.reset();
+                self.game_message = Some(MenuMessage {
+                    text: format!("saved prefab '{name}' to worldgen/prefabs/{name}.toml"),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+            Err(error) => {
+                // Keep the prompt intact: the player can fix an oversize
+                // selection, a bad name, or a collision and press Enter again.
+                self.game_message = Some(MenuMessage {
+                    text: error.to_string(),
+                    ticks_left: menu::MESSAGE_TICKS,
+                });
+            }
+        }
+    }
+
+    /// One `P` press of the prefab authoring flow (M015/S05).
+    ///
+    /// Creative selects the targeted block as corner A; the second press
+    /// completes the region and opens the bounded name prompt. Survival and a
+    /// ray miss are silent.
+    ///
+    /// Opening the prompt clears every live gameplay hold. The naming gate
+    /// only consumes *future* presses and releases, so a direction flag or
+    /// mouse button held at the instant the prompt opens would keep the player
+    /// moving, mining, eating, or drawing behind it — and its release would be
+    /// swallowed by the gate, leaving the hold stuck past Enter/Escape too.
+    /// The set below is the one every panel boundary clears (`PanelHolds`);
+    /// melee stays untouched by design, matching `reset_panel_holds` (a swing
+    /// cooldown is a timer, not a hold).
+    fn press_capture_corner(&mut self) {
+        let Some(corner) = try_capture_corner(&self.session) else {
+            return;
+        };
+        if let CornerOutcome::Ready(_) = self.capture.press_corner(corner) {
+            if self.capture.begin_naming(self.worldgen_root.as_deref()) {
+                // A stale transient notice must not accompany the fresh
+                // prompt; only a failed save adds one.
+                self.game_message = None;
+                self.input.reset();
+                self.left_mouse_held = false;
+                self.right_mouse_held = false;
+                reset_panel_holds(&mut self.mining, &mut self.eating, &mut self.bow);
+                self.inventory_drag = None;
+            }
+        }
     }
 
     /// Enter the persisted menu background as the active edit session.
@@ -10459,6 +10670,20 @@ impl GameApp {
                 return;
             }
         };
+        // M015/S03: authored content is re-read on every create when
+        // production installed a `worldgen/` root, so a content edit lands
+        // without an app restart. A `None` root (headless tests) skips the
+        // reload entirely, keeping the suite isolated from the repository
+        // tree. Broken content degrades to one inline warning plus an empty
+        // catalog; it never blocks world creation.
+        if let Some(root) = self.worldgen_root.as_deref() {
+            let (catalog, diagnostics) = reload_village_catalog(root);
+            self.village_catalog = catalog;
+            if !diagnostics.is_empty() {
+                self.new_game
+                    .set_message(format!("worldgen: {}", diagnostics.join("; ")));
+            }
+        }
         // The New Game row owns the season length (S02-T04) and the game mode
         // (S08-T01 T05): the screen's cycler values, defaulting to one game
         // day per season and Survival.
@@ -11052,6 +11277,22 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
 
+                    // Prefab capture prompt owns the keyboard while naming
+                    // (M015/S05): every press and release is consumed so no
+                    // inventory, chest, palette, digit, movement, or Escape
+                    // binding can fire through the typed name. This gate sits
+                    // before the panel gates so a panel can never swallow it.
+                    if self.capture.is_naming() {
+                        if pressed {
+                            match self.capture.key_action(code, event.text.as_deref()) {
+                                CaptureKey::Submit => self.submit_capture(),
+                                CaptureKey::Cancel => self.capture.reset(),
+                                CaptureKey::Consumed | CaptureKey::PassThrough => {}
+                            }
+                        }
+                        return;
+                    }
+
                     // Inventory panel owns the keyboard while open (S03-T03):
                     // every key and release is consumed, so no digit, movement,
                     // fly, save, or Escape-to-pause binding can fire through
@@ -11245,6 +11486,21 @@ impl ApplicationHandler for GameApp {
                                 self.creator_overlay_dirty = true;
                             }
                         }
+                        // Prefab capture authoring (M015/S05): a documented,
+                        // non-rebindable utility key like C/M/F5/F6. Creative
+                        // selects the targeted block as corner A; the second
+                        // press completes the region and opens the name
+                        // prompt. Survival and a ray miss are silent.
+                        KeyCode::KeyP if pressed && !event.repeat => {
+                            self.press_capture_corner();
+                        }
+                        // Escape while a capture selection exists cancels the
+                        // capture and writes nothing; it must not also pause.
+                        KeyCode::Escape
+                            if pressed && !event.repeat && self.capture.has_corners() =>
+                        {
+                            self.capture.reset();
+                        }
                         KeyCode::Escape if pressed && !event.repeat => {
                             // Escape in-game opens the Pause screen (S02-T02:
                             // replaces the old direct settings-menu open —
@@ -11306,6 +11562,23 @@ impl ApplicationHandler for GameApp {
                                 );
                             }
                         }
+                        // Socket-marker authoring (S04-T04): a documented,
+                        // non-rebindable utility key like C/F5/F6. Creative
+                        // places one marker on the looked-at face without
+                        // touching the selected stack; Survival stays silent.
+                        KeyCode::KeyM if pressed && !event.repeat => {
+                            if let Some(remeshed) = try_place_socket_marker(&mut self.session) {
+                                self.audio.play(SoundSlot::Place, self.settings.volume);
+                                for (cpos, mesh) in remeshed {
+                                    gpu.render_store.upload_mesh(
+                                        &gpu.ctx.device,
+                                        &gpu.renderer.chunk_bind_group_layout,
+                                        cpos,
+                                        &mesh,
+                                    );
+                                }
+                            }
+                        }
                         // Rebindable gameplay keys (S04-T03): press sets the
                         // InputState flag, release clears it — both
                         // transitions route through the loaded keybind map
@@ -11328,6 +11601,11 @@ impl ApplicationHandler for GameApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Prefab capture prompt owns the wheel while naming (M015/S05):
+                // no hotbar or palette scroll may change the pending region.
+                if self.capture.is_naming() {
+                    return;
+                }
                 // Route-before-gameplay: while a screen is open the wheel is
                 // consumed — the hotbar is gameplay state and no screen has
                 // a scroll action in this slice. Both gameplay panels consume
@@ -11373,6 +11651,20 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05): clear all pointer holds and partial progress so
+                // no release can finish a mining, eating, bow or drag gesture
+                // that started before the prompt.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Palette release (S07-T03): the screen never transfers a
                 // stack on release, but clearing every hold keeps a press
                 // that started outside from surviving the close.
@@ -11481,6 +11773,19 @@ impl ApplicationHandler for GameApp {
                 button: MouseButton::Right,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05): a release must not fire a charged bow, finish a
+                // meal, or leave a hold live behind the prompt.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Palette release (S07-T03): consume before `release_bow`, so
                 // a right press that never armed a draw cannot fire an arrow
                 // out of the palette.
@@ -11528,6 +11833,21 @@ impl ApplicationHandler for GameApp {
                 button,
                 ..
             } => {
+                // Prefab capture prompt owns every mouse button while naming
+                // (M015/S05). This gate precedes the screen, palette, inventory,
+                // chest and gameplay press routing, so no click can mine, place,
+                // eat, draw a bow, open a station, or edit the world behind the
+                // prompt; holds and drag state are cleared like a panel gate.
+                if self.capture.is_naming() {
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    self.mining.reset();
+                    self.eating.reset();
+                    self.bow.reset();
+                    self.melee.reset();
+                    self.inventory_drag = None;
+                    return;
+                }
                 // Route-before-gameplay (S02-T02): while any screen is open
                 // the cursor is released and every click belongs to that
                 // screen — the settings screen through its existing
@@ -12722,13 +13042,23 @@ impl ApplicationHandler for GameApp {
                 // through the existing menu text buffer and the same UI pass —
                 // no new pipeline and no logging (D006/MEM009).
                 if active_screen == LifecycleScreen::Playing {
-                    if let Some(message) = self.game_message.as_ref() {
+                    // Prefab capture prompt (M015/S05) takes precedence over
+                    // the transient notice: the editable name line must never
+                    // be hidden by an unrelated message while the prompt owns
+                    // the keyboard. Both share the one measured line.
+                    let notice_text = capture_notice_line(
+                        self.capture.prompt_line().as_deref(),
+                        self.game_message
+                            .as_ref()
+                            .map(|message| message.text.as_str()),
+                    );
+                    if let Some(text) = notice_text {
                         let (surface_w, surface_h) = (gpu.ctx.config.width, gpu.ctx.config.height);
                         gpu.menu_text.update(
                             &mut gpu.ui.font_system,
                             surface_w as f32,
                             surface_h as f32,
-                            &message.text,
+                            &text,
                         );
                         let measured = gpu.menu_text.measured_width();
                         // When the selected-name strip is on screen, sit the
@@ -13271,6 +13601,7 @@ impl ApplicationHandler for GameApp {
                             camera: vista_camera,
                             render_distance: self.background.world.render_distance(),
                             target_block: None,
+                            selection_box: None,
                             selected_slot: self.session.player.selected_slot(),
                         },
                         FramePresentation {
@@ -13320,6 +13651,7 @@ impl ApplicationHandler for GameApp {
                             camera: &self.session.camera,
                             render_distance: self.session.world.render_distance(),
                             target_block,
+                            selection_box: self.capture.selection_box(),
                             selected_slot: self.session.player.selected_slot(),
                         },
                         FramePresentation {
@@ -13421,6 +13753,12 @@ impl ApplicationHandler for GameApp {
             // physical-pixel cursor position, or None once it leaves the
             // window. winit 0.30 delivers PhysicalPosition<f64>.
             WindowEvent::CursorMoved { position, .. } => {
+                // Prefab capture prompt freezes pointer movement (M015/S05):
+                // looking or clicking must not alter the pending region. The
+                // actual camera look is gated in `device_event`.
+                if self.capture.is_naming() {
+                    return;
+                }
                 self.cursor_pos = Some((position.x as f32, position.y as f32));
             }
             WindowEvent::CursorLeft { .. } => {
@@ -13437,6 +13775,11 @@ impl ApplicationHandler for GameApp {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
+            // Prefab capture prompt owns the mouse while naming (M015/S05):
+            // camera look cannot continue behind the prompt.
+            if self.capture.is_naming() {
+                return;
+            }
             if self.cursor_grabbed {
                 // Settings-driven sensitivity (S04-T04): the loaded value,
                 // already clamped at load; menu adjustments clamp via the
@@ -15022,6 +15365,1072 @@ fn worldgen_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool) {
     }
 }
 
+/// Seed pinned for the `--demo-village` digest.
+///
+/// A plain constant (never a clock or `random_seed`) so the digest is a pure
+/// function of the checked-in `worldgen/` tree plus this seed.
+const VILLAGE_DEMO_SEED: u32 = 424_242;
+
+/// Seed pinned for the `--demo-capture` digest.
+///
+/// A plain constant (never a clock or `random_seed`). The demo builds its own
+/// uniform-air chunk and writes a fixed house into it, so the seed only pins
+/// the manager identity and never contributes terrain.
+const CAPTURE_DEMO_SEED: u32 = 4;
+
+/// The fixed inclusive world corners of the `--demo-capture` house.
+const CAPTURE_DEMO_MIN: IVec3 = IVec3::new(0, 40, 0);
+const CAPTURE_DEMO_MAX: IVec3 = IVec3::new(4, 43, 4);
+
+/// Seed pinned for the `--demo-capture` **village placement** leg.
+///
+/// Reuses the exact `--demo-village` seed so known-good plains sites exist for
+/// the captured prefab. Plain constant, never a clock or `random_seed`, so the
+/// placement cell and the road digest are a pure function of the fixture.
+const CAPTURE_DEMO_VILLAGE_SEED: u32 = VILLAGE_DEMO_SEED;
+
+/// Seed pinned for the `--demo-village` **session** leg.
+///
+/// Seed 14 is the pinned production seed whose village cell `(-1, 0)` lies
+/// inside the default spawn ring, so a real `WorldSession` streams it without
+/// teleporting or changing the render distance. Plain constant, never a clock
+/// or `random_seed`, so the session line stays deterministic.
+const VILLAGE_SESSION_SEED: u32 = 14;
+
+/// Inclusive placement-count band a demo village must satisfy.
+const VILLAGE_DEMO_MIN_PREFABS: usize = 10;
+const VILLAGE_DEMO_MAX_PREFABS: usize = 20;
+
+/// FNV-1a 64 offset basis, matching the catalog fingerprint.
+const VILLAGE_DEMO_FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a 64 step.
+fn village_demo_fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Fixed integer order hash for the `order` leg.
+///
+/// The demo only needs a fixed permutation; the hash is never a correctness
+/// input, so a plain FNV chain over the chunk triple is enough.
+fn village_demo_order_hash(pos: ChunkPos) -> u64 {
+    let mut hash = VILLAGE_DEMO_FNV_OFFSET_BASIS;
+    for value in [pos.x, pos.y, pos.z] {
+        hash = village_demo_fnv1a(hash, &(value as i64).to_le_bytes());
+    }
+    hash
+}
+
+/// Whether two chunks hold the same block in every cell.
+fn village_demo_chunks_equal(a: &Chunk, b: &Chunk) -> bool {
+    (0..CHUNK_SIZE)
+        .all(|y| (0..CHUNK_SIZE).all(|z| (0..CHUNK_SIZE).all(|x| a.get(x, y, z) == b.get(x, y, z))))
+}
+
+/// FNV-1a 64 over the plan's layout: placements, socket links and road cells.
+///
+/// Integer-only and field-ordered, so it is machine-independent. Prefab names
+/// use their bytes; every integer uses little-endian bytes.
+fn village_demo_layout_digest(plan: &VillagePlan<'_>) -> u64 {
+    let mut hash = VILLAGE_DEMO_FNV_OFFSET_BASIS;
+    for placement in &plan.placements {
+        hash = village_demo_fnv1a(hash, placement.prefab.name.as_bytes());
+        hash = village_demo_fnv1a(hash, &[placement.rotation.quarter_turns()]);
+        hash = village_demo_fnv1a(hash, &placement.origin_x.to_le_bytes());
+        hash = village_demo_fnv1a(hash, &placement.origin_z.to_le_bytes());
+        hash = village_demo_fnv1a(hash, &placement.base_y.to_le_bytes());
+    }
+    for link in &plan.socket_links {
+        for value in [
+            link.parent,
+            link.parent_socket,
+            link.child,
+            link.child_socket,
+        ] {
+            hash = village_demo_fnv1a(hash, &(value as u32).to_le_bytes());
+        }
+    }
+    for road in &plan.road_cells {
+        for value in road.world {
+            hash = village_demo_fnv1a(hash, &value.to_le_bytes());
+        }
+    }
+    hash
+}
+
+/// Chunk window of a plan: the plan's exact chunk AABB expanded by one chunk in
+/// x and z, over every chunk layer its y range touches.
+///
+/// The one-chunk border is what the `outside` leg generates: those chunks hold
+/// no village cell by construction, so they must stay byte-identical to the
+/// legacy generator.
+fn village_demo_window(bounds: &VillageBounds) -> Vec<ChunkPos> {
+    let size = CHUNK_SIZE as i32;
+    let cx_min = bounds.min_x.div_euclid(size) - 1;
+    let cx_max = bounds.max_x.div_euclid(size) + 1;
+    let cz_min = bounds.min_z.div_euclid(size) - 1;
+    let cz_max = bounds.max_z.div_euclid(size) + 1;
+    let cy_min = bounds.min_y.div_euclid(size);
+    let cy_max = bounds.max_y.div_euclid(size);
+    let mut positions = Vec::new();
+    for cz in cz_min..=cz_max {
+        for cx in cx_min..=cx_max {
+            for cy in cy_min..=cy_max {
+                positions.push(ChunkPos::new(cx, cy, cz));
+            }
+        }
+    }
+    positions
+}
+
+/// The production generation seam with the accepted catalog and a known spawn.
+fn village_demo_generate(
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn: (i32, i32),
+) -> Chunk {
+    generate_chunk_with_context(
+        pos,
+        seed,
+        Season::Summer,
+        &WorldGenContext {
+            rules: &[],
+            villages: Some(catalog),
+            spawn_column: Some(spawn),
+        },
+    )
+}
+
+/// Read one world cell out of a generated-chunk map.
+fn village_demo_cell(
+    chunks: &BTreeMap<(i32, i32, i32), Chunk>,
+    world: [i32; 3],
+) -> Option<BlockId> {
+    let (pos, (lx, ly, lz)) = world_to_chunk_and_local(world[0], world[1], world[2]);
+    chunks
+        .get(&(pos.x, pos.y, pos.z))
+        .map(|chunk| chunk.get(lx, ly, lz))
+}
+
+/// First `--demo-capture` village plan in a fixed cell window.
+///
+/// Scans row-major (`cz` outer, `cx` inner) so the selected cell is a pure
+/// function of `(seed, catalog)`. A plan qualifies only when it is the captured
+/// demo definition with at least two placements and one committed socket link,
+/// which is exactly what the road leg needs to prove placement *and* linkage.
+fn capture_demo_village_plan<'a>(
+    range: std::ops::RangeInclusive<i32>,
+    catalog: &'a VillageCatalog,
+    spawn: (i32, i32),
+) -> Option<VillagePlan<'a>> {
+    for cz in range.clone() {
+        for cx in range.clone() {
+            let cell = VillageCell { x: cx, z: cz };
+            let Some(plan) =
+                village_plan_with_spawn(cell, CAPTURE_DEMO_VILLAGE_SEED, catalog, spawn)
+            else {
+                continue;
+            };
+            if plan.definition == "capture_demo"
+                && plan.placement_count() >= 2
+                && plan.socket_link_count() >= 1
+            {
+                return Some(plan);
+            }
+        }
+    }
+    None
+}
+
+/// Build the deterministic `--demo-village` digest.
+///
+/// Loads only `worldgen/` (fail-soft, exactly like `--validate-worldgen`) and
+/// exercises the production plan/assembly seams over a pinned cell window. It
+/// never reads settings, packs, a registry, a save, a window, the GPU or the
+/// audio engine, and it writes nothing. The caller exits non-zero when a leg
+/// fails.
+fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // (a) Catalog leg: a second load must be byte-identical (fail-soft loader
+    // determinism) and the accepted counts must stay internally consistent.
+    let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
+    for diagnostic in &diagnostics {
+        lines.push(format!("village_demo: warning {diagnostic}"));
+    }
+    let (reloaded, reloaded_diagnostics) = VillageCatalog::load_sorted(root);
+    let prefab_count = catalog.prefabs().names().count();
+    let catalog_consistent = catalog.len() == catalog.names().count()
+        && prefab_count == reloaded.prefabs().names().count()
+        && catalog.len() == reloaded.len()
+        && catalog.fingerprint() == reloaded.fingerprint()
+        && diagnostics == reloaded_diagnostics;
+    lines.push(format!(
+        "village_demo: leg=catalog prefabs={} villages={} diagnostics={} fingerprint=0x{:016x}",
+        prefab_count,
+        catalog.len(),
+        diagnostics.len(),
+        catalog.fingerprint(),
+    ));
+    if !catalog_consistent {
+        failed.get_or_insert("catalog");
+    }
+
+    // The spawn column is computed once and reused by every context, so a
+    // plan generated here matches production exactly.
+    let spawn = find_spawn_column(VILLAGE_DEMO_SEED);
+
+    // (b) Context leg: the empty-rule context must be the faithful legacy
+    // wrapper (`generate_chunk_seeded`), so `generate_chunk_with_context` is a
+    // pure superset of the pre-M015 seam for one representative chunk.
+    let sample = ChunkPos::new(0, 1, 0);
+    let legacy_sample = generate_chunk_seeded(sample, VILLAGE_DEMO_SEED, Season::Summer);
+    let default_sample = generate_chunk_with_context(
+        sample,
+        VILLAGE_DEMO_SEED,
+        Season::Summer,
+        &WorldGenContext {
+            rules: &[],
+            villages: None,
+            spawn_column: Some(spawn),
+        },
+    );
+    let context_ok = village_demo_chunks_equal(&legacy_sample, &default_sample);
+    lines.push(format!(
+        "village_demo: leg=context rules=0 villages={}",
+        catalog.len(),
+    ));
+    if !context_ok {
+        failed.get_or_insert("context");
+    }
+
+    // (c) Site leg: scan the fixed window in row-major order and take the first
+    // cell whose plan fits the 10..=20 band.
+    let mut chosen: Option<VillagePlan<'_>> = None;
+    'scan: for cz in -6..=6 {
+        for cx in -6..=6 {
+            let cell = VillageCell { x: cx, z: cz };
+            if let Some(plan) = village_plan_with_spawn(cell, VILLAGE_DEMO_SEED, &catalog, spawn) {
+                if (VILLAGE_DEMO_MIN_PREFABS..=VILLAGE_DEMO_MAX_PREFABS)
+                    .contains(&plan.placement_count())
+                {
+                    chosen = Some(plan);
+                    break 'scan;
+                }
+            }
+        }
+    }
+    match &chosen {
+        Some(plan) => lines.push(format!(
+            "village_demo: leg=site cell={},{} anchor={},{} definition={} prefabs={} socket_links={} roads={} unmatched={}",
+            plan.cell.x,
+            plan.cell.z,
+            plan.anchor[0],
+            plan.anchor[1],
+            plan.definition,
+            plan.placement_count(),
+            plan.socket_link_count(),
+            plan.road_cell_count(),
+            plan.unmatched_socket_count(),
+        )),
+        None => lines.push(
+            "village_demo: leg=site cell=none anchor=none definition=none prefabs=0 socket_links=0 roads=0 unmatched=0"
+                .to_string(),
+        ),
+    }
+    if chosen.is_none() {
+        failed.get_or_insert("site");
+    }
+
+    // (d) Counts leg: the chosen plan stays inside the authored band.
+    let in_range = chosen.as_ref().is_some_and(|plan| {
+        (VILLAGE_DEMO_MIN_PREFABS..=VILLAGE_DEMO_MAX_PREFABS).contains(&plan.placement_count())
+    });
+    lines.push(format!(
+        "village_demo: leg=counts in_range={} min={} max={}",
+        in_range, VILLAGE_DEMO_MIN_PREFABS, VILLAGE_DEMO_MAX_PREFABS,
+    ));
+    if !in_range {
+        failed.get_or_insert("counts");
+    }
+
+    // (e) Layout leg: pinned integer digest of the plan itself.
+    let layout_digest = chosen
+        .as_ref()
+        .map_or(0, |plan| village_demo_layout_digest(plan));
+    lines.push(format!(
+        "village_demo: leg=layout digest=0x{layout_digest:016x}",
+    ));
+    if chosen.is_none() {
+        failed.get_or_insert("layout");
+    }
+
+    // The remaining legs need a plan's exact bounds. On a broken tree they
+    // report false while `failed` keeps the first real failure (`site`).
+    let mut order_identical = false;
+    let mut single_chunk_identical = false;
+    let mut empty_catalog_identical = false;
+    let mut outside_identical = false;
+    let mut foundations = false;
+    let mut no_overlap = false;
+    let mut no_orphan_road = false;
+    let mut sockets_linked = false;
+
+    if let Some(plan) = &chosen {
+        let window = village_demo_window(&plan.bounds);
+        let baseline: BTreeMap<(i32, i32, i32), Chunk> = window
+            .iter()
+            .map(|&pos| {
+                (
+                    (pos.x, pos.y, pos.z),
+                    village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn),
+                )
+            })
+            .collect();
+        let baseline_chunk = |pos: ChunkPos| baseline.get(&(pos.x, pos.y, pos.z));
+
+        // (f) Order leg: hash-sorted generation must reproduce the row-major
+        // region result chunk for chunk.
+        let mut shuffled = window.clone();
+        shuffled.sort_by_key(|pos| (village_demo_order_hash(*pos), pos.y, pos.x, pos.z));
+        order_identical = shuffled.iter().all(|&pos| {
+            let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
+            baseline_chunk(pos)
+                .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
+        });
+        lines.push(format!(
+            "village_demo: leg=order identical={order_identical}"
+        ));
+        if !order_identical {
+            failed.get_or_insert("order");
+        }
+
+        // (g) Single-chunk leg: each chunk generated alone in a fresh call must
+        // match the region result (no cross-chunk state).
+        single_chunk_identical = window.iter().all(|&pos| {
+            let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
+            baseline_chunk(pos)
+                .is_some_and(|reference| village_demo_chunks_equal(&chunk, reference))
+        });
+        lines.push(format!(
+            "village_demo: leg=single_chunk identical={single_chunk_identical}"
+        ));
+        if !single_chunk_identical {
+            failed.get_or_insert("single_chunk");
+        }
+
+        // (h) Empty-catalog leg: both `Some(empty)` and `None` must reproduce
+        // `generate_chunk_seeded_with(..., &[])` byte for byte.
+        let empty_catalog = VillageCatalog::default();
+        empty_catalog_identical = window.iter().all(|&pos| {
+            let legacy = generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
+            let via_empty = generate_chunk_with_context(
+                pos,
+                VILLAGE_DEMO_SEED,
+                Season::Summer,
+                &WorldGenContext {
+                    rules: &[],
+                    villages: Some(&empty_catalog),
+                    spawn_column: Some(spawn),
+                },
+            );
+            let via_none = generate_chunk_with_context(
+                pos,
+                VILLAGE_DEMO_SEED,
+                Season::Summer,
+                &WorldGenContext {
+                    rules: &[],
+                    villages: None,
+                    spawn_column: Some(spawn),
+                },
+            );
+            village_demo_chunks_equal(&legacy, &via_empty)
+                && village_demo_chunks_equal(&legacy, &via_none)
+        });
+        lines.push(format!(
+            "village_demo: leg=empty_catalog identical={empty_catalog_identical}"
+        ));
+        if !empty_catalog_identical {
+            failed.get_or_insert("empty_catalog");
+        }
+
+        // (i) Outside leg: chunks on the one-chunk border of the plan's chunk
+        // AABB hold no village cell and must stay byte-identical to legacy.
+        let size = CHUNK_SIZE as i32;
+        let cx_min = plan.bounds.min_x.div_euclid(size);
+        let cx_max = plan.bounds.max_x.div_euclid(size);
+        let cz_min = plan.bounds.min_z.div_euclid(size);
+        let cz_max = plan.bounds.max_z.div_euclid(size);
+        outside_identical = window
+            .iter()
+            .filter(|pos| pos.x < cx_min || pos.x > cx_max || pos.z < cz_min || pos.z > cz_max)
+            // A border chunk can belong to an adjacent cell that has its own
+            // legitimate village. Only compare chunks the chosen plan could
+            // never touch: our own cell (outside the plan's chunk AABB, so no
+            // cells are emitted) or chunks the catalog gate rejects outright.
+            .filter(|pos| {
+                let world_x = pos.x * CHUNK_SIZE as i32;
+                let world_z = pos.z * CHUNK_SIZE as i32;
+                village_cell_at(world_x, world_z) == plan.cell
+                    || !catalog.chunk_may_hold_village(**pos, VILLAGE_DEMO_SEED)
+            })
+            .all(|&pos| {
+                let legacy =
+                    generate_chunk_seeded_with(pos, VILLAGE_DEMO_SEED, Season::Summer, &[]);
+                let chunk = village_demo_generate(pos, VILLAGE_DEMO_SEED, &catalog, spawn);
+                village_demo_chunks_equal(&legacy, &chunk)
+            });
+        lines.push(format!(
+            "village_demo: leg=outside identical={outside_identical}"
+        ));
+        if !outside_identical {
+            failed.get_or_insert("outside");
+        }
+
+        // (j) Fit leg: foundations, AABB disjointness, road/link ownership and
+        // socket-to-road geometry, all against the generated region.
+        foundations = true;
+        for placement in &plan.placements {
+            for column in &placement.columns {
+                for y in (column.terrain_y + 1)..placement.base_y {
+                    let cell = village_demo_cell(&baseline, [column.world_x, y, column.world_z]);
+                    if cell != Some(BlockId::Dirt) {
+                        foundations = false;
+                    }
+                }
+            }
+        }
+
+        no_overlap = true;
+        for (index, left) in plan.placements.iter().enumerate() {
+            for right in plan.placements.iter().skip(index + 1) {
+                let overlaps = left.footprint[0] <= right.footprint[1]
+                    && left.footprint[1] >= right.footprint[0]
+                    && left.footprint[2] <= right.footprint[3]
+                    && left.footprint[3] >= right.footprint[2];
+                if overlaps {
+                    no_overlap = false;
+                }
+            }
+        }
+
+        let mut road_hits = vec![0u32; plan.road_cells.len()];
+        no_orphan_road = true;
+        for link in &plan.socket_links {
+            if link.road.is_empty() {
+                no_orphan_road = false;
+            }
+            if link.parent >= plan.placements.len()
+                || link.child >= plan.placements.len()
+                || link.parent_socket >= plan.placements[link.parent].sockets.len()
+                || link.child_socket >= plan.placements[link.child].sockets.len()
+            {
+                no_orphan_road = false;
+                continue;
+            }
+            for &index in &link.road {
+                match road_hits.get_mut(index) {
+                    Some(hits) => *hits += 1,
+                    None => no_orphan_road = false,
+                }
+            }
+        }
+        if road_hits.iter().any(|&hits| hits != 1) {
+            no_orphan_road = false;
+        }
+
+        sockets_linked = true;
+        for link in &plan.socket_links {
+            let (Some(parent), Some(child)) = (
+                plan.placements.get(link.parent),
+                plan.placements.get(link.child),
+            ) else {
+                sockets_linked = false;
+                continue;
+            };
+            let (Some(parent_socket), Some(child_socket)) = (
+                parent.sockets.get(link.parent_socket),
+                child.sockets.get(link.child_socket),
+            ) else {
+                sockets_linked = false;
+                continue;
+            };
+            if !parent_socket.linked || !child_socket.linked {
+                sockets_linked = false;
+            }
+            let dx = (parent_socket.position[0] - child_socket.position[0]).abs();
+            let dz = (parent_socket.position[2] - child_socket.position[2]).abs();
+            let manhattan = dx + dz;
+            // A road excludes both socket cells, so it is exactly one cell
+            // shorter than the Manhattan socket separation.
+            if manhattan < 1 || link.road.len() as i32 != manhattan - 1 {
+                sockets_linked = false;
+            }
+            let mut path_ok = true;
+            for pair in link.road.windows(2) {
+                let a = plan.road_cells[pair[0]].world;
+                let b = plan.road_cells[pair[1]].world;
+                let step = (a[0] - b[0]).abs() + (a[2] - b[2]).abs();
+                if step != 1 {
+                    path_ok = false;
+                }
+            }
+            if let (Some(&first), Some(&last)) = (link.road.first(), link.road.last()) {
+                let first = plan.road_cells[first].world;
+                let last = plan.road_cells[last].world;
+                let near_parent = (first[0] - parent_socket.position[0]).abs()
+                    + (first[2] - parent_socket.position[2]).abs();
+                let near_child = (last[0] - child_socket.position[0]).abs()
+                    + (last[2] - child_socket.position[2]).abs();
+                // The endpoint must be walkably adjacent in 3D, not just in
+                // XZ: a road that drifts vertically away from the socket is a
+                // floating or buried connection even when the columns line up.
+                // A socket marks the authored block at grid y 1; the road
+                // surface is the prefab's grid y 0 foundation layer, one below
+                // the socket's world Y, so that is the grade to meet.
+                let grade_parent = (first[1] - (parent_socket.position[1] - 1)).abs() <= 1;
+                let grade_child = (last[1] - (child_socket.position[1] - 1)).abs() <= 1;
+                if near_parent != 1 || near_child != 1 || !grade_parent || !grade_child {
+                    path_ok = false;
+                }
+            }
+            if !path_ok {
+                sockets_linked = false;
+            }
+        }
+        lines.push(format!(
+            "village_demo: leg=fit foundations={foundations} no_overlap={no_overlap} no_orphan_road={no_orphan_road} sockets_linked={sockets_linked}"
+        ));
+        if !foundations || !no_overlap || !no_orphan_road || !sockets_linked {
+            failed.get_or_insert("fit");
+        }
+    } else {
+        lines.push(format!(
+            "village_demo: leg=order identical={order_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=single_chunk identical={single_chunk_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=empty_catalog identical={empty_catalog_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=outside identical={outside_identical}"
+        ));
+        lines.push(format!(
+            "village_demo: leg=fit foundations={foundations} no_overlap={no_overlap} no_orphan_road={no_orphan_road} sockets_linked={sockets_linked}"
+        ));
+    }
+
+    // (k) Session leg: a real `WorldSession` on the pinned production seed must
+    // stream the village through `WorldManager::update_streaming` (the same
+    // dispatch a playing client uses) and reproduce the plan block for block.
+    // The session is never saved, so no file or directory is created.
+    let (session_spawn_x, session_spawn_z) = find_spawn_column(VILLAGE_SESSION_SEED);
+    let session_plan = village_plan_with_spawn(
+        VillageCell { x: -1, z: 0 },
+        VILLAGE_SESSION_SEED,
+        &catalog,
+        (session_spawn_x, session_spawn_z),
+    );
+    let mut session_chunks: Vec<ChunkPos> = Vec::new();
+    let mut session_cells = 0usize;
+    let session_identical = match &session_plan {
+        Some(plan) => {
+            let size = CHUNK_SIZE as i32;
+            for cz in plan.bounds.min_z.div_euclid(size)..=plan.bounds.max_z.div_euclid(size) {
+                for cy in plan.bounds.min_y.div_euclid(size)..=plan.bounds.max_y.div_euclid(size) {
+                    for cx in
+                        plan.bounds.min_x.div_euclid(size)..=plan.bounds.max_x.div_euclid(size)
+                    {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        let cells = plan.cells_for_chunk(pos);
+                        if !cells.is_empty() {
+                            session_cells += cells.len();
+                            session_chunks.push(pos);
+                        }
+                    }
+                }
+            }
+
+            let mut session = WorldSession::new_session_with_mode_and_registry(
+                VILLAGE_SESSION_SEED,
+                PathBuf::from("village-demo-session.mcvx"),
+                opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+                GameMode::Creative,
+                ContentRegistry::builtin_arc(),
+            );
+            session.set_village_catalog(Arc::new(catalog.clone()));
+            // rd=6 means gen radius 8, which covers the whole village cell
+            // while keeping the leg short.
+            session.world.set_render_distance(6);
+            // Centre the stream on the village's own chunk AABB. The village
+            // plan itself is anchored to the world spawn column (installed
+            // above), never to this centre; centring here only means the six
+            // target chunks are the first ones the spiral dispatches instead
+            // of the furthest ones, which keeps the debug-build digest fast
+            // while exercising the same production dispatch.
+            let center_x = (session_chunks.iter().map(|pos| pos.x).min().unwrap_or(0)
+                + session_chunks.iter().map(|pos| pos.x).max().unwrap_or(0))
+                / 2;
+            let center_z = (session_chunks.iter().map(|pos| pos.z).min().unwrap_or(0)
+                + session_chunks.iter().map(|pos| pos.z).max().unwrap_or(0))
+                / 2;
+            let center = ChunkPos::new(center_x, 0, center_z);
+            for _ in 0..1200 {
+                session.world.update_streaming(center, Season::Summer);
+                if session_chunks
+                    .iter()
+                    .all(|&pos| session.world.is_resident(pos))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            session_chunks.iter().all(|&pos| {
+                session.world.is_resident(pos)
+                    && plan.cells_for_chunk(pos).iter().all(|cell| {
+                        session
+                            .world
+                            .get_block(cell.world[0], cell.world[1], cell.world[2])
+                            == cell.block
+                    })
+            })
+        }
+        None => false,
+    };
+    match &session_plan {
+        Some(plan) => lines.push(format!(
+            "village_demo: leg=session cell={},{} spawn={},{} chunks={} cells={} identical={}",
+            plan.cell.x,
+            plan.cell.z,
+            session_spawn_x,
+            session_spawn_z,
+            session_chunks.len(),
+            session_cells,
+            session_identical,
+        )),
+        None => lines.push(format!(
+            "village_demo: leg=session cell=none spawn={},{} chunks=0 cells=0 identical=false",
+            session_spawn_x, session_spawn_z,
+        )),
+    }
+    if !session_identical {
+        failed.get_or_insert("session");
+    }
+
+    match failed {
+        Some(leg) => {
+            lines.push(format!("village_demo: ok=false failed={leg}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("village_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
+/// Build the deterministic `--demo-capture` digest.
+///
+/// This is the headless capture -> validate leg: it builds an isolated
+/// in-memory world (no save, settings, pack, window, GPU or audio), writes a
+/// fixed 5x4x5 house into one uniform-air chunk, drives the real
+/// [`PrefabCapture`] corner -> corner -> naming flow, and calls the production
+/// [`capture_to_file`] seam. It then re-parses the written file and runs the
+/// real [`opencraft::world::prefab::validate_worldgen_lines`] report over the
+/// demo root, so the digest proves the same bytes a player would write.
+///
+/// The only write is `<root>/prefabs/<name>.toml`; the caller owns the root and
+/// nothing is written anywhere else. The caller exits non-zero when a leg
+/// fails, so a broken capture or validator cannot pass silently.
+fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed: Option<&'static str> = None;
+
+    // A single uniform-air chunk covers the whole fixed house footprint
+    // (x 0..=4, y 40..=43, z 0..=4 all live in chunk (0, 1, 0)).
+    let mut world =
+        WorldManager::with_seed_and_edits(4, CAPTURE_DEMO_SEED, ChunkEditMap::default());
+    world.insert_chunk_for_test(ChunkPos::new(0, 1, 0), Chunk::new_uniform(BlockId::Air));
+
+    // Fixed house: oak-plank floor and roof, cobblestone perimeter walls, one
+    // loot chest and one immature wheat crop in the interior. Every other
+    // interior cell stays air, so the prefab round-trips every grid cell.
+    for x in CAPTURE_DEMO_MIN.x..=CAPTURE_DEMO_MAX.x {
+        for z in CAPTURE_DEMO_MIN.z..=CAPTURE_DEMO_MAX.z {
+            world.set_block_immediate(x, CAPTURE_DEMO_MIN.y, z, BlockId::OakPlanks);
+            world.set_block_immediate(x, CAPTURE_DEMO_MAX.y, z, BlockId::OakPlanks);
+            for y in (CAPTURE_DEMO_MIN.y + 1)..CAPTURE_DEMO_MAX.y {
+                let perimeter = x == CAPTURE_DEMO_MIN.x
+                    || x == CAPTURE_DEMO_MAX.x
+                    || z == CAPTURE_DEMO_MIN.z
+                    || z == CAPTURE_DEMO_MAX.z;
+                let block = if perimeter {
+                    BlockId::Cobblestone
+                } else {
+                    BlockId::Air
+                };
+                world.set_block_immediate(x, y, z, block);
+            }
+        }
+    }
+    world.set_block_immediate(1, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::LootChest);
+    // Threshold-step doorway in the min-z wall at x = 2: the two-tall opening
+    // leaves exactly one horizontal axis open (north, outside the region) while
+    // the cobblestone step inside it keeps the south side solid. The marker
+    // goes in last, after the opening and step exist.
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::Air);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 2, 0, BlockId::Air);
+    world.set_block_immediate(3, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::WheatStage1);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 1, BlockId::Cobblestone);
+    world.set_block_immediate(2, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::SocketMarker);
+
+    // Drive the real state machine: corner A, corner B, then the name prompt.
+    let mut capture = PrefabCapture::new();
+    let first = capture.press_corner(CAPTURE_DEMO_MIN);
+    let ready = capture.press_corner(CAPTURE_DEMO_MAX);
+    let region = match ready {
+        CornerOutcome::Ready(region) => region,
+        _ => {
+            lines.push(format!(
+                "capture_demo: leg=region error=corner sequence (first={first:?})"
+            ));
+            lines.push("capture_demo: ok=false failed=region".to_string());
+            return (lines, false);
+        }
+    };
+    let size = [
+        (region.max.x - region.min.x + 1) as u32,
+        (region.max.y - region.min.y + 1) as u32,
+        (region.max.z - region.min.z + 1) as u32,
+    ];
+    lines.push(format!(
+        "capture_demo: leg=region min={},{},{} max={},{},{} size={}x{}x{} cells={}",
+        region.min.x,
+        region.min.y,
+        region.min.z,
+        region.max.x,
+        region.max.y,
+        region.max.z,
+        size[0],
+        size[1],
+        size[2],
+        size[0] as usize * size[1] as usize * size[2] as usize,
+    ));
+
+    if !capture.begin_naming(Some(root)) {
+        lines.push("capture_demo: leg=write error=begin_naming rejected the region".to_string());
+        lines.push("capture_demo: ok=false failed=write".to_string());
+        return (lines, false);
+    }
+    let name = capture.naming_value().to_owned();
+
+    let (path, prefab) = match capture_to_file(root, &name, &world, region.min, region.max) {
+        Ok(written) => written,
+        Err(error) => {
+            lines.push(format!("capture_demo: leg=write error={error}"));
+            lines.push("capture_demo: ok=false failed=write".to_string());
+            return (lines, false);
+        }
+    };
+
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let bytes = std::fs::read(&path).map(|bytes| bytes.len()).unwrap_or(0);
+    lines.push(format!(
+        "capture_demo: leg=write name={name} path={relative} bytes={bytes}"
+    ));
+
+    // Re-parse the bytes that actually reached disk. This value drives both the
+    // round-trip check and the socket leg, so the socket proof describes the
+    // serialized file rather than the in-memory capture result.
+    let reparsed_text = std::fs::read_to_string(&path).ok();
+    let reparsed = reparsed_text
+        .as_deref()
+        .and_then(|text| opencraft::world::prefab::parse_prefab(text).ok());
+    let roundtrip_identical = reparsed.as_ref() == Some(&prefab);
+    lines.push(format!(
+        "capture_demo: leg=roundtrip identical={roundtrip_identical}"
+    ));
+    if !roundtrip_identical {
+        failed.get_or_insert("roundtrip");
+    }
+
+    // Run the real `--validate-worldgen` report over the demo root. Counting
+    // the accepted/error lines keeps the digest independent of the summary
+    // wording; the leg passes when the tree is error-free and the validator
+    // accepted the name actually captured (a reused directory legitimately
+    // holds more than one prefab).
+    let (validate_lines, validate_ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+    let prefabs = validate_lines
+        .iter()
+        .filter(|line| line.starts_with("ok: prefab "))
+        .count();
+    let captured_ok = validate_lines
+        .iter()
+        .any(|line| line == &format!("ok: prefab {name}"));
+    let errors = validate_lines
+        .iter()
+        .filter(|line| line.starts_with("error: "))
+        .count();
+    lines.push(format!(
+        "capture_demo: leg=validate ok={validate_ok} prefabs={prefabs} errors={errors}"
+    ));
+    if !validate_ok || !captured_ok || errors != 0 {
+        failed.get_or_insert("validate");
+    }
+
+    // Socket leg: the marker cell must have become exactly one origin-relative
+    // socket facing the only open horizontal axis, the marker cell itself must
+    // be air, and the serialized text must carry no marker block.
+    let socket = reparsed.as_ref().and_then(|parsed| parsed.sockets.first());
+    let socket_position = socket.map(|socket| socket.position);
+    let socket_direction = socket.map(|socket| socket.direction);
+    let socket_count = reparsed
+        .as_ref()
+        .map(|parsed| parsed.sockets.len())
+        .unwrap_or(0);
+    let marker_count = reparsed
+        .as_ref()
+        .map(|parsed| {
+            parsed
+                .blocks
+                .iter()
+                .filter(|block| block.block == BlockId::SocketMarker)
+                .count()
+        })
+        .unwrap_or(0);
+    let socket_cell_block = match (reparsed.as_ref(), socket_position) {
+        (Some(parsed), Some([x, y, z])) => {
+            let cell = [
+                parsed.origin[0] as i32 + x,
+                parsed.origin[1] as i32 + y,
+                parsed.origin[2] as i32 + z,
+            ];
+            parsed
+                .blocks
+                .iter()
+                .find(|block| block.position == [cell[0] as u32, cell[1] as u32, cell[2] as u32])
+                .map(|block| block.block)
+        }
+        _ => None,
+    };
+    let socket_text_has_marker = reparsed_text
+        .as_deref()
+        .map(|text| text.contains("socket_marker"))
+        .unwrap_or(false);
+    let socket_ok = socket_position == Some([0, 1, -2])
+        && socket_direction == Some(opencraft::world::prefab::Direction::North)
+        && socket_count == 1
+        && marker_count == 0
+        && socket_cell_block == Some(BlockId::Air)
+        && !socket_text_has_marker;
+    if socket_ok {
+        lines.push(
+            "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0"
+                .to_string(),
+        );
+    } else {
+        let position_text = match socket_position {
+            Some([x, y, z]) => format!("{x},{y},{z}"),
+            None => "none".to_string(),
+        };
+        let direction_text = match socket_direction {
+            Some(direction) => direction.as_str().to_string(),
+            None => "none".to_string(),
+        };
+        let cell_text = match socket_cell_block {
+            Some(block) => format!("{block:?}"),
+            None => "none".to_string(),
+        };
+        lines.push(format!(
+            "capture_demo: leg=socket position={position_text} direction={direction_text} sockets={socket_count} markers={marker_count} cell={cell_text} text_marker={socket_text_has_marker}"
+        ));
+        failed.get_or_insert("socket");
+    }
+
+    // Ambiguous marker: opening the west jamb gives the marker two qualifying
+    // axes (open west and open north). The whole capture must fail at the
+    // marker's world coordinate and write nothing.
+    world.set_block_immediate(1, CAPTURE_DEMO_MIN.y + 1, 0, BlockId::Air);
+    let ambiguous_path = root.join("prefabs").join("ambiguous.toml");
+    let ambiguous = capture_to_file(
+        root,
+        "ambiguous",
+        &world,
+        CAPTURE_DEMO_MIN,
+        CAPTURE_DEMO_MAX,
+    );
+    let ambiguous_reason = match &ambiguous {
+        Ok(_) => "none".to_string(),
+        Err(error) => error.to_string(),
+    };
+    let ambiguous_ok = matches!(
+        &ambiguous,
+        Err(opencraft::world::capture::CaptureError::AmbiguousSocket { pos })
+            if *pos == IVec3::new(2, CAPTURE_DEMO_MIN.y + 1, 0)
+    ) && ambiguous_reason == "socket marker at [2, 41, 0] is ambiguous"
+        && !ambiguous_path.exists();
+    lines.push(format!(
+        "capture_demo: leg=ambiguous pos=2,41,0 wrote={} reason={ambiguous_reason}",
+        ambiguous_path.exists(),
+    ));
+    if !ambiguous_ok {
+        failed.get_or_insert("ambiguous");
+    }
+
+    // Catalog leg: author exactly one demo village definition pointing at the
+    // freshly captured prefab and reload it through the production catalog
+    // seam. The file name is fixed and overwritten every run, so a reused demo
+    // directory can never leave a stale definition naming an old prefab.
+    let definition_text = format!(
+        "format = 1\nname = \"capture_demo\"\nbiomes = [\"plains\"]\nhub = \"{name}\"\nspacing = 2\nmin_prefabs = 10\nmax_prefabs = 20\nmax_slope = 16\n\n[pool]\nhouse = [\"{name}\"]\njunction = [\"{name}\"]\n"
+    );
+    let definition_dir = root.join("villages");
+    let definition_path = definition_dir.join("capture_demo.toml");
+    let definition_write = std::fs::create_dir_all(&definition_dir)
+        .and_then(|()| std::fs::write(&definition_path, definition_text.as_bytes()));
+    match definition_write {
+        Ok(()) => {
+            let (catalog, diagnostics) = reload_village_catalog(root);
+            let captured_present = catalog.prefabs().get(&name).is_some();
+            let definition_present = catalog.get("capture_demo").is_some();
+            lines.push(format!(
+                "capture_demo: leg=catalog captured={captured_present} definition={definition_present} diagnostics={}",
+                diagnostics.len()
+            ));
+            if !captured_present || !definition_present || !diagnostics.is_empty() {
+                failed.get_or_insert("catalog");
+            }
+
+            // Village leg: find the first cell whose captured-prefab plan has
+            // two placements joined by one socket link. Widen the search only
+            // when the normal 13x13 window holds no qualifying site.
+            let spawn = find_spawn_column(CAPTURE_DEMO_VILLAGE_SEED);
+            let plan = capture_demo_village_plan(-6..=6, &catalog, spawn)
+                .or_else(|| capture_demo_village_plan(-16..=16, &catalog, spawn));
+            let mut village_ok = false;
+            match &plan {
+                Some(found) => {
+                    let biome_ok = biome_at_seeded(
+                        found.anchor[0],
+                        found.anchor[1],
+                        CAPTURE_DEMO_VILLAGE_SEED,
+                    ) == Biome::Plains;
+                    let names_ok = found
+                        .placements
+                        .iter()
+                        .all(|placement| placement.prefab.name == name);
+                    village_ok = biome_ok && names_ok;
+                    lines.push(format!(
+                        "capture_demo: leg=village definition={} biome={} cell={},{} anchor={},{} prefabs={} socket_links={} roads={} prefab={}",
+                        found.definition,
+                        if biome_ok { "plains" } else { "other" },
+                        found.cell.x,
+                        found.cell.z,
+                        found.anchor[0],
+                        found.anchor[1],
+                        found.placement_count(),
+                        found.socket_link_count(),
+                        found.road_cell_count(),
+                        name,
+                    ));
+                }
+                None => lines.push(
+                    "capture_demo: leg=village definition=none biome=none cell=none anchor=none prefabs=0 socket_links=0 roads=0 prefab=none"
+                        .to_string(),
+                ),
+            }
+            if !village_ok {
+                failed.get_or_insert("village");
+            }
+
+            // Road leg: generate the plan's exact chunk window through the
+            // production seam and read world cells back. Every road surface
+            // must be cobblestone, every linked socket cell must be air, and
+            // every placement origin must carry the captured oak-plank floor.
+            let mut hits = 0usize;
+            let mut total = 0usize;
+            let mut socket_clear = false;
+            let mut prefab_block = false;
+            let mut road_ok = false;
+            if let Some(found) = &plan {
+                total = found.road_cell_count();
+                let chunks: BTreeMap<(i32, i32, i32), Chunk> = village_demo_window(&found.bounds)
+                    .into_iter()
+                    .map(|pos| {
+                        (
+                            (pos.x, pos.y, pos.z),
+                            village_demo_generate(pos, CAPTURE_DEMO_VILLAGE_SEED, &catalog, spawn),
+                        )
+                    })
+                    .collect();
+                hits = found
+                    .road_cells
+                    .iter()
+                    .filter(|road| {
+                        village_demo_cell(&chunks, road.world) == Some(BlockId::Cobblestone)
+                    })
+                    .count();
+                socket_clear = found.socket_links.iter().all(|link| {
+                    let parent = found
+                        .placements
+                        .get(link.parent)
+                        .and_then(|placement| placement.sockets.get(link.parent_socket));
+                    let child = found
+                        .placements
+                        .get(link.child)
+                        .and_then(|placement| placement.sockets.get(link.child_socket));
+                    parent.is_some_and(|socket| {
+                        village_demo_cell(&chunks, socket.position) == Some(BlockId::Air)
+                    }) && child.is_some_and(|socket| {
+                        village_demo_cell(&chunks, socket.position) == Some(BlockId::Air)
+                    })
+                });
+                prefab_block = found.placements.iter().all(|placement| {
+                    village_demo_cell(
+                        &chunks,
+                        [placement.origin_x, placement.base_y, placement.origin_z],
+                    ) == Some(BlockId::OakPlanks)
+                });
+                road_ok = total >= 1 && hits == total && socket_clear && prefab_block;
+            }
+            lines.push(format!(
+                "capture_demo: leg=road cobblestone={hits}/{total} socket_clear={socket_clear} prefab_block={prefab_block} roads={total}"
+            ));
+            if !road_ok {
+                failed.get_or_insert("road");
+            }
+        }
+        Err(error) => {
+            lines.push(format!("capture_demo: leg=catalog error={error}"));
+            failed.get_or_insert("catalog");
+        }
+    }
+
+    match failed {
+        Some(leg) => {
+            lines.push(format!("capture_demo: ok=false failed={leg}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("capture_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
 /// Resolve the palette's granted identity by stable name: blocks first, then
 /// generic items, then pack tools.
 fn palette_demo_item_id(registry: &ContentRegistry, name: &str) -> Option<ItemId> {
@@ -15590,6 +16999,75 @@ fn main() {
         return;
     }
 
+    // `--validate-worldgen [dir]` is a headless, pre-startup short-circuit:
+    // it walks the optional worldgen root (default `worldgen`), prints one
+    // stable per-prefab line plus a summary, and exits 0/1 without a session,
+    // event loop, window, GPU, save, settings file or pack stack. It is a
+    // release-facing launch switch (D245): unlike `--check-config` and
+    // `--creator-trace` it is deliberately not release-gated.
+    if let Some(root) = cli.validate_worldgen.as_deref() {
+        let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-capture <dir>` is the headless capture -> validate leg: it builds
+    // an isolated in-memory world, writes one fixed house through the real
+    // `PrefabCapture` and `capture_to_file` seams, re-parses the bytes and runs
+    // the real `validate_worldgen_lines` report. It runs after worldgen
+    // validation and before every other demo/startup branch, so it never opens
+    // a window, GPU, audio engine, event loop, settings file, pack stack or
+    // save. The only write is `<dir>/prefabs/<name>.toml`; an empty path (a
+    // bare `--demo-capture` or a following switch) fails closed with exit 2.
+    if let Some(root) = cli.demo_capture.as_deref() {
+        if root.as_os_str().is_empty() {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: --demo-capture requires a directory");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        let (lines, ok) = capture_demo_lines(root);
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `--demo-village` is the headless village digest: it loads only
+    // `worldgen/` (fail-soft, exactly like `--validate-worldgen`) and exercises
+    // the production plan/assembly seams over a pinned cell window. It runs
+    // after the worldgen validation branch and before `--demo-ui` and
+    // `StartupContent::load`, so no window, GPU, audio engine, event loop,
+    // settings file, pack stack or save is touched, and it writes nothing.
+    if cli.demo_village {
+        let (lines, ok) = village_demo_lines(Path::new(opencraft::world::prefab::WORLDGEN_DIR));
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if cli.demo_ui {
         let (lines, ok) = opencraft::ui::demo::ui_demo_digest_lines();
         use std::io::Write as _;
@@ -15759,12 +17237,16 @@ fn main() {
 
     // Build the pack-aware startup content ONCE: the same base registry names
     // the fresh/loaded startup session and becomes the app's base registry.
-    // `--validate-pack` and `--demo-ui` returned above, so no window, GPU,
-    // settings file or save is touched for those short-circuits.
+    // `--validate-pack`, `--validate-worldgen` and `--demo-ui` returned above,
+    // so no window, GPU, settings file or save is touched for those
+    // short-circuits.
     let content = StartupContent::load(
         Path::new(DEFAULT_SETTINGS_PATH),
         Path::new(pack::PACKS_DIR).to_path_buf(),
         Some(Path::new(opencraft::config::CONFIG_DIR)),
+        // Production is the one opt-in `worldgen/` reader: keep this literal
+        // shape (several source pins locate `StartupContent::load(` here).
+        Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
     );
     let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
@@ -16246,6 +17728,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_worldgen_is_a_launch_switch_and_never_a_world_intent() {
+        // Validation is a headless one-shot: asking for it must not bypass the
+        // menu on a normal launch, exactly like the other launch switches.
+        let bare = CliConfig::parse_args(Vec::<String>::new());
+        let validate = CliConfig::parse_args(["--validate-worldgen"]);
+        assert!(!cli_has_world_intent(&validate));
+        assert_eq!(cli_has_world_intent(&validate), cli_has_world_intent(&bare));
+
+        // A real world flag still grants intent; the validation switch is not
+        // persisted or turned into a world parameter. The optional root is
+        // carried verbatim.
+        let with_new = CliConfig::parse_args(["--new", "--validate-worldgen", "custom"]);
+        assert!(cli_has_world_intent(&with_new));
+        assert_eq!(
+            with_new.validate_worldgen,
+            Some(std::path::PathBuf::from("custom"))
+        );
+    }
+
+    #[test]
+    fn main_validate_worldgen_short_circuit_precedes_world_startup() {
+        // Validation must run before any world/session startup: no save,
+        // settings file, pack stack, window, or GPU work is allowed on this
+        // launch. Pin the ordering in the real binary source so a later
+        // refactor cannot silently move the seam behind startup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let lines_at = body
+            .find("validate_worldgen_lines")
+            .expect("fn main must call validate_worldgen_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        assert!(
+            validate_pack_at < validate_at,
+            "the validate-pack branch must stay first"
+        );
+        assert!(
+            validate_at < startup_at,
+            "cli.validate_worldgen must precede startup"
+        );
+        assert!(
+            lines_at < startup_at,
+            "validate_worldgen_lines must precede startup"
+        );
+        assert!(
+            validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
+            "validate-worldgen must precede the demo-ui branch"
+        );
+    }
+
+    #[test]
     fn check_config_is_a_launch_switch_and_never_a_world_intent() {
         // The audit is a headless one-shot: asking for it must not bypass the
         // menu on a normal launch, exactly like the other launch switches.
@@ -16552,6 +18095,340 @@ mod tests {
     }
 
     #[test]
+    fn main_demo_village_short_circuit_precedes_world_startup() {
+        // The village digest must run after worldgen validation and before the
+        // UI digest and any startup content/session: no window, GPU, audio
+        // engine, event loop, settings file, pack stack or save is allowed.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_village_at = body
+            .find("cli.demo_village")
+            .expect("fn main must branch on cli.demo_village");
+        let digest_at = body
+            .find("village_demo_lines(")
+            .expect("fn main must call village_demo_lines");
+        let demo_ui_at = body
+            .find("cli.demo_ui")
+            .expect("fn main must branch on cli.demo_ui");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_at < demo_village_at,
+            "the village digest must follow the worldgen validation branch"
+        );
+        assert!(
+            demo_village_at < demo_ui_at,
+            "cli.demo_village must precede the demo-ui branch"
+        );
+        assert!(
+            demo_village_at < startup_at,
+            "cli.demo_village must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "village_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn village_demo_pins_the_checked_in_reference_village_line_set() {
+        // Measured from a real run against this repository's `worldgen/` root.
+        // Never derive the expected strings from the code under test: every
+        // count, cell, link and digest below is pinned independently.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("worldgen");
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(
+            ok,
+            "the village demo must pass against the checked-in tree: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "village_demo: leg=catalog prefabs=3 villages=1 diagnostics=0 fingerprint=0x5c2b550240d34cfb"
+                    .to_string(),
+                "village_demo: leg=context rules=0 villages=1".to_string(),
+                "village_demo: leg=site cell=6,-6 anchor=1654,-1383 definition=plains prefabs=13 socket_links=12 roads=48 unmatched=22"
+                    .to_string(),
+                "village_demo: leg=counts in_range=true min=10 max=20".to_string(),
+                "village_demo: leg=layout digest=0x79663be18a213bab".to_string(),
+                "village_demo: leg=order identical=true".to_string(),
+                "village_demo: leg=single_chunk identical=true".to_string(),
+                "village_demo: leg=empty_catalog identical=true".to_string(),
+                "village_demo: leg=outside identical=true".to_string(),
+                "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true"
+                    .to_string(),
+                "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true"
+                    .to_string(),
+                "village_demo: ok=true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn main_demo_capture_short_circuit_precedes_world_startup() {
+        // The capture -> validate leg must run after worldgen validation and
+        // before the village digest and any startup content/session: no
+        // window, GPU, audio engine, event loop, settings file, pack stack or
+        // save is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_capture_at = body
+            .find("cli.demo_capture")
+            .expect("fn main must branch on cli.demo_capture");
+        let demo_village_at = body
+            .find("cli.demo_village")
+            .expect("fn main must branch on cli.demo_village");
+        let digest_at = body
+            .find("capture_demo_lines(")
+            .expect("fn main must call capture_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_at < demo_capture_at,
+            "the capture demo must follow the worldgen validation branch"
+        );
+        assert!(
+            demo_capture_at < demo_village_at,
+            "the capture demo must precede the village digest"
+        );
+        assert!(
+            demo_capture_at < startup_at,
+            "cli.demo_capture must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "capture_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn capture_demo_pins_the_fixed_house_line_set() {
+        // Measured from a real `--demo-capture <fresh-dir>` run. Never derive
+        // these strings from the code under test: the region, byte count and
+        // round-trip/validate/socket/ambiguous values below are pinned
+        // independently.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("demo");
+        std::fs::create_dir_all(&root).expect("create demo root");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(ok, "the capture demo must pass: {lines:?}");
+        assert_eq!(
+            lines,
+            vec![
+                "capture_demo: leg=region min=0,40,0 max=4,43,4 size=5x4x5 cells=100".to_string(),
+                "capture_demo: leg=write name=capture path=prefabs/capture.toml bytes=423"
+                    .to_string(),
+                "capture_demo: leg=roundtrip identical=true".to_string(),
+                "capture_demo: leg=validate ok=true prefabs=1 errors=0".to_string(),
+                "capture_demo: leg=socket position=0,1,-2 direction=north sockets=1 markers=0"
+                    .to_string(),
+                "capture_demo: leg=ambiguous pos=2,41,0 wrote=false reason=socket marker at [2, 41, 0] is ambiguous"
+                    .to_string(),
+                "capture_demo: leg=catalog captured=true definition=true diagnostics=0".to_string(),
+                "capture_demo: leg=village definition=capture_demo biome=plains cell=6,-6 anchor=1654,-1383 prefabs=2 socket_links=1 roads=2 prefab=capture"
+                    .to_string(),
+                "capture_demo: leg=road cobblestone=2/2 socket_clear=true prefab_block=true roads=2"
+                    .to_string(),
+                "capture_demo: ok=true".to_string(),
+            ]
+        );
+        let written = root.join("prefabs/capture.toml");
+        assert!(written.is_file(), "exactly one prefab file is written");
+        assert_eq!(
+            std::fs::read(&written).expect("read prefab").len(),
+            423,
+            "the pinned byte count must match the written file"
+        );
+        assert!(
+            !root.join("prefabs/ambiguous.toml").exists(),
+            "the ambiguous capture must write nothing"
+        );
+        let definition = root.join("villages/capture_demo.toml");
+        assert!(
+            definition.is_file(),
+            "exactly one demo village definition is written"
+        );
+        let definition_text = std::fs::read_to_string(&definition).expect("read demo definition");
+        assert!(
+            definition_text.contains("hub = \"capture\""),
+            "the demo definition must name the captured prefab: {definition_text}"
+        );
+    }
+
+    #[test]
+    fn capture_demo_reports_a_write_failure_without_writing() {
+        // A root that is a regular file cannot host `prefabs/`: the demo must
+        // post one readable reason and exit false, leaving the file untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"keep me").expect("write regular file");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(!ok);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error="))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one readable error: {lines:?}");
+        assert!(
+            errors[0].contains("not a directory"),
+            "the reason must name the filesystem failure: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("capture_demo: ok=false failed=write")
+        );
+        assert_eq!(std::fs::read(&root).expect("read file"), b"keep me");
+    }
+
+    #[test]
+    fn capture_demo_reports_a_catalog_write_failure_without_panicking() {
+        // The prefab leg succeeds, but `villages` is a regular file so the
+        // demo definition cannot be created: the demo must post one readable
+        // catalog error, keep the successfully captured prefab, and exit
+        // false without panicking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("demo");
+        std::fs::create_dir_all(&root).expect("create demo root");
+        std::fs::write(root.join("villages"), b"keep me").expect("write villages file");
+
+        let (lines, ok) = capture_demo_lines(&root);
+
+        assert!(!ok);
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("error="))
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one readable error: {lines:?}");
+        assert!(
+            errors[0].starts_with("capture_demo: leg=catalog error="),
+            "the reason must name the catalog leg: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("capture_demo: ok=false failed=catalog")
+        );
+        assert!(
+            root.join("prefabs/capture.toml").is_file(),
+            "the successful prefab write must survive a definition failure"
+        );
+        assert_eq!(
+            std::fs::read(root.join("villages")).expect("read file"),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn village_demo_degrades_to_warning_plus_failed_site_on_a_broken_tree() {
+        // A broken village file must degrade fail-soft: the loader reports one
+        // warning, the digest still prints its whole pinned line set, and the
+        // run exits non-zero with `failed=site` (no panic, no partial output).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        std::fs::create_dir_all(root.join("villages")).expect("create villages dir");
+        std::fs::write(root.join("villages").join("broken.toml"), "format = 1\n")
+            .expect("write broken village");
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    .starts_with("village_demo: warning worldgen/villages/broken.toml: ")),
+            "expected a prefixed loader warning: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("village_demo: leg=catalog ")
+                    && line.contains("villages=0")
+                    && line.contains("diagnostics=1")
+            }),
+            "expected the empty catalog to be reported: {lines:?}"
+        );
+
+        // A missing root is valid empty content, not a diagnostic, and still
+        // fails at the site leg instead of panicking.
+        let (lines, ok) = village_demo_lines(&dir.path().join("absent"));
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("leg=catalog prefabs=0 villages=0 diagnostics=0")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.starts_with("village_demo: warning ")));
+    }
+
+    #[test]
+    fn village_demo_treats_a_missing_hub_as_failed_site() {
+        // A definition whose hub prefab does not exist is rejected by the
+        // fail-soft loader with a diagnostic, so the demo reports zero
+        // definitions and degrades to `failed=site` instead of panicking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("worldgen");
+        std::fs::create_dir_all(root.join("prefabs")).expect("create prefabs dir");
+        std::fs::create_dir_all(root.join("villages")).expect("create villages dir");
+        for name in ["plains_hub.toml", "small_house.toml", "wheat_farm.toml"] {
+            std::fs::copy(
+                source.join("prefabs").join(name),
+                root.join("prefabs").join(name),
+            )
+            .expect("copy prefab fixture");
+        }
+        let plains = std::fs::read_to_string(source.join("villages/plains.toml"))
+            .expect("read reference definition");
+        let broken = plains.replace("hub = \"plains_hub\"", "hub = \"missing_hub\"");
+        assert_ne!(broken, plains, "fixture must rename the hub");
+        std::fs::write(root.join("villages/plains.toml"), broken)
+            .expect("write broken hub definition");
+
+        let (lines, ok) = village_demo_lines(&root);
+        assert!(!ok);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("village_demo: ok=false failed=site")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("leg=catalog prefabs=3 villages=0 diagnostics=1") }),
+            "the broken hub must be reported as a diagnostic: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("village_demo: warning worldgen/villages/plains.toml: ")
+                    && line.contains("hub prefab 'missing_hub'")
+            }),
+            "expected the missing-hub warning: {lines:?}"
+        );
+    }
+
+    #[test]
     fn main_release_gate_rejects_creator_flags_before_startup() {
         // Release builds must reject the two creator switches before any other
         // CLI branch or startup work can run. Pin both the gate text and its
@@ -16682,19 +18559,19 @@ stack = 64
 
         // Literals measured from a real run, never derived from the fixture.
         let expected = vec![
-            "presentation_demo: leg=registry blocks=25 items=1 pack_layers=2 pack_icons=1"
+            "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
             "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
                 .to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_ore id=24 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_block id=23 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
             "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64".to_string(),
             "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49".to_string(),
             "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
             "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
-            "presentation_demo: leg=placeholder unresolved=3 face=25 icon=27 break=none mesh=25".to_string(),
+            "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -16713,7 +18590,7 @@ stack = 64
             "the built-in launch is a valid presentation: {lines:#?}"
         );
         let expected = vec![
-            "presentation_demo: leg=registry blocks=23 items=0 pack_layers=0 pack_icons=0"
+            "presentation_demo: leg=registry blocks=24 items=0 pack_layers=0 pack_icons=0"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
@@ -16721,7 +18598,7 @@ stack = 64
                 .to_string(),
             "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
                 .to_string(),
-            "presentation_demo: leg=placeholder unresolved=0 face=25 icon=27 break=none mesh=25"
+            "presentation_demo: leg=placeholder unresolved=0 face=26 icon=27 break=none mesh=26"
                 .to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
@@ -16812,9 +18689,9 @@ stack = 64
         let expected = vec![
             "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
             "worldgen_demo: leg=session rules=2 matches=true".to_string(),
-            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2476 min_y=4 max_y=40 in_band=true"
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
                 .to_string(),
-            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=334 biomes=plains,forest biomes_ok=true"
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
                 .to_string(),
             "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
             "worldgen_demo: leg=empty_rules identical=true".to_string(),
@@ -23940,6 +25817,908 @@ stack = 64
                 count: 2,
             }),
             "rejected placement does not consume"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_is_creative_only_and_consumes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            30,
+            dir.path().join("socket-marker-place.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+        session.player.collect_block(BlockId::Stone);
+        session.player.collect_block(BlockId::Stone);
+        assert!(session.player.select_slot(0));
+
+        let remeshed = try_place_socket_marker(&mut session).expect("Creative placement applies");
+
+        assert!(!remeshed.is_empty(), "placement remeshes its chunk");
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::SocketMarker,
+            "the marker lands in the hit cell's adjacent cell"
+        );
+        assert_eq!(
+            session.player.hotbar_stack(0),
+            Some(ItemStack {
+                block: BlockId::Stone,
+                count: 2,
+            }),
+            "socket placement never reads or consumes the selected stack"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_is_inert_in_survival() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session_with_mode(
+            31,
+            dir.path().join("socket-marker-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        session.player.position = Vec3::new(5.5, 10.0, 5.5);
+        aim_placement_camera(&mut session);
+
+        assert!(
+            try_place_socket_marker(&mut session).is_none(),
+            "socket placement is a Creative-only action"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "Survival placement edits nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_placement_refuses_the_player_cell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            32,
+            dir.path().join("socket-marker-overlap.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        // The camera stays at y=10 looking down, so the destination is
+        // (0,6,0); placing the player's AABB there must refuse the edit.
+        aim_placement_camera(&mut session);
+        session.player.position = Vec3::new(0.5, 6.0, 0.5);
+
+        assert!(
+            try_place_socket_marker(&mut session).is_none(),
+            "a marker overlapping the player AABB is rejected"
+        );
+        assert_eq!(
+            session.world.get_block(0, 6, 0),
+            BlockId::Air,
+            "a refused placement edits nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_breaks_to_air_with_no_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            33,
+            dir.path().join("socket-marker-break.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 10, 0, BlockId::SocketMarker);
+
+        let def = session
+            .registry
+            .block(BlockId::SocketMarker)
+            .expect("the frozen registry owns the marker definition");
+        assert_eq!(def.hardness, Some(0.3), "the marker breaks in ~0.3 s");
+        assert!(def.drop.is_none(), "the marker is non-carryable");
+
+        let before = inventory_units(&session.player);
+        let (remeshed, _wear) = applied_break(break_mined_block(
+            &mut session,
+            IVec3::new(0, 10, 0),
+            BlockId::SocketMarker,
+        ));
+
+        assert!(!remeshed.is_empty(), "an applied break remeshes");
+        assert_eq!(session.world.get_block(0, 10, 0), BlockId::Air);
+        assert_eq!(
+            inventory_units(&session.player),
+            before,
+            "breaking the marker drops nothing"
+        );
+    }
+
+    #[test]
+    fn socket_marker_meshes_opaque_quads_on_layer_25() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = WorldSession::new_session(
+            34,
+            dir.path().join("socket-marker-mesh.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session
+            .world
+            .set_block_immediate(0, 10, 0, BlockId::SocketMarker);
+
+        let padded = session
+            .world
+            .build_padded_chunk(ChunkPos::new(0, 0, 0))
+            .expect("the resident halo meshes");
+        let mesh = opencraft::mesh::greedy::mesh_chunk_with(&padded, session.world.block_faces());
+
+        assert_eq!(mesh.total_quads(), 6, "one floating cube exposes six faces");
+        assert!(
+            mesh.water_quads.is_empty(),
+            "the marker is opaque terrain, never a liquid surface"
+        );
+        for quad in mesh.buckets.iter().flat_map(|bucket| bucket.iter()) {
+            assert_eq!(
+                quad.unpack().6,
+                25,
+                "every marker face samples the built-in layer-25 art"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_marker_never_enters_the_creative_palette() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = WorldSession::new_session(
+            35,
+            dir.path().join("socket-marker-palette.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let entries = palette::entries(&session.registry);
+
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.id == ItemId::Block(BlockId::SocketMarker)),
+            "a non-carryable marker must never appear in the palette"
+        );
+        let builtin_blocks = entries
+            .iter()
+            .filter(|entry| matches!(entry.id, ItemId::Block(block) if block.is_builtin()))
+            .count();
+        assert_eq!(
+            builtin_blocks, 14,
+            "the built-in carryable count is unchanged"
+        );
+    }
+
+    #[test]
+    fn socket_marker_key_m_is_a_non_rebindable_utility_key() {
+        let src = include_str!("main.rs");
+        let keym = src
+            .find("KeyCode::KeyM if pressed && !event.repeat =>")
+            .expect("the KeyM arm is present");
+        let call = src[keym..]
+            .find("try_place_socket_marker(&mut self.session)")
+            .expect("the KeyM arm calls the pure placement helper");
+        let rebindable = src
+            .find("// Rebindable gameplay keys (S04-T03)")
+            .expect("the rebindable gameplay arm is present");
+        assert!(
+            keym + call < rebindable,
+            "KeyM must sit before the rebindable fall-through as a fixed utility key"
+        );
+    }
+
+    #[test]
+    fn capture_corner_is_creative_only_and_returns_the_targeted_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut creative = WorldSession::new_session(
+            71,
+            dir.path().join("capture-corner.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut creative, BlockId::Air);
+        creative.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut creative);
+
+        assert_eq!(
+            try_capture_corner(&creative),
+            Some(IVec3::new(0, 5, 0)),
+            "the corner is the targeted block, not the adjacent placement cell"
+        );
+
+        // A ray that hits nothing has no corner to record.
+        creative.camera.pitch = std::f32::consts::FRAC_PI_2;
+        assert_eq!(try_capture_corner(&creative), None);
+
+        let mut survival = WorldSession::new_session_with_mode(
+            72,
+            dir.path().join("capture-corner-survival.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+            GameMode::Survival,
+        );
+        insert_test_chunk_with_face_neighbors(&mut survival, BlockId::Air);
+        survival.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut survival);
+        assert_eq!(
+            try_capture_corner(&survival),
+            None,
+            "Survival capture is silent"
+        );
+    }
+
+    #[test]
+    fn capture_reset_follows_screen_and_session_boundaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+
+        assert_eq!(
+            app.capture.press_corner(IVec3::new(0, 40, 0)),
+            CornerOutcome::First
+        );
+        app.enter_screen(LifecycleScreen::Pause);
+        assert!(
+            !app.capture.is_active(),
+            "Pause retires the two-corner selection"
+        );
+
+        assert_eq!(
+            app.capture.press_corner(IVec3::new(0, 40, 0)),
+            CornerOutcome::First
+        );
+        let _ = app.capture.press_corner(IVec3::new(1, 41, 1));
+        assert!(app.capture.begin_naming(None));
+        app.on_session_installed();
+        assert!(
+            !app.capture.is_active(),
+            "a session install retires the prompt and its stale region"
+        );
+    }
+
+    #[test]
+    fn capture_without_worldgen_root_posts_unavailable_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        assert!(app.worldgen_root.is_none());
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(None));
+        let name_before = app.capture.naming_value().to_owned();
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), name_before);
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("capture unavailable: no worldgen directory configured")
+        );
+        assert!(
+            !dir.path().join("worldgen").exists(),
+            "no root must never create a worldgen tree"
+        );
+    }
+
+    #[test]
+    fn capture_writes_one_prefab_and_posts_the_saved_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            73,
+            dir.path().join("capture-write.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        app.submit_capture();
+
+        let written = root.join("prefabs").join("capture.toml");
+        assert!(written.is_file(), "exactly one prefab file is written");
+        let text = std::fs::read_to_string(&written).expect("read written prefab");
+        let parsed =
+            opencraft::world::prefab::parse_prefab(&text).expect("the written prefab parses");
+        assert_eq!(parsed.name, "capture");
+        assert_eq!(parsed.size, [2, 2, 2]);
+        assert!(!app.capture.is_active(), "a successful save resets capture");
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("saved prefab 'capture' to worldgen/prefabs/capture.toml")
+        );
+    }
+
+    /// Every regular file below `root`, sorted: proves a refused capture wrote
+    /// nothing anywhere under the worldgen root.
+    fn capture_test_files_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Build the S06 doorway fixture used by the two interactive capture tests:
+    /// a 5x3x5 region with an oak-plank floor at y=5, cobblestone perimeter at
+    /// y=6..=7, a two-tall doorway in the min-z wall at x=2, a cobblestone
+    /// threshold step one cell inside, and every other interior cell air.
+    /// `remove_east_jamb` opens the cell beside the doorway so a second axis
+    /// qualifies and the marker becomes ambiguous.
+    fn insert_capture_doorway_fixture(session: &mut WorldSession, remove_east_jamb: bool) {
+        insert_test_chunk_with_face_neighbors(session, BlockId::Air);
+        for x in 0..=4 {
+            for z in 0..=4 {
+                session
+                    .world
+                    .set_block_immediate(x, 5, z, BlockId::OakPlanks);
+                for y in 6..=7 {
+                    let perimeter = x == 0 || x == 4 || z == 0 || z == 4;
+                    if perimeter {
+                        session
+                            .world
+                            .set_block_immediate(x, y, z, BlockId::Cobblestone);
+                    }
+                }
+            }
+        }
+        // Two-tall doorway in the min-z wall; the north neighbour sits outside
+        // the region, so it never reads a chunk.
+        session.world.set_block_immediate(2, 6, 0, BlockId::Air);
+        session.world.set_block_immediate(2, 7, 0, BlockId::Air);
+        // Threshold step one cell inside keeps the south side of the marker
+        // solid, leaving exactly one open axis (north).
+        session
+            .world
+            .set_block_immediate(2, 6, 1, BlockId::Cobblestone);
+        if remove_east_jamb {
+            session.world.set_block_immediate(3, 6, 0, BlockId::Air);
+        }
+        session
+            .world
+            .set_block_immediate(2, 6, 0, BlockId::SocketMarker);
+    }
+
+    fn capture_doorway_app(dir: &Path, root: &Path, seed: u32, remove_east_jamb: bool) -> GameApp {
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            None,
+            Some(root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            seed,
+            dir.join("capture-doorway.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_capture_doorway_fixture(&mut session, remove_east_jamb);
+        GameApp::new_with_content(cli, session, content, dir.join("background.mcvx"))
+    }
+
+    /// S06-T04: the player path proves a valid doorway marker becomes exactly
+    /// one origin-relative socket and the marker cell is never serialized.
+    #[test]
+    fn capture_socket_marker_becomes_one_socket_and_resets_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let mut app = capture_doorway_app(dir.path(), &root, 81, false);
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(4, 7, 4));
+        assert!(app.capture.begin_naming(Some(&root)));
+        app.submit_capture();
+
+        assert!(!app.capture.is_active(), "a successful save resets capture");
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("saved prefab 'capture' to worldgen/prefabs/capture.toml")
+        );
+
+        let files = capture_test_files_under(&root);
+        assert_eq!(files.len(), 1, "exactly one prefab file is written");
+        assert_eq!(
+            files[0],
+            root.join("prefabs").join("capture.toml"),
+            "the one file is the prefilled name under prefabs/"
+        );
+        let text = std::fs::read_to_string(&files[0]).expect("read written prefab");
+        let parsed =
+            opencraft::world::prefab::parse_prefab(&text).expect("the written prefab parses");
+        assert_eq!(parsed.name, "capture");
+        assert_eq!(parsed.size, [5, 3, 5]);
+        assert_eq!(
+            parsed.sockets,
+            vec![opencraft::world::prefab::PrefabSocket {
+                position: [0, 1, -2],
+                direction: opencraft::world::prefab::Direction::North,
+            }],
+            "the doorway marker becomes exactly one origin-relative north socket"
+        );
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .all(|block| block.block != BlockId::SocketMarker),
+            "no prefab cell may serialize the socket marker"
+        );
+        let marker_cell = parsed
+            .blocks
+            .iter()
+            .find(|block| block.position == [2, 1, 0])
+            .expect("the marker cell is emitted");
+        assert_eq!(marker_cell.block, BlockId::Air, "the marker cell is air");
+    }
+
+    /// S06-T04: an ambiguous marker names its real coordinate on the one
+    /// composed notice row, keeps the prompt and typed name alive, and writes
+    /// nothing under the worldgen root.
+    #[test]
+    fn capture_ambiguous_marker_keeps_prompt_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let mut app = capture_doorway_app(dir.path(), &root, 82, true);
+        assert_eq!(app.worldgen_root.as_deref(), Some(root.as_path()));
+
+        let before = capture_test_files_under(&root);
+        assert!(before.is_empty(), "the fixture starts with no prefab files");
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(4, 7, 4));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(
+            app.capture.naming_value(),
+            "capture",
+            "the typed name is unchanged"
+        );
+        assert_eq!(
+            app.game_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("socket marker at [2, 6, 0] is ambiguous"),
+            "the refusal names the real marker coordinate"
+        );
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains("socket marker at [2, 6, 0] is ambiguous"),
+            "the one notice row carries the reason: {composed}"
+        );
+
+        assert_eq!(
+            capture_test_files_under(&root),
+            before,
+            "an ambiguous marker writes no file"
+        );
+        assert!(
+            !root.join("prefabs").exists(),
+            "no prefabs directory is created by a refused capture"
+        );
+    }
+
+    #[test]
+    fn capture_prompt_gate_and_key_arms_precede_gameplay_routing() {
+        let src = include_str!("main.rs");
+        let prompt_gate = src
+            .find("if self.capture.is_naming()")
+            .expect("the capture prompt gate is present");
+        let inventory_gate = src
+            .find("// Inventory panel owns the keyboard while open (S03-T03)")
+            .expect("the inventory gate is present");
+        assert!(
+            prompt_gate < inventory_gate,
+            "the naming prompt gate must precede every panel and gameplay gate"
+        );
+
+        let keyp = src
+            .find("KeyCode::KeyP if pressed && !event.repeat =>")
+            .expect("the KeyP capture-corner arm is present");
+        let escape_capture = src
+            .find("self.capture.has_corners() =>")
+            .expect("the capture Escape arm is present");
+        let pause = src[keyp..]
+            .find("KeyCode::Escape if pressed && !event.repeat =>")
+            .map(|offset| keyp + offset)
+            .expect("the gameplay Escape arm is present");
+        assert!(
+            keyp < pause && escape_capture < pause,
+            "KeyP and the capture Escape must precede the global Pause arm"
+        );
+    }
+
+    /// S05-T08: opening the name prompt clears every hold the player carried
+    /// into it. The naming gate only consumes *future* events, so a direction
+    /// flag or mouse button that stays live would keep moving/mining/eating
+    /// behind the prompt, and its release would be swallowed past it.
+    #[test]
+    fn capture_prompt_open_clears_every_live_gameplay_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::Playing);
+        insert_test_chunk_with_face_neighbors(&mut app.session, BlockId::Air);
+        app.session
+            .world
+            .set_block_immediate(0, 5, 0, BlockId::Stone);
+        aim_placement_camera(&mut app.session);
+
+        // A live hold state the player can carry into the prompt: movement,
+        // both mouse buttons, a partial mine/meal/draw and an armed drag.
+        app.input.forward = true;
+        app.input.sprint = true;
+        app.left_mouse_held = true;
+        app.right_mouse_held = true;
+        app.mining.tick(
+            0.5,
+            MiningTarget::from_block(IVec3::new(0, 40, 0), BlockId::Stone, None),
+        );
+        app.eating.tick(
+            0.5,
+            Some(EatingTarget::new(0, apple_item(1), 10).expect("apple target")),
+        );
+        app.bow.tick(
+            0.5,
+            Some(BowTarget::new(0, bow_item()).expect("bow target")),
+        );
+        app.inventory_drag = Some(InventoryTarget::Slot(0));
+        assert!(app.mining.progress().is_some());
+        assert!(app.eating.progress().is_some());
+        assert!(app.bow.progress().is_some());
+
+        // The real KeyP path: two raycast presses on the stone block below the
+        // camera. The first selects corner A, the second opens the prompt.
+        app.press_capture_corner();
+        assert!(!app.capture.is_naming(), "one corner leaves gameplay alone");
+        app.press_capture_corner();
+
+        assert!(
+            app.capture.is_naming(),
+            "the second corner opens the prompt"
+        );
+        assert!(
+            !app.input.is_moving(),
+            "no direction flag may survive the prompt"
+        );
+        assert!(!app.left_mouse_held, "the left button hold is cleared");
+        assert!(!app.right_mouse_held, "the right button hold is cleared");
+        assert_eq!(app.mining.progress(), None, "partial mining is cleared");
+        assert_eq!(app.eating.progress(), None, "a partial meal is cleared");
+        assert_eq!(app.bow.progress(), None, "a drawing bow is cleared");
+        assert_eq!(app.inventory_drag, None, "an armed drag is cleared");
+    }
+
+    /// S05-T08: the naming gate swallows the release of a direction key held at
+    /// prompt entry, so the flag must already be false when the prompt closes
+    /// via either exit (Cancel or a successful Submit).
+    #[test]
+    fn capture_prompt_leaves_no_stuck_direction_after_a_swallowed_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            75,
+            dir.path().join("capture-stuck.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        aim_placement_camera(&mut app.session);
+
+        app.input.forward = true;
+        app.press_capture_corner();
+        app.press_capture_corner();
+        assert!(app.capture.is_naming());
+
+        // The gate classifies the held key's release as Consumed and never
+        // routes it to `apply_gameplay_key` (the only writer of the flag), so
+        // the flag stays cleared from prompt entry.
+        assert_eq!(
+            app.capture.key_action(KeyCode::KeyW, None),
+            CaptureKey::Consumed
+        );
+        assert!(
+            !app.input.forward,
+            "the swallowed release must not re-arm the hold"
+        );
+        assert_eq!(
+            app.capture.key_action(KeyCode::Escape, None),
+            CaptureKey::Cancel
+        );
+        app.capture.reset();
+        assert!(!app.input.is_moving(), "Cancel leaves no stuck movement");
+
+        // The successful Submit exit is equally clean.
+        app.input.forward = true;
+        app.press_capture_corner();
+        app.press_capture_corner();
+        assert!(app.capture.is_naming());
+        assert!(
+            !app.input.forward,
+            "re-opening the prompt clears the hold again"
+        );
+        assert_eq!(
+            app.capture.key_action(KeyCode::Enter, None),
+            CaptureKey::Submit
+        );
+        app.submit_capture();
+        assert!(
+            !app.capture.is_active(),
+            "a successful save closes the prompt"
+        );
+        assert!(!app.input.is_moving(), "Submit leaves no stuck movement");
+        assert!(
+            root.join("prefabs").join("capture.toml").is_file(),
+            "the submit cycle still writes exactly one prefab"
+        );
+    }
+
+    #[test]
+    fn capture_failure_keeps_the_prompt_and_composes_the_error_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            74,
+            dir.path().join("capture-failure.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+
+        // Force the collision after the prefill chose the name: the refusal
+        // must keep the prompt and expose the real CaptureError reason.
+        let prefabs = root.join("prefabs");
+        std::fs::create_dir_all(&prefabs).expect("create prefabs");
+        let existing = prefabs.join("capture.toml");
+        std::fs::write(&existing, b"format = 1\nname = \"capture\"\n").expect("write existing");
+        let before = std::fs::read(&existing).expect("read existing");
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), "capture");
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        let error = opencraft::world::capture::CaptureError::AlreadyExists {
+            name: "capture".to_owned(),
+            file: "worldgen/prefabs/capture.toml".to_owned(),
+        };
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains(&error.to_string()),
+            "the composed line must carry the CaptureError Display reason: {composed}"
+        );
+        assert_eq!(
+            std::fs::read(&existing).expect("read existing"),
+            before,
+            "a refused capture leaves the colliding file byte-identical"
+        );
+        assert!(
+            !prefabs.join("capture_2.toml").exists(),
+            "a refused capture writes nothing"
+        );
+    }
+
+    #[test]
+    fn capture_declared_name_collision_reports_once_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            73,
+            dir.path().join("capture-declared-name.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+
+        // A differently named file may still claim the name in its header, so
+        // the declared-name scan must gate the app-level submit too. Writing
+        // it after the prefill proves the refusal is the submit's, not the
+        // prompt's name avoidance.
+        let prefabs = root.join("prefabs");
+        std::fs::create_dir_all(&prefabs).expect("create prefabs");
+        let existing = prefabs.join("renamed.toml");
+        let declared = opencraft::world::prefab::Prefab {
+            name: "capture".to_owned(),
+            origin: [0, 0, 0],
+            size: [1, 1, 1],
+            blocks: vec![opencraft::world::prefab::PrefabBlock {
+                position: [0, 0, 0],
+                block: BlockId::Stone,
+            }],
+            sockets: Vec::new(),
+        };
+        std::fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
+        let before = std::fs::read(&existing).expect("read renamed prefab");
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), "capture");
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        assert_eq!(composed.lines().count(), 1, "{composed}");
+        let error = opencraft::world::capture::CaptureError::AlreadyExists {
+            name: "capture".to_owned(),
+            file: "worldgen/prefabs/renamed.toml".to_owned(),
+        };
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains(&error.to_string()),
+            "the composed line must carry the declared-name collision reason: {composed}"
+        );
+        assert_eq!(
+            std::fs::read(&existing).expect("read renamed prefab"),
+            before,
+            "a refused capture leaves the declaring file byte-identical"
+        );
+        assert!(
+            !prefabs.join("capture.toml").exists(),
+            "a refused capture writes nothing under the typed name"
+        );
+        assert!(
+            !prefabs.join("capture_2.toml").exists(),
+            "a refused capture writes no fallback name"
+        );
+    }
+
+    #[test]
+    fn capture_naming_gate_precedes_gameplay_mouse_handling() {
+        let src = include_str!("main.rs");
+        let naming_gate = "if self.capture.is_naming() {";
+
+        // Wheel: the gate sits inside the arm before the hotbar/palette scroll.
+        let wheel_arm = src
+            .find("WindowEvent::MouseWheel { delta, .. } =>")
+            .expect("the wheel arm is present");
+        let wheel_gate = src[wheel_arm..]
+            .find(naming_gate)
+            .map(|offset| wheel_arm + offset)
+            .expect("the wheel arm must gate naming first");
+        let wheel_scroll = src
+            .find("self.session.player.select_relative(step)")
+            .expect("the hotbar scroll is present");
+        assert!(
+            wheel_gate < wheel_scroll,
+            "the naming gate must precede hotbar scrolling"
+        );
+
+        // Press: the gate sits inside the Pressed arm before gameplay routing.
+        let press_arm = src
+            .find("WindowEvent::MouseInput {\n                state: ElementState::Pressed,")
+            .expect("the press arm is present");
+        let press_gate = src[press_arm..]
+            .find(naming_gate)
+            .map(|offset| press_arm + offset)
+            .expect("the press arm must gate naming first");
+        let right_click = src
+            .find("right_click_interaction(&mut self.session)")
+            .expect("the gameplay right-click path is present");
+        assert!(
+            press_gate > press_arm && press_gate < right_click,
+            "the naming gate must precede mining/placing/station interaction"
+        );
+
+        // Look: the device-event gate sits before the yaw/pitch update.
+        let device = src
+            .find("fn device_event(")
+            .expect("main.rs must define device_event");
+        let look_gate = src[device..]
+            .find(naming_gate)
+            .map(|offset| device + offset)
+            .expect("device_event must gate naming look");
+        let yaw = src
+            .find("self.session.player.yaw +=")
+            .expect("the mouse-look yaw update is present");
+        assert!(
+            look_gate < yaw,
+            "the naming gate must precede camera mouse-look"
+        );
+
+        // Cursor plumbing: the gate sits before the position update so the
+        // pointer cannot drive the world UI while naming.
+        let cursor_arm = src
+            .find("WindowEvent::CursorMoved { position, .. } =>")
+            .expect("the cursor arm is present");
+        let cursor_gate = src[cursor_arm..]
+            .find(naming_gate)
+            .map(|offset| cursor_arm + offset)
+            .expect("the cursor arm must gate naming first");
+        let cursor_store = src
+            .find("self.cursor_pos = Some((position.x as f32, position.y as f32));")
+            .expect("the cursor store is present");
+        assert!(
+            cursor_gate < cursor_store,
+            "the naming gate must precede cursor position handling"
         );
     }
 
@@ -33679,6 +36458,7 @@ stack = 64
             &dir.join("settings.toml"),
             dir.join("packs"),
             Some(&config_dir),
+            None,
         )
     }
 
@@ -33793,6 +36573,7 @@ stack = 64
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
             Some(&dir.path().join("absent-config")),
+            None,
         );
 
         assert_eq!(content.config.rules(), RulesBundle::default());
@@ -33805,6 +36586,214 @@ stack = 64
             config_warnings(&content).is_empty(),
             "missing files are warnings, never startup errors: {:?}",
             content.startup_warnings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M015/S03-T02: village catalog lifecycle (startup content, app installs)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn startup_content_without_a_worldgen_root_loads_an_empty_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            None,
+        );
+
+        assert!(
+            content.village_catalog.is_empty(),
+            "no opt-in root means no worldgen read"
+        );
+        assert!(
+            content.worldgen_root.is_none(),
+            "a headless load must not retain a reload root"
+        );
+        assert!(
+            !content.startup_warnings.iter().any(
+                |warning| warning.field == "worldgen" || warning.field.starts_with("worldgen/")
+            ),
+            "headless loading must not emit worldgen diagnostics: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn startup_content_with_the_checked_in_root_loads_the_reference_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Path::new(opencraft::world::prefab::WORLDGEN_DIR);
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(root),
+        );
+
+        assert_eq!(content.village_catalog.len(), 1);
+        assert_eq!(content.village_catalog.prefabs().len(), 3);
+        assert_eq!(content.worldgen_root.as_deref(), Some(root));
+        assert!(
+            !content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field.starts_with("worldgen")),
+            "the checked-in tree is diagnostic-free: {:?}",
+            content.startup_warnings
+        );
+    }
+
+    #[test]
+    fn village_warnings_split_the_file_from_the_reason() {
+        let warnings = village_warnings(&[
+            "worldgen/villages/plains.toml: could not read file: boom".to_string(),
+            "unlabelled diagnostic".to_string(),
+        ]);
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].field, "worldgen/villages/plains.toml");
+        assert_eq!(warnings[0].reason, "could not read file: boom");
+        assert_eq!(warnings[1].field, "worldgen");
+        assert_eq!(warnings[1].reason, "unlabelled diagnostic");
+    }
+
+    #[test]
+    fn new_with_content_installs_the_catalog_on_the_startup_session_and_leaves_the_background_alone(
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("village.mcvx");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        );
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "14",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = WorldSession::new_session(14, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        assert!(
+            session.world.village_catalog().is_none(),
+            "constructors must stay catalog-free; the app installs at the boundary"
+        );
+
+        let app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        assert_eq!(
+            app.session
+                .world
+                .village_catalog()
+                .map(|catalog| catalog.len()),
+            Some(1),
+            "the startup session must hold the launch catalog"
+        );
+        assert!(
+            app.background.world.village_catalog().is_none(),
+            "the menu background is scenery and must never gain villages"
+        );
+    }
+
+    #[test]
+    fn start_world_session_installs_the_catalog_on_a_swapped_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("swap.mcvx");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        );
+        let cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
+        let startup = WorldSession::new_session(3, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let mut app =
+            GameApp::new_with_content(cli, startup, content, dir.path().join("background.mcvx"));
+
+        let swapped = WorldSession::new_session(14, save_path, DEFAULT_SEASON_LENGTH_DAYS);
+        assert!(
+            swapped.world.village_catalog().is_none(),
+            "a freshly constructed session carries no catalog"
+        );
+
+        app.start_world_session(swapped);
+
+        assert_eq!(
+            app.session
+                .world
+                .village_catalog()
+                .map(|catalog| catalog.len()),
+            Some(1),
+            "every create/load swap must install the app catalog"
+        );
+    }
+
+    #[test]
+    fn reload_village_catalog_reads_the_tree_each_call_and_never_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Missing tree: valid empty content, no diagnostics.
+        let (catalog, diagnostics) = reload_village_catalog(root);
+        assert!(catalog.is_empty());
+        assert!(diagnostics.is_empty(), "missing tree: {diagnostics:?}");
+
+        // One broken definition appears on disk: the next call sees it, which
+        // proves the reload is uncached and never blocks on bad content.
+        let villages = root.join("villages");
+        std::fs::create_dir_all(&villages).expect("create villages dir");
+        std::fs::write(
+            villages.join("broken.toml"),
+            "format = 1\nname = \"broken\"\nbiomes = [\"plains\"]\nhub = \"missing_prefab\"\n",
+        )
+        .expect("write broken village");
+
+        let (catalog, diagnostics) = reload_village_catalog(root);
+        assert!(
+            catalog.is_empty(),
+            "broken content degrades to an empty catalog"
+        );
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert!(
+            diagnostics[0].starts_with("worldgen/villages/broken.toml: "),
+            "diagnostic keeps its logical label: {}",
+            diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn attempt_create_reloads_the_catalog_before_building_the_session() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn attempt_create(&mut self)")
+            .nth(1)
+            .expect("main.rs must define attempt_create");
+        let body = body
+            .split("fn confirm_pending_delete")
+            .next()
+            .expect("attempt_create must precede confirm_pending_delete");
+
+        let reload = body
+            .find("reload_village_catalog(")
+            .expect("attempt_create must reload authored content");
+        let build = body
+            .find("WorldSession::new_session_with_mode_and_registry(")
+            .expect("attempt_create must build the new session");
+        assert!(
+            reload < build,
+            "the reload must assign self.village_catalog before the session is built"
+        );
+        assert!(
+            body.contains("self.village_catalog = catalog;"),
+            "the reload must replace the app catalog, not a local copy"
+        );
+        assert!(
+            body.contains("self.worldgen_root.as_deref()"),
+            "the reload must be gated on the opt-in root"
         );
     }
 
@@ -35476,6 +38465,7 @@ selected_name_secs = 0.5
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
             Some(&config_dir),
+            None,
         );
         let session = startup_session_with(&cli, &content.base_registry, &content.config);
         let traced =
@@ -35681,7 +38671,8 @@ selected_name_secs = 0.5
     /// `settings.toml`.
     fn pack_app(dir: &Path) -> GameApp {
         std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
-        let content = StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None);
+        let content =
+            StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None, None);
         let save_path = dir.join("pack-app.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
@@ -37162,6 +40153,7 @@ selected_name_secs = 0.5
         let content = StartupContent::load(
             &dir.path().join("settings.toml"),
             dir.path().join("packs"),
+            None,
             None,
         );
         assert_eq!(

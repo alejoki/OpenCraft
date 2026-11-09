@@ -561,15 +561,84 @@ pub fn hotbar_slot_rect_ndc(index: usize, aspect: f32) -> (f32, f32, f32, f32) {
     (x0, y0, x0 + slot_w, y1)
 }
 
+/// Push the 12 edges (24 vertices) of an axis-aligned world-space box.
+///
+/// Shared by the opaque-block target wireframe and the capture selection
+/// cage so both use the same edge order and clipping math.
+pub fn push_box_edges(
+    verts: &mut Vec<OverlayVertex>,
+    view_proj: &Mat4,
+    min: Vec3,
+    max: Vec3,
+    color: [f32; 4],
+) {
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    for (a, b) in edges {
+        let ca = *view_proj * corners[a].extend(1.0);
+        let cb = *view_proj * corners[b].extend(1.0);
+        verts.push(OverlayVertex {
+            clip_pos: ca.to_array(),
+            color,
+        });
+        verts.push(OverlayVertex {
+            clip_pos: cb.to_array(),
+            color,
+        });
+    }
+}
+
+/// Normalize a two-corner selection into an inclusive world-space AABB.
+///
+/// Corners may arrive in any order; the returned `(min, max)` is component
+/// wise ordered and the drawn box covers every block in the inclusive range.
+pub fn normalized_selection_bounds(a: IVec3, b: IVec3) -> (Vec3, Vec3) {
+    let min = Vec3::new(
+        a.x.min(b.x) as f32,
+        a.y.min(b.y) as f32,
+        a.z.min(b.z) as f32,
+    );
+    let max = Vec3::new(
+        (a.x.max(b.x) + 1) as f32,
+        (a.y.max(b.y) + 1) as f32,
+        (a.z.max(b.z) + 1) as f32,
+    );
+    (min, max)
+}
+
 pub fn build_overlay_line_vertices(
     view_proj: &Mat4,
     aspect: f32,
     target_block: Option<IVec3>,
+    selection_box: Option<(IVec3, IVec3)>,
     selected_slot: usize,
     show_overlays: bool,
 ) -> Vec<OverlayVertex> {
     // Single gate for every gameplay overlay (3D targeted-block wireframe,
-    // center crosshair, hotbar outlines). Menus draw through UiPass instead.
+    // capture selection cage, center crosshair, hotbar outlines). Menus draw
+    // through UiPass instead.
     if !show_overlays {
         return Vec::new();
     }
@@ -589,43 +658,15 @@ pub fn build_overlay_line_vertices(
             (bpos.y + 1) as f32 + pad,
             (bpos.z + 1) as f32 + pad,
         );
-        let corners = [
-            Vec3::new(min.x, min.y, min.z),
-            Vec3::new(max.x, min.y, min.z),
-            Vec3::new(max.x, min.y, max.z),
-            Vec3::new(min.x, min.y, max.z),
-            Vec3::new(min.x, max.y, min.z),
-            Vec3::new(max.x, max.y, min.z),
-            Vec3::new(max.x, max.y, max.z),
-            Vec3::new(min.x, max.y, max.z),
-        ];
-        let edges = [
-            (0, 1),
-            (1, 2),
-            (2, 3),
-            (3, 0),
-            (4, 5),
-            (5, 6),
-            (6, 7),
-            (7, 4),
-            (0, 4),
-            (1, 5),
-            (2, 6),
-            (3, 7),
-        ];
-        let color = [0.05, 0.05, 0.05, 1.0];
-        for (a, b) in edges {
-            let ca = *view_proj * corners[a].extend(1.0);
-            let cb = *view_proj * corners[b].extend(1.0);
-            verts.push(OverlayVertex {
-                clip_pos: ca.to_array(),
-                color,
-            });
-            verts.push(OverlayVertex {
-                clip_pos: cb.to_array(),
-                color,
-            });
-        }
+        push_box_edges(&mut verts, view_proj, min, max, [0.05, 0.05, 0.05, 1.0]);
+    }
+
+    // 1b. Capture selection cage (12 edges = 24 vertices). The caller keeps
+    // the pair alive while naming, so the cage stays visible through the
+    // prompt. One corner draws a one-block box.
+    if let Some((a, b)) = selection_box {
+        let (min, max) = normalized_selection_bounds(a, b);
+        push_box_edges(&mut verts, view_proj, min, max, [0.10, 0.85, 0.95, 1.0]);
     }
 
     // 2. Center 2D Crosshair
@@ -743,6 +784,9 @@ pub struct FrameView<'a> {
     pub render_distance: i32,
     /// Block-face highlight target, if any.
     pub target_block: Option<IVec3>,
+    /// Two-corner prefab capture selection, if any. Drawn as a cyan cage in
+    /// addition to the target wireframe and kept visible while naming.
+    pub selection_box: Option<(IVec3, IVec3)>,
     /// Selected hotbar slot, drawn as the selection outline.
     pub selected_slot: usize,
 }
@@ -1113,6 +1157,7 @@ impl VoxelRenderer {
             camera,
             render_distance,
             target_block,
+            selection_box,
             selected_slot,
         } = view;
         let FramePresentation {
@@ -1160,8 +1205,14 @@ impl VoxelRenderer {
             bytemuck::bytes_of(&sky_uniform),
         );
 
-        let overlay_verts =
-            build_overlay_line_vertices(&vp, aspect, target_block, selected_slot, show_overlays);
+        let overlay_verts = build_overlay_line_vertices(
+            &vp,
+            aspect,
+            target_block,
+            selection_box,
+            selected_slot,
+            show_overlays,
+        );
         let overlay_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1443,19 +1494,93 @@ mod tests {
 
     #[test]
     fn test_overlay_vertices_include_wireframe_crosshair_and_hotbar() {
-        let verts =
-            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 0, true);
+        let verts = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            None,
+            0,
+            true,
+        );
         // 24 (wireframe) + 4 (crosshair) + 9 * 8 (hotbar) = 100 vertices
         assert_eq!(verts.len(), 100);
     }
 
     #[test]
+    fn test_overlay_selection_cage_adds_24_vertices() {
+        let base = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            None,
+            0,
+            true,
+        );
+        let with_cage = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            Some((IVec3::new(-2, 0, -2), IVec3::new(2, 4, 2))),
+            0,
+            true,
+        );
+        assert_eq!(base.len(), 100);
+        assert_eq!(with_cage.len(), 124);
+        // The cage is appended after the target wireframe and keeps the
+        // existing crosshair/hotbar tail in the same order.
+        let same = |a: &[OverlayVertex], b: &[OverlayVertex]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.clip_pos == y.clip_pos && x.color == y.color)
+        };
+        assert!(same(&with_cage[..24], &base[..24]));
+        // Cage vertices are appended in the distinct cyan color.
+        for v in &with_cage[24..48] {
+            assert_eq!(v.color, [0.10, 0.85, 0.95, 1.0]);
+        }
+        assert!(same(&with_cage[48..], &base[24..]));
+    }
+
+    #[test]
+    fn test_overlay_selection_box_normalizes_reversed_corners() {
+        let a = IVec3::new(-2, 3, -7);
+        let b = IVec3::new(4, 8, 1);
+        let forward =
+            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, None, Some((a, b)), 0, true);
+        let reversed =
+            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, None, Some((b, a)), 0, true);
+        assert_eq!(forward.len(), reversed.len());
+        for (f, r) in forward.iter().zip(reversed.iter()) {
+            assert_eq!(f.clip_pos, r.clip_pos);
+            assert_eq!(f.color, r.color);
+        }
+        assert_eq!(
+            normalized_selection_bounds(a, b),
+            normalized_selection_bounds(b, a)
+        );
+    }
+
+    #[test]
+    fn test_overlay_selection_one_corner_is_one_block() {
+        let (min, max) = normalized_selection_bounds(IVec3::new(5, 40, -3), IVec3::new(5, 40, -3));
+        assert_eq!(min, Vec3::new(5.0, 40.0, -3.0));
+        assert_eq!(max, Vec3::new(6.0, 41.0, -2.0));
+    }
+
+    #[test]
     fn test_overlay_vertices_empty_when_overlays_hidden() {
-        // Non-Playing screens must suppress the wireframe, crosshair, AND
-        // hotbar even when the inputs still carry a target and a selected
-        // slot — the flag alone gates all three.
-        let verts =
-            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, Some(IVec3::new(1, 2, 3)), 4, false);
+        // Non-Playing screens must suppress the wireframe, selection cage,
+        // crosshair, AND hotbar even when the inputs still carry a target,
+        // a selection and a selected slot — the flag alone gates all four.
+        let verts = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            Some(IVec3::new(1, 2, 3)),
+            Some((IVec3::ZERO, IVec3::new(2, 2, 2))),
+            4,
+            false,
+        );
         assert!(verts.is_empty(), "hidden overlays must emit no vertices");
     }
 

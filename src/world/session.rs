@@ -40,12 +40,15 @@ use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
-use crate::world::persistence::{ChestMap, ChunkEditMap, LoadedWorld, WorldSaveData};
+use crate::world::persistence::{
+    ChestMap, ChunkEditMap, LoadedWorld, SavedMob, SavedPlayerState, WorldSaveData,
+};
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
 };
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
+use crate::world::village::VillageCatalog;
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
 /// reachable. Shared with the placement/mining ray length so every world
@@ -1139,6 +1142,28 @@ impl WorldSession {
         self.world_spawn
     }
 
+    /// Install the accepted village catalog on this session's world.
+    ///
+    /// The manager needs the world-spawn column to enforce the village spawn
+    /// exclusion, and deriving it runs the bounded 512-ring
+    /// [`find_spawn_column`] land search. The session already cached that
+    /// position at construction ([`Self::world_spawn`]), so this setter derives
+    /// the column from the cache instead of paying a second search.
+    ///
+    /// A post-construction setter is safe: no chunk is generated before the
+    /// first `update_streaming`, so every constructor can stay signature- and
+    /// behaviour-identical and the caller installs the catalog at the session
+    /// boundary (startup, create, and load swaps). An empty catalog is a
+    /// no-op for generation: the manager keeps its byte-identical legacy
+    /// path.
+    pub fn set_village_catalog(&mut self, catalog: Arc<VillageCatalog>) {
+        let column = (
+            self.world_spawn.x.floor() as i32,
+            self.world_spawn.z.floor() as i32,
+        );
+        self.world.set_village_catalog(catalog, column);
+    }
+
     /// Whether every chunk column that could hold a spawn candidate is
     /// resident and lit.
     ///
@@ -1699,6 +1724,45 @@ impl WorldSession {
     /// The config metadata this session will attach to its next save.
     pub const fn save_config(&self) -> SaveConfigMeta {
         self.save_config
+    }
+
+    /// Build the exact save payload this session writes.
+    ///
+    /// This is the one production projection from live session state to
+    /// [`WorldSaveData`]: `save_current_world` in the binary writes the result
+    /// unchanged, and integration tests exercise the same funnel instead of a
+    /// private re-implementation. Villages are generated content and are never
+    /// persisted — `chunk_edits` is the only world state a save carries — so
+    /// this projection stays independent of whether a catalog is installed and
+    /// cannot grow a prefab field.
+    pub fn to_save_data(&self) -> WorldSaveData {
+        WorldSaveData {
+            seed: self.world.seed(),
+            time_of_day: self.clock.time_of_day,
+            day_index: self.clock.day_index,
+            season_length_days: self.season_length_days,
+            // The stored mode, not the effective one: Edit Background may be
+            // running Creative rules over a Survival world without rewriting it.
+            mode: self.save_mode,
+            player: SavedPlayerState {
+                position: self.player.position.to_array(),
+                yaw: self.player.yaw,
+                pitch: self.player.pitch,
+                fly_mode: self.player.fly_mode,
+                selected_slot: self.player.selected_slot() as u8,
+                render_distance: self.world.render_distance() as u16,
+                inventory: self.player.inventory().clone(),
+                player_grid: self.player.player_grid().clone(),
+                table_grid: self.player.table_grid().clone(),
+                survival: self.player.survival,
+            },
+            chests: self.chests.clone(),
+            // Persist the live mob records here, at the one production save
+            // site. The codec sorts by (kind, position), so the session's list
+            // order never leaks into the file layout.
+            mobs: self.mobs.iter().map(SavedMob::from).collect(),
+            chunk_edits: self.world.chunk_edits().clone(),
+        }
     }
 
     /// The non-blocking note describing how this session's loaded config
@@ -6017,6 +6081,36 @@ mod tests {
             WorldSession::spawn_position(session.world.seed())
         );
         assert!(session.world_spawn().is_finite());
+    }
+
+    #[test]
+    fn set_village_catalog_derives_the_spawn_column_from_world_spawn() {
+        let mut session = WorldSession::new_session(
+            14,
+            PathBuf::from("/nonexistent/village.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        // The derivation input is the cached spawn, and the seed-14 land search
+        // resolves to (0, 0); the derived village exclusion column must match.
+        let spawn = session.world_spawn();
+        let expected = (spawn.x.floor() as i32, spawn.z.floor() as i32);
+        assert_eq!(expected, (0, 0), "seed-14 spawn column is pinned");
+        assert!(session.world.village_catalog().is_none());
+
+        session.set_village_catalog(Arc::new(VillageCatalog::default()));
+
+        assert_eq!(
+            session.world.village_spawn_column(),
+            Some(expected),
+            "the setter must floor the cached world spawn, not run a second search"
+        );
+        assert!(
+            session
+                .world
+                .village_catalog()
+                .is_some_and(|catalog| catalog.is_empty()),
+            "the installed catalog is the one the caller passed"
+        );
     }
 
     #[test]

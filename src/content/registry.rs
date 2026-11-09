@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn modded_blocks_start_at_23_in_sorted_id_order() {
+    fn modded_blocks_start_at_builtin_count_in_sorted_id_order() {
         let mut spec = PackContentSpec::default();
         spec.blocks.push(block_entry("mymod:zeta", "z.png"));
         spec.blocks.push(block_entry("mymod:alpha", "a.png"));
@@ -1348,16 +1348,16 @@ mod tests {
 
         let alpha = registry
             .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("alpha at 23");
+            .expect("alpha at the first modded index");
         let zeta = registry
             .block(BlockId::Modded(BUILTIN_BLOCK_COUNT + 1))
-            .expect("zeta at 24");
+            .expect("zeta at the second modded index");
         assert_eq!(alpha.name, "mymod:alpha");
         assert_eq!(zeta.name, "mymod:zeta");
-        assert_eq!(alpha.id.to_raw(), 23);
-        assert_eq!(zeta.id.to_raw(), 24);
-        assert_eq!(BlockId::from_raw(23), alpha.id);
-        assert_eq!(BlockId::from_raw(24), zeta.id);
+        assert_eq!(alpha.id.to_raw(), BUILTIN_BLOCK_COUNT);
+        assert_eq!(zeta.id.to_raw(), BUILTIN_BLOCK_COUNT + 1);
+        assert_eq!(BlockId::from_raw(BUILTIN_BLOCK_COUNT), alpha.id);
+        assert_eq!(BlockId::from_raw(BUILTIN_BLOCK_COUNT + 1), zeta.id);
         assert_eq!(registry.items().len(), 0);
     }
 
@@ -1389,10 +1389,10 @@ mod tests {
         );
         let alpha = registry
             .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("alpha stays at 23");
+            .expect("alpha stays at the first modded index");
         let zeta = registry
             .block(BlockId::Modded(BUILTIN_BLOCK_COUNT + 1))
-            .expect("zeta stays at 24");
+            .expect("zeta stays at the second modded index");
         assert_eq!(alpha.name, "mymod:alpha");
         assert_eq!(alpha.display_name, "Alpha Two");
         assert_eq!(zeta.name, "mymod:zeta");
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn block_layers_append_from_48_and_cap_at_208_with_fallback_25() {
+    fn block_layers_append_from_48_and_cap_at_208_with_fallback_26() {
         let mut spec = PackContentSpec::default();
         for index in 0..161 {
             let texture = format!("layer_{index:03}.png");

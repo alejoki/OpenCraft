@@ -1,7 +1,7 @@
 /// Stable block identity for built-in terrain plus registry-local modded
 /// content.
 ///
-/// Built-in variants keep explicit discriminants `0..=22`, which are the
+/// Built-in variants keep explicit discriminants `0..=23`, which are the
 /// frozen save-vocabulary raw ids decoded by [`BlockId::from_u8`].
 ///
 /// `#[repr(u8)]` is required: Rust rejects explicit discriminants on an enum
@@ -45,6 +45,14 @@ pub enum BlockId {
     Chest = 21,
     /// Loot-bearing chest variant; world-only, breaks into an ordinary Chest.
     LootChest = 22,
+    /// Socket-authoring marker placed by the Creative build action.
+    ///
+    /// Solid, breakable, and world-only: it blocks movement, sight lines and
+    /// sky light like any terrain block, but it is non-carryable so breaking
+    /// it drops nothing and it never enters the Creative palette. The capture
+    /// and village-plot passes resolve it to a structural socket; this id is
+    /// only the authored marker identity.
+    SocketMarker = 23,
     /// Registry-local modded block identity.
     ///
     /// The payload is a dense registry index with the invariant
@@ -55,9 +63,9 @@ pub enum BlockId {
     Modded(u16),
 }
 
-/// Number of built-in block ids: `0..=22` are the frozen save vocabulary and
+/// Number of built-in block ids: `0..=23` are the frozen save vocabulary and
 /// every modded registry index starts here.
-pub const BUILTIN_BLOCK_COUNT: u16 = 23;
+pub const BUILTIN_BLOCK_COUNT: u16 = 24;
 
 /// The four wheat growth stages in ascending order, index-aligned with
 /// [`BlockId::wheat_stage`].
@@ -90,11 +98,12 @@ impl BlockId {
 
     /// Whether this block can be carried as an inventory item.
     ///
-    /// Air, bedrock, water, farmland, every wheat growth stage, and the
-    /// loot-chest block are world-only. Every other block id, including the
-    /// ordinary [`BlockId::Chest`], can become a stackable item. This is the
-    /// single predicate behind every constructor that rejects uncarryable
-    /// blocks, so the item and legacy hotbar paths cannot drift apart.
+    /// Air, bedrock, water, farmland, every wheat growth stage, the
+    /// loot-chest block, and the socket marker are world-only. Every other
+    /// block id, including the ordinary [`BlockId::Chest`], can become a
+    /// stackable item. This is the single predicate behind every constructor
+    /// that rejects uncarryable blocks, so the item and legacy hotbar paths
+    /// cannot drift apart.
     #[inline]
     pub const fn is_carryable(self) -> bool {
         !matches!(
@@ -108,6 +117,7 @@ impl BlockId {
                 | BlockId::WheatStage2
                 | BlockId::WheatStage3
                 | BlockId::LootChest
+                | BlockId::SocketMarker
         )
     }
 
@@ -173,7 +183,7 @@ impl BlockId {
     }
 
     /// The stable raw identity of this block: the built-in discriminant for
-    /// `0..=22`, or the registry index for [`BlockId::Modded`].
+    /// `0..=23`, or the registry index for [`BlockId::Modded`].
     ///
     /// Total over every representable value, so it is the storage and
     /// comparison identity used by dense chunks, meshes and the registry.
@@ -202,6 +212,7 @@ impl BlockId {
             BlockId::WheatStage3 => 20,
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
+            BlockId::SocketMarker => 23,
             BlockId::Modded(raw) => {
                 debug_assert!(raw >= BUILTIN_BLOCK_COUNT);
                 raw
@@ -211,7 +222,7 @@ impl BlockId {
 
     /// Inverse of [`BlockId::to_raw`], total over every `u16`.
     ///
-    /// Raw values `0..=22` decode to their built-in variant; anything else is
+    /// Raw values `0..=23` decode to their built-in variant; anything else is
     /// a registry-local [`BlockId::Modded`] index.
     pub const fn from_raw(raw: u16) -> Self {
         match raw {
@@ -238,6 +249,7 @@ impl BlockId {
             20 => BlockId::WheatStage3,
             21 => BlockId::Chest,
             22 => BlockId::LootChest,
+            23 => BlockId::SocketMarker,
             _ => BlockId::Modded(raw),
         }
     }
@@ -253,7 +265,7 @@ impl BlockId {
         }
     }
 
-    /// Whether this is one of the frozen built-in ids `0..=22`.
+    /// Whether this is one of the frozen built-in ids `0..=23`.
     pub const fn is_builtin(self) -> bool {
         !matches!(self, BlockId::Modded(_))
     }
@@ -284,6 +296,7 @@ impl BlockId {
             20 => Some(BlockId::WheatStage3),
             21 => Some(BlockId::Chest),
             22 => Some(BlockId::LootChest),
+            23 => Some(BlockId::SocketMarker),
             _ => None,
         }
     }
@@ -338,10 +351,12 @@ impl BlockId {
             BlockId::WheatStage3 => 20,
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
-            // First reserved block placeholder layer (25..=31 are reserved,
+            // Socket-marker art is its own built-in procedural layer (25).
+            BlockId::SocketMarker => 25,
+            // First reserved block placeholder layer (26..=31 are reserved,
             // see `src/render/texture.rs`). Modded content gets real art when
             // the registry owns the texture vocabulary.
-            BlockId::Modded(_) => 25,
+            BlockId::Modded(_) => 26,
         }
     }
 
@@ -370,6 +385,7 @@ impl BlockId {
             BlockId::WheatStage3 => "Wheat Stage 3",
             BlockId::Chest => "Chest",
             BlockId::LootChest => "Loot Chest",
+            BlockId::SocketMarker => "Socket Marker",
             BlockId::Modded(_) => "Modded Block",
         }
     }
@@ -406,6 +422,9 @@ impl BlockId {
             | BlockId::WheatStage2
             | BlockId::WheatStage3 => Some(0.05),
             BlockId::Chest | BlockId::LootChest => Some(0.8),
+            // The authored marker breaks quickly so re-placing a socket is
+            // cheap; it still follows the ordinary break path.
+            BlockId::SocketMarker => Some(0.3),
             // Fail closed until the registry answers hardness in S04: a
             // modded block is unbreakable rather than silently defaulting to
             // a built-in timing.
@@ -468,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_block_ids_roundtrip_and_ore_metadata() {
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(
                 block.to_raw(),
@@ -476,7 +495,8 @@ mod tests {
                 "block id {id} must round-trip"
             );
         }
-        assert_eq!(BlockId::from_u8(23), None);
+        assert_eq!(BlockId::from_u8(23), Some(BlockId::SocketMarker));
+        assert_eq!(BlockId::from_u8(24), None);
         assert_eq!(BlockId::from_u8(99), None);
 
         assert_eq!(BlockId::Water.to_raw(), 15);
@@ -527,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_only_the_crafting_table_is_table_interactable() {
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(
                 block.is_table_interactable(),
@@ -554,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_break_durations_cover_every_breakable_block() {
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             match block {
                 BlockId::Air | BlockId::Bedrock | BlockId::Water => {
@@ -611,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_mined_drop_is_identity_except_stone_and_farmland() {
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected = match block {
                 BlockId::Stone => BlockId::Cobblestone,
@@ -635,7 +655,7 @@ mod tests {
     fn test_solid_and_liquid_matrix_over_every_block_id() {
         // Exactly Air and Water are passable/transparent; Water is the only
         // liquid. Everything else is a solid, non-liquid block.
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected_solid = !matches!(block, BlockId::Air | BlockId::Water);
             assert_eq!(block.is_solid(), expected_solid, "{block:?} solidity");
@@ -653,7 +673,7 @@ mod tests {
         assert!(!BlockId::CraftingTable.is_liquid());
         assert!(BlockId::Water.is_liquid());
         assert!(!BlockId::Water.is_solid());
-        // The seven appended ids are solid terrain, not liquids.
+        // The eight appended ids are solid terrain, not liquids.
         for block in [
             BlockId::Farmland,
             BlockId::WheatStage0,
@@ -662,6 +682,7 @@ mod tests {
             BlockId::WheatStage3,
             BlockId::Chest,
             BlockId::LootChest,
+            BlockId::SocketMarker,
         ] {
             assert!(block.is_solid(), "{block:?} must be solid");
             assert!(!block.is_liquid(), "{block:?} must not be a liquid");
@@ -721,7 +742,7 @@ mod tests {
         assert!(!BlockId::Farmland.is_wheat_stage());
         assert!(!BlockId::Chest.is_wheat_stage());
 
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             assert_eq!(
                 block.is_wheat_stage(),
@@ -733,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_carryability_matrix_over_every_block_id() {
-        for id in 0u8..=22 {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected = !matches!(
                 block,
@@ -746,6 +767,7 @@ mod tests {
                     | BlockId::WheatStage2
                     | BlockId::WheatStage3
                     | BlockId::LootChest
+                    | BlockId::SocketMarker
             );
             assert_eq!(
                 block.is_carryable(),
@@ -765,6 +787,7 @@ mod tests {
             BlockId::WheatStage2,
             BlockId::WheatStage3,
             BlockId::LootChest,
+            BlockId::SocketMarker,
         ] {
             assert!(!block.is_carryable(), "{block:?} must stay world-only");
         }
@@ -853,12 +876,12 @@ mod tests {
 
     #[test]
     fn builtin_block_contract_is_frozen() {
-        // 23-row literal table captured from pre-M010. Every field the rest
+        // 24-row literal table captured from pre-M010. Every field the rest
         // of the engine consumes (raw id, display name, per-face texture
         // layers, hardness, mined drop) is pinned here so S01's storage and
         // registry refactor cannot silently renumber or re-skin a built-in.
         // The stable snake_case registry name arrives in T04, not here.
-        let contract: [BuiltinContractRow<'_>; 23] = [
+        let contract: [BuiltinContractRow<'_>; 24] = [
             (0, "Air", [0, 0, 0, 0, 0, 0], None, BlockId::Air),
             (1, "Grass", [1, 1, 0, 2, 1, 1], Some(0.5), BlockId::Grass),
             (2, "Dirt", [2; 6], Some(0.45), BlockId::Dirt),
@@ -918,8 +941,15 @@ mod tests {
             ),
             (21, "Chest", [21; 6], Some(0.8), BlockId::Chest),
             (22, "Loot Chest", [22; 6], Some(0.8), BlockId::Chest),
+            (
+                23,
+                "Socket Marker",
+                [25; 6],
+                Some(0.3),
+                BlockId::SocketMarker,
+            ),
         ];
-        assert_eq!(contract.len(), 23, "built-in block count is frozen at 23");
+        assert_eq!(contract.len(), 24, "built-in block count is frozen at 24");
 
         for (raw, display_name, faces, hardness, drop) in contract {
             let block = BlockId::from_u8(raw as u8)
@@ -956,25 +986,30 @@ mod tests {
         }
         // Explicit anchors for both sides of the boundary.
         assert_eq!(BlockId::from_raw(22), BlockId::LootChest);
-        assert_eq!(BlockId::from_raw(23), BlockId::Modded(23));
+        assert_eq!(BlockId::from_raw(23), BlockId::SocketMarker);
+        assert_eq!(BlockId::from_raw(24), BlockId::Modded(24));
         assert_eq!(BlockId::from_raw(u16::MAX), BlockId::Modded(u16::MAX));
     }
 
     #[test]
-    fn from_u8_still_rejects_23_to_255() {
+    fn from_u8_rejects_every_modded_raw() {
         // The legacy decode funnel is deliberately u8-only and builtin-only:
         // widening the enum must not let a save byte name modded content.
-        for raw in 23..=u8::MAX {
+        for raw in (BUILTIN_BLOCK_COUNT as u8)..=u8::MAX {
             assert_eq!(BlockId::from_u8(raw), None, "from_u8 must reject {raw}");
         }
-        for raw in 0..=22u8 {
-            assert!(BlockId::from_u8(raw).is_some(), "from_u8 must accept {raw}");
+        for raw in 0..BUILTIN_BLOCK_COUNT {
+            assert!(
+                BlockId::from_u8(raw as u8).is_some(),
+                "from_u8 must accept {raw}"
+            );
         }
     }
 
     #[test]
     fn builtin_u8_is_none_for_modded() {
-        for raw in 0..=22u8 {
+        for raw in 0..BUILTIN_BLOCK_COUNT {
+            let raw = raw as u8;
             let block = BlockId::from_u8(raw).expect("built-in must decode");
             assert_eq!(
                 block.builtin_u8(),
@@ -982,7 +1017,7 @@ mod tests {
                 "built-in {raw} must narrow to its discriminant"
             );
         }
-        for raw in [BUILTIN_BLOCK_COUNT, 24, 255, u16::MAX] {
+        for raw in [BUILTIN_BLOCK_COUNT, BUILTIN_BLOCK_COUNT + 1, 255, u16::MAX] {
             let block = BlockId::Modded(raw);
             assert_eq!(block.builtin_u8(), None, "modded {raw} must not narrow");
             assert_eq!(block.to_raw(), raw);
@@ -1002,7 +1037,7 @@ mod tests {
         // Fail-closed behavior: reserved placeholder art, generic name, no
         // break timing, self drop, and no station interaction.
         for face_dir in 0u8..6 {
-            assert_eq!(modded.face_tex_layer(face_dir), 25);
+            assert_eq!(modded.face_tex_layer(face_dir), 26);
         }
         assert_eq!(modded.name(), "Modded Block");
         assert_eq!(modded.break_duration_secs(), None);
@@ -1013,7 +1048,7 @@ mod tests {
 
     #[test]
     fn builtin_block_count_matches_from_u8() {
-        assert_eq!(BUILTIN_BLOCK_COUNT, 23, "the built-in count is frozen");
+        assert_eq!(BUILTIN_BLOCK_COUNT, 24, "the built-in count is frozen");
         let decodable = (0..=u8::MAX)
             .filter(|&raw| BlockId::from_u8(raw).is_some())
             .count();
@@ -1024,11 +1059,45 @@ mod tests {
         );
         assert_eq!(
             BlockId::from_raw(BUILTIN_BLOCK_COUNT - 1),
-            BlockId::LootChest
+            BlockId::SocketMarker
         );
         assert_eq!(
             BlockId::from_raw(BUILTIN_BLOCK_COUNT),
             BlockId::Modded(BUILTIN_BLOCK_COUNT)
         );
+    }
+
+    #[test]
+    fn socket_marker_identity_is_non_carryable_and_light_opaque() {
+        let marker = BlockId::SocketMarker;
+        assert_eq!(marker.to_raw(), 23);
+        assert_eq!(marker.name(), "Socket Marker");
+        assert!(marker.is_builtin());
+        assert_eq!(BlockId::from_raw(23), marker);
+        assert_eq!(BlockId::from_u8(23), Some(marker));
+        assert_eq!(marker.builtin_u8(), Some(23));
+
+        // Solid by the production opacity rule: collision, raycast, opaque
+        // meshing, and sky-light occlusion all consume `is_solid`.
+        assert!(marker.is_solid());
+        assert!(!marker.is_liquid());
+        assert!(!marker.is_wheat_stage());
+        assert!(!marker.is_table_interactable());
+        assert!(!marker.is_container_interactable());
+
+        // World-only: no item may be constructed from it, so a break leaves
+        // nothing behind. `mined_drop` stays on the identity arm because
+        // `BlockDef::from_builtin` turns non-carryable blocks into `drop: None`.
+        assert!(!marker.is_carryable());
+        assert_eq!(marker.mined_drop(), marker);
+
+        assert_eq!(marker.break_duration_secs(), Some(0.3));
+        for face_dir in 0u8..6 {
+            assert_eq!(
+                marker.face_tex_layer(face_dir),
+                25,
+                "socket marker face {face_dir} must use layer 25"
+            );
+        }
     }
 }

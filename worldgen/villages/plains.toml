@@ -1,0 +1,14 @@
+format = 1
+name = "plains"
+biomes = ["plains", "forest"]
+hub = "plains_hub"
+spacing = 4
+min_prefabs = 10
+max_prefabs = 20
+max_slope = 6
+
+[pool]
+house = ["small_house"]
+farm = ["wheat_farm"]
+well = []
+junction = ["plains_hub"]
