@@ -437,7 +437,8 @@ has_slice R085 M015/S04 || fail "no requirement maps to M015/S04 (expected R085)
 has_slice R086 M015/S05 || fail "no requirement maps to M015/S05 (expected R086)"
 has_slice R087 M015/S06 || fail "no requirement maps to M015/S06 (expected R087)"
 has_slice R088 M015/S07 || fail "no requirement maps to M015/S07 (expected R088)"
-pass "M015 slices S01-S07 are each mapped to at least one requirement"
+has_slice R084 M015/S08 || fail "no requirement maps to M015/S08 (expected R084)"
+pass "M015 slices S01-S08 are each mapped to at least one requirement"
 
 # ---------------------------------------------------------------------------
 # 7. Criterion trace tables, parsed section-scoped.
@@ -1095,7 +1096,7 @@ declare -A expected_sl_m15=(
     [4]="S02"
     [5]="S02,S03"
     [6]="S03"
-    [7]="S03"
+    [7]="S03,S08"
     [8]="S04,S06"
     [9]="S01,S02,S07"
     [10]="S01,S02,S03,S05"

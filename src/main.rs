@@ -26571,6 +26571,87 @@ stack = 64
     }
 
     #[test]
+    fn capture_declared_name_collision_reports_once_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("worldgen");
+        let content = StartupContent::load(
+            &dir.path().join("settings.toml"),
+            dir.path().join("packs"),
+            None,
+            Some(&root),
+        );
+        let cli = CliConfig::parse_args(Vec::<String>::new());
+        let mut session = WorldSession::new_session(
+            73,
+            dir.path().join("capture-declared-name.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        insert_test_chunk_with_face_neighbors(&mut session, BlockId::Air);
+        session.world.set_block_immediate(0, 5, 0, BlockId::Stone);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+
+        let _ = app.capture.press_corner(IVec3::new(0, 5, 0));
+        let _ = app.capture.press_corner(IVec3::new(1, 6, 1));
+        assert!(app.capture.begin_naming(Some(&root)));
+        assert_eq!(app.capture.naming_value(), "capture");
+
+        // A differently named file may still claim the name in its header, so
+        // the declared-name scan must gate the app-level submit too. Writing
+        // it after the prefill proves the refusal is the submit's, not the
+        // prompt's name avoidance.
+        let prefabs = root.join("prefabs");
+        std::fs::create_dir_all(&prefabs).expect("create prefabs");
+        let existing = prefabs.join("renamed.toml");
+        let declared = opencraft::world::prefab::Prefab {
+            name: "capture".to_owned(),
+            origin: [0, 0, 0],
+            size: [1, 1, 1],
+            blocks: vec![opencraft::world::prefab::PrefabBlock {
+                position: [0, 0, 0],
+                block: BlockId::Stone,
+            }],
+            sockets: Vec::new(),
+        };
+        std::fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
+        let before = std::fs::read(&existing).expect("read renamed prefab");
+
+        app.submit_capture();
+
+        assert!(app.capture.is_naming(), "the prompt stays for a retry");
+        assert_eq!(app.capture.naming_value(), "capture");
+        let prompt = app.capture.prompt_line().expect("prompt line");
+        let message = app
+            .game_message
+            .as_ref()
+            .map(|message| message.text.as_str());
+        let composed = capture_notice_line(Some(&prompt), message).expect("one notice line");
+        assert_eq!(composed.lines().count(), 1, "{composed}");
+        let error = opencraft::world::capture::CaptureError::AlreadyExists {
+            name: "capture".to_owned(),
+            file: "worldgen/prefabs/renamed.toml".to_owned(),
+        };
+        assert!(composed.starts_with(&prompt), "{composed}");
+        assert!(
+            composed.contains(&error.to_string()),
+            "the composed line must carry the declared-name collision reason: {composed}"
+        );
+        assert_eq!(
+            std::fs::read(&existing).expect("read renamed prefab"),
+            before,
+            "a refused capture leaves the declaring file byte-identical"
+        );
+        assert!(
+            !prefabs.join("capture.toml").exists(),
+            "a refused capture writes nothing under the typed name"
+        );
+        assert!(
+            !prefabs.join("capture_2.toml").exists(),
+            "a refused capture writes no fallback name"
+        );
+    }
+
+    #[test]
     fn capture_naming_gate_precedes_gameplay_mouse_handling() {
         let src = include_str!("main.rs");
         let naming_gate = "if self.capture.is_naming() {";

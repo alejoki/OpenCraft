@@ -844,9 +844,9 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Status: active
 - Description: Production village state lives behind an `Arc<VillageCatalog>` with a cached spawn column, dispatches from both worldgen call sites, carries across a season rollover, installs only at new-world or session boundaries, and surfaces diagnostics as warnings. Player edits win so existing cells never re-place, `SAVE_VERSION` stays 9, and no prefab name appears in save bytes or the content table. With villages enabled the measured release dispatch budget is p95 <= 8 ms and max <= 16 ms, with frame p95 <= 16.6 ms.
 - Why it matters: Adding content to worldgen must not disturb saves or the frame budget, and refilling must never overwrite what the player built.
-- Source: M015 / S03 lifecycle and budgets
+- Source: M015 / S03 lifecycle and S08 budget proof
 - Primary owning slice: M015/S03
-- Supporting slices: M015/S05, M015/S06
+- Supporting slices: M015/S05, M015/S06, M015/S08
 - Validation: cargo test --locked --test village_session; cargo test --locked --test village_continuity; cargo test --release --locked --lib -- --ignored streaming_budget_villages; cargo test --release --locked --test village_frame_budget -- --ignored
 
 ### R085 — BlockId::SocketMarker as the 24th built-in with layer 25 reserved for sockets
@@ -1019,7 +1019,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 4 | R083 | S02 | cargo test --locked --lib -- world::village; cargo run --locked --quiet -- --demo-village |
 | 5 | R083, R084 | S02, S03 | cargo test --locked --lib -- world::village; cargo test --locked --test village_session |
 | 6 | R084, R064 | S03 | cargo test --locked --test village_continuity; cargo test --locked --test save_v9_cli |
-| 7 | R084 | S03 | cargo test --release --locked --lib -- --ignored streaming_budget_villages; cargo test --release --locked --test village_frame_budget -- --ignored |
+| 7 | R084 | S03, S08 | cargo test --release --locked --lib -- --ignored streaming_budget_villages; cargo test --release --locked --test village_frame_budget -- --ignored; SMOKE_PROFILE=release SMOKE_BUDGET=1 bash scripts/village_smoke.sh |
 | 8 | R085, R087, R065 | S04, S06 | cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v9_cli; bash scripts/village_smoke.sh |
 | 9 | R088, R069 | S01, S02, S07 | bash scripts/village_smoke.sh; SMOKE_PROFILE=release bash scripts/village_smoke.sh; bash scripts/requirements_check.sh |
 | 10 | R082, R083 | S01, S02, S03, S05 | cargo test --locked --test worldgen_cli; cargo test --locked --test village_cli; cargo test --locked --test capture_cli |

@@ -77,6 +77,7 @@
 #  69. M015 row ownership reverted to another milestone
 #  70. missing M015 criterion trace row
 #  71. M015 row with an empty Validation field
+#  72. reverted M015 criterion 7 slice mapping
 #
 # Cases 8-11 exercise the M004 checker surface added with R016-R020, cases
 # 12-15 exercise the M005 surface added with R021-R026, cases 16-18 exercise
@@ -86,7 +87,7 @@
 # cases 37-43 exercise the M009 surface added with R045-R054, cases 44-50
 # exercise the M013 surface added with R055-R061, cases 51-57 exercise the
 # M010 surface added with R062-R070, cases 58-64 exercise the M014
-# surface added with R071-R081, and cases 65-71 exercise the M015 surface
+# surface added with R071-R081, and cases 65-72 exercise the M015 surface
 # added with R082-R088. The canonical registry carries 88 records (R001-R088)
 # across ten criterion tables, which all restart their row
 # numbers at 1, so these cases plus the positive control prove the checker
@@ -1279,6 +1280,24 @@ fi
 grep -q 'R084 has an empty Validation field' "$CHECK_LOG" \
     || { echo "FAIL: malformed M015 row was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
 echo "PASS: malformed M015 row rejected"
+
+# --- Case 72: reverted M015 criterion 7 slice mapping -------------------
+# Row 7's budget evidence is owned by S03 and proved by S08, so dropping S08
+# from its Slices cell must fail the M015 criterion-7 slice assertion (the
+# criterion-7 requirement cell still names R084, so only the slice gate can
+# catch it).
+case72="$(new_case "$SCRATCH/case72.md")"
+sed -i 's/^| 7 | R084 | S03, S08 |/| 7 | R084 | S03 |/' "$case72"
+assert_mutated "M015 criterion 7 slices" "$case1" "$case72"
+rc=0
+run_checker "$case72" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: reverted M015 criterion 7 slice mapping should have been rejected but the checker exited 0" >&2
+    exit 1
+fi
+grep -q 'M015 criterion 7 slices' "$CHECK_LOG" \
+    || { echo "FAIL: reverted M015 criterion 7 slice mapping was rejected for the wrong reason" >&2; sed 's/^/  checker: /' "$CHECK_LOG" >&2; exit 1; }
+echo "PASS: reverted M015 criterion 7 slice mapping rejected"
 
 # --- Canonical registry must be untouched --------------------------------
 cmp -s "$PRISTINE" "$REGISTRY" \
