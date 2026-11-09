@@ -20,14 +20,23 @@ pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
 
 pub struct WorldManager {
-    chunks: FxHashMap<ChunkPos, Chunk>,
+    /// Resident chunks, shared behind `Arc` so a light or mesh job can take a
+    /// consistent snapshot of the block data with an O(1) handle clone instead
+    /// of deep-cloning up to 54 block arrays on the frame thread.
+    ///
+    /// Ownership rule: mutation goes through `Arc::make_mut`, so a snapshot
+    /// held by an in-flight job keeps its pre-edit blocks (copy-on-write). Do
+    /// not put the `Arc` inside `Chunk`/`ChunkStorage`; that would add an
+    /// atomic uniqueness check to every generated block and every light BFS
+    /// cell.
+    chunks: FxHashMap<ChunkPos, Arc<Chunk>>,
     pending_gen: FxHashSet<ChunkPos>,
     pending_mesh: FxHashSet<ChunkPos>,
     meshed_chunks: FxHashSet<ChunkPos>,
     dirty_mesh_queue: FxHashSet<ChunkPos>,
     /// Per-chunk sky-light grids (D038/D044). Derived data only: never
     /// persisted, recomputed deterministically from chunks + edits.
-    light_grids: FxHashMap<ChunkPos, LightGrid>,
+    light_grids: FxHashMap<ChunkPos, Arc<LightGrid>>,
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
     mesh_tx: Sender<(ChunkPos, ChunkMesh)>,
@@ -121,7 +130,7 @@ struct LightJobResult {
 /// exactly; the only difference is that the block source is the detached map
 /// the frame thread handed to rayon, so the worker never touches manager state.
 fn compute_light_region_snapshot(
-    chunks: &FxHashMap<ChunkPos, Chunk>,
+    chunks: &FxHashMap<ChunkPos, Arc<Chunk>>,
     cx0: i32,
     cx1: i32,
     cz0: i32,
@@ -149,8 +158,9 @@ fn compute_light_region_snapshot(
 
 /// Per-frame ceilings for the light pipeline. Grid application is cheap (map
 /// inserts plus mesh-queue dirt) but result payloads are large; dispatch is
-/// limited because snapshotting clones up to 54 chunk block arrays on the frame
-/// thread. Both are well below the MEM229 8 ms p95 budget.
+/// limited because snapshotting still touches up to 54 map entries on the frame
+/// thread (the block arrays themselves are `Arc`-shared, so this is a handle
+/// clone, not a deep copy). Both are well below the MEM229 8 ms p95 budget.
 const LIGHT_RESULT_DRAIN_BUDGET: usize = 8;
 const LIGHT_DISPATCH_BUDGET: usize = 4;
 
@@ -318,7 +328,7 @@ impl WorldManager {
     }
 
     pub fn insert_chunk_for_test(&mut self, pos: ChunkPos, chunk: Chunk) {
-        self.chunks.insert(pos, chunk);
+        self.chunks.insert(pos, Arc::new(chunk));
     }
 
     #[inline]
@@ -538,7 +548,7 @@ impl WorldManager {
             if !changed {
                 continue;
             }
-            self.light_grids.insert(pos, grid);
+            self.light_grids.insert(pos, Arc::new(grid));
             changed_any = true;
             changed_positions.push(pos);
             if self.meshed_chunks.contains(&pos) || self.pending_mesh.contains(&pos) {
@@ -640,7 +650,7 @@ impl WorldManager {
                 continue;
             }
 
-            let mut chunks: FxHashMap<ChunkPos, Chunk> = FxHashMap::default();
+            let mut chunks: FxHashMap<ChunkPos, Arc<Chunk>> = FxHashMap::default();
             let mut complete_columns: FxHashSet<(i32, i32)> = FxHashSet::default();
             for dx in -1..=1 {
                 for dz in -1..=1 {
@@ -652,7 +662,7 @@ impl WorldManager {
                     for cy in MIN_CHUNK_Y..=MAX_CHUNK_Y {
                         let pos = ChunkPos::new(ccx, cy, ccz);
                         if let Some(chunk) = self.chunks.get(&pos) {
-                            chunks.insert(pos, chunk.clone());
+                            chunks.insert(pos, Arc::clone(chunk));
                         }
                     }
                 }
@@ -1021,6 +1031,9 @@ impl WorldManager {
         let Some(chunk) = self.chunks.get_mut(&cpos) else {
             return Vec::new();
         };
+        // Copy-on-write: an in-flight light/mesh job may still hold the old
+        // handle, and it must keep reading the pre-edit blocks.
+        let chunk = Arc::make_mut(chunk);
         chunk.set(lx, ly, lz, block);
         chunk.try_compress();
 
@@ -1181,7 +1194,7 @@ impl WorldManager {
     /// The caller has already re-applied `chunk_edits`, so edits always win:
     /// mined blocks stay mined while the surroundings turn white.
     fn swap_resident_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
-        self.chunks.insert(pos, chunk);
+        self.chunks.insert(pos, Arc::new(chunk));
 
         // Sky light is derived from these blocks. Drop the whole (x, z)
         // column BEFORE asking for light: `propagate_light_for_completed_column`
@@ -1259,7 +1272,7 @@ impl WorldManager {
             if replacement {
                 self.swap_resident_chunk(pos, chunk);
             } else {
-                self.chunks.insert(pos, chunk);
+                self.chunks.insert(pos, Arc::new(chunk));
 
                 // Column-ready trigger: this chunk may be the last piece of a
                 // full 192-block column. Only enqueue here; the light BFS runs
@@ -1473,9 +1486,10 @@ impl WorldManager {
             });
         }
 
-        // 8. Hand queued columns to rayon last, so snapshot cloning (up to 54
-        //    chunks of block data) never delays this frame's mesh dispatch. The
-        //    worker results are applied by step 2 of a later frame.
+        // 8. Hand queued columns to rayon last, so snapshotting (up to 54
+        //    `Arc` handle clones, not block-array copies) never delays this
+        //    frame's mesh dispatch. The worker results are applied by step 2
+        //    of a later frame.
         self.dispatch_light_jobs();
 
         (completed_meshes, unloaded)
@@ -1561,6 +1575,34 @@ mod tests {
         assert!(
             !completed.iter().any(|(p, _)| *p == cpos),
             "stale in-flight mesh must be ignored after set_block_immediate"
+        );
+    }
+
+    #[test]
+    fn arc_snapshot_is_isolated_from_later_edits() {
+        let mut mgr = WorldManager::new(4);
+        let cpos = ChunkPos::new(0, 0, 0);
+        mgr.insert_chunk_for_test(cpos, Chunk::new_uniform(BlockId::Stone));
+        for dir in [
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 0, 1),
+            ChunkPos::new(0, 0, -1),
+        ] {
+            mgr.insert_chunk_for_test(dir, Chunk::new_uniform(BlockId::Air));
+        }
+
+        // Stand in for an in-flight mesh/light job: keep the handle it would
+        // have snapshotted before the edit.
+        let snapshot = Arc::clone(mgr.chunks.get(&cpos).expect("center is resident"));
+        let _ = mgr.set_block_immediate(5, 5, 5, BlockId::Air);
+
+        assert_eq!(snapshot.get(5, 5, 5), BlockId::Stone);
+        assert_eq!(
+            mgr.chunks.get(&cpos).expect("center stays resident").get(5, 5, 5),
+            BlockId::Air
         );
     }
 
@@ -2793,7 +2835,7 @@ mod tests {
 
         // Uniform-light baseline: same geometry, every corner lit 15.
         for grid in mgr.light_grids.values_mut() {
-            *grid = light::full_light_grid();
+            *grid = Arc::new(light::full_light_grid());
         }
         let uniform = mesh_total(&mgr);
 
