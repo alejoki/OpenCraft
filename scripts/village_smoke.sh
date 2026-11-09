@@ -7,8 +7,8 @@
 #   Docs gate: tracked docs/WORLDGEN.md and README.md carry the authoring CLI
 #     entry points (--demo-capture, --validate-worldgen, --demo-village), the
 #     content paths, the smoke-script invocation, the profile switch, socket
-#     markers, and the TOML sections. Neither docs/UAT-M015.md (git-ignored) nor
-#     any other untracked file is required, so a fresh clone passes.
+#     markers, and the TOML sections. Neither the git-ignored human-runbook doc
+#     nor any other untracked file is required, so a fresh clone passes.
 #
 #   Validator matrix: --validate-worldgen pins clean, invalid-TOML, oversize,
 #     duplicate-name, and missing-tree runs whole-line, including the exit code
