@@ -80,3 +80,7 @@ REQUIREMENTS-REGISTRY.md
 
 # Rootless ALSA devel extraction (machine-local build prerequisite)
 /.toolchain/
+
+# Local UAT scratch dirs and milestone UAT reports (not part of the game)
+/.uat-*/
+docs/UAT-M*.md
