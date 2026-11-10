@@ -44,7 +44,7 @@ use opencraft::player::raycast::raycast_voxels;
 use opencraft::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HUNGER};
 use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
-use opencraft::render::mob::{build_mob_batch, build_mob_vertices, MobAnim};
+use opencraft::render::mob::{build_mob_batch_into, build_mob_vertices, MobAnim, MobVertex};
 use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
 use opencraft::settings::keybind::key_to_string;
@@ -8441,6 +8441,9 @@ struct GameApp {
     /// `on_session_installed` so a new world never inherits a half-drained
     /// timer from the old one; only the real Playing frame ticks it.
     mob_idle: MobIdleGate,
+    /// Reused per-frame mob/arrow CPU batch (M016/S08): cleared and refilled
+    /// in place by build_mob_batch_into, so a steady frame allocates nothing.
+    mob_vertices: Vec<MobVertex>,
     /// Fail-soft sound engine (M005/S04). Construction never blocks launch;
     /// `play` is a silent no-op when no device was opened. Every call site is
     /// confined to `window_event`/`menu_click`/`screen_click` arms so the
@@ -8980,6 +8983,7 @@ impl GameApp {
             melee: MeleeState::new(),
             bow: BowState::new(),
             mob_idle: MobIdleGate::default(),
+            mob_vertices: Vec::new(),
             audio,
             left_mouse_held: false,
             right_mouse_held: false,
@@ -13627,15 +13631,22 @@ impl ApplicationHandler for GameApp {
                         eye_is_submerged(&self.session.world, self.session.camera.position);
                     // Batched mob geometry for this frame (D136): one
                     // world-space vertex slice for every resident, in-frustum
-                    // mob. Built once per frame from the live session; an
-                    // empty mob list produces an empty slice and therefore no
-                    // GPU buffer allocation inside render_frame.
+                    // mob. Refilled in place each frame from the live session
+                    // into the buffer retained on `GameApp` (M016/S08), so a
+                    // steady frame allocates nothing; an empty mob list leaves
+                    // the slice empty and therefore produces no GPU buffer
+                    // allocation inside render_frame.
                     let aspect = gpu.ctx.config.width as f32 / gpu.ctx.config.height.max(1) as f32;
-                    let mob_vertices = build_mob_batch(&self.session, &self.session.camera, aspect);
+                    build_mob_batch_into(
+                        &mut self.mob_vertices,
+                        &self.session,
+                        &self.session.camera,
+                        aspect,
+                    );
                     gpu.renderer.render_frame(
                         &gpu.ctx,
                         &gpu.render_store,
-                        &mob_vertices,
+                        &self.mob_vertices,
                         FrameView {
                             camera: &self.session.camera,
                             render_distance: self.session.world.render_distance(),
@@ -17722,6 +17733,35 @@ mod tests {
         assert!(
             validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
             "validate-pack must precede the demo-ui branch"
+        );
+    }
+
+    #[test]
+    fn playing_frame_builds_mobs_into_the_reused_buffer() {
+        // No headless test can execute the GPU render arm, so pin its shape in
+        // the real binary source (M016/S08): the Playing frame must refill the
+        // batch buffer retained on `GameApp` in place and hand that same
+        // buffer to the renderer, never build a fresh `Vec` every frame.
+        let source = include_str!("main.rs");
+        let arm = source
+            .split("build_mob_batch_into(")
+            .nth(1)
+            .and_then(|rest| rest.split("FrameView {").next())
+            .expect("the Playing arm must call build_mob_batch_into");
+        assert!(
+            arm.contains("&mut self.mob_vertices"),
+            "the Playing frame must refill the retained mob_vertices buffer in place"
+        );
+        assert!(
+            arm.contains("&self.mob_vertices"),
+            "the renderer must receive the retained mob_vertices buffer"
+        );
+        // Build the prohibited needle at runtime: a plain literal would match
+        // itself inside this included `main.rs` source.
+        let allocating = ["let mob_vertices = ", "build_mob_batch("].concat();
+        assert!(
+            !source.contains(&allocating),
+            "the frame path must not allocate a fresh mob batch every frame"
         );
     }
 
