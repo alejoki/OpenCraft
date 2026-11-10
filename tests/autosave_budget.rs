@@ -267,8 +267,13 @@ fn big_edits_hits_the_requested_edit_count() {
 #[test]
 #[ignore = "release-only save-budget harness: cargo test --locked --release --test autosave_budget -- --ignored --nocapture"]
 fn autosave_release_frame_budget() {
+    // Release-only guard: a debug build must never be able to "pass" this
+    // gate. The condition is bound to a local first because
+    // `assert!(cfg!(...))` trips `clippy::assertions_on_constants` in the
+    // debug `--no-run` build; this keeps the guard a runtime check.
+    let release_build = !cfg!(debug_assertions);
     assert!(
-        !cfg!(debug_assertions),
+        release_build,
         "autosave_budget is release-only: run cargo test --locked --release --test autosave_budget -- --ignored --nocapture"
     );
 
