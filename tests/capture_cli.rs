@@ -317,8 +317,16 @@ fn regular_file_root_exits_1_with_one_readable_error_and_no_writes() {
         "exactly one readable error line expected\n{}",
         report(&output)
     );
+    // Unix reports ENOTDIR (`NotADirectory`) when a directory component is a
+    // regular file; Windows surfaces the same condition as
+    // ERROR_ALREADY_EXISTS (`AlreadyExists`). Both must stay one readable
+    // write failure that leaves the blocking file untouched.
+    #[cfg(unix)]
+    let expected_reason = "not a directory";
+    #[cfg(windows)]
+    let expected_reason = "already exists";
     assert!(
-        errors[0].contains("not a directory"),
+        errors[0].contains(expected_reason),
         "the error must name the filesystem reason\n{}",
         report(&output)
     );
