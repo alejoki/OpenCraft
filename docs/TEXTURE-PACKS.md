@@ -279,6 +279,7 @@ Image rules:
 - Any size in that range is resampled to the game's 16-by-16 texture grid, so you can author at 16, 32, 64, 128, or 256 pixels and still get a crisp result.
 - A missing file is fine and silently keeps the built-in texture for that block.
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
+- Every PNG file and `pack.toml` is limited to 1 MiB (1048576 bytes). A larger file falls back with a warning that names the file and the limit.
 - Partial packs always work — add one texture or all twenty-five.
 
 ## Mob textures
@@ -521,7 +522,10 @@ Warnings appear in the Settings menu as `name: reason` lines, joined together if
 | `stone.png: failed to read PNG header ...` or `failed to decode PNG ...` | The file is not a readable PNG. | Re-export the image as PNG. |
 | `stone.png: image is 32x16, layers must be square` | A block texture is not square. | Crop or resize it to equal width and height. |
 | `stone.png: image is 8x8, layers must be between 16 and 256 pixels per side` | A block texture is outside the accepted size range. | Resize it to 16 to 256 pixels per side. |
-| `logo.png: ... larger than the 1024 px logo limit` | The logo is too large. | Resize the logo to 1024 pixels or less per side. |
+| `stone.png: ... is 512x512, larger than the 256 px limit` | The PNG header declares an image larger than the 256-pixel cap, so it is rejected before decoding. | Resize it to 256 pixels or less per side. |
+| `stone.png: ... bytes, larger than the 1048576 byte limit` | The PNG file is larger than the 1 MiB cap. | Re-export it at a smaller size or with more compression. |
+| `pack.toml: ... manifest is ... bytes, larger than the 1048576 byte limit` | The manifest is larger than the 1 MiB cap, so the default manifest and textures were used. | Trim the manifest to the fields the pack needs. |
+| `logo.png: ... larger than the 1024 px limit` | The logo is too large. | Resize the logo to 1024 pixels or less per side. |
 | `my-pack: pack folder ... is missing` | `settings.toml` points at a pack folder that no longer exists. | Restore the folder, or disable that pack on the Packs screen. |
 | `break.wav: failed to decode sound file ...` | The file is not readable audio in a supported format. | Re-export it as WAV, Ogg Vorbis, FLAC, MP3, or M4A. |
 | `break.wav: sound file is ... bytes, the limit is 1048576 bytes` | The sound file is larger than the 1 MiB cap. | Shorten it or export at a lower bitrate. |
