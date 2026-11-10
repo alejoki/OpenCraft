@@ -13,6 +13,7 @@
 //! Everything here is GPU- and audio-device-free pure data plus filesystem
 //! reads, mirroring [`crate::pack::load_pack_from_dir`]'s never-fail contract.
 
+use std::io::Read;
 use std::path::Path;
 
 use crate::content::spec::{ContentDiagnostic, PackContentSpec};
@@ -34,6 +35,43 @@ use crate::settings::SettingsWarning;
 pub(crate) const MIN_LAYER_SIDE: u32 = 16;
 /// Largest accepted layer side length, in pixels.
 pub(crate) const MAX_LAYER_SIDE: u32 = 256;
+
+/// Largest accepted `pack.toml` file, in bytes.
+const MAX_MANIFEST_BYTES: u64 = asset::PACK_ASSET_BYTE_CAP;
+
+/// Read one `pack.toml` with a metadata-first size and file-type guard.
+///
+/// Returns the manifest text without any path prefix: callers own the path
+/// wording so the watcher status line keeps its pinned `failed to read:`
+/// shape while the loader names the folder. A FIFO or other non-regular file
+/// is rejected from metadata alone, so a hostile manifest cannot block the
+/// open or allocate an attacker-sized buffer.
+pub fn read_manifest_text(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|err| err.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
+            metadata.len()
+        ));
+    }
+
+    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    let mut text = String::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|err| err.to_string())?;
+    if text.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
+            text.len()
+        ));
+    }
+
+    Ok(text)
+}
 
 /// What one pack authors, before any fallback is applied.
 ///
@@ -81,7 +119,7 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     let mut warnings = Vec::new();
 
     let manifest_path = dir.join("pack.toml");
-    let (manifest, root, mut manifest_warnings) = match std::fs::read_to_string(&manifest_path) {
+    let (manifest, root, mut manifest_warnings) = match read_manifest_text(&manifest_path) {
         Ok(text) => manifest::parse_pack_file(&text),
         Err(err) => {
             warnings.push(SettingsWarning {
@@ -843,6 +881,47 @@ hardness = 1.0
         assert!(spec.warnings[0]
             .reason
             .contains("content arrays require format_version = 2"));
+    }
+
+    #[test]
+    fn oversized_manifest_warns_once_and_uses_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "huge");
+        fs::write(
+            dir.join("pack.toml"),
+            vec![b' '; asset::PACK_ASSET_BYTE_CAP as usize + 1],
+        )
+        .unwrap();
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.warnings.len(), 1, "{:?}", spec.warnings);
+        assert_eq!(spec.warnings[0].field, "pack.toml");
+        assert!(
+            spec.warnings[0]
+                .reason
+                .contains("manifest is 1048577 bytes"),
+            "{}",
+            spec.warnings[0].reason
+        );
+        assert!(
+            spec.warnings[0].reason.contains("1048576"),
+            "{}",
+            spec.warnings[0].reason
+        );
+        assert_eq!(spec.manifest.name, None);
+        assert_eq!(spec.manifest.version, None);
+        assert_eq!(
+            spec.format_version,
+            crate::pack::manifest::PackFormat::V1,
+            "an unreadable manifest falls back to defaults"
+        );
+        assert!(spec.content.blocks.is_empty());
+        assert!(spec.content.items.is_empty());
+        assert!(spec.content.builtin_icons.is_empty());
+        assert!(spec.diagnostics.is_empty());
+        assert_eq!(spec.folder, "huge", "the folder name is the display name");
+        assert!(spec.block_layers.iter().all(Option::is_none));
     }
 
     #[test]

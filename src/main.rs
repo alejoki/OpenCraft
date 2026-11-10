@@ -9395,7 +9395,7 @@ impl GameApp {
         };
         let installed_fingerprint = presentation.fingerprint;
         let installed_specs = presentation.specs.clone();
-        let text = match std::fs::read_to_string(&entry.path) {
+        let text = match pack::spec::read_manifest_text(&entry.path) {
             Ok(text) => text,
             Err(err) => {
                 self.reject_pack_entry(entry, &format!("failed to read: {err}"));
