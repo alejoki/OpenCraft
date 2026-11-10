@@ -9,6 +9,7 @@ pub mod player;
 pub mod render;
 pub mod settings;
 pub mod settle;
+pub mod startup;
 pub mod ui;
 pub mod world;
 

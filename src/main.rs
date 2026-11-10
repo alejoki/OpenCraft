@@ -29,9 +29,13 @@ use opencraft::commands::{
     apply_inventory_click, apply_inventory_click_button, try_place_selected_block, BreakRejection,
 };
 use opencraft::config::watch::{self, CreatorRuntime};
-use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, RulesBundle, SaveConfigMeta};
+#[cfg(test)]
+use opencraft::config::RulesBundle;
+use opencraft::config::{ConfigFile, ConfigRuntime, FileReload, SaveConfigMeta};
 use opencraft::content::names;
-use opencraft::content::registry::{build_registry, ContentLoadReport, PackIdentity};
+use opencraft::content::registry::ContentLoadReport;
+#[cfg(test)]
+use opencraft::content::registry::{build_registry, PackIdentity};
 use opencraft::content::{
     ContentRegistry, ItemRef, PackContentSpec, Severity, WorldgenRule, PACK_LAYER_BASE,
 };
@@ -39,12 +43,10 @@ use opencraft::content::{
 use opencraft::demo::combat::{
     combat_creative_stage, combat_drops_stage, combat_fight_stage, combat_inventory_units,
     combat_inventory_units_total, combat_quartet, combat_shot_stage, combat_skeleton_stage,
-    CombatStage, COMBAT_PINNED_HEALTH, COMBAT_PINNED_YAW, COMBAT_SAVE_BYTES,
+    CombatStage, COMBAT_DUSK_TICK, COMBAT_PINNED_HEALTH, COMBAT_PINNED_YAW, COMBAT_SAVE_BYTES,
     COMBAT_SAVE_MOB_COUNT_OFFSET, COMBAT_SAVE_TAIL_BYTES,
 };
-use opencraft::demo::combat::{
-    combat_demo_step, CombatDemo, COMBAT_DEMO_DEADLINE_SECS, COMBAT_DUSK_TICK,
-};
+use opencraft::demo::combat::{combat_demo_step, CombatDemo, COMBAT_DEMO_DEADLINE_SECS};
 #[cfg(test)]
 use opencraft::demo::content::{
     content_demo_chest_candidates, content_demo_ensure_selected, ContentStage,
@@ -53,13 +55,14 @@ use opencraft::demo::content::{content_demo_step, ContentDemo, CONTENT_DEMO_DEAD
 #[cfg(test)]
 use opencraft::demo::survival::SurvivalStage;
 use opencraft::demo::survival::{survival_demo_step, SurvivalDemo, SURVIVAL_DEMO_DEADLINE_SECS};
-use opencraft::demo::swim::{arm_swim_route, swim_frame, swim_route, SwimDemo, SWIM_DEADLINE_SECS};
 #[cfg(test)]
-use opencraft::demo::swim::{SwimProgress, SwimRoute, SwimWatch, SWIM_CROSSING_SECS, SWIM_YAW};
+use opencraft::demo::swim::{
+    arm_swim_route, SwimProgress, SwimRoute, SwimWatch, SWIM_CROSSING_SECS, SWIM_YAW,
+};
+use opencraft::demo::swim::{swim_frame, swim_route, SwimDemo, SWIM_DEADLINE_SECS};
 use opencraft::demo::watch::{
-    demo_owns_world_witness, demo_shutdown_deadline, frame_budget_digest_for_shutdown,
-    observe_demo_cycle, sample_frame_budget, scripted_demo_requested, DemoCycleWatch,
-    FrameBudgetSampler,
+    demo_shutdown_deadline, frame_budget_digest_for_shutdown, observe_demo_cycle,
+    sample_frame_budget, scripted_demo_requested, DemoCycleWatch, FrameBudgetSampler,
 };
 #[cfg(test)]
 use opencraft::demo::watch::{
@@ -98,6 +101,11 @@ use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
     VOLUME_MIN,
+};
+#[cfg(test)]
+use opencraft::startup::startup_session;
+use opencraft::startup::{
+    build_session_registry, load_startup_stack, reload_village_catalog, startup_session_with,
 };
 use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
@@ -151,7 +159,9 @@ use opencraft::world::catalog_fs::WorldCatalogFs;
 use opencraft::world::chunk::{
     linear_index, world_to_chunk_and_local, Chunk, ChunkPos, CHUNK_SIZE,
 };
-use opencraft::world::daycycle::{self, GameClock, DEFAULT_TIME_OF_DAY};
+#[cfg(test)]
+use opencraft::world::daycycle::GameClock;
+use opencraft::world::daycycle::{self, DEFAULT_TIME_OF_DAY};
 use opencraft::world::manager::{WorldManager, MAX_CHUNK_Y, MIN_CHUNK_Y};
 #[cfg(test)]
 use opencraft::world::mob::{Mob, MobAiState, MobHit, MobKind};
@@ -168,10 +178,11 @@ use opencraft::world::persistence::save_world_to_path_with_config;
 use opencraft::world::persistence::PersistenceError;
 #[cfg(test)]
 use opencraft::world::persistence::SavedMob;
+#[cfg(test)]
+use opencraft::world::persistence::DEFAULT_TIME_SCALE;
 use opencraft::world::persistence::{
     load_world_from_bytes_with, load_world_from_path_with, save_world_to_path_with, ChunkEditMap,
     CliConfig, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
-    DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -180,10 +191,11 @@ use opencraft::world::season::{season_of, weather_of_with, Season, Weather};
 use opencraft::world::session::{BowFireError, ChestCommandError};
 #[cfg(test)]
 use opencraft::world::spawning::{SpawnReport, MAX_MOBS_TOTAL};
+#[cfg(test)]
+use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::terrain::{
     biome_at_seeded, find_spawn_column, generate_chunk_seeded, generate_chunk_seeded_with,
     generate_chunk_with_context, terrain_height_at_seeded, Biome, WorldGenContext,
-    DEFAULT_WORLD_SEED,
 };
 #[cfg(test)]
 use opencraft::world::terrain::{ruin_loot_chest_at, SEA_LEVEL};
@@ -216,24 +228,6 @@ const PACK_RESTART_WORDING: &str = "content changes apply when the world is load
 /// often keeps the T01 pure tick counter time-sane without giving the menu
 /// module a clock.
 const MENU_TICK_INTERVAL: f32 = 1.0 / 60.0;
-
-/// Load the persisted ordered pack stack at startup, returning the merged
-/// presentation plus the per-pack specs and their per-file fallback warnings.
-/// The caller merges the warnings into `startup_warnings` (the S03 routing
-/// contract: warnings are data shown in the menu, never logs). An empty stack
-/// is the built-in Default pack: no presentation, no specs, no warnings. A
-/// missing stack entry stays in the stack and only produces a warning, so
-/// restoring the folder restores the pack without re-adding it.
-fn load_startup_stack(
-    packs_root: &Path,
-    stack: &[String],
-) -> (Option<LoadedPack>, Vec<PackSpec>, Vec<SettingsWarning>) {
-    if stack.is_empty() {
-        return (None, Vec::new(), Vec::new());
-    }
-    let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
-    (Some(loaded), specs, warnings)
-}
 
 /// Build and baseline the dev-only live pack watch list for `presentation`.
 ///
@@ -289,26 +283,6 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Build the session's immutable content registry from the ordered pack specs.
-/// The built-in table is the base; later packs win per definition. The caller
-/// freezes the result in an `Arc` and never replaces it mid-session (MEM512).
-fn build_session_registry(specs: &[PackSpec]) -> (Arc<ContentRegistry>, ContentLoadReport) {
-    let packs: Vec<(PackIdentity, PackContentSpec)> = specs
-        .iter()
-        .map(|spec| {
-            (
-                PackIdentity {
-                    folder: spec.folder.clone(),
-                    version: spec.version.clone(),
-                },
-                spec.content.clone(),
-            )
-        })
-        .collect();
-    let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
-    (Arc::new(registry), report)
-}
-
 /// Render registry-builder diagnostics as the same field/reason warning shape
 /// every other startup problem uses (MEM009: warnings are data, never logs).
 fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
@@ -350,17 +324,6 @@ fn village_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
             },
         })
         .collect()
-}
-
-/// Re-read the authored village/prefab catalog from `root`.
-///
-/// Wraps [`VillageCatalog::load_sorted`] so `attempt_create` can pick up
-/// content edits without an app restart and tests can exercise the reload in
-/// isolation. Deliberately uncached: each call re-walks the tree, which is the
-/// point of the reload seam.
-fn reload_village_catalog(root: &Path) -> (Arc<VillageCatalog>, Vec<String>) {
-    let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
-    (Arc::new(catalog), diagnostics)
 }
 
 /// Build the app's sound engine. Production opens the default output device
@@ -998,120 +961,6 @@ fn cli_has_world_intent(cli: &CliConfig) -> bool {
     cli.force_new_world
         || cli.seed_override.is_some()
         || cli.save_path != Path::new(DEFAULT_SAVE_PATH)
-}
-
-/// The startup world session, mirroring main()'s pre-S03 load-or-fresh
-/// block EXACTLY (byte-identical legacy behavior — including the
-/// default.mcvx launch and every CLI-flag direct launch — now testable
-/// without an event loop): when the cli save path exists and the launch
-/// did not force a new world, load it and rebuild the session via
-/// `WorldSession::session_from_save` (player state, seed, render
-/// distance, chunk edits) with `save_path = cli.save_path`; otherwise a
-/// fresh `WorldSession::new_session` at
-/// `cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED)` with the same save
-/// path.
-///
-/// Test-only built-in wrapper: production builds [`StartupContent`] first and
-/// calls [`startup_session_with`] with its base registry.
-#[cfg(test)]
-fn startup_session(cli: &CliConfig) -> WorldSession {
-    startup_session_with(
-        cli,
-        &ContentRegistry::builtin_arc(),
-        &ConfigRuntime::defaults(),
-    )
-}
-
-/// The startup world session resolved against `registry`.
-///
-/// The load branch keeps the placeholder-augmented registry and the one-shot
-/// changed-stack notice; the fresh branch freezes the supplied registry on the
-/// new session. [`startup_session`] is the built-in wrapper every existing
-/// test and demo launch uses. `config` is the effective gameplay tuning loaded
-/// from `config/` (M014/S01); both branches record its rules and its validated
-/// save meta (M014/S04) so the next save and the one-shot notice agree.
-fn startup_session_with(
-    cli: &CliConfig,
-    registry: &Arc<ContentRegistry>,
-    config: &ConfigRuntime,
-) -> WorldSession {
-    let rules: RulesBundle = config.rules();
-    let meta: SaveConfigMeta = config.meta();
-    if !cli.force_new_world && cli.save_path.exists() {
-        if let Ok(loaded) = load_world_from_path_with(&cli.save_path, registry.as_ref()) {
-            let mut session = WorldSession::from_loaded_world(loaded, cli.save_path.clone());
-            // A bounded accelerated watch that reloads a save must keep the
-            // same pinned witness as its fresh leg: no ambient records may
-            // appear in the next saved tail. The scripted demos are
-            // deliberately excluded here: a loaded `--demo-combat` leg is a
-            // one-call Restore that re-saves nothing, and T03 pinned that only
-            // the fresh scripted branch closes the gate.
-            if cli.time_scale > DEFAULT_TIME_SCALE {
-                session.set_ambient_spawning(false);
-            }
-            if cli.demo_combat {
-                // The pinned quartet sits 3.5 blocks from the player, inside
-                // the 16-block aggro, so hostile AI must stay off until the
-                // dedicated `Hostile` stage reopens it. The load branch is a
-                // one-call Restore leg, but the gate is ephemeral state the
-                // session must still start closed for the scripted run.
-                session.set_hostile_ai_enabled(false);
-            }
-            session.apply_config(&rules, meta);
-            return session;
-        }
-    }
-    let seed = cli.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
-    // The scripted combat seam (`--demo-combat`, M009/S01-T05) pins a fresh
-    // world to Survival at dusk so the mob path is proven with walking mobs in
-    // front of a non-flying player. It overrides `cli.mode` on the fresh
-    // branch only: the load branch above returns first, so a saved world is
-    // never re-moded, re-clocked, or re-seeded by the flag.
-    let mode = if cli.demo_combat {
-        GameMode::Survival
-    } else {
-        cli.mode
-    };
-    // Fresh worlds start at the default season length; the New Game row and
-    // the `--season-length` CLI seam override it on this branch only. A load
-    // branch above never reaches here, so a persisted calendar always wins
-    // over a launch flag. The mode follows the same rule: `--creative` /
-    // `--survival` pick the fresh world's persisted mode, while a loaded save
-    // restores its own stored mode and ignores the flag.
-    let mut session = WorldSession::new_session_with_mode_and_registry(
-        seed,
-        cli.save_path.clone(),
-        cli.season_length,
-        mode,
-        Arc::clone(registry),
-    );
-    if cli.demo_combat {
-        session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
-    }
-    // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v9 save tail must describe only what that
-    // demo placed, so ambient spawning and daylight burning stay off for the
-    // whole run. Production sessions never touch this switch.
-    if demo_owns_world_witness(cli) {
-        session.set_ambient_spawning(false);
-    }
-    // The pinned quartet sits 3.5 blocks from the player, inside the
-    // 16-block aggro, so hostile AI must stay off until the dedicated
-    // `Hostile` stage reopens it. Guarded on `demo_combat` alone: the other
-    // scripted demos and the accelerated watch must keep their behaviour.
-    if cli.demo_combat {
-        session.set_hostile_ai_enabled(false);
-    }
-    // Scripted ocean-crossing seam (S08-T02): only a fresh world is teleported
-    // onto the pinned route. The load branch above returns before this, so a
-    // resumed save is never moved — its own position is the contract there.
-    if cli.demo_swim {
-        if let Some(route) = swim_route(seed) {
-            arm_swim_route(&mut session, route);
-        }
-    }
-    session.apply_config(&rules, meta);
-    session
 }
 
 /// Apply a S01-confirmed pending delete through the live catalog and
