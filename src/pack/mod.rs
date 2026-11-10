@@ -492,10 +492,11 @@ whatever = true
             "zeta".to_string(),
         ];
         #[cfg(unix)]
-        {
-            expected.push("link-to-dir".to_string());
-            expected.sort();
-        }
+        expected.push("link-to-dir".to_string());
+        // Sort unconditionally: on Windows this is a no-op on the three names
+        // above, and it keeps `expected` mutable on every platform so the
+        // zero-suppression clippy gate does not trip `unused_mut`.
+        expected.sort();
 
         assert_eq!(available_pack_names(root.path()), expected);
     }
