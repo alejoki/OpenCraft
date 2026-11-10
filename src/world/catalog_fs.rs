@@ -10,9 +10,9 @@
 //!   timestamp, and probes the magic+version header through
 //!   `probe_world_at_path`. A `Loadable` row therefore means "identity valid
 //!   + header valid", not "body guaranteed to decode"; corrupt entries
-//!   degrade to typed per-row problems instead of disappearing, and Play
-//!   decodes fully so a body-corrupt file still fails closed with
-//!   [`CatalogLoadError::Load`].
+//!     degrade to typed per-row problems instead of disappearing, and Play
+//!     decodes fully so a body-corrupt file still fails closed with
+//!     [`CatalogLoadError::Load`].
 //! - **Saving** reuses `save_world_to_path` (atomic sibling-temp + rename)
 //!   unchanged; the adapter only resolves the validated target path.
 //! - **Loading** goes through `load_world_from_path_with` unchanged; the

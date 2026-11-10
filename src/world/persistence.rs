@@ -7336,7 +7336,7 @@ mod tests {
                 if len == MAX_SAVE_FILE_BYTES + 1 && limit == MAX_SAVE_FILE_BYTES
         ));
 
-        let err = load_world_from_path_with(&path, &ContentRegistry::builtin())
+        let err = load_world_from_path_with(&path, ContentRegistry::builtin())
             .expect_err("oversized save must be rejected with a registry");
         assert!(matches!(
             err,
@@ -7405,7 +7405,10 @@ mod tests {
         }
         assert_eq!(edits.len(), chunk_count);
         assert_eq!(
-            edits.values().map(rustc_hash::FxHashMap::len).sum::<usize>(),
+            edits
+                .values()
+                .map(rustc_hash::FxHashMap::len)
+                .sum::<usize>(),
             chunk_count * per_chunk
         );
         edits
@@ -7424,7 +7427,9 @@ mod tests {
 
         save_world_to_path(&path, &data).expect("a 1M-edit save should write");
 
-        let len = fs::metadata(&path).expect("metadata for the saved file").len();
+        let len = fs::metadata(&path)
+            .expect("metadata for the saved file")
+            .len();
         assert!(
             len > 1_000_000,
             "a 1M-edit save is multi-MB, got {len} bytes"
