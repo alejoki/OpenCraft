@@ -194,15 +194,18 @@ pub enum RowProblem {
     /// The file could not be read (permissions, locked, vanished).
     Unreadable,
     /// The file was read but rejected by the save loader.
-    /// (Magic/version/binary errors are represented by the wrapped
-    /// persistence error kind.)
+    /// (Magic/version/size errors are represented by the wrapped
+    /// persistence error kind.) Listing probes only the header, so this
+    /// means the save identity or magic+version header is invalid.
     InvalidFormat,
 }
 
 /// Load state of one catalog entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowStatus {
-    /// Identity fully derived and loadable.
+    /// Identity fully derived and the save's magic+version header is valid.
+    /// Not a promise that the body decodes: Play still performs the full
+    /// load and can surface a typed load error for a body-corrupt file.
     Loadable,
     /// The entry is listed but cannot be loaded or loaded-safely identified.
     Corrupt(RowProblem),

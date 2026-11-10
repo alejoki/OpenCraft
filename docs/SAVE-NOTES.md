@@ -30,7 +30,7 @@ After that, load your world. Choose Load Game from the main menu, or launch stra
 
 ## What a save file contains
 
-A world save is a single file with the `.mcvx` extension, kept in the `saves/` folder next to the game's settings. The world list shows each file as a row, using the file name and the time it was last changed. A world the game cannot read stays in the list marked "(cannot load)" instead of silently disappearing.
+A world save is a single file with the `.mcvx` extension, kept in the `saves/` folder next to the game's settings. The world list shows each file as a row, using the file name and the time it was last changed. A world the game cannot read stays in the list marked "(cannot load)" instead of silently disappearing. A save file larger than 256 MiB is treated as an invalid save and stays listed as "(cannot load)" instead of being read into memory.
 
 The file stores:
 

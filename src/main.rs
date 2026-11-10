@@ -28636,6 +28636,74 @@ stack = 64
     }
 
     #[test]
+    fn oversized_and_body_corrupt_plays_stay_on_load_game_with_inline_errors() {
+        use opencraft::world::persistence::{MAX_SAVE_FILE_BYTES, SAVE_MAGIC, SAVE_VERSION};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);
+
+        // Sparse on ext4/NTFS: `set_len` extends the file without writing
+        // (or reading) the body, so the oversized case costs no memory.
+        let huge = std::fs::File::create(dir.path().join("huge.mcvx")).expect("create huge");
+        huge.set_len(MAX_SAVE_FILE_BYTES + 1)
+            .expect("sparse extend");
+        drop(huge);
+        // Valid magic+version header followed by garbage: the listing probe
+        // accepts the row, but Play's full decode must fail closed.
+        let mut header = Vec::new();
+        header.extend_from_slice(SAVE_MAGIC);
+        header.extend_from_slice(&SAVE_VERSION.to_le_bytes());
+        header.extend_from_slice(b"junk");
+        std::fs::write(dir.path().join("corruptbody.mcvx"), &header).expect("write body");
+
+        app.refresh_load_rows();
+        let huge_index = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "huge")
+            .expect("huge row listed");
+        let body_index = app
+            .load
+            .rows()
+            .iter()
+            .position(|r| r.name == "corruptbody")
+            .expect("corruptbody row listed");
+        assert!(!app.load.rows()[huge_index].is_loadable());
+        assert!(app.load.rows()[body_index].is_loadable());
+
+        // Oversized: typed corrupt row, inline message, no session swap.
+        app.play_row(huge_index);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::LoadGame);
+        let message = app
+            .load_message
+            .as_ref()
+            .expect("oversized surfaces inline");
+        assert!(
+            message.text.contains("cannot be loaded"),
+            "unexpected oversized-row text: {}",
+            message.text
+        );
+        assert_eq!(app.session.world.seed(), 1, "session not swapped");
+
+        // Header-valid/body-corrupt: Loadable row, typed load failure inline.
+        app.play_row(body_index);
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::LoadGame);
+        let message = app
+            .load_message
+            .as_ref()
+            .expect("body-corrupt surfaces inline");
+        assert!(
+            message
+                .text
+                .contains("Could not load world \"corruptbody\""),
+            "unexpected body-corrupt text: {}",
+            message.text
+        );
+        assert_eq!(app.session.world.seed(), 1, "session not swapped");
+    }
+
+    #[test]
     fn save_and_quit_failure_composes_a_main_menu_message_and_keeps_the_retry_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Force a save failure: the save path's parent is a FILE, so the
