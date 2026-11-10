@@ -18285,8 +18285,16 @@ mod tests {
             .filter(|line| line.contains("error="))
             .collect();
         assert_eq!(errors.len(), 1, "exactly one readable error: {lines:?}");
+        // Unix reports ENOTDIR (`NotADirectory`) when a directory component is
+        // a regular file; Windows surfaces the same condition as
+        // ERROR_ALREADY_EXISTS (`AlreadyExists`). Both must stay one readable
+        // write failure that leaves the blocking file untouched.
+        #[cfg(unix)]
+        let expected_reason = "not a directory";
+        #[cfg(windows)]
+        let expected_reason = "already exists";
         assert!(
-            errors[0].contains("not a directory"),
+            errors[0].contains(expected_reason),
             "the reason must name the filesystem failure: {lines:?}"
         );
         assert_eq!(
