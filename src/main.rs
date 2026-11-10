@@ -30245,6 +30245,19 @@ selected_name_secs = 0.5
             "shutdown/close, pause Save-and-Quit, ExitGame, F5 and OOM must still save synchronously"
         );
         assert!(include_str!("commands.rs").contains("fn save_current_world("));
+        // The demo seams' call sites moved into the lib with the adapter; keep
+        // them covered by the same one-save-seam pin.
+        for moved in [
+            include_str!("demo/survival.rs"),
+            include_str!("demo/content.rs"),
+            include_str!("demo/combat.rs"),
+            include_str!("demo/digests.rs"),
+        ] {
+            assert!(
+                moved.contains("save_current_world("),
+                "moved demo modules must still call the one save seam"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
