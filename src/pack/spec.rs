@@ -151,7 +151,7 @@ pub fn decode_layer_file(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, Stri
         return Ok(None);
     }
 
-    let decoded = decode::decode_png_rgba(&path)?;
+    let decoded = decode::decode_png_rgba(&path, Some(MAX_LAYER_SIDE))?;
     validate_square_16_to_256(&decoded, "layers")?;
     Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
 }
@@ -164,7 +164,7 @@ pub fn decode_layer_file(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, Stri
 /// for pack block-face assets.
 pub fn decode_asset_file(dir: &Path, relative: &str) -> Result<Vec<u8>, String> {
     let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative)?;
+    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
     validate_square_16_to_256(&decoded, "assets")?;
     Ok(resample::resample_to_16(&decoded.rgba, decoded.width))
 }
@@ -184,7 +184,7 @@ pub fn decode_builtin_icon_file(dir: &Path, relative: &str) -> Result<Option<Vec
     }
 
     let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative)?;
+    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
     validate_square_16_to_256(&decoded, "assets")?;
     Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
 }

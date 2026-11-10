@@ -669,6 +669,29 @@ whatever = true
     }
 
     #[test]
+    fn oversized_ihdr_layer_warns_and_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "hostile");
+        read_pack_toml(&dir, "name = \"Hostile\"\n");
+        fs::write(
+            dir.join(LAYER_FILES[3]),
+            decode::png_bomb_bytes(30000, 30000),
+        )
+        .unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        assert_procedural_layer(&pack, &procedural, 3);
+        assert_eq!(warning_fields(&pack), vec![LAYER_FILES[3]]);
+        assert!(
+            pack.warnings[0].reason.contains("30000x30000"),
+            "reason should report the IHDR size: {}",
+            pack.warnings[0].reason
+        );
+    }
+
+    #[test]
     fn crafting_table_files_override_only_their_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "crafting-table");
