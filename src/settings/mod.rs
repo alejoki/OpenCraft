@@ -2,7 +2,7 @@ pub mod keybind;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use winit::keyboard::KeyCode;
 
@@ -133,6 +133,46 @@ pub struct KeybindConflict {
     pub key: KeyCode,
 }
 
+/// Append `.bak` to the full file name (`settings.toml` ->
+/// `settings.toml.bak`), unlike `with_extension` which would turn `foo.cfg`
+/// into `foo.bak`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_owned();
+    raw.push(".bak");
+    PathBuf::from(raw)
+}
+
+/// True when `bytes` are not valid UTF-8 TOML. Mirrors the loader's validity
+/// oracle so invalid-UTF-8 files (which `read_to_string` rejects) count as
+/// unparseable too.
+fn is_unparseable(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Err(_) => true,
+        Ok(text) => toml::from_str::<toml::Value>(text).is_err(),
+    }
+}
+
+/// Copy an existing unparseable settings file to `<path>.bak` exactly once.
+///
+/// A missing target is fine (no backup is created); a failed read or copy is
+/// returned so the caller can abort before the atomic rename destroys the
+/// original. `fs::copy` (not `rename`) keeps the original in place until the
+/// rename replaces it, so a crash between copy and rename loses nothing.
+fn preserve_unparseable_settings(path: &Path) -> std::io::Result<()> {
+    if backup_path(path).exists() {
+        return Ok(());
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if is_unparseable(&bytes) {
+        fs::copy(path, backup_path(path))?;
+    }
+    Ok(())
+}
+
 impl Settings {
     /// Scan the 7 keybind actions and report one conflict per duplicated
     /// `KeyCode`, listing the actions sharing it. Empty for the defaults.
@@ -183,8 +223,12 @@ impl Settings {
     /// parser so a bad field can never abort its siblings). Writes to a
     /// `.toml.tmp` sibling, syncs, then renames over the target (the
     /// pattern from `src/world/persistence.rs save_world_to_path`), so a
-    /// crash mid-save cannot corrupt the previous file. IO failures bubble
-    /// as `std::io::Result`.
+    /// crash mid-save cannot corrupt the previous file. Before the atomic
+    /// write, an existing target that is not valid UTF-8 TOML is copied once
+    /// to `<path>.bak` (skipped when that backup already exists); a missing
+    /// target creates no backup, and a failed read/copy aborts the save so a
+    /// hand-edited typo is never destroyed. IO failures bubble as
+    /// `std::io::Result`.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mirror = SettingsToml {
             keybinds: KeybindsToml {
@@ -221,6 +265,8 @@ impl Settings {
                 fs::create_dir_all(parent)?;
             }
         }
+
+        preserve_unparseable_settings(path)?;
 
         let tmp_path = path.with_extension("toml.tmp");
         {
@@ -306,19 +352,28 @@ pub fn load(path: &Path) -> Settings {
 /// phase 2 extracts each field independently with type/range checks. Plain
 /// `#[serde(default)]` derive would abort the whole struct on any field
 /// type error; the generic tree is what makes per-field fallback possible
-/// (a valid field survives an invalid sibling).
+/// (a valid field survives an invalid sibling). Phase 0 reports a missing
+/// file distinctly from an unreadable one ("settings file is missing" vs
+/// "could not read settings file"), and phase 1 reports syntactic TOML
+/// failures as "invalid TOML".
 pub fn load_with_warnings(path: &Path) -> (Settings, Vec<SettingsWarning>) {
     let mut settings = Settings::default();
     let mut warnings = Vec::new();
 
     // Phase 0: read the file. Missing/unreadable -> defaults + one warning,
-    // no panic. Never blocks launch.
+    // no panic. Never blocks launch. Missing and unreadable stay distinct so
+    // the warning names the actual problem.
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) => {
+            let reason = if err.kind() == std::io::ErrorKind::NotFound {
+                "settings file is missing; using defaults".to_string()
+            } else {
+                format!("could not read settings file: {err}")
+            };
             warnings.push(SettingsWarning {
                 field: "settings".to_string(),
-                reason: format!("could not read settings file: {err}"),
+                reason,
             });
             return (settings, warnings);
         }
@@ -1380,5 +1435,155 @@ jump_or_up = "KeyW"
         assert!(path.is_file());
         assert!(!path.with_extension("toml.tmp").exists());
         assert!(dir.path().read_dir().unwrap().count() == 1);
+    }
+
+    #[test]
+    fn backup_path_appends_bak_to_the_full_file_name() {
+        assert_eq!(
+            backup_path(Path::new("dir/foo.cfg")),
+            PathBuf::from("dir/foo.cfg.bak")
+        );
+        assert_eq!(
+            backup_path(Path::new("settings.toml")),
+            PathBuf::from("settings.toml.bak")
+        );
+    }
+
+    #[test]
+    fn saving_defaults_over_a_typoed_file_preserves_the_original_bytes() {
+        let dir = tempdir().unwrap();
+        let typo = "not [valid\n";
+        let path = write_settings_file(&dir, typo);
+
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings, Settings::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("invalid TOML"));
+
+        Settings::default().save(&path).unwrap();
+
+        let backup = dir.path().join("settings.toml.bak");
+        assert_eq!(fs::read(&backup).unwrap(), typo.as_bytes());
+        let (reloaded, warnings) = load_with_warnings(&path);
+        assert_eq!(reloaded, Settings::default());
+        assert!(warnings.is_empty());
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn saving_defaults_for_a_missing_file_creates_no_bak() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        Settings::default().save(&path).unwrap();
+
+        assert!(path.is_file());
+        assert!(!dir.path().join("settings.toml.bak").exists());
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings, Settings::default());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn saving_over_a_valid_file_creates_no_bak() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[video]\nfov = 95.0\n");
+        let (loaded, warnings) = load_with_warnings(&path);
+        assert!(warnings.is_empty());
+
+        let changed = Settings {
+            fov_degrees: 80.0,
+            ..loaded
+        };
+        changed.save(&path).unwrap();
+
+        assert!(!dir.path().join("settings.toml.bak").exists());
+        assert_eq!(load(&path), changed);
+    }
+
+    #[test]
+    fn bak_is_written_once_and_survives_later_typoed_saves() {
+        let dir = tempdir().unwrap();
+        let typo_a = "first [typo\n";
+        let typo_b = "second [typo\n";
+        let path = write_settings_file(&dir, typo_a);
+        Settings::default().save(&path).unwrap();
+
+        let backup = dir.path().join("settings.toml.bak");
+        assert_eq!(fs::read(&backup).unwrap(), typo_a.as_bytes());
+
+        fs::write(&path, typo_b).unwrap();
+        Settings::default().save(&path).unwrap();
+
+        assert_eq!(fs::read(&backup).unwrap(), typo_a.as_bytes());
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings, Settings::default());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_settings_file_is_preserved_before_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let seeded = [0xff, 0xfe, b'[', b'v', b'i', b'd'];
+        fs::write(&path, seeded).unwrap();
+
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings, Settings::default());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field, "settings");
+
+        Settings::default().save(&path).unwrap();
+
+        let backup = dir.path().join("settings.toml.bak");
+        assert_eq!(fs::read(&backup).unwrap(), seeded);
+        let (reloaded, warnings) = load_with_warnings(&path);
+        assert_eq!(reloaded, Settings::default());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn per_field_failure_does_not_create_a_bak() {
+        let dir = tempdir().unwrap();
+        let path = write_settings_file(&dir, "[video]\nfov = \"wide\"\n");
+        let (settings, warnings) = load_with_warnings(&path);
+        assert_eq!(settings, Settings::default());
+        assert_eq!(warning_fields(&warnings), vec!["video.fov"]);
+
+        Settings::default().save(&path).unwrap();
+
+        assert!(!dir.path().join("settings.toml.bak").exists());
+        let (reloaded, warnings) = load_with_warnings(&path);
+        assert_eq!(reloaded, Settings::default());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_and_parse_failures_report_distinct_readable_reasons() {
+        let dir = tempdir().unwrap();
+        let missing_path = dir.path().join("never-written.toml");
+        let (_, missing_warnings) = load_with_warnings(&missing_path);
+        assert_eq!(missing_warnings.len(), 1);
+        assert_eq!(missing_warnings[0].field, "settings");
+        assert!(missing_warnings[0].reason.contains("missing"));
+
+        let typo_path = write_settings_file(&dir, "not [valid\n");
+        let (_, typo_warnings) = load_with_warnings(&typo_path);
+        assert_eq!(typo_warnings.len(), 1);
+        assert_eq!(typo_warnings[0].field, "settings");
+        assert!(typo_warnings[0].reason.contains("invalid TOML"));
+
+        assert_ne!(missing_warnings[0].reason, typo_warnings[0].reason);
+    }
+
+    #[test]
+    fn unreadable_target_aborts_the_save_before_the_rename() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        fs::create_dir(&path).unwrap();
+
+        assert!(Settings::default().save(&path).is_err());
+        assert!(path.is_dir());
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 }
