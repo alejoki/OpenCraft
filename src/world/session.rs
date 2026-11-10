@@ -6798,10 +6798,7 @@ mod tests {
 
         assert!(session.queue_autosave(&[chunk_pos]), "the worker spawns");
         assert!(
-            matches!(
-                session.wait_autosave(),
-                Some(Err(PersistenceError::Io(_)))
-            ),
+            matches!(session.wait_autosave(), Some(Err(PersistenceError::Io(_)))),
             "the failed write is reported on reap"
         );
         assert!(

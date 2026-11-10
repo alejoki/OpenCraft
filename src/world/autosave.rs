@@ -26,9 +26,7 @@ use std::thread::JoinHandle;
 
 use crate::config::SaveConfigMeta;
 use crate::content::ContentRegistry;
-use crate::world::persistence::{
-    save_world_to_path_with_config, PersistenceError, WorldSaveData,
-};
+use crate::world::persistence::{save_world_to_path_with_config, PersistenceError, WorldSaveData};
 
 /// Frame-thread-owned handle to the single streaming-autosave worker.
 pub(crate) struct AutosaveWorker {
@@ -57,9 +55,7 @@ impl AutosaveWorker {
 
     /// Whether the in-flight worker has finished and can be reaped.
     pub(crate) fn has_finished_worker(&self) -> bool {
-        self.handle
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     /// Spawn the worker to encode and atomically write `data`.
@@ -166,9 +162,7 @@ impl Drop for AutosaveWorker {
 /// A panicking worker is a bug, not a data-loss path: the save did not
 /// complete, so the caller keeps the world dirty. D006 forbids logging, so
 /// this conversion is the only report.
-fn join_mapped(
-    handle: JoinHandle<Result<(), PersistenceError>>,
-) -> Result<(), PersistenceError> {
+fn join_mapped(handle: JoinHandle<Result<(), PersistenceError>>) -> Result<(), PersistenceError> {
     match handle.join() {
         Ok(result) => result,
         Err(_panic_payload) => Err(PersistenceError::Io(io::Error::other(
@@ -203,7 +197,10 @@ mod tests {
         worker
             .dispatch(data.clone(), path.clone(), registry.clone(), config)
             .expect("dispatch succeeds");
-        assert!(matches!(worker.wait(), Some(Ok(()))), "worker save succeeds");
+        assert!(
+            matches!(worker.wait(), Some(Ok(()))),
+            "worker save succeeds"
+        );
 
         let written = std::fs::read(&path).expect("save file readable");
         let mut expected = Vec::new();
@@ -240,7 +237,10 @@ mod tests {
         assert!(!worker.take_pending());
 
         drop(guard);
-        assert!(matches!(worker.wait(), Some(Ok(()))), "worker save succeeds");
+        assert!(
+            matches!(worker.wait(), Some(Ok(()))),
+            "worker save succeeds"
+        );
         assert!(!worker.in_flight());
     }
 
@@ -287,6 +287,9 @@ mod tests {
         assert!(worker.reap_finished().is_none());
 
         drop(guard);
-        assert!(matches!(worker.wait(), Some(Ok(()))), "worker save succeeds");
+        assert!(
+            matches!(worker.wait(), Some(Ok(()))),
+            "worker save succeeds"
+        );
     }
 }

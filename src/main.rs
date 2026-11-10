@@ -10114,6 +10114,10 @@ impl GameApp {
         // routes through the shared reset without this call, so installing
         // here (not in `on_session_installed`) keeps it village-free.
         session.set_village_catalog(Arc::clone(&self.village_catalog));
+        // Settle the outgoing session's in-flight/pending streaming autosave
+        // before the swap drops its state (M016/S02). Explicit saves keep
+        // their own synchronous join-before-write path.
+        self.session.flush_autosave();
         self.session = session;
         self.on_session_installed();
     }
@@ -12557,9 +12561,11 @@ impl ApplicationHandler for GameApp {
                     let season = self.session.season();
                     let (new_meshes, unloaded) =
                         self.session.world.update_streaming(player_chunk, season);
-                    if self.session.autosave_after_unload(&unloaded) {
-                        self.last_saved_badge = Some(Instant::now());
-                    }
+                    // Streaming autosave dispatch (M016/S02): the snapshot is
+                    // handed to the session worker here, so the encode + atomic
+                    // write runs off the frame thread. The saved badge is set
+                    // when `poll_autosave` reaps the completed write.
+                    self.session.queue_autosave(&unloaded);
                     for upos in unloaded {
                         gpu.render_store.remove_chunk(upos);
                     }
@@ -13935,6 +13941,15 @@ impl ApplicationHandler for GameApp {
         // pre-render region. A settled texture edit only queues per-layer
         // uploads for the next frame; it never rebuilds the stack.
         self.poll_pack_watcher_if_due(Instant::now());
+        // Non-blocking streaming-autosave reap (M016/S02): never joins the
+        // worker, so a save finishing late cannot stall a frame. A failed
+        // write has already re-marked the world unsaved inside the session
+        // (no logging; D006/MEM009).
+        if let Some(result) = self.session.poll_autosave() {
+            if result.is_ok() {
+                self.last_saved_badge = Some(Instant::now());
+            }
+        }
 
         let Some(window) = &self.window else {
             return;
@@ -39748,6 +39763,75 @@ selected_name_secs = 0.5
             emit.contains("!watch::CREATOR_TOOLS") && emit.contains("!self.creator_trace"),
             "pack traces need the dev build AND --creator-trace"
         );
+    }
+
+    #[test]
+    fn streaming_autosave_dispatch_reap_and_swap_flush_are_wired() {
+        let source = include_str!("main.rs");
+
+        // Streaming unload dispatch: the frame loop hands the snapshot to the
+        // session worker instead of blocking on the synchronous seam.
+        let about_to_wait = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("main.rs must define about_to_wait")
+            .split("// Headless presentation digest")
+            .next()
+            .expect("about_to_wait must end before the presentation digest");
+        assert!(
+            about_to_wait.contains("poll_autosave()"),
+            "about_to_wait must reap the autosave worker without blocking"
+        );
+        assert!(
+            about_to_wait.contains("last_saved_badge"),
+            "a reaped successful autosave sets the saved badge"
+        );
+
+        let streaming = source
+            .split("let (new_meshes, unloaded) =")
+            .nth(1)
+            .expect("main.rs must stream chunks")
+            .split("for upos in unloaded")
+            .next()
+            .expect("streaming dispatch must precede the unload loop");
+        assert!(
+            streaming.contains("queue_autosave(&unloaded)"),
+            "streaming unloads must dispatch the autosave worker: {streaming}"
+        );
+        assert!(
+            !streaming.contains("autosave_after_unload(&unloaded)"),
+            "the frame loop must not call the synchronous autosave seam"
+        );
+
+        // Session swap flushes the outgoing session's worker before the drop.
+        let start_world_session = source
+            .split("fn start_world_session(")
+            .nth(1)
+            .expect("main.rs must define start_world_session")
+            .split("fn on_session_installed(")
+            .next()
+            .expect("start_world_session must end before on_session_installed");
+        let flush_at = start_world_session
+            .find("flush_autosave()")
+            .expect("the session swap must flush the autosave worker");
+        let swap_at = start_world_session
+            .find("self.session = session;")
+            .expect("start_world_session must install the new session");
+        assert!(
+            flush_at < swap_at,
+            "the outgoing autosave flush must precede the session swap"
+        );
+
+        // Every explicit save site keeps its synchronous durable path.
+        let production = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs must define a test module");
+        assert!(
+            production.matches("save_current_world(").count() >= 6,
+            "F5/quit/exit/close/OOM/shutdown must still save synchronously"
+        );
+        assert!(production.contains("fn save_current_world("));
     }
 
     // -----------------------------------------------------------------------
