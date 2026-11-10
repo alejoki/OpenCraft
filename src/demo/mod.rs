@@ -4,6 +4,7 @@
 
 pub mod combat;
 pub mod content;
+pub mod digests;
 pub mod survival;
 pub mod swim;
 pub mod watch;
