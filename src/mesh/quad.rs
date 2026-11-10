@@ -1,16 +1,5 @@
 use bytemuck::{Pod, Zeroable};
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FaceDir {
-    PosX = 0,
-    NegX = 1,
-    PosY = 2,
-    NegY = 3,
-    PosZ = 4,
-    NegZ = 5,
-}
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct PackedQuad(pub [u32; 2]);

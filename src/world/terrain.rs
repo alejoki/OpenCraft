@@ -964,11 +964,6 @@ fn ruin_loot_chest_pos(spec: &RuinSpec) -> IVec3 {
 }
 
 #[inline]
-pub fn terrain_height_at(wx: i32, wz: i32) -> i32 {
-    terrain_height_at_seeded(wx, wz, DEFAULT_WORLD_SEED)
-}
-
-#[inline]
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)

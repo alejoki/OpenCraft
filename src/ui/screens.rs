@@ -639,14 +639,6 @@ impl NewGameScreen {
         self.mode
     }
 
-    /// The currently focused field, by reference.
-    pub fn focused_input(&self) -> &TextInput {
-        match self.focus {
-            FocusField::Name => &self.name,
-            FocusField::Seed => &self.seed,
-        }
-    }
-
     /// The currently focused field, mutably — the event loop routes
     /// printable-character and editing events here.
     pub fn focused_input_mut(&mut self) -> &mut TextInput {
