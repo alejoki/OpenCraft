@@ -28905,6 +28905,77 @@ stack = 64
     }
 
     #[test]
+    fn exit_game_preserves_a_typoed_settings_file() {
+        // S07-T02: the real ExitGame caller reaches the single writer
+        // (Settings::save) through the injected settings_path. A hand-edited
+        // TOML typo must survive the quit save as settings.toml.bak while
+        // the target is repaired, and the world-save leg still runs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("exit-typo.mcvx");
+        let settings_path = dir.path().join("settings.toml");
+        let typo = "not [valid\n";
+        std::fs::write(&settings_path, typo).unwrap();
+        let mut app = GameApp::new(
+            CliConfig::parse_args(Vec::<String>::new()),
+            WorldSession::new_session(9, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS),
+        );
+        app.settings_path = settings_path.clone();
+        // Load the typo explicitly so the assertion never depends on the
+        // developer's crate-root settings.toml that GameApp::new reads.
+        let (loaded, warnings) = load_with_warnings(&settings_path);
+        assert_eq!(loaded, Settings::default());
+        assert_eq!(warnings.len(), 1, "one warning for the whole-file typo");
+        assert!(warnings[0].reason.contains("invalid TOML"));
+        app.settings = loaded;
+
+        assert!(app.apply_lifecycle_decision(LifecycleDecision::ExitGame));
+
+        // The original typo'd bytes were preserved exactly once.
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.toml.bak")).unwrap(),
+            typo.as_bytes(),
+            "the typo'd original is preserved as settings.toml.bak"
+        );
+        // The target was repaired: defaults, no warnings, no temp leftover.
+        let (reloaded, warnings) = load_with_warnings(&settings_path);
+        assert_eq!(reloaded, Settings::default());
+        assert!(warnings.is_empty(), "repaired settings parse cleanly");
+        assert!(!settings_path.with_extension("toml.tmp").exists());
+        // The world-save leg of ExitGame still ran.
+        assert!(
+            save_path.is_file(),
+            "world saved at the session's save path"
+        );
+    }
+
+    #[test]
+    fn save_settings_or_warn_preserves_a_typoed_settings_file() {
+        // S07-T02: every accepted menu change routes through this helper.
+        // A successful save leaves no in-menu error text (D006 keeps
+        // failures in-menu), and a typo'd file is preserved once.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = dir.path().join("settings.toml");
+        let typo = "not [valid\n";
+        std::fs::write(&settings_path, typo).unwrap();
+        let mut menu = menu::SettingsMenu::new();
+
+        save_settings_or_warn(&mut menu, &Settings::default(), &settings_path);
+
+        assert!(
+            menu.message.is_none(),
+            "a successful save leaves no error message"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.toml.bak")).unwrap(),
+            typo.as_bytes(),
+            "the typo'd original is preserved as settings.toml.bak"
+        );
+        let (reloaded, warnings) = load_with_warnings(&settings_path);
+        assert_eq!(reloaded, Settings::default());
+        assert!(warnings.is_empty(), "repaired settings parse cleanly");
+    }
+
+    #[test]
     fn start_world_session_swaps_the_session_and_resets_input() {
         // GameApp::new with a bare CliConfig and a directly-built session:
         // no window/GPU needed (start_world_session tolerates gpu: None,
