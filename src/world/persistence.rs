@@ -70,6 +70,10 @@ pub const SAVED_MOB_LEN: usize = 19;
 /// Upper bound on persisted chest records. Mirrors the chunk-count bound so a
 /// forged count can never request an unbounded decode pass.
 pub const MAX_SAVED_CHESTS: usize = 1_000_000;
+/// Upper bound on the byte length of an `.mcvx` save file, checked before the
+/// body is allocated. A measured 10M-edit world is ~40 MB, so 256 MiB keeps
+/// several times that headroom while refusing a stray multi-GB file.
+pub const MAX_SAVE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
@@ -724,6 +728,12 @@ pub enum PersistenceError {
     Io(std::io::Error),
     InvalidMagic,
     UnsupportedVersion(u32),
+    /// The save file exceeds [`MAX_SAVE_FILE_BYTES`] and was rejected before
+    /// its body was allocated.
+    SaveTooLarge {
+        len: u64,
+        limit: u64,
+    },
     InvalidBlockId(u16),
     InvalidLocalIndex(u16),
     InvalidPlayerState,
@@ -793,6 +803,12 @@ impl fmt::Display for PersistenceError {
                 write!(
                     f,
                     "unsupported save version {v} (this build reads version {SAVE_VERSION})"
+                )
+            }
+            PersistenceError::SaveTooLarge { len, limit } => {
+                write!(
+                    f,
+                    "save file is too large ({len} bytes; limit {limit} bytes)"
                 )
             }
             PersistenceError::InvalidBlockId(b) => write!(f, "unknown block id {b} in save"),
@@ -2165,6 +2181,14 @@ fn peek_save_version(bytes: &[u8]) -> Result<u32, PersistenceError> {
     read_u32(&mut cur)
 }
 
+/// Rejects a version word outside `1..=SAVE_VERSION`.
+fn ensure_supported_version(version: u32) -> Result<(), PersistenceError> {
+    if !(1..=SAVE_VERSION).contains(&version) {
+        return Err(PersistenceError::UnsupportedVersion(version));
+    }
+    Ok(())
+}
+
 /// Resolves v8 name indices against a cloned base registry, appending a
 /// deterministic placeholder for each unknown-but-well-formed namespaced name.
 struct V8Resolver<'a> {
@@ -2710,9 +2734,7 @@ pub fn load_world_from_bytes_with(
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
     let version = peek_save_version(bytes)?;
-    if !(1..=SAVE_VERSION).contains(&version) {
-        return Err(PersistenceError::UnsupportedVersion(version));
-    }
+    ensure_supported_version(version)?;
     if version >= CONTENT_TABLE_VERSION {
         decode_v8(bytes, registry)
     } else {
@@ -2734,9 +2756,7 @@ pub fn load_world_from_bytes_with(
 /// only need the world data.
 pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
     let version = peek_save_version(bytes)?;
-    if !(1..=SAVE_VERSION).contains(&version) {
-        return Err(PersistenceError::UnsupportedVersion(version));
-    }
+    ensure_supported_version(version)?;
     if version >= CONTENT_TABLE_VERSION {
         load_world_from_bytes_with(bytes, ContentRegistry::builtin()).map(|loaded| loaded.data)
     } else {
@@ -2976,8 +2996,32 @@ pub fn save_world_to_path_with_config(
     write_save_file(path, &bytes)
 }
 
+/// Rejects a save longer than [`MAX_SAVE_FILE_BYTES`] before it is read.
+fn reject_oversized_save(len: u64) -> Result<(), PersistenceError> {
+    if len > MAX_SAVE_FILE_BYTES {
+        return Err(PersistenceError::SaveTooLarge {
+            len,
+            limit: MAX_SAVE_FILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Reads a whole save file while refusing to allocate more than
+/// [`MAX_SAVE_FILE_BYTES`].
+fn read_save_bytes(path: &Path) -> Result<Vec<u8>, PersistenceError> {
+    let file = File::open(path)?;
+    reject_oversized_save(file.metadata()?.len())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SAVE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    // A file that grew between the metadata check and the read is still
+    // rejected here rather than silently truncated.
+    reject_oversized_save(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
 pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceError> {
-    let bytes = fs::read(path)?;
+    let bytes = read_save_bytes(path)?;
     load_world_from_bytes(&bytes)
 }
 
@@ -2986,8 +3030,24 @@ pub fn load_world_from_path_with(
     path: &Path,
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
-    let bytes = fs::read(path)?;
+    let bytes = read_save_bytes(path)?;
     load_world_from_bytes_with(&bytes, registry)
+}
+
+/// Probes whether `path` carries a save header this build can play.
+///
+/// This is a catalog probe: it reads only the 8-byte magic + version header,
+/// so an `Ok(())` means the header is valid and the save is listed as
+/// loadable, not that the body is guaranteed to decode. Playing the row loads
+/// the whole file through [`load_world_from_path`] and surfaces any typed
+/// decode error from there.
+pub fn probe_world_at_path(path: &Path) -> Result<(), PersistenceError> {
+    let file = File::open(path)?;
+    reject_oversized_save(file.metadata()?.len())?;
+    let mut header = [0u8; 8];
+    file.take(8).read_exact(&mut header)?;
+    let version = peek_save_version(&header)?;
+    ensure_supported_version(version)
 }
 
 #[cfg(test)]
@@ -7257,5 +7317,75 @@ mod tests {
         let v7 = load_world_from_bytes(&legacy_world_bytes(&v7_data, 7)).unwrap();
         assert_eq!(v7.mobs, pinned_mobs());
         assert_eq!(v7.chests, v7_data.chests);
+    }
+
+    #[test]
+    fn oversized_save_is_rejected_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.mcvx");
+        // Sparse on ext4/NTFS: only the length is set, the body is never
+        // written and never read by any of the loaders below.
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SAVE_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = load_world_from_path(&path).expect_err("oversized save must be rejected");
+        assert!(matches!(
+            err,
+            PersistenceError::SaveTooLarge { len, limit }
+                if len == MAX_SAVE_FILE_BYTES + 1 && limit == MAX_SAVE_FILE_BYTES
+        ));
+
+        let err = load_world_from_path_with(&path, &ContentRegistry::builtin())
+            .expect_err("oversized save must be rejected with a registry");
+        assert!(matches!(
+            err,
+            PersistenceError::SaveTooLarge { len, limit }
+                if len == MAX_SAVE_FILE_BYTES + 1 && limit == MAX_SAVE_FILE_BYTES
+        ));
+
+        let err =
+            probe_world_at_path(&path).expect_err("oversized save must be rejected by the probe");
+        assert!(matches!(err, PersistenceError::SaveTooLarge { .. }));
+
+        assert!(PersistenceError::SaveTooLarge { len: 5, limit: 7 }
+            .to_string()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn probe_accepts_a_header_and_rejects_short_bad_magic_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let valid = dir.path().join("valid.mcvx");
+        let mut header = Vec::new();
+        header.extend_from_slice(SAVE_MAGIC);
+        header.extend_from_slice(&SAVE_VERSION.to_le_bytes());
+        fs::write(&valid, &header).unwrap();
+        probe_world_at_path(&valid).expect("a valid 8-byte header is loadable");
+
+        let short = dir.path().join("short.mcvx");
+        fs::write(&short, b"MCV").unwrap();
+        assert!(matches!(
+            probe_world_at_path(&short),
+            Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+
+        let bad_magic = dir.path().join("bad_magic.mcvx");
+        fs::write(&bad_magic, b"NOPE!1234").unwrap();
+        assert!(matches!(
+            probe_world_at_path(&bad_magic),
+            Err(PersistenceError::InvalidMagic)
+        ));
+
+        let future = dir.path().join("future.mcvx");
+        let mut header = Vec::new();
+        header.extend_from_slice(SAVE_MAGIC);
+        header.extend_from_slice(&(SAVE_VERSION + 1).to_le_bytes());
+        fs::write(&future, &header).unwrap();
+        assert!(matches!(
+            probe_world_at_path(&future),
+            Err(PersistenceError::UnsupportedVersion(v)) if v == SAVE_VERSION + 1
+        ));
     }
 }
