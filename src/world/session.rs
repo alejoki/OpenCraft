@@ -1,10 +1,11 @@
 //! The replaceable active world session: the CPU-side world state
 //! (`WorldManager` + `Player` + `Camera`) plus the save path every save
 //! site writes to. Holding the camera inside the session lets the swap
-//! atomically replace view state too. This module is pure lib code — no
-//! I/O, no winit/wgpu — so the session-boundary contracts are unit-testable
-//! without a window or GPU (D008 layering: S03-T02 wires this into
-//! GameApp the way S01's lifecycle contracts were wired in S02).
+//! atomically replace view state too. No winit/wgpu here, so the
+//! session-boundary contracts are unit-testable without a window or GPU (D008
+//! layering: S03-T02 wires this into GameApp the way S01's lifecycle contracts
+//! were wired in S02). The module also owns the session's save writer — the
+//! one synchronous v9 I/O funnel every save site goes through.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +42,8 @@ use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{
-    ChestMap, ChunkEditMap, LoadedWorld, SavedMob, SavedPlayerState, WorldSaveData,
+    save_world_to_path_with_config, ChestMap, ChunkEditMap, LoadedWorld, PersistenceError,
+    SavedMob, SavedPlayerState, WorldSaveData,
 };
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
@@ -254,6 +256,12 @@ pub struct WorldSession {
     /// last one is a different damage path, not a second writer for the same
     /// one.
     last_damage_cause: Option<DamageCause>,
+}
+
+/// The streaming-autosave condition (audit finding 5): a chunk actually
+/// unloaded and the world holds edits that no save has cleared.
+pub fn autosave_due(unloaded: &[ChunkPos], unsaved_changes: bool) -> bool {
+    !unloaded.is_empty() && unsaved_changes
 }
 
 impl WorldSession {
@@ -1763,6 +1771,29 @@ impl WorldSession {
             mobs: self.mobs.iter().map(SavedMob::from).collect(),
             chunk_edits: self.world.chunk_edits().clone(),
         }
+    }
+
+    /// The single synchronous v9 writer: projection + atomic write, clearing
+    /// the unsaved flag only after the write succeeds.
+    pub fn save(&mut self) -> Result<(), PersistenceError> {
+        let data = self.to_save_data();
+        let result = save_world_to_path_with_config(
+            &self.save_path,
+            &data,
+            self.registry.as_ref(),
+            self.save_config(),
+        );
+        if result.is_ok() {
+            self.world.mark_saved();
+        }
+        result
+    }
+
+    /// Synchronous streaming-autosave seam. Returns whether a save was
+    /// attempted and succeeded; `false` on empty unloads, a clean world, or a
+    /// failed write (the flag stays set for the next opportunity).
+    pub fn autosave_after_unload(&mut self, unloaded: &[ChunkPos]) -> bool {
+        autosave_due(unloaded, self.world.has_unsaved_changes()) && self.save().is_ok()
     }
 
     /// The non-blocking note describing how this session's loaded config
@@ -6448,6 +6479,130 @@ mod tests {
         save_world_to_bytes(&mut resaved, &rebuilt).expect("restored mobs re-encode");
 
         assert_eq!(resaved, bytes, "restore then save is byte-identical");
+    }
+
+    #[test]
+    fn autosave_due_truth_table() {
+        let pos = ChunkPos::new(1, 2, 3);
+
+        assert!(!autosave_due(&[], true));
+        assert!(!autosave_due(&[], false));
+        assert!(!autosave_due(&[pos], false));
+        assert!(autosave_due(&[pos], true));
+    }
+
+    #[test]
+    fn autosave_after_unload_saves_once_and_clears_the_flag() {
+        use crate::world::persistence::load_world_from_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4242u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let chunk_pos = ChunkPos::new(1, 2, 3);
+        let pos = IVec3::new(1 * 32 + 5, 2 * 32 + 5, 3 * 32 + 5);
+        assert_eq!(insert_generated_chunk(&mut session, pos), chunk_pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        assert!(session.world.has_unsaved_changes());
+
+        let first_saved_time = session.clock.time_of_day;
+        assert!(session.autosave_after_unload(&[chunk_pos]));
+        assert!(path.exists(), "the seam writes the save file");
+        assert!(!session.world.has_unsaved_changes(), "the flag is cleared");
+
+        let saved = load_world_from_path(&path).expect("saved world loads");
+        assert!(
+            saved.chunk_edits.contains_key(&chunk_pos),
+            "the edited chunk is persisted"
+        );
+
+        // The clock is not world state, so dirtying it alone must not trigger
+        // a second write: the reloaded time proves exactly one save.
+        session.clock.time_of_day = first_saved_time.wrapping_add(1234);
+        assert!(!session.autosave_after_unload(&[chunk_pos]));
+
+        let reloaded = load_world_from_path(&path).expect("saved world reloads");
+        assert_eq!(reloaded.time_of_day, first_saved_time, "exactly one write");
+    }
+
+    #[test]
+    fn autosave_after_unload_writes_nothing_for_an_empty_unload_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4243u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        assert!(session.world.has_unsaved_changes());
+
+        assert!(!session.autosave_after_unload(&[]));
+        assert!(!path.exists(), "no empty-unload save is written");
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the edits are still unsaved"
+        );
+    }
+
+    #[test]
+    fn autosave_after_unload_keeps_the_flag_when_the_write_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let mut session = WorldSession::new_session(4244u32, blocker, DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        // A regular file as the parent makes `create_dir_all` fail without
+        // relying on chmod/permission bits.
+        session.save_path = session.save_path.join("world.mcvx");
+
+        assert!(!session.autosave_after_unload(&[chunk_pos]));
+        assert!(
+            session.world.has_unsaved_changes(),
+            "a failed write leaves the flag set for the next opportunity"
+        );
+        assert!(!session.save_path.exists());
+    }
+
+    #[test]
+    fn session_save_writes_the_unchanged_v9_bytes() {
+        use crate::world::persistence::save_world_to_bytes_with_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4245u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        session.save().expect("session save writes");
+        let bytes = std::fs::read(&path).expect("save file readable");
+
+        let mut expected = Vec::new();
+        save_world_to_bytes_with_config(
+            &mut expected,
+            &session.to_save_data(),
+            session.registry.as_ref(),
+            session.save_config(),
+        )
+        .expect("expected bytes encode");
+
+        assert_eq!(
+            bytes, expected,
+            "session save writes the v9 bytes unchanged"
+        );
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes());
     }
 
     #[test]
