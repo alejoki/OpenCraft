@@ -112,12 +112,13 @@ use opencraft::world::mob_loot::{drop_roll, mob_drops, MobDropItem, MobDropRepor
 #[cfg(test)]
 use opencraft::world::persistence::save_world_to_path;
 #[cfg(test)]
+use opencraft::world::persistence::save_world_to_path_with_config;
+#[cfg(test)]
 use opencraft::world::persistence::SavedMob;
 use opencraft::world::persistence::{
     load_world_from_bytes_with, load_world_from_path, load_world_from_path_with,
-    save_world_to_path_with, save_world_to_path_with_config, ChunkEditMap, CliConfig,
-    PersistenceError, SavedPlayerState, WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH,
-    DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
+    save_world_to_path_with, ChunkEditMap, CliConfig, PersistenceError, SavedPlayerState,
+    WorldSaveData, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH, DEFAULT_TIME_SCALE,
 };
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
@@ -374,30 +375,15 @@ fn vsync_interval(window: &Window) -> Option<Duration> {
 /// (S03-T02: every save site — F5 quick-save, streaming autosave on
 /// unload, pause Save-and-Quit, Exit Game, CloseRequested, OutOfMemory —
 /// funnels through this one session-tied function, so no site can drift
-/// back to writing cli.save_path). `save_world_to_path` creates parent
-/// directories atomically. Returns `Ok` only after the write succeeded
-/// (only then is the world's unsaved-changes flag cleared); on failure the
-/// `PersistenceError` is returned as data — the session's world keeps
-/// its unsaved-changes flag for the next save opportunity, and the caller
-/// surfaces the error where a message slot exists (no log by convention;
-/// D006/MEM009).
+/// back to writing cli.save_path). `WorldSession::save()` owns the whole
+/// write: projection to the v9 payload, the atomic file write (including
+/// parent-directory creation), and clearing the unsaved-changes flag only
+/// on success. A failed save returns the `PersistenceError` as data with
+/// the session's unsaved-changes flag intact for the next save
+/// opportunity, and the caller surfaces the error where a message slot
+/// exists (no log by convention; D006/MEM009).
 fn save_current_world(session: &mut WorldSession) -> Result<(), PersistenceError> {
-    // The session owns the projection from live state to the save payload, so
-    // integration tests exercise the exact struct production writes.
-    let data = session.to_save_data();
-    // S04: the one production save site writes the session's validated
-    // effective config meta (schema + digest), never a re-derived or default
-    // one. The meta is captured at every startup/install/apply seam.
-    let result = save_world_to_path_with_config(
-        &session.save_path,
-        &data,
-        session.registry.as_ref(),
-        session.save_config(),
-    );
-    if result.is_ok() {
-        session.world.mark_saved();
-    }
-    result
+    session.save()
 }
 
 /// Join the two one-shot session notices into the single transient gameplay
@@ -12571,10 +12557,7 @@ impl ApplicationHandler for GameApp {
                     let season = self.session.season();
                     let (new_meshes, unloaded) =
                         self.session.world.update_streaming(player_chunk, season);
-                    if !unloaded.is_empty()
-                        && self.session.world.has_unsaved_changes()
-                        && save_current_world(&mut self.session).is_ok()
-                    {
+                    if self.session.autosave_after_unload(&unloaded) {
                         self.last_saved_badge = Some(Instant::now());
                     }
                     for upos in unloaded {

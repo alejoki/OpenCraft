@@ -6500,7 +6500,7 @@ mod tests {
         let mut session =
             WorldSession::new_session(4242u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
         let chunk_pos = ChunkPos::new(1, 2, 3);
-        let pos = IVec3::new(1 * 32 + 5, 2 * 32 + 5, 3 * 32 + 5);
+        let pos = IVec3::new(32 + 5, 2 * 32 + 5, 3 * 32 + 5);
         assert_eq!(insert_generated_chunk(&mut session, pos), chunk_pos);
         session
             .world
