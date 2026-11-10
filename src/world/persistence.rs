@@ -7388,4 +7388,65 @@ mod tests {
             Err(PersistenceError::UnsupportedVersion(v)) if v == SAVE_VERSION + 1
         ));
     }
+
+    /// Builds a synthetic edit map with exactly `chunk_count * per_chunk`
+    /// edits over `chunk_count` chunks, mirroring the release-only budget
+    /// harness in `tests/autosave_budget.rs`.
+    fn big_edit_map(chunk_count: usize, per_chunk: usize) -> ChunkEditMap {
+        let mut edits: ChunkEditMap =
+            ChunkEditMap::with_capacity_and_hasher(chunk_count, Default::default());
+        for i in 0..chunk_count {
+            let mut chunk =
+                rustc_hash::FxHashMap::with_capacity_and_hasher(per_chunk, Default::default());
+            for local in 0..per_chunk {
+                chunk.insert(local as u16, BlockId::Stone);
+            }
+            edits.insert(ChunkPos::new((i % 50) as i32, 0, (i / 50) as i32), chunk);
+        }
+        assert_eq!(edits.len(), chunk_count);
+        assert_eq!(
+            edits.values().map(rustc_hash::FxHashMap::len).sum::<usize>(),
+            chunk_count * per_chunk
+        );
+        edits
+    }
+
+    #[test]
+    fn million_edit_save_roundtrips_within_the_cap() {
+        // ~1-3 s in debug (2,000 chunks / 1,000,000 edits): acceptable for the
+        // 60-minute two-OS lane and the only default-suite proof that a real
+        // large save still loads under the 256 MiB cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("million.mcvx");
+
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = big_edit_map(2_000, 500);
+
+        save_world_to_path(&path, &data).expect("a 1M-edit save should write");
+
+        let len = fs::metadata(&path).expect("metadata for the saved file").len();
+        assert!(
+            len > 1_000_000,
+            "a 1M-edit save is multi-MB, got {len} bytes"
+        );
+        assert!(
+            len < MAX_SAVE_FILE_BYTES,
+            "a legitimate 1M-edit save must stay under the cap, got {len} bytes"
+        );
+
+        let loaded = load_world_from_path(&path).expect("a 1M-edit save should load");
+        assert_eq!(loaded.chunk_edits.len(), 2_000);
+        assert_eq!(
+            loaded
+                .chunk_edits
+                .values()
+                .map(rustc_hash::FxHashMap::len)
+                .sum::<usize>(),
+            1_000_000
+        );
+        assert_eq!(loaded.chunk_edits, data.chunk_edits);
+        assert_eq!(loaded.player, data.player);
+        assert_eq!(loaded.seed, data.seed);
+        assert_eq!(loaded.time_of_day, data.time_of_day);
+    }
 }
