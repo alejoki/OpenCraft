@@ -1,4 +1,5 @@
 pub mod arrow;
+pub(crate) mod autosave;
 pub mod background;
 pub mod block;
 pub mod capture;
