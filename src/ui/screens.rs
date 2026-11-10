@@ -1677,6 +1677,22 @@ mod tests {
                 WorldNameError::InvalidCharacter { ch: '/', index: 3 }
             ))
         );
+        // ReservedStem: the payload is the Windows-folder-folded stem as
+        // typed, so `CON ` reports `CON`.
+        for (input, stem) in [
+            ("NUL", "NUL"),
+            ("com1", "com1"),
+            ("CON ", "CON"),
+            ("LPT9", "LPT9"),
+        ] {
+            assert_eq!(
+                validate_create(input, &rows),
+                Err(NewGameFormError::InvalidName(
+                    WorldNameError::ReservedStem { name: stem.into() }
+                )),
+                "{input:?} must be a typed reserved-stem error"
+            );
+        }
     }
 
     #[test]
@@ -1712,6 +1728,12 @@ mod tests {
         let bad_char =
             NewGameFormError::InvalidName(WorldNameError::InvalidCharacter { ch: '/', index: 3 });
         assert!(bad_char.to_string().contains('/'), "names the character");
+        let reserved =
+            NewGameFormError::InvalidName(WorldNameError::ReservedStem { name: "CON".into() });
+        assert_eq!(
+            reserved.to_string(),
+            "World name \"CON\" is reserved by Windows."
+        );
     }
 
     // --- load screen state ---

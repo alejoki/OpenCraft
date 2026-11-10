@@ -28495,6 +28495,56 @@ stack = 64
     }
 
     #[test]
+    fn reserved_windows_names_stay_on_new_game_with_inline_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (input, stem) in [
+            ("NUL", "NUL"),
+            ("com1", "com1"),
+            ("CON ", "CON"),
+            ("LPT9", "LPT9"),
+        ] {
+            let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+            app.new_game
+                .apply(TextInputAction::InsertText(input.into()));
+            app.attempt_create();
+
+            assert_eq!(
+                app.lifecycle.screen(),
+                LifecycleScreen::NewGame,
+                "{input:?} must stay on the create screen"
+            );
+            let message = app
+                .new_game
+                .message()
+                .unwrap_or_else(|| panic!("{input:?} must surface inline"));
+            assert!(
+                message.text.contains("reserved by Windows"),
+                "unexpected reserved-name text for {input:?}: {}",
+                message.text
+            );
+            assert!(
+                message.text.contains(stem),
+                "message must name the folded stem {stem:?}: {}",
+                message.text
+            );
+            assert_eq!(message.ticks_left, menu::MESSAGE_TICKS);
+            assert_eq!(app.session.world.seed(), 1, "session not swapped");
+            assert!(
+                app.catalog.list_rows().is_empty(),
+                "{input:?} must not create a catalog entry"
+            );
+        }
+
+        // Ordinary names still create and own their save path.
+        let mut app = app_at_screen(dir.path(), LifecycleScreen::NewGame);
+        app.new_game
+            .apply(TextInputAction::InsertText("Village".into()));
+        app.attempt_create();
+        assert_eq!(app.lifecycle.screen(), LifecycleScreen::Playing);
+        assert_eq!(app.session.save_path, dir.path().join("Village.mcvx"));
+    }
+
+    #[test]
     fn loadable_play_rebuilds_the_session_from_the_row_and_enters_playing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_at_screen(dir.path(), LifecycleScreen::LoadGame);

@@ -479,6 +479,51 @@ mod tests {
     }
 
     #[test]
+    fn reserved_windows_names_are_rejected_without_writing_any_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+
+        for name in ["NUL", "com1", "CON ", "LPT9"] {
+            match catalog_fs.save_world(name, &sample_save(1)) {
+                Err(CatalogSaveError::InvalidName(WorldNameError::ReservedStem { .. })) => {}
+                other => panic!("expected reserved-stem rejection for {name:?}, got {other:?}"),
+            }
+            assert!(
+                catalog_fs.list_rows().is_empty(),
+                "{name:?} must not appear in the catalog"
+            );
+            // Never probe a device path like NUL.mcvx on Windows: the
+            // tempdir listing is the platform-safe no-file assertion.
+            let entries = std::fs::read_dir(dir.path()).expect("read tempdir").count();
+            assert_eq!(entries, 0, "{name:?} must not create any file");
+        }
+    }
+
+    #[test]
+    fn village_name_saves_lists_and_reloads_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+        let original = sample_save(4242);
+
+        let path = catalog_fs
+            .save_world("Village", &original)
+            .expect("save Village");
+        assert_eq!(path, dir.path().join("Village.mcvx"));
+
+        let rows = catalog_fs.list_rows();
+        assert_eq!(rows.len(), 1, "only the Village save exists");
+        let village = row_for(&rows, "Village");
+        assert!(village.is_loadable(), "Village is a loadable row");
+        assert_eq!(village.file_name, "Village.mcvx");
+
+        let loaded = catalog_fs.load_row(village).expect("load Village");
+        assert_eq!(loaded.seed, original.seed);
+        assert_eq!(loaded.mode, original.mode);
+        assert_eq!(loaded.chunk_edits, original.chunk_edits);
+        assert_eq!(loaded.player.position, original.player.position);
+    }
+
+    #[test]
     fn default_save_file_remains_discoverable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
