@@ -2658,8 +2658,21 @@ pub fn combat_skeleton_spot(session: &WorldSession, seed: u32) -> Option<Vec3> {
 /// [`crate::ui::screens::death_cause_line`] — so the demo proves the shipped
 /// path instead of a parallel copy of it.
 ///
-/// Three documented demo pins, not gameplay rules:
+/// Five documented demo pins, not gameplay rules:
 ///
+/// * the body is settled onto the world's real block top before the spot
+///   search, for the same reason the Hostile stage does it: release frame
+///   pacing can reach this stage while the spawn fall is still mid-settle, and
+///   the spot rule floors the float feet, so a mid-fall y floors into the empty
+///   cell above the standing cell and every candidate is rejected. On the debug
+///   profile the body already rests there, so the snap is a no-op and every
+///   pinned digest stays byte-identical;
+/// * the yaw and pitch are pinned to `Player::new`'s defaults before the scan,
+///   because `combat_skeleton_spot` builds its 16-angle lattice from the live
+///   yaw while the Playing frames feed Wayland mouse-motion deltas into it. A
+///   few thousandths of drift can move the whole lattice off the rare-bow
+///   candidates that pass the one-in-sixteen gate. Live mouse-look must not
+///   move them while the stage runs;
 /// * the two surviving pinned hostiles are parked 20 blocks behind the camera
 ///   and re-pinned at the top of every observation, so a wander can never bring
 ///   one inside the 16-block aggro range and steal the damage or death cause
@@ -2714,6 +2727,42 @@ pub fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) 
         demo.abort("skeleton", "observed=bow_not_selected");
         return true;
     }
+
+    // Settle the demo pose before the spot search, exactly like the Hostile
+    // stage. A fresh world drops the body from terrain + 4 and physics lands it
+    // on an integer block top, but release frame pacing can reach this stage
+    // while the body is still mid-settle (debug has already landed by the same
+    // frame count). The spot rule floors the float feet, so a mid-fall y floors
+    // into the empty cell above the standing cell and every candidate is
+    // rejected. Snapping onto the world's real block top first is a no-op on
+    // the debug profile (the body already rests there), which is what keeps
+    // every pinned digest and the 317-byte v9 witness byte-identical.
+    let pose_before_settle = session.player.position;
+    let Some(grounded_y) = combat_grounded_feet_y(session, pose_before_settle) else {
+        demo.abort(
+            "skeleton",
+            &format!(
+                "observed=ground player=({:.3},{:.3},{:.3})",
+                pose_before_settle.x, pose_before_settle.y, pose_before_settle.z
+            ),
+        );
+        return true;
+    };
+    if pose_before_settle.y != grounded_y {
+        session.player.position.y = grounded_y;
+        session.player.velocity = Vec3::ZERO;
+        session.player.on_ground = true;
+        session.sync_camera();
+    }
+
+    // Pin the yaw/pitch the whole stage is measured against, after the settle so
+    // the spot scan, the forward axis and the victim pose all agree. These are
+    // `Player::new`'s defaults (src/player/physics.rs:280-281); live mouse-look
+    // must not move them while the stage runs, because the rare-bow candidates
+    // only pass the one-in-sixteen gate at the canonical lattice.
+    session.player.yaw = -std::f32::consts::FRAC_PI_4;
+    session.player.pitch = -0.25;
+    session.sync_camera();
 
     let pose = (
         session.player.position,
