@@ -75,22 +75,7 @@ jobs:
 
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux'
-        run: |
-          # Runner mirrors are occasionally unreachable (DNS/TLS flake on
-          # archive.ubuntu.com); a release must not fail on a transient tail.
-          # Bounded retries, then a hard failure so a real outage is loud.
-          set -uo pipefail
-          attempts=5
-          for attempt in $(seq 1 "$attempts"); do
-            if sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config; then
-              echo "release: Linux build dependencies installed on attempt $attempt"
-              exit 0
-            fi
-            echo "release: apt attempt $attempt/$attempts failed, retrying in 20s" >&2
-            sleep 20
-          done
-          echo "release: could not install Linux audio build dependencies after $attempts attempts" >&2
-          exit 1
+        run: bash scripts/install_linux_build_deps.sh
 
       - name: Cache cargo registry, git and target
         uses: actions/cache@v6
