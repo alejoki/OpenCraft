@@ -3115,6 +3115,12 @@ impl GameApp {
         }
     }
 
+    /// Scripted demo poses are pinned by the harness, not by input: live
+    /// mouse-look must not perturb a stage while a demo owns the session.
+    fn scripted_demo_owns_mouse_look(&self) -> bool {
+        self.combat_demo.is_some()
+    }
+
     /// Drive every armed scripted demo through one `about_to_wait` turn.
     ///
     /// Called before the death transition: the starvation stage respawns in
@@ -6890,6 +6896,11 @@ impl ApplicationHandler for GameApp {
             if self.capture.is_naming() {
                 return;
             }
+            // A scripted demo pins its own pose (S11): live pointer deltas
+            // cannot steer a stage the harness is driving.
+            if self.scripted_demo_owns_mouse_look() {
+                return;
+            }
             if self.cursor_grabbed {
                 // Settings-driven sensitivity (S04-T04): the loaded value,
                 // already clamped at load; menu adjustments clamp via the
@@ -10580,6 +10591,60 @@ stack = 64
         assert!(digest.contains("ok=false"), "{digest}");
         assert!(menu_app.demo_finished, "the abort ends the bounded run");
         assert!(menu_app.exit_failure, "the abort requests a non-zero exit");
+    }
+
+    /// A scripted demo pins its own pose, so live mouse-look deltas are dropped
+    /// before any yaw/pitch write while the seam is armed.
+    #[test]
+    fn combat_demo_ignores_live_mouse_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().join("combat-mouse.mcvx");
+        let cli = CliConfig::parse_args([
+            "--new",
+            "--seed",
+            "1",
+            "--demo-combat",
+            "--save",
+            save_path.to_str().expect("utf8 path"),
+        ]);
+        let session = startup_session(&cli);
+        let mut app = GameApp::new(cli, session);
+        assert!(
+            app.scripted_demo_owns_mouse_look(),
+            "an armed combat demo owns the mouse look"
+        );
+
+        app.start_world_session(WorldSession::new_session(
+            7,
+            dir.path().join("other.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        ));
+        assert!(
+            !app.scripted_demo_owns_mouse_look(),
+            "a session swap retires the input seam with the demo"
+        );
+
+        // Wiring pin: the guard sits inside the look arm, after the naming
+        // gate and before the yaw write, so it cannot be dropped silently.
+        let src = include_str!("main.rs");
+        let device = src
+            .find("fn device_event(")
+            .expect("main.rs must define device_event");
+        let naming_gate = src[device..]
+            .find("if self.capture.is_naming() {")
+            .map(|offset| device + offset)
+            .expect("device_event must gate naming look");
+        let demo_gate = src[device..]
+            .find("if self.scripted_demo_owns_mouse_look() {")
+            .map(|offset| device + offset)
+            .expect("device_event must gate scripted demo look");
+        let yaw = src
+            .find("self.session.player.yaw +=")
+            .expect("the mouse-look yaw update is present");
+        assert!(
+            naming_gate < demo_gate && demo_gate < yaw,
+            "the scripted demo guard must sit between the naming gate and the yaw write"
+        );
     }
 
     /// A loaded save with no mob tail (a v6 save, or a v7 save that persisted
