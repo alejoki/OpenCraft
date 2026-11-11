@@ -41,10 +41,10 @@ use opencraft::content::WorldgenRule;
 use opencraft::content::{ContentRegistry, PackContentSpec, Severity, PACK_LAYER_BASE};
 #[cfg(test)]
 use opencraft::demo::combat::{
-    combat_creative_stage, combat_drops_stage, combat_fight_stage, combat_inventory_units,
-    combat_inventory_units_total, combat_quartet, combat_shot_stage, combat_skeleton_stage,
-    CombatStage, COMBAT_DUSK_TICK, COMBAT_PINNED_HEALTH, COMBAT_PINNED_YAW, COMBAT_SAVE_BYTES,
-    COMBAT_SAVE_MOB_COUNT_OFFSET, COMBAT_SAVE_TAIL_BYTES,
+    combat_creative_stage, combat_drops_stage, combat_fight_stage, combat_grounded_feet_y,
+    combat_inventory_units, combat_inventory_units_total, combat_quartet, combat_shot_stage,
+    combat_skeleton_stage, CombatStage, COMBAT_DUSK_TICK, COMBAT_PINNED_HEALTH, COMBAT_PINNED_YAW,
+    COMBAT_SAVE_BYTES, COMBAT_SAVE_MOB_COUNT_OFFSET, COMBAT_SAVE_TAIL_BYTES,
 };
 use opencraft::demo::combat::{combat_demo_step, CombatDemo, COMBAT_DEMO_DEADLINE_SECS};
 #[cfg(test)]
@@ -11686,12 +11686,10 @@ stack = 64
         assert_eq!(creative.mobs().len(), 2, "the abort pushes no victim");
     }
 
-    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot ->
-    /// Skeleton -> Creative -> Save) to completion and return the session plus
-    /// its finished demo. Both save-leg tests use this so the fresh save is
-    /// always produced by the production Save stage rather than hand-built wire
-    /// data.
-    fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
+    /// Build the real generated-terrain fixture shared by the fresh combat-leg
+    /// tests: the production spawn chunks, the production hostile gate, the
+    /// Settle-style terrain+1 grounding, and a fresh demo. No stage is stepped.
+    fn fresh_combat_fixture(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
         let mut session = WorldSession::new_session_with_mode(
             seed,
             save_path,
@@ -11741,18 +11739,29 @@ stack = 64
             ),
         );
 
-        let mut demo = CombatDemo::new(seed, true, None);
-        assert!(!combat_demo_step(&mut demo, &mut session), "settle");
+        let demo = CombatDemo::new(seed, true, None);
+        (session, demo)
+    }
+
+    /// Step the shared fresh leg from Settle through the standard stages. When
+    /// `stop_before` names a stage, the loop returns at the top of the update
+    /// that would step it, leaving the demo parked on that stage.
+    fn step_fresh_combat_leg(
+        session: &mut WorldSession,
+        demo: &mut CombatDemo,
+        stop_before: Option<CombatStage>,
+    ) {
+        assert!(!combat_demo_step(demo, session), "settle");
         assert_eq!(demo.stage, CombatStage::Ambient, "the spawn gate settles");
         // This test pins Walk/Fight/Drops/Save; the Ambient proof has its own
         // dedicated test, and the 7-chunk demo fixture has no light grids, so
         // it could never satisfy `column_ready`.
         demo.stage = CombatStage::Spawn;
-        assert!(!combat_demo_step(&mut demo, &mut session), "spawn");
+        assert!(!combat_demo_step(demo, session), "spawn");
         assert_eq!(demo.stage, CombatStage::Walk);
         for pos in demo.spawn_positions {
             insert_generated_chunk_with_generated_face_neighbors(
-                &mut session,
+                session,
                 IVec3::new(
                     pos.x.floor() as i32,
                     pos.y.floor() as i32,
@@ -11763,6 +11772,10 @@ stack = 64
         let mut updates = 0;
         let mut ended = false;
         while !ended && updates < 600 {
+            if stop_before == Some(demo.stage) {
+                assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+                return;
+            }
             updates += 1;
             session.tick_mobs(0.05, 1.0);
             if demo.stage == CombatStage::Hostile {
@@ -11773,14 +11786,127 @@ stack = 64
                 // pinned `combat_demo:` digest byte-identical.
                 demo.stage = CombatStage::Shot;
             }
-            ended = combat_demo_step(&mut demo, &mut session);
+            ended = combat_demo_step(demo, session);
         }
         assert!(
             demo.finished(),
             "the fresh leg must finish within 600 updates"
         );
         assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+    }
+
+    /// Run a headless fresh combat leg (Settle -> Spawn -> Walk -> Shot ->
+    /// Skeleton -> Creative -> Save) to completion and return the session plus
+    /// its finished demo. Both save-leg tests use this so the fresh save is
+    /// always produced by the production Save stage rather than hand-built wire
+    /// data.
+    fn run_fresh_combat_leg(seed: u32, save_path: PathBuf) -> (WorldSession, CombatDemo) {
+        let (mut session, mut demo) = fresh_combat_fixture(seed, save_path);
+        step_fresh_combat_leg(&mut session, &mut demo, None);
         (session, demo)
+    }
+
+    /// Run the shared fresh leg but park it on the Skeleton stage before that
+    /// stage steps. The full 3x3 chunk grid around the spawn chunk is loaded so
+    /// the 5.5-9.5-block spot lattice is resident for any spawn position (the
+    /// plus-only coverage may miss the diagonal chunk that holds seed 1's
+    /// canonical first bow cell).
+    fn run_fresh_combat_leg_until_skeleton(
+        seed: u32,
+        save_path: PathBuf,
+    ) -> (WorldSession, CombatDemo) {
+        let (mut session, mut demo) = fresh_combat_fixture(seed, save_path);
+        let feet = session.player.position;
+        let cs = CHUNK_SIZE as i32;
+        let base = IVec3::new(
+            feet.x.floor() as i32,
+            feet.y.floor() as i32,
+            feet.z.floor() as i32,
+        );
+        // Five plus-shaped inserts (centre, +x, -x, +z, -z) union to the 3x3
+        // chunk grid around the spawn chunk.
+        for offset in [
+            IVec3::ZERO,
+            IVec3::new(cs, 0, 0),
+            IVec3::new(-cs, 0, 0),
+            IVec3::new(0, 0, cs),
+            IVec3::new(0, 0, -cs),
+        ] {
+            insert_generated_chunk_with_generated_face_neighbors(&mut session, base + offset);
+        }
+        step_fresh_combat_leg(&mut session, &mut demo, Some(CombatStage::Skeleton));
+        (session, demo)
+    }
+
+    /// Pre-fix this aborts at the fire proof (`observed=fired=20 player_hits=0`):
+    /// a mid-fall fractional feet height floors into the empty cell above the
+    /// standing cell, so the spot lattice rejects every candidate. The stage must
+    /// settle the body onto the world's real block top and complete on the real
+    /// generated-terrain fixture.
+    #[test]
+    fn combat_skeleton_stage_grounds_a_fractional_pose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 1;
+        let (mut session, mut demo) = run_fresh_combat_leg_until_skeleton(
+            seed,
+            dir.path().join("combat-skeleton-fractional.mcvx"),
+        );
+        assert_eq!(demo.stage, CombatStage::Skeleton);
+        assert!(!demo.failed, "unexpected early abort: {:?}", demo.digest);
+
+        let grounded = combat_grounded_feet_y(&session, session.player.position)
+            .expect("the fixture grounds the player on generated terrain");
+        session.player.position.y = grounded + 1.8;
+        session.player.velocity = Vec3::new(0.0, -6.0, 0.0);
+        session.player.on_ground = false;
+        session.sync_camera();
+
+        let aborted = combat_skeleton_stage(&mut demo, &mut session);
+        assert!(!aborted, "unexpected abort: {:?}", demo.digest);
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, CombatStage::Creative);
+        assert_eq!(demo.skeleton_fired, 1);
+        assert!(demo.skeleton_bow);
+        assert!(demo.skeleton_respawn);
+        assert_eq!(session.player.position.y, grounded);
+        assert_eq!(
+            demo.skeleton_digest.as_deref(),
+            Some(
+                "combat_skeleton: seed=1 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+            )
+        );
+    }
+
+    /// Pre-fix a drifted yaw rotates the 16-ray spot lattice off the only three
+    /// rare-bow-passing cells: `-0.851398408` yields zero candidates and the
+    /// stage aborts with `observed=spot` 5/5. The stage must pin the canonical
+    /// yaw/pitch before the scan and restore them for the Save witness.
+    #[test]
+    fn combat_skeleton_stage_pins_a_drifted_yaw() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = 1;
+        let (mut session, mut demo) =
+            run_fresh_combat_leg_until_skeleton(seed, dir.path().join("combat-skeleton-yaw.mcvx"));
+        assert_eq!(demo.stage, CombatStage::Skeleton);
+        assert!(!demo.failed, "unexpected early abort: {:?}", demo.digest);
+
+        session.player.yaw = -0.851398408;
+        session.player.pitch = 0.4;
+        session.sync_camera();
+
+        let aborted = combat_skeleton_stage(&mut demo, &mut session);
+        assert!(!aborted, "unexpected abort: {:?}", demo.digest);
+        assert!(!demo.failed, "unexpected abort: {:?}", demo.digest);
+        assert_eq!(demo.stage, CombatStage::Creative);
+        assert!(demo.skeleton_bow);
+        assert_eq!(
+            demo.skeleton_digest.as_deref(),
+            Some(
+                "combat_skeleton: seed=1 fired=1 player_hits=1 damage=2 cause=skeleton_arrow arc=true killed=1 bones=1 arrows=2 bow=true respawn=spawn ok=true"
+            )
+        );
+        assert_eq!(session.player.yaw, -std::f32::consts::FRAC_PI_4);
+        assert_eq!(session.player.pitch, -0.25);
     }
 
     /// The fresh leg writes the v9 save through the production save site, and
