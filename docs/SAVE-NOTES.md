@@ -125,7 +125,7 @@ Version 8 is the modding foundation. The save no longer stores numeric block, it
 When a saved name is well-formed but absent from the loaded content stack, the load does not fail and does not drop the reference. It appends a deterministic placeholder definition and resolves the saved index to it:
 
 - An unknown block name becomes a placeholder block. It is solid, unbreakable, and drops nothing. Placeholder blocks use the built-in checker texture and stay in the world exactly where they were saved.
-- An unknown generic item name becomes a placeholder item. It is movable and stackable in the inventory, and uses the reserved transparent checker icon layer.
+- An unknown generic item name becomes a placeholder item. It is movable and stackable in the inventory, and uses the reserved opaque checker icon layer.
 - An unknown pack tool degrades to a count-one placeholder item, keeping its pack-tool kind on the wire. Restoring the pack returns it as the live tool at its full authored durability: wear is not carried through the placeholder.
 - The saved names are preserved across a second save. Removing a pack never rewrites the world to a different id: restoring the pack resolves the same names to the real definitions again.
 - A name that is malformed, uses a reserved namespace (`opencraft`, `builtin`, `minecraft`) but does not exist, or refers to a liquid is not a placeholder: the whole load fails closed with a named error.

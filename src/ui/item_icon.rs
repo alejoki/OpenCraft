@@ -403,6 +403,11 @@ const TIER_WOOD: [u8; 4] = [0xA9, 0x74, 0x38, 0xFF];
 const TIER_STONE: [u8; 4] = [0x8C, 0x8C, 0x8C, 0xFF];
 const TIER_IRON: [u8; 4] = [0xD9, 0xDD, 0xE2, 0xFF];
 const STRING: [u8; 4] = [0xD8, 0xD8, 0xD8, 0xFF];
+// Placeholder checker shades. Both are fully opaque neutral greys so a
+// placeholder item stays inside the item-icon grey family and never collides
+// with the magenta block-reserved checker (src/render/texture.rs).
+const PLACEHOLDER_DARK: [u8; 4] = [0x4F, 0x4F, 0x57, 0xFF];
+const PLACEHOLDER_LIGHT: [u8; 4] = [0xA8, 0xA8, 0xB0, 0xFF];
 
 /// Tiny deterministic RGBA pixel canvas. The background starts fully
 /// transparent so the inventory/hotbar slot shows through every sprite.
@@ -712,11 +717,29 @@ fn draw_material(material: Material, canvas: &mut SpriteCanvas) {
     }
 }
 
+/// Draw the opaque grey checker used by the reserved placeholder layer.
+///
+/// Every texel is opaque; the pattern uses the same 2x2-cell rule as the
+/// block-reserved checker so the two read as one visual family, while the
+/// neutral grey shades keep placeholder items distinct from real item art.
+fn draw_placeholder(canvas: &mut SpriteCanvas) {
+    for y in 0..ITEM_SPRITE_SIZE as i32 {
+        for x in 0..ITEM_SPRITE_SIZE as i32 {
+            let color = if (x / 2 + y / 2) % 2 == 0 {
+                PLACEHOLDER_LIGHT
+            } else {
+                PLACEHOLDER_DARK
+            };
+            canvas.pixel(x, y, color);
+        }
+    }
+}
+
 fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
     match id {
         ItemId::Block(_) => {}
-        // Layer 27 is the reserved transparent checker slot: a placeholder
-        // pack item draws no art until a pack supplies an icon.
+        // Layer 27 is the reserved opaque checker slot. Placeholder pack
+        // items render `draw_placeholder` until a pack supplies an icon.
         ItemId::Item(_) => {}
         // Pack tool art is registry-authored; there is no procedural fallback.
         ItemId::ModTool(_) => {}
@@ -741,8 +764,10 @@ fn draw_item(id: ItemId, canvas: &mut SpriteCanvas) {
 ///
 /// Returns exactly [`ITEM_SPRITE_LAYERS`] layers of [`ITEM_SPRITE_BYTES`]
 /// bytes. The result is deterministic: no randomness, clocks, or floating
-/// point, so two calls always compare byte-for-byte. Layers `27..32` are
-/// reserved and stay fully transparent.
+/// point, so two calls always compare byte-for-byte. Layers `28..32` are
+/// reserved and stay fully transparent; layer 27 is the opaque checker
+/// placeholder that placeholder pack items render until a pack supplies an
+/// icon.
 pub fn generate_item_sprite_layers_rgba() -> Vec<Vec<u8>> {
     let mut layers = vec![vec![0u8; ITEM_SPRITE_BYTES]; ITEM_SPRITE_LAYERS as usize];
     for (id, layer) in ITEM_SPRITE_TABLE {
@@ -750,14 +775,18 @@ pub fn generate_item_sprite_layers_rgba() -> Vec<Vec<u8>> {
         draw_item(id, &mut canvas);
         layers[layer as usize] = canvas.into_rgba();
     }
+    let mut placeholder = SpriteCanvas::new();
+    draw_placeholder(&mut placeholder);
+    layers[usize::from(crate::content::PLACEHOLDER_ICON_LAYER)] = placeholder.into_rgba();
     layers
 }
 
 /// Resolve a built-in sprite override name to its pinned procedural layer.
 ///
 /// Only the append-only [`ITEM_SPRITE_TABLE`] slots (`0..=26`) are overridable:
-/// the reserved placeholder layer 27 and the spare layers `28..=31` can never
-/// be replaced. Blocks, forged tool pairs, and unknown names return `None`.
+/// the opaque checker placeholder layer 27 and the spare layers `28..=31` can
+/// never be replaced. Blocks, forged tool pairs, and unknown names return
+/// `None`.
 pub fn builtin_icon_layer(name: &str) -> Option<u32> {
     let id = crate::content::names::builtin_item_sprite_id_by_name(name)?;
     let layer = item_sprite_layer(id)?;
@@ -2587,10 +2616,10 @@ mod tests {
         }
         assert_eq!(hashes.len(), 27, "every used sprite must be distinct");
 
-        for layer in 27..ITEM_SPRITE_LAYERS {
+        for layer in 28..ITEM_SPRITE_LAYERS {
             assert!(
                 first[layer as usize].iter().all(|byte| *byte == 0),
-                "reserved layer {layer} must stay fully transparent"
+                "reserved spare layer {layer} must stay fully transparent"
             );
         }
     }
@@ -2664,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_pack_items_use_the_reserved_transparent_layer() {
+    fn placeholder_pack_items_use_the_reserved_opaque_checker() {
         let id = ItemId::Item(0);
         assert_eq!(
             item_sprite_layer(id),
@@ -2677,15 +2706,88 @@ mod tests {
             )))
         );
 
-        // Layer 27 stays transparent: a placeholder item has no art until a
-        // pack supplies one, and must not alias another material or tool.
-        let layers = generate_item_sprite_layers_rgba();
-        assert!(
-            layers[usize::from(crate::content::PLACEHOLDER_ICON_LAYER)]
-                .iter()
-                .all(|byte| *byte == 0),
-            "the reserved placeholder layer must stay fully transparent"
+        // Layer 27 is the opaque checker placeholder: a placeholder item is
+        // visible in the hotbar with no pack supplying art, and must not alias
+        // any real material or tool sprite.
+        let layer_index = usize::from(crate::content::PLACEHOLDER_ICON_LAYER);
+        let first = generate_item_sprite_layers_rgba();
+        let second = generate_item_sprite_layers_rgba();
+        assert_eq!(first, second, "the placeholder layer must be deterministic");
+
+        let procedural = &first[layer_index];
+
+        // Fully opaque everywhere, so an alpha-blended hotbar draw can never
+        // leave the placeholder invisible.
+        for (pixel_index, pixel) in procedural.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                pixel[3], 255,
+                "placeholder pixel {pixel_index} must be fully opaque"
+            );
+        }
+
+        // Exactly two shades, and the composed atlas equals the procedural
+        // layer, so built-in generation and composition cannot drift.
+        let shades: std::collections::BTreeSet<[u8; 4]> =
+            procedural.as_chunks::<4>().0.iter().copied().collect();
+        assert_eq!(
+            shades.len(),
+            2,
+            "the checker must use exactly two shades, got {shades:?}"
         );
+
+        let composed = compose_item_sprite_layers(&[]);
+        assert_eq!(
+            &composed[layer_index], procedural,
+            "the composed placeholder layer must equal the procedural one"
+        );
+
+        // 8x8 cells of 2x2 texels: each cell uniform, adjacent cells alternate.
+        let size = ITEM_SPRITE_SIZE as usize;
+        let shade_at = |x: usize, y: usize| {
+            let offset = (y * size + x) * 4;
+            &procedural[offset..offset + 4]
+        };
+        let cells = size / 2;
+        for cell_y in 0..cells {
+            for cell_x in 0..cells {
+                let corner = shade_at(cell_x * 2, cell_y * 2);
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        assert_eq!(
+                            shade_at(cell_x * 2 + dx, cell_y * 2 + dy),
+                            corner,
+                            "cell ({cell_x}, {cell_y}) must be uniform"
+                        );
+                    }
+                }
+                if cell_x + 1 < cells {
+                    let right = shade_at(cell_x * 2 + 2, cell_y * 2);
+                    assert_ne!(corner, right, "horizontal cells must alternate");
+                }
+                if cell_y + 1 < cells {
+                    let below = shade_at(cell_x * 2, cell_y * 2 + 2);
+                    assert_ne!(corner, below, "vertical cells must alternate");
+                }
+            }
+        }
+
+        // The placeholder must not alias any real sprite layer.
+        let placeholder_hash = stable_hash(procedural);
+        for (_, layer) in ITEM_SPRITE_TABLE {
+            assert_ne!(
+                placeholder_hash,
+                stable_hash(&first[layer as usize]),
+                "placeholder layer must not alias sprite layer {layer}"
+            );
+        }
+
+        // Only the spare layers above the placeholder stay transparent.
+        for layer in 28..ITEM_SPRITE_LAYERS {
+            assert!(
+                first[layer as usize].iter().all(|byte| *byte == 0),
+                "reserved spare layer {layer} must stay fully transparent"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3063,10 +3165,10 @@ mod tests {
                 "{id:?} must have visible default-pack art at layer {layer}"
             );
         }
-        for layer in 27..ITEM_SPRITE_LAYERS {
+        for layer in 28..ITEM_SPRITE_LAYERS {
             assert!(
                 layers[layer as usize].iter().all(|byte| *byte == 0),
-                "reserved default layer {layer} must stay transparent"
+                "reserved spare default layer {layer} must stay transparent"
             );
         }
 

@@ -390,7 +390,7 @@ impl ContentRegistry {
     /// Appends a deterministic placeholder item for a save-local name.
     ///
     /// The new definition's dense index is the current table length. The
-    /// placeholder uses the reserved transparent icon layer and is not food.
+    /// placeholder uses the reserved opaque checker icon layer and is not food.
     /// Returns the allocated index.
     pub fn append_placeholder_item(&mut self, name: &str) -> u16 {
         let index = u16::try_from(self.items.len())
