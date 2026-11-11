@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-    # TEMPORARY rehearsal trigger for M016/S14-T03. A push to milestone/M016
-    # runs version/build/package/artifact-upload on both OSes while the publish
-    # job stays tag-gated (see the `release` job `if:`). S14/T04 removes this
-    # branches entry before the final tag.
-    branches:
-      - "milestone/M016"
 
 permissions:
   contents: read
