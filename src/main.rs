@@ -11890,7 +11890,7 @@ stack = 64
         assert_eq!(demo.stage, CombatStage::Skeleton);
         assert!(!demo.failed, "unexpected early abort: {:?}", demo.digest);
 
-        session.player.yaw = -0.851398408;
+        session.player.yaw = -0.851_398_4;
         session.player.pitch = 0.4;
         session.sync_camera();
 
