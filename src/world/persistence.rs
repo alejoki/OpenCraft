@@ -734,6 +734,10 @@ pub enum PersistenceError {
         len: u64,
         limit: u64,
     },
+    /// The save path is not a regular file: a directory, FIFO, socket, or
+    /// device. Rejected from metadata before `File::open`, so a FIFO can
+    /// never block the reader.
+    NotRegularFile,
     InvalidBlockId(u16),
     InvalidLocalIndex(u16),
     InvalidPlayerState,
@@ -811,6 +815,7 @@ impl fmt::Display for PersistenceError {
                     "save file is too large ({len} bytes; limit {limit} bytes)"
                 )
             }
+            PersistenceError::NotRegularFile => write!(f, "save path is not a regular file"),
             PersistenceError::InvalidBlockId(b) => write!(f, "unknown block id {b} in save"),
             PersistenceError::InvalidLocalIndex(i) => {
                 write!(f, "invalid block index {i} in save")
@@ -3007,11 +3012,34 @@ fn reject_oversized_save(len: u64) -> Result<(), PersistenceError> {
     Ok(())
 }
 
+/// Opens a save for reading, rejecting non-regular paths before `File::open`.
+///
+/// `std::fs::metadata` follows symlinks and never opens the path, so a FIFO
+/// is rejected without waiting for a writer. A directory opens on Linux but
+/// every read fails with `EISDIR`; it is rejected here with the same typed
+/// error on every OS.
+fn open_save_file(path: &Path) -> Result<File, PersistenceError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(PersistenceError::NotRegularFile);
+    }
+    reject_oversized_save(metadata.len())?;
+
+    let file = File::open(path)?;
+    // Recheck type and length from the opened handle: the path can change
+    // between metadata and open (benign TOCTOU).
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(PersistenceError::NotRegularFile);
+    }
+    reject_oversized_save(opened.len())?;
+    Ok(file)
+}
+
 /// Reads a whole save file while refusing to allocate more than
 /// [`MAX_SAVE_FILE_BYTES`].
 fn read_save_bytes(path: &Path) -> Result<Vec<u8>, PersistenceError> {
-    let file = File::open(path)?;
-    reject_oversized_save(file.metadata()?.len())?;
+    let file = open_save_file(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_SAVE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     // A file that grew between the metadata check and the read is still
@@ -3042,8 +3070,7 @@ pub fn load_world_from_path_with(
 /// the whole file through [`load_world_from_path`] and surfaces any typed
 /// decode error from there.
 pub fn probe_world_at_path(path: &Path) -> Result<(), PersistenceError> {
-    let file = File::open(path)?;
-    reject_oversized_save(file.metadata()?.len())?;
+    let file = open_save_file(path)?;
     let mut header = [0u8; 8];
     file.take(8).read_exact(&mut header)?;
     let version = peek_save_version(&header)?;
@@ -7351,6 +7378,27 @@ mod tests {
         assert!(PersistenceError::SaveTooLarge { len: 5, limit: 7 }
             .to_string()
             .contains("too large"));
+    }
+
+    #[test]
+    fn directory_at_save_path_is_rejected_as_not_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("folder.mcvx");
+        fs::create_dir(&path).unwrap();
+
+        for err in [
+            load_world_from_path(&path).unwrap_err(),
+            load_world_from_path_with(&path, ContentRegistry::builtin()).unwrap_err(),
+            probe_world_at_path(&path).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, PersistenceError::NotRegularFile),
+                "expected NotRegularFile, got {err:?}"
+            );
+        }
+        assert!(PersistenceError::NotRegularFile
+            .to_string()
+            .contains("not a regular file"));
     }
 
     #[test]

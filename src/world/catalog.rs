@@ -191,7 +191,8 @@ pub fn world_file_name(name: &str) -> String {
 pub enum RowProblem {
     /// The file stem is not a valid world name.
     InvalidName,
-    /// The file could not be read (permissions, locked, vanished).
+    /// The file could not be read (permissions, locked, vanished, or not a
+    /// regular file).
     Unreadable,
     /// The file was read but rejected by the save loader.
     /// (Magic/version/size errors are represented by the wrapped

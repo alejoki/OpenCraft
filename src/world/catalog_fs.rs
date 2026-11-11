@@ -154,6 +154,7 @@ fn row_problem_for(error: &PersistenceError) -> RowProblem {
             RowProblem::InvalidFormat
         }
         PersistenceError::Io(_) => RowProblem::Unreadable,
+        PersistenceError::NotRegularFile => RowProblem::Unreadable,
         _ => RowProblem::InvalidFormat,
     }
 }
