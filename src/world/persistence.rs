@@ -7401,6 +7401,68 @@ mod tests {
             .contains("not a regular file"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_socket_save_paths_are_rejected_without_blocking() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A Unix socket is not a regular file and std can create it with no
+        // external binary, so this leg always runs.
+        let socket = dir.path().join("sock.mcvx");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for err in [
+            load_world_from_path(&socket).unwrap_err(),
+            probe_world_at_path(&socket).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, PersistenceError::NotRegularFile),
+                "got {err:?}"
+            );
+        }
+        drop(listener);
+
+        // A FIFO is the hazard the guard exists for: open(2) for reading
+        // blocks until a writer appears. mkfifo(1) is the only dependency-
+        // free way to create one (std has no mkfifo).
+        let fifo = dir.path().join("pipe.mcvx");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            other => {
+                eprintln!("skipping FIFO leg: mkfifo unavailable ({other:?})");
+                return;
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let result = probe_world_at_path(&probe_path);
+            let _ = tx.send(format!("{result:?}"));
+        });
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(payload) => {
+                reader.join().unwrap();
+                assert!(payload.contains("NotRegularFile"), "got {payload}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The reader is stuck in open(2); a writer open completes the
+                // pair so the thread can exit, then we fail the test.
+                let _ = File::create(&fifo);
+                reader.join().unwrap();
+                panic!("probe_world_at_path blocked on a FIFO before rejecting it");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The reader panicked; do NOT open the FIFO for writing here
+                // (there would be no reader to pair with and this test would
+                // hang). Surface the thread panic instead.
+                reader.join().unwrap();
+                panic!("probe thread disconnected before reporting");
+            }
+        }
+    }
+
     #[test]
     fn probe_accepts_a_header_and_rejects_short_bad_magic_and_version() {
         let dir = tempfile::tempdir().unwrap();

@@ -729,6 +729,22 @@ mod tests {
     }
 
     #[test]
+    fn non_regular_save_entries_never_list_and_map_to_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("folder.mcvx");
+        fs::create_dir(&path).expect("create dir at save path");
+
+        // is_world_file requires a regular file, so listing filters it out.
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+        assert!(catalog_fs.list_rows().is_empty());
+
+        // A direct (or post-listing race) classification maps the typed
+        // error onto the existing three-problem vocabulary: no new variant.
+        let row = build_row(&path);
+        assert_eq!(row.status, RowStatus::Corrupt(RowProblem::Unreadable));
+    }
+
+    #[test]
     fn vanished_files_surface_as_structured_load_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
