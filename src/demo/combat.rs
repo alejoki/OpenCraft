@@ -1884,6 +1884,38 @@ pub fn combat_spot_feet_y(y: f32) -> f32 {
     (y + 1e-3).floor()
 }
 
+/// How far below the current float feet the demo settles a body before its
+/// spot search. The fresh spawn drops the body from terrain + 4, so four blocks
+/// is the physically reachable fall; the extra margin only absorbs a raised
+/// terrain edge under the same column.
+pub const COMBAT_GROUND_SETTLE_BLOCKS: i32 = 8;
+
+/// The block top physically under `position`, derived from the world.
+///
+/// Scans down from the column's float feet cell for the first solid block and
+/// returns its top as the grounded feet height, or `None` when the column has
+/// no support within [`COMBAT_GROUND_SETTLE_BLOCKS`]. The game has no half
+/// blocks, so a body that lands there rests at an integer feet height; a body
+/// still mid-fall keeps a fractional one. The distinction matters because the
+/// spot rule floors the float feet: a mid-fall y floors into the *empty* cell
+/// above the standing cell, so every candidate fails the air/air/solid guard
+/// even though the body is about to land on a perfectly good block.
+pub fn combat_grounded_feet_y(session: &WorldSession, position: Vec3) -> Option<f32> {
+    if !position.is_finite() {
+        return None;
+    }
+    let x = position.x.floor() as i32;
+    let z = position.z.floor() as i32;
+    let start = position.y.floor() as i32;
+    let lowest = start.saturating_sub(COMBAT_GROUND_SETTLE_BLOCKS);
+    for y in (lowest..=start).rev() {
+        if session.world.get_block(x, y, z).is_solid() {
+            return Some((y + 1) as f32);
+        }
+    }
+    None
+}
+
 /// The Hostile stage: the slice's real-binary proof that a Zombie acquires the
 /// player through line of sight, closes to melee range, and lands repeated
 /// 3-damage hits at a 1.0 s cadence with knockback until the player dies with a
@@ -1901,11 +1933,16 @@ pub fn combat_spot_feet_y(y: f32) -> f32 {
 /// [`WorldSession::spawn_position`] — so the demo proves the shipped path
 /// instead of a parallel copy of it.
 ///
-/// Two documented demo pins, not gameplay rules:
+/// Three documented demo pins, not gameplay rules:
 ///
 /// * the live Zombie is re-pinned at a chosen spot next to the player (the
 ///   Drops stage leaves the quartet pose, and the stage needs a measured
 ///   starting distance);
+/// * the fresh-spawn body is settled onto the world's real block top before
+///   the spot search, because release frame pacing can reach this stage while
+///   the spawn fall is still mid-settle (debug has already landed by the same
+///   frame count). On the debug profile this is a no-op — the body already
+///   rests there — so every pinned digest stays byte-identical;
 /// * the player pose is restored afterwards, so the Shot stage and the Save
 ///   witness start from the same pinned pose (the v9 layout itself is measured
 ///   by the fresh-leg test, never by this stage).
@@ -1926,6 +1963,34 @@ pub fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -
     if session.player.mode() != GameMode::Survival {
         demo.abort("hostile", &format!("mode={:?}", session.player.mode()));
         return true;
+    }
+
+    // Settle the demo pose before the spot search. A fresh world drops the body
+    // from terrain + 4 and physics lands it on an integer block top, but release
+    // frame pacing can reach this stage while the body is still mid-settle
+    // (debug has already landed by the same frame count). The spot rule floors
+    // the float feet, so a mid-fall y floors into the empty cell above the
+    // standing cell and all eight candidates are rejected. Snapping onto the
+    // world's real block top first is a no-op on the debug profile (the body
+    // already rests there), which is what keeps every pinned digest and the
+    // 317-byte v9 witness byte-identical; a mid-fall release pose becomes the
+    // exact resting pose the debug run reaches instead of aborting the demo.
+    let pose_before_settle = session.player.position;
+    let Some(grounded_y) = combat_grounded_feet_y(session, pose_before_settle) else {
+        demo.abort(
+            "hostile",
+            &format!(
+                "observed=ground player=({:.3},{:.3},{:.3})",
+                pose_before_settle.x, pose_before_settle.y, pose_before_settle.z
+            ),
+        );
+        return true;
+    };
+    if pose_before_settle.y != grounded_y {
+        session.player.position.y = grounded_y;
+        session.player.velocity = Vec3::ZERO;
+        session.player.on_ground = true;
+        session.sync_camera();
     }
 
     // The respawn assertion compares against the pose the Save witness expects,
