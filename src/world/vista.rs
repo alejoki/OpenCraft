@@ -25,9 +25,9 @@ pub const VISTA_SEED: u32 = 0x5EED_4A11;
 ///
 /// This is a default-scene value, not a render-time invariant: a persisted or
 /// edited background derives its season from its own saved calendar (D091).
-/// Under [`VISTA_SEED`] the calendar's day-0 season is Summer, so this constant
-/// and [`crate::world::background::BackgroundScene::season`] agree for the
-/// demo scene.
+/// New calendars start in Spring on day 0, so the demo scene's clock sits on
+/// day 1 where the calendar resolves to Summer, preserving the historical
+/// backdrop.
 pub const VISTA_SEASON: Season = Season::Summer;
 
 /// Slow linear yaw drift, in radians per second. At this rate a full turn
@@ -123,12 +123,12 @@ mod tests {
 
     #[test]
     fn default_demo_season_is_summer() {
-        // The demo scene's calendar (VISTA_SEED at day 0) must keep resolving
+        // The demo scene's calendar (VISTA_SEED at day 1) must keep resolving
         // to Summer so a fresh install looks unchanged after M012. A persisted
         // background derives its season from its own save instead (D091).
         assert_eq!(VISTA_SEASON, Season::Summer);
         assert_eq!(
-            crate::world::season::season_of(0, 1, VISTA_SEED),
+            crate::world::season::season_of(1, 1, VISTA_SEED),
             VISTA_SEASON
         );
     }

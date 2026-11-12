@@ -34,13 +34,12 @@ pub const SEASON_CYCLE: [Season; SEASONS_PER_YEAR as usize] = [
     Season::Winter,
 ];
 
-/// First day of Spring in a calendar whose seed-derived starting season is
-/// Spring, at [`DEFAULT_SEASON_LENGTH_DAYS`].
+/// First day of Spring, the season every new calendar starts in.
 ///
-/// Boundary pins (MEM184): day 0 is the first day of the seed's starting
-/// season, so a Spring-starting world begins here. Deliberately named rather
-/// than recomputed at runtime so an accidental change to the day math fails a
-/// test instead of silently shifting the calendar.
+/// Boundary pins (MEM184): day 0 is the first day of Spring, so a fresh world
+/// begins here. Deliberately named rather than recomputed at runtime so an
+/// accidental change to the day math fails a test instead of silently shifting
+/// the calendar.
 pub const FIRST_SPRING_DAY: u32 = 0;
 
 /// First day of Summer in a Spring-starting calendar at the default length.
@@ -139,20 +138,6 @@ impl Default for WeatherRules {
     }
 }
 
-/// FNV-1a 32-bit hash over the four little-endian bytes of `seed`.
-///
-/// Reuses the exact FNV-1a pattern of [`crate::world::catalog::resolve_seed`]:
-/// stable, dependency-free, and identical across runs (std's SipHash-based
-/// hasher makes no cross-run stability promise).
-fn seed_hash(seed: u32) -> u32 {
-    let mut hash: u32 = 0x811C_9DC5;
-    for byte in seed.to_le_bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
 /// FNV-1a 32-bit hash of `seed` followed by `day_index` (both little-endian).
 ///
 /// The high bits are consumed for weather rolls (`>> 8`), which diffuses day
@@ -170,21 +155,23 @@ fn day_hash(seed: u32, day_index: u32) -> u32 {
     hash
 }
 
-/// The season for `day_index` in a world with the given season length and seed.
+/// The season for `day_index` in a world with the given season length.
 ///
-/// Day 0 starts in the season selected by `seed_hash(seed) % 4` (so different
-/// worlds begin in different seasons), and the calendar advances one season
-/// every `season_length_days` days, wrapping Winter → Spring. Pure: repeated
-/// calls with the same inputs always return the same season.
+/// **Every new world starts in Spring on day 0**, so the first days are the
+/// mildest and a fresh Survival run gets the best chance to establish itself.
+/// The calendar then advances one season every `season_length_days` days,
+/// wrapping Winter → Spring. The `seed` parameter is retained in the signature
+/// because callers derive the calendar from saved world state; it deliberately
+/// does not shift the starting season. Pure: repeated calls with the same
+/// inputs always return the same season.
 ///
 /// `season_length_days == 0` is treated as one day instead of panicking, so a
 /// corrupt persisted scalar can never crash the world; persistence clamps the
 /// field as well.
-pub fn season_of(day_index: u32, season_length_days: u32, seed: u32) -> Season {
+pub fn season_of(day_index: u32, season_length_days: u32, _seed: u32) -> Season {
     let length = season_length_days.max(1);
-    let starting_season = seed_hash(seed) % SEASONS_PER_YEAR;
     let seasons_elapsed = day_index / length;
-    Season::from_index(starting_season.wrapping_add(seasons_elapsed))
+    Season::from_index(seasons_elapsed)
 }
 
 /// The weather for `day_index` in the given season under default rules.
@@ -322,8 +309,8 @@ mod tests {
         );
     }
 
-    /// Seed 1 hashes to starting-season index 0 (Spring) under the documented
-    /// FNV-1a scheme, so its boundary days land exactly on the named consts.
+    /// SPRING_START_SEED is the historical fixture seed: day 0 is now Spring
+    /// for every seed, so the boundary constants below are seed-independent.
     const SPRING_START_SEED: u32 = 1;
 
     fn all_seasons_within_four_days(seed: u32) -> bool {
@@ -391,17 +378,31 @@ mod tests {
     }
 
     #[test]
-    fn fixed_seeds_start_in_the_expected_season() {
-        // Hand-derived from FNV-1a over the seed's four little-endian bytes,
-        // then `% SEASONS_PER_YEAR`; never read back from the implementation.
-        assert_eq!(season_of(0, 1, 0), Season::Summer);
-        assert_eq!(season_of(0, 1, 1), Season::Spring);
-        assert_eq!(season_of(0, 1, 2), Season::Winter);
-        assert_eq!(season_of(0, 1, 3), Season::Autumn);
-        assert_eq!(season_of(0, 1, 42), Season::Winter);
-        assert_eq!(season_of(0, 1, 12_345), Season::Spring);
-        assert_eq!(season_of(0, 1, 0xDEAD_BEEF), Season::Winter);
-        assert_eq!(season_of(0, 1, 0x00C0_FFEE), Season::Autumn);
+    fn every_seed_starts_in_spring_and_cycles_in_order() {
+        // Fresh worlds always start mild: day 0 is Spring regardless of seed.
+        for seed in [0u32, 1, 2, 3, 42, 12_345, 0xDEAD_BEEF, 0x00C0_FFEE] {
+            assert_eq!(
+                season_of(0, 1, seed),
+                Season::Spring,
+                "seed {seed} must start in Spring"
+            );
+            assert_eq!(season_of(1, 1, seed), Season::Summer);
+            assert_eq!(season_of(2, 1, seed), Season::Autumn);
+            assert_eq!(season_of(3, 1, seed), Season::Winter);
+            assert_eq!(season_of(4, 1, seed), Season::Spring);
+        }
+    }
+
+    #[test]
+    fn seed_does_not_shift_the_calendar() {
+        // The seed is carried for call-site symmetry with persisted world
+        // state, never as a starting-season selector.
+        for day in [0u32, 1, 2, 3, 17, 1_000] {
+            let expected = season_of(day, DEFAULT_SEASON_LENGTH_DAYS, 0);
+            for seed in [1u32, 42, 0xDEAD_BEEF, 0x00C0_FFEE] {
+                assert_eq!(season_of(day, DEFAULT_SEASON_LENGTH_DAYS, seed), expected);
+            }
+        }
     }
 
     #[test]

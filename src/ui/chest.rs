@@ -15,9 +15,12 @@
 use glam::IVec3;
 
 use crate::player::container::Container;
-use crate::player::inventory::{Inventory, Item, CHEST_SLOTS, INVENTORY_SLOTS};
+use crate::player::inventory::{
+    Inventory, Item, CHEST_SLOTS, HOTBAR_SLOTS, INVENTORY_SLOTS, MAIN_SLOTS,
+};
 use crate::ui::inventory::{
-    item_color, Rect, LABEL_LINE_HEIGHT, PANEL_MARGIN, SLOT_GAP, SLOT_SIZE,
+    Rect, HOTBAR_GAP, HOTBAR_SEPARATOR_THICKNESS, LABEL_LINE_HEIGHT, PANEL_MARGIN, SEPARATOR_COLOR,
+    SLOT_GAP, SLOT_SIZE,
 };
 use crate::ui::Quad;
 
@@ -33,9 +36,10 @@ use crate::ui::Quad;
 pub const MAX_CHEST_LABELS: usize = 160;
 
 const SLOT_COLUMNS: usize = 9;
+const STORAGE_ROWS: usize = MAIN_SLOTS / SLOT_COLUMNS;
 const GRID_W: f32 = 9.0 * SLOT_SIZE + 8.0 * SLOT_GAP;
 const CHEST_GRID_H: f32 = 3.0 * SLOT_SIZE + 2.0 * SLOT_GAP;
-const INVENTORY_GRID_H: f32 = 4.0 * SLOT_SIZE + 3.0 * SLOT_GAP;
+const STORAGE_H: f32 = STORAGE_ROWS as f32 * SLOT_SIZE + (STORAGE_ROWS as f32 - 1.0) * SLOT_GAP;
 
 const PANEL_PAD: f32 = 16.0;
 const TITLE_HEIGHT: f32 = 24.0;
@@ -45,16 +49,14 @@ const FOOTER_HEIGHT: f32 = 52.0;
 
 const SLOTS_TOP: f32 = PANEL_PAD + TITLE_HEIGHT + TITLE_GAP;
 const INVENTORY_TOP: f32 = SLOTS_TOP + CHEST_GRID_H + SECTION_GAP;
+const HOTBAR_TOP: f32 = INVENTORY_TOP + STORAGE_H + HOTBAR_GAP;
+const HOTBAR_SEPARATOR_TOP: f32 =
+    INVENTORY_TOP + STORAGE_H + (HOTBAR_GAP - HOTBAR_SEPARATOR_THICKNESS) * 0.5;
 const PANEL_W: f32 = 2.0 * PANEL_PAD + GRID_W;
-const PANEL_H: f32 = INVENTORY_TOP + INVENTORY_GRID_H + FOOTER_HEIGHT + PANEL_PAD;
+const PANEL_H: f32 = HOTBAR_TOP + SLOT_SIZE + FOOTER_HEIGHT + PANEL_PAD;
 
 const PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.94];
 const SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
-
-/// Fraction of a slot edge used as the inset for the item fill quad.
-const FILL_INSET_RATIO: f32 = 0.12;
-/// Alpha of the cursor ghost quad (the identity color itself stays opaque).
-const CURSOR_GHOST_ALPHA: f32 = 0.85;
 
 // ---------------------------------------------------------------------------
 // Screen state
@@ -97,6 +99,21 @@ impl ChestScreen {
 }
 
 // ---------------------------------------------------------------------------
+// Rendering bundle
+// ---------------------------------------------------------------------------
+
+/// One resolved chest frame: the open screen, its pixel layout, and the two
+/// item grids. Bundled so the pure quad/icon builders stay a function of one
+/// frame snapshot instead of a long argument list.
+#[derive(Clone, Copy)]
+pub struct ChestPanel<'a> {
+    pub screen: &'a ChestScreen,
+    pub layout: &'a ChestLayout,
+    pub chest: Option<&'a Container>,
+    pub inventory: &'a Inventory,
+}
+
+// ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 
@@ -107,8 +124,12 @@ pub struct ChestLayout {
     pub panel: Rect,
     /// 27 chest slots in display order (three rows of nine).
     pub chest_slots: [Rect; CHEST_SLOTS],
-    /// 36 player slots: `0..9` hotbar row, `9..36` three main-storage rows.
+    /// 36 player slots: `9..36` are the three main-storage rows at the top,
+    /// and `0..9` are the hotbar's bottom row below them.
     pub inventory_slots: [Rect; INVENTORY_SLOTS],
+    /// Divider line between the storage rows and the hotbar row, spanning the
+    /// slot grid exactly like the player inventory screen.
+    pub hotbar_separator: Rect,
 }
 
 /// Builds the layout for the given surface. Centers the panel and scales the
@@ -150,10 +171,18 @@ pub fn layout(surface_w: u32, surface_h: u32) -> ChestLayout {
 
     let inventory_slots = std::array::from_fn(|index| {
         let col = index % SLOT_COLUMNS;
-        let row = index / SLOT_COLUMNS;
+        let y = if index < HOTBAR_SLOTS {
+            // Public hotbar indices stay 0..9; only their row moves to the
+            // bottom of the slot block, matching the inventory screen.
+            HOTBAR_TOP
+        } else {
+            let storage_index = index - HOTBAR_SLOTS;
+            let row = storage_index / SLOT_COLUMNS;
+            INVENTORY_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP)
+        };
         to_px(
             PANEL_PAD + col as f32 * (SLOT_SIZE + SLOT_GAP),
-            INVENTORY_TOP + row as f32 * (SLOT_SIZE + SLOT_GAP),
+            y,
             SLOT_SIZE,
             SLOT_SIZE,
         )
@@ -163,6 +192,12 @@ pub fn layout(surface_w: u32, surface_h: u32) -> ChestLayout {
         panel: to_px(0.0, 0.0, PANEL_W, PANEL_H),
         chest_slots,
         inventory_slots,
+        hotbar_separator: to_px(
+            PANEL_PAD,
+            HOTBAR_SEPARATOR_TOP,
+            GRID_W,
+            HOTBAR_SEPARATOR_THICKNESS,
+        ),
     }
 }
 
@@ -235,71 +270,27 @@ fn rect_quad(rect: Rect, color: [f32; 4]) -> Quad {
     }
 }
 
-/// Shrinks a rect by `amount` on every edge without ever inverting it.
-fn inset((x, y, w, h): Rect, amount: f32) -> Rect {
-    let dx = amount.min(w * 0.5).max(0.0);
-    let dy = amount.min(h * 0.5).max(0.0);
-    (
-        x + dx,
-        y + dy,
-        (w - 2.0 * dx).max(0.0),
-        (h - 2.0 * dy).max(0.0),
-    )
-}
-
-/// Fill rect for one occupied cell: the identity color inset inside the slot
-/// outline so the outline stays visible.
-fn cell_fill(rect: Rect) -> Rect {
-    inset(rect, rect.2 * FILL_INSET_RATIO)
-}
-
-fn push_slot_quads(quads: &mut Vec<Quad>, rect: Rect, item: Option<Item>) {
-    quads.push(rect_quad(rect, SLOT_COLOR));
-    if let Some(item) = item {
-        quads.push(rect_quad(cell_fill(rect), item_color(item)));
-    }
-}
-
-/// All quads for one frame: backdrop, chest and inventory slot outlines, item
-/// fills, and the cursor ghost. Empty for a closed screen.
+/// All quads for one frame: backdrop, chest and inventory slot outlines, the
+/// storage/hotbar separator, and nothing else. Empty for a closed screen.
 ///
-/// A missing chest record (`None`) renders as twenty-seven empty slots; the
-/// caller decides whether that means "not loaded yet" or "untouched".
-pub fn screen_quads(
-    screen: &ChestScreen,
-    layout: &ChestLayout,
-    chest: Option<&Container>,
-    inventory: &Inventory,
-    cursor_item: Option<Item>,
-    cursor_pos: Option<(f32, f32)>,
-) -> Vec<Quad> {
+/// Item art is textured, not tinted: `ui::item_icon::chest_icon_vertices_with`
+/// draws every occupied cell after these outlines. A missing chest record
+/// (`None`) renders as twenty-seven empty slots; the caller decides whether
+/// that means "not loaded yet" or "untouched".
+pub fn screen_quads(screen: &ChestScreen, layout: &ChestLayout) -> Vec<Quad> {
     if !screen.is_open() {
         return Vec::new();
     }
 
-    let mut quads = Vec::with_capacity(1 + CHEST_SLOTS + INVENTORY_SLOTS + 37);
+    let mut quads = Vec::with_capacity(2 + CHEST_SLOTS + INVENTORY_SLOTS);
     quads.push(rect_quad(layout.panel, PANEL_COLOR));
+    quads.push(rect_quad(layout.hotbar_separator, SEPARATOR_COLOR));
 
-    for (index, rect) in layout.chest_slots.iter().enumerate() {
-        let item = chest.and_then(|chest| chest.slot(index));
-        push_slot_quads(&mut quads, *rect, item);
+    for rect in layout.chest_slots.iter() {
+        quads.push(rect_quad(*rect, SLOT_COLOR));
     }
-    for (index, rect) in layout.inventory_slots.iter().enumerate() {
-        push_slot_quads(&mut quads, *rect, inventory.slot(index));
-    }
-
-    if let (Some(item), Some((cx, cy))) = (cursor_item, cursor_pos) {
-        if cx.is_finite() && cy.is_finite() {
-            let size = layout.chest_slots[0].2 * 0.75;
-            let color = item_color(item);
-            quads.push(Quad {
-                x: cx - size * 0.5,
-                y: cy - size * 0.5,
-                w: size,
-                h: size,
-                color: [color[0], color[1], color[2], CURSOR_GHOST_ALPHA],
-            });
-        }
+    for rect in layout.inventory_slots.iter() {
+        quads.push(rect_quad(*rect, SLOT_COLOR));
     }
 
     quads
@@ -513,7 +504,7 @@ mod tests {
             }
         }
 
-        // Chest grid is three rows of nine above the four-row player grid.
+        // Chest grid is three rows of nine above the player storage rows.
         for row in 0..3 {
             let first = row * SLOT_COLUMNS;
             let row_top = layout.chest_slots[first].1;
@@ -521,19 +512,59 @@ mod tests {
                 assert_eq!(layout.chest_slots[first + col].1, row_top);
             }
         }
-        for row in 0..4 {
-            let first = row * SLOT_COLUMNS;
+        // Player storage rows are indices 9..36; the hotbar (0..9) is the
+        // bottom row, separated by the divider exactly like the inventory.
+        let storage_top = layout.inventory_slots[HOTBAR_SLOTS].1;
+        for row in 0..STORAGE_ROWS {
+            let first = HOTBAR_SLOTS + row * SLOT_COLUMNS;
             let row_top = layout.inventory_slots[first].1;
+            assert_eq!(row_top, storage_top + row as f32 * (SLOT_SIZE + SLOT_GAP));
             for col in 0..SLOT_COLUMNS {
                 assert_eq!(layout.inventory_slots[first + col].1, row_top);
             }
         }
+        let hotbar_top = layout.inventory_slots[0].1;
+        for index in 0..HOTBAR_SLOTS {
+            assert_eq!(layout.inventory_slots[index].1, hotbar_top);
+            assert!(
+                layout.inventory_slots[index].1
+                    > layout.inventory_slots[HOTBAR_SLOTS + (STORAGE_ROWS - 1) * SLOT_COLUMNS].1,
+                "hotbar slot {index} must sit below every storage row"
+            );
+        }
+
         let last_chest = layout.chest_slots[CHEST_SLOTS - 1];
-        let first_inventory = layout.inventory_slots[0];
+        let storage_bottom = storage_top + STORAGE_H;
         assert!(
-            last_chest.1 + last_chest.3 < first_inventory.1,
+            last_chest.1 + last_chest.3 < storage_top,
             "chest grid must sit fully above the player grid"
         );
+
+        // The divider sits inside HOTBAR_GAP, below storage and above the
+        // hotbar, and overlaps no slot.
+        let separator = layout.hotbar_separator;
+        assert!(inside_panel(separator, layout.panel));
+        assert!((separator.0 - layout.panel.0 - PANEL_PAD).abs() <= 1e-3);
+        assert!((separator.2 - GRID_W).abs() <= 1e-3);
+        assert!(
+            separator.1 >= storage_bottom,
+            "separator starts above storage"
+        );
+        assert!(
+            separator.1 + separator.3 <= hotbar_top,
+            "separator ends below the hotbar top"
+        );
+        for (index, rect) in layout
+            .chest_slots
+            .iter()
+            .chain(layout.inventory_slots.iter())
+            .enumerate()
+        {
+            assert!(
+                !rects_overlap(separator, *rect),
+                "slot {index} overlaps the separator"
+            );
+        }
     }
 
     #[test]
@@ -585,18 +616,25 @@ mod tests {
         let inventory =
             Inventory::from_parts(std::array::from_fn(|_| Some(stone(2))), Some(stone(5)));
 
-        assert!(screen_quads(
-            &closed,
-            &layout,
-            Some(&chest),
-            &inventory,
-            Some(stone(1)),
-            Some((10.0, 10.0)),
-        )
-        .is_empty());
+        assert!(screen_quads(&closed, &layout).is_empty());
         assert!(
             screen_labels(&closed, &layout, Some(&chest), &inventory, Some("hidden")).is_empty()
         );
+    }
+
+    #[test]
+    fn screen_quads_emit_only_the_panel_separator_and_slot_outlines() {
+        let layout = layout(1280, 720);
+        let screen = open_screen();
+
+        let quads = screen_quads(&screen, &layout);
+        // Panel + separator + 27 chest and 36 inventory outlines.
+        assert_eq!(quads.len(), 2 + CHEST_SLOTS + INVENTORY_SLOTS);
+        assert_eq!(quads[0].color, PANEL_COLOR);
+        assert_eq!(quads[1].color, SEPARATOR_COLOR);
+        for quad in &quads[2..] {
+            assert_eq!(quad.color, SLOT_COLOR, "slots draw only their outline");
+        }
     }
 
     #[test]
@@ -605,24 +643,11 @@ mod tests {
         let screen = open_screen();
         let inventory = Inventory::empty();
 
-        let quads = screen_quads(&screen, &layout, None, &inventory, None, None);
-        // One panel plus 27 chest and 36 inventory outlines, no item fills.
-        assert_eq!(quads.len(), 1 + CHEST_SLOTS + INVENTORY_SLOTS);
-        let empty_chest = Container::empty();
-        let empty_quads =
-            screen_quads(&screen, &layout, Some(&empty_chest), &inventory, None, None);
+        // Quads are content-independent: item art is a separate textured pass.
         assert_eq!(
-            quads.len(),
-            empty_quads.len(),
-            "a missing chest record must render exactly like an empty chest"
+            screen_quads(&screen, &layout).len(),
+            2 + CHEST_SLOTS + INVENTORY_SLOTS
         );
-        for (a, b) in quads.iter().zip(empty_quads.iter()) {
-            assert_eq!(
-                (a.x, a.y, a.w, a.h, a.color),
-                (b.x, b.y, b.w, b.h, b.color),
-                "a missing chest record must render exactly like an empty chest"
-            );
-        }
 
         let labels = screen_labels(&screen, &layout, None, &inventory, None);
         assert_eq!(labels.len(), 2, "title plus hint only");
@@ -631,29 +656,11 @@ mod tests {
     }
 
     #[test]
-    fn chest_and_inventory_items_get_fills() {
-        let layout = layout(1280, 720);
-        let screen = open_screen();
-        let chest = Container::from_slots(std::array::from_fn(|index| {
-            Some(if index == 0 { worn_pickaxe() } else { stone(1) })
-        }));
-        let inventory = Inventory::from_parts(
-            std::array::from_fn(|index| Some(stone(index as u16 + 1))),
-            None,
-        );
-
-        let quads = screen_quads(&screen, &layout, Some(&chest), &inventory, None, None);
-        assert_eq!(
-            quads.len(),
-            1 + CHEST_SLOTS + INVENTORY_SLOTS + CHEST_SLOTS + INVENTORY_SLOTS
-        );
-    }
-
-    #[test]
     fn degenerate_surfaces_stay_finite_and_safe() {
         for (w, h) in [(0_u32, 0_u32), (1, 1), (100, 80)] {
             let layout = layout(w, h);
             let rects = std::iter::once(layout.panel)
+                .chain(std::iter::once(layout.hotbar_separator))
                 .chain(layout.chest_slots)
                 .chain(layout.inventory_slots);
             for rect in rects {
@@ -679,54 +686,12 @@ mod tests {
             for cursor in [(0.0, 0.0), (w as f32 * 0.5, h as f32 * 0.5), (-5.0, -5.0)] {
                 let _ = hit_test(&screen, &layout, cursor);
             }
-            let _ = screen_quads(
-                &screen,
-                &layout,
-                Some(&chest),
-                &inventory,
-                Some(stone(1)),
-                Some((0.0, 0.0)),
-            );
+            let _ = screen_quads(&screen, &layout);
             let labels = screen_labels(&screen, &layout, Some(&chest), &inventory, Some("status"));
             for label in labels {
                 assert!(label.left.is_finite() && label.top.is_finite());
             }
         }
-    }
-
-    #[test]
-    fn cursor_ghost_requires_both_item_and_finite_position() {
-        let layout = layout(1280, 720);
-        let screen = open_screen();
-        let inventory = Inventory::empty();
-        let base = 1 + CHEST_SLOTS + INVENTORY_SLOTS;
-
-        let no_ghost = [
-            (None, None),
-            (Some(stone(1)), None),
-            (None, Some((120.0, 120.0))),
-            (Some(stone(1)), Some((f32::NAN, 120.0))),
-            (Some(stone(1)), Some((120.0, f32::INFINITY))),
-        ];
-        for (cursor_item, cursor_pos) in no_ghost {
-            assert_eq!(
-                screen_quads(&screen, &layout, None, &inventory, cursor_item, cursor_pos).len(),
-                base
-            );
-        }
-
-        let quads = screen_quads(
-            &screen,
-            &layout,
-            None,
-            &inventory,
-            Some(stone(1)),
-            Some((120.0, 120.0)),
-        );
-        assert_eq!(quads.len(), base + 1);
-        let ghost = quads[base];
-        assert_eq!(ghost.color[3], CURSOR_GHOST_ALPHA);
-        assert!(ghost.x.is_finite() && ghost.y.is_finite());
     }
 
     #[test]
@@ -793,20 +758,10 @@ mod tests {
         );
         let screen = open_screen();
 
-        for (layout, w, h) in [
-            (&layout_1x, 1280.0, 720.0),
-            (&layout_10x, 12_800.0, 7_200.0),
-        ] {
-            let quads = screen_quads(
-                &screen,
-                layout,
-                Some(&chest),
-                &inventory,
-                Some(worn_pickaxe()),
-                Some((w * 0.5, h * 0.5)),
-            );
-            // 1 panel + 63 outlines + 63 fills + 1 cursor ghost.
-            assert_eq!(quads.len(), 128);
+        for layout in [&layout_1x, &layout_10x] {
+            let quads = screen_quads(&screen, layout);
+            // 1 panel + 1 separator + 63 outlines.
+            assert_eq!(quads.len(), 65);
             let labels = screen_labels(&screen, layout, Some(&chest), &inventory, Some("status"));
             assert_eq!(labels.len(), 130);
             assert!(labels.len() <= MAX_CHEST_LABELS);

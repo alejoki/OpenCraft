@@ -87,15 +87,10 @@ const PANEL_H: f32 = SLOTS_TOP + PANEL_CONTENT_H + FOOTER_HEIGHT + PANEL_PAD;
 const PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.94];
 /// Subtle divider tint for [`InventoryLayout::hotbar_separator`]: lighter than
 /// the panel and the slot outlines so it reads as a rule, not another slot.
-const SEPARATOR_COLOR: [f32; 4] = [0.34, 0.35, 0.40, 1.0];
+pub const SEPARATOR_COLOR: [f32; 4] = [0.34, 0.35, 0.40, 1.0];
 const SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 const GRID_COLOR: [f32; 4] = [0.17, 0.18, 0.21, 1.0];
 const RESULT_COLOR: [f32; 4] = [0.28, 0.25, 0.14, 1.0];
-
-/// Fraction of a slot edge used as the inset for the item fill quad.
-const FILL_INSET_RATIO: f32 = 0.12;
-/// Alpha of the cursor ghost quad (the identity color itself stays opaque).
-const CURSOR_GHOST_ALPHA: f32 = 0.85;
 
 // ---------------------------------------------------------------------------
 // Mode + screen state
@@ -220,7 +215,9 @@ pub struct InventoryLayout {
     /// `0..9` are the hotbar's bottom row below them.
     pub slots: [Rect; INVENTORY_SLOTS],
     /// Divider line centered in [`HOTBAR_GAP`] between the storage rows and
-    /// the hotbar row, spanning the panel's inner width.
+    /// the hotbar row, spanning only the slot grid. It deliberately stops at
+    /// the inventory column: the crafting column is taller, and a panel-wide
+    /// rule would cut through the table grid's top row.
     pub hotbar_separator: Rect,
     /// Active 2x2 player cells, row-major.
     pub player_grid: [Rect; PLAYER_GRID_DIM * PLAYER_GRID_DIM],
@@ -310,7 +307,7 @@ pub fn layout(surface_w: u32, surface_h: u32, _mode: InventoryMode) -> Inventory
         hotbar_separator: to_px(
             PANEL_PAD,
             HOTBAR_SEPARATOR_TOP,
-            PANEL_W - 2.0 * PANEL_PAD,
+            SLOTS_W,
             HOTBAR_SEPARATOR_THICKNESS,
         ),
         player_grid,
@@ -684,33 +681,6 @@ fn rect_quad(rect: Rect, color: [f32; 4]) -> Quad {
     }
 }
 
-/// Shrinks a rect by `amount` on every edge without ever inverting it.
-fn inset((x, y, w, h): Rect, amount: f32) -> Rect {
-    let dx = amount.min(w * 0.5).max(0.0);
-    let dy = amount.min(h * 0.5).max(0.0);
-    (
-        x + dx,
-        y + dy,
-        (w - 2.0 * dx).max(0.0),
-        (h - 2.0 * dy).max(0.0),
-    )
-}
-
-/// Fill rect for one occupied cell: the identity color inset inside the slot
-/// outline so the outline stays visible.
-fn cell_fill(rect: Rect) -> Rect {
-    inset(rect, rect.2 * FILL_INSET_RATIO)
-}
-
-fn preview_fill_with(
-    rect: Rect,
-    preview: RecipePreview,
-    registry: &ContentRegistry,
-) -> Option<Quad> {
-    let item = Item::new_with(registry, preview.output, preview.output_count).ok()?;
-    Some(rect_quad(cell_fill(rect), item_color(item)))
-}
-
 /// One resolved inventory frame: the open mode, its pixel layout, and the three
 /// slot grids the panel draws.
 ///
@@ -730,106 +700,41 @@ pub struct InventoryPanel<'a> {
     pub table_grid: &'a CraftingGrid,
 }
 
-/// All quads for one frame: backdrop, the storage/hotbar separator, slot/grid
-/// outlines, item fills, result previews, and the cursor ghost. Empty for a
-/// closed screen. Draw order is intentional: the separator lands after the
-/// panel background and before any slot fill, so slot outlines and item fills
-/// always paint over it.
-pub fn screen_quads(
-    mode: InventoryMode,
-    layout: &InventoryLayout,
-    inventory: &Inventory,
-    player_grid: &CraftingGrid,
-    table_grid: &CraftingGrid,
-    cursor_item: Option<Item>,
-    cursor_pos: Option<(f32, f32)>,
-) -> Vec<Quad> {
-    screen_quads_with(
-        InventoryPanel {
-            mode,
-            layout,
-            inventory,
-            player_grid,
-            table_grid,
-        },
-        cursor_item,
-        cursor_pos,
-        ContentRegistry::builtin(),
-    )
-}
-
-/// Registry-aware [`screen_quads`]: result previews resolve through `registry`
-/// so a pack-tool preview renders with its authored identity/colour.
+/// All quads for one frame: backdrop, the storage/hotbar separator, and every
+/// slot/grid/result outline. Empty for a closed screen.
 ///
-/// The frame plumbing travels in one [`InventoryPanel`]; the geometry stays a
-/// pure function of its inputs (no hidden state).
-pub fn screen_quads_with(
-    panel: InventoryPanel<'_>,
-    cursor_item: Option<Item>,
-    cursor_pos: Option<(f32, f32)>,
-    registry: &ContentRegistry,
-) -> Vec<Quad> {
-    let InventoryPanel {
-        mode,
-        layout,
-        inventory,
-        player_grid,
-        table_grid,
-    } = panel;
+/// Item art is textured, not a tinted fill: [`super::item_icon`] draws the
+/// block cube or sprite for each occupied cell after these quads. Keeping the
+/// identity colour out of this batch is what makes a slot show its texture
+/// instead of a coloured square behind it. Draw order is intentional: the
+/// separator lands after the panel background and before any slot outline, so
+/// slot outlines always paint over it.
+pub fn screen_quads(mode: InventoryMode, layout: &InventoryLayout) -> Vec<Quad> {
     if !mode.is_open() {
         return Vec::new();
     }
     let mut quads = Vec::new();
     quads.push(rect_quad(layout.panel, PANEL_COLOR));
     // Separator between the three storage rows and the hotbar row. It is
-    // emitted before the slots so the slot fills (which never overlap the
+    // emitted before the slots so the slot outlines (which never overlap the
     // separator by layout construction) keep their own draw order.
     quads.push(rect_quad(layout.hotbar_separator, SEPARATOR_COLOR));
 
-    for (index, rect) in layout.slots.iter().enumerate() {
+    for rect in layout.slots.iter() {
         quads.push(rect_quad(*rect, SLOT_COLOR));
-        if let Some(item) = inventory.slot(index) {
-            quads.push(rect_quad(cell_fill(*rect), item_color(item)));
-        }
     }
 
-    for (index, rect) in layout.player_grid.iter().enumerate() {
+    for rect in layout.player_grid.iter() {
         quads.push(rect_quad(*rect, GRID_COLOR));
-        if let Some(item) = player_grid.slot(index) {
-            quads.push(rect_quad(cell_fill(*rect), item_color(item)));
-        }
     }
 
     quads.push(rect_quad(layout.player_result, RESULT_COLOR));
-    if let Some(preview) = player_grid.preview_with(registry) {
-        quads.extend(preview_fill_with(layout.player_result, preview, registry));
-    }
 
     if mode == InventoryMode::Table {
-        for (index, rect) in layout.table_grid.iter().enumerate() {
+        for rect in layout.table_grid.iter() {
             quads.push(rect_quad(*rect, GRID_COLOR));
-            if let Some(item) = table_grid.slot(index) {
-                quads.push(rect_quad(cell_fill(*rect), item_color(item)));
-            }
         }
         quads.push(rect_quad(layout.table_result, RESULT_COLOR));
-        if let Some(preview) = table_grid.preview_with(registry) {
-            quads.extend(preview_fill_with(layout.table_result, preview, registry));
-        }
-    }
-
-    if let (Some(item), Some((cx, cy))) = (cursor_item, cursor_pos) {
-        if cx.is_finite() && cy.is_finite() {
-            let size = layout.player_result.2 * 0.75;
-            let color = item_color(item);
-            quads.push(Quad {
-                x: cx - size * 0.5,
-                y: cy - size * 0.5,
-                w: size,
-                h: size,
-                color: [color[0], color[1], color[2], CURSOR_GHOST_ALPHA],
-            });
-        }
     }
 
     quads
@@ -1171,16 +1076,22 @@ mod tests {
             "storage bottom {storage_bottom} to hotbar top {hotbar_top} is narrower than HOTBAR_GAP"
         );
 
-        // The separator spans the panel's inner width, sits inside the gap,
-        // and overlaps no slot.
+        // The separator spans only the slot grid, sits inside the gap, and
+        // overlaps no slot. It must stop before the crafting column so the
+        // taller table grid's top row can never be cut by it.
         let separator = layout.hotbar_separator;
         assert!(
             inside_panel(separator, panel),
             "separator escapes the panel"
         );
         let pad = panel.2 * (PANEL_PAD / PANEL_W);
+        let slots_w = panel.2 * (SLOTS_W / PANEL_W);
         assert!((separator.0 - (panel.0 + pad)).abs() <= f32::EPSILON);
-        assert!((separator.2 - (panel.2 - 2.0 * pad)).abs() <= f32::EPSILON);
+        assert!((separator.2 - slots_w).abs() <= f32::EPSILON);
+        assert!(
+            separator.0 + separator.2 <= layout.player_grid[0].0,
+            "separator must stop before the crafting column"
+        );
         assert!(
             separator.1 >= storage_bottom,
             "separator starts above the storage bottom"
@@ -1236,15 +1147,7 @@ mod tests {
     #[test]
     fn screen_quads_draws_separator_before_slots_and_no_slot_overlaps_it() {
         let layout = layout(1280, 720, InventoryMode::Player);
-        let quads = screen_quads(
-            InventoryMode::Player,
-            &layout,
-            &Inventory::empty(),
-            &CraftingGrid::new(GridKind::Player),
-            &CraftingGrid::new(GridKind::Table),
-            None,
-            None,
-        );
+        let quads = screen_quads(InventoryMode::Player, &layout);
 
         // Backdrop first, then the separator, then every slot outline in
         // public index order (0..9 hotbar, 9..36 storage). No remapping.
@@ -1389,18 +1292,7 @@ mod tests {
         assert_eq!(hit_test(InventoryMode::Player, &layout, (-1.0, -1.0)), None);
 
         // No table quads are emitted in Player mode.
-        let inventory = Inventory::empty();
-        let player_grid = CraftingGrid::new(GridKind::Player);
-        let table_grid = CraftingGrid::new(GridKind::Table);
-        let quads = screen_quads(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
-            None,
-            None,
-        );
+        let quads = screen_quads(InventoryMode::Player, &layout);
         // panel + separator + 36 slots + 4 player cells + player result
         assert_eq!(quads.len(), 43);
     }
@@ -1447,15 +1339,7 @@ mod tests {
             );
         }
 
-        let quads = screen_quads(
-            InventoryMode::Table,
-            &layout,
-            &Inventory::empty(),
-            &CraftingGrid::new(GridKind::Player),
-            &CraftingGrid::new(GridKind::Table),
-            None,
-            None,
-        );
+        let quads = screen_quads(InventoryMode::Table, &layout);
         // 43 player-mode quads + 16 table cells + table result
         assert_eq!(quads.len(), 43 + 16 + 1);
     }
@@ -1481,16 +1365,7 @@ mod tests {
             hit_test(InventoryMode::Closed, &layout, center(layout.table_result)),
             None
         );
-        assert!(screen_quads(
-            InventoryMode::Closed,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
-            Some(stone(1)),
-            Some((10.0, 10.0)),
-        )
-        .is_empty());
+        assert!(screen_quads(InventoryMode::Closed, &layout).is_empty());
         assert!(screen_labels(
             InventoryMode::Closed,
             &layout,
@@ -1554,15 +1429,7 @@ mod tests {
                 let inventory = Inventory::empty();
                 let player_grid = CraftingGrid::new(GridKind::Player);
                 let table_grid = CraftingGrid::new(GridKind::Table);
-                let _ = screen_quads(
-                    mode,
-                    &layout,
-                    &inventory,
-                    &player_grid,
-                    &table_grid,
-                    Some(stone(1)),
-                    Some((0.0, 0.0)),
-                );
+                let _ = screen_quads(mode, &layout);
                 let _ = screen_labels(
                     mode,
                     &layout,

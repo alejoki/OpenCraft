@@ -228,24 +228,8 @@ fn digest_line(
     );
     let hotbar_icons = hotbar_icon_vertices(&fixture.inventory, surface_w, surface_h);
 
-    let player_quads = screen_quads(
-        InventoryMode::Player,
-        &player_layout,
-        &fixture.inventory,
-        &fixture.player_grid,
-        &fixture.table_grid,
-        cursor_item,
-        cursor_pos,
-    );
-    let table_quads = screen_quads(
-        InventoryMode::Table,
-        &table_layout,
-        &fixture.inventory,
-        &fixture.player_grid,
-        &fixture.table_grid,
-        cursor_item,
-        cursor_pos,
-    );
+    let player_quads = screen_quads(InventoryMode::Player, &player_layout);
+    let table_quads = screen_quads(InventoryMode::Table, &table_layout);
 
     let empty = fixture
         .inventory
@@ -375,8 +359,8 @@ fn digest_line(
     );
     push_check(&mut failures, "empty", empty == 25);
     push_check(&mut failures, "empty_table", empty_table == 12);
-    push_check(&mut failures, "quads_player", player_quads.len() == 60);
-    push_check(&mut failures, "quads_table", table_quads.len() == 82);
+    push_check(&mut failures, "quads_player", player_quads.len() == 43);
+    push_check(&mut failures, "quads_table", table_quads.len() == 60);
     push_check(&mut failures, "sep_gap", (sep_gap - 16.0).abs() < 1e-4);
     push_check(&mut failures, "sep_h", (sep_h - 2.0).abs() < 1e-4);
     push_check(
@@ -492,9 +476,9 @@ mod tests {
     // Pinned in two places on purpose: `scripts/ui_smoke.sh` mirrors these
     // exact lines. Update both halves together when a fixture or count changes.
     const PINNED_LINES: [&str; 3] = [
-        "ui_demo: size=1280x720 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=60 quads_table=82 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=14.577 vitals_row=162.169 vitals_gap=1.822 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
-        "ui_demo: size=1920x1080 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=60 quads_table=82 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=21.865 vitals_row=243.253 vitals_gap=2.733 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
-        "ui_demo: size=3840x2160 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=60 quads_table=82 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=43.731 vitals_row=486.507 vitals_gap=5.466 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=1280x720 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=14.577 vitals_row=162.169 vitals_gap=1.822 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=1920x1080 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=21.865 vitals_row=243.253 vitals_gap=2.733 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=3840x2160 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=43.731 vitals_row=486.507 vitals_gap=5.466 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
     ];
 
     #[test]

@@ -62,7 +62,7 @@ Saves written before the calendar existed carry no day or season data. They load
 - A season length of one game day.
 - Noon, if the save is old enough to predate time-of-day storage.
 
-Day 0 starts in the season chosen by your world seed. Different seeds start in different seasons, so an old world may resume in Spring, Summer, Autumn, or Winter. That is determined by the seed, not by the date you load it.
+Day 0 is always Spring, in every world. New saves start in the mildest season so a fresh Survival run has the best chance to establish itself, and the calendar then advances Spring → Summer → Autumn → Winter. The starting season does not depend on the seed or on the date you load a save.
 
 The calendar is stored the next time the world is saved. Use quick save, the pause menu's Save and Quit, or simply close the window.
 
@@ -216,9 +216,9 @@ Loading an existing save never moves you. Your saved position is restored exactl
 
 ## Seasons and weather
 
-The calendar is a pure function of three things: the day index, the season length, and the world seed. Nothing depends on your computer's clock, so the same save always resumes in the same season and the same weather.
+The calendar is a pure function of the day index and the season length; weather additionally mixes in the world seed. Nothing depends on your computer's clock, so the same save always resumes in the same season and the same weather.
 
-- Day 0 starts in the season chosen by the seed.
+- Day 0 is always Spring, so every new world starts in Spring.
 - A new season begins every time the day index crosses the season length.
 - The New Game screen offers season lengths of 1, 2, 4, and 8 days. The default is 1 day.
 - A save file can carry any season length from 1 to 365 days. A stored value outside that range is treated as 1 day instead of breaking the world.

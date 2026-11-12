@@ -22,6 +22,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use super::chest::ChestPanel;
 use super::hud::{hotbar_icon_rect, hotbar_slot_rects};
 use super::inventory::{InventoryMode, InventoryPanel, Rect};
 use super::palette::{self, PaletteLayout, PaletteScreen};
@@ -1165,6 +1166,70 @@ pub fn inventory_icon_vertices_with(
     out
 }
 
+/// Item icons for the open chest screen: all 27 chest cells and the 36 player
+/// inventory slots, on the same textured pass the inventory uses. Closed
+/// screens emit nothing.
+pub fn chest_icon_vertices(
+    panel: ChestPanel<'_>,
+    cursor_item: Option<Item>,
+    cursor_pos: Option<(f32, f32)>,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    chest_icon_vertices_with(None, panel, cursor_item, cursor_pos, surface_w, surface_h)
+}
+
+/// [`chest_icon_vertices`] with pack identities resolved through the frozen
+/// session registry.
+pub fn chest_icon_vertices_with(
+    registry: Option<&Arc<ContentRegistry>>,
+    panel: ChestPanel<'_>,
+    cursor_item: Option<Item>,
+    cursor_pos: Option<(f32, f32)>,
+    surface_w: u32,
+    surface_h: u32,
+) -> IconDrawList {
+    let ChestPanel {
+        screen,
+        layout,
+        chest,
+        inventory,
+    } = panel;
+    let mut out = match registry {
+        Some(registry) => IconDrawList::with_registry(Arc::clone(registry)),
+        None => IconDrawList::new(),
+    };
+    if !screen.is_open() {
+        return out;
+    }
+
+    for (index, rect) in layout.chest_slots.iter().enumerate() {
+        out.push_item(
+            chest.and_then(|chest| chest.slot(index)),
+            *rect,
+            surface_w,
+            surface_h,
+        );
+    }
+    for (index, rect) in layout.inventory_slots.iter().enumerate() {
+        out.push_item(inventory.slot(index), *rect, surface_w, surface_h);
+    }
+
+    if let (Some(item), Some((cx, cy))) = (cursor_item, cursor_pos) {
+        if cx.is_finite() && cy.is_finite() {
+            let size = layout.chest_slots[0].2 * 0.75;
+            out.push_item(
+                Some(item),
+                (cx - size * 0.5, cy - size * 0.5, size, size),
+                surface_w,
+                surface_h,
+            );
+        }
+    }
+
+    out
+}
+
 /// Item icons for the nine gameplay hotbar slots.
 ///
 /// Each icon is inset inside its [`hotbar_slot_rects`] slot and owns the full
@@ -1679,10 +1744,12 @@ fn upload_icon_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::container::Container;
     use crate::player::inventory::{
         CraftingGrid, GridKind, Inventory, Item, ItemId, Material, ToolKind, ToolTier,
         HOTBAR_SLOTS, INVENTORY_SLOTS,
     };
+    use crate::ui::chest::ChestScreen;
     use crate::ui::text_input::TextInputAction;
 
     const SLOT: Rect = (10.0, 20.0, 40.0, 40.0);
@@ -2226,6 +2293,117 @@ mod tests {
         let hotbar = hotbar_icon_vertices(&inventory, 1280, 720);
         assert!(hotbar.block.is_empty());
         assert_eq!(hotbar.sprite.len(), HOTBAR_SLOTS * 6);
+    }
+
+    #[test]
+    fn chest_icons_cover_both_grids_and_put_the_hotbar_at_the_bottom() {
+        let layout = crate::ui::chest::layout(1280, 720);
+        let mut screen = ChestScreen::new();
+        screen.open();
+        let stone = item(ItemId::Block(BlockId::Stone));
+        let stick = item(ItemId::Material(Material::Stick));
+        let chest = Container::from_slots(std::array::from_fn(|_| Some(stone)));
+        let inventory = Inventory::from_parts(std::array::from_fn(|_| Some(stick)), None);
+
+        let panel = ChestPanel {
+            screen: &screen,
+            layout: &layout,
+            chest: Some(&chest),
+            inventory: &inventory,
+        };
+        let verts = chest_icon_vertices(panel, None, None, 1280, 720);
+        assert_eq!(verts.block.len(), 27 * 18, "every chest slot has a cube");
+        assert_eq!(
+            verts.sprite.len(),
+            INVENTORY_SLOTS * 6,
+            "every player slot has a sprite"
+        );
+
+        // The first nine inventory icons belong to the hotbar row, which must
+        // sit below the separator exactly like the inventory screen.
+        let separator_bottom = layout.hotbar_separator.1 + layout.hotbar_separator.3;
+        for v in &verts.sprite[..HOTBAR_SLOTS * 6] {
+            let (_, y) = pixel(v, 1280, 720);
+            assert!(
+                y >= separator_bottom - 1e-4,
+                "hotbar icon y={y} above separator bottom {separator_bottom}"
+            );
+        }
+
+        // A closed screen draws nothing, and a missing chest record draws only
+        // the player inventory icons.
+        let closed = ChestScreen::new();
+        assert!(chest_icon_vertices(
+            ChestPanel {
+                screen: &closed,
+                layout: &layout,
+                chest: Some(&chest),
+                inventory: &inventory,
+            },
+            Some(stone),
+            Some((10.0, 10.0)),
+            1280,
+            720,
+        )
+        .is_empty());
+        let no_chest = chest_icon_vertices(
+            ChestPanel {
+                screen: &screen,
+                layout: &layout,
+                chest: None,
+                inventory: &inventory,
+            },
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(no_chest.block.is_empty());
+        assert_eq!(no_chest.sprite.len(), INVENTORY_SLOTS * 6);
+    }
+
+    #[test]
+    fn chest_cursor_ghost_is_a_textured_icon_with_the_inventory_ghost_size() {
+        let layout = crate::ui::chest::layout(1280, 720);
+        let mut screen = ChestScreen::new();
+        screen.open();
+        let stone = item(ItemId::Block(BlockId::Stone));
+        let inventory = Inventory::empty();
+        let base = chest_icon_vertices(
+            ChestPanel {
+                screen: &screen,
+                layout: &layout,
+                chest: None,
+                inventory: &inventory,
+            },
+            None,
+            None,
+            1280,
+            720,
+        );
+        assert!(base.is_empty());
+
+        let ghost = chest_icon_vertices(
+            ChestPanel {
+                screen: &screen,
+                layout: &layout,
+                chest: None,
+                inventory: &inventory,
+            },
+            Some(stone),
+            Some((120.0, 120.0)),
+            1280,
+            720,
+        );
+        assert_eq!(ghost.block.len(), 18);
+        let size = layout.chest_slots[0].2 * 0.75;
+        let expected = (120.0 - size * 0.5, 120.0 - size * 0.5, size, size);
+        let (ix, iy, iw, ih) = icon_rect(expected);
+        for v in &ghost.block {
+            let (x, y) = pixel(v, 1280, 720);
+            assert!(x >= ix - 1e-4 && x <= ix + iw + 1e-4);
+            assert!(y >= iy - 1e-4 && y <= iy + ih + 1e-4);
+        }
     }
 
     #[test]

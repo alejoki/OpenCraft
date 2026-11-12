@@ -118,7 +118,7 @@ use opencraft::startup::{
 use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
     hit_test as chest_hit_test, layout as chest_layout, screen_labels as chest_screen_labels,
-    screen_quads as chest_screen_quads, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
+    screen_quads as chest_screen_quads, ChestPanel, ChestScreen, ChestTarget, MAX_CHEST_LABELS,
 };
 #[cfg(test)]
 use opencraft::ui::hud::mining_progress_quads;
@@ -130,14 +130,14 @@ use opencraft::ui::hud::{
 #[cfg(test)]
 use opencraft::ui::inventory::InventoryMode;
 use opencraft::ui::inventory::{
-    hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads_with,
+    hit_test, hovered_item_with, layout, rects_intersect, screen_labels_with, screen_quads,
     tooltip_lines_with, tooltip_rect, InventoryPanel, InventoryScreen, InventoryTarget,
     LABEL_LINE_HEIGHT, MAX_LABELS, TOOLTIP_PAD_X, TOOLTIP_PAD_Y,
 };
 use opencraft::ui::item_icon::{
-    builtin_icon_layer, compose_item_sprite_layers, compose_item_sprite_layers_with_overrides,
-    hotbar_icon_vertices_with, inventory_icon_vertices_with, palette_icon_vertices_with,
-    IconDrawList,
+    builtin_icon_layer, chest_icon_vertices_with, compose_item_sprite_layers,
+    compose_item_sprite_layers_with_overrides, hotbar_icon_vertices_with,
+    inventory_icon_vertices_with, palette_icon_vertices_with, IconDrawList,
 };
 use opencraft::ui::logo;
 use opencraft::ui::menu::{self, AdjustDirection, MenuMessage, MenuRow};
@@ -6229,18 +6229,7 @@ impl ApplicationHandler for GameApp {
                 let inventory_layout = if inventory_mode.is_open() {
                     let layout =
                         layout(gpu.ctx.config.width, gpu.ctx.config.height, inventory_mode);
-                    quads.extend(screen_quads_with(
-                        InventoryPanel {
-                            mode: inventory_mode,
-                            layout: &layout,
-                            inventory: self.session.player.inventory(),
-                            player_grid: self.session.player.player_grid(),
-                            table_grid: self.session.player.table_grid(),
-                        },
-                        self.session.player.inventory().cursor(),
-                        self.cursor_pos,
-                        &self.session_registry,
-                    ));
+                    quads.extend(screen_quads(inventory_mode, &layout));
                     Some(layout)
                 } else {
                     None
@@ -6253,14 +6242,7 @@ impl ApplicationHandler for GameApp {
                 // renders as empty slots.
                 let chest_layout_value = if self.chest.is_open() {
                     let layout = chest_layout(gpu.ctx.config.width, gpu.ctx.config.height);
-                    quads.extend(chest_screen_quads(
-                        &self.chest,
-                        &layout,
-                        self.session.open_chest_contents(),
-                        self.session.player.inventory(),
-                        self.session.player.inventory().cursor(),
-                        self.cursor_pos,
-                    ));
+                    quads.extend(chest_screen_quads(&self.chest, &layout));
                     Some(layout)
                 } else {
                     None
@@ -6414,6 +6396,21 @@ impl ApplicationHandler for GameApp {
                             inventory: self.session.player.inventory(),
                             player_grid: self.session.player.player_grid(),
                             table_grid: self.session.player.table_grid(),
+                        },
+                        self.session.player.inventory().cursor(),
+                        self.cursor_pos,
+                        gpu.ctx.config.width,
+                        gpu.ctx.config.height,
+                    ));
+                }
+                if let Some(layout) = chest_layout_value.as_ref() {
+                    icons.append(chest_icon_vertices_with(
+                        Some(&self.session_registry),
+                        ChestPanel {
+                            screen: &self.chest,
+                            layout,
+                            chest: self.session.open_chest_contents(),
+                            inventory: self.session.player.inventory(),
                         },
                         self.session.player.inventory().cursor(),
                         self.cursor_pos,
@@ -12832,7 +12829,7 @@ stack = 64
             app.background.clock.time_of_day,
             daycycle::VISTA_GOLDEN_HOUR
         );
-        assert_eq!(app.background.clock.day_index, 0);
+        assert_eq!(app.background.clock.day_index, 1);
         assert_eq!(app.background.season(), Season::Summer);
         assert!(!app.background.persisted);
         assert_eq!(app.background.anchor, vista::vista_anchor());
@@ -17827,32 +17824,19 @@ stack = 64
             "the built-in registry cannot preview pack content"
         );
 
-        let pack_quads = screen_quads_with(
-            InventoryPanel {
-                mode: InventoryMode::Table,
-                layout: &ui_layout,
-                inventory: player.inventory(),
-                player_grid: player.player_grid(),
-                table_grid: player.table_grid(),
-            },
-            None,
-            None,
-            &registry,
-        );
-        let builtin_quads = screen_quads(
-            InventoryMode::Table,
-            &ui_layout,
-            player.inventory(),
-            player.player_grid(),
-            player.table_grid(),
-            None,
-            None,
-        );
+        let pack_quads = screen_quads(InventoryMode::Table, &ui_layout);
+        let builtin_quads = screen_quads(InventoryMode::Table, &ui_layout);
         assert_eq!(
             pack_quads.len(),
-            builtin_quads.len() + 1,
-            "the pack-tool preview adds exactly one result fill quad"
+            builtin_quads.len(),
+            "the preview is textured art, not a tinted fill, so the quad list is registry-independent"
         );
+        for (pack, builtin) in pack_quads.iter().zip(builtin_quads.iter()) {
+            assert_eq!(
+                (pack.x, pack.y, pack.w, pack.h, pack.color),
+                (builtin.x, builtin.y, builtin.w, builtin.h, builtin.color)
+            );
+        }
 
         let outcome = apply_inventory_click_button_with(
             &mut player,
@@ -18190,16 +18174,7 @@ stack = 64
         let layout = layout(1280, 720, InventoryMode::Player);
 
         // A closed screen contributes no geometry and no text at all.
-        assert!(screen_quads(
-            InventoryMode::Closed,
-            &layout,
-            &empty_inventory,
-            &empty_player_grid,
-            &empty_table_grid,
-            Some(test_stack(BlockId::Stone, 3)),
-            Some((100.0, 100.0)),
-        )
-        .is_empty());
+        assert!(screen_quads(InventoryMode::Closed, &layout).is_empty());
         assert!(screen_labels(
             InventoryMode::Closed,
             &layout,
@@ -18210,77 +18185,16 @@ stack = 64
         )
         .is_empty());
 
-        // Empty player mode: backdrop + storage/hotbar separator + 36 slot
+        // Player mode: backdrop + storage/hotbar separator + 36 slot
         // outlines + 4 grid cells + the player result slot. Table mode adds the
-        // 16 table cells and result.
-        let player_quads = screen_quads(
-            InventoryMode::Player,
-            &layout,
-            &empty_inventory,
-            &empty_player_grid,
-            &empty_table_grid,
-            None,
-            None,
-        );
+        // 16 table cells and result. The quad list is content-independent:
+        // item texture is drawn by the separate icon pass, never as a fill.
+        let player_quads = screen_quads(InventoryMode::Player, &layout);
         assert_eq!(player_quads.len(), 1 + 1 + INVENTORY_SLOTS + 4 + 1);
-        let table_quads = screen_quads(
-            InventoryMode::Table,
-            &layout,
-            &empty_inventory,
-            &empty_player_grid,
-            &empty_table_grid,
-            None,
-            None,
-        );
+        let table_quads = screen_quads(InventoryMode::Table, &layout);
         assert_eq!(
             table_quads.len(),
             1 + 1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
-        );
-
-        // Occupied state adds exactly one fill per occupied cell plus the
-        // cursor ghost. Player mode never draws a table cell fill.
-        let stone = test_stack(BlockId::Stone, 3);
-        let mut slots = [None; INVENTORY_SLOTS];
-        slots[0] = Some(stone);
-        let inventory = Inventory::from_parts(slots, Some(stone));
-        let mut player_grid = CraftingGrid::new(GridKind::Player);
-        player_grid.set(0, Some(stone)).expect("player cell");
-        let mut table_grid = CraftingGrid::new(GridKind::Table);
-        table_grid.set(15, Some(stone)).expect("table cell");
-        let cursor = Some((200.0, 150.0));
-
-        let player_quads = screen_quads(
-            InventoryMode::Player,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
-            Some(stone),
-            cursor,
-        );
-        assert_eq!(
-            player_quads.len(),
-            1 + 1 + INVENTORY_SLOTS + 4 + 1 // chrome (panel + separator)
-                + 1 // slot 0 fill
-                + 1 // player cell 0 fill
-                + 1 // cursor ghost
-        );
-        let table_quads = screen_quads(
-            InventoryMode::Table,
-            &layout,
-            &inventory,
-            &player_grid,
-            &table_grid,
-            Some(stone),
-            cursor,
-        );
-        assert_eq!(
-            table_quads.len(),
-            1 + 1 + INVENTORY_SLOTS + 4 + 1 + MAX_GRID_SLOTS + 1
-                + 1 // slot 0 fill
-                + 1 // player cell 0 fill
-                + 1 // table cell 15 fill
-                + 1 // cursor ghost
         );
     }
 

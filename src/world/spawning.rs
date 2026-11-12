@@ -92,8 +92,8 @@ pub const SPAWN_MIN_SEPARATION: f32 = 1.0;
 /// spawn there at any hour.
 pub const HOSTILE_CAVE_LIGHT: u8 = 7;
 
-/// Full sky light. Both the night-surface and the lit-grass passive rules
-/// require exactly this value.
+/// Full sky light. Both the night-surface and the lit-passive rules require
+/// exactly this value.
 pub const PASSIVE_SURFACE_LIGHT: u8 = 15;
 
 /// Whole spawn attempts a single [`SpawnRuntime::tick`] may execute, so one
@@ -748,11 +748,15 @@ fn try_spawn_at(
     } else if lit_surface && daycycle::is_night(ctx.time_of_day) {
         // Night on the lit surface.
         hostile_kind(ctx, attempt_index)
-    } else if lit_surface && below == BlockId::Grass && daycycle::is_day(ctx.time_of_day) {
+    } else if lit_surface
+        && matches!(below, BlockId::Grass | BlockId::Snow)
+        && daycycle::is_day(ctx.time_of_day)
+    {
         passive_kind(ctx, attempt_index)
     } else {
         // The twilight band (between the two thresholds), unlit surfaces at
-        // day, and every non-grass floor are ineligible.
+        // day, and every floor that is neither the warm-season Grass skin nor
+        // the seasonal Winter Snow blanket are ineligible.
         return;
     };
 
@@ -999,6 +1003,25 @@ mod tests {
     }
 
     #[test]
+    fn day_spawns_passives_on_the_winter_snow_blanket() {
+        let mut world = FakeWorld::flat();
+        world.surface_block = BlockId::Snow;
+        let ctx = flat_ctx(6_000);
+        let mut runtime = SpawnRuntime::new();
+        let mut mobs = Vec::new();
+        run_attempts(&mut runtime, &ctx, &world, &mut mobs, 400);
+
+        assert!(
+            !mobs.is_empty(),
+            "a lit Winter snow plain must still produce passives"
+        );
+        assert_eq!(runtime.report().spawned as usize, mobs.len());
+        for mob in &mobs {
+            assert!(mob.kind.is_passive(), "winter day spawned {:?}", mob.kind);
+        }
+    }
+
+    #[test]
     fn night_spawns_only_hostiles_on_the_lit_surface() {
         let world = FakeWorld::flat();
         let ctx = flat_ctx(18_000);
@@ -1134,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn passives_require_grass() {
+    fn passives_require_a_land_surface() {
         let mut world = FakeWorld::flat();
         world.surface_block = BlockId::Stone;
         let ctx = flat_ctx(6_000);

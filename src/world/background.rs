@@ -63,9 +63,8 @@ impl BackgroundScene {
     /// The deterministic demo scene used when no background save exists.
     ///
     /// Uses the same fixed seed, anchor, golden-hour clock, and calendar as
-    /// the pre-M012 vista. Under [`VISTA_SEED`] the seed-derived starting
-    /// season is [`Season::Summer`], so the calendar and the historical
-    /// pinned season agree.
+    /// the pre-M012 vista. New calendars start in Spring on day 0, so the demo
+    /// clock sits on day 1 to preserve the historical Summer backdrop.
     pub fn new_default(render_distance: i32) -> Self {
         Self {
             world: WorldManager::with_seed_and_edits(
@@ -73,7 +72,7 @@ impl BackgroundScene {
                 VISTA_SEED,
                 ChunkEditMap::default(),
             ),
-            clock: GameClock::from_day_and_time(0, VISTA_GOLDEN_HOUR),
+            clock: GameClock::from_day_and_time(1, VISTA_GOLDEN_HOUR),
             season_length_days: DEFAULT_SEASON_LENGTH_DAYS,
             anchor: vista::vista_anchor(),
             persisted: false,
@@ -203,14 +202,14 @@ mod tests {
         let scene = BackgroundScene::new_default(16);
         assert_eq!(scene.world.seed(), VISTA_SEED);
         assert_eq!(scene.clock.time_of_day, VISTA_GOLDEN_HOUR);
-        assert_eq!(scene.clock.day_index, 0);
+        assert_eq!(scene.clock.day_index, 1);
         assert_eq!(scene.season_length_days, DEFAULT_SEASON_LENGTH_DAYS);
         assert_eq!(scene.anchor, vista::vista_anchor());
         assert!(!scene.persisted);
         assert_eq!(scene.season(), VISTA_SEASON);
         assert_eq!(
             scene.season(),
-            season_of(0, DEFAULT_SEASON_LENGTH_DAYS, VISTA_SEED),
+            season_of(1, DEFAULT_SEASON_LENGTH_DAYS, VISTA_SEED),
             "the demo calendar agrees with the historical pinned season"
         );
     }

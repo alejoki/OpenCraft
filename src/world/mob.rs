@@ -15,7 +15,9 @@
 
 use glam::Vec3;
 
-use crate::world::mob_ai::{MobAction, MobAttack, MobTarget, MobWorld};
+use crate::world::mob_ai::{
+    mob_box_clear, move_in, move_in_at_speed, MobAction, MobAttack, MobTarget, MobWorld,
+};
 
 /// Fixed simulation rate of every mob AI step (D134).
 pub const MOB_TICK_HZ: u32 = 20;
@@ -752,10 +754,13 @@ impl MobRuntime {
                             mob.yaw = offset.x.atan2(offset.z) + std::f32::consts::PI;
                         }
 
-                        let speed = mob.kind.walk_speed();
-                        mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
-                        mob.position += mob.velocity * MOB_TICK_SECS;
-                        mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+                        // World-aware movement: the shared mover handles the
+                        // one-block step up, the one-block drop, the cliff
+                        // guard, footprint support and solid-block collision,
+                        // so a wandering passive can climb and descend terrain
+                        // but never clip through a wall.
+                        let forward = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos());
+                        move_in(mob, world, forward);
 
                         if !mob.position.is_finite() {
                             mob.position = mob.home;
@@ -770,11 +775,13 @@ impl MobRuntime {
                     }
                     MobAiState::Flee => {
                         // Flee ignores the home leash: the whole point is to
-                        // put distance between the mob and its attacker.
+                        // put distance between the mob and its attacker. It
+                        // still uses the shared collision-aware mover, so a
+                        // panicking animal cannot run through a wall or off a
+                        // two-block ledge.
                         let speed = mob.kind.walk_speed() * MOB_FLEE_SPEED_FACTOR;
-                        mob.velocity = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos()) * speed;
-                        mob.position += mob.velocity * MOB_TICK_SECS;
-                        mob.walk_phase += speed * MOB_TICK_SECS * 4.0;
+                        let forward = Vec3::new(mob.yaw.sin(), 0.0, mob.yaw.cos());
+                        move_in_at_speed(mob, world, forward, speed);
 
                         if !mob.position.is_finite() {
                             mob.position = mob.home;
@@ -793,7 +800,15 @@ impl MobRuntime {
             mob.knockback = Vec3::ZERO;
         }
         if mob.knockback.length_squared() > 0.0 {
-            mob.position += mob.knockback * MOB_TICK_SECS;
+            // The impulse is horizontal and must respect the same solid-block
+            // AABB as walking: a hit may shove a mob against a wall, never
+            // through it. A blocked slide is dropped instead of tunneling.
+            let candidate = mob.position + mob.knockback * MOB_TICK_SECS;
+            if mob_box_clear(mob, candidate, world) {
+                mob.position = candidate;
+            } else {
+                mob.knockback = Vec3::ZERO;
+            }
             mob.knockback *= MOB_KNOCKBACK_DECAY;
             if mob.knockback.length_squared() < MOB_KNOCKBACK_EPSILON_SQ {
                 mob.knockback = Vec3::ZERO;
@@ -811,9 +826,9 @@ mod tests {
     use super::*;
     use crate::world::block::BlockId;
 
-    /// A world with no solid blocks: LOS is always clear and every step is
-    /// passable. These runtime tests exercise timing and passive arms, not
-    /// world-aware steering (which has its own suite in `mob_ai`).
+    /// A world with no solid blocks: LOS is always clear and the walking mover
+    /// refuses every step because there is no support. Runtime tests that only
+    /// exercise timing use this; movement tests build [`GridWorld`].
     struct NoWorld;
 
     impl MobWorld for NoWorld {
@@ -824,6 +839,49 @@ mod tests {
 
     fn resident(_: Vec3) -> bool {
         true
+    }
+
+    /// Synthetic block grid: absent cells are air. Used by the movement tests
+    /// to prove the shared step-up/down/collision mover reaches the passive
+    /// wander and flee arms.
+    struct GridWorld(std::collections::HashMap<(i32, i32, i32), BlockId>);
+
+    impl GridWorld {
+        fn new() -> Self {
+            Self(std::collections::HashMap::new())
+        }
+
+        /// Solid slab whose top face is y = `top` for a generous x/z region.
+        fn flat(top: i32) -> Self {
+            let mut world = Self::new();
+            for x in -8..=48 {
+                for z in -8..=48 {
+                    for y in -4..=top {
+                        world.0.insert((x, y, z), BlockId::Stone);
+                    }
+                }
+            }
+            world
+        }
+
+        fn set(&mut self, x: i32, y: i32, z: i32, block: BlockId) {
+            self.0.insert((x, y, z), block);
+        }
+    }
+
+    impl MobWorld for GridWorld {
+        fn block(&self, x: i32, y: i32, z: i32) -> BlockId {
+            self.0.get(&(x, y, z)).copied().unwrap_or(BlockId::Air)
+        }
+    }
+
+    /// One fixed production step for a mob, bypassing the public tick loop so
+    /// the yaw-reroll cannot change the fixture's direction.
+    fn one_step(runtime: &MobRuntime, mob: &mut Mob, world: &GridWorld) {
+        let mut attacks = Vec::new();
+        let mut shots = Vec::new();
+        runtime.step_mob(mob, 0, None, world, &mut attacks, &mut shots);
+        assert!(attacks.is_empty() && shots.is_empty());
     }
 
     #[test]
@@ -1014,6 +1072,7 @@ mod tests {
 
     #[test]
     fn runtime_is_frame_rate_independent_at_20hz() {
+        let world = GridWorld::flat(4);
         let mut a = MobRuntime::new(1);
         let mut b = MobRuntime::new(1);
         let mut mobs_a = vec![Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0)];
@@ -1021,13 +1080,13 @@ mod tests {
 
         for _ in 0..10 {
             assert_eq!(
-                a.tick(0.05, &mut mobs_a, resident, None, &NoWorld).ai_steps,
+                a.tick(0.05, &mut mobs_a, resident, None, &world).ai_steps,
                 1
             );
         }
         let mut b_steps = 0;
         for _ in 0..50 {
-            b_steps += b.tick(0.01, &mut mobs_b, resident, None, &NoWorld).ai_steps;
+            b_steps += b.tick(0.01, &mut mobs_b, resident, None, &world).ai_steps;
         }
         assert_eq!(b_steps, 10, "50 small frames still run ten fixed steps");
 
@@ -1087,13 +1146,14 @@ mod tests {
 
     #[test]
     fn non_resident_mob_keeps_slot_and_position() {
+        let world = GridWorld::flat(4);
         let mut runtime = MobRuntime::new(9);
         let anchor = Vec3::new(0.5, 5.0, 0.5);
         let mut mobs = vec![
             Mob::new(MobKind::Pig, anchor, 0.0),
             Mob::new(MobKind::Cow, Vec3::new(100.5, 5.0, 0.5), 0.0),
         ];
-        runtime.tick(0.05, &mut mobs, |pos| pos.x < 50.0, None, &NoWorld);
+        runtime.tick(0.05, &mut mobs, |pos| pos.x < 50.0, None, &world);
         assert_eq!(mobs.len(), 2);
         assert_eq!(mobs[1].position, Vec3::new(100.5, 5.0, 0.5));
         assert_eq!(mobs[1].walk_phase, 0.0);
@@ -1121,12 +1181,13 @@ mod tests {
 
     #[test]
     fn mob_returns_home_when_it_wanders_past_the_leash() {
+        let world = GridWorld::flat(4);
         let mut runtime = MobRuntime::new(11);
         let home = Vec3::new(0.5, 5.0, 0.5);
         let mut mobs = vec![Mob::new(MobKind::Skeleton, home, 0.0)];
         // Straight +Z for many steps should trip the 4-block leash.
         for _ in 0..200 {
-            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
+            runtime.tick(0.05, &mut mobs, resident, None, &world);
             mobs[0].state = MobAiState::Wander;
         }
         let dx = mobs[0].position.x - home.x;
@@ -1141,15 +1202,16 @@ mod tests {
 
     #[test]
     fn positions_stay_finite_over_many_steps() {
+        let world = GridWorld::flat(4);
         let mut runtime = MobRuntime::new(0xDEAD_BEEF);
         let mut mobs = vec![
-            Mob::new(MobKind::Pig, Vec3::ZERO, 0.0),
-            Mob::new(MobKind::Cow, Vec3::new(1.0, 0.0, 1.0), 1.0),
-            Mob::new(MobKind::Zombie, Vec3::new(-1.0, 0.0, -1.0), 2.0),
-            Mob::new(MobKind::Skeleton, Vec3::new(2.0, 0.0, -2.0), 3.0),
+            Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0),
+            Mob::new(MobKind::Cow, Vec3::new(1.5, 5.0, 1.5), 1.0),
+            Mob::new(MobKind::Zombie, Vec3::new(-1.5, 5.0, -1.5), 2.0),
+            Mob::new(MobKind::Skeleton, Vec3::new(2.5, 5.0, -2.5), 3.0),
         ];
         for _ in 0..100 {
-            runtime.tick(0.05, &mut mobs, resident, None, &NoWorld);
+            runtime.tick(0.05, &mut mobs, resident, None, &world);
         }
         for mob in &mobs {
             assert!(mob.position.is_finite(), "position became non-finite");
@@ -1157,6 +1219,116 @@ mod tests {
             assert!(mob.walk_phase.is_finite());
             assert!(mob.knockback.is_finite());
         }
+    }
+
+    #[test]
+    fn wandering_passive_steps_up_a_one_block_rise() {
+        // Flat ground at top y = 5 for z <= 1, raised to top y = 6 for z >= 2.
+        let mut world = GridWorld::flat(4);
+        for x in -8..=48 {
+            for z in 2..=48 {
+                world.set(x, 5, z, BlockId::Stone);
+            }
+        }
+        let runtime = MobRuntime::new(1);
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0);
+
+        for _ in 0..60 {
+            one_step(&runtime, &mut pig, &world);
+        }
+
+        assert!(
+            (pig.position.y - 6.0).abs() < 1e-5,
+            "a passive must step up onto the raised block, got {:?}",
+            pig.position
+        );
+        assert!(
+            pig.position.z > 2.5,
+            "the passive must keep walking after the step up, got {:?}",
+            pig.position
+        );
+    }
+
+    #[test]
+    fn wandering_passive_steps_down_a_one_block_drop() {
+        // Flat ground at top y = 5 for z <= 2, one block lower (top y = 4)
+        // beyond the edge at z = 3.
+        let mut world = GridWorld::new();
+        for x in -8..=48 {
+            for z in -8..=48 {
+                let top = if z <= 2 { 4 } else { 3 };
+                for y in -4..=top {
+                    world.set(x, y, z, BlockId::Stone);
+                }
+            }
+        }
+        let runtime = MobRuntime::new(1);
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0);
+
+        let mut dropped = None;
+        for _ in 0..80 {
+            one_step(&runtime, &mut pig, &world);
+            if (pig.position.y - 4.0).abs() < 1e-5 {
+                dropped = Some(pig.position);
+                break;
+            }
+        }
+
+        let dropped = dropped.expect("a passive must walk down a one-block drop");
+        assert!(dropped.z > 3.0, "the step down must continue forward");
+    }
+
+    #[test]
+    fn fleeing_passive_cannot_run_through_a_two_block_wall() {
+        let mut world = GridWorld::flat(4);
+        world.set(0, 5, 2, BlockId::Stone);
+        world.set(0, 6, 2, BlockId::Stone);
+        let runtime = MobRuntime::new(1);
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        pig.state = MobAiState::Flee;
+        pig.flee = 10.0;
+
+        for _ in 0..80 {
+            one_step(&runtime, &mut pig, &world);
+        }
+
+        assert!(
+            pig.position.z + MobKind::Pig.width() * 0.5 < 2.0 + 1e-4,
+            "a fleeing passive clipped into the wall at {:?}",
+            pig.position
+        );
+        assert!(
+            mob_box_clear(&pig, pig.position, &world),
+            "the fleeing passive must stay outside solid blocks"
+        );
+        assert!(
+            pig.stuck > 0.0,
+            "the refused step must accumulate stuck time"
+        );
+    }
+
+    #[test]
+    fn knockback_stops_at_a_solid_wall_instead_of_tunneling() {
+        let mut world = GridWorld::flat(4);
+        world.set(0, 5, 1, BlockId::Stone);
+        let runtime = MobRuntime::new(1);
+        let mut pig = Mob::new(MobKind::Pig, Vec3::new(0.5, 5.0, 0.5), 0.0);
+        pig.take_hit(1, Vec3::new(0.5, 5.0, -2.0))
+            .expect("the hit lands");
+        assert!(pig.knockback.z > 0.0, "knockback points at the wall");
+
+        one_step(&runtime, &mut pig, &world);
+
+        assert!(
+            pig.position.z + MobKind::Pig.width() * 0.5 < 1.0 + 1e-4,
+            "knockback pushed the body into the wall at {:?}",
+            pig.position
+        );
+        assert_eq!(
+            pig.knockback,
+            Vec3::ZERO,
+            "a blocked impulse must be dropped, not tunneled"
+        );
     }
 
     // ---- take_hit: damage, i-frames, flash, knockback -------------------

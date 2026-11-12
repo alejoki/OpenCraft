@@ -22,8 +22,9 @@
 //!   candidate tries a one-block step-up; a candidate whose column has no
 //!   support drops at most one block. A larger drop is refused (cliff guard),
 //!   so a hostile never walks off a two-block ledge. Closing and retreating
-//!   share the same mover ([`move_in`]) — there is exactly one steering
-//!   implementation.
+//!   share the same mover ([`move_in`]) — and so do the passive wander/flee
+//!   arms in [`crate::world::mob`], so every kind climbs, descends and collides
+//!   with solid blocks identically.
 //! * **Skeleton stand-off (S08).** A kind with a
 //!   [`MobKind::ranged_profile`] never melees: beyond `fire_range` it closes,
 //!   inside `min_range` it backs away, and in the band it stands still and
@@ -333,7 +334,8 @@ pub fn step_hostile(
     None
 }
 
-/// The shared step-up/down/cliff mover, in any horizontal direction.
+/// The shared step-up/down/cliff mover, in any horizontal direction, at the
+/// kind's walk speed.
 ///
 /// Updates `position`, `velocity`, `walk_phase`, and the stuck timer; never
 /// changes yaw or state. Closing passes the facing vector and retreating passes
@@ -341,13 +343,20 @@ pub fn step_hostile(
 /// cliff guard, footprint support and stuck rules. `dir` must be a finite
 /// horizontal direction (the callers pass the unit yaw vector or its
 /// negation); a degenerate or non-finite direction refuses the step.
-fn move_in(mob: &mut Mob, world: &impl MobWorld, dir: Vec3) {
+pub fn move_in(mob: &mut Mob, world: &impl MobWorld, dir: Vec3) {
+    move_in_at_speed(mob, world, dir, mob.kind.walk_speed());
+}
+
+/// [`move_in`] with an explicit speed, used by the passive flee arm.
+///
+/// A non-finite or non-positive speed refuses the step instead of committing a
+/// body position the rest of the game cannot reason about.
+pub fn move_in_at_speed(mob: &mut Mob, world: &impl MobWorld, dir: Vec3, speed: f32) {
     let dir = Vec3::new(dir.x, 0.0, dir.z);
-    if !dir.is_finite() || dir.length_squared() < 1e-12 {
+    if !dir.is_finite() || dir.length_squared() < 1e-12 || !speed.is_finite() || speed <= 0.0 {
         refuse(mob);
         return;
     }
-    let speed = mob.kind.walk_speed();
     let candidate = mob.position + dir * speed * crate::world::mob::MOB_TICK_SECS;
 
     // Flat continuation: the candidate box must be clear and the destination
@@ -365,6 +374,14 @@ fn move_in(mob: &mut Mob, world: &impl MobWorld, dir: Vec3) {
                 commit_move(mob, lowered, dir, speed);
                 return;
             }
+        }
+        // Already airborne (a spawned/knocked body over a void, or a synthetic
+        // test world with no floor): keep the pre-existing horizontal drift.
+        // Terrain walking never reaches this arm because a grounded mob is
+        // supported at its feet level and is refused by the cliff guard above.
+        if airborne(mob, mob.position, world) {
+            commit_move(mob, candidate, dir, speed);
+            return;
         }
         refuse(mob);
         return;
@@ -396,7 +413,10 @@ fn refuse(mob: &mut Mob) {
 }
 
 /// The mob's own box, not the player-sized `Aabb::from_feet`.
-fn mob_box_clear(mob: &Mob, feet: Vec3, world: &impl MobWorld) -> bool {
+///
+/// Public so the knockback integration in [`crate::world::mob`] can refuse a
+/// slide into a solid block through the exact same AABB the walking mover uses.
+pub fn mob_box_clear(mob: &Mob, feet: Vec3, world: &impl MobWorld) -> bool {
     let half = mob.kind.width() * 0.5;
     let min = Vec3::new(feet.x - half, feet.y, feet.z - half);
     let max = Vec3::new(feet.x + half, feet.y + mob.kind.height(), feet.z + half);
@@ -427,6 +447,18 @@ fn footprint_supported(mob: &Mob, feet: Vec3, level: i32, world: &impl MobWorld)
         }
     }
     false
+}
+
+/// Whether the mob has no support at its feet level or one block below.
+///
+/// True means it is already airborne before this step. There is no mob gravity,
+/// so such a body keeps its horizontal drift instead of freezing mid-air; a
+/// grounded body that reaches a two-block ledge is still refused by the cliff
+/// guard.
+fn airborne(mob: &Mob, feet: Vec3, world: &impl MobWorld) -> bool {
+    let level = support_level(feet);
+    !footprint_supported(mob, feet, level, world)
+        && !footprint_supported(mob, feet, level - 1, world)
 }
 
 #[cfg(test)]
