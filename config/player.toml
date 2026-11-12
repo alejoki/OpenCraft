@@ -1,6 +1,6 @@
 # OpenCraft creator configuration: player movement and camera.
 #
-# Every curated key in this domain lives here at its default value.
+# Every curated key in this domain lives here; this checkout ships tuned values.
 # See docs/CONFIG.md for loading, validation, live reload, and
 # --check-config semantics.
 #

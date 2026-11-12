@@ -35,7 +35,7 @@
 #     mining, render) through the live watcher. The trace must contain exactly
 #     six applied lines (one per file) and zero rejections, the edited tree
 #     must stay byte-identical, and the post-run `--check-config` digest must
-#     equal the final applied digest `0x4c3af491ff874482` (not the default
+#     equal the final applied digest `0x18d98c480e113ab1` (not the default
 #     `0xeaeac8ddce568dec`). The release profile skips this leg: release has
 #     no creator watcher.
 #
@@ -58,7 +58,7 @@
 #     Both profiles then prove the one-shot config-mismatch notice: a
 #     `walk_speed = 6.0` edit makes the derived v9 file warn exactly once
 #     (`config changed since this world was saved`), re-save with digest
-#     `0xb384bf0fac507102` at 446 bytes, and a third run on that output loads
+#     `0x14092db54f42a9d1` at 446 bytes, and a third run on that output loads
 #     with no notice (the notice is one-shot, not repeated). The debug profile
 #     additionally re-checks the mismatched tree's `--check-config` digest;
 #     release rejects `--check-config` by design (Leg A).
@@ -444,7 +444,7 @@ if [[ "$PROFILE" == "debug" ]]; then
     [[ "$LEG_A_LINES" -eq 7 ]] ||
         fail "leg A: valid check-config printed $LEG_A_LINES lines (expected 6 ok lines + 1 summary)"
 
-    sed -i 's/^walk_speed = 4\.6$/walk_speed = 0/' "$LEG_A/config/player.toml" ||
+    sed -i 's/^walk_speed = 4$/walk_speed = 0/' "$LEG_A/config/player.toml" ||
         fail "leg A: cannot inject the invalid movement.walk_speed value"
     run_headless "$LEG_A" "$LEG_A/check-invalid.out" "$LEG_A/check-invalid.err" --check-config
     CHECK_RC=$?
@@ -499,7 +499,7 @@ if [[ "$PROFILE" == "debug" ]]; then
 
     start_live "$LEG_B" 12 "$LEG_B/live.log" --new --save live.mcvx --creator-trace
     sleep 5
-    sed -i 's/^walk_speed = 4\.6$/walk_speed = 8.0/' "$LEG_B/config/player.toml" ||
+    sed -i 's/^walk_speed = 4$/walk_speed = 8.0/' "$LEG_B/config/player.toml" ||
         fail "leg B: cannot apply the valid walk_speed edit"
     sleep 1.5
     sed -i 's/^walk_speed = 8\.0$/walk_speed = 0/' "$LEG_B/config/player.toml" ||
@@ -534,11 +534,11 @@ if [[ "$PROFILE" == "debug" ]]; then
 
     start_live "$LEG_B2" 14 "$LEG_B2/live.log" --new --save domains.mcvx --creator-trace
     sleep 5
-    sed -i 's/^walk_speed = 4\.6$/walk_speed = 8.0/' "$LEG_B2/config/player.toml" ||
+    sed -i 's/^walk_speed = 4$/walk_speed = 8.0/' "$LEG_B2/config/player.toml" ||
         fail "leg B2: cannot edit config/player.toml"
     sed -i 's/^hunger_drain_secs = 30\.0$/hunger_drain_secs = 2.0/' "$LEG_B2/config/survival.toml" ||
         fail "leg B2: cannot edit config/survival.toml"
-    sed -i 's/^reach = 3\.0$/reach = 8.0/' "$LEG_B2/config/combat.toml" ||
+    sed -i 's/^reach = 3$/reach = 8.0/' "$LEG_B2/config/combat.toml" ||
         fail "leg B2: cannot edit config/combat.toml"
     sed -i 's/^day_seconds = 1200\.0$/day_seconds = 120.0/' "$LEG_B2/config/world.toml" ||
         fail "leg B2: cannot edit config/world.toml"
@@ -569,8 +569,8 @@ if [[ "$PROFILE" == "debug" ]]; then
     B2_LAST_LINE="$(grep -E '^creator: applied ' "$LEG_B2/live.log" | tail -n 1 || true)"
     [[ -n "$B2_LAST_LINE" ]] || fail "leg B2: no applied trace line found"
     B2_LAST_DIGEST="${B2_LAST_LINE##*digest=}"
-    [[ "$B2_LAST_DIGEST" == "0x4c3af491ff874482" ]] ||
-        fail "leg B2: last applied digest is [$B2_LAST_DIGEST], expected 0x4c3af491ff874482"
+    [[ "$B2_LAST_DIGEST" == "0x18d98c480e113ab1" ]] ||
+        fail "leg B2: last applied digest is [$B2_LAST_DIGEST], expected 0x18d98c480e113ab1"
     [[ "$B2_LAST_DIGEST" != "0xeaeac8ddce568dec" ]] ||
         fail "leg B2: last applied digest is the default 0xeaeac8ddce568dec"
     B2_SUMMARY="$(tail -n 1 "$LEG_B2/check.out")"
@@ -725,7 +725,7 @@ V9_SNAPSHOT_SIZE="$(wc -c <"$LEG_E/v8.v9.snapshot")"
 [[ "$V9_SNAPSHOT_SIZE" -eq 446 ]] ||
     fail "leg E: v9 snapshot size $V9_SNAPSHOT_SIZE (expected 446)"
 
-sed -i 's/^walk_speed = 4\.6$/walk_speed = 6.0/' "$LEG_E/config/player.toml" ||
+sed -i 's/^walk_speed = 4$/walk_speed = 6.0/' "$LEG_E/config/player.toml" ||
     fail "leg E: cannot apply the config-mismatch edit"
 
 run_headless "$LEG_E" "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" --demo-save-v9 --save v8.v9.mcvx
@@ -739,7 +739,7 @@ mapfile -t MISMATCH_LINES <"$LEG_E/mismatch.out"
     fail "leg E: config-mismatch run printed ${#MISMATCH_LINES[@]} stdout lines (expected 4)"
 [[ "${MISMATCH_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=config changed since this world was saved playable=true' ]] ||
     fail "leg E: config-mismatch load line drifted: [${MISMATCH_LINES[0]}]"
-MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0xb384bf0fac507102 bytes=[0-9]+$'
+MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x14092db54f42a9d1 bytes=[0-9]+$'
 [[ "${MISMATCH_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
     fail "leg E: config-mismatch resave line drifted: [${MISMATCH_LINES[1]}]"
 MISMATCH_BYTES="${MISMATCH_LINES[1]##*bytes=}"
@@ -771,7 +771,7 @@ if [[ "$PROFILE" == "debug" ]]; then
     fi
     expect_regex_count "leg E config-mismatch check-config" 6 "$LEG_E/check-mismatch.out" '^ok: config/'
     LEG_E_SUMMARY="$(tail -n 1 "$LEG_E/check-mismatch.out")"
-    [[ "$LEG_E_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=0xb384bf0fac507102" ]] ||
+    [[ "$LEG_E_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=0x14092db54f42a9d1" ]] ||
         fail "leg E: config-mismatch summary drifted: [$LEG_E_SUMMARY]"
 fi
 

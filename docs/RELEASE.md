@@ -74,7 +74,7 @@ final pre-tag commit, before tagging.
 ```bash
 WORKFLOW=release.yml bash scripts/ci_gate.sh
 gh run download <run-id> --dir dist/rehearsal
-bash scripts/verify_release_artifacts.sh dist/rehearsal 0.2.1
+bash scripts/verify_release_artifacts.sh dist/rehearsal 0.2.2
 ```
 
 `verify_release_artifacts.sh` unpacks the archives and asserts that
@@ -113,8 +113,8 @@ regression (the release build drops the creator watcher, overlay, and trace).
 ## 6. Tag
 
 ```bash
-git tag -a v0.2.1 -m "OpenCraft 0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "OpenCraft 0.2.2"
+git push origin v0.2.2
 ```
 
 Always use an annotated tag. The tag name must match `v` + the `Cargo.toml`
@@ -124,17 +124,17 @@ tag triggers the package jobs and the publish job for that commit.
 ## 7. Verify the published release
 
 ```bash
-gh release view v0.2.1
-gh release download v0.2.1 --dir dist/published
-bash scripts/verify_release_artifacts.sh dist/published 0.2.1
-bash scripts/verify_release_page.sh v0.2.1 0.2.1
+gh release view v0.2.2
+gh release download v0.2.2 --dir dist/published
+bash scripts/verify_release_artifacts.sh dist/published 0.2.2
+bash scripts/verify_release_page.sh v0.2.2 0.2.2
 ```
 
 Check by eye and by script:
 
-- exactly two assets, `opencraft-0.2.1-x86_64-unknown-linux-gnu.tar.gz` and
-  `opencraft-0.2.1-x86_64-pc-windows-msvc.zip`;
-- the release body is the contents of `docs/RELEASE-NOTES-0.2.1.md`;
+- exactly two assets, `opencraft-0.2.2-x86_64-unknown-linux-gnu.tar.gz` and
+  `opencraft-0.2.2-x86_64-pc-windows-msvc.zip`;
+- the release body is the contents of `docs/RELEASE-NOTES-0.2.2.md`;
 - `verify_release_page.sh` finds the archive names, `SmartScreen`, and
   `version 9` in the published body;
 - on Linux, extract the tarball and run `./opencraft --demo-ui` headlessly: it
@@ -151,7 +151,7 @@ To repeat the fresh-clone build locally on Linux:
 
 ```bash
 tmp=$(mktemp -d)
-git clone --depth 1 --branch v0.2.1 https://github.com/alejoki/OpenCraft.git "$tmp/opencraft"
+git clone --depth 1 --branch v0.2.2 https://github.com/alejoki/OpenCraft.git "$tmp/opencraft"
 cd "$tmp/opencraft"
 PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo test --locked
 PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo build --release --locked
@@ -172,13 +172,13 @@ job repairs a partial release without hand-editing assets.
 If the tag is wrong, delete the release and the tag, fix, and re-tag:
 
 ```bash
-gh release delete v0.2.1 --cleanup-tag -y
+gh release delete v0.2.2 --cleanup-tag -y
 # or, if the release never existed:
-git push origin :refs/tags/v0.2.1
+git push origin :refs/tags/v0.2.2
 ```
 
 Never move a published tag without deleting the release first: downstream
-clones and cached tarballs would otherwise disagree about what `v0.2.1` means.
+clones and cached tarballs would otherwise disagree about what `v0.2.2` means.
 After re-tagging, repeat section 7.
 
 ## Failure modes of this checklist

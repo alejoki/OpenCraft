@@ -42,8 +42,8 @@ CONFIG_FILES = (
     "mining.toml",
     "render.toml",
 )
-DEFAULT_DIGEST = "0x2d99ee0c5e96d8bd"
-EDITED_DIGEST = "0x4c3af491ff874482"
+DEFAULT_DIGEST = "0x1bf613464d108311"
+EDITED_DIGEST = "0x18d98c480e113ab1"
 DEFAULT_SUMMARY = (
     "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest="
     + DEFAULT_DIGEST
@@ -59,13 +59,13 @@ INVALID_MINING_ERROR = (
     "tools.iron_speed_multiplier (5.0)"
 )
 SAFE_EDITS = (
-    ("config/player.toml", "walk_speed = 4.6", "walk_speed = 8.0"),
+    ("config/player.toml", "walk_speed = 4", "walk_speed = 8.0"),
     (
         "config/survival.toml",
         "hunger_drain_secs = 30.0",
         "hunger_drain_secs = 2.0",
     ),
-    ("config/combat.toml", "reach = 3.0", "reach = 8.0"),
+    ("config/combat.toml", "reach = 3", "reach = 8.0"),
     ("config/world.toml", "day_seconds = 1200.0", "day_seconds = 120.0"),
     ("config/mining.toml", "table_reach = 8.0", "table_reach = 16.0"),
     (

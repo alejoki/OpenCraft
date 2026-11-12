@@ -192,7 +192,7 @@ fn invalid_value_exits_nonzero_with_stable_line() {
     let config = copy_config(temp.path());
     replace_once(
         &config.join("player.toml"),
-        "walk_speed = 4.6",
+        "walk_speed = 4",
         "walk_speed = 0",
     );
 

@@ -10,10 +10,10 @@
 # by hand.
 
 [tools]
-hand_speed_multiplier = 0.5
-wood_speed_multiplier = 2
-stone_speed_multiplier = 4
-iron_speed_multiplier = 6
+hand_speed_multiplier = 1.0
+wood_speed_multiplier = 1.5
+stone_speed_multiplier = 3
+iron_speed_multiplier = 5
 
 [interaction]
 table_reach = 8.0

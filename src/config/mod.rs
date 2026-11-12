@@ -1530,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_config_tree_is_complete_with_tuned_mining() {
+    fn checked_in_config_tree_is_complete_with_tuned_values() {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CONFIG_DIR);
         let runtime = ConfigRuntime::load_dir(&config_dir);
 
@@ -1542,6 +1542,14 @@ mod tests {
         );
         for row in REGISTRY {
             let expected = match row.key {
+                "movement.walk_speed" => ConfigValue::Float(4.0),
+                "movement.sprint_speed" => ConfigValue::Float(7.0),
+                "movement.swim_vertical_drag" => ConfigValue::Float(7.0),
+                "movement.swim_rise_accel" => ConfigValue::Float(30.0),
+                "movement.swim_rise_speed" => ConfigValue::Float(3.0),
+                "melee.sword_damage_wood" => ConfigValue::Int(3),
+                "melee.sword_damage_iron" => ConfigValue::Int(7),
+                "melee.reach" => ConfigValue::Float(3.0),
                 "tools.hand_speed_multiplier" => ConfigValue::Float(1.0),
                 "tools.wood_speed_multiplier" => ConfigValue::Float(1.5),
                 "tools.stone_speed_multiplier" => ConfigValue::Float(3.0),

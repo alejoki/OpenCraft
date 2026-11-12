@@ -30,6 +30,7 @@ lpt[1-9]
 lpt[1-9].*
 *.swp
 *.swo
+*.kate-swp
 *~
 .idea/
 .vscode/

@@ -28,7 +28,7 @@ const CONFIG_FILES: [&str; 6] = [
 
 /// Registry schema and digest of the checked-in default config.
 const DEFAULTS_SCHEMA: u16 = 1;
-const DEFAULTS_DIGEST: u64 = 0x2d99_ee0c_5e96_d8bd;
+const DEFAULTS_DIGEST: u64 = 0x1bf6_1346_4d10_8311;
 
 /// Copy the six checked-in config files byte-for-byte into `dest/config`.
 fn copy_config(dest: &Path) -> PathBuf {
@@ -220,7 +220,7 @@ fn changed_config_warns_once_and_resaves_v9() {
     // Second leg: reload the v9 output under a changed tuning value.
     replace_once(
         &config.join("player.toml"),
-        "walk_speed = 4.6",
+        "walk_speed = 4",
         "walk_speed = 6.0",
     );
 
