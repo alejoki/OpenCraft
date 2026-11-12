@@ -27826,6 +27826,7 @@ wheat_stage_game_secs = 30.0
     /// table reach.
     const TUNED_MINING_TOML: &str = "\
 [tools]
+hand_speed_multiplier = 2.0
 wood_speed_multiplier = 8
 stone_speed_multiplier = 12
 iron_speed_multiplier = 16
@@ -27887,7 +27888,8 @@ selected_name_secs = 0.5
         assert_eq!(rules.spawning.spawn_max_radius_blocks, 40);
         assert_eq!(rules.spawning.max_mobs_total, 24);
         assert_eq!(rules.farming.wheat_stage_game_secs, 30.0);
-        assert_eq!(rules.tools.wood_speed_multiplier, 8);
+        assert_eq!(rules.tools.hand_speed_multiplier, 2.0);
+        assert_eq!(rules.tools.wood_speed_multiplier, 8.0);
         assert_eq!(rules.interaction.table_reach, 12.0);
         assert_eq!(rules.render.rain_fog_factor, 0.5);
         assert_eq!(rules.render.moonlit_floor, 0.2);
@@ -27930,8 +27932,8 @@ selected_name_secs = 0.5
         assert_eq!(app.selection_label.remaining(), 0.0);
         assert_eq!(app.selection_label.alpha(), 0.0);
 
-        // Mining: the live tool rules cut the wooden tier's stone duration to
-        // 1.2 / 8 while the default wrapper stays at 1.2 / 2.
+        // Mining: the live hand baseline x wooden tier cuts the stone duration
+        // to 1.2 / (2 * 8) while the default wrapper stays at 1.2 / 2.
         app.session
             .player
             .insert_items(&[wood_pickaxe])
@@ -27953,7 +27955,7 @@ selected_name_secs = 0.5
         let pos = IVec3::new(0, 64, 0);
         let tuned =
             session_mining_target(&app.session, pos, BlockId::Stone).expect("stone is breakable");
-        assert_eq!(tuned.duration(), 1.2 / 8.0);
+        assert_eq!(tuned.duration(), 1.2 / 16.0);
         assert_eq!(
             MiningTarget::from_block_with(
                 &app.session.registry,
@@ -28091,7 +28093,8 @@ selected_name_secs = 0.5
     #[test]
     fn default_world_mining_render_wrappers_preserve_pinned_numbers() {
         use opencraft::player::tools::{
-            ToolRules, IRON_SPEED_MULTIPLIER, STONE_SPEED_MULTIPLIER, WOOD_SPEED_MULTIPLIER,
+            ToolRules, HAND_SPEED_MULTIPLIER, IRON_SPEED_MULTIPLIER, STONE_SPEED_MULTIPLIER,
+            WOOD_SPEED_MULTIPLIER,
         };
         use opencraft::ui::selection::{SelectionRules, SELECTED_NAME_SECS};
         use opencraft::world::daycycle::{
@@ -28155,6 +28158,7 @@ selected_name_secs = 0.5
         assert_eq!(
             rules.tools,
             ToolRules {
+                hand_speed_multiplier: HAND_SPEED_MULTIPLIER,
                 wood_speed_multiplier: WOOD_SPEED_MULTIPLIER,
                 stone_speed_multiplier: STONE_SPEED_MULTIPLIER,
                 iron_speed_multiplier: IRON_SPEED_MULTIPLIER,

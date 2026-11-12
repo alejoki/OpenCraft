@@ -819,32 +819,41 @@ pub const REGISTRY: &[ConfigRow] = &[
         "Game seconds between wheat growth stages.",
     ),
     // -----------------------------------------------------------------
-    // config/mining.toml (4)
+    // config/mining.toml (5)
     // -----------------------------------------------------------------
-    int(
+    float(
+        "tools.hand_speed_multiplier",
+        Mining,
+        tools::HAND_SPEED_MULTIPLIER,
+        0.1,
+        32.0,
+        "x",
+        "Bare-hand mining speed multiplier; tool multipliers stack on top.",
+    ),
+    float(
         "tools.wood_speed_multiplier",
         Mining,
-        tools::WOOD_SPEED_MULTIPLIER as i64,
-        1,
-        32,
+        tools::WOOD_SPEED_MULTIPLIER,
+        1.0,
+        32.0,
         "x",
         "Mining speed multiplier for wooden tools.",
     ),
-    int(
+    float(
         "tools.stone_speed_multiplier",
         Mining,
-        tools::STONE_SPEED_MULTIPLIER as i64,
-        1,
-        32,
+        tools::STONE_SPEED_MULTIPLIER,
+        1.0,
+        32.0,
         "x",
         "Mining speed multiplier for stone tools.",
     ),
-    int(
+    float(
         "tools.iron_speed_multiplier",
         Mining,
-        tools::IRON_SPEED_MULTIPLIER as i64,
-        1,
-        32,
+        tools::IRON_SPEED_MULTIPLIER,
+        1.0,
+        32.0,
         "x",
         "Mining speed multiplier for iron tools.",
     ),
@@ -1034,8 +1043,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_eighty_five_rows() {
-        assert_eq!(REGISTRY.len(), 85);
+    fn registry_has_eighty_six_rows() {
+        assert_eq!(REGISTRY.len(), 86);
     }
 
     #[test]
@@ -1065,7 +1074,7 @@ mod tests {
             (ConfigFile::Survival, 15),
             (ConfigFile::Combat, 21),
             (ConfigFile::World, 19),
-            (ConfigFile::Mining, 4),
+            (ConfigFile::Mining, 5),
             (ConfigFile::Render, 10),
         ];
         let mut total = 0;
@@ -1074,7 +1083,7 @@ mod tests {
             assert_eq!(actual, count, "{} row count", file.name());
             total += actual;
         }
-        assert_eq!(total, 85);
+        assert_eq!(total, 86);
     }
 
     #[test]
@@ -1285,14 +1294,14 @@ mod tests {
         assert_eq!(
             lines.len(),
             REGISTRY.len() + 2,
-            "header, separator, 85 rows"
+            "header, separator, 86 rows"
         );
         assert_eq!(
             lines
                 .iter()
                 .filter(|line| line.starts_with("| config/"))
                 .count(),
-            85
+            86
         );
     }
 
@@ -1300,7 +1309,7 @@ mod tests {
     fn index_of_finds_known_keys_and_rejects_unknown_ones() {
         assert_eq!(index_of("movement.walk_speed"), Some(0));
         assert_eq!(index_of("camera.z_far"), Some(15));
-        assert_eq!(index_of("ui.selected_name_secs"), Some(84));
+        assert_eq!(index_of("ui.selected_name_secs"), Some(85));
         assert_eq!(index_of("movement.not_a_key"), None);
         assert_eq!(index_of(""), None);
     }

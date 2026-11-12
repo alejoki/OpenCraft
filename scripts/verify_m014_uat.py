@@ -42,20 +42,21 @@ CONFIG_FILES = (
     "mining.toml",
     "render.toml",
 )
-DEFAULT_DIGEST = "0x7aa35ddbdb5a30b7"
-EDITED_DIGEST = "0x66965e5a33dcbd8c"
+DEFAULT_DIGEST = "0x2d99ee0c5e96d8bd"
+EDITED_DIGEST = "0x4c3af491ff874482"
 DEFAULT_SUMMARY = (
-    "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest="
+    "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest="
     + DEFAULT_DIGEST
 )
 EDITED_SUMMARY = (
-    "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest="
+    "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest="
     + EDITED_DIGEST
 )
 INVALID_MINING_ERROR = (
     "error: config/mining.toml: tools.stone_speed_multiplier: tool speed "
-    "multipliers must satisfy tools.wood_speed_multiplier (16) <= "
-    "tools.stone_speed_multiplier (4) <= tools.iron_speed_multiplier (6)"
+    "multipliers must satisfy tools.hand_speed_multiplier (1.0) <= "
+    "tools.wood_speed_multiplier (16.0) <= tools.stone_speed_multiplier (3.0) <= "
+    "tools.iron_speed_multiplier (5.0)"
 )
 SAFE_EDITS = (
     ("config/player.toml", "walk_speed = 4.6", "walk_speed = 8.0"),
@@ -323,7 +324,7 @@ def check_invalid_mining(work):
     apply_line_edit(
         work,
         "config/mining.toml",
-        "wood_speed_multiplier = 2",
+        "wood_speed_multiplier = 1.5",
         "wood_speed_multiplier = 16",
     )
     result = run(DEBUG, work, "--check-config")

@@ -3,7 +3,8 @@
 //! This module owns three rules and nothing else:
 //!
 //! 1. which blocks each [`ToolKind`] is *intended* for,
-//! 2. the per-tier speed multiplier (Wood 2x, Stone 4x, Iron 6x), and
+//! 2. the bare-hand baseline and per-tier speed multipliers (Wood 2x,
+//!    Stone 4x, Iron 6x relative to the hand baseline), and
 //! 3. the resulting [`break_duration`] for a block plus a selected item.
 //!
 //! It has no window, renderer, filesystem, or session dependency, so the
@@ -15,30 +16,36 @@
 use crate::player::inventory::{Item, ToolKind, ToolTier};
 use crate::world::block::BlockId;
 
+/// Speed multiplier for a bare hand: the mining baseline.
+pub const HAND_SPEED_MULTIPLIER: f32 = 1.0;
 /// Speed multiplier for a wood tool: twice the bare-hand rate.
-pub const WOOD_SPEED_MULTIPLIER: u8 = 2;
+pub const WOOD_SPEED_MULTIPLIER: f32 = 2.0;
 /// Speed multiplier for a stone tool: four times the bare-hand rate.
-pub const STONE_SPEED_MULTIPLIER: u8 = 4;
+pub const STONE_SPEED_MULTIPLIER: f32 = 4.0;
 /// Speed multiplier for an iron tool: six times the bare-hand rate.
-pub const IRON_SPEED_MULTIPLIER: u8 = 6;
+pub const IRON_SPEED_MULTIPLIER: f32 = 6.0;
 
-/// Creator-tunable per-tier mining speed multipliers.
+/// Creator-tunable hand baseline and per-tier mining speed multipliers.
 ///
 /// Kept in this module so the tool authority stays free of session and config
-/// types; defaults read the existing constants.
+/// types; defaults read the existing constants. The hand baseline scales every
+/// built-in break; each tier multiplier then stacks on top of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ToolRules {
-    /// Speed multiplier for wooden tools.
-    pub wood_speed_multiplier: u8,
-    /// Speed multiplier for stone tools.
-    pub stone_speed_multiplier: u8,
-    /// Speed multiplier for iron tools.
-    pub iron_speed_multiplier: u8,
+    /// Speed multiplier for a bare hand; the baseline for every tool tier.
+    pub hand_speed_multiplier: f32,
+    /// Speed multiplier for wooden tools, relative to the hand baseline.
+    pub wood_speed_multiplier: f32,
+    /// Speed multiplier for stone tools, relative to the hand baseline.
+    pub stone_speed_multiplier: f32,
+    /// Speed multiplier for iron tools, relative to the hand baseline.
+    pub iron_speed_multiplier: f32,
 }
 
 impl Default for ToolRules {
     fn default() -> Self {
         Self {
+            hand_speed_multiplier: HAND_SPEED_MULTIPLIER,
             wood_speed_multiplier: WOOD_SPEED_MULTIPLIER,
             stone_speed_multiplier: STONE_SPEED_MULTIPLIER,
             iron_speed_multiplier: IRON_SPEED_MULTIPLIER,
@@ -89,23 +96,40 @@ pub const fn tier_sword_damage(tier: ToolTier) -> u16 {
     }
 }
 
+/// Effective bare-hand baseline multiplier under live [`ToolRules`].
+///
+/// A non-finite or non-positive value fails closed to `1.0` so a degenerate
+/// bundle can never freeze or reverse the mining accumulator.
+pub fn hand_speed_multiplier_with_rules(rules: &ToolRules) -> f32 {
+    let value = rules.hand_speed_multiplier;
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
+    }
+}
+
 /// Speed multiplier for a tool tier. Always `>= 1`, so a matched tool can only
-/// ever shorten a break, never lengthen it.
-pub fn tier_speed_multiplier(tier: ToolTier) -> u8 {
+/// ever shorten a break relative to the hand baseline, never lengthen it.
+pub fn tier_speed_multiplier(tier: ToolTier) -> f32 {
     tier_speed_multiplier_with_rules(tier, &ToolRules::default())
 }
 
 /// Speed multiplier for a tool tier under live [`ToolRules`].
 ///
 /// The configured value is clamped to at least 1: a degenerate `0` can neither
-/// divide by zero nor make a matched tool longer than bare hand.
-pub fn tier_speed_multiplier_with_rules(tier: ToolTier, rules: &ToolRules) -> u8 {
-    match tier {
+/// divide by zero nor make a matched tool slower than the hand baseline.
+pub fn tier_speed_multiplier_with_rules(tier: ToolTier, rules: &ToolRules) -> f32 {
+    let value = match tier {
         ToolTier::Wood => rules.wood_speed_multiplier,
         ToolTier::Stone => rules.stone_speed_multiplier,
         ToolTier::Iron => rules.iron_speed_multiplier,
+    };
+    if value.is_finite() {
+        value.max(1.0)
+    } else {
+        1.0
     }
-    .max(1)
 }
 
 /// Seconds of held left-click needed to break `block` while `selected_item` is
@@ -113,9 +137,9 @@ pub fn tier_speed_multiplier_with_rules(tier: ToolTier, rules: &ToolRules) -> u8
 ///
 /// Returns `None` for structurally unbreakable blocks (Air, Bedrock) — the
 /// same fail-closed answer as [`BlockId::break_duration_secs`], regardless of
-/// which tool is held. A matching tool divides the base hardness by its tier
-/// multiplier; a mismatched tool, a non-tool, and an empty slot all keep the
-/// base hardness.
+/// which tool is held. The hand baseline divides the base hardness; a matching
+/// tool stacks its tier multiplier on top of the baseline, while a mismatched
+/// tool, a non-tool, and an empty slot keep the baseline rate.
 pub fn break_duration(block: BlockId, selected_item: Option<Item>) -> Option<f32> {
     break_duration_with_rules(block, selected_item, &ToolRules::default())
 }
@@ -156,13 +180,14 @@ pub fn break_duration_for_with_rules(
     rules: &ToolRules,
 ) -> Option<f32> {
     let base = hardness?;
+    let hand = hand_speed_multiplier_with_rules(rules);
     let Some((kind, tier)) = selected_item.and_then(|item| item.id().tool()) else {
-        return Some(base);
+        return Some(base / hand);
     };
     if tool_class != Some(kind) {
-        return Some(base);
+        return Some(base / hand);
     }
-    Some(base / f32::from(tier_speed_multiplier_with_rules(tier, rules)))
+    Some(base / (hand * tier_speed_multiplier_with_rules(tier, rules)))
 }
 
 /// Registry-friendly core for a pack tool tier.
@@ -170,8 +195,8 @@ pub fn break_duration_for_with_rules(
 /// `kind` and `speed` are the authored values from the resolved [`ToolDef`]
 /// and its [`TierDef`], so a pack tier gets the same class gate and hardness
 /// division as the built-in `Tool { kind, tier }` arm. A mismatched tool class
-/// keeps the authored hardness, and a missing/degenerate authored speed fails
-/// closed to bare-hand timing instead of producing a non-finite or
+/// keeps the hand-baseline rate, and a missing/degenerate authored speed fails
+/// closed to that same baseline instead of producing a non-finite or
 /// longer-than-base duration.
 ///
 /// [`ToolDef`]: crate::content::ToolDef
@@ -182,11 +207,32 @@ pub fn break_duration_for_pack_tier(
     kind: ToolKind,
     speed: f32,
 ) -> Option<f32> {
+    break_duration_for_pack_tier_with_rules(
+        hardness,
+        tool_class,
+        kind,
+        speed,
+        &ToolRules::default(),
+    )
+}
+
+/// [`break_duration_for_pack_tier`] with a live hand baseline.
+///
+/// Pack tiers keep their authored `speed`; only the hand baseline follows the
+/// live rules, matching the built-in path's `hand * tier` stacking.
+pub fn break_duration_for_pack_tier_with_rules(
+    hardness: Option<f32>,
+    tool_class: Option<ToolKind>,
+    kind: ToolKind,
+    speed: f32,
+    rules: &ToolRules,
+) -> Option<f32> {
     let base = hardness?;
+    let hand = hand_speed_multiplier_with_rules(rules);
     if tool_class != Some(kind) || !speed.is_finite() || speed < 1.0 {
-        return Some(base);
+        return Some(base / hand);
     }
-    Some(base / speed)
+    Some(base / (hand * speed))
 }
 
 #[cfg(test)]
@@ -197,6 +243,7 @@ mod tests {
     #[test]
     fn tool_rules_default_matches_constants() {
         let rules = ToolRules::default();
+        assert_eq!(rules.hand_speed_multiplier, HAND_SPEED_MULTIPLIER);
         assert_eq!(rules.wood_speed_multiplier, WOOD_SPEED_MULTIPLIER);
         assert_eq!(rules.stone_speed_multiplier, STONE_SPEED_MULTIPLIER);
         assert_eq!(rules.iron_speed_multiplier, IRON_SPEED_MULTIPLIER);
@@ -312,12 +359,12 @@ mod tests {
 
     #[test]
     fn tier_multipliers_are_two_four_six() {
-        assert_eq!(tier_speed_multiplier(ToolTier::Wood), 2);
-        assert_eq!(tier_speed_multiplier(ToolTier::Stone), 4);
-        assert_eq!(tier_speed_multiplier(ToolTier::Iron), 6);
-        assert_eq!(WOOD_SPEED_MULTIPLIER, 2);
-        assert_eq!(STONE_SPEED_MULTIPLIER, 4);
-        assert_eq!(IRON_SPEED_MULTIPLIER, 6);
+        assert_eq!(tier_speed_multiplier(ToolTier::Wood), 2.0);
+        assert_eq!(tier_speed_multiplier(ToolTier::Stone), 4.0);
+        assert_eq!(tier_speed_multiplier(ToolTier::Iron), 6.0);
+        assert_eq!(WOOD_SPEED_MULTIPLIER, 2.0);
+        assert_eq!(STONE_SPEED_MULTIPLIER, 4.0);
+        assert_eq!(IRON_SPEED_MULTIPLIER, 6.0);
     }
 
     #[test]
@@ -407,7 +454,7 @@ mod tests {
                     let expected = match base {
                         None => None,
                         Some(base) if class == Some(kind) => {
-                            Some(base / f32::from(tier_speed_multiplier(tier)))
+                            Some(base / tier_speed_multiplier(tier))
                         }
                         Some(base) => Some(base),
                     };
@@ -510,16 +557,17 @@ mod tests {
     #[test]
     fn tuned_tier_multipliers_drive_builtin_break_durations() {
         let rules = ToolRules {
-            wood_speed_multiplier: 8,
-            stone_speed_multiplier: 12,
-            iron_speed_multiplier: 16,
+            hand_speed_multiplier: 1.0,
+            wood_speed_multiplier: 8.0,
+            stone_speed_multiplier: 12.0,
+            iron_speed_multiplier: 16.0,
         };
         // Stone base is 1.2 s, so tuned wood/stone/iron are 1.2/8, 1.2/12,
         // 1.2/16 instead of the pinned 0.6/0.3/0.2.
         for (tier, multiplier) in [
-            (ToolTier::Wood, 8u8),
-            (ToolTier::Stone, 12),
-            (ToolTier::Iron, 16),
+            (ToolTier::Wood, 8.0f32),
+            (ToolTier::Stone, 12.0),
+            (ToolTier::Iron, 16.0),
         ] {
             assert_eq!(tier_speed_multiplier_with_rules(tier, &rules), multiplier);
             approx(
@@ -529,7 +577,7 @@ mod tests {
                     &rules,
                 )
                 .unwrap(),
-                1.2 / f32::from(multiplier),
+                1.2 / multiplier,
             );
         }
 
@@ -547,14 +595,20 @@ mod tests {
     #[test]
     fn degenerate_tuned_multipliers_fail_closed_to_bare_hand() {
         let rules = ToolRules {
-            wood_speed_multiplier: 0,
-            stone_speed_multiplier: 0,
-            iron_speed_multiplier: 0,
+            hand_speed_multiplier: 0.0,
+            wood_speed_multiplier: 0.0,
+            stone_speed_multiplier: 0.0,
+            iron_speed_multiplier: 0.0,
         };
+        assert_eq!(
+            hand_speed_multiplier_with_rules(&rules),
+            1.0,
+            "a zero hand baseline must clamp to 1x"
+        );
         for tier in [ToolTier::Wood, ToolTier::Stone, ToolTier::Iron] {
             assert_eq!(
                 tier_speed_multiplier_with_rules(tier, &rules),
-                1,
+                1.0,
                 "a zero multiplier must clamp to 1x, never divide by zero"
             );
             let duration = break_duration_with_rules(
@@ -582,6 +636,63 @@ mod tests {
                 &rules
             ),
             Some(0.9)
+        );
+    }
+
+    #[test]
+    fn hand_baseline_stacks_with_tier_multipliers() {
+        let rules = ToolRules {
+            hand_speed_multiplier: 2.0,
+            wood_speed_multiplier: 2.0,
+            stone_speed_multiplier: 4.0,
+            iron_speed_multiplier: 6.0,
+        };
+        // Bare hand and a mismatched tool both use the 2x baseline.
+        approx(
+            break_duration_with_rules(BlockId::Stone, None, &rules).unwrap(),
+            0.6,
+        );
+        approx(
+            break_duration_with_rules(
+                BlockId::Stone,
+                Some(tool(ToolKind::Axe, ToolTier::Iron)),
+                &rules,
+            )
+            .unwrap(),
+            0.6,
+        );
+        // A matched wood pickaxe stacks 2x baseline x 2x tier = 4x.
+        approx(
+            break_duration_with_rules(
+                BlockId::Stone,
+                Some(tool(ToolKind::Pickaxe, ToolTier::Wood)),
+                &rules,
+            )
+            .unwrap(),
+            0.3,
+        );
+        // Pack tiers keep their authored speed and stack on the baseline.
+        approx(
+            break_duration_for_pack_tier_with_rules(
+                Some(3.0),
+                Some(ToolKind::Pickaxe),
+                ToolKind::Pickaxe,
+                9.0,
+                &rules,
+            )
+            .unwrap(),
+            3.0 / 18.0,
+        );
+        approx(
+            break_duration_for_pack_tier_with_rules(
+                Some(3.0),
+                Some(ToolKind::Pickaxe),
+                ToolKind::Axe,
+                9.0,
+                &rules,
+            )
+            .unwrap(),
+            1.5,
         );
     }
 

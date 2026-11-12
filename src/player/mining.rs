@@ -339,9 +339,10 @@ mod tests {
         )
         .expect("valid pickaxe");
         let rules = ToolRules {
-            wood_speed_multiplier: 8,
-            stone_speed_multiplier: 12,
-            iron_speed_multiplier: 16,
+            hand_speed_multiplier: 1.0,
+            wood_speed_multiplier: 8.0,
+            stone_speed_multiplier: 12.0,
+            iron_speed_multiplier: 16.0,
         };
 
         let tuned = MiningTarget::from_block_with_rules(
@@ -361,9 +362,10 @@ mod tests {
         // A zero multiplier clamps to bare hand instead of creating a
         // zero/infinity duration that `new_with` would reject or mis-time.
         let zero = ToolRules {
-            wood_speed_multiplier: 0,
-            stone_speed_multiplier: 0,
-            iron_speed_multiplier: 0,
+            hand_speed_multiplier: 0.0,
+            wood_speed_multiplier: 0.0,
+            stone_speed_multiplier: 0.0,
+            iron_speed_multiplier: 0.0,
         };
         let clamped = MiningTarget::from_block_with_rules(
             registry,

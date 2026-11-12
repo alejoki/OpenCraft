@@ -29,16 +29,16 @@ const CONFIG_FILES: [(&str, usize); 6] = [
     ("survival.toml", 15),
     ("combat.toml", 21),
     ("world.toml", 19),
-    ("mining.toml", 4),
+    ("mining.toml", 5),
     ("render.toml", 10),
 ];
 
 #[cfg(debug_assertions)]
 const SUMMARY_PREFIX: &str =
-    "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=0x";
+    "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=0x";
 #[cfg(debug_assertions)]
 const MISSING_SUMMARY_PREFIX: &str =
-    "config: files=6 missing=6 warnings=6 errors=0 keys=85 schema=1 digest=0x";
+    "config: files=6 missing=6 warnings=6 errors=0 keys=86 schema=1 digest=0x";
 
 /// Copy the six checked-in config files byte-for-byte into `dest/config`.
 #[cfg(debug_assertions)]
@@ -323,7 +323,7 @@ fn extra_toml_warns_and_exits_zero() {
     );
     assert_summary(
         &lines,
-        "config: files=6 missing=0 warnings=1 errors=0 keys=85 schema=1 digest=0x",
+        "config: files=6 missing=0 warnings=1 errors=0 keys=86 schema=1 digest=0x",
     );
 }
 

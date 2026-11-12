@@ -35,8 +35,8 @@
 #     mining, render) through the live watcher. The trace must contain exactly
 #     six applied lines (one per file) and zero rejections, the edited tree
 #     must stay byte-identical, and the post-run `--check-config` digest must
-#     equal the final applied digest `0x66965e5a33dcbd8c` (not the default
-#     `0x7aa35ddbdb5a30b7`). The release profile skips this leg: release has
+#     equal the final applied digest `0x4c3af491ff874482` (not the default
+#     `0xeaeac8ddce568dec`). The release profile skips this leg: release has
 #     no creator watcher.
 #
 #   Leg C live textures (debug only): a v2 texture-only pack overrides
@@ -58,7 +58,7 @@
 #     Both profiles then prove the one-shot config-mismatch notice: a
 #     `walk_speed = 6.0` edit makes the derived v9 file warn exactly once
 #     (`config changed since this world was saved`), re-save with digest
-#     `0x9a0c860806183bec` at 446 bytes, and a third run on that output loads
+#     `0xb384bf0fac507102` at 446 bytes, and a third run on that output loads
 #     with no notice (the notice is one-shot, not repeated). The debug profile
 #     additionally re-checks the mismatched tree's `--check-config` digest;
 #     release rejects `--check-config` by design (Leg A).
@@ -438,7 +438,7 @@ if [[ "$PROFILE" == "debug" ]]; then
     fi
     expect_regex_count "leg A valid check-config" 6 "$LEG_A/check-ok.out" '^ok: config/'
     LEG_A_SUMMARY="$(tail -n 1 "$LEG_A/check-ok.out")"
-    [[ "$LEG_A_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=0x"* ]] ||
+    [[ "$LEG_A_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=0x"* ]] ||
         fail "leg A: summary line drifted: [$LEG_A_SUMMARY]"
     LEG_A_LINES="$(wc -l <"$LEG_A/check-ok.out")"
     [[ "$LEG_A_LINES" -eq 7 ]] ||
@@ -569,12 +569,12 @@ if [[ "$PROFILE" == "debug" ]]; then
     B2_LAST_LINE="$(grep -E '^creator: applied ' "$LEG_B2/live.log" | tail -n 1 || true)"
     [[ -n "$B2_LAST_LINE" ]] || fail "leg B2: no applied trace line found"
     B2_LAST_DIGEST="${B2_LAST_LINE##*digest=}"
-    [[ "$B2_LAST_DIGEST" == "0x66965e5a33dcbd8c" ]] ||
-        fail "leg B2: last applied digest is [$B2_LAST_DIGEST], expected 0x66965e5a33dcbd8c"
-    [[ "$B2_LAST_DIGEST" != "0x7aa35ddbdb5a30b7" ]] ||
-        fail "leg B2: last applied digest is the default 0x7aa35ddbdb5a30b7"
+    [[ "$B2_LAST_DIGEST" == "0x4c3af491ff874482" ]] ||
+        fail "leg B2: last applied digest is [$B2_LAST_DIGEST], expected 0x4c3af491ff874482"
+    [[ "$B2_LAST_DIGEST" != "0xeaeac8ddce568dec" ]] ||
+        fail "leg B2: last applied digest is the default 0xeaeac8ddce568dec"
     B2_SUMMARY="$(tail -n 1 "$LEG_B2/check.out")"
-    [[ "$B2_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=$B2_LAST_DIGEST" ]] ||
+    [[ "$B2_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=$B2_LAST_DIGEST" ]] ||
         fail "leg B2: post-live summary drifted: [$B2_SUMMARY]"
 fi
 
@@ -739,7 +739,7 @@ mapfile -t MISMATCH_LINES <"$LEG_E/mismatch.out"
     fail "leg E: config-mismatch run printed ${#MISMATCH_LINES[@]} stdout lines (expected 4)"
 [[ "${MISMATCH_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=config changed since this world was saved playable=true' ]] ||
     fail "leg E: config-mismatch load line drifted: [${MISMATCH_LINES[0]}]"
-MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x9a0c860806183bec bytes=[0-9]+$'
+MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0xb384bf0fac507102 bytes=[0-9]+$'
 [[ "${MISMATCH_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
     fail "leg E: config-mismatch resave line drifted: [${MISMATCH_LINES[1]}]"
 MISMATCH_BYTES="${MISMATCH_LINES[1]##*bytes=}"
@@ -771,7 +771,7 @@ if [[ "$PROFILE" == "debug" ]]; then
     fi
     expect_regex_count "leg E config-mismatch check-config" 6 "$LEG_E/check-mismatch.out" '^ok: config/'
     LEG_E_SUMMARY="$(tail -n 1 "$LEG_E/check-mismatch.out")"
-    [[ "$LEG_E_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest=0x9a0c860806183bec" ]] ||
+    [[ "$LEG_E_SUMMARY" == "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest=0xb384bf0fac507102" ]] ||
         fail "leg E: config-mismatch summary drifted: [$LEG_E_SUMMARY]"
 fi
 

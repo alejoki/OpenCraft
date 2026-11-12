@@ -8,17 +8,17 @@
 # by hand.
 
 [movement]
-walk_speed = 4.6
-sprint_speed = 7.2
+walk_speed = 4
+sprint_speed = 7
 fly_speed = 18.0
 fly_sprint_speed = 48.0
 fly_vertical_factor = 0.75
 jump_velocity = 9.0
 gravity = 28.0
 terminal_velocity = 45.0
-swim_vertical_drag = 6.0
-swim_rise_accel = 40.0
-swim_rise_speed = 4.0
+swim_vertical_drag = 7.0
+swim_rise_accel = 30.0
+swim_rise_speed = 3.0
 swim_max_sink_speed = 6.0
 swim_walk_speed_mult = 0.55
 swim_sink_accel = 28.0

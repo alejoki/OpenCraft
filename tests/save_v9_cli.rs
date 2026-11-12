@@ -28,7 +28,7 @@ const CONFIG_FILES: [&str; 6] = [
 
 /// Registry schema and digest of the checked-in default config.
 const DEFAULTS_SCHEMA: u16 = 1;
-const DEFAULTS_DIGEST: u64 = 0x7aa3_5ddb_db5a_30b7;
+const DEFAULTS_DIGEST: u64 = 0x2d99_ee0c_5e96_d8bd;
 
 /// Copy the six checked-in config files byte-for-byte into `dest/config`.
 fn copy_config(dest: &Path) -> PathBuf {

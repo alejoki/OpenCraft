@@ -1,6 +1,8 @@
 # OpenCraft creator configuration: mining tools and block interaction.
 #
-# Every curated key in this domain lives here at its default value.
+# Every curated key in this domain is listed here. This checkout ships tuned
+# mining multipliers (hand 1.0, wood 1.5, stone 3, iron 5) rather than the
+# registry defaults (1.0 / 2 / 4 / 6).
 # See docs/CONFIG.md for loading, validation, live reload, and
 # --check-config semantics.
 #
@@ -8,6 +10,7 @@
 # by hand.
 
 [tools]
+hand_speed_multiplier = 0.5
 wood_speed_multiplier = 2
 stone_speed_multiplier = 4
 iron_speed_multiplier = 6

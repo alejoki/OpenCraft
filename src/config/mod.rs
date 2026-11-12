@@ -484,9 +484,10 @@ impl ConfigRuntime {
                 wheat_stage_game_secs: self.f32("farming.wheat_stage_game_secs"),
             },
             tools: ToolRules {
-                wood_speed_multiplier: self.u8("tools.wood_speed_multiplier"),
-                stone_speed_multiplier: self.u8("tools.stone_speed_multiplier"),
-                iron_speed_multiplier: self.u8("tools.iron_speed_multiplier"),
+                hand_speed_multiplier: self.f32("tools.hand_speed_multiplier"),
+                wood_speed_multiplier: self.f32("tools.wood_speed_multiplier"),
+                stone_speed_multiplier: self.f32("tools.stone_speed_multiplier"),
+                iron_speed_multiplier: self.f32("tools.iron_speed_multiplier"),
             },
             interaction: InteractionRules {
                 table_reach: self.f32("interaction.table_reach"),
@@ -1065,6 +1066,16 @@ fn effective_value(rows: &[&ConfigRow], values: &[ConfigValue], key: &str) -> Co
     values[index]
 }
 
+/// Format a multiplier the way the docs table spells floats: whole values keep
+/// one decimal place (`2.0`), fractions keep their natural spelling (`1.5`).
+fn format_multiplier(value: f32) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
 fn expect_float(value: ConfigValue, key: &str) -> f32 {
     match value {
         ConfigValue::Float(value) => value,
@@ -1185,26 +1196,44 @@ fn cross_field_violation(
             None
         }
         ConfigFile::Mining => {
-            let wood = expect_int(
+            let hand = expect_float(
+                value("tools.hand_speed_multiplier"),
+                "tools.hand_speed_multiplier",
+            );
+            let wood = expect_float(
                 value("tools.wood_speed_multiplier"),
                 "tools.wood_speed_multiplier",
             );
-            let stone = expect_int(
+            let stone = expect_float(
                 value("tools.stone_speed_multiplier"),
                 "tools.stone_speed_multiplier",
             );
-            let iron = expect_int(
+            let iron = expect_float(
                 value("tools.iron_speed_multiplier"),
                 "tools.iron_speed_multiplier",
             );
-            if wood > stone || stone > iron {
+            let violation = if hand > wood {
+                Some("tools.wood_speed_multiplier")
+            } else if wood > stone {
+                Some("tools.stone_speed_multiplier")
+            } else if stone > iron {
+                Some("tools.iron_speed_multiplier")
+            } else {
+                None
+            };
+            if let Some(field) = violation {
                 return Some((
-                    "tools.stone_speed_multiplier",
+                    field,
                     format!(
                         "tool speed multipliers must satisfy \
-                         tools.wood_speed_multiplier ({wood}) <= \
-                         tools.stone_speed_multiplier ({stone}) <= \
-                         tools.iron_speed_multiplier ({iron})"
+                         tools.hand_speed_multiplier ({}) <= \
+                         tools.wood_speed_multiplier ({}) <= \
+                         tools.stone_speed_multiplier ({}) <= \
+                         tools.iron_speed_multiplier ({})",
+                        format_multiplier(hand),
+                        format_multiplier(wood),
+                        format_multiplier(stone),
+                        format_multiplier(iron),
                     ),
                 ));
             }
@@ -1323,7 +1352,7 @@ mod tests {
 
     /// Pinned defaults digest. Changing the digest stream format or a registry
     /// default must be a deliberate contract change (S04 persists this value).
-    const DEFAULT_DIGEST: u64 = 0x7aa3_5ddb_db5a_30b7;
+    const DEFAULT_DIGEST: u64 = 0xeaea_c8dd_ce56_8dec;
 
     fn tempdir_with_config() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1446,7 +1475,7 @@ mod tests {
         write_file(
             &config,
             ConfigFile::Mining,
-            "[tools]\nwood_speed_multiplier = 8\nstone_speed_multiplier = 12\niron_speed_multiplier = 16\n\n[interaction]\ntable_reach = 12.0\n",
+            "[tools]\nhand_speed_multiplier = 2.0\nwood_speed_multiplier = 8\nstone_speed_multiplier = 12\niron_speed_multiplier = 16\n\n[interaction]\ntable_reach = 12.0\n",
         );
         write_file(
             &config,
@@ -1475,9 +1504,10 @@ mod tests {
         assert_eq!(rules.spawning.passive_surface_light, 12);
         assert_eq!(rules.spawning.max_spawn_attempts_per_call, 8);
         assert_eq!(rules.farming.wheat_stage_game_secs, 30.0);
-        assert_eq!(rules.tools.wood_speed_multiplier, 8);
-        assert_eq!(rules.tools.stone_speed_multiplier, 12);
-        assert_eq!(rules.tools.iron_speed_multiplier, 16);
+        assert_eq!(rules.tools.hand_speed_multiplier, 2.0);
+        assert_eq!(rules.tools.wood_speed_multiplier, 8.0);
+        assert_eq!(rules.tools.stone_speed_multiplier, 12.0);
+        assert_eq!(rules.tools.iron_speed_multiplier, 16.0);
         assert_eq!(rules.interaction.table_reach, 12.0);
         assert_eq!(rules.render.rain_fog_factor, 0.5);
         assert_eq!(rules.render.snow_fog_factor, 0.6);
@@ -1500,19 +1530,25 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_config_tree_is_complete_and_default() {
+    fn checked_in_config_tree_is_complete_with_tuned_mining() {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CONFIG_DIR);
         let runtime = ConfigRuntime::load_dir(&config_dir);
 
-        assert_eq!(REGISTRY.len(), 85);
+        assert_eq!(REGISTRY.len(), 86);
         assert!(
             runtime.diagnostics().is_empty(),
             "checked-in config tree must load without diagnostics: {:?}",
             runtime.diagnostics()
         );
-        assert_eq!(runtime.digest(), ConfigRuntime::defaults().digest());
         for row in REGISTRY {
-            assert_eq!(runtime.value(row.key), row.default, "{}", row.key);
+            let expected = match row.key {
+                "tools.hand_speed_multiplier" => ConfigValue::Float(1.0),
+                "tools.wood_speed_multiplier" => ConfigValue::Float(1.5),
+                "tools.stone_speed_multiplier" => ConfigValue::Float(3.0),
+                "tools.iron_speed_multiplier" => ConfigValue::Float(5.0),
+                _ => row.default,
+            };
+            assert_eq!(runtime.value(row.key), expected, "{}", row.key);
             assert_eq!(
                 runtime.origin(row.key),
                 ValueOrigin::File(row.file),
@@ -1520,6 +1556,7 @@ mod tests {
                 row.key
             );
         }
+        assert_ne!(runtime.digest(), ConfigRuntime::defaults().digest());
     }
 
     #[test]
@@ -1877,8 +1914,9 @@ mod tests {
         );
         assert_eq!(
             diagnostics[0].reason,
-            "tool speed multipliers must satisfy tools.wood_speed_multiplier (5) <= \
-             tools.stone_speed_multiplier (3) <= tools.iron_speed_multiplier (10)"
+            "tool speed multipliers must satisfy tools.hand_speed_multiplier (1.0) <= \
+             tools.wood_speed_multiplier (5.0) <= tools.stone_speed_multiplier (3.0) <= \
+             tools.iron_speed_multiplier (10.0)"
         );
         assert!(startup_warnings(&runtime)
             .iter()
@@ -2254,11 +2292,11 @@ mod tests {
             6
         );
 
-        let digest = format!("{:#018x}", ConfigRuntime::defaults().digest());
+        let digest = format!("{:#018x}", ConfigRuntime::load_dir(&config).digest());
         assert_eq!(
             lines.last().unwrap(),
             &format!(
-                "config: files=6 missing=0 warnings=0 errors=0 keys=85 schema=1 digest={digest}"
+                "config: files=6 missing=0 warnings=0 errors=0 keys=86 schema=1 digest={digest}"
             )
         );
         assert_lower_hex_digest(summary_digest(&lines));
@@ -2311,10 +2349,10 @@ mod tests {
         assert!(error.contains("spawning.safe_radius_blocks"), "{error}");
         assert!(!lines.contains(&expected_ok_line(ConfigFile::World)));
 
-        // The whole world file fell back, so the effective digest is the
-        // registry-default digest even though the file exists and parses.
-        let defaults = format!("{:016x}", ConfigRuntime::defaults().digest());
-        assert_eq!(summary_digest(&lines), defaults.as_str());
+        // The whole world file fell back to registry defaults, so the digest
+        // matches the loader's view of the same tree.
+        let expected = format!("{:016x}", ConfigRuntime::load_dir(&config).digest());
+        assert_eq!(summary_digest(&lines), expected.as_str());
     }
 
     #[test]
@@ -2368,7 +2406,7 @@ mod tests {
                 summary.contains("files=6 missing=6 warnings=6 errors=0"),
                 "{summary}"
             );
-            assert!(summary.contains("keys=85 schema=1"), "{summary}");
+            assert!(summary.contains("keys=86 schema=1"), "{summary}");
         }
     }
 
@@ -2505,11 +2543,11 @@ mod tests {
         assert!(position("error: config/combat.toml:") < position("warning: config/world.toml:"));
         assert!(position("warning: config/world.toml:") < position("ok: config/world.toml:"));
 
-        let digest = format!("{:#018x}", ConfigRuntime::defaults().digest());
+        let digest = format!("{:#018x}", ConfigRuntime::load_dir(&config).digest());
         assert_eq!(
             lines.last().unwrap(),
             &format!(
-                "config: files=6 missing=0 warnings=3 errors=2 keys=85 schema=1 digest={digest}"
+                "config: files=6 missing=0 warnings=3 errors=2 keys=86 schema=1 digest={digest}"
             )
         );
     }

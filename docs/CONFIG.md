@@ -54,8 +54,8 @@ problem becomes a warning or an error that `--check-config` can report.
   - world: `spawning.safe_radius_blocks` < `spawning.spawn_max_radius_blocks` <
     `spawning.despawn_radius_blocks`, and
     `spawning.spawn_region_cap` < `spawning.max_mobs_total`.
-  - mining: `tools.wood_speed_multiplier` <= `tools.stone_speed_multiplier` <=
-    `tools.iron_speed_multiplier`.
+  - mining: `tools.hand_speed_multiplier` <= `tools.wood_speed_multiplier` <=
+    `tools.stone_speed_multiplier` <= `tools.iron_speed_multiplier`.
 - **File-level failure** — an unreadable file, a file larger than 1 MiB, or
   invalid TOML rejects that whole file (all its keys revert to defaults) and is
   reported as an error.
@@ -207,11 +207,11 @@ warning: config/<file>: <dotted.key>: unknown key
 warning: config/<file-name>: not a config file
 error: config/<file>: <dotted.key>: <reason>
 error: config/<file>: <reason>
-config: files=6 missing=<n> warnings=<n> errors=<n> keys=85 schema=1 digest=0x<16 lowercase hex digits>
+config: files=6 missing=<n> warnings=<n> errors=<n> keys=86 schema=1 digest=0x<16 lowercase hex digits>
 ```
 
 `<N>` is the number of curated values in that file: 16 player, 15 survival, 21
-combat, 19 world, 4 mining, 10 render. A file with any error prints its error
+combat, 19 world, 5 mining, 10 render. A file with any error prints its error
 lines and no `ok:` line. The final summary line is always last; `warnings` and
 `errors` count diagnostic lines, and missing-file and extra-file warnings are
 included.
@@ -349,9 +349,10 @@ key's `Range` is the inclusive accepted range.
 | config/world.toml | spawning.passive_surface_light | int | 15 | 0..=15 | light | live | Minimum light level where passive mobs may spawn on the surface. |
 | config/world.toml | spawning.max_spawn_attempts_per_call | int | 4 | 1..=64 | attempts | live | Maximum spawn positions tried per spawn attempt. |
 | config/world.toml | farming.wheat_stage_game_secs | float | 60.0 | 1.0..=3600.0 | s | live | Game seconds between wheat growth stages. |
-| config/mining.toml | tools.wood_speed_multiplier | int | 2 | 1..=32 | x | live | Mining speed multiplier for wooden tools. |
-| config/mining.toml | tools.stone_speed_multiplier | int | 4 | 1..=32 | x | live | Mining speed multiplier for stone tools. |
-| config/mining.toml | tools.iron_speed_multiplier | int | 6 | 1..=32 | x | live | Mining speed multiplier for iron tools. |
+| config/mining.toml | tools.hand_speed_multiplier | float | 1.0 | 0.1..=32.0 | x | live | Bare-hand mining speed multiplier; tool multipliers stack on top. |
+| config/mining.toml | tools.wood_speed_multiplier | float | 2.0 | 1.0..=32.0 | x | live | Mining speed multiplier for wooden tools. |
+| config/mining.toml | tools.stone_speed_multiplier | float | 4.0 | 1.0..=32.0 | x | live | Mining speed multiplier for stone tools. |
+| config/mining.toml | tools.iron_speed_multiplier | float | 6.0 | 1.0..=32.0 | x | live | Mining speed multiplier for iron tools. |
 | config/mining.toml | interaction.table_reach | float | 8.0 | 1.0..=32.0 | blocks | live | Maximum distance for interacting with a placed crafting table in blocks. |
 | config/render.toml | fog.rain_factor | float | 0.75 | 0.0..=4.0 | multiplier | live | Fog range multiplier applied during rain. |
 | config/render.toml | fog.snow_factor | float | 0.85 | 0.0..=4.0 | multiplier | live | Fog range multiplier applied during snowfall. |

@@ -542,10 +542,10 @@ impl ContentRegistry {
 
     /// [`Self::break_duration`] with live [`ToolRules`] for built-in tiers.
     ///
-    /// The live tuning only reaches the built-in `Tool { kind, tier }` path.
-    /// A pack tool keeps its authored [`TierDef::speed`] and is therefore
-    /// byte-identical to [`Self::break_duration`]; the mined `mining.toml`
-    /// rows can never retune a pack's own tier table.
+    /// The hand baseline applies to both paths. The built-in `Tool { kind,
+    /// tier }` path also follows the live tier rows, while a pack tool keeps
+    /// its authored [`TierDef::speed`]; the mined `mining.toml` rows can never
+    /// retune a pack's own tier table.
     pub fn break_duration_with_rules(
         &self,
         block: BlockId,
@@ -568,9 +568,15 @@ impl ContentRegistry {
             .tool(index)
             .and_then(|tool| self.tier(tool.tier).map(|tier| (tool.kind, tier.speed)))
         else {
-            return tools::break_duration_for(def.hardness, def.tool_class, None);
+            return tools::break_duration_for_with_rules(def.hardness, def.tool_class, None, rules);
         };
-        tools::break_duration_for_pack_tier(def.hardness, def.tool_class, kind, speed)
+        tools::break_duration_for_pack_tier_with_rules(
+            def.hardness,
+            def.tool_class,
+            kind,
+            speed,
+            rules,
+        )
     }
 
     /// The insertable drop for `block` and its authored stack limit.
@@ -827,7 +833,7 @@ fn builtin_tiers() -> Vec<TierDef> {
             index: index as u16,
             name: names::builtin_tier_id_name(tier).to_string(),
             display_name: tier.name().to_string(),
-            speed: f32::from(tools::tier_speed_multiplier(tier)),
+            speed: tools::tier_speed_multiplier(tier),
             durability: tier.max_durability(),
             damage: tools::tier_sword_damage(tier),
         })
@@ -1503,9 +1509,10 @@ mod tests {
     #[test]
     fn break_duration_with_rules_retunes_builtins_and_leaves_pack_tiers_alone() {
         let rules = ToolRules {
-            wood_speed_multiplier: 8,
-            stone_speed_multiplier: 12,
-            iron_speed_multiplier: 16,
+            hand_speed_multiplier: 1.0,
+            wood_speed_multiplier: 8.0,
+            stone_speed_multiplier: 12.0,
+            iron_speed_multiplier: 16.0,
         };
         let registry = ContentRegistry::builtin();
         let wood_pickaxe = Item::new(
