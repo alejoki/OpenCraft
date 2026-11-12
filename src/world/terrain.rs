@@ -188,7 +188,7 @@ const RUIN_ANCHOR_MARGIN: i32 = RUIN_FOOTPRINT_HALF;
 const RUIN_WALL_MIN_HEIGHT: i32 = 1;
 const RUIN_WALL_MAX_HEIGHT: i32 = 3;
 
-/// Surface-height band a ruin may stand on: exactly the Grass band above the
+/// Surface-height band a ruin may stand on: exactly the land band above the
 /// Sand beach shelf and below Mountain stone (the same window trees use, so
 /// both structures agree on what counts as buildable land).
 const RUIN_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
@@ -741,10 +741,17 @@ fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
 /// writes into a neighbouring chunk and needs no neighbour heights.
 ///
 /// The surface-block gate is the authoritative one, exactly like the tree
-/// pass: the column must still hold `BlockId::Grass` after the terrain, cave,
-/// tree and ore passes. That single check is what keeps ruins off Sand beaches,
-/// seabed, mountain Stone, the altitude Snow cap and the seasonal Winter
-/// blanket (which turns Plains/Forest land into Snow emergently).
+/// pass: the column must still hold a land skin after the terrain, cave, tree
+/// and ore passes. `Grass` is the warm-season skin; the seasonal Winter
+/// blanket turns the same Plains/Forest land into `Snow`, which is equally
+/// valid. That single check is what keeps ruins off Sand beaches, seabed and
+/// mountain Stone. The altitude Snow cap can never reach here: `ruin_at`
+/// already rejects every column outside the Plains/Forest height band.
+///
+/// Ruins are therefore season-independent at the anchor level: the same
+/// ruins and loot chests exist in every season. A winter shell can gain a cell
+/// where a warm-season leaf occupied the only-into-Air write; it never loses
+/// one.
 fn place_surface_ruins(
     chunk: &mut Chunk,
     heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
@@ -763,7 +770,10 @@ fn place_surface_ruins(
             if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
                 continue;
             }
-            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+            if !matches!(
+                chunk.get(lx, surface_ly as usize, lz),
+                BlockId::Grass | BlockId::Snow
+            ) {
                 continue;
             }
             let wx = base_wx + lx as i32;
@@ -911,10 +921,14 @@ fn place_ruin_at(
             if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
                 continue;
             }
-            // Per-footprint-column surface gate: the shell stands on Grass
-            // only, so a footprint straddling a beach or a mountain stone
-            // column simply loses those cells.
-            if chunk.get(lx, surface_ly as usize, lz) != BlockId::Grass {
+            // Per-footprint-column surface gate: the shell stands on the
+            // seasonal land skin (Grass, or Snow in Winter) only, so a
+            // footprint straddling a beach or a mountain stone column simply
+            // loses those cells.
+            if !matches!(
+                chunk.get(lx, surface_ly as usize, lz),
+                BlockId::Grass | BlockId::Snow
+            ) {
                 continue;
             }
             let block = ruin_wall_block(dx, dz);
@@ -1301,19 +1315,20 @@ fn ruin_footprint_fits_chunk_layer(
 /// gate, the sparse hash gate and the footprint-aware vertical-fit gate all
 /// live here, so no caller can disagree with the generator about where a ruin
 /// stands. The generator additionally checks the actual generated surface
-/// block (`Grass`), which is the authoritative gate for beaches, seabed,
-/// mountain stone and the seasonal Winter blanket.
+/// block (`Grass`, or `Snow` under the seasonal Winter blanket), which is the
+/// authoritative gate for beaches, seabed and mountain stone.
 ///
 /// Deliberately season-blind: ruins are a function of `(pos, seed)` only, so
-/// the same ruins exist in every season (in Winter the snow surface suppresses
-/// them emergently at the generator's `Grass` gate). Trees are different after
-/// D088: their placement ignores the seasonal surface, so only ruins keep this
-/// emergent Winter suppression.
+/// the same ruins exist in every season. The generator's surface gate accepts
+/// both the warm-season `Grass` skin and the seasonal Winter `Snow` blanket;
+/// the biome/height gate above already excludes Sand, Stone and the altitude
+/// Snow cap. Trees share the same season-blind placement after D088.
 fn ruin_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<RuinSpec> {
     let ruin_hash = ruin_anchor_hash(wx, wz, seed)?;
-    // The band is the Grass window: above the Sand beach shelf and below the
+    // The band is the land window: above the Sand beach shelf and below the
     // Mountain stone threshold. Combined with the Plains/Forest gate below,
-    // a ruin can never stand on Sand, Stone, Snow or a water column.
+    // a ruin can never stand on Sand, Stone or a water column. The surface
+    // may be Grass or the seasonal Winter Snow blanket.
     if !(RUIN_MIN_HEIGHT..=RUIN_MAX_HEIGHT).contains(&h) {
         return None;
     }
@@ -1372,9 +1387,10 @@ pub fn ruin_at_seeded(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
 /// like an OakLog trunk.
 ///
 /// Conservative by construction: it does not check the generated surface block
-/// (that needs a chunk), so a column can be rejected for a ruin the Winter
-/// blanket would suppress — the same over-rejection the tree clearance already
-/// accepts, and it keeps the spawn purely a function of `seed`.
+/// (that needs a chunk), so it may reject a column whose generated surface is
+/// Sand or Stone even though no ruin could actually stand there. That
+/// over-rejection is the same the tree clearance already accepts, and it keeps
+/// the spawn purely a function of `seed`.
 fn ruin_covering(wx: i32, wz: i32, seed: u32) -> Option<RuinSpec> {
     for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
         for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
@@ -3853,7 +3869,7 @@ mod tests {
     }
 
     #[test]
-    fn test_surface_ruins_stand_only_on_grass_land() {
+    fn test_surface_ruins_stand_on_plains_forest_land_in_every_season() {
         let seed = DEFAULT_WORLD_SEED;
         let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
         assert!(!anchors.is_empty(), "region has no ruin anchors");
@@ -3926,10 +3942,10 @@ mod tests {
             }
         }
 
-        // The seasonal Winter blanket turns Plains/Forest land into Snow, so the
-        // authoritative Grass gate suppresses every ruin: the same chunks that
-        // carried shells in Summer must carry neither shells nor loot chests in
-        // Winter.
+        // The seasonal Winter blanket turns Plains/Forest land into Snow. The
+        // surface gate accepts that skin too, so the same chunks must carry the
+        // same shells and the same loot chests in Winter: ruins are
+        // season-independent by construction.
         let mut ruin_chunks: Vec<(i32, i32)> = blocks
             .iter()
             .map(|&(wx, _, wz, _)| {
@@ -3945,32 +3961,52 @@ mod tests {
         for &(cx, cz) in ruin_chunks.iter().take(8) {
             for cy in 0..=2 {
                 let winter = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Winter);
+                let summer = generate_chunk_seeded(ChunkPos::new(cx, cy, cz), seed, Season::Summer);
                 for lz in 0..CHUNK_SIZE {
                     for ly in 0..CHUNK_SIZE {
                         for lx in 0..CHUNK_SIZE {
-                            let block = winter.get(lx, ly, lz);
-                            assert!(
-                                !matches!(
-                                    block,
-                                    BlockId::Cobblestone | BlockId::Brick | BlockId::LootChest
-                                ),
-                                "winter Snow surface should suppress ruins, but ({cx}, {cy}, {cz}) has {block:?} at ({lx}, {ly}, {lz})"
-                            );
+                            let summer_block = summer.get(lx, ly, lz);
+                            if matches!(
+                                summer_block,
+                                BlockId::Cobblestone | BlockId::Brick | BlockId::LootChest
+                            ) {
+                                assert_eq!(
+                                    winter.get(lx, ly, lz),
+                                    summer_block,
+                                    "winter removed ruin cell ({lx}, {ly}, {lz}) in chunk ({cx}, {cy}, {cz})"
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
-        // No Winter LootChest anywhere in the region either: the whole
-        // placement pass, chest included, is behind the Grass gate.
+        // The whole region keeps every Summer ruin shell cell in Winter. Winter
+        // may gain shell cells where Summer leaves occupied the only-into-Air
+        // write (bare winter canopies expose more Air), but it must never lose
+        // one. Loot chests are identical because their interior column is never
+        // a canopy cell.
+        let winter_blocks = ruin_blocks_in_region(RUIN_SCAN_RADIUS, seed, Season::Winter);
+        let winter_cells: std::collections::HashSet<_> = winter_blocks.iter().copied().collect();
+        for cell in &blocks {
+            assert!(
+                winter_cells.contains(cell),
+                "winter removed ruin cell {cell:?}"
+            );
+        }
+        assert_eq!(
+            loot_chests_in_region(RUIN_SCAN_RADIUS, seed, Season::Winter),
+            loot_chests_in_region(RUIN_SCAN_RADIUS, seed, Season::Summer),
+            "winter must keep every ruin loot chest"
+        );
         assert!(
-            loot_chests_in_region(RUIN_SCAN_RADIUS, seed, Season::Winter).is_empty(),
-            "Winter chunks must not contain a ruin loot chest"
+            !loot_chests_in_region(RUIN_SCAN_RADIUS, seed, Season::Winter).is_empty(),
+            "Winter ruins must still carry loot chests"
         );
 
         // Ocean and mountain chunks carry no ruin at all: Sand and Stone
-        // surfaces fail the same Grass gate as Snow.
+        // surfaces still fail the land-skin gate.
         let found = first_column_per_biome(seed);
         for biome in [Biome::Ocean, Biome::Mountains] {
             let (wx, _, wz) = found[biome_index(biome)].expect("seed must have both biomes");
