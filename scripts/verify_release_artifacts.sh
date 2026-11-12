@@ -3,10 +3,11 @@
 #
 # Usage: bash scripts/verify_release_artifacts.sh <dist_dir> <version>
 #
-# The directory must contain exactly the two D269 archives (any extra entry is
-# a failure, so a stale or misnamed upload cannot pass):
+# The directory must contain exactly the three release assets (any extra
+# entry is a failure, so a stale or misnamed upload cannot pass):
 #   opencraft-<version>-x86_64-unknown-linux-gnu.tar.gz
 #   opencraft-<version>-x86_64-pc-windows-msvc.zip
+#   opencraft-<version>-x86_64-pc-windows-msvc-setup.exe
 #
 # Linux: extract, require an executable `opencraft` plus `config/combat.toml`,
 # `worldgen/villages/plains.toml` and `LICENSE`, then run three headless
@@ -18,7 +19,11 @@
 #                    the archive)
 # Windows: a python3 zipfile reader requires `opencraft.exe`, the same config
 # and worldgen files, and `LICENSE` at the archive root, and rejects any
-# `packs/`, `saves/`, `settings.toml` entry or wrapper directory.
+# `packs/`, `saves/`, `settings.toml` entry or wrapper directory. The exe must
+# not import VCRUNTIME140.dll: D290 builds the release with a static CRT so a
+# clean Windows box needs no VC++ redistributable.
+# Installer: the setup exe must be a PE image whose version resource names
+# OpenCraft and <version> in UTF-16LE.
 #
 # Dependencies: bash, python3, tar, mktemp, timeout, cp, wc, tail, grep.
 
@@ -43,11 +48,14 @@ VERSION="$2"
 
 LINUX_NAME="opencraft-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
 WINDOWS_NAME="opencraft-$VERSION-x86_64-pc-windows-msvc.zip"
+INSTALLER_NAME="opencraft-$VERSION-x86_64-pc-windows-msvc-setup.exe"
 LINUX="$DIST/$LINUX_NAME"
 WINDOWS="$DIST/$WINDOWS_NAME"
+INSTALLER="$DIST/$INSTALLER_NAME"
 
 found_linux=0
 found_windows=0
+found_installer=0
 unexpected=()
 shopt -s nullglob
 for entry in "$DIST"/*; do
@@ -55,16 +63,19 @@ for entry in "$DIST"/*; do
     case "$name" in
         "$LINUX_NAME") found_linux=1 ;;
         "$WINDOWS_NAME") found_windows=1 ;;
+        "$INSTALLER_NAME") found_installer=1 ;;
         *) unexpected+=("$name") ;;
     esac
 done
 [[ "$found_linux" -eq 1 ]] || fail "missing $LINUX_NAME in $DIST"
 [[ "$found_windows" -eq 1 ]] || fail "missing $WINDOWS_NAME in $DIST"
+[[ "$found_installer" -eq 1 ]] || fail "missing $INSTALLER_NAME in $DIST"
 if [[ ${#unexpected[@]} -gt 0 ]]; then
     fail "unexpected entries in $DIST: ${unexpected[*]}"
 fi
 [[ -s "$LINUX" ]] || fail "empty archive: $LINUX"
 [[ -s "$WINDOWS" ]] || fail "empty archive: $WINDOWS"
+[[ -s "$INSTALLER" ]] || fail "empty installer: $INSTALLER"
 
 LINUX_DIR="$(mktemp -d "${TMPDIR:-/tmp}/opencraft-verify.XXXXXX")" ||
     fail "mktemp failed"
@@ -189,10 +200,73 @@ try:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+        exe = archive.read("opencraft.exe")
+        if not exe.startswith(b"MZ"):
+            print(
+                "verify_release: FAIL windows opencraft.exe is not a PE image",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if b"vcruntime140" in exe.lower():
+            print(
+                "verify_release: FAIL windows opencraft.exe still imports "
+                "VCRUNTIME140.dll; the release build must use a static CRT (D290)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 except zipfile.BadZipFile as error:
     print(f"verify_release: FAIL windows archive is not a zip: {error}", file=sys.stderr)
     sys.exit(1)
 PY
 
 echo "verify_release: windows=ok"
+
+python3 - "$INSTALLER" "$VERSION" <<'PY' || exit 1
+import struct
+import sys
+
+path = sys.argv[1]
+version = sys.argv[2]
+try:
+    with open(path, "rb") as setup:
+        data = setup.read()
+except OSError as error:
+    print(f"verify_release: FAIL cannot read installer: {error}", file=sys.stderr)
+    sys.exit(1)
+
+if len(data) < 1024 * 1024:
+    print(
+        f"verify_release: FAIL installer is only {len(data)} bytes; "
+        "expected a compiled setup exe",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if data[:2] != b"MZ" or len(data) < 0x40:
+    print("verify_release: FAIL installer is not a PE image", file=sys.stderr)
+    sys.exit(1)
+pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+    print("verify_release: FAIL installer has no PE header", file=sys.stderr)
+    sys.exit(1)
+
+
+def utf16(text):
+    return text.encode("utf-16-le")
+
+
+if utf16("OpenCraft") not in data:
+    print(
+        "verify_release: FAIL installer version resource does not name OpenCraft",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if utf16(version) not in data and utf16(version + ".0") not in data:
+    print(
+        f"verify_release: FAIL installer version resource does not carry {version}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+
+echo "verify_release: installer=ok"
 echo "verify_release: ok"

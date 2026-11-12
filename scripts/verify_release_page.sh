@@ -5,8 +5,9 @@
 #
 # Calls `gh release view <tag> --json tagName,assets,body` and asserts:
 #   - tagName equals the requested tag
-#   - the asset name set is exactly the two D269 archives
-#   - both asset sizes are greater than zero
+#   - the asset name set is exactly the three release assets (two portable
+#     archives plus the Windows installer, D290)
+#   - all asset sizes are greater than zero
 #   - the release body contains `SmartScreen` and `version 9`
 #
 # Prints one machine-readable latch line on success and one readable FAIL line
@@ -55,6 +56,7 @@ if actual_tag != tag:
 expected = {
     f"opencraft-{version}-x86_64-unknown-linux-gnu.tar.gz",
     f"opencraft-{version}-x86_64-pc-windows-msvc.zip",
+    f"opencraft-{version}-x86_64-pc-windows-msvc-setup.exe",
 }
 assets = payload.get("assets") or []
 names = {asset.get("name") for asset in assets}
@@ -86,4 +88,4 @@ if missing:
     sys.exit(1)
 ' "$TAG" "$VERSION" || exit 1
 
-echo "verify_release_page: tag=$TAG assets=2 ok"
+echo "verify_release_page: tag=$TAG assets=3 ok"

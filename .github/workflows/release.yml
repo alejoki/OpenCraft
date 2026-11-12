@@ -55,15 +55,19 @@ jobs:
           - os: ubuntu-latest
             triple: x86_64-unknown-linux-gnu
             archive: tar.gz
+            rustflags: ""
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             archive: zip
+            # D290: the released exe must not depend on VCRUNTIME140.dll.
+            rustflags: "-C target-feature=+crt-static"
     defaults:
       run:
         shell: bash
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TRIPLE: ${{ matrix.triple }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
 
@@ -91,11 +95,27 @@ jobs:
       - name: Package release archive
         run: bash scripts/package_release.sh "$VERSION" "$TRIPLE"
 
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: bash scripts/build_windows_installer.sh "$VERSION"
+
+      - name: Smoke-test the Windows installer
+        if: runner.os == 'Windows'
+        run: bash scripts/smoke_windows_installer.sh "$VERSION"
+
       - name: Upload release archive
         uses: actions/upload-artifact@v7
         with:
           name: opencraft-${{ matrix.triple }}
           path: dist/opencraft-${{ needs.version.outputs.version }}-${{ matrix.triple }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: opencraft-installer
+          path: dist/opencraft-${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc-setup.exe
           if-no-files-found: error
 
   release:
@@ -129,11 +149,12 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "OpenCraft $TAG" \
               --notes-file "docs/RELEASE-NOTES-$VERSION.md"
-            gh release upload "$TAG" dist/opencraft-*.tar.gz dist/opencraft-*.zip --clobber
+            gh release upload "$TAG" dist/opencraft-*.tar.gz dist/opencraft-*.zip \
+              dist/opencraft-*-setup.exe --clobber
           else
             gh release create "$TAG" --verify-tag --title "OpenCraft $TAG" \
               --notes-file "docs/RELEASE-NOTES-$VERSION.md" \
-              dist/opencraft-*.tar.gz dist/opencraft-*.zip
+              dist/opencraft-*.tar.gz dist/opencraft-*.zip dist/opencraft-*-setup.exe
           fi
 
       - name: Verify the published release page

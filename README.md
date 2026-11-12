@@ -68,7 +68,7 @@ Spawn attempts are deterministic for a seed and continue while you play. A mob t
 
 ### Downloading a release
 
-Prebuilt archives are published at [github.com/alejoki/OpenCraft/releases](https://github.com/alejoki/OpenCraft/releases): `opencraft-0.2.2-x86_64-unknown-linux-gnu.tar.gz` for Linux and `opencraft-0.2.2-x86_64-pc-windows-msvc.zip` for Windows. Extract the archive and run the binary inside it. The Linux build needs ALSA (`libasound2`), and the Windows build is unsigned, so SmartScreen asks for **More info** -> **Run anyway**. See the [0.2.2 release notes](docs/RELEASE-NOTES-0.2.2.md) for details.
+Prebuilt archives are published at [github.com/alejoki/OpenCraft/releases](https://github.com/alejoki/OpenCraft/releases): `opencraft-0.2.2-x86_64-unknown-linux-gnu.tar.gz` for Linux, and for Windows either the per-user installer `opencraft-0.2.2-x86_64-pc-windows-msvc-setup.exe` or the portable `opencraft-0.2.2-x86_64-pc-windows-msvc.zip`. The installer adds Start Menu and Apps entries and needs no administrator approval; the portable archive is extracted and its `opencraft.exe` runs in place. The Linux build needs ALSA (`libasound2`), and the Windows build is unsigned, so SmartScreen asks for **More info** -> **Run anyway**. See the [0.2.2 release notes](docs/RELEASE-NOTES-0.2.2.md) for details.
 
 ### Building
 

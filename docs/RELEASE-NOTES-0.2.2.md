@@ -45,12 +45,15 @@ accepts the tuned tree, and the live multiplier invariant is
 | Platform | Archive |
 | --- | --- |
 | Linux (x86_64, glibc) | `opencraft-0.2.2-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows (x86_64) | `opencraft-0.2.2-x86_64-pc-windows-msvc.zip` |
+| Windows (x86_64) installer | `opencraft-0.2.2-x86_64-pc-windows-msvc-setup.exe` |
+| Windows (x86_64) portable | `opencraft-0.2.2-x86_64-pc-windows-msvc.zip` |
 
-Each archive is a portable folder: the `opencraft` binary for that platform,
-the shipped `config/` and `worldgen/` trees, and `LICENSE`. It contains no
-`saves/`, `packs/`, or `settings.toml`, so nothing of yours is overwritten.
-These release notes live on the release page rather than inside the archive.
+The two archives are portable folders: the `opencraft` binary for that
+platform, the shipped `config/` and `worldgen/` trees, and `LICENSE`. Neither
+contains `saves/`, `packs/`, or `settings.toml`, so nothing of yours is
+overwritten. The Windows setup exe installs the same files for the current
+user. These release notes live on the release page rather than inside the
+archives.
 
 ## Linux
 
@@ -66,11 +69,21 @@ from source instead on such a system.
 
 ## Windows
 
-1. Download `opencraft-0.2.2-x86_64-pc-windows-msvc.zip`.
-2. Extract it, then run `opencraft.exe` from the extracted folder.
+1. Download `opencraft-0.2.2-x86_64-pc-windows-msvc-setup.exe` and run it.
+2. The installer places OpenCraft in `%LOCALAPPDATA%\OpenCraft`, adds a Start
+   Menu shortcut, and registers an uninstall entry under
+   **Settings > Apps**. It installs for the current user and does not ask for
+   administrator approval.
+3. Launch OpenCraft from the Start Menu. Settings, saves, and packs stay in
+   the install folder next to the game.
 
-The build is unsigned, so the first launch shows a SmartScreen warning. Choose
-**More info**, then **Run anyway**.
+The portable `opencraft-0.2.2-x86_64-pc-windows-msvc.zip` is still published:
+extract it and run `opencraft.exe` from the extracted folder.
+
+The Windows build links the C runtime statically, so it does not need the
+Visual C++ Redistributable. The build is unsigned, so the first launch of the
+installer or the game shows a SmartScreen warning. Choose **More info**, then
+**Run anyway**.
 
 ## Save compatibility
 

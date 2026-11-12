@@ -40,8 +40,10 @@ Do **not** run a bare `cargo update`; it churns unrelated dependency versions.
 
 Then write `docs/RELEASE-NOTES-<VERSION>.md`. The workflow looks up exactly
 `docs/RELEASE-NOTES-${VERSION}.md` and fails the run if it is missing. Keep the
-two archive names in the download table in sync with what the workflow builds
-(they derive from the crate name and version).
+three asset names in the download table in sync with what the workflow builds
+(they derive from the crate name and version): both portable archives plus
+`opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe`. Document the Windows
+installer next to the zip, and keep the unsigned/SmartScreen caveat for both.
 
 Add the `### Downloading a release` line in `README.md` if this is a new minor
 version.
@@ -59,11 +61,15 @@ trigger under `on.push`, immediately after the `tags:` entry:
 ```
 
 Commit that with the version bump, push the branch, and let the `version` and
-`build` jobs run on both OSes. The `publish` job stays tag-gated by
+`build` jobs run on both OSes. The Windows job additionally builds
+`installer/opencraft.iss` with Inno Setup 6.3+ (installed via Chocolatey when
+the runner does not provide `ISCC.exe`), silently installs it into
+`dist/install-smoke`, and runs the installed `--demo-ui` seam before uploading
+`opencraft-installer`. The `publish` job stays tag-gated by
 `if: startsWith(github.ref, 'refs/tags/v')`, so the packaged artifacts are
 uploaded and nothing is published. This is the whole point of the rehearsal —
-archive generation, the layout check, and the two-OS build are exercised before
-a tag exists.
+archive generation, installer compile and install, the layout check, and the
+two-OS build are exercised before a tag exists.
 
 There is no `workflow_dispatch` path: `release.yml` does not exist on `main`,
 so a dispatch trigger would not be usable. Delete the `branches` entry in the
@@ -81,8 +87,12 @@ bash scripts/verify_release_artifacts.sh dist/rehearsal 0.2.2
 `opencraft-<VERSION>-x86_64-unknown-linux-gnu.tar.gz` contains an executable
 `opencraft`, that `opencraft-<VERSION>-x86_64-pc-windows-msvc.zip` contains
 `opencraft.exe`, and that both carry `config/combat.toml`,
-`worldgen/villages/plains.toml` and `LICENSE` at the archive root. It also runs
-the Linux binary headlessly (`--demo-ui`, `--demo-village`, `--validate-pack`)
+`worldgen/villages/plains.toml` and `LICENSE` at the archive root. It also
+rejects a Windows `opencraft.exe` that still imports `VCRUNTIME140.dll` (D290
+builds the release with a static CRT), and requires
+`opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` to be a PE image whose
+version resource names OpenCraft and the release version. The script runs the
+Linux binary headlessly (`--demo-ui`, `--demo-village`, `--validate-pack`)
 from a scratch directory, and rejects any `packs/`, `saves/` or `settings.toml`
 entry in the Windows zip.
 
@@ -132,10 +142,13 @@ bash scripts/verify_release_page.sh v0.2.2 0.2.2
 
 Check by eye and by script:
 
-- exactly two assets, `opencraft-0.2.2-x86_64-unknown-linux-gnu.tar.gz` and
-  `opencraft-0.2.2-x86_64-pc-windows-msvc.zip`;
+- exactly three assets, `opencraft-<VERSION>-x86_64-unknown-linux-gnu.tar.gz`,
+  `opencraft-<VERSION>-x86_64-pc-windows-msvc.zip` and
+  `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` (releases published
+  before D290, including v0.2.2, carry only the two portable archives; verify
+  those with the verifier from that tag);
 - the release body is the contents of `docs/RELEASE-NOTES-0.2.2.md`;
-- `verify_release_page.sh` finds the archive names, `SmartScreen`, and
+- `verify_release_page.sh` finds the three asset names, `SmartScreen`, and
   `version 9` in the published body;
 - on Linux, extract the tarball and run `./opencraft --demo-ui` headlessly: it
   must print the `ui_demo:` digest lines and exit before opening a window.
@@ -189,5 +202,16 @@ After re-tagging, repeat section 7.
   before any packaging.
 - **Missing `docs/RELEASE-NOTES-<VERSION>.md`:** the release-notes step fails
   the run; no release is created.
+- **ISCC.exe missing or older than 6.3:** the Windows job's
+  `scripts/build_windows_installer.sh` installs Inno Setup via Chocolatey and
+  fails when `ISCC.exe` is still absent; `ArchitecturesAllowed=x64compatible`
+  is rejected by Inno Setup older than 6.3.
+- **Windows exe still imports `VCRUNTIME140.dll`:** the release build lost its
+  `RUSTFLAGS: -C target-feature=+crt-static` matrix entry (D290), so
+  `verify_release_artifacts.sh` rejects the zip before publishing.
+- **A Windows dependency refuses the static CRT:** if the link fails, restore a
+  dynamic-CRT build and chain `VC_redist.x64.exe` from the installer's `[Run]`
+  section instead; replace the verifier's `VCRUNTIME140.dll` rejection with a
+  redistributable presence check in the same change.
 - **Pushing a tag on a red commit:** package jobs fail, publish is skipped, and
   the tag stays behind until it is deleted in section 9.
