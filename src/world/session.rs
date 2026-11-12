@@ -1,10 +1,13 @@
 //! The replaceable active world session: the CPU-side world state
 //! (`WorldManager` + `Player` + `Camera`) plus the save path every save
 //! site writes to. Holding the camera inside the session lets the swap
-//! atomically replace view state too. This module is pure lib code — no
-//! I/O, no winit/wgpu — so the session-boundary contracts are unit-testable
-//! without a window or GPU (D008 layering: S03-T02 wires this into
-//! GameApp the way S01's lifecycle contracts were wired in S02).
+//! atomically replace view state too. No winit/wgpu here, so the
+//! session-boundary contracts are unit-testable without a window or GPU (D008
+//! layering: S03-T02 wires this into GameApp the way S01's lifecycle contracts
+//! were wired in S02). The module also owns the session's save writer:
+//! [`WorldSession::save`] is the one synchronous v9 write implementation every
+//! explicit save site goes through, and the session-owned [`AutosaveWorker`]
+//! calls that same writer off the frame thread (D268 single-writer rule).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +34,7 @@ use crate::player::survival::{
 use crate::world::arrow::{
     arrow_hit_damage, segment_aabb, Arrow, ArrowOwner, ArrowState, ARROW_CAP,
 };
+use crate::world::autosave::AutosaveWorker;
 use crate::world::block::BlockId;
 use crate::world::chunk::{world_to_chunk_and_local, ChunkPos};
 use crate::world::daycycle::GameClock;
@@ -41,7 +45,8 @@ use crate::world::mob::{Mob, MobHit, MobKind, MobRuntime, MobShot, MobTick};
 use crate::world::mob_ai::{MobAttack, MobTarget};
 use crate::world::mob_loot::{drop_roll, mob_drops, MobDropReport, MobKillCause};
 use crate::world::persistence::{
-    ChestMap, ChunkEditMap, LoadedWorld, SavedMob, SavedPlayerState, WorldSaveData,
+    save_world_to_path_with_config, ChestMap, ChunkEditMap, LoadedWorld, PersistenceError,
+    SavedMob, SavedPlayerState, WorldSaveData,
 };
 use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
@@ -163,6 +168,11 @@ pub struct WorldSession {
     /// Edit Background applies Creative rules to the live player while the
     /// world's stored mode must survive the next save unchanged.
     pub save_mode: GameMode,
+    /// Frame-thread-owned handle to the single off-thread autosave worker.
+    /// Only this session dispatches and reaps it, so the join handle's
+    /// presence is the in-flight flag (D268's autosave equivalent). A
+    /// synchronous [`WorldSession::save`] always joins it before writing.
+    autosave: AutosaveWorker,
     /// Persisted chest contents keyed by absolute block position. Cloned only
     /// at save time; the frame loop never iterates it.
     pub chests: ChestMap,
@@ -256,6 +266,12 @@ pub struct WorldSession {
     last_damage_cause: Option<DamageCause>,
 }
 
+/// The streaming-autosave condition (audit finding 5): a chunk actually
+/// unloaded and the world holds edits that no save has cleared.
+pub fn autosave_due(unloaded: &[ChunkPos], unsaved_changes: bool) -> bool {
+    !unloaded.is_empty() && unsaved_changes
+}
+
 impl WorldSession {
     /// A fresh world, exactly mirroring main()'s fresh-world branch:
     /// render distance 16, the given seed, the requested season length, day 0
@@ -324,6 +340,7 @@ impl WorldSession {
             clock: GameClock::new(),
             season_length_days,
             save_mode: mode,
+            autosave: AutosaveWorker::new(),
             chests: ChestMap::default(),
             save_path,
             registry,
@@ -411,6 +428,7 @@ impl WorldSession {
             // Edit Background is a Creative-rules editor; a stored world mode
             // only enters through `session_from_save`.
             save_mode: GameMode::Creative,
+            autosave: AutosaveWorker::new(),
             chests: ChestMap::default(),
             save_path,
             registry,
@@ -563,6 +581,7 @@ impl WorldSession {
             clock,
             season_length_days,
             save_mode: mode,
+            autosave: AutosaveWorker::new(),
             chests,
             save_path,
             registry,
@@ -1763,6 +1782,127 @@ impl WorldSession {
             mobs: self.mobs.iter().map(SavedMob::from).collect(),
             chunk_edits: self.world.chunk_edits().clone(),
         }
+    }
+
+    /// The single synchronous v9 writer: projection + atomic write, clearing
+    /// the unsaved flag only after the write succeeds.
+    ///
+    /// An in-flight autosave is joined and any coalesced request dropped
+    /// before the snapshot is taken, so an explicit F5/quit save can never be
+    /// followed by a stale worker overwriting newer data (D268). The write
+    /// still happens even when the world looks clean: F5 refreshes the player
+    /// position and clock.
+    pub fn save(&mut self) -> Result<(), PersistenceError> {
+        let _ = self.wait_autosave();
+        self.autosave.clear_pending();
+        let data = self.to_save_data();
+        let result = {
+            let _write_guard = self.autosave.acquire_write_lock();
+            save_world_to_path_with_config(
+                &self.save_path,
+                &data,
+                self.registry.as_ref(),
+                self.save_config(),
+            )
+        };
+        if result.is_ok() {
+            self.world.mark_saved();
+        }
+        result
+    }
+
+    /// Frame-thread autosave entry point.
+    ///
+    /// Keeps the S01 pure condition ([`autosave_due`]) separate from write
+    /// success (MEM741): `false` means either "not due" or "handed off". An
+    /// attempt that arrives while a worker is in flight is coalesced into the
+    /// single pending request and dispatched by [`Self::poll_autosave`] or
+    /// [`Self::wait_autosave`]. Returns whether a worker thread was spawned.
+    pub fn queue_autosave(&mut self, unloaded: &[ChunkPos]) -> bool {
+        if !autosave_due(unloaded, self.world.has_unsaved_changes()) {
+            return false;
+        }
+        if self.autosave.in_flight() {
+            self.autosave.request_pending();
+            return false;
+        }
+        self.dispatch_autosave_snapshot()
+    }
+
+    /// Project the session and hand the snapshot to the worker.
+    ///
+    /// The snapshot owns the edits, so clearing the dirty flag at dispatch is
+    /// correct: new edits re-dirty the world and a failed write is re-marked
+    /// on reap. Returns whether the thread was spawned.
+    fn dispatch_autosave_snapshot(&mut self) -> bool {
+        let data = self.to_save_data();
+        let path = self.save_path.clone();
+        let registry = Arc::clone(&self.registry);
+        let config = self.save_config;
+        match self.autosave.dispatch(data, path, registry, config) {
+            Ok(()) => {
+                self.world.mark_saved();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Non-blocking autosave poll: reap one finished worker, then dispatch a
+    /// coalesced follow-up when one was requested and the world is dirty.
+    ///
+    /// Returns `None` while no finished worker exists. A failed worker write
+    /// re-marks the world unsaved so the next opportunity retries.
+    pub fn poll_autosave(&mut self) -> Option<Result<(), PersistenceError>> {
+        let result = self.autosave.reap_finished();
+        if matches!(result, Some(Err(_))) {
+            self.world.mark_unsaved();
+        }
+        if self.autosave.take_pending() && self.world.has_unsaved_changes() {
+            let _ = self.dispatch_autosave_snapshot();
+        }
+        result
+    }
+
+    /// Blocking autosave drain: join the worker, re-mark on error, and
+    /// dispatch + join at most one coalesced follow-up when the world is
+    /// still dirty. Returns the last joined result.
+    pub fn wait_autosave(&mut self) -> Option<Result<(), PersistenceError>> {
+        let mut last = None;
+        while let Some(result) = self.autosave.wait() {
+            if result.is_err() {
+                self.world.mark_unsaved();
+            }
+            last = Some(result);
+            if self.autosave.take_pending() && self.world.has_unsaved_changes() {
+                if !self.dispatch_autosave_snapshot() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        last
+    }
+
+    /// Quit/F5 flush: drain the worker, drop any stale pending request, and
+    /// fall back to a synchronous [`Self::save`] when the world is still
+    /// dirty (a failed worker write).
+    pub fn flush_autosave(&mut self) {
+        let _ = self.wait_autosave();
+        self.autosave.clear_pending();
+        if self.world.has_unsaved_changes() {
+            let _ = self.save();
+        }
+    }
+
+    /// Synchronous streaming-autosave seam. Returns whether a save was
+    /// attempted and succeeded; `false` on empty unloads, a clean world, or a
+    /// failed write (the flag stays set for the next opportunity). Retained as
+    /// the synchronous test/fallback seam; the frame loop uses
+    /// [`Self::queue_autosave`].
+    pub fn autosave_after_unload(&mut self, unloaded: &[ChunkPos]) -> bool {
+        autosave_due(unloaded, self.world.has_unsaved_changes()) && self.save().is_ok()
     }
 
     /// The non-blocking note describing how this session's loaded config
@@ -6448,6 +6588,398 @@ mod tests {
         save_world_to_bytes(&mut resaved, &rebuilt).expect("restored mobs re-encode");
 
         assert_eq!(resaved, bytes, "restore then save is byte-identical");
+    }
+
+    #[test]
+    fn autosave_due_truth_table() {
+        let pos = ChunkPos::new(1, 2, 3);
+
+        assert!(!autosave_due(&[], true));
+        assert!(!autosave_due(&[], false));
+        assert!(!autosave_due(&[pos], false));
+        assert!(autosave_due(&[pos], true));
+    }
+
+    #[test]
+    fn autosave_after_unload_saves_once_and_clears_the_flag() {
+        use crate::world::persistence::load_world_from_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4242u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let chunk_pos = ChunkPos::new(1, 2, 3);
+        let pos = IVec3::new(32 + 5, 2 * 32 + 5, 3 * 32 + 5);
+        assert_eq!(insert_generated_chunk(&mut session, pos), chunk_pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        assert!(session.world.has_unsaved_changes());
+
+        let first_saved_time = session.clock.time_of_day;
+        assert!(session.autosave_after_unload(&[chunk_pos]));
+        assert!(path.exists(), "the seam writes the save file");
+        assert!(!session.world.has_unsaved_changes(), "the flag is cleared");
+
+        let saved = load_world_from_path(&path).expect("saved world loads");
+        assert!(
+            saved.chunk_edits.contains_key(&chunk_pos),
+            "the edited chunk is persisted"
+        );
+
+        // The clock is not world state, so dirtying it alone must not trigger
+        // a second write: the reloaded time proves exactly one save.
+        session.clock.time_of_day = first_saved_time.wrapping_add(1234);
+        assert!(!session.autosave_after_unload(&[chunk_pos]));
+
+        let reloaded = load_world_from_path(&path).expect("saved world reloads");
+        assert_eq!(reloaded.time_of_day, first_saved_time, "exactly one write");
+    }
+
+    #[test]
+    fn autosave_after_unload_writes_nothing_for_an_empty_unload_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4243u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        assert!(session.world.has_unsaved_changes());
+
+        assert!(!session.autosave_after_unload(&[]));
+        assert!(!path.exists(), "no empty-unload save is written");
+        assert!(
+            session.world.has_unsaved_changes(),
+            "the edits are still unsaved"
+        );
+    }
+
+    #[test]
+    fn autosave_after_unload_keeps_the_flag_when_the_write_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let mut session = WorldSession::new_session(4244u32, blocker, DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        // A regular file as the parent makes `create_dir_all` fail without
+        // relying on chmod/permission bits.
+        session.save_path = session.save_path.join("world.mcvx");
+
+        assert!(!session.autosave_after_unload(&[chunk_pos]));
+        assert!(
+            session.world.has_unsaved_changes(),
+            "a failed write leaves the flag set for the next opportunity"
+        );
+        assert!(!session.save_path.exists());
+    }
+
+    #[test]
+    fn session_save_writes_the_unchanged_v9_bytes() {
+        use crate::world::persistence::save_world_to_bytes_with_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(4245u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        session.save().expect("session save writes");
+        let bytes = std::fs::read(&path).expect("save file readable");
+
+        let mut expected = Vec::new();
+        save_world_to_bytes_with_config(
+            &mut expected,
+            &session.to_save_data(),
+            session.registry.as_ref(),
+            session.save_config(),
+        )
+        .expect("expected bytes encode");
+
+        assert_eq!(
+            bytes, expected,
+            "session save writes the v9 bytes unchanged"
+        );
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes());
+    }
+
+    #[test]
+    fn worker_autosave_is_byte_identical_to_session_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut source = WorldSession::new_session(
+            5001u32,
+            dir.path().join("source.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut source, pos);
+        source
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        let data = source.to_save_data();
+
+        let sync_path = dir.path().join("sync.mcvx");
+        let async_path = dir.path().join("async.mcvx");
+        let mut sync_session = WorldSession::session_from_save(data.clone(), sync_path.clone());
+        let mut async_session = WorldSession::session_from_save(data, async_path.clone());
+
+        sync_session.save().expect("synchronous save writes");
+        async_session.world.mark_unsaved();
+        assert!(
+            async_session.queue_autosave(&[chunk_pos]),
+            "a dirty world dispatches the worker"
+        );
+        assert!(
+            matches!(async_session.wait_autosave(), Some(Ok(()))),
+            "worker save succeeds"
+        );
+
+        let sync_bytes = std::fs::read(&sync_path).expect("sync save readable");
+        let async_bytes = std::fs::read(&async_path).expect("async save readable");
+        assert_eq!(
+            async_bytes, sync_bytes,
+            "R064: the worker writes exactly the session save's bytes"
+        );
+        assert_eq!(&async_bytes[4..8], &9u32.to_le_bytes());
+    }
+
+    #[test]
+    fn queue_autosave_ignores_empty_unloads_and_a_clean_world() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(5002u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        assert!(session.world.has_unsaved_changes());
+
+        assert!(!session.queue_autosave(&[]), "no unload means no save");
+        assert!(!path.exists());
+        assert!(!session.autosave.in_flight());
+
+        session.world.mark_saved();
+        assert!(
+            !session.queue_autosave(&[chunk_pos]),
+            "a clean world is not saved"
+        );
+        assert!(!path.exists());
+        assert!(!session.autosave.in_flight());
+    }
+
+    #[test]
+    fn queue_autosave_keeps_the_flag_when_the_worker_write_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let mut session = WorldSession::new_session(5003u32, blocker, DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+        // A regular file as the parent makes `create_dir_all` fail without
+        // relying on chmod/permission bits.
+        session.save_path = session.save_path.join("world.mcvx");
+
+        assert!(session.queue_autosave(&[chunk_pos]), "the worker spawns");
+        assert!(
+            matches!(session.wait_autosave(), Some(Err(PersistenceError::Io(_)))),
+            "the failed write is reported on reap"
+        );
+        assert!(
+            session.world.has_unsaved_changes(),
+            "a failed worker write re-marks the world unsaved"
+        );
+        assert!(!session.save_path.exists());
+    }
+
+    #[test]
+    fn queue_autosave_coalesces_while_in_flight() {
+        use crate::world::persistence::load_world_from_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(5004u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos_a = IVec3::new(5, 69, 101);
+        let pos_b = IVec3::new(6, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos_a);
+
+        let lock = session.autosave.lock_for_test();
+        let guard = lock.lock().expect("test lock");
+
+        session
+            .world
+            .set_block_immediate(pos_a.x, pos_a.y, pos_a.z, BlockId::Stone);
+        assert!(
+            session.queue_autosave(&[chunk_pos]),
+            "the first save dispatches a worker"
+        );
+        assert!(session.autosave.in_flight());
+        assert!(
+            !session.world.has_unsaved_changes(),
+            "dispatch clears the flag because the snapshot owns the edits"
+        );
+
+        session
+            .world
+            .set_block_immediate(pos_b.x, pos_b.y, pos_b.z, BlockId::Dirt);
+        assert!(session.world.has_unsaved_changes());
+        assert!(
+            !session.queue_autosave(&[chunk_pos]),
+            "a request while in flight is coalesced"
+        );
+        assert!(
+            session.autosave.take_pending(),
+            "the coalesced request is recorded"
+        );
+        // Restore the request the peek consumed so the drain can dispatch it.
+        session.autosave.request_pending();
+
+        drop(guard);
+        assert!(
+            matches!(session.wait_autosave(), Some(Ok(()))),
+            "the coalesced follow-up save succeeds"
+        );
+        assert!(
+            !session.autosave.take_pending(),
+            "the drain consumed the pending request"
+        );
+
+        let reloaded = load_world_from_path(&path).expect("save reloads");
+        let edits = reloaded
+            .chunk_edits
+            .get(&chunk_pos)
+            .expect("the edited chunk persisted");
+        assert_eq!(edits.len(), 2, "both coalesced edits landed");
+        assert!(edits.values().any(|block| *block == BlockId::Stone));
+        assert!(edits.values().any(|block| *block == BlockId::Dirt));
+    }
+
+    #[test]
+    fn explicit_save_after_a_queued_autosave_writes_the_latest_snapshot() {
+        use crate::world::persistence::save_world_to_bytes_with_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(5005u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos_a = IVec3::new(5, 69, 101);
+        let pos_b = IVec3::new(6, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos_a);
+
+        let lock = session.autosave.lock_for_test();
+        let guard = lock.lock().expect("test lock");
+        session
+            .world
+            .set_block_immediate(pos_a.x, pos_a.y, pos_a.z, BlockId::Stone);
+        assert!(
+            session.queue_autosave(&[chunk_pos]),
+            "the autosave worker is in flight"
+        );
+        // The worker snapshot predates this edit, so only join-before-write
+        // ordering can make the explicit save the final file.
+        session
+            .world
+            .set_block_immediate(pos_b.x, pos_b.y, pos_b.z, BlockId::Dirt);
+        drop(guard);
+
+        session.save().expect("explicit save joins then writes");
+
+        let bytes = std::fs::read(&path).expect("save readable");
+        let mut expected = Vec::new();
+        save_world_to_bytes_with_config(
+            &mut expected,
+            &session.to_save_data(),
+            session.registry.as_ref(),
+            session.save_config(),
+        )
+        .expect("expected bytes encode");
+        assert_eq!(
+            bytes, expected,
+            "no stale in-flight autosave overwrote the explicit save"
+        );
+        assert!(!session.world.has_unsaved_changes());
+        assert!(!session.autosave.in_flight());
+    }
+
+    #[test]
+    fn poll_autosave_is_non_blocking_while_the_worker_is_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(5006u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        let lock = session.autosave.lock_for_test();
+        let guard = lock.lock().expect("test lock");
+        assert!(session.queue_autosave(&[chunk_pos]), "the worker spawns");
+        assert!(
+            session.poll_autosave().is_none(),
+            "poll returns immediately while the worker is in flight"
+        );
+        drop(guard);
+
+        let mut reaped = None;
+        for _ in 0..2_000 {
+            if let Some(result) = session.poll_autosave() {
+                reaped = Some(result);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            matches!(reaped, Some(Ok(()))),
+            "a finished worker is reaped as Ok"
+        );
+        assert!(!session.autosave.in_flight());
+        assert!(!session.world.has_unsaved_changes());
+    }
+
+    #[test]
+    fn flush_autosave_drains_a_queued_save_and_leaves_the_world_clean() {
+        use crate::world::persistence::load_world_from_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("world.mcvx");
+        let mut session =
+            WorldSession::new_session(5007u32, path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
+        let pos = IVec3::new(5, 69, 101);
+        let chunk_pos = insert_generated_chunk(&mut session, pos);
+        session
+            .world
+            .set_block_immediate(pos.x, pos.y, pos.z, BlockId::Stone);
+
+        assert!(session.queue_autosave(&[chunk_pos]), "the worker spawns");
+        session.flush_autosave();
+
+        assert!(
+            !session.world.has_unsaved_changes(),
+            "flush leaves the world clean"
+        );
+        assert!(path.exists(), "flush lands the save file");
+        assert!(!session.autosave.in_flight());
+        let reloaded = load_world_from_path(&path).expect("flush save reloads");
+        assert!(reloaded.chunk_edits.contains_key(&chunk_pos));
     }
 
     #[test]

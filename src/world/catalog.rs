@@ -84,8 +84,15 @@ pub enum WorldNameError {
     /// alphanumeric via `char::is_alphanumeric`). Everything else — path
     /// separators, `:` `*` `?` `"` `<` `>` `|`, control characters, dots,
     /// and other punctuation — is rejected so the name can be used directly
-    /// as a file stem on Windows, macOS, and Linux.
+    /// as a file stem on Windows, macOS, and Linux. The one exception to
+    /// "directly usable" is a Windows-reserved device stem, reported as
+    /// [`WorldNameError::ReservedStem`] instead.
     InvalidCharacter { ch: char, index: usize },
+    /// The trimmed name, after Windows folder trimming (trailing spaces and
+    /// dots), is a Windows-reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+    /// `COM1`-`COM9`, `LPT1`-`LPT9`, case-insensitively). Such a stem cannot
+    /// be used as a file name on Windows: it resolves to the device instead.
+    ReservedStem { name: String },
 }
 
 impl core::fmt::Display for WorldNameError {
@@ -102,8 +109,29 @@ impl core::fmt::Display for WorldNameError {
                     "Character {ch:?} at position {index} is not allowed in a world name."
                 )
             }
+            WorldNameError::ReservedStem { name } => {
+                write!(f, "World name \"{name}\" is reserved by Windows.")
+            }
         }
     }
+}
+
+/// Return the Windows-folder-trimmed stem when `name` is a Windows-reserved
+/// device name, or `None` when it is usable as a file stem.
+///
+/// Windows ignores trailing spaces and dots in folder names, so `CON `,
+/// `CON.` and `CON .` all resolve to the `CON` device. Matching is
+/// ASCII-case-insensitive and works on bytes so Unicode input can never hit
+/// a non-char-boundary slice panic.
+fn reserved_windows_stem(name: &str) -> Option<&str> {
+    let stem = name.trim_end_matches([' ', '.']);
+    let upper = stem.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(bytes[3], b'1'..=b'9'));
+    reserved.then_some(stem)
 }
 
 /// Check whether a single character is filename-safe for a world name.
@@ -124,6 +152,13 @@ pub fn validate_world_name(name: &str) -> Result<String, WorldNameError> {
     let len = trimmed.chars().count();
     if len > MAX_WORLD_NAME_LEN {
         return Err(WorldNameError::TooLong { len });
+    }
+    // Reserved stems are checked before the character rules: `CON.` and
+    // `CON ` are reserved even though `.` is otherwise an invalid character.
+    if let Some(stem) = reserved_windows_stem(trimmed) {
+        return Err(WorldNameError::ReservedStem {
+            name: stem.to_owned(),
+        });
     }
     for (index, ch) in trimmed.char_indices() {
         if !is_valid_name_char(ch) {
@@ -156,18 +191,22 @@ pub fn world_file_name(name: &str) -> String {
 pub enum RowProblem {
     /// The file stem is not a valid world name.
     InvalidName,
-    /// The file could not be read (permissions, locked, vanished).
+    /// The file could not be read (permissions, locked, vanished, or not a
+    /// regular file).
     Unreadable,
     /// The file was read but rejected by the save loader.
-    /// (Magic/version/binary errors are represented by the wrapped
-    /// persistence error kind.)
+    /// (Magic/version/size errors are represented by the wrapped
+    /// persistence error kind.) Listing probes only the header, so this
+    /// means the save identity or magic+version header is invalid.
     InvalidFormat,
 }
 
 /// Load state of one catalog entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowStatus {
-    /// Identity fully derived and loadable.
+    /// Identity fully derived and the save's magic+version header is valid.
+    /// Not a promise that the body decodes: Play still performs the full
+    /// load and can surface a typed load error for a body-corrupt file.
     Loadable,
     /// The entry is listed but cannot be loaded or loaded-safely identified.
     Corrupt(RowProblem),
@@ -428,6 +467,69 @@ mod tests {
         assert!(WorldNameError::InvalidCharacter { ch: '/', index: 3 }
             .to_string()
             .contains('/'));
+    }
+
+    #[test]
+    fn reserved_windows_device_stems_are_typed_errors() {
+        // All twelve reserved stems, plus mixed case, are rejected.
+        let mut reserved: Vec<String> =
+            vec!["CON".into(), "PRN".into(), "AUX".into(), "NUL".into()];
+        for n in 1..=9 {
+            reserved.push(format!("COM{n}"));
+            reserved.push(format!("LPT{n}"));
+        }
+        for name in &reserved {
+            assert_eq!(
+                validate_world_name(name),
+                Err(WorldNameError::ReservedStem { name: name.clone() }),
+                "{name} must be reserved"
+            );
+        }
+        for (name, folded) in [("nul", "nul"), ("Com1", "Com1"), ("lpt9", "lpt9")] {
+            assert_eq!(
+                validate_world_name(name),
+                Err(WorldNameError::ReservedStem {
+                    name: folded.into()
+                }),
+                "{name} must be reserved case-insensitively"
+            );
+        }
+
+        // Trailing dots and spaces are folded away by Windows, so the payload
+        // is the trimmed stem, not the raw input.
+        for name in ["CON ", "CON.", "CON ."] {
+            assert_eq!(
+                validate_world_name(name),
+                Err(WorldNameError::ReservedStem { name: "CON".into() }),
+                "{name:?} must fold to CON"
+            );
+        }
+
+        assert_eq!(
+            WorldNameError::ReservedStem { name: "CON".into() }.to_string(),
+            "World name \"CON\" is reserved by Windows."
+        );
+    }
+
+    #[test]
+    fn reserved_stem_matching_does_not_overreach() {
+        for name in [
+            "CONSOLE",
+            "NULA",
+            "COM10",
+            "COM0",
+            "LPT0",
+            "LPT10",
+            "CON-WORLD",
+            "MY CON",
+            "CON_1",
+        ] {
+            assert_eq!(
+                validate_world_name(name),
+                Ok(name.to_owned()),
+                "{name} is a legal world name"
+            );
+        }
     }
 
     // --- ordering ----------------------------------------------------------

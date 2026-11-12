@@ -492,10 +492,11 @@ whatever = true
             "zeta".to_string(),
         ];
         #[cfg(unix)]
-        {
-            expected.push("link-to-dir".to_string());
-            expected.sort();
-        }
+        expected.push("link-to-dir".to_string());
+        // Sort unconditionally: on Windows this is a no-op on the three names
+        // above, and it keeps `expected` mutable on every platform so the
+        // zero-suppression clippy gate does not trip `unused_mut`.
+        expected.sort();
 
         assert_eq!(available_pack_names(root.path()), expected);
     }
@@ -665,6 +666,29 @@ whatever = true
         // falls back silently.
         assert_eq!(pack.layers[17], procedural[17]);
         assert_eq!(pack.layers[24], procedural[24]);
+    }
+
+    #[test]
+    fn oversized_ihdr_layer_warns_and_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "hostile");
+        read_pack_toml(&dir, "name = \"Hostile\"\n");
+        fs::write(
+            dir.join(LAYER_FILES[3]),
+            decode::png_bomb_bytes(30000, 30000),
+        )
+        .unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        assert_procedural_layer(&pack, &procedural, 3);
+        assert_eq!(warning_fields(&pack), vec![LAYER_FILES[3]]);
+        assert!(
+            pack.warnings[0].reason.contains("30000x30000"),
+            "reason should report the IHDR size: {}",
+            pack.warnings[0].reason
+        );
     }
 
     #[test]

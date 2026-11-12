@@ -639,14 +639,6 @@ impl NewGameScreen {
         self.mode
     }
 
-    /// The currently focused field, by reference.
-    pub fn focused_input(&self) -> &TextInput {
-        match self.focus {
-            FocusField::Name => &self.name,
-            FocusField::Seed => &self.seed,
-        }
-    }
-
     /// The currently focused field, mutably — the event loop routes
     /// printable-character and editing events here.
     pub fn focused_input_mut(&mut self) -> &mut TextInput {
@@ -1677,6 +1669,22 @@ mod tests {
                 WorldNameError::InvalidCharacter { ch: '/', index: 3 }
             ))
         );
+        // ReservedStem: the payload is the Windows-folder-folded stem as
+        // typed, so `CON ` reports `CON`.
+        for (input, stem) in [
+            ("NUL", "NUL"),
+            ("com1", "com1"),
+            ("CON ", "CON"),
+            ("LPT9", "LPT9"),
+        ] {
+            assert_eq!(
+                validate_create(input, &rows),
+                Err(NewGameFormError::InvalidName(
+                    WorldNameError::ReservedStem { name: stem.into() }
+                )),
+                "{input:?} must be a typed reserved-stem error"
+            );
+        }
     }
 
     #[test]
@@ -1712,6 +1720,12 @@ mod tests {
         let bad_char =
             NewGameFormError::InvalidName(WorldNameError::InvalidCharacter { ch: '/', index: 3 });
         assert!(bad_char.to_string().contains('/'), "names the character");
+        let reserved =
+            NewGameFormError::InvalidName(WorldNameError::ReservedStem { name: "CON".into() });
+        assert_eq!(
+            reserved.to_string(),
+            "World name \"CON\" is reserved by Windows."
+        );
     }
 
     // --- load screen state ---

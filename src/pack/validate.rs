@@ -478,4 +478,65 @@ apple = "missing.png"
             "{text}"
         );
     }
+
+    #[test]
+    fn oversized_manifest_warns_but_exits_ok() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "huge");
+        fs::write(
+            dir.join("pack.toml"),
+            vec![b' '; crate::pack::asset::PACK_ASSET_BYTE_CAP as usize + 1],
+        )
+        .unwrap();
+
+        let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "huge");
+        let text = lines_joined(&lines);
+        assert!(ok, "an oversized manifest must not fail validation: {text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("warning: pack.toml:")),
+            "the manifest fallback is explained: {text}"
+        );
+        assert!(!text.contains("error:"), "{text}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("validate-pack: huge: 0 entries, 0 errors, 1 warnings"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn truncated_asset_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "broken");
+        write_manifest(
+            &dir,
+            r#"
+format_version = 2
+
+[[blocks]]
+id = "broken:truncated"
+textures = { all = "broken.png" }
+hardness = 1.0
+"#,
+        );
+        write_png(&dir.join("broken.png"), 16);
+        let bytes = fs::read(dir.join("broken.png")).unwrap();
+        fs::write(dir.join("broken.png"), &bytes[..bytes.len() / 2]).unwrap();
+
+        let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "broken");
+        let text = lines_joined(&lines);
+        assert!(!ok, "a truncated asset must fail validation: {text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("error: asset broken.png")),
+            "the bad asset is named: {text}"
+        );
+        assert!(
+            !text.contains("ok: block broken:truncated"),
+            "the rejected entry must not also claim success: {text}"
+        );
+    }
 }

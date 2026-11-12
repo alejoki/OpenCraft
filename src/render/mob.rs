@@ -2,26 +2,30 @@
 //!
 //! This module is deliberately split into two layers:
 //!
-//! 1. [`build_mob_vertices`] is a pure model-space builder. It needs no world,
-//!    no GPU, and no session: feet sit at `y = 0` and yaw 0 faces `+Z`
-//!    (matching [`crate::world::mob`]'s yaw convention).
-//! 2. [`build_mob_batch`] is a thin scene assembler that residency-gates,
+//! 1. [`build_mob_vertices_into`] is a pure model-space builder that appends
+//!    to a caller-owned buffer. It needs no world, no GPU, and no session:
+//!    feet sit at `y = 0` and yaw 0 faces `+Z` (matching
+//!    [`crate::world::mob`]'s yaw convention). [`build_mob_vertices`] is the
+//!    allocating convenience wrapper for tests and the demo seam.
+//! 2. [`build_mob_batch_into`] is a thin scene assembler that residency-gates,
 //!    frustum-culls, lights, and transforms those model vertices into world
-//!    space.
+//!    space straight into one reused buffer, so a steady frame allocates
+//!    nothing. [`build_mob_batch`] is its allocating convenience wrapper.
 //!
 //! Every mob is exactly six axis-aligned cuboids (body, head, and four limbs)
 //! emitted as `6 parts x 6 faces x 2 triangles x 3 vertices = 216` vertices.
 //! The sub-block part sizes are the reason [`crate::mesh::quad::PackedQuad`]
 //! cannot represent a mob: that format only stores integer chunk-local block
-//! coordinates. [`build_mob_vertices`] and [`build_mob_batch`] stay pure CPU
-//! data so the model contract remains headlessly testable; the wgpu-facing
-//! [`create_mob_pipeline`] factory below only translates that contract into a
-//! pipeline descriptor (one camera bind group, no per-mob state).
+//! coordinates. [`build_mob_vertices_into`] and [`build_mob_batch_into`] stay
+//! pure CPU data so the model contract remains headlessly testable; the
+//! wgpu-facing [`create_mob_pipeline`] factory below only translates that
+//! contract into a pipeline descriptor (one camera bind group, no per-mob
+//! state).
 //!
-//! Arrows share that one batch: [`build_arrow_vertices`] is the pure
+//! Arrows share that one batch: [`build_arrow_vertices_into`] appends the pure
 //! model-space arrow box (36 vertices, long axis `+Z`, already-authored layer
-//! [`crate::render::texture::MOB_ARROW_TEX_LAYER`]) and [`build_mob_batch`]
-//! appends one oriented copy per visible projectile. The shader, vertex
+//! [`crate::render::texture::MOB_ARROW_TEX_LAYER`]) and [`build_mob_batch_into`]
+//! appends and orients one copy per visible projectile. The shader, vertex
 //! layout, stride and texture layers 0..=43 are untouched, so a projectile
 //! costs vertices in the existing draw call, never a second pipeline or
 //! `rpass.draw`.
@@ -494,10 +498,13 @@ fn rotate_x_about(point: Vec3, pivot: Vec3, angle: f32) -> Vec3 {
     pivot + Vec3::new(rel.x, rel.y * cos - rel.z * sin, rel.y * sin + rel.z * cos)
 }
 
-/// Build one mob's model-space vertices.
+/// Append one mob's model-space vertices to `out`.
 ///
-/// Model space: feet at `y = 0`, yaw 0 faces `+Z`. The result is always
-/// exactly [`MOB_VERTS_PER_MOB`] vertices in six fixed 36-vertex part blocks.
+/// Model space: feet at `y = 0`, yaw 0 faces `+Z`. Every call appends exactly
+/// [`MOB_VERTS_PER_MOB`] vertices in six fixed 36-vertex part blocks and never
+/// allocates beyond growing the caller-provided buffer, so the per-frame path
+/// ([`build_mob_batch_into`]) can reuse one vector forever.
+///
 /// Non-finite inputs are sanitised to their neutral value so a malformed
 /// caller can never poison the vertex buffer with NaNs.
 ///
@@ -505,7 +512,14 @@ fn rotate_x_about(point: Vec3, pivot: Vec3, angle: f32) -> Vec3 {
 /// `death` (0..=1) squashes the model toward its feet, adds a forward lean,
 /// and clamps every final `y` to `>= 0`, so `death = 1.0` leaves a collapsed
 /// silhouette.
-pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -> Vec<MobVertex> {
+pub fn build_mob_vertices_into(
+    out: &mut Vec<MobVertex>,
+    kind: MobKind,
+    anim: MobAnim,
+    hurt: f32,
+    death: f32,
+) {
+    let start = out.len();
     let light = finite_or(anim.light, 0.0).clamp(0.0, 1.0);
     let shade_mul = 0.35 + 0.65 * light;
     let flash = finite_or(hurt, 0.0).clamp(0.0, 1.0);
@@ -522,7 +536,6 @@ pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -
 
     let layers = mob_texture_layers(kind);
     let parts = kind_parts(kind);
-    let mut out = Vec::with_capacity(MOB_VERTS_PER_MOB);
 
     for part in parts {
         let tex_layer = match part.tex {
@@ -569,7 +582,17 @@ pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -
         }
     }
 
-    debug_assert_eq!(out.len(), MOB_VERTS_PER_MOB);
+    debug_assert_eq!(out.len() - start, MOB_VERTS_PER_MOB);
+}
+
+/// Build one mob's model-space vertices into a fresh vector.
+///
+/// Allocating convenience wrapper around [`build_mob_vertices_into`], kept for
+/// the tests and the `--demo-combat` walk verdict. The frame path uses the
+/// `_into` form with a reused buffer.
+pub fn build_mob_vertices(kind: MobKind, anim: MobAnim, hurt: f32, death: f32) -> Vec<MobVertex> {
+    let mut out = Vec::with_capacity(MOB_VERTS_PER_MOB);
+    build_mob_vertices_into(&mut out, kind, anim, hurt, death);
     out
 }
 
@@ -589,20 +612,23 @@ const ARROW_HALF_THICK: f32 = 0.03;
 ///
 /// Model space: a single axis-aligned cuboid **centred on the origin** whose
 /// long axis is `+Z` and whose cross-section is `x`/`y`. Centring matters:
-/// [`build_mob_batch`] rotates about the midpoint, so offsetting the box would
-/// swing it in an arc instead of aiming it along the velocity.
+/// [`build_mob_batch_into`] rotates about the midpoint, so offsetting the box
+/// would swing it in an arc instead of aiming it along the velocity.
 ///
 /// Every vertex uses [`MOB_ARROW_TEX_LAYER`] (already authored on the block
 /// texture array) and `flash = 0.0`. `light` is baked into `shade` with the
-/// exact same face-shading constants as [`build_mob_vertices`], so arrows and
-/// mobs respond identically to world light. Non-finite light is sanitised to
-/// `0.0` and clamped to `0..=1`.
-pub fn build_arrow_vertices(light: f32) -> Vec<MobVertex> {
+/// exact same face-shading constants as [`build_mob_vertices_into`], so arrows
+/// and mobs respond identically to world light. Non-finite light is sanitised
+/// to `0.0` and clamped to `0..=1`.
+///
+/// Appends exactly [`ARROW_VERTS`] vertices and allocates nothing beyond the
+/// caller-provided buffer.
+pub fn build_arrow_vertices_into(out: &mut Vec<MobVertex>, light: f32) {
+    let start = out.len();
     let light = finite_or(light, 0.0).clamp(0.0, 1.0);
     let shade_mul = 0.35 + 0.65 * light;
     let min = Vec3::new(-ARROW_HALF_THICK, -ARROW_HALF_THICK, -ARROW_HALF_LEN);
     let max = Vec3::new(ARROW_HALF_THICK, ARROW_HALF_THICK, ARROW_HALF_LEN);
-    let mut out = Vec::with_capacity(ARROW_VERTS);
 
     for face in &FACES {
         let shade = face.shade * shade_mul;
@@ -623,8 +649,29 @@ pub fn build_arrow_vertices(light: f32) -> Vec<MobVertex> {
         }
     }
 
-    debug_assert_eq!(out.len(), ARROW_VERTS);
+    debug_assert_eq!(out.len() - start, ARROW_VERTS);
+}
+
+/// Build the model-space vertices of one arrow into a fresh vector.
+///
+/// Allocating convenience wrapper around [`build_arrow_vertices_into`], kept
+/// for the tests. The frame path uses the `_into` form with a reused buffer.
+pub fn build_arrow_vertices(light: f32) -> Vec<MobVertex> {
+    let mut out = Vec::with_capacity(ARROW_VERTS);
+    build_arrow_vertices_into(&mut out, light);
     out
+}
+
+/// Rotate every vertex by `rotation` about the model origin, then translate it
+/// by `position`.
+///
+/// Single-sources the rotate-then-translate order shared by mobs and arrows: a
+/// rotation about the model centre followed by a translation, never the
+/// reverse, so an arrow swings about its midpoint instead of orbiting it.
+fn transform_vertices(vertices: &mut [MobVertex], rotation: Quat, position: Vec3) {
+    for vertex in vertices {
+        vertex.position = (rotation * Vec3::from(vertex.position) + position).to_array();
+    }
 }
 
 /// Orientation for a projectile moving along `velocity`.
@@ -652,23 +699,23 @@ fn arrow_orientation(velocity: Vec3) -> Quat {
 
 /// Places `model` arrow vertices into world space and appends them to `out`.
 ///
-/// Shared by [`build_mob_batch`] and the geometry tests so both exercise the
-/// same rotate-then-translate order.
+/// Test-only: [`build_mob_batch_into`] now appends the arrow model straight
+/// into the batch and transforms the appended slice, so this helper survives
+/// only for the geometry tests' expected values.
+#[cfg(test)]
 fn place_arrow_vertices(
     out: &mut Vec<MobVertex>,
     model: &[MobVertex],
     rotation: Quat,
     position: Vec3,
 ) {
-    for vertex in model {
-        let mut world = *vertex;
-        world.position = (rotation * Vec3::from(vertex.position) + position).to_array();
-        out.push(world);
-    }
+    let start = out.len();
+    out.extend_from_slice(model);
+    transform_vertices(&mut out[start..], rotation, position);
 }
 
-/// Build the world-space vertex batch for every visible mob **and arrow** in
-/// `session`.
+/// Append the world-space vertex batch for every visible mob **and arrow** in
+/// `session` to `out`.
 ///
 /// A mob is included only when its feet chunk is resident and its AABB
 /// intersects the camera frustum. A dying mob is still included (it remains a
@@ -685,14 +732,25 @@ fn place_arrow_vertices(
 /// velocity via [`arrow_orientation`] and translated to its centre (embedded
 /// arrows keep their impact velocity and rest position).
 ///
+/// `out` is cleared first and then grown in place: the only storage is the
+/// caller-provided buffer; a steady frame allocates nothing. No `reserve` is
+/// derived from `session.mobs().len()` — a decoded v9 save may hold up to
+/// `MAX_SAVED_MOBS = 16_384` non-resident records, and reserving a mob's worth
+/// of vertices for each would be ~113 MB for a frame drawing a handful. Push
+/// growth stabilises on the first frame and is retained thereafter.
+///
 /// Everything lands in one output vector, so the renderer still uploads one
 /// buffer and issues the existing single `rpass.draw(0..mob_vertices.len())`:
 /// no pipeline, uniform, stride or texture-layer change is involved. This is
-/// intentionally pure: no wgpu calls and no allocations beyond the returned
-/// output vector.
-pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> Vec<MobVertex> {
+/// intentionally pure: no wgpu calls.
+pub fn build_mob_batch_into(
+    out: &mut Vec<MobVertex>,
+    session: &WorldSession,
+    camera: &Camera,
+    aspect: f32,
+) {
     let frustum = Frustum::from_view_proj(&camera.view_proj(aspect));
-    let mut out = Vec::new();
+    out.clear();
 
     for mob in session.mobs() {
         if !mob.position.is_finite() || !mob.yaw.is_finite() {
@@ -721,11 +779,9 @@ pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> 
             light: light as f32 / 15.0,
         };
         let rotation = Quat::from_rotation_y(mob.yaw);
-        for vertex in build_mob_vertices(mob.kind, anim, mob.hurt, mob.death_progress()) {
-            let mut world = vertex;
-            world.position = (rotation * Vec3::from(vertex.position) + mob.position).to_array();
-            out.push(world);
-        }
+        let start = out.len();
+        build_mob_vertices_into(out, mob.kind, anim, mob.hurt, mob.death_progress());
+        transform_vertices(&mut out[start..], rotation, mob.position);
     }
 
     // Arrows: same gates as mobs, one 36-vertex box each. A zero or non-finite
@@ -749,14 +805,21 @@ pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> 
             arrow.position.z.floor() as i32,
         );
         let rotation = arrow_orientation(arrow.velocity);
-        place_arrow_vertices(
-            &mut out,
-            &build_arrow_vertices(light as f32 / 15.0),
-            rotation,
-            arrow.position,
-        );
+        let start = out.len();
+        build_arrow_vertices_into(out, light as f32 / 15.0);
+        transform_vertices(&mut out[start..], rotation, arrow.position);
     }
+}
 
+/// Build the world-space vertex batch for every visible mob **and arrow** in
+/// `session` into a fresh vector.
+///
+/// Allocating convenience wrapper around [`build_mob_batch_into`], kept for the
+/// tests and the `--demo-combat` seam. The frame path calls the `_into` form
+/// with the buffer it reuses across frames.
+pub fn build_mob_batch(session: &WorldSession, camera: &Camera, aspect: f32) -> Vec<MobVertex> {
+    let mut out = Vec::new();
+    build_mob_batch_into(&mut out, session, camera, aspect);
     out
 }
 
@@ -1496,5 +1559,57 @@ mod tests {
         assert!((min.y - 0.7).abs() < 1e-3 && (max.y - 1.3).abs() < 1e-3);
         assert!(max.z - min.z < 0.1, "downward heading is thin in Z");
         assert!(velocity.y < 0.0);
+    }
+
+    #[test]
+    fn build_mob_vertices_into_appends_and_matches_the_wrapper() {
+        let mut out = verts(MobKind::Pig);
+        assert_eq!(out.len(), MOB_VERTS_PER_MOB);
+
+        build_mob_vertices_into(&mut out, MobKind::Cow, rest_anim(), 0.0, 0.0);
+        assert_eq!(out.len(), 2 * MOB_VERTS_PER_MOB);
+        assert_eq!(
+            &out[MOB_VERTS_PER_MOB..],
+            verts(MobKind::Cow).as_slice(),
+            "the appended tail must equal the allocating wrapper's output"
+        );
+    }
+
+    #[test]
+    fn batch_into_matches_the_wrapper_and_reuses_capacity_across_frames() {
+        let eye = Vec3::new(0.5, 1.6, -3.0);
+        let mut session = session();
+        session
+            .world
+            .insert_chunk_for_test(ChunkPos::new(0, 0, 0), Chunk::new_uniform(BlockId::Air));
+        session
+            .mobs_mut()
+            .push(Mob::new(MobKind::Pig, Vec3::new(0.5, 0.0, 0.5), 0.0));
+        spawn_arrow(
+            &mut session,
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+        );
+        let camera = camera_looking_at_plus_z(eye);
+
+        // Prefill with junk: `build_mob_batch_into` must clear it first.
+        let mut out = verts(MobKind::Cow);
+        build_mob_batch_into(&mut out, &session, &camera, 16.0 / 9.0);
+        let expected = build_mob_batch(&session, &camera, 16.0 / 9.0);
+        assert_eq!(out, expected, "the into-form must match the wrapper");
+        assert_eq!(out.len(), MOB_VERTS_PER_MOB + ARROW_VERTS);
+
+        let capacity = out.capacity();
+        build_mob_batch_into(&mut out, &session, &camera, 16.0 / 9.0);
+        assert_eq!(
+            out, expected,
+            "a second frame must yield identical vertices"
+        );
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "a steady frame must not grow the reused buffer"
+        );
     }
 }

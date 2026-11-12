@@ -228,7 +228,7 @@ pub fn load_content_assets(
             break;
         }
 
-        let decoded = match decode::decode_png_rgba_bytes(&bytes, &relative) {
+        let decoded = match decode::decode_png_rgba_bytes(&bytes, &relative, Some(MAX_LAYER_SIDE)) {
             Ok(decoded) => decoded,
             Err(reason) => {
                 err(diagnostics, format!("asset {relative}"), reason);
@@ -2605,6 +2605,31 @@ icon = "huge.bin"
         let (spec, diagnostics) = load_assets(text, &dir);
         assert!(spec.assets.is_empty());
         assert_has_reason(&diagnostics, "per-file limit");
+    }
+
+    #[test]
+    fn oversized_ihdr_asset_is_diagnosed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+        fs::write(dir.join("huge.png"), decode::png_bomb_bytes(30000, 30000)).unwrap();
+
+        let text = r#"
+[[blocks]]
+id = "mymod:huge"
+textures = { all = "huge.png" }
+hardness = 1.0
+"#;
+        let (spec, diagnostics) = load_assets(text, &dir);
+        assert!(spec.assets.is_empty());
+        assert_eq!(entries(&diagnostics), vec!["asset huge.png"]);
+        assert!(
+            diagnostics[0].reason.contains("30000x30000"),
+            "diagnostic should report the IHDR size: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].reason.contains("256"),
+            "diagnostic should mention the limit: {diagnostics:?}"
+        );
     }
 
     #[test]

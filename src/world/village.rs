@@ -829,11 +829,6 @@ impl VillageCatalog {
         })
     }
 
-    /// Whether the cell passes the full site gate.
-    pub fn cell_is_candidate(&self, cell: VillageCell, seed: u32) -> bool {
-        self.site(cell, seed).is_some()
-    }
-
     /// Conservative per-chunk gate: a site exists and the chunk's x/z span
     /// intersects the anchor's `VILLAGE_MAX_RADIUS` box.
     ///

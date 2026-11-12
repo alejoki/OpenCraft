@@ -7,12 +7,17 @@
 //!
 //! - **Listing** scans the saves directory for `*.mcvx` files, derives a
 //!   validated world identity from each file stem, reads the modified
-//!   timestamp, and probes the file through `load_world_from_path` so
-//!   `Loadable` rows are genuinely loadable while corrupt entries degrade
-//!   to typed per-row problems instead of disappearing.
+//!   timestamp, and probes the magic+version header through
+//!   `probe_world_at_path`. A `Loadable` row therefore means "identity valid
+//!   + header valid", not "body guaranteed to decode"; corrupt entries
+//!     degrade to typed per-row problems instead of disappearing, and Play
+//!     decodes fully so a body-corrupt file still fails closed with
+//!     [`CatalogLoadError::Load`].
 //! - **Saving** reuses `save_world_to_path` (atomic sibling-temp + rename)
 //!   unchanged; the adapter only resolves the validated target path.
-//! - **Loading** goes through `load_world_from_path` unchanged.
+//! - **Loading** goes through `load_world_from_path_with` unchanged; the
+//!   full decode (and its typed errors) stays on this path, never in the
+//!   listing probe.
 //! - **Deleting** accepts only a [`PendingDelete`] produced by the pure
 //!   [`crate::world::catalog::DeleteConfirmation::confirm`] call — the
 //!   adapter never decides on its own whether a delete may proceed.
@@ -31,7 +36,7 @@ use crate::world::catalog::{
     self, CatalogRow, PendingDelete, RowProblem, RowStatus, WorldNameError,
 };
 use crate::world::persistence::{
-    load_world_from_path, load_world_from_path_with, save_world_to_path, LoadedWorld,
+    load_world_from_path_with, probe_world_at_path, save_world_to_path, LoadedWorld,
     PersistenceError, WorldSaveData, DEFAULT_SAVE_PATH,
 };
 
@@ -149,6 +154,7 @@ fn row_problem_for(error: &PersistenceError) -> RowProblem {
             RowProblem::InvalidFormat
         }
         PersistenceError::Io(_) => RowProblem::Unreadable,
+        PersistenceError::NotRegularFile => RowProblem::Unreadable,
         _ => RowProblem::InvalidFormat,
     }
 }
@@ -176,10 +182,11 @@ fn modified_secs(path: &Path) -> Option<u64> {
 
 /// Build one catalog row from a `*.mcvx` path.
 ///
-/// Probing loads the file through `load_world_from_path` so a `Loadable`
-/// row is guaranteed to actually load. Saves are small header + chunk-edit
-/// files, so this full-read probe at menu-open time is cheap; the load
-/// path itself reads the file again.
+/// Listing probes only the magic+version header through
+/// `probe_world_at_path`, so a `Loadable` row means "identity valid +
+/// header valid". The body is never decoded here: Play goes through
+/// `load_row_loaded`, which still decodes the whole save and surfaces a
+/// typed [`CatalogLoadError::Load`] when the body is corrupt.
 fn build_row(path: &Path) -> CatalogRow {
     let file_name = path
         .file_name()
@@ -192,7 +199,7 @@ fn build_row(path: &Path) -> CatalogRow {
     let modified_secs = modified_secs(path);
 
     match catalog::validate_world_name(&stem) {
-        Ok(name) => match load_world_from_path(path) {
+        Ok(name) => match probe_world_at_path(path) {
             Ok(_) => CatalogRow::loadable(name, file_name, modified_secs),
             Err(error) => {
                 CatalogRow::corrupt(name, file_name, modified_secs, row_problem_for(&error))
@@ -479,6 +486,51 @@ mod tests {
     }
 
     #[test]
+    fn reserved_windows_names_are_rejected_without_writing_any_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+
+        for name in ["NUL", "com1", "CON ", "LPT9"] {
+            match catalog_fs.save_world(name, &sample_save(1)) {
+                Err(CatalogSaveError::InvalidName(WorldNameError::ReservedStem { .. })) => {}
+                other => panic!("expected reserved-stem rejection for {name:?}, got {other:?}"),
+            }
+            assert!(
+                catalog_fs.list_rows().is_empty(),
+                "{name:?} must not appear in the catalog"
+            );
+            // Never probe a device path like NUL.mcvx on Windows: the
+            // tempdir listing is the platform-safe no-file assertion.
+            let entries = std::fs::read_dir(dir.path()).expect("read tempdir").count();
+            assert_eq!(entries, 0, "{name:?} must not create any file");
+        }
+    }
+
+    #[test]
+    fn village_name_saves_lists_and_reloads_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+        let original = sample_save(4242);
+
+        let path = catalog_fs
+            .save_world("Village", &original)
+            .expect("save Village");
+        assert_eq!(path, dir.path().join("Village.mcvx"));
+
+        let rows = catalog_fs.list_rows();
+        assert_eq!(rows.len(), 1, "only the Village save exists");
+        let village = row_for(&rows, "Village");
+        assert!(village.is_loadable(), "Village is a loadable row");
+        assert_eq!(village.file_name, "Village.mcvx");
+
+        let loaded = catalog_fs.load_row(village).expect("load Village");
+        assert_eq!(loaded.seed, original.seed);
+        assert_eq!(loaded.mode, original.mode);
+        assert_eq!(loaded.chunk_edits, original.chunk_edits);
+        assert_eq!(loaded.player.position, original.player.position);
+    }
+
+    #[test]
     fn default_save_file_remains_discoverable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog_fs = WorldCatalogFs::new(dir.path());
@@ -558,6 +610,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_and_truncated_saves_degrade_to_typed_corrupt_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+
+        // Sparse on ext4/NTFS: `set_len` extends the file without writing
+        // (or reading) the body, so the oversized case costs no memory.
+        let huge = dir.path().join("huge.mcvx");
+        let file = fs::File::create(&huge).expect("create huge");
+        file.set_len(crate::world::persistence::MAX_SAVE_FILE_BYTES + 1)
+            .expect("sparse extend");
+        drop(file);
+        // Truncated below the 8-byte header.
+        fs::write(dir.path().join("trunc.mcvx"), b"MCV").expect("write truncated");
+
+        let rows = catalog_fs.list_rows();
+        assert_eq!(rows.len(), 2);
+        let huge_row = row_for(&rows, "huge").clone();
+        let trunc_row = row_for(&rows, "trunc").clone();
+        assert_eq!(
+            huge_row.status,
+            RowStatus::Corrupt(RowProblem::InvalidFormat)
+        );
+        assert_eq!(
+            trunc_row.status,
+            RowStatus::Corrupt(RowProblem::InvalidFormat)
+        );
+
+        // Both fail closed with the existing typed corrupt display.
+        for row in [&huge_row, &trunc_row] {
+            match catalog_fs.load_row(row) {
+                Err(CatalogLoadError::Corrupt { .. }) => {}
+                other => panic!("expected Corrupt error, got {other:?}"),
+            }
+            let message = catalog_fs.load_row(row).unwrap_err().to_string();
+            assert!(
+                message.contains("cannot be loaded"),
+                "unexpected corrupt text: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_valid_body_corrupt_saves_list_loadable_and_fail_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+
+        let mut header = Vec::new();
+        header.extend_from_slice(crate::world::persistence::SAVE_MAGIC);
+        header.extend_from_slice(&crate::world::persistence::SAVE_VERSION.to_le_bytes());
+        header.extend_from_slice(b"junk");
+        for n in 0..16 {
+            fs::write(dir.path().join(format!("body{n}.mcvx")), &header).expect("write body");
+        }
+
+        // The listing probes only the header, so every row is Loadable...
+        let rows = catalog_fs.list_rows();
+        assert_eq!(rows.len(), 16);
+        for n in 0..16 {
+            let row = row_for(&rows, &format!("body{n}"));
+            assert_eq!(row.status, RowStatus::Loadable);
+        }
+
+        // ...while Play still decodes fully and fails closed with a typed
+        // load error. This pins the deliberate semantics shift: a Loadable
+        // row is header-valid, not decode-guaranteed.
+        for n in 0..16 {
+            let row = row_for(&rows, &format!("body{n}"));
+            match catalog_fs.load_row(row) {
+                Err(CatalogLoadError::Load { .. }) => {}
+                other => panic!("expected Load error for body{n}, got {other:?}"),
+            }
+            let message = catalog_fs.load_row(row).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("Could not load world \"body{n}\"")),
+                "unexpected load text: {message}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn running_as_root() -> bool {
         std::fs::read_to_string("/proc/self/status")
@@ -594,6 +726,22 @@ mod tests {
 
         // Restore so TempDir cleanup is unhindered.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    }
+
+    #[test]
+    fn non_regular_save_entries_never_list_and_map_to_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("folder.mcvx");
+        fs::create_dir(&path).expect("create dir at save path");
+
+        // is_world_file requires a regular file, so listing filters it out.
+        let catalog_fs = WorldCatalogFs::new(dir.path());
+        assert!(catalog_fs.list_rows().is_empty());
+
+        // A direct (or post-listing race) classification maps the typed
+        // error onto the existing three-problem vocabulary: no new variant.
+        let row = build_row(&path);
+        assert_eq!(row.status, RowStatus::Corrupt(RowProblem::Unreadable));
     }
 
     #[test]
@@ -766,8 +914,8 @@ mod tests {
         let path = dir.path().join("modded.mcvx");
         save_world_to_path_with(&path, &data, &registry).expect("write v8 save");
 
-        // Row probing stays built-in, so a pack-resolved v8 row is Loadable
-        // even when the probe has to create throwaway placeholders.
+        // The probe is header-only and never touches pack content, so a
+        // pack-resolved v8 row is Loadable from its header alone.
         let rows = catalog_fs.list_rows();
         let row = row_for(&rows, "modded");
         assert!(row.is_loadable());

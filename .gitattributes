@@ -1,0 +1,8 @@
+# Windows CI must see Linux bytes: LF text, untouched binary fixtures.
+* text=auto eol=lf
+
+*.png binary
+
+*.wav binary
+
+*.mcvx binary

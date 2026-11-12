@@ -1134,7 +1134,15 @@ mod tests {
         match error {
             CaptureError::WriteFailed { file, reason } => {
                 assert_eq!(file, "worldgen/prefabs/capture.toml");
-                assert_eq!(reason, "is a directory");
+                // Unix reports EISDIR (`IsADirectory`); Windows surfaces a
+                // write to a directory as ERROR_ACCESS_DENIED
+                // (`PermissionDenied`). Both must stay a WriteFailed that
+                // leaves the blocking directory untouched.
+                #[cfg(unix)]
+                let expected_reason = "is a directory";
+                #[cfg(windows)]
+                let expected_reason = "permission denied";
+                assert_eq!(reason, expected_reason);
             }
             other => panic!("expected WriteFailed, got {other:?}"),
         }

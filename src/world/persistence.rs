@@ -70,6 +70,10 @@ pub const SAVED_MOB_LEN: usize = 19;
 /// Upper bound on persisted chest records. Mirrors the chunk-count bound so a
 /// forged count can never request an unbounded decode pass.
 pub const MAX_SAVED_CHESTS: usize = 1_000_000;
+/// Upper bound on the byte length of an `.mcvx` save file, checked before the
+/// body is allocated. A measured 10M-edit world is ~40 MB, so 256 MiB keeps
+/// several times that headroom while refusing a stray multi-GB file.
+pub const MAX_SAVE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// First save version that carries the 27-byte hotbar header block.
 pub const HOTBAR_HEADER_VERSION: u32 = 2;
 /// First save version that carries the time-of-day `u32`.
@@ -724,6 +728,16 @@ pub enum PersistenceError {
     Io(std::io::Error),
     InvalidMagic,
     UnsupportedVersion(u32),
+    /// The save file exceeds [`MAX_SAVE_FILE_BYTES`] and was rejected before
+    /// its body was allocated.
+    SaveTooLarge {
+        len: u64,
+        limit: u64,
+    },
+    /// The save path is not a regular file: a directory, FIFO, socket, or
+    /// device. Rejected from metadata before `File::open`, so a FIFO can
+    /// never block the reader.
+    NotRegularFile,
     InvalidBlockId(u16),
     InvalidLocalIndex(u16),
     InvalidPlayerState,
@@ -795,6 +809,13 @@ impl fmt::Display for PersistenceError {
                     "unsupported save version {v} (this build reads version {SAVE_VERSION})"
                 )
             }
+            PersistenceError::SaveTooLarge { len, limit } => {
+                write!(
+                    f,
+                    "save file is too large ({len} bytes; limit {limit} bytes)"
+                )
+            }
+            PersistenceError::NotRegularFile => write!(f, "save path is not a regular file"),
             PersistenceError::InvalidBlockId(b) => write!(f, "unknown block id {b} in save"),
             PersistenceError::InvalidLocalIndex(i) => {
                 write!(f, "invalid block index {i} in save")
@@ -2165,6 +2186,14 @@ fn peek_save_version(bytes: &[u8]) -> Result<u32, PersistenceError> {
     read_u32(&mut cur)
 }
 
+/// Rejects a version word outside `1..=SAVE_VERSION`.
+fn ensure_supported_version(version: u32) -> Result<(), PersistenceError> {
+    if !(1..=SAVE_VERSION).contains(&version) {
+        return Err(PersistenceError::UnsupportedVersion(version));
+    }
+    Ok(())
+}
+
 /// Resolves v8 name indices against a cloned base registry, appending a
 /// deterministic placeholder for each unknown-but-well-formed namespaced name.
 struct V8Resolver<'a> {
@@ -2710,9 +2739,7 @@ pub fn load_world_from_bytes_with(
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
     let version = peek_save_version(bytes)?;
-    if !(1..=SAVE_VERSION).contains(&version) {
-        return Err(PersistenceError::UnsupportedVersion(version));
-    }
+    ensure_supported_version(version)?;
     if version >= CONTENT_TABLE_VERSION {
         decode_v8(bytes, registry)
     } else {
@@ -2734,9 +2761,7 @@ pub fn load_world_from_bytes_with(
 /// only need the world data.
 pub fn load_world_from_bytes(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
     let version = peek_save_version(bytes)?;
-    if !(1..=SAVE_VERSION).contains(&version) {
-        return Err(PersistenceError::UnsupportedVersion(version));
-    }
+    ensure_supported_version(version)?;
     if version >= CONTENT_TABLE_VERSION {
         load_world_from_bytes_with(bytes, ContentRegistry::builtin()).map(|loaded| loaded.data)
     } else {
@@ -2976,8 +3001,55 @@ pub fn save_world_to_path_with_config(
     write_save_file(path, &bytes)
 }
 
+/// Rejects a save longer than [`MAX_SAVE_FILE_BYTES`] before it is read.
+fn reject_oversized_save(len: u64) -> Result<(), PersistenceError> {
+    if len > MAX_SAVE_FILE_BYTES {
+        return Err(PersistenceError::SaveTooLarge {
+            len,
+            limit: MAX_SAVE_FILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Opens a save for reading, rejecting non-regular paths before `File::open`.
+///
+/// `std::fs::metadata` follows symlinks and never opens the path, so a FIFO
+/// is rejected without waiting for a writer. A directory opens on Linux but
+/// every read fails with `EISDIR`; it is rejected here with the same typed
+/// error on every OS.
+fn open_save_file(path: &Path) -> Result<File, PersistenceError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(PersistenceError::NotRegularFile);
+    }
+    reject_oversized_save(metadata.len())?;
+
+    let file = File::open(path)?;
+    // Recheck type and length from the opened handle: the path can change
+    // between metadata and open (benign TOCTOU).
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(PersistenceError::NotRegularFile);
+    }
+    reject_oversized_save(opened.len())?;
+    Ok(file)
+}
+
+/// Reads a whole save file while refusing to allocate more than
+/// [`MAX_SAVE_FILE_BYTES`].
+fn read_save_bytes(path: &Path) -> Result<Vec<u8>, PersistenceError> {
+    let file = open_save_file(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SAVE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    // A file that grew between the metadata check and the read is still
+    // rejected here rather than silently truncated.
+    reject_oversized_save(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
 pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceError> {
-    let bytes = fs::read(path)?;
+    let bytes = read_save_bytes(path)?;
     load_world_from_bytes(&bytes)
 }
 
@@ -2986,8 +3058,23 @@ pub fn load_world_from_path_with(
     path: &Path,
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
-    let bytes = fs::read(path)?;
+    let bytes = read_save_bytes(path)?;
     load_world_from_bytes_with(&bytes, registry)
+}
+
+/// Probes whether `path` carries a save header this build can play.
+///
+/// This is a catalog probe: it reads only the 8-byte magic + version header,
+/// so an `Ok(())` means the header is valid and the save is listed as
+/// loadable, not that the body is guaranteed to decode. Playing the row loads
+/// the whole file through [`load_world_from_path`] and surfaces any typed
+/// decode error from there.
+pub fn probe_world_at_path(path: &Path) -> Result<(), PersistenceError> {
+    let file = open_save_file(path)?;
+    let mut header = [0u8; 8];
+    file.take(8).read_exact(&mut header)?;
+    let version = peek_save_version(&header)?;
+    ensure_supported_version(version)
 }
 
 #[cfg(test)]
@@ -7257,5 +7344,224 @@ mod tests {
         let v7 = load_world_from_bytes(&legacy_world_bytes(&v7_data, 7)).unwrap();
         assert_eq!(v7.mobs, pinned_mobs());
         assert_eq!(v7.chests, v7_data.chests);
+    }
+
+    #[test]
+    fn oversized_save_is_rejected_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.mcvx");
+        // Sparse on ext4/NTFS: only the length is set, the body is never
+        // written and never read by any of the loaders below.
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SAVE_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = load_world_from_path(&path).expect_err("oversized save must be rejected");
+        assert!(matches!(
+            err,
+            PersistenceError::SaveTooLarge { len, limit }
+                if len == MAX_SAVE_FILE_BYTES + 1 && limit == MAX_SAVE_FILE_BYTES
+        ));
+
+        let err = load_world_from_path_with(&path, ContentRegistry::builtin())
+            .expect_err("oversized save must be rejected with a registry");
+        assert!(matches!(
+            err,
+            PersistenceError::SaveTooLarge { len, limit }
+                if len == MAX_SAVE_FILE_BYTES + 1 && limit == MAX_SAVE_FILE_BYTES
+        ));
+
+        let err =
+            probe_world_at_path(&path).expect_err("oversized save must be rejected by the probe");
+        assert!(matches!(err, PersistenceError::SaveTooLarge { .. }));
+
+        assert!(PersistenceError::SaveTooLarge { len: 5, limit: 7 }
+            .to_string()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn directory_at_save_path_is_rejected_as_not_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("folder.mcvx");
+        fs::create_dir(&path).unwrap();
+
+        for err in [
+            load_world_from_path(&path).unwrap_err(),
+            load_world_from_path_with(&path, ContentRegistry::builtin()).unwrap_err(),
+            probe_world_at_path(&path).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, PersistenceError::NotRegularFile),
+                "expected NotRegularFile, got {err:?}"
+            );
+        }
+        assert!(PersistenceError::NotRegularFile
+            .to_string()
+            .contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_socket_save_paths_are_rejected_without_blocking() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A Unix socket is not a regular file and std can create it with no
+        // external binary, so this leg always runs.
+        let socket = dir.path().join("sock.mcvx");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for err in [
+            load_world_from_path(&socket).unwrap_err(),
+            probe_world_at_path(&socket).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, PersistenceError::NotRegularFile),
+                "got {err:?}"
+            );
+        }
+        drop(listener);
+
+        // A FIFO is the hazard the guard exists for: open(2) for reading
+        // blocks until a writer appears. mkfifo(1) is the only dependency-
+        // free way to create one (std has no mkfifo).
+        let fifo = dir.path().join("pipe.mcvx");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            other => {
+                eprintln!("skipping FIFO leg: mkfifo unavailable ({other:?})");
+                return;
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let result = probe_world_at_path(&probe_path);
+            let _ = tx.send(format!("{result:?}"));
+        });
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(payload) => {
+                reader.join().unwrap();
+                assert!(payload.contains("NotRegularFile"), "got {payload}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The reader is stuck in open(2); a writer open completes the
+                // pair so the thread can exit, then we fail the test.
+                let _ = File::create(&fifo);
+                reader.join().unwrap();
+                panic!("probe_world_at_path blocked on a FIFO before rejecting it");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The reader panicked; do NOT open the FIFO for writing here
+                // (there would be no reader to pair with and this test would
+                // hang). Surface the thread panic instead.
+                reader.join().unwrap();
+                panic!("probe thread disconnected before reporting");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_accepts_a_header_and_rejects_short_bad_magic_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let valid = dir.path().join("valid.mcvx");
+        let mut header = Vec::new();
+        header.extend_from_slice(SAVE_MAGIC);
+        header.extend_from_slice(&SAVE_VERSION.to_le_bytes());
+        fs::write(&valid, &header).unwrap();
+        probe_world_at_path(&valid).expect("a valid 8-byte header is loadable");
+
+        let short = dir.path().join("short.mcvx");
+        fs::write(&short, b"MCV").unwrap();
+        assert!(matches!(
+            probe_world_at_path(&short),
+            Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+
+        let bad_magic = dir.path().join("bad_magic.mcvx");
+        fs::write(&bad_magic, b"NOPE!1234").unwrap();
+        assert!(matches!(
+            probe_world_at_path(&bad_magic),
+            Err(PersistenceError::InvalidMagic)
+        ));
+
+        let future = dir.path().join("future.mcvx");
+        let mut header = Vec::new();
+        header.extend_from_slice(SAVE_MAGIC);
+        header.extend_from_slice(&(SAVE_VERSION + 1).to_le_bytes());
+        fs::write(&future, &header).unwrap();
+        assert!(matches!(
+            probe_world_at_path(&future),
+            Err(PersistenceError::UnsupportedVersion(v)) if v == SAVE_VERSION + 1
+        ));
+    }
+
+    /// Builds a synthetic edit map with exactly `chunk_count * per_chunk`
+    /// edits over `chunk_count` chunks, mirroring the release-only budget
+    /// harness in `tests/autosave_budget.rs`.
+    fn big_edit_map(chunk_count: usize, per_chunk: usize) -> ChunkEditMap {
+        let mut edits: ChunkEditMap =
+            ChunkEditMap::with_capacity_and_hasher(chunk_count, Default::default());
+        for i in 0..chunk_count {
+            let mut chunk =
+                rustc_hash::FxHashMap::with_capacity_and_hasher(per_chunk, Default::default());
+            for local in 0..per_chunk {
+                chunk.insert(local as u16, BlockId::Stone);
+            }
+            edits.insert(ChunkPos::new((i % 50) as i32, 0, (i / 50) as i32), chunk);
+        }
+        assert_eq!(edits.len(), chunk_count);
+        assert_eq!(
+            edits
+                .values()
+                .map(rustc_hash::FxHashMap::len)
+                .sum::<usize>(),
+            chunk_count * per_chunk
+        );
+        edits
+    }
+
+    #[test]
+    fn million_edit_save_roundtrips_within_the_cap() {
+        // ~1-3 s in debug (2,000 chunks / 1,000,000 edits): acceptable for the
+        // 60-minute two-OS lane and the only default-suite proof that a real
+        // large save still loads under the 256 MiB cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("million.mcvx");
+
+        let mut data = sample_data(sample_player());
+        data.chunk_edits = big_edit_map(2_000, 500);
+
+        save_world_to_path(&path, &data).expect("a 1M-edit save should write");
+
+        let len = fs::metadata(&path)
+            .expect("metadata for the saved file")
+            .len();
+        assert!(
+            len > 1_000_000,
+            "a 1M-edit save is multi-MB, got {len} bytes"
+        );
+        assert!(
+            len < MAX_SAVE_FILE_BYTES,
+            "a legitimate 1M-edit save must stay under the cap, got {len} bytes"
+        );
+
+        let loaded = load_world_from_path(&path).expect("a 1M-edit save should load");
+        assert_eq!(loaded.chunk_edits.len(), 2_000);
+        assert_eq!(
+            loaded
+                .chunk_edits
+                .values()
+                .map(rustc_hash::FxHashMap::len)
+                .sum::<usize>(),
+            1_000_000
+        );
+        assert_eq!(loaded.chunk_edits, data.chunk_edits);
+        assert_eq!(loaded.player, data.player);
+        assert_eq!(loaded.seed, data.seed);
+        assert_eq!(loaded.time_of_day, data.time_of_day);
     }
 }
