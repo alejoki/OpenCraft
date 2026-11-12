@@ -4,9 +4,6 @@ on:
   push:
     tags:
       - "v*"
-    # TEMPORARY rehearsal trigger: removed before the tag.
-    branches:
-      - main
 
 permissions:
   contents: read
