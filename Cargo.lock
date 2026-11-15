@@ -1667,6 +1667,7 @@ dependencies = [
  "crossbeam-channel",
  "glam",
  "glyphon",
+ "opencraft-core",
  "png",
  "pollster",
  "rayon",
@@ -1677,6 +1678,34 @@ dependencies = [
  "toml",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "opencraft-core"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
+name = "opencraft-gfx"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+]
+
+[[package]]
+name = "opencraft-pathfinding"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+]
+
+[[package]]
+name = "opencraft-physics"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
 ]
 
 [[package]]
