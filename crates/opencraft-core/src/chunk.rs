@@ -1,6 +1,6 @@
 //! Chunk dimensions, chunk coordinates, and dense-cell indexing.
 //!
-//! Deliberately storage-free: the game keeps its `BlockId`-bearing `Chunk`
+//! Deliberately storage-free: the game keeps its dense block-cell `Chunk`
 //! type, while the neutral coordinate math lives here.
 
 pub const CHUNK_SIZE: usize = 32;
