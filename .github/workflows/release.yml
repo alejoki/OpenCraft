@@ -87,7 +87,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+
+      - name: check engine boundaries
+        run: bash scripts/check_engine_boundaries.sh
 
       - name: cargo build --release
         run: cargo build --release --locked
