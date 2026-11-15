@@ -80,6 +80,20 @@ cd OpenCraft
 cargo build --release
 ```
 
+### Testing
+
+Run the whole workspace — the root game plus the engine crates under `crates/` — with:
+
+```bash
+cargo test --workspace --locked
+```
+
+Plain `cargo test` only runs the root `opencraft` package, so it skips the engine crates. The committed engine-boundary check runs locally with:
+
+```bash
+bash scripts/check_engine_boundaries.sh
+```
+
 ### Running
 
 To run the game, use `cargo run`. This will launch the game and open the main menu.
@@ -243,3 +257,10 @@ The codebase is organized into several modules within the `src/` directory:
 *   `mesh/`: Implements the greedy meshing algorithm for creating optimized chunk geometry.
 *   `ui/`: Defines the pure-logic state machines and geometry for all UI screens (main menu, settings, etc.).
 *   `settings/`: Manages loading, saving, and applying user-configurable settings.
+
+The workspace also contains engine crates under `crates/`:
+
+*   `opencraft-core`: Neutral primitives — chunk-coordinate math, block queries, AABB/ray geometry, camera math, and RGBA downsampling. No game logic, GPU, or windowing.
+*   `opencraft-gfx`: The `wgpu` rendering layer over a game-created surface. Does not depend on `winit`.
+*   `opencraft-physics`: AABB collision, raycasting, and movement solvers over the `BlockQuery` trait.
+*   `opencraft-pathfinding`: Steering plus nav-grid A*. Not yet wired into mobs.
