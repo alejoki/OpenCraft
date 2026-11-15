@@ -633,31 +633,10 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
 
 /// Halve a square RGBA image with a 2x box average (edge-clamped).
 /// Shared by the texture-array mip chain and the pack resample path so both
-/// use one averaging rule.
-pub fn downsample_rgba_2x(src: &[u8], src_dim: u32) -> Vec<u8> {
-    let dst_dim = (src_dim / 2).max(1);
-    let mut dst = vec![0u8; (dst_dim * dst_dim * 4) as usize];
-    for y in 0..dst_dim {
-        for x in 0..dst_dim {
-            let mut sum = [0u32; 4];
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let sx = (x * 2 + dx).min(src_dim - 1);
-                    let sy = (y * 2 + dy).min(src_dim - 1);
-                    let sidx = ((sy * src_dim + sx) * 4) as usize;
-                    for c in 0..4 {
-                        sum[c] += src[sidx + c] as u32;
-                    }
-                }
-            }
-            let didx = ((y * dst_dim + x) * 4) as usize;
-            for c in 0..4 {
-                dst[didx + c] = (sum[c] / 4) as u8;
-            }
-        }
-    }
-    dst
-}
+/// use one averaging rule. The implementation lives in `opencraft-core`; this
+/// re-export keeps every `crate::render::texture::downsample_rgba_2x` caller
+/// and the source-pin mip-rule test on one path.
+pub use opencraft_core::rgba::downsample_rgba_2x;
 
 /// True when `layers` matches the fixed block texture array contract:
 /// exactly [`NUM_TEX_LAYERS`] layers, each [`TEX_SIZE`] × [`TEX_SIZE`] × 4

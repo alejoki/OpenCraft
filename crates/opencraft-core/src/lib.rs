@@ -6,4 +6,7 @@
 //! engine member build on this crate, never the other way around.
 
 pub mod block;
+pub mod camera;
 pub mod chunk;
+pub mod geometry;
+pub mod rgba;

@@ -12,6 +12,8 @@ use crate::player::inventory::{
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
 use crate::world::block::BlockId;
 
+pub use opencraft_core::geometry::Aabb;
+
 /// Errors from the narrow inventory-screen command façade.
 ///
 /// Every variant is a rejected command whose pre-state (slots, cursor, both
@@ -126,41 +128,6 @@ impl Default for MovementRules {
             swim_walk_speed_mult: SWIM_WALK_SPEED_MULT,
             swim_sink_accel: SWIM_SINK_ACCEL,
         }
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct Aabb {
-    pub min: Vec3,
-    pub max: Vec3,
-}
-
-impl Aabb {
-    #[inline]
-    pub fn from_feet(feet: Vec3) -> Self {
-        Self {
-            min: Vec3::new(
-                feet.x - PLAYER_HALF_WIDTH,
-                feet.y,
-                feet.z - PLAYER_HALF_WIDTH,
-            ),
-            max: Vec3::new(
-                feet.x + PLAYER_HALF_WIDTH,
-                feet.y + PLAYER_HEIGHT,
-                feet.z + PLAYER_HALF_WIDTH,
-            ),
-        }
-    }
-
-    #[inline]
-    pub fn intersects_block(&self, bx: i32, by: i32, bz: i32) -> bool {
-        let eps = 1e-4;
-        self.max.x > bx as f32 + eps
-            && self.min.x < (bx + 1) as f32 - eps
-            && self.max.y > by as f32 + eps
-            && self.min.y < (by + 1) as f32 - eps
-            && self.max.z > bz as f32 + eps
-            && self.min.z < (bz + 1) as f32 - eps
     }
 }
 
@@ -907,7 +874,7 @@ impl Player {
 
     #[inline]
     pub fn aabb(&self) -> Aabb {
-        Aabb::from_feet(self.position)
+        Aabb::from_feet(self.position, PLAYER_HALF_WIDTH, PLAYER_HEIGHT)
     }
 
     #[inline]
@@ -1043,7 +1010,10 @@ impl Player {
             let dy = self.velocity.y * sub_dt;
             if dy != 0.0 {
                 let candidate_y = Vec3::new(self.position.x, self.position.y + dy, self.position.z);
-                if collides_with_world(Aabb::from_feet(candidate_y), &get_block) {
+                if collides_with_world(
+                    Aabb::from_feet(candidate_y, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
+                    &get_block,
+                ) {
                     if dy < 0.0 {
                         self.position.y = (self.position.y + dy).ceil();
                         self.on_ground = true;
@@ -1059,7 +1029,10 @@ impl Player {
             let dx = self.velocity.x * sub_dt;
             if dx != 0.0 {
                 let candidate_x = Vec3::new(self.position.x + dx, self.position.y, self.position.z);
-                if !collides_with_world(Aabb::from_feet(candidate_x), &get_block) {
+                if !collides_with_world(
+                    Aabb::from_feet(candidate_x, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
+                    &get_block,
+                ) {
                     self.position.x += dx;
                 } else {
                     self.velocity.x = 0.0;
@@ -1070,7 +1043,10 @@ impl Player {
             let dz = self.velocity.z * sub_dt;
             if dz != 0.0 {
                 let candidate_z = Vec3::new(self.position.x, self.position.y, self.position.z + dz);
-                if !collides_with_world(Aabb::from_feet(candidate_z), &get_block) {
+                if !collides_with_world(
+                    Aabb::from_feet(candidate_z, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
+                    &get_block,
+                ) {
                     self.position.z += dz;
                 } else {
                     self.velocity.z = 0.0;
