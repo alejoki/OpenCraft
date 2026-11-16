@@ -11,5 +11,6 @@
 pub mod archive;
 pub mod chunk_section;
 mod error;
+pub mod file;
 
 pub use error::StorageError;
