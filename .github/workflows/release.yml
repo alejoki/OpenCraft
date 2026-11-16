@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+    # TEMPORARY M017 rehearsal (D284): exercise the tag-only Windows installer
+    # steps on a branch push. Remove this branch filter immediately after the
+    # rehearsal run; the publish job stays tag-gated.
+    branches:
+      - "milestone/M017"
 
 permissions:
   contents: read
