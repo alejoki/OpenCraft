@@ -252,15 +252,18 @@ The codebase is organized into several modules within the `src/` directory:
 
 *   `main.rs`: The main application entry point, handling the event loop, windowing, and state management.
 *   `world/`: Contains all logic related to the game world, including chunk management, procedural terrain generation, and persistence (saving/loading).
-*   `render/`: The `wgpu`-based rendering engine, including shaders, pipelines, and buffer management.
+*   `render/`: Owns game-side content identity, texture-pack art, and mob/arrow scene assembly. The `wgpu` renderer, sky/weather and frame passes live in `opencraft-gfx`.
 *   `player/`: Handles player state, physics, camera, and input processing.
 *   `mesh/`: Implements the greedy meshing algorithm for creating optimized chunk geometry.
 *   `ui/`: Defines the pure-logic state machines and geometry for all UI screens (main menu, settings, etc.).
 *   `settings/`: Manages loading, saving, and applying user-configurable settings.
 
-The workspace also contains engine crates under `crates/`:
+The workspace also contains the engine crates and their external reuse proof under `crates/`:
 
 *   `opencraft-core`: Neutral primitives — chunk-coordinate math, block queries, AABB/ray geometry, camera math, and RGBA downsampling. No game logic, GPU, or windowing.
-*   `opencraft-gfx`: The `wgpu` rendering layer over a game-created surface. Does not depend on `winit`.
+*   `opencraft-gfx`: The `wgpu` frame layer over a game-created surface: buffers, meshes, texture arrays, models, sky/weather and frame passes. Does not depend on `winit`.
 *   `opencraft-physics`: AABB collision, raycasting, and movement solvers over the `BlockQuery` trait.
 *   `opencraft-pathfinding`: Steering plus nav-grid A*. Not yet wired into mobs.
+*   `engine-reuse-proof`: An external, device-free consumer of the four engine crates. It runs headless, prints a deterministic 15-line report, has no `opencraft` dependency, and never creates a GPU adapter.
+
+See [the engine crate guide](docs/CRATES.md) for the workspace layout, neutral-API rules, gate commands and M018 scope.
