@@ -1710,6 +1710,7 @@ dependencies = [
 name = "opencraft-physics"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "opencraft-core",
 ]
 
