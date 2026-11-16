@@ -6,6 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+bytemuck = { version = "1.14", features = ["derive"] }
 opencraft-core = { path = "../opencraft-core" }
 pollster = "0.3"
+rustc-hash = "1.1"
 wgpu = "0.19"

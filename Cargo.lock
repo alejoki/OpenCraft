@@ -1691,8 +1691,10 @@ dependencies = [
 name = "opencraft-gfx"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "opencraft-core",
  "pollster",
+ "rustc-hash",
  "wgpu",
 ]
 
