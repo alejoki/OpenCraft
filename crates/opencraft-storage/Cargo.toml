@@ -1,0 +1,12 @@
+[package]
+name = "opencraft-storage"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+opencraft-core = { path = "../opencraft-core" }
+
+[dev-dependencies]
+tempfile = "3"

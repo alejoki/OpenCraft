@@ -1694,6 +1694,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "opencraft-content"
+version = "0.1.0"
+
+[[package]]
 name = "opencraft-core"
 version = "0.1.0"
 dependencies = [
@@ -1727,6 +1731,18 @@ dependencies = [
  "glam",
  "opencraft-core",
 ]
+
+[[package]]
+name = "opencraft-storage"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+ "tempfile",
+]
+
+[[package]]
+name = "opencraft-worldgen"
+version = "0.1.0"
 
 [[package]]
 name = "orbclient"
