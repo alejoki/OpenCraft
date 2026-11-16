@@ -68,3 +68,6 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      - name: cargo test engine-reuse-proof
+        run: cargo test -p engine-reuse-proof --locked

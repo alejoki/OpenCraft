@@ -14,4 +14,18 @@
 pub mod gfx;
 pub mod motion;
 pub mod physics;
+pub mod report;
 pub mod world;
+
+/// Run every device-free proof and aggregate the result.
+///
+/// This is the single entry point the `engine-reuse-proof` bin prints. It runs
+/// the physics, gfx and motion proofs in a fixed order and creates no adapter,
+/// device, surface, file, thread or child process.
+pub fn run() -> report::ProofReport {
+    report::ProofReport {
+        physics: physics::run(),
+        gfx: gfx::run(),
+        motion: motion::run(),
+    }
+}
