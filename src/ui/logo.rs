@@ -10,7 +10,7 @@ use wgpu::util::DeviceExt;
 
 use super::quad::Quad;
 use crate::pack::PackLogo;
-use crate::render::context::RenderContext;
+use opencraft_gfx::context::RenderContext;
 
 /// Engine-styled title text. "Engine-styled" is the same monospace family
 /// every other UI string uses (see `ui::text`).
@@ -69,7 +69,7 @@ pub fn logo_rect(surface_w: u32, logo_w: u32, logo_h: u32, max_h: f32) -> (f32, 
 
 /// One textured-quad vertex: clip-space position plus image UV.
 ///
-/// Same `clip_pos` shape as `render::pipeline::OverlayVertex`, but carries a
+/// Same `clip_pos` shape as `opencraft_gfx::pipeline::OverlayVertex`, but carries a
 /// texture coordinate instead of a color.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]

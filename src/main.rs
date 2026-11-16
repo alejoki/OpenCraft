@@ -100,10 +100,7 @@ use opencraft::player::physics::Player;
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError};
 use opencraft::player::raycast::raycast_voxels;
-use opencraft::render::buffer::ChunkRenderStore;
-use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch_into, MobVertex};
-use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 use opencraft::render::texture::{
     compose_block_array_layers, generate_all_texture_layers_rgba, BLOCK_ARRAY_SPEC,
 };
@@ -213,6 +210,9 @@ use opencraft::world::terrain::{ruin_loot_chest_at, SEA_LEVEL};
 use opencraft::world::village::VillageCatalog;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
+use opencraft_gfx::buffer::ChunkRenderStore;
+use opencraft_gfx::context::RenderContext;
+use opencraft_gfx::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;

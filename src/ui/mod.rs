@@ -45,8 +45,8 @@ pub use screens::{
 pub use text_input::{TextInput, TextInputAction, TextInputOutcome};
 
 use crate::pack::PackLogo;
-use crate::render::context::RenderContext;
-use crate::render::pipeline::UiPass;
+use opencraft_gfx::context::RenderContext;
+use opencraft_gfx::pipeline::UiPass;
 
 pub use quad::{Quad, QuadRenderer};
 pub use text::{StatsOverlay, FONT_SIZE, LINE_HEIGHT};

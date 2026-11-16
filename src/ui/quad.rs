@@ -1,12 +1,12 @@
 use wgpu::util::DeviceExt;
 
-use crate::render::context::RenderContext;
-use crate::render::pipeline::OverlayVertex;
+use opencraft_gfx::context::RenderContext;
+use opencraft_gfx::pipeline::OverlayVertex;
 
 /// Pass-through overlay shader (same shape as the line overlay pipeline's):
 /// vertices arrive already projected to clip space on the CPU, with a
 /// per-vertex color the fragment stage passes through untouched. Defined
-/// locally to avoid cross-module churn in `render::pipeline`.
+/// locally to avoid cross-module churn in `opencraft_gfx::pipeline`.
 const QUAD_SHADER_WGSL: &str = r#"
 struct OverlayOutput {
     @builtin(position) clip_pos: vec4<f32>,
