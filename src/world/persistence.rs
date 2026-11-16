@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 use glam::IVec3;
 use rustc_hash::FxHashMap;
 
+#[cfg(test)]
+use crate::world::chunk::{
+    linear_index, local_coords_from_index, world_to_chunk_and_local, CHUNK_SIZE,
+};
+#[cfg(test)]
+use opencraft_storage::archive::{encode_archive, SaveImage, SectionId};
+#[cfg(test)]
+use opencraft_storage::chunk_section::ChunkSection;
+use opencraft_storage::StorageError;
+
 use crate::config::{ConfigRuntime, SaveConfigMeta, CONFIG_SCHEMA_VERSION};
 use crate::content::{names, ContentRegistry, PackIdentity};
 use crate::player::container::Container;
@@ -38,6 +48,55 @@ pub const CONTENT_TABLE_VERSION: u32 = 8;
 pub const CONFIG_TAIL_VERSION: u32 = 9;
 /// Fixed on-disk size of the v9 config tail: `u16` schema + `u64` digest.
 pub const CONFIG_TAIL_LEN: usize = 10;
+
+// ---------------------------------------------------------------------
+// v10 sectioned format (D323)
+// ---------------------------------------------------------------------
+
+/// v10 archive version. Production still writes [`SAVE_VERSION`] until the
+/// T03 cutover; the v10 writer/reader are built and pinned behind direct
+/// tests first so the format risk retires before any live file changes.
+#[cfg(test)]
+const V10_SAVE_VERSION: u32 = 10;
+/// Sorted kind-tagged content table (the v10 header replacement).
+#[cfg(test)]
+const V10_SECTION_CONTENT_TABLE: u32 = 1;
+/// Seed, player pose, clock, calendar, mode and vitals.
+#[cfg(test)]
+const V10_SECTION_WORLD_PLAYER: u32 = 2;
+/// 36 inventory slots, cursor, player grid and table grid.
+#[cfg(test)]
+const V10_SECTION_INVENTORY: u32 = 3;
+/// Chest count plus sorted chest records.
+#[cfg(test)]
+const V10_SECTION_CHESTS: u32 = 4;
+/// Mob count plus canonically sorted mob records.
+#[cfg(test)]
+const V10_SECTION_MOBS: u32 = 5;
+/// Sorted pack identities plus the registry digest.
+#[cfg(test)]
+const V10_SECTION_CONTENT_META: u32 = 6;
+/// Config schema plus effective-value digest.
+#[cfg(test)]
+const V10_SECTION_CONFIG: u32 = 7;
+/// Sorted world positions of immature wheat crops.
+#[cfg(test)]
+const V10_SECTION_CROPS: u32 = 8;
+/// Sorted non-empty chunk index: `{x, y, z, edit_count}` records.
+#[cfg(test)]
+const V10_SECTION_CHUNK_INDEX: u32 = 9;
+/// First per-chunk palette section id; chunk `i` lives at this base + `i`.
+#[cfg(test)]
+const V10_CHUNK_SECTION_BASE: u32 = 16;
+/// Ids between the fixed sections and the chunk range are reserved.
+#[cfg(test)]
+const V10_RESERVED_SECTION_IDS: std::ops::RangeInclusive<u32> = 10..=15;
+/// Upper bound on persisted immature-wheat crop positions.
+#[cfg(test)]
+const MAX_SAVED_CROPS: usize = 1_000_000;
+/// Upper bound on persisted non-empty chunk records (same as v9).
+#[cfg(test)]
+const MAX_SAVED_CHUNKS: usize = 1_000_000;
 /// Version the frozen test-only legacy encoder emits.
 #[cfg(test)]
 const LEGACY_WRITE_VERSION: u32 = 7;
@@ -790,6 +849,24 @@ pub enum PersistenceError {
     /// The v9 config tail was malformed (zero schema, a writer schema other
     /// than [`CONFIG_SCHEMA_VERSION`], or truncation/trailing bytes in v9).
     InvalidConfigMeta,
+    /// A v10 archive failed its neutral framing validation (magic, flags,
+    /// codec, directory, bounds or truncation). The inner typed
+    /// [`StorageError`] is preserved.
+    InvalidArchive(StorageError),
+    /// A required fixed v10 section is absent.
+    MissingSection {
+        id: u32,
+    },
+    /// The v10 chunk index was malformed: unsorted or duplicate positions, a
+    /// zero/over-volume edit count, a count/body mismatch, or a chunk-section
+    /// ordinal gap.
+    InvalidChunkIndex,
+    /// A v10 chunk palette section failed the canonical codec or disagreed
+    /// with the content table.
+    InvalidChunkSection(StorageError),
+    /// The v10 crop section was malformed: over the cap, unsorted/duplicate,
+    /// or naming a position that is not an immature-wheat edit.
+    InvalidCrops,
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -879,6 +956,33 @@ impl fmt::Display for PersistenceError {
             PersistenceError::InvalidConfigMeta => {
                 write!(f, "invalid config metadata in save")
             }
+            PersistenceError::InvalidArchive(error) => {
+                write!(f, "invalid v10 save archive: {error}")
+            }
+            PersistenceError::MissingSection { id } => {
+                write!(f, "missing required v10 save section {id}")
+            }
+            PersistenceError::InvalidChunkIndex => {
+                write!(f, "invalid v10 chunk index in save")
+            }
+            PersistenceError::InvalidChunkSection(error) => {
+                write!(f, "invalid v10 chunk section in save: {error}")
+            }
+            PersistenceError::InvalidCrops => {
+                write!(f, "invalid v10 crop section in save")
+            }
+        }
+    }
+}
+
+impl From<StorageError> for PersistenceError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Io(error) => Self::Io(error),
+            StorageError::TooLarge { len, limit } => Self::SaveTooLarge { len, limit },
+            StorageError::NotRegularFile => Self::NotRegularFile,
+            StorageError::InvalidMagic => Self::InvalidMagic,
+            other => Self::InvalidArchive(other),
         }
     }
 }
@@ -1519,6 +1623,20 @@ where
     Ok(())
 }
 
+/// Lookup seam shared by the v9 name-only table and the v10 kind-tagged
+/// table, so the v8 item encoding is identical for both formats.
+trait ContentTable {
+    /// Wire index of `(kind, name)`.
+    fn index_of(&self, kind: ContentKind, name: &str) -> Result<u16, PersistenceError>;
+
+    /// Wire index of the `(kind, name)` pair implied by `item`.
+    fn index_of_item(
+        &self,
+        registry: &ContentRegistry,
+        item: Item,
+    ) -> Result<u16, PersistenceError>;
+}
+
 /// Sorted, unique save-local content names plus their `u16` wire indices.
 struct ContentNameTable {
     names: Vec<String>,
@@ -1550,23 +1668,17 @@ impl ContentNameTable {
         }
         Ok(Self { names, index })
     }
+}
 
-    fn index_of(&self, name: &str) -> Result<u16, PersistenceError> {
+impl ContentTable for ContentNameTable {
+    fn index_of(&self, _kind: ContentKind, name: &str) -> Result<u16, PersistenceError> {
         self.index
             .get(name)
             .copied()
             .ok_or_else(|| PersistenceError::InvalidContentName(name.to_string()))
     }
 
-    fn name_index_of_block(
-        &self,
-        registry: &ContentRegistry,
-        block: BlockId,
-    ) -> Result<u16, PersistenceError> {
-        self.index_of(content_name_of_block(registry, block)?)
-    }
-
-    fn name_index_of_item(
+    fn index_of_item(
         &self,
         registry: &ContentRegistry,
         item: Item,
@@ -1576,37 +1688,40 @@ impl ContentNameTable {
                 let name = registry
                     .tool_def_name(index)
                     .ok_or(PersistenceError::UnknownItemIndex(index))?;
-                self.index_of(name)
+                self.index_of(ContentKind::ModTool, name)
             }
-            _ => self.index_of(content_name_of_item(registry, item)?),
+            _ => self.index_of(
+                ContentKind::GenericItem,
+                content_name_of_item(registry, item)?,
+            ),
         }
     }
 }
 
 /// Writes one v8 item record: `tag` then a tag-specific payload built from a
 /// `u16` content-name index.
-fn write_v8_item(
+fn write_v8_item<T: ContentTable>(
     out: &mut Vec<u8>,
     item: Option<Item>,
     registry: &ContentRegistry,
-    table: &ContentNameTable,
+    table: &T,
 ) -> Result<(), PersistenceError> {
     match item {
         None => out.push(ITEM_TAG_EMPTY),
         Some(item) => match item.id() {
             ItemId::Block(_) => {
                 out.push(ITEM_TAG_BLOCK);
-                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.count().to_le_bytes());
             }
             ItemId::Material(_) => {
                 out.push(ITEM_TAG_MATERIAL);
-                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.count().to_le_bytes());
             }
             ItemId::Tool { .. } => {
                 out.push(ITEM_TAG_TOOL);
-                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
             }
             ItemId::Item(_) => {
@@ -1618,17 +1733,17 @@ fn write_v8_item(
                 // carried": reading clamps it to the authored maximum.
                 if item_is_degraded_placeholder_tool(registry, item) {
                     out.push(ITEM_TAG_MOD_TOOL);
-                    out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                    out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                     out.extend_from_slice(&u16::MAX.to_le_bytes());
                 } else {
                     out.push(ITEM_TAG_GENERIC);
-                    out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                    out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                     out.extend_from_slice(&item.count().to_le_bytes());
                 }
             }
             ItemId::ModTool(_) => {
                 out.push(ITEM_TAG_MOD_TOOL);
-                out.extend_from_slice(&table.name_index_of_item(registry, item)?.to_le_bytes());
+                out.extend_from_slice(&table.index_of_item(registry, item)?.to_le_bytes());
                 out.extend_from_slice(&item.durability().unwrap_or(0).to_le_bytes());
             }
         },
@@ -1636,11 +1751,11 @@ fn write_v8_item(
     Ok(())
 }
 
-fn write_v8_grid(
+fn write_v8_grid<T: ContentTable>(
     out: &mut Vec<u8>,
     grid: &CraftingGrid,
     registry: &ContentRegistry,
-    table: &ContentNameTable,
+    table: &T,
 ) -> Result<(), PersistenceError> {
     out.push(grid_kind_tag(grid.kind()));
     for index in 0..grid.kind().slot_count() {
@@ -1649,13 +1764,13 @@ fn write_v8_grid(
     Ok(())
 }
 
-fn write_v8_inventory_extension(
+fn write_v8_inventory_extension<T: ContentTable>(
     out: &mut Vec<u8>,
     inventory: &Inventory,
     player_grid: &CraftingGrid,
     table_grid: &CraftingGrid,
     registry: &ContentRegistry,
-    table: &ContentNameTable,
+    table: &T,
 ) -> Result<(), PersistenceError> {
     for item in inventory.slots() {
         write_v8_item(out, *item, registry, table)?;
@@ -1710,6 +1825,38 @@ fn write_pack_identity(out: &mut Vec<u8>, pack: &PackIdentity) -> Result<(), Per
     Ok(())
 }
 
+/// Validates the mob cap, finite pose, health bound and canonical sort, and
+/// returns the wire count plus the sorted records.
+fn checked_sorted_mobs(data: &WorldSaveData) -> Result<(u32, Vec<SavedMob>), PersistenceError> {
+    let mob_count = checked_mob_count(data.mobs.len())?;
+    let mut sorted_mobs = data.mobs.clone();
+    for mob in &sorted_mobs {
+        if !mob.position.iter().all(|c| c.is_finite()) || !mob.yaw.is_finite() {
+            return Err(PersistenceError::InvalidMobState);
+        }
+        if mob.health > mob.kind.max_health() {
+            return Err(PersistenceError::InvalidMobState);
+        }
+    }
+    sorted_mobs.sort_by(|a, b| {
+        a.kind
+            .tag()
+            .cmp(&b.kind.tag())
+            .then_with(|| a.position[0].total_cmp(&b.position[0]))
+            .then_with(|| a.position[1].total_cmp(&b.position[1]))
+            .then_with(|| a.position[2].total_cmp(&b.position[2]))
+    });
+    if sorted_mobs.windows(2).any(|pair| {
+        pair[0].kind == pair[1].kind
+            && pair[0].position[0] == pair[1].position[0]
+            && pair[0].position[1] == pair[1].position[1]
+            && pair[0].position[2] == pair[1].position[2]
+    }) {
+        return Err(PersistenceError::InvalidMobState);
+    }
+    Ok((mob_count, sorted_mobs))
+}
+
 /// Writes a flat save at `version`: the v8 sorted save-local content table in
 /// the header, a `u16` name index for every content reference, the
 /// pack-identity + digest content tail, and the config schema + digest tail
@@ -1743,32 +1890,7 @@ fn write_world_with_version(
 
     let chest_count = checked_chest_count(data.chests.len())?;
 
-    let mob_count = checked_mob_count(data.mobs.len())?;
-    let mut sorted_mobs = data.mobs.clone();
-    for mob in &sorted_mobs {
-        if !mob.position.iter().all(|c| c.is_finite()) || !mob.yaw.is_finite() {
-            return Err(PersistenceError::InvalidMobState);
-        }
-        if mob.health > mob.kind.max_health() {
-            return Err(PersistenceError::InvalidMobState);
-        }
-    }
-    sorted_mobs.sort_by(|a, b| {
-        a.kind
-            .tag()
-            .cmp(&b.kind.tag())
-            .then_with(|| a.position[0].total_cmp(&b.position[0]))
-            .then_with(|| a.position[1].total_cmp(&b.position[1]))
-            .then_with(|| a.position[2].total_cmp(&b.position[2]))
-    });
-    if sorted_mobs.windows(2).any(|pair| {
-        pair[0].kind == pair[1].kind
-            && pair[0].position[0] == pair[1].position[0]
-            && pair[0].position[1] == pair[1].position[1]
-            && pair[0].position[2] == pair[1].position[2]
-    }) {
-        return Err(PersistenceError::InvalidMobState);
-    }
+    let (mob_count, sorted_mobs) = checked_sorted_mobs(data)?;
 
     let packs = checked_packs(registry)?;
 
@@ -1835,7 +1957,11 @@ fn write_world_with_version(
         out.extend_from_slice(&(sorted_edits.len() as u32).to_le_bytes());
         for (idx, block) in sorted_edits {
             out.extend_from_slice(&idx.to_le_bytes());
-            out.extend_from_slice(&table.name_index_of_block(registry, block)?.to_le_bytes());
+            out.extend_from_slice(
+                &table
+                    .index_of(ContentKind::Block, content_name_of_block(registry, block)?)?
+                    .to_le_bytes(),
+            );
         }
     }
 
@@ -2822,6 +2948,1068 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
         } else {
             PersistenceError::InvalidContentMeta
         });
+    }
+
+    let unresolved = resolver.unresolved;
+    Ok(LoadedWorld {
+        data: WorldSaveData {
+            seed,
+            time_of_day,
+            day_index,
+            season_length_days,
+            mode,
+            player: SavedPlayerState {
+                position: [px, py, pz],
+                yaw,
+                pitch,
+                fly_mode: fly_raw != 0,
+                selected_slot,
+                render_distance,
+                inventory,
+                player_grid,
+                table_grid,
+                survival,
+            },
+            chests,
+            mobs,
+            chunk_edits,
+        },
+        registry: resolver.registry,
+        saved_content: Some(SaveContentMeta { packs, digest }),
+        saved_config,
+        unresolved,
+    })
+}
+
+// ---------------------------------------------------------------------
+// v10 sectioned writer and reader (D323)
+// ---------------------------------------------------------------------
+
+/// Sorted, kind-tagged v10 content table.
+///
+/// Entries are keyed by `(name, kind)` and wire-indexed in that order, which
+/// removes the v8 "guess the kind from context" ambiguity. Chunk palettes may
+/// only reference block (`kind` 1) entries.
+#[cfg(test)]
+struct V10ContentTable {
+    entries: Vec<(String, ContentKind)>,
+}
+
+#[cfg(test)]
+impl V10ContentTable {
+    /// Collects the same references as the v9 name-only table, but keeps the
+    /// wire kind and sorts by `(name, kind)`.
+    fn collect(data: &WorldSaveData, registry: &ContentRegistry) -> Result<Self, PersistenceError> {
+        let mut set: std::collections::BTreeSet<(String, ContentKind)> =
+            std::collections::BTreeSet::new();
+        for_each_content_ref(data, registry, |kind, name| {
+            set.insert((name.to_string(), kind));
+            Ok(())
+        })?;
+        if set.len() > MAX_SAVE_CONTENT_NAMES {
+            return Err(PersistenceError::InvalidContentTable);
+        }
+        Ok(Self {
+            entries: set.into_iter().collect(),
+        })
+    }
+
+    /// Encodes the body: `u32 count` then `{u8 kind, u16 name_len, name}`.
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), PersistenceError> {
+        let count =
+            u32::try_from(self.entries.len()).map_err(|_| PersistenceError::InvalidContentTable)?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for (name, kind) in &self.entries {
+            let len =
+                u16::try_from(name.len()).map_err(|_| PersistenceError::InvalidContentTable)?;
+            out.push(*kind as u8);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ContentTable for V10ContentTable {
+    fn index_of(&self, kind: ContentKind, name: &str) -> Result<u16, PersistenceError> {
+        self.entries
+            .binary_search_by(|(entry_name, entry_kind)| {
+                entry_name
+                    .as_str()
+                    .cmp(name)
+                    .then_with(|| entry_kind.cmp(&kind))
+            })
+            .map(|index| index as u16)
+            .map_err(|_| PersistenceError::InvalidContentName(name.to_string()))
+    }
+
+    fn index_of_item(
+        &self,
+        registry: &ContentRegistry,
+        item: Item,
+    ) -> Result<u16, PersistenceError> {
+        let (kind, name) = content_kind_and_name_of_item(registry, item)?;
+        self.index_of(kind, name)
+    }
+}
+
+/// Immature wheat is every wheat stage except the mature harvest stage.
+#[cfg(test)]
+fn is_immature_wheat(block: BlockId) -> bool {
+    block.is_wheat_stage() && block != BlockId::WheatStage3
+}
+
+/// Validates the whole payload, then builds every v10 section body in memory.
+///
+/// The caller gets a complete section list or a typed error: no output byte is
+/// emitted for a rejected save, matching the v9 writer's atomic-rejection
+/// contract.
+#[cfg(test)]
+fn build_v10_sections(
+    data: &WorldSaveData,
+    registry: &ContentRegistry,
+    config: SaveConfigMeta,
+) -> Result<Vec<(u32, Vec<u8>)>, PersistenceError> {
+    // A hand-built or stale meta must never reach the wire.
+    if config.schema != CONFIG_SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidConfigMeta);
+    }
+
+    // Every content reference, name bound, liquid edit and id lookup is
+    // validated here, before any section body is built.
+    let table = V10ContentTable::collect(data, registry)?;
+
+    if data.player.player_grid.kind() != GridKind::Player
+        || data.player.table_grid.kind() != GridKind::Table
+    {
+        return Err(PersistenceError::InvalidCraftingState);
+    }
+
+    let chest_count = checked_chest_count(data.chests.len())?;
+    let (mob_count, sorted_mobs) = checked_sorted_mobs(data)?;
+    let packs = checked_packs(registry)?;
+
+    let mut non_empty_chunks: Vec<(&ChunkPos, &FxHashMap<u16, BlockId>)> = data
+        .chunk_edits
+        .iter()
+        .filter(|(_, edits)| !edits.is_empty())
+        .collect();
+    if non_empty_chunks.len() > MAX_SAVED_CHUNKS {
+        return Err(PersistenceError::InvalidChunkIndex);
+    }
+    non_empty_chunks.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+
+    // Crop candidates are derived from the same edits and bounded here so an
+    // over-cap world rejects before the chunk bodies are encoded.
+    let mut crops: Vec<IVec3> = Vec::new();
+    for (pos, edits) in &non_empty_chunks {
+        for (&local, &block) in edits.iter() {
+            if is_immature_wheat(block) {
+                let (lx, ly, lz) = local_coords_from_index(local);
+                let chunk_size = i64::from(CHUNK_SIZE as i32);
+                let wx = i64::from(pos.x) * chunk_size + lx as i64;
+                let wy = i64::from(pos.y) * chunk_size + ly as i64;
+                let wz = i64::from(pos.z) * chunk_size + lz as i64;
+                let (Ok(wx), Ok(wy), Ok(wz)) =
+                    (i32::try_from(wx), i32::try_from(wy), i32::try_from(wz))
+                else {
+                    return Err(PersistenceError::InvalidCrops);
+                };
+                crops.push(IVec3::new(wx, wy, wz));
+            }
+        }
+    }
+    if crops.len() > MAX_SAVED_CROPS {
+        return Err(PersistenceError::InvalidCrops);
+    }
+    crops.sort_by_key(|pos| (pos.x, pos.y, pos.z));
+
+    let mut sections: Vec<(u32, Vec<u8>)> = Vec::new();
+
+    // 1: sorted kind-tagged content table.
+    let mut content_table = Vec::new();
+    table.encode(&mut content_table)?;
+    sections.push((V10_SECTION_CONTENT_TABLE, content_table));
+
+    // 2: world/player.
+    let mut world = Vec::new();
+    world.extend_from_slice(&data.seed.to_le_bytes());
+    for c in data.player.position {
+        world.extend_from_slice(&c.to_le_bytes());
+    }
+    world.extend_from_slice(&data.player.yaw.to_le_bytes());
+    world.extend_from_slice(&data.player.pitch.to_le_bytes());
+    world.push(u8::from(data.player.fly_mode && data.mode.allows_fly()));
+    world.push(data.player.selected_slot.min(8));
+    world.extend_from_slice(&data.player.render_distance.clamp(4, 36).to_le_bytes());
+    world.extend_from_slice(&data.time_of_day.clamp(0, DAY_TICKS).to_le_bytes());
+    world.extend_from_slice(&data.day_index.to_le_bytes());
+    world.extend_from_slice(
+        &data
+            .season_length_days
+            .clamp(1, MAX_SEASON_LENGTH_DAYS)
+            .to_le_bytes(),
+    );
+    world.push(game_mode_tag(data.mode));
+    world.extend_from_slice(&data.player.survival.health().to_le_bytes());
+    world.extend_from_slice(&data.player.survival.hunger().to_le_bytes());
+    world.extend_from_slice(&data.player.survival.air().to_le_bytes());
+    sections.push((V10_SECTION_WORLD_PLAYER, world));
+
+    // 3: 36 inventory slots, cursor, player grid and table grid.
+    let mut inventory = Vec::new();
+    write_v8_inventory_extension(
+        &mut inventory,
+        &data.player.inventory,
+        &data.player.player_grid,
+        &data.player.table_grid,
+        registry,
+        &table,
+    )?;
+    sections.push((V10_SECTION_INVENTORY, inventory));
+
+    // 4: chest count plus canonically sorted chest records.
+    let mut chests = Vec::new();
+    chests.extend_from_slice(&chest_count.to_le_bytes());
+    let mut sorted_chests: Vec<(&IVec3, &Container)> = data.chests.iter().collect();
+    sorted_chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    for (pos, container) in sorted_chests {
+        chests.extend_from_slice(&pos.x.to_le_bytes());
+        chests.extend_from_slice(&pos.y.to_le_bytes());
+        chests.extend_from_slice(&pos.z.to_le_bytes());
+        for slot in container.slots() {
+            write_v8_item(&mut chests, *slot, registry, &table)?;
+        }
+    }
+    sections.push((V10_SECTION_CHESTS, chests));
+
+    // 5: mob count plus canonically sorted mob records.
+    let mut mobs = Vec::new();
+    mobs.extend_from_slice(&mob_count.to_le_bytes());
+    for mob in sorted_mobs {
+        mobs.push(mob.kind.tag());
+        for c in mob.position {
+            mobs.extend_from_slice(&c.to_le_bytes());
+        }
+        mobs.extend_from_slice(&mob.yaw.to_le_bytes());
+        mobs.extend_from_slice(&mob.health.to_le_bytes());
+    }
+    sections.push((V10_SECTION_MOBS, mobs));
+
+    // 6: sorted pack identities plus the registry digest.
+    let mut content_meta = Vec::new();
+    let pack_count =
+        u32::try_from(packs.len()).map_err(|_| PersistenceError::InvalidContentMeta)?;
+    content_meta.extend_from_slice(&pack_count.to_le_bytes());
+    for pack in &packs {
+        write_pack_identity(&mut content_meta, pack)?;
+    }
+    content_meta.extend_from_slice(&registry.digest().to_le_bytes());
+    sections.push((V10_SECTION_CONTENT_META, content_meta));
+
+    // 7: config schema plus effective-value digest.
+    let mut config_section = Vec::new();
+    config_section.extend_from_slice(&config.schema.to_le_bytes());
+    config_section.extend_from_slice(&config.digest.to_le_bytes());
+    sections.push((V10_SECTION_CONFIG, config_section));
+
+    // 8: sorted immature-wheat world positions.
+    let mut crop_section = Vec::new();
+    let crop_count = u32::try_from(crops.len()).map_err(|_| PersistenceError::InvalidCrops)?;
+    crop_section.extend_from_slice(&crop_count.to_le_bytes());
+    for pos in crops {
+        crop_section.extend_from_slice(&pos.x.to_le_bytes());
+        crop_section.extend_from_slice(&pos.y.to_le_bytes());
+        crop_section.extend_from_slice(&pos.z.to_le_bytes());
+    }
+    sections.push((V10_SECTION_CROPS, crop_section));
+
+    // 9: sorted non-empty chunk index, then one palette section per chunk in
+    // the same order (ids 16..16+count).
+    let mut chunk_index = Vec::new();
+    let chunk_count =
+        u32::try_from(non_empty_chunks.len()).map_err(|_| PersistenceError::InvalidChunkIndex)?;
+    chunk_index.extend_from_slice(&chunk_count.to_le_bytes());
+    let mut chunk_sections: Vec<(u32, Vec<u8>)> = Vec::with_capacity(non_empty_chunks.len());
+    for (ordinal, (pos, edits)) in non_empty_chunks.iter().enumerate() {
+        chunk_index.extend_from_slice(&pos.x.to_le_bytes());
+        chunk_index.extend_from_slice(&pos.y.to_le_bytes());
+        chunk_index.extend_from_slice(&pos.z.to_le_bytes());
+        let edit_count =
+            u32::try_from(edits.len()).map_err(|_| PersistenceError::InvalidChunkIndex)?;
+        if edit_count == 0 || usize::try_from(edit_count).unwrap_or(usize::MAX) > CHUNK_VOLUME {
+            return Err(PersistenceError::InvalidChunkIndex);
+        }
+        chunk_index.extend_from_slice(&edit_count.to_le_bytes());
+
+        let mut sorted_edits: Vec<(u16, u16)> = Vec::with_capacity(edits.len());
+        for (&local, &block) in edits.iter() {
+            let name_index =
+                table.index_of(ContentKind::Block, content_name_of_block(registry, block)?)?;
+            sorted_edits.push((local, name_index));
+        }
+        sorted_edits.sort_by_key(|&(local, _)| local);
+
+        let mut body = Vec::new();
+        opencraft_storage::chunk_section::encode_chunk_section(&mut body, &sorted_edits)?;
+        let id = V10_CHUNK_SECTION_BASE
+            .checked_add(u32::try_from(ordinal).map_err(|_| PersistenceError::InvalidChunkIndex)?)
+            .ok_or(PersistenceError::InvalidChunkIndex)?;
+        chunk_sections.push((id, body));
+    }
+    sections.push((V10_SECTION_CHUNK_INDEX, chunk_index));
+    sections.extend(chunk_sections);
+    sections.sort_by_key(|(id, _)| *id);
+    Ok(sections)
+}
+
+/// Encodes a v10 archive into `out` through the neutral storage crate.
+#[cfg(test)]
+fn write_v10_world(
+    out: &mut Vec<u8>,
+    data: &WorldSaveData,
+    registry: &ContentRegistry,
+    config: SaveConfigMeta,
+) -> Result<(), PersistenceError> {
+    let sections = build_v10_sections(data, registry, config)?;
+    let borrowed: Vec<(SectionId, &[u8])> = sections
+        .iter()
+        .map(|(id, body)| (SectionId(*id), body.as_slice()))
+        .collect();
+    let archive = encode_archive(V10_SAVE_VERSION, 0, &borrowed)?;
+    out.extend_from_slice(&archive);
+    Ok(())
+}
+
+/// One eagerly resolved v10 content-table entry.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedContent {
+    Block(BlockId),
+    Material(Material),
+    Tool {
+        kind: ToolKind,
+        tier: ToolTier,
+    },
+    /// A generic item, including a deterministic placeholder.
+    Item(u16),
+    /// A live pack tool (dense tool index).
+    ModTool(u16),
+    /// A degraded pack tool: a count-one placeholder item whose stale wear is
+    /// not carried over.
+    ModToolPlaceholder(u16),
+}
+
+#[cfg(test)]
+fn content_kind_from_tag(tag: u8) -> Option<ContentKind> {
+    match tag {
+        1 => Some(ContentKind::Block),
+        2 => Some(ContentKind::Material),
+        3 => Some(ContentKind::Tool),
+        4 => Some(ContentKind::GenericItem),
+        5 => Some(ContentKind::ModTool),
+        _ => None,
+    }
+}
+
+/// Validated v10 content table plus the registry it resolved against.
+///
+/// The whole table is validated before any name is resolved, then every entry
+/// is resolved eagerly in table order. Placeholders are therefore appended in
+/// `(name, kind)` order, which is intentionally different from the v9
+/// first-reference order and pinned by a test.
+#[cfg(test)]
+struct V10Resolver {
+    entries: Vec<(ContentKind, String)>,
+    resolved: Vec<ResolvedContent>,
+    registry: ContentRegistry,
+    unresolved: usize,
+}
+
+#[cfg(test)]
+impl V10Resolver {
+    fn parse(body: &[u8], base: &ContentRegistry) -> Result<Self, PersistenceError> {
+        let mut cur = Cursor::new(body);
+        let count_raw = read_u32(&mut cur)?;
+        let count =
+            usize::try_from(count_raw).map_err(|_| PersistenceError::InvalidContentTable)?;
+        if count > MAX_SAVE_CONTENT_NAMES {
+            return Err(PersistenceError::InvalidContentTable);
+        }
+        let mut entries: Vec<(ContentKind, String)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kind_raw = read_u8(&mut cur)?;
+            let kind =
+                content_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidContentTable)?;
+            let len_raw = read_u16(&mut cur)?;
+            let len = usize::from(len_raw);
+            if len == 0 || len > MAX_SAVE_CONTENT_NAME_LEN {
+                return Err(PersistenceError::InvalidContentTable);
+            }
+            let mut buf = vec![0u8; len];
+            cur.read_exact(&mut buf)?;
+            let name = String::from_utf8(buf).map_err(|_| PersistenceError::InvalidContentTable)?;
+            if !is_wire_content_name(&name) {
+                return Err(PersistenceError::InvalidContentName(name));
+            }
+            if let Some((previous_kind, previous_name)) = entries.last() {
+                if (previous_name.as_str(), *previous_kind) >= (name.as_str(), kind) {
+                    return Err(PersistenceError::InvalidContentTable);
+                }
+            }
+            entries.push((kind, name));
+        }
+        if cur.position() != body.len() as u64 {
+            return Err(PersistenceError::InvalidContentTable);
+        }
+
+        let mut resolver = Self {
+            entries,
+            resolved: Vec::with_capacity(count),
+            registry: base.clone(),
+            unresolved: 0,
+        };
+        resolver.resolve_all()?;
+        Ok(resolver)
+    }
+
+    fn resolve_all(&mut self) -> Result<(), PersistenceError> {
+        for index in 0..self.entries.len() {
+            let (kind, name) = self.entries[index].clone();
+            let resolved = match kind {
+                ContentKind::Block => ResolvedContent::Block(self.resolve_block(&name)?),
+                ContentKind::Material => {
+                    let material = names::builtin_material_by_name(&name)
+                        .ok_or_else(|| PersistenceError::InvalidContentName(name.clone()))?;
+                    ResolvedContent::Material(material)
+                }
+                ContentKind::Tool => match names::builtin_tool_id_by_name(&name) {
+                    Some(ItemId::Tool { kind, tier }) => ResolvedContent::Tool { kind, tier },
+                    _ => return Err(PersistenceError::InvalidContentName(name)),
+                },
+                ContentKind::GenericItem => ResolvedContent::Item(self.resolve_item(&name)?),
+                ContentKind::ModTool => self.resolve_mod_tool(&name)?,
+            };
+            self.resolved.push(resolved);
+        }
+        Ok(())
+    }
+
+    /// Whether `name` exists in the registry under a different content kind.
+    fn exists_under_other_kind(&self, name: &str) -> bool {
+        self.registry.item_by_name(name).is_some()
+            || self.registry.tool_by_name(name).is_some()
+            || self.registry.tier_by_name(name).is_some()
+            || self.registry.recipe_by_name(name).is_some()
+    }
+
+    fn resolve_block(&mut self, name: &str) -> Result<BlockId, PersistenceError> {
+        if let Some(block) = names::builtin_block_id_by_name(name) {
+            if block.is_liquid() {
+                return Err(PersistenceError::InvalidBlockId(block.to_raw()));
+            }
+            return Ok(block);
+        }
+        if names::builtin_item_id_by_name(name).is_some() || self.exists_under_other_kind(name) {
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if let Some(def) = self.registry.block_by_name(name) {
+            return Ok(def.id);
+        }
+        if is_placeholder_content_name(name) {
+            let id = self.registry.append_placeholder_block(name);
+            self.unresolved += 1;
+            return Ok(id);
+        }
+        Err(PersistenceError::InvalidContentName(name.to_string()))
+    }
+
+    fn resolve_item(&mut self, name: &str) -> Result<u16, PersistenceError> {
+        if let Some(def) = self.registry.item_by_name(name) {
+            return Ok(def.index);
+        }
+        if names::builtin_item_id_by_name(name).is_some()
+            || self.registry.block_by_name(name).is_some()
+            || self.exists_under_other_kind(name)
+        {
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if is_placeholder_content_name(name) {
+            let index = self.registry.append_placeholder_item(name);
+            self.unresolved += 1;
+            return Ok(index);
+        }
+        Err(PersistenceError::InvalidContentName(name.to_string()))
+    }
+
+    fn resolve_mod_tool(&mut self, name: &str) -> Result<ResolvedContent, PersistenceError> {
+        if let Some(def) = self.registry.tool_by_name(name) {
+            return Ok(ResolvedContent::ModTool(def.index));
+        }
+        if let Some(def) = self.registry.item_by_name(name) {
+            if def.placeholder {
+                return Ok(ResolvedContent::ModToolPlaceholder(def.index));
+            }
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if names::builtin_item_id_by_name(name).is_some()
+            || self.registry.block_by_name(name).is_some()
+            || self.registry.tier_by_name(name).is_some()
+            || self.registry.recipe_by_name(name).is_some()
+        {
+            return Err(PersistenceError::InvalidContentName(name.to_string()));
+        }
+        if is_placeholder_content_name(name) {
+            let index = self.registry.append_placeholder_tool_item(name);
+            self.unresolved += 1;
+            return Ok(ResolvedContent::ModToolPlaceholder(index));
+        }
+        Err(PersistenceError::InvalidContentName(name.to_string()))
+    }
+
+    fn name(&self, index: u16) -> Result<&str, PersistenceError> {
+        self.entries
+            .get(usize::from(index))
+            .map(|(_, name)| name.as_str())
+            .ok_or(PersistenceError::InvalidContentTable)
+    }
+
+    fn resolved(&self, index: u16) -> Result<ResolvedContent, PersistenceError> {
+        self.resolved
+            .get(usize::from(index))
+            .copied()
+            .ok_or(PersistenceError::InvalidContentTable)
+    }
+
+    /// Resolves one chunk-palette entry; only block entries are legal there.
+    fn block_at(&self, index: u16) -> Result<BlockId, PersistenceError> {
+        match self.resolved(index)? {
+            ResolvedContent::Block(block) => Ok(block),
+            _ => Err(PersistenceError::InvalidContentName(
+                self.name(index)?.to_string(),
+            )),
+        }
+    }
+
+    fn mod_tool_max_durability(&self, index: u16) -> Option<u16> {
+        let def = self.registry.tool(index)?;
+        let tier = self.registry.tier(def.tier)?;
+        Some(tier.durability.max(1))
+    }
+}
+
+/// Reads one v10 item record, enforcing wire-tag/kind agreement.
+#[cfg(test)]
+fn read_v10_item<R: Read>(
+    r: &mut R,
+    resolver: &V10Resolver,
+) -> Result<Option<Item>, PersistenceError> {
+    let tag = read_u8(r)?;
+    match tag {
+        ITEM_TAG_EMPTY => Ok(None),
+        ITEM_TAG_BLOCK => {
+            let index = read_u16(r)?;
+            let count = read_u16(r)?;
+            let block = resolver.block_at(index)?;
+            Item::new(ItemId::Block(block), count)
+                .map(Some)
+                .map_err(PersistenceError::InvalidItem)
+        }
+        ITEM_TAG_MATERIAL => {
+            let index = read_u16(r)?;
+            let count = read_u16(r)?;
+            match resolver.resolved(index)? {
+                ResolvedContent::Material(material) => Item::new(ItemId::Material(material), count)
+                    .map(Some)
+                    .map_err(PersistenceError::InvalidItem),
+                _ => Err(PersistenceError::InvalidContentName(
+                    resolver.name(index)?.to_string(),
+                )),
+            }
+        }
+        ITEM_TAG_TOOL => {
+            let index = read_u16(r)?;
+            let durability = read_u16(r)?;
+            match resolver.resolved(index)? {
+                ResolvedContent::Tool { kind, tier } => {
+                    Item::tool_with_durability(kind, tier, durability)
+                        .map(Some)
+                        .map_err(PersistenceError::InvalidItem)
+                }
+                _ => Err(PersistenceError::InvalidContentName(
+                    resolver.name(index)?.to_string(),
+                )),
+            }
+        }
+        ITEM_TAG_GENERIC => {
+            let index = read_u16(r)?;
+            let count = read_u16(r)?;
+            match resolver.resolved(index)? {
+                ResolvedContent::Item(item_index) => Item::new(ItemId::Item(item_index), count)
+                    .map(Some)
+                    .map_err(PersistenceError::InvalidItem),
+                _ => Err(PersistenceError::InvalidContentName(
+                    resolver.name(index)?.to_string(),
+                )),
+            }
+        }
+        ITEM_TAG_MOD_TOOL => {
+            let index = read_u16(r)?;
+            let durability = read_u16(r)?;
+            if durability == 0 {
+                return Err(PersistenceError::InvalidItem(ItemError::InvalidDurability));
+            }
+            let name = resolver.name(index)?.to_string();
+            match resolver.resolved(index)? {
+                ResolvedContent::ModTool(tool_index) => {
+                    // Persistence policy: a saved durability above the
+                    // authored maximum clamps instead of bricking the world.
+                    let max = resolver
+                        .mod_tool_max_durability(tool_index)
+                        .ok_or_else(|| PersistenceError::InvalidContentName(name.clone()))?;
+                    Item::tool_with_durability_with(
+                        &resolver.registry,
+                        ItemId::ModTool(tool_index),
+                        durability.min(max),
+                    )
+                    .map(Some)
+                    .map_err(PersistenceError::InvalidItem)
+                }
+                // A degraded pack tool becomes a count-one placeholder item;
+                // its stale durability is intentionally not carried over.
+                ResolvedContent::ModToolPlaceholder(item_index) => {
+                    Item::new_with(&resolver.registry, ItemId::Item(item_index), 1)
+                        .map(Some)
+                        .map_err(PersistenceError::InvalidItem)
+                }
+                _ => Err(PersistenceError::InvalidContentName(name)),
+            }
+        }
+        other => Err(PersistenceError::InvalidItemTag(other)),
+    }
+}
+
+#[cfg(test)]
+fn read_v10_grid<R: Read>(
+    r: &mut R,
+    resolver: &V10Resolver,
+    expected: GridKind,
+) -> Result<CraftingGrid, PersistenceError> {
+    let kind_raw = read_u8(r)?;
+    let kind = grid_kind_from_tag(kind_raw).ok_or(PersistenceError::InvalidGridKind(kind_raw))?;
+    if kind != expected {
+        return Err(PersistenceError::InvalidCraftingState);
+    }
+
+    let mut slots = [None; MAX_GRID_SLOTS];
+    for slot in slots.iter_mut().take(kind.slot_count()) {
+        *slot = read_v10_item(r, resolver)?;
+    }
+    CraftingGrid::from_slots(kind, slots).map_err(|_| PersistenceError::InvalidCraftingState)
+}
+
+#[cfg(test)]
+fn read_v10_inventory_extension<R: Read>(
+    r: &mut R,
+    resolver: &V10Resolver,
+) -> Result<(Inventory, CraftingGrid, CraftingGrid), PersistenceError> {
+    let mut slots = [None; INVENTORY_SLOTS];
+    for slot in slots.iter_mut() {
+        *slot = read_v10_item(r, resolver)?;
+    }
+    let cursor = read_v10_item(r, resolver)?;
+    let player_grid = read_v10_grid(r, resolver, GridKind::Player)?;
+    let table_grid = read_v10_grid(r, resolver, GridKind::Table)?;
+    Ok((
+        Inventory::from_parts(slots, cursor),
+        player_grid,
+        table_grid,
+    ))
+}
+
+/// Decodes a v10 archive into a placeholder-augmented registry.
+///
+/// Every required fixed section must appear exactly once, chunk section ids
+/// must be exactly `16..16+index_count`, the content table is fully validated
+/// before any name is resolved, and every section body must be fully consumed.
+/// A forged payload fails closed with a typed error; this decoder never
+/// panics.
+#[cfg(test)]
+fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, PersistenceError> {
+    if image.version() != V10_SAVE_VERSION {
+        return Err(PersistenceError::UnsupportedVersion(image.version()));
+    }
+
+    let mut fixed: Vec<Option<&[u8]>> = vec![None; 10];
+    let mut chunk_ids: Vec<u32> = Vec::new();
+    for entry in image.sections() {
+        let id = entry.id().0;
+        if (1..=9).contains(&id) {
+            fixed[id as usize] = image.section(entry.id());
+        } else if V10_RESERVED_SECTION_IDS.contains(&id) {
+            return Err(PersistenceError::InvalidArchive(
+                StorageError::InvalidSectionDirectory,
+            ));
+        } else if id >= V10_CHUNK_SECTION_BASE {
+            chunk_ids.push(id);
+        } else {
+            return Err(PersistenceError::InvalidArchive(
+                StorageError::InvalidSectionDirectory,
+            ));
+        }
+    }
+
+    // 1: validate the whole content table, then eagerly resolve it in table
+    // order.
+    let content_body =
+        fixed[V10_SECTION_CONTENT_TABLE as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_CONTENT_TABLE,
+        })?;
+    let resolver = V10Resolver::parse(content_body, base)?;
+
+    // 2: world/player.
+    let world_body =
+        fixed[V10_SECTION_WORLD_PLAYER as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_WORLD_PLAYER,
+        })?;
+    let mut cur = Cursor::new(world_body);
+    let seed = read_u32(&mut cur)?;
+    let px = read_f32(&mut cur)?;
+    let py = read_f32(&mut cur)?;
+    let pz = read_f32(&mut cur)?;
+    let yaw = read_f32(&mut cur)?;
+    let pitch = read_f32(&mut cur)?;
+    let fly_raw = read_u8(&mut cur)?;
+    let selected_slot = read_u8(&mut cur)?;
+    let render_distance = read_u16(&mut cur)?;
+    let time_of_day = read_u32(&mut cur)?.min(DAY_TICKS - 1);
+    let day_index = read_u32(&mut cur)?;
+    let raw_season_length = read_u32(&mut cur)?;
+    let mode_raw = read_u8(&mut cur)?;
+    let health = read_u16(&mut cur)?;
+    let hunger = read_u16(&mut cur)?;
+    let air = read_u16(&mut cur)?;
+    if selected_slot >= 9 || !(4..=36).contains(&render_distance) {
+        return Err(PersistenceError::InvalidPlayerState);
+    }
+    let mode = game_mode_from_tag(mode_raw).ok_or(PersistenceError::InvalidGameMode(mode_raw))?;
+    let survival =
+        SurvivalState::new(health, hunger, air).ok_or(PersistenceError::InvalidVitals {
+            health,
+            hunger,
+            air,
+        })?;
+    let season_length_days = if (1..=MAX_SEASON_LENGTH_DAYS).contains(&raw_season_length) {
+        raw_season_length
+    } else {
+        DEFAULT_SEASON_LENGTH_DAYS
+    };
+    if cur.position() != world_body.len() as u64 {
+        return Err(PersistenceError::InvalidPlayerState);
+    }
+
+    // 3: inventory, cursor and both grids.
+    let inventory_body =
+        fixed[V10_SECTION_INVENTORY as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_INVENTORY,
+        })?;
+    let mut cur = Cursor::new(inventory_body);
+    let (inventory, player_grid, table_grid) = read_v10_inventory_extension(&mut cur, &resolver)?;
+    if cur.position() != inventory_body.len() as u64 {
+        return Err(PersistenceError::InvalidCraftingState);
+    }
+
+    // 4: chests.
+    let chests_body =
+        fixed[V10_SECTION_CHESTS as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_CHESTS,
+        })?;
+    let mut cur = Cursor::new(chests_body);
+    let chest_count_raw = read_u32(&mut cur)?;
+    let chest_count =
+        usize::try_from(chest_count_raw).map_err(|_| PersistenceError::InvalidChestState)?;
+    if chest_count > MAX_SAVED_CHESTS {
+        return Err(PersistenceError::InvalidChestState);
+    }
+    let mut chests: ChestMap = FxHashMap::default();
+    for _ in 0..chest_count {
+        let x = read_i32(&mut cur)?;
+        let y = read_i32(&mut cur)?;
+        let z = read_i32(&mut cur)?;
+        let pos = IVec3::new(x, y, z);
+        if chests.contains_key(&pos) {
+            return Err(PersistenceError::InvalidChestState);
+        }
+        let mut slots: ChestSlots = [None; CHEST_SLOTS];
+        for slot in slots.iter_mut() {
+            *slot = read_v10_item(&mut cur, &resolver)?;
+        }
+        chests.insert(pos, Container::from_slots(slots));
+    }
+    if cur.position() != chests_body.len() as u64 {
+        return Err(PersistenceError::InvalidChestState);
+    }
+
+    // 5: mobs.
+    let mobs_body = fixed[V10_SECTION_MOBS as usize].ok_or(PersistenceError::MissingSection {
+        id: V10_SECTION_MOBS,
+    })?;
+    let mut cur = Cursor::new(mobs_body);
+    let mob_count_raw = read_u32(&mut cur)?;
+    let mob_count =
+        usize::try_from(mob_count_raw).map_err(|_| PersistenceError::InvalidMobState)?;
+    if mob_count > MAX_SAVED_MOBS {
+        return Err(PersistenceError::InvalidMobState);
+    }
+    let mut mobs: Vec<SavedMob> = Vec::with_capacity(mob_count);
+    for _ in 0..mob_count {
+        let tag = read_u8(&mut cur)?;
+        let Some(kind) = MobKind::from_tag(tag) else {
+            return Err(PersistenceError::InvalidMobKind(tag));
+        };
+        let x = read_mob_f32(&mut cur)?;
+        let y = read_mob_f32(&mut cur)?;
+        let z = read_mob_f32(&mut cur)?;
+        let mob_yaw = read_mob_f32(&mut cur)?;
+        let mob_health = read_u16(&mut cur)?;
+        if mob_health > kind.max_health() {
+            return Err(PersistenceError::InvalidMobState);
+        }
+        mobs.push(SavedMob {
+            kind,
+            position: [x, y, z],
+            yaw: mob_yaw,
+            health: mob_health,
+        });
+    }
+    let mut keys: Vec<(u8, f32, f32, f32)> = mobs
+        .iter()
+        .map(|mob| {
+            (
+                mob.kind.tag(),
+                mob.position[0],
+                mob.position[1],
+                mob.position[2],
+            )
+        })
+        .collect();
+    keys.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.3.total_cmp(&b.3))
+    });
+    if keys.windows(2).any(|pair| {
+        pair[0].0 == pair[1].0
+            && pair[0].1 == pair[1].1
+            && pair[0].2 == pair[1].2
+            && pair[0].3 == pair[1].3
+    }) {
+        return Err(PersistenceError::InvalidMobState);
+    }
+    if cur.position() != mobs_body.len() as u64 {
+        return Err(PersistenceError::InvalidMobState);
+    }
+
+    // 6: content metadata.
+    let meta_body =
+        fixed[V10_SECTION_CONTENT_META as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_CONTENT_META,
+        })?;
+    let mut cur = Cursor::new(meta_body);
+    let pack_count_raw = read_u32(&mut cur)?;
+    let pack_count =
+        usize::try_from(pack_count_raw).map_err(|_| PersistenceError::InvalidContentMeta)?;
+    if pack_count > MAX_SAVED_PACKS {
+        return Err(PersistenceError::InvalidContentMeta);
+    }
+    let mut packs: Vec<PackIdentity> = Vec::with_capacity(pack_count);
+    for _ in 0..pack_count {
+        let folder_len_raw = read_u16(&mut cur)?;
+        let folder_len = usize::from(folder_len_raw);
+        if folder_len == 0 || folder_len > MAX_SAVE_CONTENT_NAME_LEN {
+            return Err(PersistenceError::InvalidContentMeta);
+        }
+        let mut folder_bytes = vec![0u8; folder_len];
+        cur.read_exact(&mut folder_bytes)?;
+        let folder =
+            String::from_utf8(folder_bytes).map_err(|_| PersistenceError::InvalidContentMeta)?;
+        let has_version = read_u8(&mut cur)?;
+        let version = match has_version {
+            0 => None,
+            1 => {
+                let version_len_raw = read_u16(&mut cur)?;
+                let version_len = usize::from(version_len_raw);
+                if version_len == 0 || version_len > MAX_SAVE_CONTENT_NAME_LEN {
+                    return Err(PersistenceError::InvalidContentMeta);
+                }
+                let mut version_bytes = vec![0u8; version_len];
+                cur.read_exact(&mut version_bytes)?;
+                Some(
+                    String::from_utf8(version_bytes)
+                        .map_err(|_| PersistenceError::InvalidContentMeta)?,
+                )
+            }
+            _ => return Err(PersistenceError::InvalidContentMeta),
+        };
+        if let Some(previous) = packs.last() {
+            if previous.folder.as_str() >= folder.as_str() {
+                return Err(PersistenceError::InvalidContentMeta);
+            }
+        }
+        packs.push(PackIdentity { folder, version });
+    }
+    let digest = read_u64(&mut cur)?;
+    if cur.position() != meta_body.len() as u64 {
+        return Err(PersistenceError::InvalidContentMeta);
+    }
+
+    // 7: config.
+    let config_body =
+        fixed[V10_SECTION_CONFIG as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_CONFIG,
+        })?;
+    let mut cur = Cursor::new(config_body);
+    let schema = read_u16(&mut cur)?;
+    if schema == 0 {
+        return Err(PersistenceError::InvalidConfigMeta);
+    }
+    let config_digest = read_u64(&mut cur)?;
+    if cur.position() != config_body.len() as u64 {
+        return Err(PersistenceError::InvalidConfigMeta);
+    }
+    let saved_config = Some(SaveConfigMeta {
+        schema,
+        digest: config_digest,
+    });
+
+    // 8: crops.
+    let crops_body = fixed[V10_SECTION_CROPS as usize].ok_or(PersistenceError::MissingSection {
+        id: V10_SECTION_CROPS,
+    })?;
+    let mut cur = Cursor::new(crops_body);
+    let crop_count_raw = read_u32(&mut cur)?;
+    let crop_count = usize::try_from(crop_count_raw).map_err(|_| PersistenceError::InvalidCrops)?;
+    if crop_count > MAX_SAVED_CROPS {
+        return Err(PersistenceError::InvalidCrops);
+    }
+    let remaining = crops_body.len() as u64 - cur.position();
+    if u64::try_from(crop_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(12)
+        > remaining
+    {
+        return Err(PersistenceError::InvalidCrops);
+    }
+    let mut crops: Vec<IVec3> = Vec::with_capacity(crop_count);
+    for _ in 0..crop_count {
+        let x = read_i32(&mut cur)?;
+        let y = read_i32(&mut cur)?;
+        let z = read_i32(&mut cur)?;
+        let pos = IVec3::new(x, y, z);
+        if let Some(previous) = crops.last() {
+            if (previous.x, previous.y, previous.z) >= (pos.x, pos.y, pos.z) {
+                return Err(PersistenceError::InvalidCrops);
+            }
+        }
+        crops.push(pos);
+    }
+    if cur.position() != crops_body.len() as u64 {
+        return Err(PersistenceError::InvalidCrops);
+    }
+
+    // 9: chunk index.
+    let index_body =
+        fixed[V10_SECTION_CHUNK_INDEX as usize].ok_or(PersistenceError::MissingSection {
+            id: V10_SECTION_CHUNK_INDEX,
+        })?;
+    let mut cur = Cursor::new(index_body);
+    let chunk_count_raw = read_u32(&mut cur)?;
+    let chunk_count =
+        usize::try_from(chunk_count_raw).map_err(|_| PersistenceError::InvalidChunkIndex)?;
+    if chunk_count > MAX_SAVED_CHUNKS {
+        return Err(PersistenceError::InvalidChunkIndex);
+    }
+    let remaining = index_body.len() as u64 - cur.position();
+    if u64::try_from(chunk_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(16)
+        > remaining
+    {
+        return Err(PersistenceError::InvalidChunkIndex);
+    }
+    let mut records: Vec<(ChunkPos, u32)> = Vec::with_capacity(chunk_count);
+    for _ in 0..chunk_count {
+        let x = read_i32(&mut cur)?;
+        let y = read_i32(&mut cur)?;
+        let z = read_i32(&mut cur)?;
+        let pos = ChunkPos::new(x, y, z);
+        let edit_count = read_u32(&mut cur)?;
+        if edit_count == 0 || usize::try_from(edit_count).unwrap_or(usize::MAX) > CHUNK_VOLUME {
+            return Err(PersistenceError::InvalidChunkIndex);
+        }
+        if let Some((previous, _)) = records.last() {
+            if (previous.x, previous.y, previous.z) >= (pos.x, pos.y, pos.z) {
+                return Err(PersistenceError::InvalidChunkIndex);
+            }
+        }
+        records.push((pos, edit_count));
+    }
+    if cur.position() != index_body.len() as u64 {
+        return Err(PersistenceError::InvalidChunkIndex);
+    }
+
+    // Chunk section ids must be exactly `16..16+count`, in index order.
+    if chunk_ids.len() != records.len() {
+        return Err(PersistenceError::InvalidChunkIndex);
+    }
+    for (ordinal, id) in chunk_ids.iter().enumerate() {
+        let expected = V10_CHUNK_SECTION_BASE
+            .checked_add(ordinal as u32)
+            .ok_or(PersistenceError::InvalidChunkIndex)?;
+        if *id != expected {
+            return Err(PersistenceError::InvalidChunkIndex);
+        }
+    }
+
+    let mut chunk_edits: ChunkEditMap = FxHashMap::default();
+    for (ordinal, (pos, edit_count)) in records.into_iter().enumerate() {
+        let id = V10_CHUNK_SECTION_BASE + ordinal as u32;
+        let section_body = image
+            .section(SectionId(id))
+            .ok_or(PersistenceError::InvalidChunkIndex)?;
+        let section =
+            ChunkSection::decode(section_body).map_err(PersistenceError::InvalidChunkSection)?;
+        if section.len() as u32 != edit_count {
+            return Err(PersistenceError::InvalidChunkIndex);
+        }
+        let mut edits = FxHashMap::default();
+        for &(local, palette_index) in section.edits() {
+            let content_index = *section.palette().get(usize::from(palette_index)).ok_or(
+                PersistenceError::InvalidChunkSection(StorageError::PaletteIndexOutOfRange {
+                    index: palette_index,
+                    palette_len: section.palette().len() as u16,
+                }),
+            )?;
+            let block = resolver.block_at(content_index)?;
+            edits.insert(local, block);
+        }
+        chunk_edits.insert(pos, edits);
+    }
+
+    // Every crop position must name an immature-wheat edit in the decoded
+    // chunks; a scattered or stale crop is a forged payload.
+    for crop in &crops {
+        let (chunk_pos, (lx, ly, lz)) = world_to_chunk_and_local(crop.x, crop.y, crop.z);
+        let local = linear_index(lx, ly, lz) as u16;
+        let block = chunk_edits
+            .get(&chunk_pos)
+            .and_then(|edits| edits.get(&local))
+            .copied();
+        if !block.is_some_and(is_immature_wheat) {
+            return Err(PersistenceError::InvalidCrops);
+        }
     }
 
     let unresolved = resolver.unresolved;
@@ -6585,7 +7773,7 @@ mod tests {
         let table = ContentNameTable::collect(&data, &registry).expect("v8 names pack tools");
         assert_eq!(
             table
-                .index_of("mymod:ruby_pickaxe")
+                .index_of(ContentKind::ModTool, "mymod:ruby_pickaxe")
                 .expect("tool name is tabled"),
             0
         );
@@ -7686,5 +8874,746 @@ mod tests {
         assert_eq!(loaded.player, data.player);
         assert_eq!(loaded.seed, data.seed);
         assert_eq!(loaded.time_of_day, data.time_of_day);
+    }
+
+    // ------------------------------------------------------------------
+    // v10 sectioned format (D323)
+    // ------------------------------------------------------------------
+
+    /// Header (16) + nine 21-byte directory entries + the empty bodies.
+    const V10_EMPTY_SAVE_LEN: usize = 353;
+
+    fn v10_archive(data: &WorldSaveData, registry: &ContentRegistry) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_v10_world(&mut bytes, data, registry, ConfigRuntime::defaults().meta())
+            .expect("v10 archive encodes");
+        bytes
+    }
+
+    fn v10_sections(data: &WorldSaveData, registry: &ContentRegistry) -> Vec<(u32, Vec<u8>)> {
+        build_v10_sections(data, registry, ConfigRuntime::defaults().meta())
+            .expect("v10 sections build")
+    }
+
+    fn v10_archive_from_sections(sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let borrowed: Vec<(SectionId, &[u8])> = sections
+            .iter()
+            .map(|(id, body)| (SectionId(*id), body.as_slice()))
+            .collect();
+        encode_archive(V10_SAVE_VERSION, 0, &borrowed).expect("v10 archive encodes")
+    }
+
+    fn decode_v10_bytes(
+        bytes: Vec<u8>,
+        registry: &ContentRegistry,
+    ) -> Result<LoadedWorld, PersistenceError> {
+        let image = SaveImage::parse(bytes).map_err(PersistenceError::from)?;
+        decode_v10(image, registry)
+    }
+
+    fn v10_section_mut(sections: &mut [(u32, Vec<u8>)], id: u32) -> &mut Vec<u8> {
+        &mut sections
+            .iter_mut()
+            .find(|(section_id, _)| *section_id == id)
+            .expect("section exists")
+            .1
+    }
+
+    /// Rich payload covering every fixed section plus three chunks, one of
+    /// which holds an immature and a mature wheat edit.
+    fn v10_rich_data() -> WorldSaveData {
+        let mut data = v8_fixture_data();
+        let mut wheat = rustc_hash::FxHashMap::default();
+        wheat.insert(linear_index(1, 2, 3) as u16, BlockId::WheatStage1);
+        wheat.insert(linear_index(4, 5, 6) as u16, BlockId::WheatStage3);
+        data.chunk_edits.insert(ChunkPos::new(-1, 2, 4), wheat);
+        let mut dirt = rustc_hash::FxHashMap::default();
+        dirt.insert(linear_index(0, 0, 0) as u16, BlockId::Dirt);
+        data.chunk_edits.insert(ChunkPos::new(0, 0, 0), dirt);
+        data
+    }
+
+    fn v10_single_chunk_data() -> WorldSaveData {
+        let mut data = sample_data(sample_player());
+        let mut edits = rustc_hash::FxHashMap::default();
+        edits.insert(linear_index(1, 2, 3) as u16, BlockId::Stone);
+        data.chunk_edits.insert(ChunkPos::new(0, 0, 0), edits);
+        data
+    }
+
+    #[test]
+    fn v10_roundtrips_rich_world_and_resaves_byte_stably() {
+        let data = v10_rich_data();
+        let registry = ContentRegistry::builtin().clone();
+        let bytes = v10_archive(&data, &registry);
+
+        assert_eq!(&bytes[..4], &SAVE_MAGIC[..]);
+        assert_eq!(&bytes[4..8], &V10_SAVE_VERSION.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0u32.to_le_bytes());
+
+        let image = SaveImage::parse(bytes.clone()).expect("archive parses");
+        assert_eq!(image.version(), V10_SAVE_VERSION);
+        assert_eq!(
+            image.section_count(),
+            9 + data.chunk_edits.len(),
+            "nine fixed sections plus one section per non-empty chunk"
+        );
+        let ids: Vec<u32> = image.sections().map(|entry| entry.id().0).collect();
+        assert_eq!(
+            ids,
+            (1..=9)
+                .chain(16..(16 + data.chunk_edits.len() as u32))
+                .collect::<Vec<_>>()
+        );
+
+        let loaded = decode_v10_bytes(bytes.clone(), &registry).expect("v10 loads");
+        assert_eq!(loaded.data, data);
+        assert_eq!(loaded.unresolved, 0);
+        assert_eq!(loaded.saved_config, Some(ConfigRuntime::defaults().meta()));
+        let meta = loaded
+            .saved_content
+            .as_ref()
+            .expect("v10 carries content meta");
+        assert!(meta.packs.is_empty());
+        assert_eq!(meta.digest, registry.digest());
+
+        assert_eq!(
+            v10_archive(&data, &registry),
+            bytes,
+            "repeated saves are deterministic"
+        );
+        assert_eq!(
+            v10_archive(&loaded.data, &loaded.registry),
+            bytes,
+            "a decoded v10 world re-saves byte-stably"
+        );
+    }
+
+    #[test]
+    fn v10_bytes_are_independent_of_chunk_insertion_order() {
+        let entries = [
+            (
+                ChunkPos::new(3, 1, -2),
+                linear_index(1, 2, 3) as u16,
+                BlockId::Stone,
+            ),
+            (
+                ChunkPos::new(-1, 0, 4),
+                linear_index(5, 6, 7) as u16,
+                BlockId::Dirt,
+            ),
+            (
+                ChunkPos::new(0, 2, 0),
+                linear_index(8, 9, 10) as u16,
+                BlockId::OakPlanks,
+            ),
+        ];
+        let mut forward = sample_data(sample_player());
+        let mut reverse = sample_data(sample_player());
+        for (pos, local, block) in entries.iter() {
+            let mut edits = rustc_hash::FxHashMap::default();
+            edits.insert(*local, *block);
+            forward.chunk_edits.insert(*pos, edits);
+        }
+        for (pos, local, block) in entries.iter().rev() {
+            let mut edits = rustc_hash::FxHashMap::default();
+            edits.insert(*local, *block);
+            reverse.chunk_edits.insert(*pos, edits);
+        }
+
+        let registry = ContentRegistry::builtin().clone();
+        assert_eq!(
+            v10_archive(&forward, &registry),
+            v10_archive(&reverse, &registry),
+            "chunk insertion order cannot leak into the archive"
+        );
+        let loaded = decode_v10_bytes(v10_archive(&forward, &registry), &registry).expect("loads");
+        assert_eq!(loaded.data, forward);
+    }
+
+    #[test]
+    fn v10_empty_save_has_the_measured_length_and_section_count() {
+        let data = sample_data(sample_player());
+        let registry = ContentRegistry::builtin().clone();
+        let bytes = v10_archive(&data, &registry);
+
+        assert_eq!(bytes.len(), V10_EMPTY_SAVE_LEN);
+        assert_eq!(bytes.len(), 353);
+        let image = SaveImage::parse(bytes.clone()).expect("archive parses");
+        assert_eq!(image.section_count(), 9);
+        assert_eq!(image.version(), V10_SAVE_VERSION);
+        assert_eq!(image.flags(), 0);
+
+        let loaded = decode_v10_bytes(bytes, &registry).expect("loads");
+        assert_eq!(loaded.data, data);
+        assert_eq!(loaded.unresolved, 0);
+    }
+
+    #[test]
+    fn v10_content_table_is_sorted_by_name_then_kind() {
+        let registry = ruby_registry();
+        let data = v8_data_with_ruby_content();
+        let sections = v10_sections(&data, &registry);
+        let body = sections
+            .iter()
+            .find(|(id, _)| *id == V10_SECTION_CONTENT_TABLE)
+            .expect("content table section")
+            .1
+            .clone();
+
+        let expected = [
+            (ContentKind::GenericItem as u8, "mymod:ruby"),
+            (ContentKind::Block as u8, "mymod:ruby_ore"),
+        ];
+        let mut cur = Cursor::new(body.as_slice());
+        assert_eq!(read_u32(&mut cur).unwrap() as usize, expected.len());
+        for (kind, name) in expected {
+            assert_eq!(read_u8(&mut cur).unwrap(), kind);
+            let len = usize::from(read_u16(&mut cur).unwrap());
+            let mut buf = vec![0u8; len];
+            cur.read_exact(&mut buf).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), name);
+        }
+        assert_eq!(cur.position(), body.len() as u64);
+
+        let loaded = decode_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
+        assert_eq!(loaded.data, data);
+        assert_eq!(loaded.unresolved, 0);
+    }
+
+    #[test]
+    fn v10_placeholders_are_allocated_in_table_order_not_reference_order() {
+        let mut source = ContentRegistry::builtin().clone();
+        let aaa = source.append_placeholder_item("mymod:aaa");
+        let zzz = source.append_placeholder_item("mymod:zzz");
+
+        let mut slots = [None; INVENTORY_SLOTS];
+        slots[0] = Some(Item::new(ItemId::Item(zzz), 1).unwrap());
+        slots[1] = Some(Item::new(ItemId::Item(aaa), 1).unwrap());
+        let mut player = sample_player();
+        player.inventory = Inventory::from_parts(slots, None);
+        let data = sample_data(player);
+
+        let loaded = decode_v10_bytes(v10_archive(&data, &source), ContentRegistry::builtin())
+            .expect("v10 loads");
+        assert_eq!(loaded.unresolved, 2);
+        assert_eq!(
+            loaded.registry.item(0).map(|def| def.name.as_str()),
+            Some("mymod:aaa")
+        );
+        assert_eq!(
+            loaded.registry.item(1).map(|def| def.name.as_str()),
+            Some("mymod:zzz")
+        );
+        // Slot 0 referenced zzz first, but v10 allocates by table order.
+        assert_eq!(
+            loaded.data.player.inventory.slots()[0]
+                .as_ref()
+                .unwrap()
+                .id(),
+            ItemId::Item(1)
+        );
+        assert_eq!(
+            loaded.data.player.inventory.slots()[1]
+                .as_ref()
+                .unwrap()
+                .id(),
+            ItemId::Item(0)
+        );
+
+        // The v9 reader still allocates in first-reference order; this is the
+        // intentional semantic change the v10 table pins.
+        let v9 = v9_witness_bytes_with(&data, &source);
+        let v9_loaded =
+            load_world_from_bytes_with(&v9, ContentRegistry::builtin()).expect("v9 loads");
+        assert_eq!(v9_loaded.unresolved, 2);
+        assert_eq!(
+            v9_loaded.registry.item(0).map(|def| def.name.as_str()),
+            Some("mymod:zzz")
+        );
+        assert_eq!(
+            v9_loaded.registry.item(1).map(|def| def.name.as_str()),
+            Some("mymod:aaa")
+        );
+    }
+
+    #[test]
+    fn v10_writer_rejects_invalid_payload_before_first_byte() {
+        let registry = ContentRegistry::builtin().clone();
+
+        let mut wrong_grid = v10_rich_data();
+        wrong_grid.player.player_grid = CraftingGrid::new(GridKind::Table);
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_v10_world(
+                &mut out,
+                &wrong_grid,
+                &registry,
+                ConfigRuntime::defaults().meta()
+            ),
+            Err(PersistenceError::InvalidCraftingState)
+        ));
+        assert!(out.is_empty(), "rejection must emit no byte");
+
+        let mut unnameable = v10_rich_data();
+        unnameable
+            .chunk_edits
+            .entry(ChunkPos::new(9, 9, 9))
+            .or_default()
+            .insert(0, BlockId::Modded(BUILTIN_BLOCK_COUNT));
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_v10_world(
+                &mut out,
+                &unnameable,
+                &registry,
+                ConfigRuntime::defaults().meta()
+            ),
+            Err(PersistenceError::InvalidBlockId(_))
+        ));
+        assert!(out.is_empty(), "rejection must emit no byte");
+    }
+
+    #[test]
+    fn v10_rejects_truncated_nonzero_flags_and_unknown_codec_archives() {
+        let registry = ContentRegistry::builtin().clone();
+        let bytes = v10_archive(&v10_rich_data(), &registry);
+
+        let truncated = bytes[..bytes.len() - 1].to_vec();
+        assert!(matches!(
+            decode_v10_bytes(truncated, &registry),
+            Err(PersistenceError::InvalidArchive(_))
+        ));
+        let short_header = bytes[..12].to_vec();
+        assert!(matches!(
+            decode_v10_bytes(short_header, &registry),
+            Err(PersistenceError::InvalidArchive(StorageError::Truncated))
+        ));
+
+        let mut flagged = bytes.clone();
+        flagged[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            decode_v10_bytes(flagged, &registry),
+            Err(PersistenceError::InvalidArchive(
+                StorageError::UnsupportedFlags(1)
+            ))
+        ));
+
+        // The first directory entry starts at offset 16; codec is its last
+        // byte (16 + 20).
+        let mut codec = bytes;
+        codec[36] = 9;
+        assert!(matches!(
+            decode_v10_bytes(codec, &registry),
+            Err(PersistenceError::InvalidArchive(
+                StorageError::UnknownCodec(9)
+            ))
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_missing_reserved_and_orphan_sections() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&sample_data(sample_player()), &registry);
+
+        let mut missing = sections.clone();
+        missing.retain(|(id, _)| *id != V10_SECTION_WORLD_PLAYER);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&missing), &registry),
+            Err(PersistenceError::MissingSection {
+                id: V10_SECTION_WORLD_PLAYER
+            })
+        ));
+
+        let mut reserved = sections.clone();
+        reserved.push((10, vec![0]));
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&reserved), &registry),
+            Err(PersistenceError::InvalidArchive(_))
+        ));
+
+        let mut orphan = sections.clone();
+        orphan.push((V10_CHUNK_SECTION_BASE, vec![0]));
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&orphan), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+
+        // A hole in the contiguous chunk range is rejected too.
+        let rich = v10_rich_data();
+        let mut hole = v10_sections(&rich, &registry);
+        hole.retain(|(id, _)| *id != V10_CHUNK_SECTION_BASE + 1);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&hole), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+
+        let mut missing_crops = sections;
+        missing_crops.retain(|(id, _)| *id != V10_SECTION_CROPS);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&missing_crops), &registry),
+            Err(PersistenceError::MissingSection {
+                id: V10_SECTION_CROPS
+            })
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_malformed_chunk_index_and_section_cross_checks() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&v10_rich_data(), &registry);
+
+        // A zero edit count is never a valid chunk record.
+        let mut zero = sections.clone();
+        {
+            let body = v10_section_mut(&mut zero, V10_SECTION_CHUNK_INDEX);
+            let mut cur = Cursor::new(body.as_slice());
+            assert_eq!(read_u32(&mut cur).unwrap(), 3);
+            let _x = read_i32(&mut cur).unwrap();
+            let _y = read_i32(&mut cur).unwrap();
+            let _z = read_i32(&mut cur).unwrap();
+            let offset = cur.position() as usize;
+            body[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&zero), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+
+        // Duplicate (therefore unsorted) chunk positions.
+        let mut duplicate = sections.clone();
+        {
+            let body = v10_section_mut(&mut duplicate, V10_SECTION_CHUNK_INDEX);
+            let mut cur = Cursor::new(body.as_slice());
+            let _count = read_u32(&mut cur).unwrap();
+            let first = cur.position() as usize;
+            let mut record = [0u8; 16];
+            record.copy_from_slice(&body[first..first + 16]);
+            body[first + 16..first + 32].copy_from_slice(&record);
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&duplicate), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+
+        // The index edit count disagrees with the decoded section length. The
+        // first sorted chunk (-1, 2, 4) carries two edits.
+        let mut mismatch = sections.clone();
+        {
+            let body = v10_section_mut(&mut mismatch, V10_SECTION_CHUNK_INDEX);
+            let mut cur = Cursor::new(body.as_slice());
+            let _count = read_u32(&mut cur).unwrap();
+            let _x = read_i32(&mut cur).unwrap();
+            let _y = read_i32(&mut cur).unwrap();
+            let _z = read_i32(&mut cur).unwrap();
+            let offset = cur.position() as usize;
+            body[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&mismatch), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+
+        // The chunk count cap is enforced before any record is read.
+        let mut over_cap = sections;
+        {
+            let body = v10_section_mut(&mut over_cap, V10_SECTION_CHUNK_INDEX);
+            body.clear();
+            body.extend_from_slice(&(MAX_SAVED_CHUNKS as u32 + 1).to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
+            Err(PersistenceError::InvalidChunkIndex)
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_malformed_content_tables() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&sample_data(sample_player()), &registry);
+
+        fn content_table(entries: &[(u8, &[u8])]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for (kind, name) in entries {
+                body.push(*kind);
+                body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                body.extend_from_slice(name);
+            }
+            body
+        }
+
+        let long_name = vec![b'a'; MAX_SAVE_CONTENT_NAME_LEN + 1];
+        let cases = [
+            // Duplicate `(name, kind)`.
+            content_table(&[(1, b"stone"), (1, b"stone")]),
+            // Unsorted by name.
+            content_table(&[(1, b"stone"), (1, b"dirt")]),
+            // Unknown kind tag.
+            content_table(&[(9, b"stone")]),
+            // Empty name.
+            content_table(&[(1, b"")]),
+            // Name over the wire cap.
+            content_table(&[(1, long_name.as_slice())]),
+            // Over-cap count: rejected before any entry is allocated.
+            {
+                let mut body = Vec::new();
+                body.extend_from_slice(&(MAX_SAVE_CONTENT_NAMES as u32 + 1).to_le_bytes());
+                body
+            },
+        ];
+        for body in cases {
+            let mut broken = sections.clone();
+            *v10_section_mut(&mut broken, V10_SECTION_CONTENT_TABLE) = body;
+            assert!(matches!(
+                decode_v10_bytes(v10_archive_from_sections(&broken), &registry),
+                Err(PersistenceError::InvalidContentTable)
+            ));
+        }
+
+        let mut trailing = sections.clone();
+        v10_section_mut(&mut trailing, V10_SECTION_CONTENT_TABLE).push(0);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&trailing), &registry),
+            Err(PersistenceError::InvalidContentTable)
+        ));
+
+        let mut reserved = sections;
+        *v10_section_mut(&mut reserved, V10_SECTION_CONTENT_TABLE) =
+            content_table(&[(1, b"minecraft:stone")]);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&reserved), &registry),
+            Err(PersistenceError::InvalidContentName(_))
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_malformed_chunk_sections_and_non_block_palettes() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&v10_single_chunk_data(), &registry);
+
+        let mut empty = sections.clone();
+        *v10_section_mut(&mut empty, V10_CHUNK_SECTION_BASE) = Vec::new();
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&empty), &registry),
+            Err(PersistenceError::InvalidChunkSection(_))
+        ));
+
+        // Palette length 1 with an edit pointing at palette index 1.
+        let mut bad_index = sections.clone();
+        {
+            let body = v10_section_mut(&mut bad_index, V10_CHUNK_SECTION_BASE);
+            body.clear();
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&bad_index), &registry),
+            Err(PersistenceError::InvalidChunkSection(
+                StorageError::PaletteIndexOutOfRange { .. }
+            ))
+        ));
+
+        // A palette entry resolving to a material is a forged chunk: only
+        // block-kind table entries are legal inside a chunk body.
+        let mut non_block = sections.clone();
+        {
+            let mut table = Vec::new();
+            table.extend_from_slice(&1u32.to_le_bytes());
+            table.push(ContentKind::Material as u8);
+            table.extend_from_slice(&5u16.to_le_bytes());
+            table.extend_from_slice(b"stick");
+            *v10_section_mut(&mut non_block, V10_SECTION_CONTENT_TABLE) = table;
+
+            let body = v10_section_mut(&mut non_block, V10_CHUNK_SECTION_BASE);
+            body.clear();
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&(linear_index(1, 2, 3) as u16).to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&non_block), &registry),
+            Err(PersistenceError::InvalidContentName(name)) if name == "stick"
+        ));
+
+        // A palette content index outside the table is rejected even when the
+        // palette itself is canonical.
+        let mut outside_table = sections.clone();
+        {
+            let body = v10_section_mut(&mut outside_table, V10_CHUNK_SECTION_BASE);
+            body.clear();
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&5u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&(linear_index(1, 2, 3) as u16).to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&outside_table), &registry),
+            Err(PersistenceError::InvalidContentTable)
+        ));
+
+        let mut trailing = sections;
+        v10_section_mut(&mut trailing, V10_CHUNK_SECTION_BASE).push(0);
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&trailing), &registry),
+            Err(PersistenceError::InvalidChunkSection(
+                StorageError::TrailingBytes(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_over_cap_and_invalid_crops() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&v10_rich_data(), &registry);
+
+        let mut over_cap = sections.clone();
+        {
+            let body = v10_section_mut(&mut over_cap, V10_SECTION_CROPS);
+            body.clear();
+            body.extend_from_slice(&(MAX_SAVED_CROPS as u32 + 1).to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
+            Err(PersistenceError::InvalidCrops)
+        ));
+
+        // (0, 0, 0) is a Dirt edit, not an immature wheat crop.
+        let mut stray = sections.clone();
+        {
+            let body = v10_section_mut(&mut stray, V10_SECTION_CROPS);
+            body.clear();
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&0i32.to_le_bytes());
+            body.extend_from_slice(&0i32.to_le_bytes());
+            body.extend_from_slice(&0i32.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&stray), &registry),
+            Err(PersistenceError::InvalidCrops)
+        ));
+
+        // Rich data has one immature crop; duplicating it is unsorted.
+        let mut unsorted = sections;
+        {
+            let body = v10_section_mut(&mut unsorted, V10_SECTION_CROPS);
+            let mut cur = Cursor::new(body.as_slice());
+            assert_eq!(read_u32(&mut cur).unwrap(), 1);
+            let offset = cur.position() as usize;
+            let mut record = [0u8; 12];
+            record.copy_from_slice(&body[offset..offset + 12]);
+            body.extend_from_slice(&record);
+            body[..4].copy_from_slice(&2u32.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&unsorted), &registry),
+            Err(PersistenceError::InvalidCrops)
+        ));
+    }
+
+    #[test]
+    fn v10_rejects_trailing_bytes_inside_fixed_sections() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&v10_rich_data(), &registry);
+
+        let expected = [
+            (V10_SECTION_WORLD_PLAYER, "player"),
+            (V10_SECTION_INVENTORY, "inventory"),
+            (V10_SECTION_CHESTS, "chests"),
+            (V10_SECTION_MOBS, "mobs"),
+            (V10_SECTION_CONTENT_META, "content meta"),
+            (V10_SECTION_CONFIG, "config"),
+            (V10_SECTION_CROPS, "crops"),
+            (V10_SECTION_CHUNK_INDEX, "chunk index"),
+        ];
+        for (id, label) in expected {
+            let mut broken = sections.clone();
+            v10_section_mut(&mut broken, id).push(0);
+            let result = decode_v10_bytes(v10_archive_from_sections(&broken), &registry);
+            assert!(
+                result.is_err(),
+                "trailing bytes in the {label} section must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn v10_rejects_other_archive_versions() {
+        let registry = ContentRegistry::builtin().clone();
+        let sections = v10_sections(&sample_data(sample_player()), &registry);
+        let borrowed: Vec<(SectionId, &[u8])> = sections
+            .iter()
+            .map(|(id, body)| (SectionId(*id), body.as_slice()))
+            .collect();
+        let bytes =
+            encode_archive(V10_SAVE_VERSION + 1, 0, &borrowed).expect("encode future version");
+        assert!(matches!(
+            decode_v10_bytes(bytes, &registry),
+            Err(PersistenceError::UnsupportedVersion(11))
+        ));
+    }
+
+    #[test]
+    fn v10_roundtrips_pack_tool_and_clamps_durability() {
+        let registry = ruby_tool_registry();
+        let data = sample_data(pack_tool_player(&registry, 137));
+        let sections = v10_sections(&data, &registry);
+
+        let table = sections
+            .iter()
+            .find(|(id, _)| *id == V10_SECTION_CONTENT_TABLE)
+            .expect("content table section")
+            .1
+            .clone();
+        let mut cur = Cursor::new(table.as_slice());
+        assert_eq!(read_u32(&mut cur).unwrap(), 1);
+        assert_eq!(read_u8(&mut cur).unwrap(), ContentKind::ModTool as u8);
+        assert_eq!(
+            read_u16(&mut cur).unwrap() as usize,
+            "mymod:ruby_pickaxe".len()
+        );
+
+        let loaded = decode_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
+        assert_eq!(loaded.data, data);
+
+        // A saved durability over the authored maximum clamps (policy), while
+        // zero still fails closed.
+        let mut clamped = sections.clone();
+        {
+            let body = v10_section_mut(&mut clamped, V10_SECTION_INVENTORY);
+            assert_eq!(body[0], ITEM_TAG_MOD_TOOL);
+            body[3..5].copy_from_slice(&1000u16.to_le_bytes());
+        }
+        let loaded = decode_v10_bytes(v10_archive_from_sections(&clamped), &registry)
+            .expect("clamped durability loads");
+        let tool = loaded.data.player.inventory.slots()[0]
+            .as_ref()
+            .expect("pack tool slot");
+        assert_eq!(tool.durability(), Some(900));
+
+        let mut zero = sections.clone();
+        {
+            let body = v10_section_mut(&mut zero, V10_SECTION_INVENTORY);
+            body[3..5].copy_from_slice(&0u16.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&zero), &registry),
+            Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
+        ));
+
+        // Wire-tag/kind agreement: a generic tag against a mod-tool table
+        // entry is forged cross-kind data.
+        let mut cross_kind = sections;
+        v10_section_mut(&mut cross_kind, V10_SECTION_INVENTORY)[0] = ITEM_TAG_GENERIC;
+        assert!(matches!(
+            decode_v10_bytes(v10_archive_from_sections(&cross_kind), &registry),
+            Err(PersistenceError::InvalidContentName(_))
+        ));
     }
 }
