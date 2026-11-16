@@ -35,7 +35,7 @@ use crate::world::block::BlockId;
 use crate::world::chunk::ChunkPos;
 use crate::world::farming::CropRuntime;
 use crate::world::persistence::{
-    load_world_from_path_with, save_world_to_path, ChunkEditMap, SAVE_MAGIC, SAVE_VERSION,
+    load_world_from_path_with, save_v9_world_to_path, ChunkEditMap, SAVE_MAGIC, SAVE_VERSION,
 };
 use crate::world::season::{Season, DEFAULT_SEASON_LENGTH_DAYS};
 use crate::WorldSession;
@@ -108,8 +108,9 @@ fn edit_totals(edits: &ChunkEditMap) -> (usize, usize) {
 ///
 /// The edit map is moved into the save payload and dropped explicitly after
 /// the write so the five measured loads do not coexist with the generator's
-/// copy. The header is read back from disk to prove the live writer emitted
-/// v9 (`SAVE_VERSION == 9` in S01).
+/// copy. The header is read back from disk to prove the frozen witness writer
+/// emitted v9 (`SAVE_VERSION == 9` in S01), and the measured length plus edit
+/// checksum pin the fixture byte-for-byte to the S01 baseline (D316).
 fn write_fixture(path: &Path) -> u64 {
     let mut data =
         WorldSession::new_session(WORLD_SEED, path.to_path_buf(), DEFAULT_SEASON_LENGTH_DAYS)
@@ -117,8 +118,9 @@ fn write_fixture(path: &Path) -> u64 {
     let (edits, chunks) = big_edits(EDIT_TARGET);
     assert_eq!(chunks, CHUNK_COUNT, "fixture must span 20,000 chunks");
     data.chunk_edits = edits;
-    save_world_to_path(path, &data)
+    save_v9_world_to_path(path, &data, ContentRegistry::builtin())
         .unwrap_or_else(|error| panic!("write fixture {}: {error:?}", path.display()));
+    let (_, _, checksum) = verify_edits(&data.chunk_edits);
     drop(data);
 
     let mut header = [0u8; 8];
@@ -141,9 +143,18 @@ fn write_fixture(path: &Path) -> u64 {
         "S01 freezes the v9 baseline; the version bump belongs to S02"
     );
 
-    std::fs::metadata(path)
+    let file_bytes = std::fs::metadata(path)
         .unwrap_or_else(|error| panic!("stat fixture {}: {error}", path.display()))
-        .len()
+        .len();
+    assert_eq!(
+        file_bytes, 40_320_186,
+        "the S01 10M-edit v9 fixture must keep its measured byte length"
+    );
+    assert_eq!(
+        checksum, 0xd3ef_88bd_c7ae_0ebc,
+        "the S01 10M-edit v9 fixture must keep its measured edit checksum"
+    );
+    file_bytes
 }
 
 /// One order-independent mix round.

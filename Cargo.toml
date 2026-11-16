@@ -12,6 +12,7 @@ opencraft-core = { path = "crates/opencraft-core" }
 opencraft-gfx = { path = "crates/opencraft-gfx" }
 opencraft-pathfinding = { path = "crates/opencraft-pathfinding" }
 opencraft-physics = { path = "crates/opencraft-physics" }
+opencraft-storage = { path = "crates/opencraft-storage" }
 rayon = "1.10"
 rustc-hash = "1.1"
 wgpu = "0.19"
