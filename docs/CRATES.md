@@ -149,7 +149,7 @@ promises. Re-run the commands to refresh them.
 | `opencraft-physics` | 20 tests |
 | `opencraft-pathfinding` | 15 unit + 7 `nav_contract` + 3 doctests |
 | `engine-reuse-proof` | 22 tests (1 lib, 6 gfx, 10 motion, 5 physics) and the deterministic 15-line `ProofReport` |
-| Workspace | 5175 passed at S08, 0 failed |
+| Workspace | 31 `test result: ok` blocks, 2657 passed / 0 failed / 6 ignored (2679 including the explicit consumer step) |
 | Boundary gate | Seven `PASS:` lines |
 | Streaming budget | p95 <= 8 ms, max <= 16 ms |
 | Autosave budget | frame p95 <= 16.6 ms |
