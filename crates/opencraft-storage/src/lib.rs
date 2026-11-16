@@ -6,9 +6,10 @@
 //! `u16` content indices, and the bounded/atomic file helpers. It never reads
 //! a game block id, content registry, session, player or mob type, and never
 //! depends on a GPU or windowing crate. `archive` is the neutral container;
-//! the chunk-section codec and bounded file helpers land beside it.
+//! `chunk_section` is the canonical palette codec.
 
 pub mod archive;
+pub mod chunk_section;
 mod error;
 
 pub use error::StorageError;
