@@ -189,9 +189,7 @@ pub fn weather_vertex_range(precipitation: Precipitation) -> Option<Range<u32>> 
     match precipitation {
         Precipitation::Clear => None,
         Precipitation::Rain => Some(0..RAIN_VERTEX_COUNT),
-        Precipitation::Snowfall => {
-            Some(RAIN_VERTEX_COUNT..RAIN_VERTEX_COUNT + SNOW_VERTEX_COUNT)
-        }
+        Precipitation::Snowfall => Some(RAIN_VERTEX_COUNT..RAIN_VERTEX_COUNT + SNOW_VERTEX_COUNT),
     }
 }
 

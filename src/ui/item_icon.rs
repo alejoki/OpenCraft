@@ -2612,7 +2612,7 @@ mod tests {
         assert!(ui_block.contains("&renderer.block_texture_view"));
         assert!(ui_block.contains("&renderer.block_texture_sampler"));
         let renderer_at = src
-            .find("let renderer = VoxelRenderer::new(&ctx);")
+            .find("let renderer = VoxelRenderer::new(&ctx, BLOCK_ARRAY_SPEC, sky_geometry());")
             .expect("renderer construction exists");
         assert!(
             renderer_at < ui_at,

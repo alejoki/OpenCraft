@@ -39,8 +39,10 @@ pub const MIP_LEVELS: u32 = 5;
 /// Neutral upload/mip spec for the block texture array. The game keeps every
 /// content-identity constant (16px layers, 256 GPU layers, 5 mips);
 /// [`opencraft_gfx::texture`] owns the device-facing descriptor, view, and
-/// upload machinery that consumes this shape.
-const BLOCK_ARRAY_SPEC: TextureArraySpec = TextureArraySpec {
+/// upload machinery that consumes this shape. Public because the host now
+/// passes it into the renderer constructor, which creates the texture/view/
+/// sampler from it.
+pub const BLOCK_ARRAY_SPEC: TextureArraySpec = TextureArraySpec {
     label: "block_texture_array",
     size: TEX_SIZE,
     layers: BLOCK_ARRAY_LAYERS,

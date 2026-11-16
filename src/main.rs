@@ -104,7 +104,9 @@ use opencraft::render::buffer::ChunkRenderStore;
 use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch_into, MobVertex};
 use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
-use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
+use opencraft::render::texture::{
+    compose_block_array_layers, generate_all_texture_layers_rgba, BLOCK_ARRAY_SPEC,
+};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
@@ -877,9 +879,8 @@ fn sky_uniform_from_time(time_of_day: u32) -> opencraft_gfx::sky::SkyUniform {
 /// Static sky geometry built once from the day-cycle constants.
 ///
 /// The crate owns the billboard expansion; the host owns the deterministic
-/// star seed and the angular sizes. Tests drive it now; the frame-seam move
-/// wires it into `VoxelRenderer::new` next.
-#[allow(dead_code)] // Consumed by the tests until the frame seam moves.
+/// star seed and the angular sizes. Passed into `VoxelRenderer::new` at
+/// startup.
 fn sky_geometry() -> opencraft_gfx::sky::SkyGeometry {
     opencraft_gfx::sky::SkyGeometry {
         star_field: daycycle::generate_star_field(),
@@ -4147,7 +4148,7 @@ impl ApplicationHandler for GameApp {
         let surface = instance.create_surface(window.clone()).expect("Failed to create wgpu surface");
         #[rustfmt::skip]
         let ctx = RenderContext::new(instance, surface, size.width, size.height, self.settings.vsync);
-        let renderer = VoxelRenderer::new(&ctx);
+        let renderer = VoxelRenderer::new(&ctx, BLOCK_ARRAY_SPEC, sky_geometry());
         // Re-apply the persisted texture pack to the freshly created GPU
         // texture (M004/S03): the renderer is still a local here, so the
         // initial upload reuses the same live-apply path as cycling. A
@@ -6756,6 +6757,7 @@ impl ApplicationHandler for GameApp {
                             target_block: None,
                             selection_box: None,
                             selected_slot: self.session.player.selected_slot(),
+                            hotbar_rects: &[],
                         },
                         FramePresentation {
                             show_overlays: false,
@@ -6797,6 +6799,7 @@ impl ApplicationHandler for GameApp {
                     // the slice empty and therefore produces no GPU buffer
                     // allocation inside render_frame.
                     let aspect = gpu.ctx.config.width as f32 / gpu.ctx.config.height.max(1) as f32;
+                    let hotbar_rects = opencraft::ui::hud::hotbar_slot_ndc_rects(aspect);
                     build_mob_batch_into(
                         &mut self.mob_vertices,
                         &self.session,
@@ -6813,6 +6816,7 @@ impl ApplicationHandler for GameApp {
                             target_block,
                             selection_box: self.capture.selection_box(),
                             selected_slot: self.session.player.selected_slot(),
+                            hotbar_rects: &hotbar_rects,
                         },
                         FramePresentation {
                             show_overlays: playing,
@@ -21640,6 +21644,89 @@ stack = 64
         assert!(
             vista_arm.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
             "menu frames must render through the scene clock and Clear-weather sky inputs"
+        );
+    }
+
+    #[test]
+    fn menu_sky_params_follow_the_background_scene_and_stay_dry() {
+        // Vista sky inputs are derived from the background scene's own clock,
+        // so the celestial uniform tracks that clock rather than a pinned
+        // constant (D091); weather stays Clear and the fog factor identity, so
+        // the panorama never draws precipitation.
+        for vista_time in [daycycle::VISTA_GOLDEN_HOUR, 0, 12_000] {
+            let vista = vista_sky_params(daycycle::sky_palette(vista_time), vista_time);
+            assert_eq!(
+                bytemuck::bytes_of(&vista.celestial),
+                bytemuck::bytes_of(&sky_uniform_from_time(vista_time)),
+                "the menu scene clock must reach the celestial uniform"
+            );
+            assert_eq!(vista.weather, Precipitation::Clear);
+            assert_eq!(vista.fog_range_factor, 1.0);
+            assert_eq!(vista.weather_phase, 0.0);
+            assert!(!vista.underwater);
+        }
+
+        // Source pin: the menu arm must go through `vista_sky_params` with the
+        // background scene's own clock and anchor (D091), while the session arm
+        // passes the live clock plus the per-frame weather derivation. The menu
+        // helper pins weather Clear and the identity fog factor, so the
+        // panorama never draws precipitation.
+        let src = include_str!("main.rs");
+        // Build scan needles at runtime: plain literals would match themselves
+        // inside this included `main.rs` source.
+        let menu_clock_call = [
+            "vista_sky_params(palette,",
+            " self.background.clock.time_of_day)",
+        ]
+        .concat();
+        assert!(
+            src.contains(&menu_clock_call),
+            "menu frames must follow the background scene clock and stay dry"
+        );
+        // Whitespace-insensitive copy for chained calls that rustfmt wraps.
+        let compact: String = src.split_whitespace().collect();
+        assert!(
+            src.contains("self.background.anchor"),
+            "the menu camera must anchor at the background scene's saved eye position"
+        );
+        assert!(
+            compact.contains(
+                "self.background.world.update_streaming(vista_chunk,self.background.season())"
+            ),
+            "menu streaming must use the background world and its saved-calendar season"
+        );
+        assert!(
+            src.contains("self.background.world.render_distance(),"),
+            "menu rendering must use the background world's render distance"
+        );
+        let golden_palette = ["vista_sky_params(palette,", "daycycle::VISTA_GOLDEN_HOUR)"].concat();
+        let golden_call = [
+            "vista_sky_params(daycycle::sky_palette(",
+            "daycycle::VISTA_GOLDEN_HOUR))",
+        ]
+        .concat();
+        let vista_season = ["update_streaming(vista_chunk,", "vista::VISTA_SEASON)"].concat();
+        assert!(
+            !compact.contains(&golden_palette)
+                && !compact.contains(&golden_call)
+                && !compact.contains(&vista_season),
+            "VISTA_GOLDEN_HOUR / VISTA_SEASON are default-scene values, never render-time menu constants"
+        );
+        assert!(
+            src.contains("let weather = session_weather(&self.session);"),
+            "session frames must derive weather per frame from the calendar"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "the session arm must exercise the empty ambient-audio seam"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the weather phase must follow the live game clock"
+        );
+        assert!(
+            src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),
+            "the session arm must derive the flag from the live eye position"
         );
     }
 
