@@ -7,7 +7,7 @@ use crate::player::camera::{visible_face_mask, Camera, Frustum};
 use crate::player::inventory::HOTBAR_SLOTS;
 use crate::render::buffer::{ChunkRenderStore, QUAD_VERTICES};
 use crate::render::context::{RenderContext, DEPTH_FORMAT};
-use crate::render::mob::{create_mob_pipeline, MobVertex};
+use crate::render::mob::MobVertex;
 use crate::render::sky;
 use crate::render::texture::{
     block_array_layers_match_shape, create_block_texture_array, upload_block_layer_at,
@@ -17,6 +17,7 @@ use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::daycycle;
 use crate::world::season::Weather;
+use opencraft_gfx::model::create_model_pipeline;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -883,7 +884,7 @@ impl VoxelRenderer {
         // this is the only place the camera bind group layout is in hand; the
         // pipeline layout borrows it, so nothing else can be reordered above
         // it without re-creating the layout.
-        let mob_pipeline = create_mob_pipeline(ctx, &camera_bgl);
+        let mob_pipeline = create_model_pipeline(ctx, &camera_bgl);
 
         let chunk_bind_group_layout =
             ctx.device
@@ -1472,6 +1473,11 @@ mod tests {
         // and fog_start_end (3 vec4s) = 7 vec4s = 112 bytes. Any new field
         // here would change the CPU/GPU layout contract.
         assert_eq!(std::mem::size_of::<CameraUniform>(), 112);
+        assert_eq!(
+            std::mem::size_of::<CameraUniform>(),
+            opencraft_gfx::model::MODEL_CAMERA_UNIFORM_BYTES,
+            "the crate and the camera uniform must agree on the 112-byte contract"
+        );
         assert_eq!(std::mem::size_of::<CameraUniform>() % 16, 0);
         assert_eq!(
             std::mem::size_of::<CameraUniform>(),
@@ -2065,46 +2071,6 @@ mod tests {
         let guard_block = &code[guard_at..draw_at];
         assert!(guard_block.contains("set_pipeline(&self.mob_pipeline)"));
         assert!(guard_block.contains("mob_vertex_buffer.slice(..)"));
-    }
-
-    #[test]
-    fn mob_pipeline_is_opaque_and_camera_only() {
-        // Source pin on the mob pipeline factory in mob.rs: opaque REPLACE
-        // blending, depth writes with LessEqual, and a layout that carries the
-        // camera bind group ONLY (no chunk uniform, no per-mob bind group).
-        let src = include_str!("mob.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("mob test module marker")];
-        assert!(
-            code.contains("depth_write_enabled: true"),
-            "mobs must write depth so water behind them is occluded"
-        );
-        assert!(code.contains("CompareFunction::LessEqual"));
-        assert!(
-            code.contains("BlendState::REPLACE"),
-            "mobs are opaque; no alpha blending"
-        );
-        assert!(
-            code.contains("bind_group_layouts: &[camera_bgl]"),
-            "the mob pipeline layout must be the camera bind group alone"
-        );
-        assert!(
-            code.contains("buffers: &[mob_vertex_layout()]"),
-            "the mob pipeline must consume the pinned 32-byte vertex layout"
-        );
-        assert!(
-            !code.contains("chunk_bind_group") && !code.contains("@group(1)"),
-            "mobs must not bind a chunk uniform or a second group"
-        );
-        // Shader contract: shared camera view-projection, array sample by flat
-        // layer, shade multiply, hurt flash tint, distance fog.
-        assert!(code.contains("camera.view_proj * vec4<f32>(position, 1.0)"));
-        assert!(code.contains("camera.fog_start_end.x") && code.contains("camera.fog_start_end.y"));
-        assert!(
-            code.contains("textureSample(block_texture, block_sampler, in.uv, i32(in.tex_layer))")
-        );
-        assert!(code.contains("texel.rgb * in.shade"));
-        assert!(code.contains("vec3<f32>(1.0, 0.15, 0.1), in.flash"));
-        assert!(code.contains("mix(rgb, camera.fog_color.rgb, in.fog)"));
     }
 
     fn assert_close(actual: f32, expected: f32, what: &str) {
