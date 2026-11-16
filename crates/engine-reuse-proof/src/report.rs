@@ -1,4 +1,4 @@
-//! Aggregated, deterministic [`ProofReport`] over the three proof areas.
+//! Aggregated, deterministic [`ProofReport`] over the four proof areas.
 //!
 //! The report is the runnable surface of the consumer: the `engine-reuse-proof`
 //! bin prints it and exits 0. Every line is a `key=value` pair, floats use a
@@ -11,6 +11,7 @@ use std::fmt;
 use crate::gfx::GfxProof;
 use crate::motion::MotionProof;
 use crate::physics::PhysicsProof;
+use crate::storage::StorageProof;
 
 /// The aggregated result of one device-free consumer proof run.
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +22,8 @@ pub struct ProofReport {
     pub gfx: GfxProof,
     /// Steering and deterministic A* proof.
     pub motion: MotionProof,
+    /// Archive container and chunk-section codec proof.
+    pub storage: StorageProof,
 }
 
 /// Format a proof float with fixed precision, normalizing negative zero.
@@ -81,6 +84,10 @@ impl fmt::Display for ProofReport {
         )?;
         writeln!(f, "motion.path_len={}", self.motion.path_len)?;
         writeln!(f, "motion.deterministic={}", self.motion.deterministic)?;
+
+        writeln!(f, "storage.archive_bytes={}", self.storage.archive_bytes)?;
+        writeln!(f, "storage.section_count={}", self.storage.section_count)?;
+        writeln!(f, "storage.chunk_edits={}", self.storage.chunk_edits)?;
         Ok(())
     }
 }
@@ -89,7 +96,7 @@ impl fmt::Display for ProofReport {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 15] = [
+    const KEYS: [&str; 18] = [
         "physics.landing_y=",
         "physics.wall_x=",
         "physics.ray_block=",
@@ -105,6 +112,9 @@ mod tests {
         "motion.airborne_z=",
         "motion.path_len=",
         "motion.deterministic=",
+        "storage.archive_bytes=",
+        "storage.section_count=",
+        "storage.chunk_edits=",
     ];
 
     #[test]
@@ -113,6 +123,7 @@ mod tests {
             physics: crate::physics::run(),
             gfx: crate::gfx::run(),
             motion: crate::motion::run(),
+            storage: crate::storage::run(),
         };
         let rendered = report.to_string();
 

@@ -600,6 +600,7 @@ dependencies = [
  "opencraft-gfx",
  "opencraft-pathfinding",
  "opencraft-physics",
+ "opencraft-storage",
 ]
 
 [[package]]
