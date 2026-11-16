@@ -1669,6 +1669,7 @@ dependencies = [
  "glyphon",
  "opencraft-core",
  "opencraft-gfx",
+ "opencraft-pathfinding",
  "opencraft-physics",
  "png",
  "rayon",
