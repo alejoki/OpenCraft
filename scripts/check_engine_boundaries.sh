@@ -2,7 +2,8 @@
 # Fail the build if an engine crate reaches back into the game or picks up
 # dependencies it must not own (M017/S01).
 #
-# Rules for every crates/opencraft-* member:
+# Rules for every engine member under crates/ (the four opencraft-* crates
+# and the engine-reuse-proof consumer):
 #   - no dependency on the root `opencraft` game package (direct or transitive)
 #   - publish = false and no version.workspace (the release guard reads the
 #     root package version; members version independently)
@@ -10,6 +11,9 @@
 #     wgpu-core, wgpu-types, winit or raw-window-handle
 #   - opencraft-gfx: no winit (wgpu is allowed), and no direct winit or
 #     raw-window-handle manifest entry
+#   - engine-reuse-proof: no direct wgpu, winit, raw-window-handle, pollster,
+#     bytemuck, serde or tempfile manifest entry; it consumes the engine crates
+#     only and the no-game-package rule above still applies
 #
 # Dependencies: bash, cargo, grep, sed. Deliberately no jq or Python so the
 # gate also runs on the Windows runner.
@@ -68,6 +72,9 @@ manifest_violation() {
         opencraft-core|opencraft-physics|opencraft-pathfinding)
             forbidden='wgpu|wgpu-core|wgpu-types|winit|raw-window-handle'
             ;;
+        engine-reuse-proof)
+            forbidden='wgpu|winit|raw-window-handle|pollster|bytemuck|serde|tempfile'
+            ;;
         *)
             forbidden=''
             ;;
@@ -117,14 +124,14 @@ if ! cargo metadata --locked --no-deps --format-version 1 >/dev/null; then
     fail "cargo metadata --locked failed (stale Cargo.lock or malformed manifest)"
 fi
 
-for crate in opencraft-core opencraft-gfx opencraft-physics opencraft-pathfinding; do
+for crate in opencraft-core opencraft-gfx opencraft-physics opencraft-pathfinding engine-reuse-proof; do
     [[ -f "crates/$crate/Cargo.toml" ]] || fail "missing crates/$crate/Cargo.toml"
 done
 
 self_test
 
 shopt -s nullglob
-manifests=(crates/opencraft-*/Cargo.toml)
+manifests=(crates/opencraft-*/Cargo.toml crates/engine-reuse-proof/Cargo.toml)
 shopt -u nullglob
 [[ ${#manifests[@]} -gt 0 ]] || fail "no crates/opencraft-*/Cargo.toml manifests found"
 

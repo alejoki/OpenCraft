@@ -592,6 +592,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-reuse-proof"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-core",
+ "opencraft-gfx",
+ "opencraft-pathfinding",
+ "opencraft-physics",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
