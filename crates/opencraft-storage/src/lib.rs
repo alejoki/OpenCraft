@@ -5,5 +5,10 @@
 //! sectioned archive container, the canonical per-chunk palette codec over raw
 //! `u16` content indices, and the bounded/atomic file helpers. It never reads
 //! a game block id, content registry, session, player or mob type, and never
-//! depends on a GPU or windowing crate. Modules land with the storage slices;
-//! this skeleton intentionally has none yet.
+//! depends on a GPU or windowing crate. `archive` is the neutral container;
+//! the chunk-section codec and bounded file helpers land beside it.
+
+pub mod archive;
+mod error;
+
+pub use error::StorageError;
