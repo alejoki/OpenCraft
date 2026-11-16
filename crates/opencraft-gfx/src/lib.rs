@@ -8,8 +8,10 @@
 //! machinery that the host drives from its own content spec, plus the neutral
 //! model vertex ABI, WGSL and single-camera-bind-group pipeline factory. It
 //! also owns the camera-relative sky billboard pass, driven by a host-supplied
-//! per-frame uniform and static geometry. It builds on `opencraft-core` for
-//! neutral math and never depends on the game crate.
+//! per-frame uniform and static geometry, and the precipitation stage, driven
+//! by a neutral [`weather::Precipitation`] value and a host-supplied clock
+//! phase. It builds on `opencraft-core` for neutral math and never depends on
+//! the game crate.
 
 pub mod buffer;
 pub mod context;
@@ -17,3 +19,4 @@ pub mod mesh;
 pub mod model;
 pub mod sky;
 pub mod texture;
+pub mod weather;

@@ -16,8 +16,8 @@ use crate::render::texture::{
 use crate::render::weather;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::daycycle;
-use crate::world::season::Weather;
 use opencraft_gfx::model::create_model_pipeline;
+use opencraft_gfx::weather::Precipitation;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -54,11 +54,12 @@ pub struct SkyParams {
     /// is a plain flag so `SkyParams` stays `Copy` and `render_frame`'s
     /// signature does not grow.
     pub underwater: bool,
-    /// The day's weather, derived purely from the persisted calendar. It
-    /// selects the precipitation pattern in [`weather::WeatherUniform`] and
-    /// gates the precip *draw* (never a pass). `Clear` disables that draw and
-    /// is the identity everywhere else.
-    pub weather: Weather,
+    /// The precipitation state the host resolved for this frame. It selects
+    /// the pattern in [`weather::WeatherUniform`] and gates the precip *draw*
+    /// (never a pass). `Clear` disables that draw and is the identity
+    /// everywhere else. It is a neutral crate enum so `SkyParams` carries no
+    /// game type.
+    pub weather: Precipitation,
     /// Rust-side multiplier applied to the fog start/end range
     /// ([`daycycle::weather_fog_range_factor`]). Exactly `1.0` for Clear, so
     /// the dry path stays byte-identical; precipitation pulls fog closer.
@@ -124,8 +125,8 @@ pub fn effective_fog(
 ///
 /// `stage_present` is passed explicitly (rather than `&self`) so the decision
 /// stays pure and testable without a `wgpu::Device`.
-pub fn weather_draw_visible(weather: Weather, stage_present: bool) -> bool {
-    stage_present && !matches!(weather, Weather::Clear)
+pub fn weather_draw_visible(precipitation: Precipitation, stage_present: bool) -> bool {
+    stage_present && !matches!(precipitation, Precipitation::Clear)
 }
 
 /// GPU resources for the precipitation stage, built once at renderer
@@ -1299,7 +1300,8 @@ impl VoxelRenderer {
             weather::weather_vertex_range(sky.weather).map(|range| (stage, range))
         });
         if let Some((stage, _)) = weather_draw {
-            let uniform = weather::WeatherUniform::from_weather(sky.weather, sky.weather_phase);
+            let uniform =
+                weather::WeatherUniform::from_precipitation(sky.weather, sky.weather_phase);
             ctx.queue
                 .write_buffer(&stage.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         }
@@ -1425,12 +1427,12 @@ impl VoxelRenderer {
             // depth, so drops never occlude later draws. `weather_draw` is
             // `None` for Clear weather or an absent/empty stage — the draw is
             // skipped, not the pass.
-            if let Some((stage, (base_vertex, vertex_count))) = weather_draw {
+            if let Some((stage, range)) = weather_draw {
                 rpass.set_pipeline(&stage.pipeline);
                 rpass.set_bind_group(0, &self.camera_bind_group, &[]);
                 rpass.set_bind_group(1, &stage.bind_group, &[]);
                 rpass.set_vertex_buffer(0, stage.vertex_buffer.slice(..));
-                rpass.draw(base_vertex..base_vertex + vertex_count, 0..1);
+                rpass.draw(range, 0..1);
             }
 
             if !overlay_verts.is_empty() {
@@ -1471,6 +1473,17 @@ impl VoxelRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Host-side fog-range expectations for each precipitation state. The
+    /// production factor is computed by the game and passed into `SkyParams`;
+    /// these literals pin the values the renderer must reproduce.
+    fn expected_fog_range_factor(precipitation: Precipitation) -> f32 {
+        match precipitation {
+            Precipitation::Clear => 1.0,
+            Precipitation::Rain => 0.75,
+            Precipitation::Snowfall => 0.85,
+        }
+    }
 
     #[test]
     fn camera_uniform_stays_seven_vec4s() {
@@ -1619,7 +1632,7 @@ mod tests {
             },
             celestial,
             underwater: false,
-            weather: Weather::Rain,
+            weather: Precipitation::Rain,
             fog_range_factor: 0.75,
             weather_phase: 12_000.0,
         };
@@ -1631,7 +1644,7 @@ mod tests {
         );
         assert_eq!(params.day_factor, 0.35);
         assert!(!params.underwater);
-        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.weather, Precipitation::Rain);
         assert_eq!(params.fog_range_factor, 0.75);
         assert_eq!(params.weather_phase, 12_000.0);
         assert!(
@@ -1693,8 +1706,8 @@ mod tests {
             clear_color: wgpu::Color::BLACK,
             celestial: sky::SkyUniform::default(),
             underwater: true,
-            weather: Weather::Clear,
-            fog_range_factor: daycycle::weather_fog_range_factor(Weather::Clear),
+            weather: Precipitation::Clear,
+            fog_range_factor: 1.0,
             weather_phase: 0.0,
         };
         assert!(params.underwater);
@@ -1702,9 +1715,9 @@ mod tests {
 
     #[test]
     fn clear_weather_fog_factor_is_the_identity() {
-        // Clear is pinned to exactly 1.0 in daycycle, and `x * 1.0 == x`, so
-        // the dry path must remain bit-identical.
-        assert_eq!(daycycle::weather_fog_range_factor(Weather::Clear), 1.0);
+        // Clear is pinned to exactly 1.0 in the game's calendar rules, and
+        // `x * 1.0 == x`, so the dry path must remain bit-identical.
+        assert_eq!(expected_fog_range_factor(Precipitation::Clear), 1.0);
         let palette_fog = [0.53, 0.76, 0.96, 1.0];
         let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
         assert_eq!(color, palette_fog);
@@ -1714,8 +1727,8 @@ mod tests {
     #[test]
     fn rain_and_snow_fog_factors_shrink_the_range() {
         let palette_fog = [0.53, 0.76, 0.96, 1.0];
-        for weather in [Weather::Rain, Weather::Snowfall] {
-            let factor = daycycle::weather_fog_range_factor(weather);
+        for weather in [Precipitation::Rain, Precipitation::Snowfall] {
+            let factor = expected_fog_range_factor(weather);
             let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, factor);
             assert_eq!(color, palette_fog, "weather never recolors fog here");
             assert_eq!(start, 300.0 * factor);
@@ -1727,8 +1740,8 @@ mod tests {
             assert!(start < end, "compressed range must stay ordered");
         }
         assert!(
-            daycycle::weather_fog_range_factor(Weather::Rain)
-                < daycycle::weather_fog_range_factor(Weather::Snowfall),
+            expected_fog_range_factor(Precipitation::Rain)
+                < expected_fog_range_factor(Precipitation::Snowfall),
             "rain is the more enclosing state"
         );
     }
@@ -1767,9 +1780,9 @@ mod tests {
     #[test]
     fn weather_draw_gating_table() {
         // Clear never draws; both precip states draw only with a stage.
-        assert!(!weather_draw_visible(Weather::Clear, false));
-        assert!(!weather_draw_visible(Weather::Clear, true));
-        for weather in [Weather::Rain, Weather::Snowfall] {
+        assert!(!weather_draw_visible(Precipitation::Clear, false));
+        assert!(!weather_draw_visible(Precipitation::Clear, true));
+        for weather in [Precipitation::Rain, Precipitation::Snowfall] {
             assert!(
                 weather_draw_visible(weather, true),
                 "{weather:?} with a stage must draw"
@@ -1781,7 +1794,7 @@ mod tests {
         }
         // The stage's static buffer is authoritative about which segment to
         // draw; Clear yields no range at all.
-        assert_eq!(weather::weather_vertex_range(Weather::Clear), None);
+        assert_eq!(weather::weather_vertex_range(Precipitation::Clear), None);
     }
 
     #[test]
@@ -1807,7 +1820,7 @@ mod tests {
         );
 
         let weather_block = &src[weather_at..overlay_at];
-        assert!(weather_block.contains("base_vertex..base_vertex + vertex_count"));
+        assert!(weather_block.contains("rpass.draw(range, 0..1)"));
         assert!(weather_block.contains("stage.bind_group"));
         assert!(weather_block.contains("stage.vertex_buffer"));
         assert!(
@@ -1815,8 +1828,7 @@ mod tests {
             "an empty static buffer must skip the draw, not record an empty one"
         );
         assert!(
-            src[..weather_at]
-                .contains("if let Some((stage, (base_vertex, vertex_count))) = weather_draw"),
+            src[..weather_at].contains("if let Some((stage, range)) = weather_draw"),
             "the precip draw must be guarded by the pure weather gating decision"
         );
 

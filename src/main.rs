@@ -913,8 +913,9 @@ fn sky_params(
         // Weather travels through the same grouped struct so render_frame's
         // 10-argument signature did not grow. Only the session arm feeds live
         // values; the vista arm pins Clear / 1.0 / 0.0 so the panorama stays
-        // byte-identical to pre-S06 output and never draws precipitation.
-        weather,
+        // byte-identical to pre-S06 output and never draws precipitation. The
+        // game enum maps to the crate's neutral value here, at the seam.
+        weather: weather.precipitation(),
         fog_range_factor,
         weather_phase,
         fog_color: [
@@ -7506,6 +7507,7 @@ mod tests {
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
     use opencraft::world::season::{weather_of, Season, WeatherRules};
     use opencraft::world::terrain::generate_chunk_seeded;
+    use opencraft_gfx::weather::Precipitation;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
@@ -21282,7 +21284,7 @@ stack = 64
             assert_eq!(params.clear_color.a, 1.0);
             assert_eq!(params.fog_color, [fog[0], fog[1], fog[2], 1.0]);
             // The Clear identity keeps the pre-S06 dry path unchanged.
-            assert_eq!(params.weather, Weather::Clear);
+            assert_eq!(params.weather, Precipitation::Clear);
             assert_eq!(params.fog_range_factor, 1.0);
             assert_eq!(params.weather_phase, 0.0);
         }
@@ -21605,7 +21607,7 @@ stack = 64
             daycycle::weather_fog_range_factor(Weather::Rain),
             12_345.5,
         );
-        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.weather, Precipitation::Rain);
         assert_eq!(params.fog_range_factor, 0.75);
         assert_eq!(params.weather_phase, 12_345.5);
         assert_eq!(params.clear_color.r, tinted.sky_color[0] as f64);
@@ -21622,7 +21624,7 @@ stack = 64
             bytemuck::bytes_of(&sky_uniform_from_time(vista_time)),
             "the menu scene clock reaches SkyParams, never a pinned constant"
         );
-        assert_eq!(vista.weather, Weather::Clear);
+        assert_eq!(vista.weather, Precipitation::Clear);
         assert_eq!(vista.fog_range_factor, 1.0);
         assert_eq!(vista.weather_phase, 0.0);
         assert!(!vista.underwater);
