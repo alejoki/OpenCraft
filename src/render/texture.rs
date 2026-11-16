@@ -1,4 +1,5 @@
 use crate::content::{PACK_LAYER_BASE, PACK_LAYER_CAP};
+use opencraft_gfx::texture::TextureArraySpec;
 
 pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
@@ -34,6 +35,17 @@ pub const MOB_ARROW_TEX_LAYER: u32 = 44;
 /// First of the three reserved spare layers after the mob range.
 pub const MOB_SPARE_LAYER_BASE: u32 = 45;
 pub const MIP_LEVELS: u32 = 5;
+
+/// Neutral upload/mip spec for the block texture array. The game keeps every
+/// content-identity constant (16px layers, 256 GPU layers, 5 mips);
+/// [`opencraft_gfx::texture`] owns the device-facing descriptor, view, and
+/// upload machinery that consumes this shape.
+const BLOCK_ARRAY_SPEC: TextureArraySpec = TextureArraySpec {
+    label: "block_texture_array",
+    size: TEX_SIZE,
+    layers: BLOCK_ARRAY_LAYERS,
+    mip_levels: MIP_LEVELS,
+};
 
 #[inline]
 fn hash_pixel(x: u32, y: u32, seed: u32) -> u32 {
@@ -649,8 +661,7 @@ pub fn block_layers_match_shape(layers: &[Vec<u8>]) -> bool {
 /// exactly [`BLOCK_ARRAY_LAYERS`] layers, each [`TEX_SIZE`] × [`TEX_SIZE`] × 4
 /// RGBA bytes. Used to guard live re-uploads (MEM111) in debug builds.
 pub fn block_array_layers_match_shape(layers: &[Vec<u8>]) -> bool {
-    layers.len() == BLOCK_ARRAY_LAYERS as usize
-        && layers.iter().all(|layer| layer.len() == LAYER_BYTES)
+    BLOCK_ARRAY_SPEC.matches_shape(layers)
 }
 
 /// Compose the 256-layer GPU block array from the 48 authored/procedural base
@@ -694,7 +705,8 @@ pub fn compose_block_array_layers(base: &[Vec<u8>], pack_layers: &[Vec<u8>]) -> 
 /// existing texture array at `layer`.
 ///
 /// `rgba` must be exactly [`TEX_SIZE`] × [`TEX_SIZE`] × 4 bytes and `layer`
-/// must be below [`BLOCK_ARRAY_LAYERS`]. Both are debug assertions so release
+/// must be below [`BLOCK_ARRAY_LAYERS`]. Both are debug assertions inside
+/// [`opencraft_gfx::texture::TextureArraySpec::upload_layer`] so release
 /// builds never panic here; callers reject or fall back on bad art before
 /// reaching this seam. The texture, view, and bind group are never recreated
 /// (MEM111: only contents change).
@@ -704,47 +716,7 @@ pub fn upload_block_layer_at(
     layer: u32,
     rgba: &[u8],
 ) {
-    debug_assert!(
-        layer < BLOCK_ARRAY_LAYERS,
-        "layer {layer} is outside the {BLOCK_ARRAY_LAYERS}-layer block array"
-    );
-    debug_assert_eq!(
-        rgba.len(),
-        LAYER_BYTES,
-        "layer bytes must match {TEX_SIZE}x{TEX_SIZE} RGBA"
-    );
-
-    let mut current = rgba.to_vec();
-    let mut dim = TEX_SIZE;
-    for mip in 0..MIP_LEVELS {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture,
-                mip_level: mip,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &current,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * dim),
-                rows_per_image: Some(dim),
-            },
-            wgpu::Extent3d {
-                width: dim,
-                height: dim,
-                depth_or_array_layers: 1,
-            },
-        );
-        if mip + 1 < MIP_LEVELS {
-            current = downsample_rgba_2x(&current, dim);
-            dim = (dim / 2).max(1);
-        }
-    }
+    BLOCK_ARRAY_SPEC.upload_layer(texture, queue, layer, rgba);
 }
 
 /// Upload every layer's base mip and its box-filtered mip chain into an
@@ -753,43 +725,27 @@ pub fn upload_block_layer_at(
 /// Shared by the initial creation path and live pack re-uploads so both use
 /// exactly one upload rule (MEM111: the texture object itself is never
 /// recreated; only its contents change). Delegates to
-/// [`upload_block_layer_at`] so the bulk and single-layer paths cannot drift.
+/// [`opencraft_gfx::texture::TextureArraySpec::upload_layers`], which loops
+/// the single-layer rule so the bulk and single-layer paths cannot drift.
 pub fn upload_block_layers(texture: &wgpu::Texture, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
-    for (layer_idx, base_rgba) in layers.iter().enumerate() {
-        upload_block_layer_at(texture, queue, layer_idx as u32, base_rgba);
-    }
+    BLOCK_ARRAY_SPEC.upload_layers(texture, queue, layers);
 }
 
+/// Create the retained block texture array, its D2-array view, and the
+/// repeat/nearest sampler.
+///
+/// Content identity (size, GPU layers, mip count) stays game-side in
+/// [`BLOCK_ARRAY_SPEC`]; the descriptor and mip upload rule live in
+/// [`opencraft_gfx::texture`]. The texture/view/sampler are never recreated
+/// after this call (MEM111: pack changes re-upload contents only).
 pub fn create_block_texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
     let layers = compose_block_array_layers(&generate_all_texture_layers_rgba(), &[]);
-    let size = wgpu::Extent3d {
-        width: TEX_SIZE,
-        height: TEX_SIZE,
-        depth_or_array_layers: BLOCK_ARRAY_LAYERS,
-    };
-
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("block_texture_array"),
-        size,
-        mip_level_count: MIP_LEVELS,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    upload_block_layers(&texture, queue, &layers);
-
-    let view = texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("block_texture_array_view"),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        array_layer_count: Some(BLOCK_ARRAY_LAYERS),
-        ..Default::default()
-    });
+    let texture = BLOCK_ARRAY_SPEC.create_texture(device);
+    BLOCK_ARRAY_SPEC.upload_layers(&texture, queue, &layers);
+    let view = BLOCK_ARRAY_SPEC.create_view(&texture);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("block_sampler"),
@@ -1130,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn single_layer_upload_keeps_the_existing_mip_rule_and_bounds() {
+    fn single_layer_upload_delegates_to_the_neutral_spec() {
         let src = include_str!("texture.rs");
         let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
         let production = &src[..tests_at];
@@ -1141,28 +1097,8 @@ mod tests {
         let body = &body[..body.find("\n}\n").expect("function body ends") + 3];
 
         assert!(
-            body.contains("debug_assert")
-                && body.contains("layer <")
-                && body.contains("BLOCK_ARRAY_LAYERS"),
-            "out-of-range layers must be caught in debug builds without panicking in release"
-        );
-        assert!(
-            body.contains("debug_assert_eq")
-                && body.contains("rgba.len()")
-                && body.contains("LAYER_BYTES"),
-            "wrong-sized layers must be caught in debug builds without panicking in release"
-        );
-        assert!(
-            body.contains("for mip in 0..MIP_LEVELS"),
-            "per-layer uploads must write the same mip chain as the initial upload"
-        );
-        assert!(
-            body.contains("downsample_rgba_2x(&current, dim)"),
-            "per-layer uploads must reuse the shared box-filter mip rule"
-        );
-        assert!(
-            body.contains("z: layer"),
-            "the upload must target the requested array layer"
+            body.contains("BLOCK_ARRAY_SPEC.upload_layer(texture, queue, layer, rgba)"),
+            "the game must delegate the per-layer upload and mip rule to opencraft-gfx"
         );
     }
 
@@ -1178,13 +1114,72 @@ mod tests {
         let body = &body[..body.find("\n}\n").expect("function body ends") + 3];
 
         assert!(
-            body.contains("upload_block_layer_at(texture, queue, layer_idx as u32, base_rgba)"),
-            "the bulk path must reuse the per-layer rule so the two paths cannot drift"
+            body.contains("BLOCK_ARRAY_SPEC.upload_layers(texture, queue, layers)"),
+            "the bulk path must delegate to the neutral spec's single-layer rule"
+        );
+
+        // Negative pin: the moved machinery must not linger in the game.
+        // Tokens are split so this assertion cannot match its own source text.
+        let write_tex = concat!("queue.write", "_texture");
+        let copy_tex = concat!("ImageCopy", "Texture");
+        let mip_loop = concat!("for ", "mip in");
+        assert!(
+            !production.contains(write_tex),
+            "the game must not keep its own write-texture upload"
         );
         assert!(
-            !body.contains("queue.write_texture("),
-            "upload_block_layers must not keep a second copy of the upload loop"
+            !production.contains(copy_tex),
+            "the game must not keep its own image-copy descriptor"
         );
+        assert!(
+            !production.contains(mip_loop),
+            "the game must not keep its own mip loop"
+        );
+    }
+
+    #[test]
+    fn create_block_texture_array_delegates_to_the_neutral_spec() {
+        let src = include_str!("texture.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
+        let production = &src[..tests_at];
+        let at = production
+            .find("pub fn create_block_texture_array(")
+            .expect("create_block_texture_array exists");
+        let body = &production[at..];
+        let body = &body[..body.find("\n}\n").expect("function body ends") + 3];
+
+        assert!(
+            body.contains("create_texture(device)"),
+            "the texture must be created from the neutral spec"
+        );
+        assert!(
+            body.contains("upload_layers(&texture, queue, &layers)"),
+            "the full upload must go through the neutral spec"
+        );
+        assert!(
+            body.contains("create_view(&texture)"),
+            "the view must be built by the neutral spec"
+        );
+        assert!(
+            body.contains("label: Some(\"block_sampler\")")
+                && body.contains("address_mode_u: wgpu::AddressMode::Repeat")
+                && body.contains("address_mode_v: wgpu::AddressMode::Repeat")
+                && body.contains("address_mode_w: wgpu::AddressMode::Repeat")
+                && body.contains("mag_filter: wgpu::FilterMode::Nearest")
+                && body.contains("min_filter: wgpu::FilterMode::Nearest")
+                && body.contains("mipmap_filter: wgpu::FilterMode::Linear"),
+            "the sampler descriptor must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn block_array_spec_matches_the_game_contract() {
+        assert!(BLOCK_ARRAY_SPEC.validate().is_ok());
+        assert_eq!(BLOCK_ARRAY_SPEC.size, TEX_SIZE);
+        assert_eq!(BLOCK_ARRAY_SPEC.layers, BLOCK_ARRAY_LAYERS);
+        assert_eq!(BLOCK_ARRAY_SPEC.mip_levels, MIP_LEVELS);
+        assert_eq!(BLOCK_ARRAY_SPEC.label, "block_texture_array");
+        assert_eq!(BLOCK_ARRAY_SPEC.layer_bytes(), LAYER_BYTES);
     }
 
     #[test]
